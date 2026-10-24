@@ -1,0 +1,92 @@
+{
+  "name": "zacro-browser",
+  "version": "0.2.0",
+  "description": "A sidebar-first Chromium browser with Spaces, profiles, Peek, and optional AI.",
+  "main": "src/main/main.cjs",
+  "private": true,
+  "author": "Zacro Technologies",
+  "license": "MIT",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron .",
+    "icons": "electron scripts/generate-icons.cjs",
+    "test": "node --test test/*.test.cjs",
+    "check": "node scripts/check.cjs",
+    "format": "prettier --write \"src/**/*.{cjs,js,html,css}\" \"test/**/*.cjs\" \"scripts/*.cjs\" \"*.json\" \".github/**/*.{yml,yaml}\"",
+    "format:check": "prettier --check \"src/**/*.{cjs,js,html,css}\" \"test/**/*.cjs\" \"scripts/*.cjs\" \"*.json\" \".github/**/*.{yml,yaml}\"",
+    "test:e2e": "node --test --test-concurrency=1 test/e2e/*.test.cjs",
+    "test:package": "node --test test/package/*.test.cjs",
+    "verify": "npm run format:check && npm run check && npm test && npm run test:e2e",
+    "pack": "electron-builder --dir",
+    "prepack": "node scripts/prepare-runtime.cjs",
+    "dist": "electron-builder --win nsis --x64",
+    "predist": "node scripts/prepare-runtime.cjs",
+    "dist:release": "node scripts/release.cjs",
+    "test:interactive": "node scripts/interactive-qa.cjs",
+    "test:soak": "node --test test/soak/*.test.cjs"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.64.1",
+    "electron": "45.0.0",
+    "electron-builder": "26.18.0",
+    "prettier": "3.9.10"
+  },
+  "build": {
+    "appId": "com.zacro.browser",
+    "productName": "Zacro",
+    "asar": true,
+    "electronDist": "node_modules/electron/dist",
+    "electronFuses": {
+      "runAsNode": false,
+      "enableCookieEncryption": true,
+      "enableNodeOptionsEnvironmentVariable": false,
+      "enableNodeCliInspectArguments": false,
+      "enableEmbeddedAsarIntegrityValidation": true,
+      "onlyLoadAppFromAsar": true
+    },
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "src/**/*",
+      "assets/**/*",
+      "LICENSE",
+      "THIRD_PARTY_NOTICES.md",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "icon": "assets/icon.ico",
+      "artifactName": "Zacro-${version}-${arch}-Setup.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "deleteAppDataOnUninstall": false
+    },
+    "mac": {
+      "target": [
+        "dmg"
+      ],
+      "category": "public.app-category.productivity",
+      "hardenedRuntime": true
+    },
+    "linux": {
+      "target": [
+        "AppImage"
+      ],
+      "icon": "assets/icon.png",
+      "category": "Network;WebBrowser"
+    }
+  },
+  "dependencies": {
+    "pdfjs-dist": "6.4.299"
+  }
+}

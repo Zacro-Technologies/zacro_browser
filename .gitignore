@@ -1,0 +1,14 @@
+node_modules/
+dist/
+coverage/
+test-results/
+.tmp/
+tmp/
+output/
+*.log
+.env
+.env.*
+!.env.example
+*.pfx
+*.p12
+*.pem

@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'none'; object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'"
+    />
+    <meta name="color-scheme" content="light dark" />
+    <title>Zacro</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div id="app" class="app">
+      <aside id="sidebar" class="sidebar" aria-label="Spaces and tabs"></aside>
+      <main class="main">
+        <header id="toolbar" class="toolbar" aria-label="Browser controls"></header>
+        <div id="workspace" class="workspace">
+          <section id="newtab" class="newtab" aria-label="New tab"></section>
+          <section id="page-status" class="page-status" hidden></section>
+          <section id="peek" class="peek" aria-label="Link preview" hidden></section>
+        </div>
+      </main>
+      <aside id="side-panel" class="side-panel" aria-label="Library" hidden></aside>
+      <div id="findbar" class="findbar" hidden></div>
+      <div id="page-backdrop" aria-hidden="true" inert hidden></div>
+      <div id="dialog-root"></div>
+      <div id="toast-root" class="toast-root" role="status" aria-live="polite" aria-atomic="true"></div>
+      <div id="live-region" class="sr-only" role="status" aria-live="polite"></div>
+    </div>
+    <script type="module" src="app.js"></script>
+  </body>
+</html>

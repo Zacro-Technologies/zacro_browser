@@ -1,0 +1,101 @@
+'use strict';
+
+const clamp = (value, minimum, maximum) => Math.min(maximum, Math.max(minimum, value));
+const finite = (value, fallback) => (Number.isFinite(value) ? value : fallback);
+
+function browserLayout({ width, height, sidebarWidth = 260, panelWidth = 0, split = false }) {
+  width = Math.max(1, Math.round(finite(width, 1440)));
+  height = Math.max(1, Math.round(finite(height, 940)));
+  const left = Math.round(clamp(finite(sidebarWidth, 260), 180, Math.max(180, width - 400)));
+  const right = Math.round(clamp(finite(panelWidth, 0), 0, Math.max(0, width - left - 316)));
+  const available = Math.max(1, width - left - (right > 0 ? right + 16 : 8));
+  const top = Math.min(60, height - 1);
+  const gap = 6;
+  const secondaryVisible = split && available >= gap + 2;
+  const firstWidth = secondaryVisible ? Math.floor((available - gap) / 2) : available;
+  return {
+    primary: { x: left, y: top, width: firstWidth, height: Math.max(1, height - top - 8) },
+    secondary: secondaryVisible
+      ? {
+          x: left + firstWidth + gap,
+          y: top,
+          width: available - firstWidth - gap,
+          height: Math.max(1, height - top - 8),
+        }
+      : null,
+    peek: {
+      x: left + 36,
+      y: Math.min(112, height - 1),
+      width: Math.max(1, available - 72),
+      height: Math.max(1, height - 156),
+    },
+  };
+}
+
+function sameBounds(left, right) {
+  return Boolean(left && right && ['x', 'y', 'width', 'height'].every((key) => left[key] === right[key]));
+}
+
+// Repeated state publications must not hide and show the focused native page.
+function presentView(view, previous, next, parent = null) {
+  let attached = Boolean(previous?.attached);
+  // Hidden native children can remain reachable through platform accessibility
+  // trees. Remove them from that hierarchy while retaining the living page.
+  if (parent && next.visible && !attached) {
+    parent.addChildView(view);
+    attached = true;
+  }
+  if (next.bounds && !sameBounds(previous?.bounds, next.bounds)) view.setBounds(next.bounds);
+  if (previous?.visible !== next.visible) view.setVisible(next.visible);
+  if (parent && !next.visible && !next.retainAttachment && attached) {
+    parent.removeChildView(view);
+    attached = false;
+  }
+  return { visible: next.visible, bounds: next.bounds || previous?.bounds || null, attached };
+}
+
+function resolveSplit(pair, tabs, activeTabId, spaceId) {
+  if (!pair || pair.length !== 2 || pair[0] === pair[1] || !pair.includes(activeTabId)) return null;
+  if (
+    !pair.every((id) =>
+      tabs.some((tab) => tab.id === id && tab.spaceId === spaceId && tab.url !== 'zacro://newtab'),
+    )
+  )
+    return null;
+  return { leftId: pair[0], rightId: pair[1], otherId: pair[0] === activeTabId ? pair[1] : pair[0] };
+}
+
+function restoreWindowPlacement(saved = {}, workAreas = []) {
+  const areas = workAreas.filter(
+    (area) => Number.isFinite(area.x) && Number.isFinite(area.y) && area.width > 0 && area.height > 0,
+  );
+  const fallback = { x: 0, y: 0, width: 1920, height: 1080 };
+  const width = clamp(finite(saved.width, 1440), 960, 7680);
+  const height = clamp(finite(saved.height, 940), 640, 4320);
+  const intersection = (area) =>
+    Math.max(0, Math.min(saved.x + width, area.x + area.width) - Math.max(saved.x, area.x)) *
+    Math.max(0, Math.min(saved.y + height, area.y + area.height) - Math.max(saved.y, area.y));
+  const positioned = Number.isFinite(saved.x) && Number.isFinite(saved.y);
+  const target = positioned
+    ? [...areas].sort((a, b) => intersection(b) - intersection(a))[0] || fallback
+    : areas[0] || fallback;
+  const size = { width: Math.min(width, target.width), height: Math.min(height, target.height) };
+  const visible = positioned && intersection(target) > 0;
+  return {
+    width: Math.round(size.width),
+    height: Math.round(size.height),
+    x: Math.round(
+      visible
+        ? clamp(saved.x, target.x, target.x + target.width - size.width)
+        : target.x + (target.width - size.width) / 2,
+    ),
+    y: Math.round(
+      visible
+        ? clamp(saved.y, target.y, target.y + target.height - size.height)
+        : target.y + (target.height - size.height) / 2,
+    ),
+    maximized: saved.maximized === true,
+  };
+}
+
+module.exports = { browserLayout, presentView, resolveSplit, restoreWindowPlacement };
