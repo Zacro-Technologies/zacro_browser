@@ -27,3 +27,9 @@ Tabs may carry `customTitle`; an explicit user rename controls the displayed `ti
 ## Interface additions in 0.3
 
 The default sidebar width is 230; saved user widths remain valid. The renderer handles `sidebar:toggle {fromPage}` and returns focus through `page:focus` when the shortcut originated in a native page. Library is a compact chooser whose panels share section navigation and preserve their opener for focus return. Settings uses persistent disclosure state. Dialog and panel entrances are short; dismissal and native-view geometry updates are immediate.
+
+## macOS integration
+
+The host's `src/main/mac.cjs` defines native window chrome, the menu template and Mac shortcut mapping. Runtime snapshots include `fullScreen` and `focused`; the renderer exposes `data-platform`, `data-fullscreen` and the platform's shortcut labels. macOS uses native traffic lights with `hiddenInset` and reserves their area in both normal and hidden-sidebar layouts. The shell never draws replacement traffic-light buttons.
+
+`app:quit` requests application quit separately from `window:close`. macOS closes the native window after existing beforeunload decisions, releases its native contents, and retains the process for Dock activation. Reopening rebuilds the shell and restores session metadata. It does not promise that an approved window close preserves a live page's in-memory draft. Pending quit intent is cancelled when a page's close decision is cancelled. OS web-link events are validated and queued until a window can accept them. Menu editing commands target the focused web contents, including the active native page.

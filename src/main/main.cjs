@@ -13,6 +13,7 @@ const {
   clipboard,
   nativeTheme,
   screen,
+  webContents,
 } = require('electron');
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
@@ -23,6 +24,7 @@ const { BrowserStore, normalizeAddress } = require('../core/store.cjs');
 const { webURL, safeFilename, unusedPath, renameWithoutOverwrite } = require('./security.cjs');
 const { browserLayout, presentView, resolveSplit, restoreWindowPlacement } = require('./layout.cjs');
 const { FaviconLoader } = require('./favicon.cjs');
+const { windowChrome, macShortcut, macMenuTemplate } = require('./mac.cjs');
 const faviconLoader = new FaviconLoader();
 
 app.setName('Zacro');
@@ -55,6 +57,12 @@ let popupTimes = [];
 let pendingAuth = null;
 let backdropGeneration = 0;
 let backdropContext = null;
+let windowReady = null;
+let startupReady = false;
+let quitRequested = false;
+let drainingExternalURLs = false;
+const externalURLs = [];
+let defaultBrowser = { supported: process.platform === 'darwin' && app.isPackaged, configured: false };
 
 const activeSpace = () => store.state.spaces.find((item) => item.id === store.state.activeSpaceId);
 const activeTab = () => store.state.tabs.find((item) => item.id === store.state.activeTabId);
@@ -213,6 +221,9 @@ function snapshot() {
     aiProvider: status.provider,
     aiModel: status.model,
     maximized: validWindow() && win.isMaximized(),
+    fullScreen: Boolean(validWindow() && win.isFullScreen()),
+    focused: Boolean(validWindow() && win.isFocused()),
+    defaultBrowser,
     dark: nativeTheme.shouldUseDarkColors,
   };
   // Managed extension paths are operational details, not a renderer capability.
@@ -223,8 +234,10 @@ function publish() {
   if (publishTimer || quitting || !validWindow() || win.webContents.isDestroyed()) return;
   publishTimer = setTimeout(() => {
     publishTimer = null;
-    if (!quitting && validWindow() && !win.webContents.isDestroyed())
+    if (!quitting && validWindow() && !win.webContents.isDestroyed()) {
+      updateMacMenu();
       win.webContents.send('zacro:state', snapshot());
+    }
   }, 25);
 }
 
@@ -405,6 +418,7 @@ function guestPreferences(profileId) {
     allowRunningInsecureContent: false,
     navigateOnDragDrop: false,
     spellcheck: true,
+    scrollBounce: process.platform === 'darwin',
   };
 }
 function createEntry(profileId, tabId = null, suppliedOptions = {}) {
@@ -688,7 +702,7 @@ function ensureView(tabId) {
   return views.get(tabId);
 }
 function reconcile() {
-  if (!validWindow() || quitting) return;
+  if (!validWindow() || quitting || closingWindow) return;
   const profileId = activeSpace()?.profileId;
   if (
     backdropContext &&
@@ -806,6 +820,15 @@ function showPageMenu(entry, params) {
   const source = tabForContents(wc);
   const link = webURL(params.linkURL);
   const items = [];
+  if (params.misspelledWord && params.isEditable) {
+    for (const suggestion of (params.dictionarySuggestions || []).slice(0, 5))
+      items.push({ label: suggestion, click: () => wc.replaceMisspelling(suggestion) });
+    if (items.length) items.push({ type: 'separator' });
+  }
+  if (process.platform === 'darwin' && params.selectionText?.trim()) {
+    items.push({ label: 'Look Up Selection', click: () => wc.showDefinitionForSelection() });
+    items.push({ type: 'separator' });
+  }
   if (link && source)
     items.push(
       {
@@ -872,7 +895,7 @@ function showPageMenu(entry, params) {
 }
 
 function handleShortcut(event, input, contents) {
-  if (input.type !== 'keyDown') return;
+  if (input.type !== 'keyDown' || input.isComposing || !validWindow()) return;
   const mod = process.platform === 'darwin' ? input.meta : input.control;
   const key = input.key.toLowerCase();
   const run = (callback) => {
@@ -884,6 +907,15 @@ function handleShortcut(event, input, contents) {
       report(error);
     }
   };
+  if (process.platform === 'darwin') {
+    const action = macShortcut(input);
+    if (action) return run(() => runMacAction(action, contents !== win.webContents));
+    // These belong to Cocoa: Command-H hides the app and Command-Tab is the
+    // system application switcher. They must never become browser actions.
+    // Unrecognized modified Command combinations also remain native. Falling
+    // through would turn, for example, Command-Option-T into a new tab.
+    if (input.meta && (input.control || input.alt || input.shift || ['h', 'q', 'tab'].includes(key))) return;
+  }
   if (key === 'f6') {
     return run(() => {
       const target = activeContents();
@@ -936,16 +968,16 @@ function handleShortcut(event, input, contents) {
   if (mod && key === 'p') return run(() => contents.print({}));
   if ((mod && key === 'r') || key === 'f5')
     return run(() => (input.shift ? contents.reloadIgnoringCache() : contents.reload()));
-  if (mod && key === 'tab') return run(() => cycleTab(input.shift ? -1 : 1));
+  if (process.platform !== 'darwin' && mod && key === 'tab') return run(() => cycleTab(input.shift ? -1 : 1));
   if (mod && /^[1-9]$/.test(key))
     return run(() => {
       const tabs = store.state.tabs.filter((tab) => tab.spaceId === store.state.activeSpaceId);
       const tab = tabs[key === '9' ? tabs.length - 1 : Number(key) - 1];
       if (tab) return invoke('tab:activate', { id: tab.id });
     });
-  if (input.alt && key === 'arrowleft')
+  if (process.platform !== 'darwin' && input.alt && key === 'arrowleft')
     return run(() => contents.navigationHistory.canGoBack() && contents.navigationHistory.goBack());
-  if (input.alt && key === 'arrowright')
+  if (process.platform !== 'darwin' && input.alt && key === 'arrowright')
     return run(() => contents.navigationHistory.canGoForward() && contents.navigationHistory.goForward());
   if (mod && ['+', '=', '-', '0'].includes(key))
     return run(() => zoom(contents, key === '0' ? { reset: true } : { delta: key === '-' ? -0.1 : 0.1 }));
@@ -1498,6 +1530,18 @@ async function invoke(action, payload = {}) {
   }
   const contents = activeContents();
   switch (action) {
+    case 'app:quit':
+      // Let the IPC reply settle before a successful quit destroys its sender.
+      setImmediate(() => app.quit());
+      return null;
+    case 'app:set-default-browser':
+      if (!defaultBrowser.supported)
+        throw new Error('Install the macOS application before choosing it as your default browser.');
+      app.setAsDefaultProtocolClient('http');
+      app.setAsDefaultProtocolClient('https');
+      refreshDefaultBrowser();
+      publish();
+      return { ...defaultBrowser };
     case 'state:get':
       return snapshot();
     case 'page:focus':
@@ -1772,6 +1816,36 @@ function registerIPC() {
   });
 }
 function buildMenu() {
+  if (process.platform === 'darwin') {
+    app.setAboutPanelOptions({
+      applicationName: 'Zacro',
+      applicationVersion: app.getVersion(),
+      copyright: 'An independent, open-source browser by Zacro Technologies.',
+      website: 'https://github.com/Zacro-Technologies/zacro_browser',
+      iconPath: path.join(__dirname, '../../assets/icon.png'),
+    });
+    Menu.setApplicationMenu(
+      Menu.buildFromTemplate(
+        macMenuTemplate(
+          (action) => runMacAction(action).catch(report),
+          (action) => {
+            // BrowserWindow.webContents is the shell, not necessarily the
+            // native page's first responder. Respect focused page editors.
+            const contents = webContents.getFocusedWebContents();
+            if (contents && !contents.isDestroyed()) contents[action]();
+          },
+        ),
+      ),
+    );
+    app.dock?.setMenu(
+      Menu.buildFromTemplate([
+        { label: 'Open Browser Window', click: () => ensureWindow().catch(report) },
+        { label: 'New Tab', click: () => runMacAction('new-tab').catch(report) },
+        { label: 'New Private Space', click: () => runMacAction('new-private-space').catch(report) },
+      ]),
+    );
+    return;
+  }
   const template = [
     ...(process.platform === 'darwin' ? [{ role: 'appMenu' }] : []),
     {
@@ -1838,7 +1912,181 @@ function buildMenu() {
   ];
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
+function refreshDefaultBrowser() {
+  defaultBrowser = {
+    supported: process.platform === 'darwin' && app.isPackaged,
+    configured:
+      process.platform === 'darwin' &&
+      app.isPackaged &&
+      app.isDefaultProtocolClient('http') &&
+      app.isDefaultProtocolClient('https'),
+  };
+}
+function updateMacMenu() {
+  if (process.platform !== 'darwin') return;
+  const menu = Menu.getApplicationMenu();
+  if (!menu) return;
+  const available = Boolean(validWindow() && !closingWindow);
+  const page = available && activeContents();
+  const pageAvailable = Boolean(page && !page.isDestroyed());
+  const enable = (id, enabled) => {
+    const item = menu.getMenuItemById(id);
+    if (item) item.enabled = enabled;
+  };
+  for (const id of ['close-tab', 'close-window', 'sidebar-toggle', 'fullscreen', 'previous-tab', 'next-tab'])
+    enable(id, available);
+  for (const id of [
+    'print',
+    'reload',
+    'force-reload',
+    'find',
+    'zoom-in',
+    'zoom-out',
+    'zoom-reset',
+    'developer-tools',
+    'bookmark',
+  ])
+    enable(id, pageAvailable);
+  enable('history-back', pageAvailable && page.navigationHistory.canGoBack());
+  enable('history-forward', pageAvailable && page.navigationHistory.canGoForward());
+  const fullscreen = menu.getMenuItemById('fullscreen');
+  if (fullscreen)
+    fullscreen.label = available && win.isFullScreen() ? 'Exit Full Screen' : 'Enter Full Screen';
+}
+async function runMacAction(action, fromPage = false) {
+  if (action === 'releases' || action === 'issues')
+    return shell.openExternal(`https://github.com/Zacro-Technologies/zacro_browser/${action}`);
+  if (['close-tab', 'close-window'].includes(action) && !validWindow()) return;
+  await ensureWindow();
+  if (!validWindow() || closingWindow || quitting) return;
+  const contents = activeContents();
+  const showChrome = (event) => {
+    emit(event);
+    win.webContents.focus();
+  };
+  switch (action) {
+    case 'open-browser':
+      return;
+    case 'new-tab':
+      if (!(await invoke('tab:create', {}))) return;
+      return showChrome({ type: 'command', mode: 'navigate' });
+    case 'new-private-space':
+      await invoke('profile:create', { name: 'Private', private: true });
+      return;
+    case 'reopen-tab':
+      return invoke('tab:restore', {});
+    case 'close-tab':
+      return peek ? requestClosePeek() : requestCloseTab(store.state.activeTabId);
+    case 'close-window':
+      win.close();
+      return;
+    case 'open-location':
+      return showChrome({ type: 'command', mode: 'address' });
+    case 'preferences':
+    case 'history':
+    case 'downloads':
+      return showChrome({ type: 'panel', panel: action === 'preferences' ? 'settings' : action });
+    case 'find':
+      return showChrome({ type: 'find' });
+    case 'print':
+      return contents?.print({});
+    case 'reload':
+      return contents?.reload();
+    case 'force-reload':
+      return contents?.reloadIgnoringCache();
+    case 'sidebar-toggle':
+      return emit({ type: 'sidebar:toggle', fromPage });
+    case 'zoom-in':
+    case 'zoom-out':
+    case 'zoom-reset':
+      return zoom(
+        contents,
+        action === 'zoom-reset' ? { reset: true } : { delta: action === 'zoom-in' ? 0.1 : -0.1 },
+      );
+    case 'fullscreen':
+      win.setFullScreen(!win.isFullScreen());
+      return;
+    case 'developer-tools':
+      return contents?.openDevTools({ mode: 'detach' });
+    case 'history-back':
+      if (contents?.navigationHistory.canGoBack()) contents.navigationHistory.goBack();
+      return;
+    case 'history-forward':
+      if (contents?.navigationHistory.canGoForward()) contents.navigationHistory.goForward();
+      return;
+    case 'previous-tab':
+    case 'next-tab':
+      return cycleTab(action === 'previous-tab' ? -1 : 1);
+    case 'bookmark':
+      return invoke('bookmark:toggle', {});
+    case 'import':
+      return importData();
+    case 'export':
+      return exportData();
+  }
+}
+async function ensureWindow() {
+  if (!store || quitting || quitRequested) return;
+  if (windowReady) await windowReady;
+  else if (!validWindow()) {
+    windowReady = createWindow();
+    try {
+      await windowReady;
+    } finally {
+      windowReady = null;
+    }
+  }
+  if (!validWindow() || closingWindow) return;
+  if (win.isMinimized()) win.restore();
+  if (process.platform === 'darwin' && app.isHidden()) app.show();
+  win.show();
+  win.focus();
+}
+async function drainExternalURLs() {
+  if (!startupReady || drainingExternalURLs || quitRequested || quitting) return;
+  drainingExternalURLs = true;
+  try {
+    await ensureWindow();
+    while (externalURLs.length && validWindow() && !closingWindow && !quitRequested)
+      await invoke('tab:create', { url: externalURLs.shift() });
+  } finally {
+    drainingExternalURLs = false;
+  }
+}
+function receiveExternalURL(value) {
+  const url = webURL(value);
+  if (!url || externalURLs.length >= 32) return;
+  externalURLs.push(url);
+  void drainExternalURLs().catch(report);
+}
+async function endPrivateSessions() {
+  // The Mac process survives closing its last window; private browsing must
+  // not. Run only after every page has accepted the close, never on Cancel.
+  for (const profile of store.state.profiles.filter((item) => item.private)) {
+    for (const record of store.state.downloads.filter((item) => item.profileId === profile.id))
+      liveDownloads.get(record.id)?.cancel();
+    const ses = sessions.get(profile.id);
+    if (ses) {
+      faviconLoader.clear(ses);
+      for (const extension of store.state.extensions.filter((item) => item.profileId === profile.id))
+        if (extension.enabled) ses.extensions.removeExtension(extension.extensionId);
+      await ses.closeAllConnections();
+      await ses.clearStorageData();
+      await ses.clearAuthCache();
+      await ses.clearCache();
+      sessions.delete(profile.id);
+    }
+    store.dispatch('profile:delete', { id: profile.id });
+  }
+}
 async function createWindow() {
+  closingWindow = false;
+  allowWindowClose = false;
+  splitTabId = null;
+  splitPair = null;
+  layout = { sidebarWidth: store.state.settings.sidebarWidth || 230, panelWidth: 0, overlay: false };
+  clearTimeout(publishTimer);
+  publishTimer = null;
   const primary = screen.getPrimaryDisplay();
   const displays = [primary, ...screen.getAllDisplays().filter((display) => display.id !== primary.id)];
   const bounds = restoreWindowPlacement(
@@ -1856,12 +2104,9 @@ async function createWindow() {
     minHeight: Math.min(640, bounds.height),
     title: 'Zacro',
     backgroundColor: '#f4f2ef',
-    frame: false,
+    ...windowChrome(process.platform),
     useContentSize,
     icon: path.join(__dirname, '../../assets/icon.png'),
-    ...(process.platform === 'darwin'
-      ? { titleBarStyle: 'hiddenInset', trafficLightPosition: { x: 18, y: 20 } }
-      : {}),
     show: false,
     autoHideMenuBar: true,
     webPreferences: {
@@ -1874,7 +2119,7 @@ async function createWindow() {
       spellcheck: false,
     },
   });
-  if (!useContentSize) {
+  if (!useContentSize && process.platform === 'win32') {
     // On fractional Windows scaling, constructing a frameless window may add
     // rounded non-client pixels even for outer bounds. Correct against the
     // measured native rectangle, with a fixed limit rather than accumulating
@@ -1929,8 +2174,24 @@ async function createWindow() {
   win.on('moved', rememberNormalBounds);
   win.on('maximize', publish);
   win.on('unmaximize', publish);
+  win.on('focus', () => {
+    refreshDefaultBrowser();
+    publish();
+  });
+  win.on('blur', publish);
+  const fullscreenChanged = () => {
+    sizeShell();
+    arrangeViews();
+    const item = Menu.getApplicationMenu()?.getMenuItemById('fullscreen');
+    if (item) item.label = win.isFullScreen() ? 'Exit Full Screen' : 'Enter Full Screen';
+    publish();
+  };
+  win.on('enter-full-screen', fullscreenChanged);
+  win.on('leave-full-screen', fullscreenChanged);
   win.on('close', (event) => {
-    if (!allowWindowClose && (views.size || peek)) {
+    const hasPrivateSession =
+      process.platform === 'darwin' && store.state.profiles.some((item) => item.private);
+    if (!allowWindowClose && (views.size || peek || hasPrivateSession)) {
       event.preventDefault();
       if (closingWindow) return;
       closingWindow = true;
@@ -1939,17 +2200,22 @@ async function createWindow() {
         for (const entry of candidates) {
           if (!(await requestCloseEntry(entry))) {
             closingWindow = false;
+            quitRequested = false;
             reconcile();
+            if (externalURLs.length) setImmediate(() => drainExternalURLs().catch(report));
             return;
           }
         }
         if (peek?.entry.contents.isDestroyed()) peek = null;
+        if (process.platform === 'darwin') await endPrivateSessions();
         allowWindowClose = true;
         if (validWindow()) win.close();
       })().catch((error) => {
         closingWindow = false;
+        quitRequested = false;
         report(error);
         reconcile();
+        if (externalURLs.length) setImmediate(() => drainExternalURLs().catch(report));
       });
       return;
     }
@@ -1964,6 +2230,10 @@ async function createWindow() {
     }
   });
   win.on('closed', () => {
+    clearTimeout(publishTimer);
+    publishTimer = null;
+    finishAuth();
+    clearBackdrop();
     for (const entry of views.values()) destroyEntry(entry);
     views.clear();
     if (peek) {
@@ -1971,6 +2241,13 @@ async function createWindow() {
       peek = null;
     }
     win = null;
+    updateMacMenu();
+    splitTabId = null;
+    splitPair = null;
+    void ai?.handle('ai:cancel', {}).catch(() => {});
+    if (quitRequested) setImmediate(() => app.quit());
+    else if (process.platform === 'darwin' && externalURLs.length)
+      setImmediate(() => drainExternalURLs().catch(report));
   });
   await win.loadFile(UI_FILE);
   if (bounds.maximized) win.maximize();
@@ -1978,22 +2255,32 @@ async function createWindow() {
   reconcile();
 }
 
+// Register synchronously: Launch Services may deliver a link before ready.
+app.on('open-url', (event, url) => {
+  event.preventDefault();
+  receiveExternalURL(url);
+});
 app.on('second-instance', (_event, argv) => {
-  if (!validWindow()) return;
-  if (win.isMinimized()) win.restore();
-  win.focus();
-  const url = argv.find((value) => webURL(value));
-  if (url && store) invoke('tab:create', { url }).catch(report);
+  const urls = argv.filter((value) => webURL(value)).slice(0, 32);
+  for (const url of urls) receiveExternalURL(url);
+  if (!urls.length && startupReady) void ensureWindow().catch(report);
+});
+app.on('activate', () => {
+  if (!startupReady) return;
+  void ensureWindow().then(drainExternalURLs).catch(report);
 });
 app.on('certificate-error', (_event, _contents, _url, _error, _certificate, callback) => callback(false));
 app.on('login', requestAuthentication);
 app.on('web-contents-created', (_event, contents) =>
   contents.on('will-attach-webview', (event) => event.preventDefault()),
 );
-app.on('window-all-closed', () => app.quit());
+app.on('window-all-closed', () => {
+  if (process.platform !== 'darwin') app.quit();
+});
 app.on('before-quit', (event) => {
   if (validWindow() && !allowWindowClose) {
     event.preventDefault();
+    quitRequested = true;
     win.close();
   }
 });
@@ -2045,7 +2332,8 @@ if (singleInstance)
       );
       registerIPC();
       buildMenu();
-      await createWindow();
+      refreshDefaultBrowser();
+      await ensureWindow();
       if (store.recoveryWarning) toast(store.recoveryWarning);
       await restoreExtensions();
       store.dispatch('tab:archive-stale', { excludeIds: [...views.keys()] });
@@ -2053,8 +2341,9 @@ if (singleInstance)
         () => store.dispatch('tab:archive-stale', { excludeIds: [...views.keys()] }),
         60_000,
       );
-      const url = process.argv.find((value) => webURL(value));
-      if (url) store.dispatch('tab:create', { url });
+      startupReady = true;
+      for (const url of process.argv.filter((value) => webURL(value)).slice(0, 32)) receiveExternalURL(url);
+      await drainExternalURLs();
     })
     .catch((error) => {
       console.error(error);

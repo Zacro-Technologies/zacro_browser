@@ -75,7 +75,30 @@ const primary = (action, label, symbol = '', attrs = '') =>
   `<button type="button" class="primary" data-action="${action}" ${attrs}>${symbol ? icon(symbol) : ''}${esc(label)}</button>`;
 const secondary = (action, label, symbol = '', attrs = '') =>
   `<button type="button" class="secondary" data-action="${action}" ${attrs}>${symbol ? icon(symbol) : ''}${esc(label)}</button>`;
-const mod = window.zacro?.platform === 'darwin' ? '⌘' : 'Ctrl';
+const isMac = window.zacro?.platform === 'darwin';
+// Native Mac handling owns modified Command accelerators before DOM delivery.
+// Leave all other Option/Control/Shift combinations to the focused editor/OS.
+const primaryModifier = (event) =>
+  isMac ? event.metaKey && !event.altKey && !event.ctrlKey && !event.shiftKey : event.ctrlKey;
+const shortcut = (keys) => {
+  const parts = keys.split('+');
+  if (isMac) {
+    const order = ['Ctrl', 'Alt', 'Shift', 'Mod'];
+    parts.sort(
+      (a, b) => (order.includes(a) ? order.indexOf(a) : 4) - (order.includes(b) ? order.indexOf(b) : 4),
+    );
+  }
+  return parts
+    .map((key) =>
+      isMac
+        ? { Mod: '⌘', Ctrl: '⌃', Alt: '⌥', Shift: '⇧', Enter: '↵', Left: '←', Right: '→' }[key] || key
+        : key === 'Mod'
+          ? 'Ctrl'
+          : key,
+    )
+    .join(isMac ? '' : ' + ');
+};
+document.documentElement.dataset.platform = window.zacro?.platform || 'unknown';
 const colors = [
   ['berry', '#9d4460'],
   ['forest', '#416958'],
@@ -405,6 +428,8 @@ function applyState(next) {
   const previousSpace = state?.activeSpaceId;
   const previousTab = state?.activeTabId;
   state = next;
+  document.documentElement.dataset.fullscreen = String(Boolean(state.runtime?.fullScreen));
+  document.documentElement.dataset.focused = String(state.runtime?.focused !== false);
   setTheme();
   if (previousSpace !== state.activeSpaceId || previousTab !== state.activeTabId) clearPageBackdrop();
   if (previousProfile && previousProfile !== activeProfile()?.id) {
@@ -508,7 +533,7 @@ function renderSidebar() {
     ${profile?.private ? '<div class="private-indicator">Private session</div>' : ''}
     <div class="tabs-scroll">
     ${pins.length ? `<div class="favorites" aria-label="Pinned tabs">${pins.map((tab) => `<button type="button" class="favorite ${tab.id === state.activeTabId ? 'active' : ''}" draggable="true" data-tab-id="${esc(tab.id)}" data-action="tab:activate" data-id="${esc(tab.id)}" data-key="pin-${esc(tab.id)}" ${tab.id === state.activeTabId ? 'aria-current="page"' : ''} aria-label="${esc(tab.title || hostname(tab.url))}" title="${esc(tab.title)} — ${esc(tab.url)}">${favicon(tab.url, tab.id)}</button>`).join('')}</div>` : ''}
-    <div class="tabs-section-header"><button type="button" class="new-tab" data-action="ui:new-tab" data-key="new-tab">${icon('plus')}<span>New tab</span><kbd>${mod} T</kbd></button>${button('ui:new-folder', 'New folder', 'folderPlus', '', 'small-button')}</div>
+    <div class="tabs-section-header"><button type="button" class="new-tab" data-action="ui:new-tab" data-key="new-tab">${icon('plus')}<span>New tab</span><kbd>${shortcut('Mod+T')}</kbd></button>${button('ui:new-folder', 'New folder', 'folderPlus', '', 'small-button')}</div>
     ${folders
       .map(
         (folder) =>
@@ -573,7 +598,7 @@ function renderToolbar() {
   if (signature === ui.toolbarSignature) return;
   ui.toolbarSignature = signature;
   $('#toolbar').innerHTML =
-    `<div class="navigation">${button('ui:sidebar-toggle', ui.sidebarHidden ? 'Show sidebar (Ctrl + Shift + B)' : 'Hide sidebar (Ctrl + Shift + B)', 'sidebar', `data-key="sidebar-toggle" aria-pressed="${!ui.sidebarHidden}"`)}${button('back', 'Back (Alt + Left)', 'back', `data-key="back" ${page.canGoBack ? '' : 'disabled'}`)}${button('forward', 'Forward (Alt + Right)', 'forward', `data-key="forward" ${page.canGoForward ? '' : 'disabled'}`)}${button(page.loading ? 'stop' : 'reload', page.loading ? 'Stop loading' : 'Reload (Ctrl + R)', page.loading ? 'close' : 'reload', `data-key="reload" ${blank ? 'disabled' : ''}`)}</div><button type="button" class="address-button" data-action="ui:address" data-key="address" title="${esc(tab?.url || 'Search or enter a URL')}" aria-label="Address bar: ${esc(tab?.url || 'New tab')}">${icon(blank ? 'search' : secure ? 'lock' : 'globe')}<span class="address-text">${esc(blank ? 'Search or enter a URL' : displayURL(tab.url))}</span></button><div class="toolbar-actions">${button('bookmark:toggle', bookmarked ? 'Remove bookmark' : 'Bookmark this page', 'star', `data-key="bookmark" data-url="${esc(tab?.url || '')}" data-title="${esc(tab?.title || '')}" aria-pressed="${bookmarked}" ${blank ? 'disabled' : ''}`)}${button('ui:split', state.runtime?.splitTabId ? 'Close split view' : 'Split view', 'split', `data-key="split" aria-pressed="${Boolean(state.runtime?.splitTabId)}"`, 'optional')}${button('ui:panel', 'Ask Zacro', 'sparkle', `data-panel="ai" data-key="panel-ai" aria-pressed="${ui.panel === 'ai'}"`)}</div><div class="window-controls" aria-label="Window controls">${button('window:minimize', 'Minimize', 'minimize')}${button('window:maximize', 'Maximize or restore', state.runtime?.maximized ? 'restore' : 'maximize')}${button('window:close', 'Close window', 'close', '', 'close-window')}</div>`;
+    `<div class="navigation">${button('ui:sidebar-toggle', `${ui.sidebarHidden ? 'Show' : 'Hide'} sidebar (${shortcut('Mod+Shift+B')})`, 'sidebar', `data-key="sidebar-toggle" aria-pressed="${!ui.sidebarHidden}"`)}${button('back', `Back (${shortcut(isMac ? 'Mod+[' : 'Alt+Left')})`, 'back', `data-key="back" ${page.canGoBack ? '' : 'disabled'}`)}${button('forward', `Forward (${shortcut(isMac ? 'Mod+]' : 'Alt+Right')})`, 'forward', `data-key="forward" ${page.canGoForward ? '' : 'disabled'}`)}${button(page.loading ? 'stop' : 'reload', page.loading ? 'Stop loading' : `Reload (${shortcut('Mod+R')})`, page.loading ? 'close' : 'reload', `data-key="reload" ${blank ? 'disabled' : ''}`)}</div><button type="button" class="address-button" data-action="ui:address" data-key="address" title="${esc(tab?.url || 'Search or enter a URL')}" aria-label="Address bar: ${esc(tab?.url || 'New tab')}">${icon(blank ? 'search' : secure ? 'lock' : 'globe')}<span class="address-text">${esc(blank ? 'Search or enter a URL' : displayURL(tab.url))}</span></button><div class="toolbar-actions">${button('bookmark:toggle', bookmarked ? 'Remove bookmark' : 'Bookmark this page', 'star', `data-key="bookmark" data-url="${esc(tab?.url || '')}" data-title="${esc(tab?.title || '')}" aria-pressed="${bookmarked}" ${blank ? 'disabled' : ''}`)}${button('ui:split', state.runtime?.splitTabId ? 'Close split view' : 'Split view', 'split', `data-key="split" aria-pressed="${Boolean(state.runtime?.splitTabId)}"`, 'optional')}${button('ui:panel', 'Ask Zacro', 'sparkle', `data-panel="ai" data-key="panel-ai" aria-pressed="${ui.panel === 'ai'}"`)}</div>${isMac ? '' : `<div class="window-controls" aria-label="Window controls">${button('window:minimize', 'Minimize', 'minimize')}${button('window:maximize', 'Maximize or restore', state.runtime?.maximized ? 'restore' : 'maximize')}${button('window:close', 'Close window', 'close', '', 'close-window')}</div>`}`;
 }
 function renderWorkspace() {
   const tab = activeTab();
@@ -746,7 +771,7 @@ function renderPanel(force = false) {
   element.setAttribute('aria-label', panelNames[ui.panel][1]);
   const data =
     ui.panel === 'settings'
-      ? [state.profiles, state.spaces, activeProfile()?.id]
+      ? [state.profiles, state.spaces, activeProfile()?.id, state.runtime?.defaultBrowser]
       : ui.panel === 'ai'
         ? [
             ui.aiMessages,
@@ -864,7 +889,7 @@ function renderDownloads(records) {
       const complete = status === 'completed';
       const paused = file.paused || status === 'paused';
       const running = ['progressing', 'paused'].includes(status);
-      return `<div class="resource"><span class="download-file">${icon('file')}</span><div class="grow"><div class="resource-title" title="${esc(name)}">${esc(name)}</div><div class="resource-meta">${esc(complete ? bytes(file.totalBytes || file.receivedBytes) : status === 'cancelled' ? 'Cancelled' : status === 'interrupted' ? 'Interrupted' : paused ? 'Paused' : `${bytes(file.receivedBytes || 0)}${file.totalBytes > 0 ? ' / ' + bytes(file.totalBytes) : ''}`)}</div>${running ? `<div class="download-progress"><progress max="100" value="${progress}" aria-label="Download progress"></progress></div>` : ''}<div class="download-operations">${complete ? `<button type="button" class="text-button" data-action="download:show" data-id="${esc(file.id)}">Show in folder</button><button type="button" class="text-button" data-action="ui:download-rename" data-id="${esc(file.id)}">Rename</button><button type="button" class="text-button" data-action="ui:download-suggest" data-id="${esc(file.id)}">${icon('sparkle')}${ui.downloadSuggestions.has(file.id) ? 'Review name' : 'Suggest name'}</button>${file.originalName || file.previousPath || file.previousName ? `<button type="button" class="text-button" data-action="download:undo" data-id="${esc(file.id)}">Undo rename</button>` : ''}` : running ? `<button type="button" class="text-button" data-action="download:${paused ? 'resume' : 'pause'}" data-id="${esc(file.id)}">${paused ? 'Resume' : 'Pause'}</button><button type="button" class="text-button danger" data-action="download:cancel" data-id="${esc(file.id)}">Cancel</button>` : ''}</div></div></div>`;
+      return `<div class="resource"><span class="download-file">${icon('file')}</span><div class="grow"><div class="resource-title" title="${esc(name)}">${esc(name)}</div><div class="resource-meta">${esc(complete ? bytes(file.totalBytes || file.receivedBytes) : status === 'cancelled' ? 'Cancelled' : status === 'interrupted' ? 'Interrupted' : paused ? 'Paused' : `${bytes(file.receivedBytes || 0)}${file.totalBytes > 0 ? ' / ' + bytes(file.totalBytes) : ''}`)}</div>${running ? `<div class="download-progress"><progress max="100" value="${progress}" aria-label="Download progress"></progress></div>` : ''}<div class="download-operations">${complete ? `<button type="button" class="text-button" data-action="download:show" data-id="${esc(file.id)}">${isMac ? 'Show in Finder' : 'Show in folder'}</button><button type="button" class="text-button" data-action="ui:download-rename" data-id="${esc(file.id)}">Rename</button><button type="button" class="text-button" data-action="ui:download-suggest" data-id="${esc(file.id)}">${icon('sparkle')}${ui.downloadSuggestions.has(file.id) ? 'Review name' : 'Suggest name'}</button>${file.originalName || file.previousPath || file.previousName ? `<button type="button" class="text-button" data-action="download:undo" data-id="${esc(file.id)}">Undo rename</button>` : ''}` : running ? `<button type="button" class="text-button" data-action="download:${paused ? 'resume' : 'pause'}" data-id="${esc(file.id)}">${paused ? 'Resume' : 'Pause'}</button><button type="button" class="text-button danger" data-action="download:cancel" data-id="${esc(file.id)}">Cancel</button>` : ''}</div></div></div>`;
     })
     .join('');
 }
@@ -899,11 +924,19 @@ function renderAIConnection() {
 function renderSettings() {
   const settings = state.settings;
   const profile = activeProfile();
-  return `<section class="setting-section"><h3>Appearance</h3>${settingSelect('theme', 'Appearance', [
-    ['system', 'Follow system'],
-    ['light', 'Light'],
-    ['dark', 'Dark'],
-  ])}${settingSelect('searchEngine', 'Search engine', [
+  const defaultBrowser =
+    isMac && state.runtime?.defaultBrowser?.supported
+      ? `<div class="setting-field"><span>Default browser</span>${state.runtime.defaultBrowser.configured ? '<span class="muted">Zacro</span>' : secondary('ui:default-browser', 'Make default')}</div>`
+      : '';
+  return `<section class="setting-section"><h3>Appearance</h3>${defaultBrowser}${settingSelect(
+    'theme',
+    'Appearance',
+    [
+      ['system', 'Follow system'],
+      ['light', 'Light'],
+      ['dark', 'Dark'],
+    ],
+  )}${settingSelect('searchEngine', 'Search engine', [
     ['duckduckgo', 'DuckDuckGo'],
     ['google', 'Google'],
     ['bing', 'Bing'],
@@ -999,7 +1032,7 @@ function renderAI() {
   }
   return `<div class="panel-body conversation" id="conversation">${body}${ui.aiBusy ? `<div class="ai-progress" role="status"><span class="spinner"></span>${esc(ui.aiProgress || 'Looking into it…')}</div>` : ''}</div>${
     configured
-      ? `<div class="ai-footer" id="ai-footer">${ui.aiSources.length && !ui.aiBusy ? `<button type="button" class="secondary ai-source-action" id="ai-open-sources" data-action="ai:open-sources">${icon('external')}Open sources <kbd>${mod} Enter</kbd></button>` : ''}<div class="ai-context" id="ai-context-controls">${icon('shield')}<label for="ai-context" class="sr-only">Content to share</label><select id="ai-context" ${activeProfile()?.private ? 'disabled' : ''}>${selectOptions(
+      ? `<div class="ai-footer" id="ai-footer">${ui.aiSources.length && !ui.aiBusy ? `<button type="button" class="secondary ai-source-action" id="ai-open-sources" data-action="ai:open-sources">${icon('external')}Open sources <kbd>${shortcut('Mod+Enter')}</kbd></button>` : ''}<div class="ai-context" id="ai-context-controls">${icon('shield')}<label for="ai-context" class="sr-only">Content to share</label><select id="ai-context" ${activeProfile()?.private ? 'disabled' : ''}>${selectOptions(
           [
             ['research', 'Web research · no page sharing'],
             ['page', 'Current page'],
@@ -1211,14 +1244,14 @@ function showMenu() {
     `<button type="button" class="context-action" data-action="${name}">${icon(symbol)}${label}${key ? `<kbd>${key}</kbd>` : ''}</button>`;
   openDialog(
     'menu',
-    `<div class="dialog-body">${action('ui:new-tab', 'New tab', 'plus', mod + ' T')}${action('ui:new-private', 'New private session', 'shield')}${action('ui:spaces', 'Spaces & profiles', 'user')}<hr class="context-separator">${action('ui:find', 'Find on page', 'search', mod + ' F')}${action('ui:zoom-in', 'Zoom in', 'plus', mod + ' +')}${action('ui:zoom-out', 'Zoom out', 'minimize', mod + ' −')}${action('ui:zoom-reset', 'Reset zoom', 'monitor', mod + ' 0')}${action('ui:print', 'Print page', 'print', mod + ' P')}${action('ui:devtools', 'Developer tools', 'terminal')}<hr class="context-separator">${action('ui:extensions', 'Extensions', 'extension')}${action('ui:settings', 'Settings', 'settings')}${action('ui:shortcuts', 'Keyboard shortcuts', 'keyboard')}${action('ui:about', 'About Zacro', 'info')}</div>`,
+    `<div class="dialog-body">${action('ui:new-tab', 'New tab', 'plus', shortcut('Mod+T'))}${action('ui:new-private', 'New private session', 'shield')}${action('ui:spaces', 'Spaces & profiles', 'user')}<hr class="context-separator">${action('ui:find', 'Find on page', 'search', shortcut('Mod+F'))}${action('ui:zoom-in', 'Zoom in', 'plus', shortcut('Mod+='))}${action('ui:zoom-out', 'Zoom out', 'minimize', shortcut('Mod+−'))}${action('ui:zoom-reset', 'Reset zoom', 'monitor', shortcut('Mod+0'))}${action('ui:print', 'Print page', 'print', shortcut('Mod+P'))}${action('ui:devtools', 'Developer tools', 'terminal')}<hr class="context-separator">${action('ui:extensions', 'Extensions', 'extension')}${action('ui:settings', 'Settings', 'settings')}${action('ui:shortcuts', 'Keyboard shortcuts', 'keyboard')}${action('ui:about', 'About Zacro', 'info')}</div>`,
     { title: 'Browser menu' },
   );
 }
 function showLibrary() {
   openDialog(
     'library',
-    `<div class="dialog-body">${['bookmarks', 'history', 'downloads', 'archive'].map((panel) => `<button type="button" class="context-action" data-action="ui:panel" data-panel="${panel}" data-key="panel-${panel}">${icon(panelNames[panel][0])}<span>${panelNames[panel][1]}</span>${panel === 'history' ? `<kbd>${mod} H</kbd>` : panel === 'downloads' ? `<kbd>${mod} J</kbd>` : ''}</button>`).join('')}</div>`,
+    `<div class="dialog-body">${['bookmarks', 'history', 'downloads', 'archive'].map((panel) => `<button type="button" class="context-action" data-action="ui:panel" data-panel="${panel}" data-key="panel-${panel}">${icon(panelNames[panel][0])}<span>${panelNames[panel][1]}</span>${panel === 'history' ? `<kbd>${shortcut(isMac ? 'Mod+Y' : 'Mod+H')}</kbd>` : panel === 'downloads' ? `<kbd>${shortcut(isMac ? 'Mod+Shift+J' : 'Mod+J')}</kbd>` : ''}</button>`).join('')}</div>`,
     { title: 'Library' },
   );
 }
@@ -1342,24 +1375,36 @@ function showPermissions() {
 }
 function showShortcuts() {
   const shortcuts = [
-    ['Search or enter an address', mod + ' L'],
-    ['New tab', mod + ' T'],
-    ['Toggle sidebar', mod + ' Shift B'],
-    ['Close current tab', mod + ' W'],
-    ['Restore closed tab', mod + ' Shift T'],
-    ['Ask AI / open sources', mod + ' Enter'],
-    ['Find in page', mod + ' F'],
-    ['Reload', mod + ' R'],
-    ['History', mod + ' H'],
-    ['Downloads', mod + ' J'],
-    ['Bookmark page', mod + ' D'],
-    ['Next tab', mod + ' Tab'],
-    ['Peek link', 'Alt + click'],
+    ['Search or enter an address', shortcut('Mod+L')],
+    ['New tab', shortcut('Mod+T')],
+    ['Toggle sidebar', shortcut('Mod+Shift+B')],
+    ['Close current tab', shortcut('Mod+W')],
+    ['Restore closed tab', shortcut('Mod+Shift+T')],
+    ['Ask AI / open sources', shortcut('Mod+Enter')],
+    ['Find in page', shortcut('Mod+F')],
+    ['Reload', shortcut('Mod+R')],
+    ['History', shortcut(isMac ? 'Mod+Y' : 'Mod+H')],
+    ['Downloads', shortcut(isMac ? 'Mod+Shift+J' : 'Mod+J')],
+    ['Bookmark page', shortcut('Mod+D')],
+    ['Next tab', shortcut('Ctrl+Tab')],
+    ['Previous tab', shortcut('Ctrl+Shift+Tab')],
+    ['Settings', shortcut('Mod+,')],
+    [
+      'Back / Forward',
+      `${shortcut(isMac ? 'Mod+[' : 'Alt+Left')} / ${shortcut(isMac ? 'Mod+]' : 'Alt+Right')}`,
+    ],
+    ...(isMac
+      ? [
+          ['Close window', shortcut('Mod+Shift+W')],
+          ['Full screen', shortcut('Ctrl+Mod+F')],
+        ]
+      : []),
+    ['Peek link', isMac ? '⌥ click' : 'Alt + click'],
     ['Dismiss Peek / dialog', 'Esc'],
   ];
   openDialog(
     'shortcuts',
-    `<div class="dialog-header"><h2>Make yourself faster.</h2>${button('ui:dialog-close', 'Close', 'close')}</div><div class="dialog-body"><p class="dialog-description">A few small shortcuts for a little more flow.</p><div class="shortcut-grid">${shortcuts.map(([label, key]) => `<span>${label}</span><kbd>${key}</kbd>`).join('')}</div></div>`,
+    `<div class="dialog-header"><h2>Keyboard shortcuts</h2>${button('ui:dialog-close', 'Close', 'close')}</div><div class="dialog-body"><div class="shortcut-grid">${shortcuts.map(([label, key]) => `<span>${label}</span><kbd>${key}</kbd>`).join('')}</div></div>`,
     { title: 'Keyboard shortcuts' },
   );
 }
@@ -1379,7 +1424,7 @@ function commandOptions(query) {
         label: `Ask Zacro: ${query.trim()}`,
         description: '',
         symbol: 'sparkle',
-        type: mod + ' Enter',
+        type: shortcut('Mod+Enter'),
         run: () => {
           closeDialog();
           askAI(query);
@@ -1810,6 +1855,22 @@ document.addEventListener('click', (event) => {
 async function handleAction(action, data = {}, target) {
   const id = data.id;
   switch (action) {
+    case 'ui:default-browser': {
+      target.disabled = true;
+      try {
+        const status = await invoke('app:set-default-browser');
+        if (state.runtime) state.runtime.defaultBrowser = status;
+        renderPanel(true);
+        toast(
+          status.configured
+            ? 'Zacro is your default browser.'
+            : 'Confirm Zacro as your default browser in macOS.',
+        );
+      } finally {
+        if (target.isConnected) target.disabled = false;
+      }
+      return;
+    }
     case 'ui:sidebar-toggle':
       toggleSidebar();
       return;
@@ -2314,7 +2375,7 @@ document.addEventListener('change', (event) => {
 });
 document.addEventListener('keydown', (event) => {
   if (event.isComposing || event.keyCode === 229) return;
-  const cmd = event.ctrlKey || event.metaKey;
+  const cmd = primaryModifier(event);
   if (ui.dialog === 'command' && event.target.id === 'command-input') {
     if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
       event.preventDefault();
@@ -2491,7 +2552,7 @@ async function showAbout() {
 document.addEventListener('keydown', (event) => {
   if (event.isComposing || event.keyCode === 229) return;
   if (event.defaultPrevented || !state || ui.dialog) return;
-  const cmd = event.ctrlKey || event.metaKey;
+  const cmd = primaryModifier(event);
   const key = event.key.toLowerCase();
   let action = null,
     payload = {};
@@ -2500,7 +2561,7 @@ document.addEventListener('keydown', (event) => {
     action = state.runtime?.peek ? 'peek:close' : 'tab:close';
     payload = { id: state.activeTabId };
   } else if (cmd && key === 'd') action = 'bookmark:toggle';
-  else if (cmd && key === 'h') {
+  else if (cmd && key === (isMac ? 'y' : 'h')) {
     event.preventDefault();
     openPanel('history');
     return;
@@ -2519,7 +2580,7 @@ document.addEventListener('keydown', (event) => {
     openCommand('address');
     return;
   } else if (cmd && key === 'i' && event.shiftKey) action = 'devtools';
-  else if (cmd && key === 'tab') {
+  else if ((isMac ? event.ctrlKey && !event.metaKey : cmd) && key === 'tab') {
     event.preventDefault();
     const tabs = currentTabs();
     const current = tabs.findIndex((t) => t.id === state.activeTabId);
@@ -2535,8 +2596,8 @@ document.addEventListener('keydown', (event) => {
   } else if (cmd && ['+', '=', '-', '0'].includes(key)) {
     action = 'zoom';
     payload = key === '0' ? { reset: true } : { delta: key === '-' ? -0.1 : 0.1 };
-  } else if (event.altKey && key === 'arrowleft') action = 'back';
-  else if (event.altKey && key === 'arrowright') action = 'forward';
+  } else if (!isMac && event.altKey && key === 'arrowleft') action = 'back';
+  else if (!isMac && event.altKey && key === 'arrowright') action = 'forward';
   if (action) {
     event.preventDefault();
     safely(invoke(action, payload));

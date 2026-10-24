@@ -10,7 +10,7 @@ Zacro is an independent project, not an official continuation of Arc or an affil
 
 ## Project status
 
-**Desktop development build.** This repository contains a runnable Chromium browser built with Electron, targeting Windows 11 x64 first. It includes real page rendering, sandboxed tabs, Spaces, separate profiles, Peek, split view, local session recovery, library panels, compatible unpacked extensions, and optional AI through your Codex subscription.
+**Desktop development build.** This repository contains a runnable Chromium browser built with Electron, with Windows 11 x64 and native macOS integration for Apple silicon and Intel. It includes real page rendering, sandboxed tabs, Spaces, separate profiles, Peek, split view, local session recovery, library panels, compatible unpacked extensions, and optional AI through your Codex subscription. Windows has been exercised locally; macOS has dedicated native CI and acceptance checks. See [macOS setup and validation](docs/MACOS.md) for the exact support boundary.
 
 This is **not yet a complete implementation of the vision or a commercial release**. Zacro account sync, full Chrome extension compatibility and `chrome.storage.sync`, consequential browser agents, signed automatic updates, and operational/security release gates remain open. Subscription sign-in is implemented; live account and inference acceptance still requires a user to finish ChatGPT sign-in. The [implementation roadmap](docs/ROADMAP.md) separates working features from required release work; [AI documentation](docs/AI.md) describes the connection and data boundaries.
 
@@ -77,7 +77,11 @@ npm run test:package # Verify the packaged executable, security fuses and PDF wo
 npm run dist       # Unsigned Windows NSIS test installer
 ```
 
-Tests create temporary profiles and local fixture servers; they do not use your normal browsing data or make paid AI calls. `npm run dist:release` requires organization code-signing credentials. An unsigned test installer does not satisfy the [commercial release gates](docs/ROADMAP.md#5-commercial-distribution). macOS and Linux build targets are configured but have not been validated on those platforms.
+Tests create temporary profiles and local fixture servers; they do not use your normal browsing data or make paid AI calls. `npm run dist:release` requires organization code-signing credentials, and macOS releases additionally require notarization. Development artifacts do not satisfy the [commercial release gates](docs/ROADMAP.md#5-commercial-distribution). Linux remains an unvalidated packaging target.
+
+On **macOS 13 or later**, install native Node.js 24 for your Mac's architecture and run `npm ci` followed by `npm start`. `npm run pack:mac` creates a local `.app`; `npm run dist:mac` creates separate development DMG and ZIP files for the current architecture. Use `npm run test:mac` for the Mac acceptance suite. Build Apple silicon (`arm64`) and Intel (`x64`) packages on matching hosts; cross-architecture packaging is rejected to keep Electron and the bundled Codex runtime aligned.
+
+Mac touches include native traffic lights, a full application menu with Services and Hide, **⌘,** Settings, **⌘[ / ⌘]** history, **⌃Tab** tab switching, Finder reveal, and native full screen. **⌘Tab** and **⌘H** retain their macOS meanings. Closing the browser window keeps the app available in the Dock; reopening restores the browsing session, while **⌘Q** quits. See the [Mac guide](docs/MACOS.md) for shortcuts, packaging, and release verification.
 
 Browser data lives in Electron's per-user Zacro application-data directory. For an isolated development profile, set `ZACRO_USER_DATA` to a separate absolute directory. Export/import in Settings supports Zacro JSON and standard browser bookmark HTML. Arc migration currently uses supported bookmark exports; native Arc sidebar databases are not imported.
 

@@ -1,6 +1,6 @@
 # Zacro implementation and commercial release gates
 
-This repository started with a vision and no implementation. The first desktop implementation targets Windows 11 x64 using Electron 45's Chromium/Blink/V8 runtime. macOS and Linux packaging targets are defined but need platform validation. The work below distinguishes runnable code from release acceptance. An unchecked gate is not a shipped capability.
+This repository started with a vision and no implementation. The desktop implementation uses Electron 45's Chromium/Blink/V8 runtime. Windows 11 x64 has local acceptance evidence. macOS 13+ now has native window/menu/lifecycle integration, separate Apple silicon and Intel build paths, and native CI acceptance; passing Mac runner results and signed release acceptance are still required before claiming verified platform support. Linux remains a packaging target requiring implementation review and platform validation. The work below distinguishes runnable code from release acceptance. An unchecked gate is not a shipped capability. See [the Mac guide](MACOS.md).
 
 ## 1. A reliable local browser
 
@@ -35,11 +35,11 @@ Acceptance: two-device convergence after concurrent install/uninstall; a revoked
 ## 5. Commercial distribution
 
 - [ ] Complete the extension/sync and README-required AI gaps above, or obtain an explicit product scope change.
-- [ ] Complete Windows accessibility and assistive-technology review, performance/memory soak tests and real-site compatibility matrix (including media, OAuth and PDF).
+- [ ] Complete Windows and macOS accessibility and assistive-technology review, performance/memory soak tests and real-site compatibility matrix (including media, OAuth and PDF).
 - [ ] Pass independent browser-host security assessment, permission review, extension review and update threat modelling.
 - [ ] Operate the account/sync services with monitoring, backup restore tests, privacy documentation and a support process.
-- [ ] Provision organization code-signing credentials; sign installers and executables, notarize macOS releases when supported.
+- [ ] Provision organization code-signing credentials; sign installers and executables, notarize and staple macOS application/DMG releases, and pass clean-machine Gatekeeper acceptance on Apple silicon and Intel.
 - [ ] Deploy authenticated, signed update metadata and test staged updates, failed downloads, signature rejection, rollback and emergency Chromium releases.
 - [ ] Publish tested platform support, exact limitations, third-party notices, release notes and incident-reporting routes.
 
-`npm run dist` creates a local unsigned test installer. `npm run dist:release` refuses to proceed without signing credentials, but passing that command alone does not satisfy this checklist. Do not call a build commercial-ready while any release gate above remains open.
+`npm run dist` creates a local unsigned Windows test installer. `npm run dist:mac` creates an explicitly named development DMG/ZIP with ad-hoc signing; that is not a trusted publisher release. `npm run dist:release` refuses to proceed without signing credentials and, on macOS, notarization configuration. It verifies produced artifacts, but passing that command alone does not satisfy this checklist. Do not call a build commercial-ready while any release gate above remains open.

@@ -6,6 +6,8 @@ The initial 0.3 validation passed **90 unit/security tests, 38 desktop integrati
 
 The subsequent sidebar Space-scroll change passed `npm run verify`: **90 unit/security tests and 41 desktop integration tests**, plus formatting and syntax. Three new regressions cover native horizontal wheel input, directional/reduced motion, page identity and draft retention, per-Space tab-list scroll, intent thresholds, momentum, direction changes, wheel delta modes, Shift-wheel, profile boundaries, and interrupted gestures. A native Computer pass on the development application confirmed forward/back switching, the final-Space edge stop, and unchanged Space selection when scrolling over a webpage. The packaged and soak results below refer to the initial 0.3 build.
 
+The macOS integration passed local Windows verification: **98 unit/security tests, 42 desktop tests, and one rebuilt-package test**, plus formatting and syntax. Six Darwin-only native integration tests explicitly skipped on Windows; the simulated Mac renderer check is not native macOS acceptance. CI now defines separate Apple silicon and Intel jobs for source/unit checks, Mac behavior, development DMG/ZIP generation and packaged acceptance. Native runner results remain pending; no signed/notarized Mac artifact or physical Mac review has been completed. See [macOS validation and release steps](MACOS.md).
+
 The 0.3 checks cover compact tab density, native page bounds with the sidebar hidden, page-field focus and draft preservation, Library navigation and return focus, home-shortcut deduplication, Settings disclosure state, short motion and immediate dismissal, and the subscription connection UI/protocol. Account-change, cancellation and filename-stream regressions protect the AI lifecycle.
 
 The previous 0.2.0 baseline passed 74 unit/security tests, 30 desktop integration tests, one packaged-application test and a 120-cycle lifecycle soak. That earlier run is historical context, not a substitute for 0.3 verification.
@@ -55,6 +57,6 @@ The baseline pass used UIA clicks/edits and F6/Escape. Control-key delivery was 
 - Real-world long-running browsing, media/DRM, OAuth, accessibility/assistive technology and performance testing.
 - Broader extension compatibility, full account/extension sync and service operation.
 - Signed installer acceptance, automatic-update infrastructure, signature/rollback testing and release incident processes.
-- macOS and Linux validation; only Windows was run here.
+- Successful native macOS CI on Apple silicon and Intel plus physical-device acceptance and signed/notarized installation checks. Linux validation remains open. Only Windows was run in this local development session.
 
 Local file navigation, native Arc database migration, a password manager, full Chrome extension APIs and Web Store installation, device pairing choosers, and managed default-browser registration are not implemented. Loaded pages are deliberately excluded from automatic archiving to protect live form state. See the [roadmap](ROADMAP.md) for remaining commercial release requirements and [AI documentation](AI.md) for supported context and provider boundaries.

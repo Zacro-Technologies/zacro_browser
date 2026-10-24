@@ -10,13 +10,14 @@ const { once } = require('node:events');
 const { _electron, chromium, expect } = require('@playwright/test');
 const { getCurrentFuseWire, FuseV1Options } = require('@electron/fuses');
 const { makePDF } = require('../fixtures/pdf.cjs');
+const { packagedPaths } = require('../../scripts/platform-build.cjs');
 
 test(
-  'Windows package has hardened fuses, browses, parses PDFs and starts its isolated Codex runtime',
-  { timeout: 90000, skip: process.platform !== 'win32' },
+  'native package has hardened fuses, browses, parses PDFs and starts its isolated Codex runtime',
+  { timeout: 90000, skip: !['win32', 'darwin'].includes(process.platform) },
   async (t) => {
     const root = path.resolve(__dirname, '../..');
-    const executable = path.join(root, 'dist/win-unpacked/Zacro.exe');
+    const { executable, resources } = packagedPaths(root);
     await fs.access(executable);
     const fuses = await getCurrentFuseWire(executable);
     for (const fuse of ['RunAsNode', 'EnableNodeOptionsEnvironmentVariable', 'EnableNodeCliInspectArguments'])
@@ -113,7 +114,7 @@ test(
       await shell.screenshot({ path: path.join(root, `test-results/packaged-home-${theme}.png`) });
     }
     const exited = once(child, 'exit');
-    await shell.evaluate(() => window.zacro.invoke('window:close')).catch(() => {});
+    await shell.evaluate(() => window.zacro.invoke('app:quit')).catch(() => {});
     await Promise.race([
       exited,
       new Promise((_, reject) => {
@@ -142,7 +143,7 @@ test(
         return extractPDF(process.getBuiltinModule('buffer').Buffer.from(data.pdf, 'base64'));
       },
       {
-        modulePath: path.join(root, 'dist/win-unpacked/resources/app.asar/src/main/pdf.cjs'),
+        modulePath: path.join(resources, 'app.asar/src/main/pdf.cjs'),
         pdf: document.toString('base64'),
       },
     );

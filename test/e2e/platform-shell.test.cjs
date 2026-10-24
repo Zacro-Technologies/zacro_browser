@@ -1,0 +1,104 @@
+'use strict';
+const { test } = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs/promises');
+const os = require('node:os');
+const path = require('node:path');
+const { _electron: electron, expect } = require('@playwright/test');
+
+test(
+  'Mac shell reserves native controls, uses Mac conventions and leaves system shortcuts alone',
+  { timeout: 30000 },
+  async (t) => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'zacro-platform-shell-'));
+    const env = { ...process.env, ZACRO_USER_DATA: directory };
+    delete env.ELECTRON_RUN_AS_NODE;
+    const app = await electron.launch({
+      args: [path.resolve(__dirname, '../fixtures/platform-shell.cjs')],
+      env,
+    });
+    const errors = [];
+    t.after(async () => {
+      await app.close();
+      assert.equal(path.dirname(directory), path.resolve(os.tmpdir()));
+      assert(path.basename(directory).startsWith('zacro-platform-shell-'));
+      await fs.rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+      assert.deepEqual(errors, []);
+    });
+    const shell = await app.firstWindow();
+    shell.on('pageerror', (error) => errors.push(error.message));
+    await expect(shell.locator('.space-picker')).toBeVisible();
+    await expect(shell.locator('html')).toHaveAttribute('data-platform', 'darwin');
+    assert.equal(await shell.locator('.window-controls').count(), 0);
+    assert((await shell.locator('.space-picker').boundingBox()).x >= 88);
+    await expect(shell.locator('[data-key="sidebar-toggle"]')).toHaveAttribute('title', 'Hide sidebar (⇧⌘B)');
+    await expect(shell.locator('[data-key="back"]')).toHaveAttribute('title', 'Back (⌘[)');
+    await shell.locator('[data-key="sidebar-toggle"]').click();
+    assert((await shell.locator('.navigation').boundingBox()).x >= 88);
+    await app.evaluate(({ app }) => app.emit('fixture:runtime', null, { fullScreen: true }));
+    await expect(shell.locator('html')).toHaveAttribute('data-fullscreen', 'true');
+    assert((await shell.locator('.navigation').boundingBox()).x < 30);
+    await shell.locator('[data-key="sidebar-toggle"]').click();
+    assert((await shell.locator('.space-picker').boundingBox()).x < 30);
+    await app.evaluate(({ app }) => app.emit('fixture:runtime', null, { fullScreen: false }));
+    await expect
+      .poll(async () => (await shell.locator('.space-picker').boundingBox()).x)
+      .toBeGreaterThanOrEqual(88);
+
+    const key = (options) =>
+      shell.evaluate((options) => {
+        const event = new KeyboardEvent('keydown', { bubbles: true, cancelable: true, ...options });
+        document.dispatchEvent(event);
+        return event.defaultPrevented;
+      }, options);
+    assert.equal(await key({ key: 'h', metaKey: true }), false, 'Cmd-H belongs to macOS Hide');
+    assert.equal(await key({ key: 'Tab', metaKey: true }), false, 'Cmd-Tab belongs to the app switcher');
+    assert.equal(await key({ key: 'l', ctrlKey: true }), false, 'Control must not alias Command on Mac');
+    assert.equal(await key({ key: 't', metaKey: true, altKey: true }), false);
+    assert.equal(await key({ key: 'f', metaKey: true, shiftKey: true }), false);
+    assert.equal(await key({ key: 'ArrowLeft', altKey: true }), false, 'Option arrows belong to the editor');
+    await key({ key: ',', metaKey: true });
+    await expect(shell.locator('#panel-title')).toHaveText('Settings');
+    await shell.getByRole('button', { name: 'Make default', exact: true }).click();
+    await expect(shell.getByRole('button', { name: 'Make default', exact: true })).toHaveCount(0);
+    assert(
+      (await app.evaluate(({ app }) => app.fixtureCalls)).some(
+        (call) => call.action === 'app:set-default-browser',
+      ),
+    );
+    await shell.locator('[data-key="panel-close"]').click();
+    await key({ key: 'y', metaKey: true });
+    await expect(shell.locator('#panel-title')).toHaveText('History');
+    await shell.locator('[data-key="panel-close"]').click();
+    await app.evaluate(({ app }) => app.emit('fixture:downloads'));
+    await key({ key: 'j', metaKey: true });
+    await expect(shell.getByRole('button', { name: 'Show in Finder', exact: true })).toBeVisible();
+    await shell.locator('[data-key="panel-close"]').click();
+    await key({ key: 'l', metaKey: true });
+    await expect(shell.locator('#command-input')).toBeFocused();
+    const cdp = await shell.context().newCDPSession(shell);
+    await cdp.send('Emulation.setEmulatedMedia', {
+      features: [
+        { name: 'prefers-contrast', value: 'more' },
+        { name: 'prefers-reduced-transparency', value: 'reduce' },
+      ],
+    });
+    const accessibility = await shell.evaluate(() => ({
+      blur: getComputedStyle(document.querySelector('.dialog-backdrop')).backdropFilter,
+      backdrop: getComputedStyle(document.querySelector('#page-backdrop')).visibility,
+      outline: getComputedStyle(document.querySelector('.space-dot.active')).outlineStyle,
+    }));
+    assert.deepEqual(accessibility, { blur: 'none', backdrop: 'hidden', outline: 'solid' });
+    await cdp.detach();
+    await shell.keyboard.press('Escape');
+
+    await shell.evaluate(async () => {
+      await window.zacro.invoke('tab:create', { active: true });
+    });
+    const before = (await shell.evaluate(() => window.zacro.invoke('state:get'))).activeTabId;
+    await key({ key: 'Tab', ctrlKey: true });
+    await expect
+      .poll(async () => (await shell.evaluate(() => window.zacro.invoke('state:get'))).activeTabId)
+      .not.toBe(before);
+  },
+);

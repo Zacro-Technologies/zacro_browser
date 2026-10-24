@@ -13,6 +13,8 @@ The interface has been redesigned after reviewing Arc, Pinterest browser referen
 - Sidebar shortcuts preserve focus in page fields; Library returns focus to its opener; Settings preserves expanded groups and drafts.
 - Optional AI now uses ChatGPT sign-in and the user's Codex allowance through a bundled, isolated app-server. API-key and Claude connections have been removed; requests never fall back to separate API billing.
 - Codex credentials use an isolated OS keyring entry. Research can use hosted web search; explicitly shared page/PDF context uses search-disabled requests with no execution environments.
+- macOS integration adds native traffic lights, application/Dock menus, Mac shortcuts, focused-page editing, Finder reveal, Look Up, scroll bounce, full screen, explicit default-browser selection, and correct window-close/quit behavior with private-session cleanup.
+- Separate Apple silicon and Intel development DMG/ZIP builds, native Mac CI, and a guarded Developer ID/notarization release path. Native Mac results and clean-machine release acceptance remain distinct from Windows verification; see [the Mac guide](MACOS.md).
 
 Existing sidebar-width preferences are preserved. The default applies to new profiles.
 

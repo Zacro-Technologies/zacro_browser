@@ -42,6 +42,10 @@
   color-scheme: dark;
 }
 
+:root[data-platform='darwin'] {
+  font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+}
+
 * {
   box-sizing: border-box;
 }
@@ -1054,6 +1058,21 @@ kbd {
   font-size: 12px;
   font-weight: 600;
 }
+
+/* Leave the native traffic lights their own hit area. In focus mode the same
+   reservation moves to the toolbar; full screen returns it to the page. */
+:root[data-platform='darwin'] .brand-button {
+  display: none;
+}
+:root[data-platform='darwin']:not([data-fullscreen='true']) .space-header {
+  padding-left: 80px;
+}
+:root[data-platform='darwin']:not([data-fullscreen='true']) .app[data-sidebar-hidden='true'] .toolbar {
+  padding-left: 88px;
+}
+:root[data-platform='darwin'][data-focused='false'] .space-dot.active {
+  background: var(--hover);
+}
 .profile-caption {
   font-size: 11px;
   line-height: 1.6;
@@ -1084,6 +1103,11 @@ kbd {
 .tabs-scroll:focus-within {
   scrollbar-color: var(--line) transparent;
 }
+:root[data-platform='darwin'] .tabs-scroll {
+  scrollbar-width: auto;
+  scrollbar-color: auto;
+}
+
 .section-label {
   display: flex;
   align-items: center;
@@ -2627,6 +2651,7 @@ details.setting-section[open] > :not(summary) {
 @media (prefers-contrast: more) {
   :root {
     --muted: #554a58;
+    --line: var(--muted);
   }
   :root[data-theme='dark'] {
     --muted: #d6cbd9;
@@ -2641,6 +2666,22 @@ details.setting-section[open] > :not(summary) {
   .home-search,
   .home-link {
     border-color: var(--muted);
+  }
+  .tab-row.active,
+  .space-dot.active,
+  .favorite.active {
+    outline: 1px solid var(--ink);
+    outline-offset: -1px;
+  }
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  .dialog-backdrop {
+    backdrop-filter: none !important;
+    background: var(--chrome) !important;
+  }
+  #page-backdrop {
+    visibility: hidden;
   }
 }
 

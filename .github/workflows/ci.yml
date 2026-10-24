@@ -27,3 +27,42 @@ jobs:
           name: windows-validation
           path: test-results/
           retention-days: 7
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          architecture: ${{ matrix.arch }}
+          cache: npm
+      - run: npm ci
+      - run: npm run format:check
+      - run: npm run check
+      - run: npm test
+      - run: npm run test:mac
+      - run: npm run dist:mac
+      - run: npm run test:package
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: macos-${{ matrix.arch }}-validation
+          path: test-results/
+          retention-days: 7
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}-development
+          path: |
+            dist/*-mac-${{ matrix.arch }}-development.dmg
+            dist/*-mac-${{ matrix.arch }}-development.zip
+          if-no-files-found: error
+          retention-days: 7

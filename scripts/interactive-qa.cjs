@@ -6,6 +6,7 @@ const { spawn } = require('node:child_process');
 const { BrowserStore } = require('../src/core/store.cjs');
 const { createInteractiveSite } = require('../test/fixtures/interactive-site.cjs');
 const { createShowcaseState } = require('../test/fixtures/showcase-state.cjs');
+const { packagedPaths } = require('./platform-build.cjs');
 
 async function main() {
   const root = path.resolve(__dirname, '..');
@@ -25,14 +26,16 @@ async function main() {
     store.state = createShowcaseState(url);
     store.save();
   }
-  const executable = packaged ? path.join(root, 'dist/win-unpacked/Zacro.exe') : require('electron');
+  const executable = packaged ? packagedPaths(root).executable : require('electron');
   const env = { ...process.env, ZACRO_USER_DATA: directory };
   delete env.ELECTRON_RUN_AS_NODE;
   console.log(`Opening ${packaged ? 'packaged' : 'development'} Zacro with an isolated test profile.`);
   console.log(`Local test page: ${url}`);
   if (showcase) console.log('Showcase: demo Spaces, folders, and saved pages; only the local journal loads.');
   console.log('Options: --showcase for the demo workspace; --packaged for the built application.');
-  console.log('Close the browser when finished. No real browser profile is modified.');
+  console.log(
+    `${process.platform === 'darwin' ? 'Quit Zacro with Command-Q' : 'Close the browser'} when finished. No real browser profile is modified.`,
+  );
   const args = packaged ? [] : [root];
   if (!showcase) args.push(url);
   const child = spawn(executable, args, { cwd: root, env, windowsHide: false, stdio: 'inherit' });

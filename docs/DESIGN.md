@@ -10,6 +10,8 @@ Scroll horizontally over the sidebar to move between Spaces in the current profi
 
 Windows High Contrast uses system colors, explicit selection/focus outlines, native checkboxes and named Space-color choices. Decorative artwork and blurred page backdrops are omitted in forced-colors mode so controls remain distinct.
 
+macOS uses native traffic lights and a native menu bar. The title area reserves the controls' space with the sidebar shown or hidden; full screen removes that reservation until the controls return. The interface uses familiar ⌃⌥⇧⌘ labels, system typography, inactive-window treatment, Finder wording, and system contrast/transparency preferences. ⌘Tab and ⌘H retain their operating-system actions; ⌃Tab cycles browser tabs. Close Window and Quit are distinct, with Dock reopening and private-session cleanup. See [the Mac guide](MACOS.md) for the full behavior and verification boundary.
+
 ## Motion rules
 
 - Motion has an 80–170ms target. The current entrance transitions take 140–160ms; microfeedback takes 100–120ms. Controls respond immediately; no animation delays navigation, input focus, or IPC completion.
