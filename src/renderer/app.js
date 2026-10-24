@@ -1,3 +1,5 @@
+import { createSyncUI } from './sync.js';
+
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 const esc = (value = '') =>
@@ -143,6 +145,20 @@ const activeProfile = () => state?.profiles.find((p) => p.id === activeSpace()?.
 const activeTab = () => state?.tabs.find((t) => t.id === state.activeTabId);
 const currentTabs = () => state?.tabs.filter((t) => t.spaceId === state.activeSpaceId) || [];
 const profileItems = (key) => (state?.[key] || []).filter((item) => item.profileId === activeProfile()?.id);
+const syncUI = createSyncUI({
+  getState: () => state,
+  getProfile: activeProfile,
+  invoke,
+  esc,
+  field,
+  primary,
+  secondary,
+  button,
+  formDialog,
+  openDialog,
+  closeDialog,
+  toast,
+});
 const sidebarScroll = new Map();
 const spaceScroll = { lastEvent: -Infinity, distance: 0, consumed: false, pending: false };
 function interruptSpaceScroll() {
@@ -431,6 +447,11 @@ function applyState(next) {
   setTheme();
   if (previousSpace !== state.activeSpaceId || previousTab !== state.activeTabId) clearPageBackdrop();
   if (previousProfile && previousProfile !== activeProfile()?.id) {
+    syncUI.profileChanged();
+    if (ui.extensionDialog) {
+      closeDialog();
+      ui.extensionDialog = false;
+    }
     invalidateAIRequest();
     ui.aiMessages = [];
     ui.aiSources = [];
@@ -791,7 +812,7 @@ function renderPanel(force = false) {
   element.setAttribute('aria-label', panelNames[ui.panel][1]);
   const data =
     ui.panel === 'settings'
-      ? [state.profiles, state.spaces, activeProfile()?.id, state.runtime?.defaultBrowser]
+      ? [state.profiles, state.spaces, activeProfile()?.id, state.runtime?.defaultBrowser, state.sync]
       : ui.panel === 'ai'
         ? [
             ui.aiMessages,
@@ -828,6 +849,10 @@ function renderPanel(force = false) {
     element.innerHTML = panelHeader() + `<div class="panel-body">${renderSettings()}</div>`;
   } else if (ui.panel === 'extensions') {
     element.innerHTML = panelHeader() + `<div class="panel-body">${renderExtensions()}</div>`;
+    for (const badge of $$('.extension-badge', element)) {
+      badge.style.backgroundColor = badge.dataset.badgeBackground;
+      badge.style.color = badge.dataset.badgeForeground;
+    }
   } else if (ui.panel === 'ai') {
     const html = panelHeader() + renderAI();
     if (sameAIProfile && $('#conversation', element)) {
@@ -979,7 +1004,7 @@ function renderSettings() {
         ? [[settings.sidebarWidth, `${settings.sidebarWidth}px`]]
         : []),
     ],
-  )}<label class="setting-toggle"><span>Restore session</span><input type="checkbox" data-setting="restoreSession" ${settings.restoreSession ? 'checked' : ''}></label><div class="setting-actions">${secondary('ui:edit-space', 'Customize Space', 'edit')}${secondary('ui:profiles', 'Profiles', 'user')}</div></section><details class="setting-section" id="ai-settings"><summary>Codex subscription</summary>${renderAIConnection()}${settingSelect(
+  )}<label class="setting-toggle"><span>Restore session</span><input type="checkbox" data-setting="restoreSession" ${settings.restoreSession ? 'checked' : ''}></label><div class="setting-actions">${secondary('ui:edit-space', 'Customize Space', 'edit')}${secondary('ui:profiles', 'Profiles', 'user')}</div></section>${syncUI.render()}<details class="setting-section" id="ai-settings"><summary>Codex subscription</summary>${renderAIConnection()}${settingSelect(
     'openSourcesLimit',
     'Pages to open from each answer',
     [
@@ -988,11 +1013,38 @@ function renderSettings() {
       [3, '3 sources'],
       [5, '5 sources'],
     ],
-  )}<p class="provider-note">Page sharing is off by default. Choose “Current page” or select tabs in the conversation to share page or PDF text for a question. Password and form fields are excluded. Scanned and encrypted PDFs cannot be read.</p></details><details class="setting-section"><summary>Your data</summary><p class="panel-intro"><strong>${esc(profile?.name)}</strong> profile</p><div class="setting-actions">${secondary('data:export', 'Export data', 'external')}${secondary('data:import', 'Import data', 'download')}</div><p class="provider-note">Zacro backups and bookmark HTML. Private sessions and sign-in credentials are excluded.</p><div class="setting-actions">${secondary('ui:data-clear', 'Clear browsing data', 'trash')}${secondary('ui:permissions', 'Site permissions', 'shield')}</div></details><details class="setting-section"><summary>Extensions</summary><p class="panel-intro">Load compatible unpacked extensions into this profile. Supported APIs vary; Chrome Web Store installation and extension sync are not available.</p>${secondary('ui:panel', 'Manage extensions', 'extension', 'data-panel="extensions"')}</details><details class="setting-section"><summary>About Zacro</summary><p class="panel-intro">An independent, open-source browser.<br>Version ${esc(state.runtime?.version || '0.1.0')} · Built on Chromium</p><div class="setting-actions">${secondary('app:about', 'Version details', 'info')}${secondary('ui:shortcuts', 'Shortcuts', 'keyboard')}</div></details>`;
+  )}<p class="provider-note">Page sharing is off by default. Choose “Current page” or select tabs in the conversation to share page or PDF text for a question. Password and form fields are excluded. Scanned and encrypted PDFs cannot be read.</p></details><details class="setting-section"><summary>Your data</summary><p class="panel-intro"><strong>${esc(profile?.name)}</strong> profile</p><div class="setting-actions">${secondary('data:export', 'Export data', 'external')}${secondary('data:import', 'Import data', 'download')}</div><p class="provider-note">Zacro backups and bookmark HTML. Private sessions and sign-in credentials are excluded.</p><div class="setting-actions">${secondary('ui:data-clear', 'Clear browsing data', 'trash')}${secondary('ui:permissions', 'Site permissions', 'shield')}</div></details><details class="setting-section"><summary>Extensions</summary><p class="panel-intro">Install compatible extensions from the Chrome Web Store or a local folder. Review access and updates for this profile. Extension settings sync is a separate Account & sync choice.</p>${secondary('ui:panel', 'Manage extensions', 'extension', 'data-panel="extensions"')}</details><details class="setting-section"><summary>About Zacro</summary><p class="panel-intro">An independent, open-source browser.<br>Version ${esc(state.runtime?.version || '0.1.0')} · Built on Chromium</p><div class="setting-actions">${secondary('app:about', 'Version details', 'info')}${secondary('ui:shortcuts', 'Shortcuts', 'keyboard')}</div></details>`;
 }
 function renderExtensions() {
+  const badgeColor = (value, fallback) => {
+    if (typeof value === 'string' && /^(#[0-9a-f]{3,8}|[a-z]{1,30})$/i.test(value)) return value;
+    if (
+      Array.isArray(value) &&
+      value.length === 4 &&
+      value.every((n) => Number.isInteger(n) && n >= 0 && n <= 255)
+    )
+      return `rgba(${value[0]},${value[1]},${value[2]},${value[3] / 255})`;
+    return fallback;
+  };
+  if (activeProfile()?.private)
+    return empty(
+      'shield',
+      'Private profile',
+      'Extensions and synchronization are unavailable in private profiles.',
+    );
   const extensions = profileItems('extensions');
-  return `<p class="panel-intro">Extensions are isolated to <strong>${esc(activeProfile()?.name)}</strong>. Install only extensions you trust and review their requested access.</p>${primary('extension:install', 'Load unpacked extension', 'plus')}<p class="provider-note">Select a local folder containing manifest.json. Electron supports a subset of Chrome extension APIs; storage.sync and Web Store installation are unavailable.</p>${extensions.length ? extensions.map((ext) => `<article class="extension-card"><div class="row"><div class="extension-icon">${icon('extension')}</div><div class="grow"><h3>${esc(ext.name || ext.id)}</h3><span class="small muted">${esc(ext.version || '')} · ${ext.enabled === false ? 'Disabled' : 'Enabled'}</span></div></div>${ext.description ? `<p>${esc(ext.description)}</p>` : ''}${ext.error ? `<p class="danger">${esc(ext.error)}</p>` : ''}<div class="row between"><button type="button" class="text-button" data-action="extension:toggle" data-id="${esc(ext.id)}">${ext.enabled === false ? 'Enable' : 'Disable'}</button><button type="button" class="text-button danger" data-action="ui:extension-remove" data-id="${esc(ext.id)}">Remove</button></div></article>`).join('') : empty('extension', 'No extensions', 'Installed extensions appear here.')}`;
+  const labels = {
+    enabled: 'Enabled',
+    disabled: 'Disabled',
+    'pending-approval': 'Needs permission on this device',
+    'pending-reload': 'Reload pages to finish',
+    incompatible: 'Unsupported requirements',
+    'load-failed': 'Could not load',
+    'remote-pending': 'Needs installation on this device',
+  };
+  const control = (ext, action, label, danger = false) =>
+    `<button type="button" class="text-button ${danger ? 'danger' : ''}" data-action="${action}" data-id="${esc(ext.id)}" data-generation="${esc(ext.generation || '')}" data-profile-id="${esc(ext.profileId)}" ${action === 'extension:action' && ext.action?.enabled === false ? 'disabled' : ''}>${esc(label)}</button>`;
+  return `<p class="panel-intro">Extensions belong to <strong>${esc(activeProfile()?.name)}</strong>. Review requested access before allowing an extension to run.</p><div class="setting-actions">${primary('ui:extension-store', 'Install from Chrome Web Store', 'plus')}${secondary('extension:install', 'Load unpacked extension', 'folder')}${secondary('extension:check-updates', 'Check for updates', 'reload')}</div><p class="provider-note">Compatibility depends on the APIs each extension uses. Local folders stay on this device. Settings sync requires a linked account and separate consent.</p>${extensions.length ? extensions.map((ext) => `<article class="extension-card"><div class="row"><div class="extension-icon">${ext.iconData ? `<img src="${esc(ext.iconData)}" alt="">` : icon('extension')}</div><div class="grow"><h3>${esc(ext.name || ext.id)}</h3><span class="small muted">${esc(ext.version || '')} · ${esc(labels[ext.status] || ext.status)}</span></div>${ext.action?.badgeText ? `<span class="extension-badge" data-badge-background="${esc(badgeColor(ext.action.badgeBackgroundColor, '#000000'))}" data-badge-foreground="${esc(badgeColor(ext.action.badgeTextColor, '#ffffff'))}">${esc(ext.action.badgeText)}</span>` : ''}</div><p class="small muted">${ext.source === 'chrome-web-store' ? 'Chrome Web Store' : 'Local folder · only on this device'}${ext.publisherVerified ? ' · Publisher proof verified' : ''}</p>${ext.description ? `<p>${esc(ext.description)}</p>` : ''}${ext.error || ext.syncError || ext.notificationError ? `<p class="danger">${esc(ext.error || ext.syncError || ext.notificationError)}</p>` : ''}${ext.requiresPageReload ? '<p class="provider-note">Open pages may still contain scripts from the previous version. Reload them to finish changing access.</p>' : ''}${ext.unsupported?.length ? `<ul class="extension-access">${ext.unsupported.map((item) => `<li>${esc(item.capability)}: ${esc(item.reason)}</li>`).join('')}</ul>` : ''}<div class="setting-actions">${ext.syncError ? control(ext, 'extension:retry-sync', 'Retry library change') : ''}${ext.status === 'remote-pending' ? control(ext, 'extension:review-remote', 'Review installation') : `${ext.pendingVersion && ext.compatible ? control(ext, 'extension:approve', 'Review permissions') : ''}${ext.status !== 'incompatible' && ext.status !== 'pending-approval' ? control(ext, 'extension:toggle', ext.enabled ? 'Disable' : 'Enable') : ''}${ext.enabled && ext.hasAction ? control(ext, 'extension:action', ext.action?.title || 'Open extension') : ''}${ext.enabled && ext.hasOptions ? control(ext, 'extension:options', 'Options') : ''}${ext.source === 'chrome-web-store' ? control(ext, 'extension:update', 'Check update') : ''}${ext.canRollback ? control(ext, 'extension:rollback', 'Roll back') : ''}${control(ext, 'ui:extension-remove', 'Remove', true)}`}</div>${ext.status !== 'remote-pending' ? `<details><summary>Permissions and compatibility</summary><p class="small muted">${ext.adapted ? 'Runs a managed compatibility copy. The verified original is retained.' : 'Legacy local installation; reinstall to receive the compatibility adapter.'}</p><h4>Granted access</h4><ul class="extension-access">${[...(ext.grants?.permissions || []), ...(ext.grants?.origins || [])].map((value) => `<li>${esc(value)}</li>`).join('') || '<li>No permissions granted</li>'}</ul>${['permissions', 'origins'].flatMap((kind) => (ext.revocable?.[kind] || []).map((value) => `<button type="button" class="text-button" data-action="extension:revoke-permission" data-id="${esc(ext.id)}" data-profile-id="${esc(ext.profileId)}" data-generation="${esc(ext.generation)}" data-permission-kind="${kind}" data-permission="${esc(value)}">Revoke ${esc(value)}</button>`)).join('')}${ext.pendingVersion ? `<h4>Requested access · ${esc(ext.pendingVersion)}</h4><ul class="extension-access">${[...(ext.requested?.permissions || []), ...(ext.requested?.origins || [])].map((value) => `<li>${esc(value)}</li>`).join('')}</ul>` : ''}${ext.commands?.length ? `<h4>Keyboard shortcuts</h4><ul class="extension-access">${ext.commands.map((command) => `<li>${esc(command.description || command.name)}: ${esc(command.shortcut || command.status === 'conflict' ? command.shortcut || 'Conflicts with another shortcut' : 'Unassigned')}</li>`).join('')}</ul>` : ''}<p class="small muted">${ext.syncState === 'local-only' ? 'Only on this device' : ext.syncState === 'not-linked' ? 'Not linked to a sync profile' : `Library sync: ${esc(ext.syncState)}. Permission approval is local to this device.`}</p></details>` : ''}</article>`).join('') : empty('extension', 'No extensions', 'Installed extensions and requests from your other devices appear here.')}`;
 }
 function renderAnswer(message) {
   const text = String(message.text || '');
@@ -1949,6 +2001,7 @@ document.addEventListener('click', (event) => {
   safely(handleAction(target.dataset.action, target.dataset, target));
 });
 async function handleAction(action, data = {}, target) {
+  if (action.startsWith('ui:sync-')) return syncUI.handle(action, data);
   const id = data.id;
   switch (action) {
     case 'ui:default-browser': {
@@ -2221,11 +2274,38 @@ async function handleAction(action, data = {}, target) {
       applyState(await invoke('state:get'));
       showPermissions();
       return;
+    case 'ui:extension-store': {
+      const profileId = activeProfile()?.id;
+      const current = state.tabs.find((tab) => tab.id === state.activeTabId)?.url || '';
+      const source =
+        /^https:\/\/(?:chromewebstore\.google\.com\/detail|chrome\.google\.com\/webstore\/detail)\/[^/]+\/[a-p]{32}(?:[?#]|$)/.test(
+          current,
+        )
+          ? current
+          : '';
+      formDialog(
+        'Install from Chrome Web Store',
+        'Paste an extension detail URL or ID. Zacro downloads and verifies the package, then asks you to review its permissions before it can run.',
+        field('url', 'Store URL or extension ID', source, 'text', 'required'),
+        'Review extension',
+        async (data, context) => {
+          await invoke('extension:install-store', { url: data.get('url'), profileId });
+          if (context.isCurrent()) context.close();
+        },
+      );
+      ui.extensionDialog = true;
+      return;
+    }
     case 'ui:extension-remove':
       confirmDialog(
         'Remove extension?',
         'The extension will be removed from this profile.',
-        () => invoke('extension:remove', { id }),
+        () =>
+          invoke('extension:remove', {
+            id,
+            profileId: data.profileId || activeProfile()?.id,
+            generation: data.generation,
+          }),
         'Remove extension',
       );
       return;
@@ -2392,6 +2472,12 @@ async function handleAction(action, data = {}, target) {
       if (id) payload.id = id;
       if (data.url) payload.url = data.url;
       if (data.title) payload.title = data.title;
+      if (action.startsWith('extension:')) {
+        payload.profileId = data.profileId || activeProfile()?.id;
+        if (data.generation) payload.generation = data.generation;
+        if (data.permissionKind) payload.permissionKind = data.permissionKind;
+        if (data.permission) payload.permission = data.permission;
+      }
       return invoke(action, payload);
     }
   }
@@ -2400,6 +2486,7 @@ document.addEventListener('submit', (event) => {
   event.preventDefault();
   const form = event.target;
   const data = new FormData(form);
+  for (const input of form.querySelectorAll('input[type="password"]')) input.value = '';
   if (form.id === 'home-search') {
     const url = String(data.get('query') || '').trim();
     if (url) safely(invoke('navigate', { url }));

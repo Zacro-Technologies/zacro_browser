@@ -56,7 +56,12 @@ test(
       await new Promise((resolve) => server.close(resolve));
       await fs.rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     });
-    const env = { ...process.env, ZACRO_USER_DATA: path.join(directory, 'packaged') };
+    const env = {
+      ...process.env,
+      ZACRO_USER_DATA: path.join(directory, 'packaged'),
+      ZACRO_SYNC_DEV_LOOPBACK: '1',
+    };
+    delete env.ZACRO_SYNC_URL;
     delete env.ELECTRON_RUN_AS_NODE;
     child = spawn(executable, ['--remote-debugging-address=127.0.0.1', '--remote-debugging-port=0'], {
       env,
@@ -99,6 +104,14 @@ test(
     const about = await shell.evaluate(() => window.zacro.invoke('app:about'));
     assert.equal(about.packaged, true);
     assert.equal(about.name, 'Zacro');
+    const sync = await shell.evaluate(() => window.zacro.invoke('sync:status'));
+    assert.equal(sync.state, 'setup-required');
+    assert.equal(sync.account, null);
+    await assert.rejects(
+      shell.evaluate(() => window.zacro.invoke('sync:configure', { endpoint: 'http://127.0.0.1:4040' })),
+      /HTTPS origin/,
+      'a packaged build ignores the development-only plaintext setting',
+    );
     // No login and no model request: verify the shipped ASAR-unpacked native
     // runtime actually initializes from the hardened executable with its own home.
     const aiStatus = await shell.evaluate(() => window.zacro.invoke('ai:status'));
@@ -162,5 +175,66 @@ test(
     );
     assert.match(parsed.text, /packaged PDF worker found this evidence/);
     assert.equal(parsed.totalPages, 1);
+    const adapters = await harness.evaluate(
+      async ({ app, safeStorage }, { asar, directory }) => {
+        const requireModule = process
+          .getBuiltinModule('module')
+          .createRequire(app.getAppPath() + '/package.json');
+        const fs = process.getBuiltinModule('fs');
+        const path = process.getBuiltinModule('path');
+        const { SyncStorage } = requireModule(path.join(asar, 'src/main/sync/storage.cjs'));
+        const { CredentialVault } = requireModule(path.join(asar, 'src/main/sync/vault.cjs'));
+        const BOOTSTRAP = 'zacro-compat-bootstrap.js';
+        const { adaptExtension } = requireModule(path.join(asar, 'src/main/extensions/adapt.cjs'));
+        // Requiring these exact packaged modules also resolves their shipped
+        // archive/HTML dependencies, rather than borrowing checkout modules.
+        requireModule(path.join(asar, 'src/main/extensions/host.cjs'));
+        const local = path.join(directory, 'packaged-storage');
+        const storage = new SyncStorage({ directory: local });
+        storage.call('fixture', 'set', [{ packaged: true }]);
+        storage.close();
+        const reopened = new SyncStorage({ directory: local });
+        const values = reopened.call('fixture', 'get', [null]);
+        reopened.close();
+        const vault = new CredentialVault({
+          directory: local,
+          protect: (text) => safeStorage.encryptString(text),
+          unprotect: (bytes) => safeStorage.decryptString(bytes),
+        });
+        vault.assertAvailable();
+        const source = path.join(directory, 'package-extension-source');
+        const derived = path.join(directory, 'package-extension-derived');
+        fs.mkdirSync(source);
+        fs.writeFileSync(
+          path.join(source, 'manifest.json'),
+          JSON.stringify({
+            manifest_version: 2,
+            name: 'Package fixture',
+            version: '1.0',
+            background: { page: 'background.html', persistent: true },
+          }),
+        );
+        fs.writeFileSync(
+          path.join(source, 'background.html'),
+          '<!doctype html><html><head><title>Packaged adapter</title></head><body></body></html>',
+        );
+        await adaptExtension(source, derived);
+        return {
+          values,
+          bootstrap: fs.readFileSync(path.join(derived, BOOTSTRAP), 'utf8').length > 0,
+          adapted: fs.readFileSync(path.join(derived, 'background.html'), 'utf8').includes(BOOTSTRAP),
+          serverBundled: fs.existsSync(path.join(asar, 'services/sync/server.cjs')),
+          testEntryBundled: fs.existsSync(path.join(asar, 'test/fixtures/extensions/sync-browser.cjs')),
+        };
+      },
+      { asar: path.join(resources, 'app.asar'), directory },
+    );
+    assert.deepEqual(adapters, {
+      values: { packaged: true },
+      bootstrap: true,
+      adapted: true,
+      serverBundled: false,
+      testEntryBundled: false,
+    });
   },
 );

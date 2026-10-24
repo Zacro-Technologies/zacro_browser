@@ -3034,3 +3034,53 @@ details.setting-section[open] > :not(summary) {
     transform: none;
   }
 }
+
+.recovery-codes {
+  display: grid;
+  gap: 8px;
+  padding: 12px 0 20px;
+}
+.recovery-codes code {
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+.sync-endpoint {
+  overflow-wrap: anywhere;
+}
+.sync-device,
+.sync-rejections article {
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.extension-access {
+  padding-left: 18px;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.extension-card .setting-actions {
+  flex-wrap: wrap;
+  gap: 12px;
+}
+.extension-card details {
+  margin-top: 12px;
+  font-size: 12px;
+}
+.extension-card h4 {
+  margin: 12px 0 5px;
+}
+.extension-icon img {
+  width: 24px;
+  height: 24px;
+  object-fit: contain;
+}
+.extension-badge {
+  padding: 2px 6px;
+  border-radius: 5px;
+  background: var(--accent);
+  color: white;
+  font-size: 11px;
+}

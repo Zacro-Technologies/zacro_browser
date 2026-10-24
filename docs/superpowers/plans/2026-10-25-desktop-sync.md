@@ -40,11 +40,11 @@
 **Files:** modify `src/main/main.cjs`, `src/core/store.cjs`, `src/renderer/app.js`, `styles.css`, `package.json`, `.github/workflows/ci.yml`; tests `test/e2e/extensions-sync.test.cjs` and extension fixtures.
 **Interfaces:** connect the extension manager/API/bridge and SyncClient through explicit profile callbacks; expose only narrow validated shell `extension:*` and `sync:*` actions. Snapshot includes nonsecret extension/sync status. Async operations cannot use a changed active profile implicitly.
 
-- [ ] Write failing Electron flows for store installation review, action/options UI, registration/devices, dataset linking, sync consent, pending remote permissions and errors.
-- [ ] Integrate lifecycle cleanup, account/profile actions, compact UI, cancellation and readable status; remove the native webRequest listener conflict without weakening page/PDF behavior.
-- [ ] Run the two-browser fixture against the actual service, including writes from frame/worker/content contexts and remote change events.
+- [x] Write failing Electron flows for store installation review, action/options UI, registration/devices, dataset linking, sync consent, pending remote permissions and errors.
+- [x] Integrate lifecycle cleanup, account/profile actions, compact UI, cancellation and readable status; remove the native webRequest listener conflict without weakening page/PDF behavior.
+- [x] Run the two-browser fixture against the actual service, including writes from frame/worker/content contexts and remote change events.
 - [ ] Run `npm run verify`, `npm run test:soak`, then `npm run pack:mac` and `npm run test:package`. Expected: baseline and new assertions pass; isolate any platform failures with evidence instead of weakening tests.
-- [ ] Update CI to include new suites for Windows and both Mac architectures. Remote CI and public provider checks are reported only if actually run.
+- [x] Update CI to include new suites for Windows and both Mac architectures. Remote CI and public provider checks are reported only if actually run.
 - [ ] Commit.
 
 ### Task 3: Acceptance record and whole-branch review

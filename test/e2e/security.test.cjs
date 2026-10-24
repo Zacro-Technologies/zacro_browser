@@ -12,7 +12,7 @@ const { makePDF } = require('../fixtures/pdf.cjs');
 let server, base;
 before(async () => {
   server = http.createServer(async (request, response) => {
-    if (request.url === '/document.pdf') {
+    if (request.url === '/document.pdf' || request.url === '/document-without-suffix') {
       response.writeHead(200, { 'Content-Type': 'application/pdf', 'Content-Disposition': 'inline' });
       response.end(
         makePDF([
@@ -554,10 +554,16 @@ test(
   { timeout: 60000 },
   async (t) => {
     const browser = await launch(t);
-    await browser.invoke('navigate', { url: `${base}/document.pdf` });
+    await browser.navigate(`${base}/before-pdf`);
+    await browser.app.evaluate(({ session }) => {
+      session
+        .fromPartition('persist:zacro-default')
+        .webRequest.onHeadersReceived((_details, callback) => callback({}));
+    });
+    await browser.invoke('navigate', { url: `${base}/document-without-suffix` });
     await expect
       .poll(async () => (await browser.state()).runtime.page.url, { timeout: 15000 })
-      .toBe(`${base}/document.pdf`);
+      .toBe(`${base}/document-without-suffix`);
     await browser.app.evaluate(({ app }) => {
       const requireModule = process
         .getBuiltinModule('module')
@@ -598,7 +604,7 @@ test(
     assert.ok(!JSON.stringify(captured.messages).includes('%PDF-'));
     assert.equal(captured.research, false);
     assert.equal(answer.citations[0].pageNumber, 1);
-    assert.equal(answer.citations[0].url, `${base}/document.pdf#page=1`);
+    assert.equal(answer.citations[0].url, `${base}/document-without-suffix#page=1`);
     await browser.invoke('ai:disconnect');
   },
 );

@@ -15,8 +15,8 @@
     "icons": "electron scripts/generate-icons.cjs",
     "test": "node --test test/*.test.cjs",
     "check": "node scripts/check.cjs",
-    "format": "prettier --write \"src/**/*.{cjs,js,html,css}\" \"test/**/*.cjs\" \"scripts/*.cjs\" \"*.json\" \".github/**/*.{yml,yaml}\"",
-    "format:check": "prettier --check \"src/**/*.{cjs,js,html,css}\" \"test/**/*.cjs\" \"scripts/*.cjs\" \"*.json\" \".github/**/*.{yml,yaml}\"",
+    "format": "prettier --write \"src/**/*.{cjs,js,html,css}\" \"test/**/*.cjs\" \"scripts/*.cjs\" \"services/**/*.cjs\" \"*.json\" \".github/**/*.{yml,yaml}\"",
+    "format:check": "prettier --check \"src/**/*.{cjs,js,html,css}\" \"test/**/*.cjs\" \"scripts/*.cjs\" \"services/**/*.cjs\" \"*.json\" \".github/**/*.{yml,yaml}\"",
     "test:e2e": "node --test --test-concurrency=1 test/e2e/*.test.cjs",
     "test:package": "node --test test/package/*.test.cjs",
     "verify": "npm run format:check && npm run check && npm test && npm run test:e2e",
@@ -24,12 +24,13 @@
     "prepack": "node scripts/prepare-runtime.cjs",
     "pack:mac": "node scripts/build-mac.cjs --dir",
     "dist:mac": "node scripts/build-mac.cjs",
-    "test:mac": "node --test --test-concurrency=1 test/e2e/mac.test.cjs test/e2e/browser.test.cjs test/e2e/compact-layout.test.cjs test/e2e/platform-shell.test.cjs test/e2e/motion.test.cjs test/e2e/space-swipe.test.cjs test/e2e/security.test.cjs test/e2e/startup.test.cjs",
+    "test:mac": "node --test --test-concurrency=1 test/e2e/mac.test.cjs test/e2e/browser.test.cjs test/e2e/compact-layout.test.cjs test/e2e/platform-shell.test.cjs test/e2e/motion.test.cjs test/e2e/space-swipe.test.cjs test/e2e/security.test.cjs test/e2e/startup.test.cjs test/e2e/extension-*.test.cjs test/e2e/extensions-sync.test.cjs",
     "dist": "electron-builder --win nsis --x64",
     "predist": "node scripts/prepare-runtime.cjs",
     "dist:release": "node scripts/release.cjs",
     "test:interactive": "node scripts/interactive-qa.cjs",
-    "test:soak": "node --test test/soak/*.test.cjs"
+    "test:soak": "node --test test/soak/*.test.cjs",
+    "test:provider": "node --test test/provider/*.test.cjs"
   },
   "devDependencies": {
     "@playwright/test": "1.64.1",

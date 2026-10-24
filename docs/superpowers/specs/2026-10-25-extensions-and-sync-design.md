@@ -74,6 +74,8 @@ The adapter knows the source profile, installed extension, granted permissions, 
 - `storage.sync`: the complete scope defined below. Preserve native `storage.local`; do not alias local and sync namespaces.
 - Integrate native supported `scripting`, `webRequest`, and runtime messaging without overriding them with incomplete adapters. Audit the existing `webRequest.onHeadersReceived` MIME observer so it does not silently suppress extension listeners. Unsupported engine APIs, including native messaging, identity services, or rules APIs not provided by the pinned runtime, are reported in the compatibility matrix.
 
+**2026-10-25 pinned-runtime finding:** Native `activeTab` access remains denied after a real host action, including an execution marked as a user gesture. The implementation rejects required activeTab and disallows optional activeTab rather than granting broader native host access. This is an explicit Electron compatibility boundary under the unsupported-capability rule, not a claim that temporary native grants work. Raw MV2 lazy pages do suspend/wake. The initial compatibility Port prevented suspension; subsequent implementation added authenticated idle teardown and native event-triggered wake, verified after native background contexts reached zero. MV2 native `scripting` is absent; MV3 native scripting is tested.
+
 ### Extension contexts
 
 First implementation milestone proves the pinned Electron runtime can expose the adapter to extension pages, MV2 background pages where supported, MV3 classic/module service workers, and isolated content scripts, while exposing nothing to ordinary page worlds.

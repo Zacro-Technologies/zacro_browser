@@ -162,6 +162,15 @@ class SyncClient {
   notify() {
     if (!this.closed) this.onChange(this.status());
   }
+  extensionIntents(profileId) {
+    this.profile(profileId);
+    const link = this.store.read().links[profileId];
+    if (!link || !this.credentials) return [];
+    return Object.values(library(link)).map((extension) => ({
+      ...this.identity(profileId, link),
+      extension: clone(extension),
+    }));
+  }
   guard(epoch = this.epoch) {
     if (this.closed || epoch !== this.epoch) throw cancelled();
   }

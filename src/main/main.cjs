@@ -25,6 +25,9 @@ const { webURL, safeFilename, unusedPath, renameWithoutOverwrite } = require('./
 const { browserLayout, presentView, resolveSplit, restoreWindowPlacement } = require('./layout.cjs');
 const { FaviconLoader } = require('./favicon.cjs');
 const { windowChrome, macShortcut, macMenuTemplate } = require('./mac.cjs');
+const { SyncController } = require('./sync/controller.cjs');
+const { ExtensionHost } = require('./extensions/host.cjs');
+const { createBrowserAdapter } = require('./extensions/browser.cjs');
 const faviconLoader = new FaviconLoader();
 
 app.setName('Zacro');
@@ -43,7 +46,9 @@ const sessions = new Map();
 const liveDownloads = new Map();
 const downloadReservations = new Set();
 const promptRequests = new Set();
-let store, win, ai, archiveTimer, publishTimer;
+let store, win, ai, syncAccount, extensionHost, extensionBrowser, archiveTimer, publishTimer;
+let extensionsReady = false;
+let extensionTabSnapshot = new Map();
 let splitTabId = null;
 let splitPair = null;
 let normalWindowBounds = null;
@@ -72,7 +77,13 @@ let defaultBrowser = { supported: process.platform === 'darwin' && app.isPackage
 const activeSpace = () => store.state.spaces.find((item) => item.id === store.state.activeSpaceId);
 const activeTab = () => store.state.tabs.find((item) => item.id === store.state.activeTabId);
 const activeProfile = () => store.state.profiles.find((item) => item.id === activeSpace()?.profileId);
-const activeEntry = () => peek?.entry || views.get(store.state.activeTabId);
+const activeEntry = () => {
+  if (peek?.entry) return peek.entry;
+  const entry = views.get(store.state.activeTabId);
+  return entry && (!entry.dormant || entry.blankPopup) && (activeTab()?.url !== NEW_TAB || entry.blankPopup)
+    ? entry
+    : undefined;
+};
 const activeContents = () => activeEntry()?.contents;
 const validWindow = () => win && !win.isDestroyed();
 function focusContentOrChrome(contents = activeContents()) {
@@ -187,7 +198,7 @@ function requestAuthentication(event, contents, details, authInfo, callback) {
   win.webContents.focus();
 }
 function pageState(entry) {
-  if (!entry || entry.contents.isDestroyed())
+  if (!entry || entry.dormant || entry.contents.isDestroyed())
     return { loading: false, canGoBack: false, canGoForward: false, zoom: 1 };
   const wc = entry.contents;
   return {
@@ -232,10 +243,12 @@ function snapshot() {
     dark: nativeTheme.shouldUseDarkColors,
   };
   // Managed extension paths are operational details, not a renderer capability.
-  result.extensions = result.extensions.map(({ path: _path, ...extension }) => extension);
+  result.extensions = extensionHost?.snapshot(activeProfile()?.id) || [];
+  result.sync = syncAccount?.status() || { state: 'setup-required', account: null, profiles: [] };
   return result;
 }
 function publish() {
+  extensionHost?.refreshRemote();
   if (publishTimer || quitting || !validWindow() || win.webContents.isDestroyed()) return;
   publishTimer = setTimeout(() => {
     publishTimer = null;
@@ -358,26 +371,6 @@ function profileSession(profileId) {
   });
   // Device pairing requires a product-level chooser; never silently grant it.
   ses.setDevicePermissionHandler(() => false);
-  ses.webRequest.onHeadersReceived((details, callback) => {
-    try {
-      if (details.resourceType === 'mainFrame') {
-        const entry = [...views.values(), ...(peek ? [peek.entry] : [])].find(
-          (item) => !item.contents.isDestroyed() && item.contents.id === details.webContentsId,
-        );
-        if (entry) {
-          const header = Object.entries(details.responseHeaders || {}).find(
-            ([name]) => name.toLowerCase() === 'content-type',
-          );
-          entry.mimeType = String(header?.[1]?.[0] || '')
-            .split(';')[0]
-            .trim()
-            .toLowerCase();
-        }
-      }
-    } finally {
-      callback({});
-    }
-  });
   ses.on('will-download', (event, item, contents) => onDownload(event, item, contents, profileId));
   sessions.set(profileId, ses);
   return ses;
@@ -390,10 +383,23 @@ function tabForContents(contents) {
     return { ...peek, id: 'peek', title: contents.getTitle(), url: contents.getURL() };
   return null;
 }
+function extensionPageURL(profileId, value) {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'chrome-extension:' &&
+      !url.pathname.startsWith('/zacro-compat-') &&
+      extensionHost?.manager.resolveExtension(profileId, url.hostname)?.enabled
+      ? url.href
+      : null;
+  } catch {
+    return null;
+  }
+}
 function safeNavigate(entry, address) {
   if (!entry || entry.contents.isDestroyed()) return;
-  const url = webURL(address);
-  if (!url) throw new Error('Only HTTP and HTTPS pages can be opened.');
+  const url = webURL(address) || extensionPageURL(entry.profileId, address);
+  if (!url) throw new Error('Only web pages and enabled extension pages can be opened.');
+  entry.dormant = false;
   entry.error = null;
   entry.requestedURL = url;
   entry.contents.loadURL(url).catch((error) => {
@@ -441,6 +447,8 @@ function createEntry(profileId, tabId = null, suppliedOptions = {}) {
     tabId,
     error: null,
     requestedURL: null,
+    dormant: !suppliedOptions.webContents,
+    documentEpoch: 0,
     disposing: false,
     presentation: { visible: false, bounds: null, attached: false },
   };
@@ -488,10 +496,10 @@ function createEntry(profileId, tabId = null, suppliedOptions = {}) {
     };
   });
   wc.on('will-navigate', (event, url) => {
-    if (!webURL(url)) event.preventDefault();
+    if (!webURL(url) && !extensionPageURL(entry.profileId, url)) event.preventDefault();
   });
   wc.on('will-redirect', (event, url) => {
-    if (!webURL(url)) event.preventDefault();
+    if (!webURL(url) && !extensionPageURL(entry.profileId, url)) event.preventDefault();
   });
   wc.on('will-attach-webview', (event) => event.preventDefault());
   wc.on('did-start-loading', () => {
@@ -499,6 +507,7 @@ function createEntry(profileId, tabId = null, suppliedOptions = {}) {
     publish();
   });
   wc.on('did-start-navigation', (_event, url, _isInPlace, isMainFrame) => {
+    if (isMainFrame && entry.tabId) publishExtensionTab(entry, { status: 'loading', url });
     if (isMainFrame && !_isInPlace) {
       entry.faviconRequest?.abort();
       entry.favicon = null;
@@ -508,15 +517,23 @@ function createEntry(profileId, tabId = null, suppliedOptions = {}) {
     if (isMainFrame && pendingAuth?.contentsId === wc.id && url !== pendingAuth.url) finishAuth();
   });
   wc.on('did-stop-loading', () => {
+    if (entry.tabId) publishExtensionTab(entry, { status: 'complete' });
     arrangeViews();
     publish();
   });
-  wc.on('did-navigate', (_event, url) => navigated(entry, url, true));
+  wc.on('did-navigate', (_event, url) => {
+    entry.documentEpoch++;
+    navigated(entry, url, true);
+  });
   wc.on('did-navigate-in-page', (_event, url, isMainFrame) => {
     if (isMainFrame) navigated(entry, url, false);
   });
   wc.on('page-title-updated', (_event, title) => {
-    if (entry.tabId && store.state.tabs.some((tab) => tab.id === entry.tabId))
+    if (
+      entry.tabId &&
+      (webURL(wc.getURL()) || extensionPageURL(profileId, wc.getURL()) || entry.blankPopup) &&
+      store.state.tabs.some((tab) => tab.id === entry.tabId)
+    )
       store.dispatch('tab:update', { id: entry.tabId, title: title.slice(0, 300) });
     const visit = store.state.history.find(
       (item) => item.profileId === entry.profileId && item.url === wc.getURL(),
@@ -598,8 +615,17 @@ function createEntry(profileId, tabId = null, suppliedOptions = {}) {
       // document rejects navigation, including reload/back/forward changes.
       const currentURL = wc.getURL();
       entry.requestedURL = currentURL;
-      if (entry.tabId && webURL(currentURL) && store.state.tabs.some((tab) => tab.id === entry.tabId)) {
-        store.dispatch('tab:update', { id: entry.tabId, url: currentURL, title: wc.getTitle() });
+      const extensionURL = extensionPageURL(entry.profileId, currentURL);
+      if (
+        entry.tabId &&
+        (webURL(currentURL) || extensionURL) &&
+        store.state.tabs.some((tab) => tab.id === entry.tabId)
+      ) {
+        store.dispatch(extensionURL ? 'tab:extension-page' : 'tab:update', {
+          id: entry.tabId,
+          url: currentURL,
+          title: wc.getTitle(),
+        });
       }
       publish();
     }
@@ -640,15 +666,28 @@ function createEntry(profileId, tabId = null, suppliedOptions = {}) {
   });
   return entry;
 }
+function publishExtensionTab(entry, changes) {
+  const tab = store.state.tabs.find((item) => item.id === entry.tabId);
+  if (tab && extensionBrowser && extensionHost)
+    extensionHost.api.publish(entry.profileId, 'tabs.onUpdated', [
+      entry.contents.id,
+      changes,
+      extensionBrowser.tabData(tab),
+    ]);
+}
 function navigated(entry, url, addHistory) {
-  if (!webURL(url)) return;
+  if (!webURL(url) && !extensionPageURL(entry.profileId, url)) return;
   entry.requestedURL = url;
   entry.blankPopup = false;
   entry.error = null;
   if (entry.tabId && store.state.tabs.some((tab) => tab.id === entry.tabId)) {
     const title = entry.contents.getTitle() || new URL(url).hostname;
-    store.dispatch('tab:update', { id: entry.tabId, url, title });
-    if (addHistory) store.dispatch('history:add', { profileId: entry.profileId, url, title });
+    store.dispatch(url.startsWith('chrome-extension:') ? 'tab:extension-page' : 'tab:update', {
+      id: entry.tabId,
+      url,
+      title,
+    });
+    if (addHistory && webURL(url)) store.dispatch('history:add', { profileId: entry.profileId, url, title });
   }
   publish();
 }
@@ -698,19 +737,22 @@ async function requestClosePeek() {
   }
   return closed;
 }
+function reserveView(tab) {
+  if (!views.has(tab.id)) views.set(tab.id, createEntry(tab.profileId, tab.id));
+  return views.get(tab.id);
+}
 function ensureView(tabId) {
-  if (views.has(tabId)) return views.get(tabId);
   const tab = store.state.tabs.find((item) => item.id === tabId);
-  if (!tab || tab.url === NEW_TAB || !webURL(tab.url)) return null;
-  if (!views.has(tabId)) {
-    const entry = createEntry(tab.profileId, tabId);
-    views.set(tabId, entry);
+  if (!tab) return null;
+  const entry = reserveView(tab);
+  if (extensionsReady && entry.dormant && (webURL(tab.url) || extensionPageURL(tab.profileId, tab.url))) {
     // Establish the native parent and visible bounds before the first load.
     // A newly created renderer must inherit the page's actual presentation.
+    entry.dormant = false;
     arrangeViews();
     safeNavigate(entry, tab.url);
   }
-  return views.get(tabId);
+  return entry;
 }
 function reconcile() {
   if (!validWindow() || quitting || closingWindow) return;
@@ -721,15 +763,23 @@ function reconcile() {
   )
     clearBackdrop();
   if (pendingAuth && pendingAuth.profileId !== profileId) finishAuth(null, 'profile-changed');
-  if (lastProfileId && lastProfileId !== profileId) ai?.handle('ai:cancel', {}).catch(() => {});
+  if (lastProfileId && lastProfileId !== profileId) {
+    ai?.handle('ai:cancel', {}).catch(() => {});
+    syncAccount?.profileChanged();
+    extensionHost?.profileChanged();
+  }
   lastProfileId = profileId;
   for (const [id, entry] of views) {
     const tab = store.state.tabs.find((item) => item.id === id);
-    if (!tab || (tab.url === NEW_TAB && !entry.blankPopup)) {
+    if (!tab) {
       destroyEntry(entry);
       views.delete(id);
     }
   }
+  // Allocate stable native tab identities without starting renderers or
+  // network navigation for restored/background pages.
+  for (const tab of store.state.tabs) reserveView(tab);
+  publishExtensionTabChanges();
   const split = resolveSplit(splitPair, store.state.tabs, store.state.activeTabId, store.state.activeSpaceId);
   splitTabId = split?.otherId || null;
   if (!split) splitPair = null;
@@ -748,6 +798,35 @@ function reconcile() {
   arrangeViews();
   publish();
 }
+function publishExtensionTabChanges() {
+  if (!extensionBrowser || !extensionHost) return;
+  const next = new Map();
+  for (const tab of store.state.tabs) {
+    if (store.state.profiles.find((profile) => profile.id === tab.profileId)?.private) continue;
+    const value = extensionBrowser.tabData(tab),
+      previous = extensionTabSnapshot.get(tab.id);
+    next.set(tab.id, { profileId: tab.profileId, value });
+    if (!previous) extensionHost.api.publish(tab.profileId, 'tabs.onCreated', [value]);
+    else {
+      const changed = {};
+      for (const key of ['url', 'title', 'pinned', 'audible', 'status'])
+        if (previous.value[key] !== value[key]) changed[key] = value[key];
+      if (Object.keys(changed).length)
+        extensionHost.api.publish(tab.profileId, 'tabs.onUpdated', [value.id, changed, value]);
+      if (value.active && !previous.value.active)
+        extensionHost.api.publish(tab.profileId, 'tabs.onActivated', [
+          { tabId: value.id, windowId: value.windowId },
+        ]);
+    }
+  }
+  for (const [id, previous] of extensionTabSnapshot)
+    if (!next.has(id))
+      extensionHost.api.publish(previous.profileId, 'tabs.onRemoved', [
+        previous.value.id,
+        { windowId: previous.value.windowId, isWindowClosing: closingWindow },
+      ]);
+  extensionTabSnapshot = next;
+}
 function arrangeViews() {
   if (!validWindow()) return;
   const [width, height] = win.getContentSize();
@@ -758,8 +837,18 @@ function arrangeViews() {
     else {
       const first = views.get(splitPair?.[0] || store.state.activeTabId);
       const second = splitPair ? views.get(splitPair[1]) : null;
-      if (first) desired.set(first, { bounds: rectangles.primary, visible: !first.error });
-      if (second && rectangles.secondary)
+      if (
+        first &&
+        !first.dormant &&
+        (first.blankPopup || store.state.tabs.find((t) => t.id === first.tabId)?.url !== NEW_TAB)
+      )
+        desired.set(first, { bounds: rectangles.primary, visible: !first.error });
+      if (
+        second &&
+        !second.dormant &&
+        rectangles.secondary &&
+        store.state.tabs.find((t) => t.id === second.tabId)?.url !== NEW_TAB
+      )
         desired.set(second, { bounds: rectangles.secondary, visible: !second.error });
     }
   }
@@ -902,6 +991,8 @@ function showPageMenu(entry, params) {
     { type: 'separator' },
     { label: 'Inspect element', click: () => wc.inspectElement(params.x, params.y) },
   );
+  const extensionItems = extensionHost?.menu(entry, params) || [];
+  if (extensionItems.length) items.push({ type: 'separator' }, ...extensionItems);
   Menu.buildFromTemplate(items).popup({ window: win });
 }
 
@@ -918,6 +1009,10 @@ function handleShortcut(event, input, contents) {
       report(error);
     }
   };
+  if (extensionHost?.shortcut(input)) {
+    event.preventDefault();
+    return;
+  }
   if (process.platform === 'darwin') {
     const action = macShortcut(input);
     if (action) return run(() => runMacAction(action, contents !== win.webContents));
@@ -1130,145 +1225,6 @@ function managedExtensionPath(value) {
   const candidate = path.resolve(value);
   return candidate.startsWith(root + path.sep) && candidate !== root;
 }
-async function inspectExtension(directory) {
-  const manifestPath = path.join(directory, 'manifest.json');
-  const raw = await fsp.readFile(manifestPath, 'utf8');
-  if (raw.length > 1024 * 1024) throw new Error('The extension manifest is too large.');
-  const manifest = JSON.parse(raw);
-  if (
-    ![2, 3].includes(manifest.manifest_version) ||
-    typeof manifest.name !== 'string' ||
-    typeof manifest.version !== 'string'
-  )
-    throw new Error('Choose an unpacked Chromium extension with a valid manifest.json.');
-  const permissions = [
-    ...new Set([
-      ...(manifest.permissions || []),
-      ...(manifest.host_permissions || []),
-      ...(manifest.content_scripts || []).flatMap((script) => script.matches || []),
-    ]),
-  ].filter((value) => typeof value === 'string');
-  return { manifest, permissions };
-}
-async function copyExtension(source, destination) {
-  let files = 0,
-    bytes = 0;
-  async function visit(from, to) {
-    const stat = await fsp.lstat(from);
-    if (stat.isSymbolicLink()) throw new Error('Extensions containing symbolic links cannot be installed.');
-    if (stat.isDirectory()) {
-      await fsp.mkdir(to, { recursive: true });
-      for (const name of await fsp.readdir(from)) await visit(path.join(from, name), path.join(to, name));
-    } else if (stat.isFile()) {
-      if (++files > 15000 || (bytes += stat.size) > 300 * 1024 * 1024)
-        throw new Error('This extension exceeds the supported size limit (300 MB / 15,000 files).');
-      await fsp.copyFile(from, to, fs.constants.COPYFILE_EXCL);
-    } else throw new Error('Unsupported file type in extension.');
-  }
-  await visit(source, destination);
-}
-async function installExtension() {
-  const profile = activeProfile();
-  if (profile.private) throw new Error('Extensions are not available in private profiles.');
-  const selection = await dialog.showOpenDialog(win, {
-    title: 'Choose an unpacked extension folder',
-    properties: ['openDirectory'],
-  });
-  if (selection.canceled || !selection.filePaths[0]) return null;
-  const directory = path.join(managedExtensionRoot(), profile.id, randomUUID());
-  const source = path.resolve(selection.filePaths[0]);
-  const relative = path.relative(source, directory);
-  if (!relative.startsWith('..') && !path.isAbsolute(relative))
-    throw new Error('Choose the extension folder itself, outside Zacro’s browser-data folder.');
-  try {
-    await copyExtension(selection.filePaths[0], directory);
-    const { manifest, permissions } = await inspectExtension(directory);
-    const answer = await dialog.showMessageBox(win, {
-      type: 'warning',
-      title: 'Install extension',
-      message: `Install “${manifest.name}” in ${profile.name}?`,
-      detail: `Only install extensions from developers you trust. Extensions can read or change pages within their granted access.\n\nRequested access:\n${permissions.length ? permissions.join('\n').slice(0, 10000) : 'No declared permissions'}\n\nZacro supports a subset of Chrome extension APIs. Chrome Web Store installs and chrome.storage.sync are not supported.`,
-      buttons: ['Cancel', 'Install'],
-      defaultId: 0,
-      cancelId: 0,
-    });
-    if (answer.response !== 1) {
-      await fsp.rm(directory, { recursive: true, force: true });
-      return null;
-    }
-    const extension = await profileSession(profile.id).extensions.loadExtension(directory, {
-      allowFileAccess: false,
-    });
-    const existing = store.state.extensions.find(
-      (item) => item.extensionId === extension.id && item.profileId === profile.id,
-    );
-    if (existing) throw new Error('This extension is already installed in this profile.');
-    const record = {
-      id: randomUUID(),
-      extensionId: extension.id,
-      profileId: profile.id,
-      name: manifest.name,
-      version: manifest.version,
-      description: String(manifest.description || '').slice(0, 500),
-      enabled: true,
-      path: directory,
-      permissions,
-      installedAt: Date.now(),
-    };
-    store.state.extensions.push(record);
-    store.changed();
-    return record;
-  } catch (error) {
-    if (managedExtensionPath(directory))
-      await fsp.rm(directory, { recursive: true, force: true }).catch(() => {});
-    throw error;
-  }
-}
-async function extensionAction(action, payload) {
-  if (action === 'extension:install') return installExtension();
-  const extension = store.state.extensions.find(
-    (item) => item.id === payload.id && item.profileId === activeSpace()?.profileId,
-  );
-  if (!extension || !managedExtensionPath(extension.path))
-    throw new Error('Extension not found in the active profile.');
-  const ses = profileSession(extension.profileId);
-  if (action === 'extension:remove') {
-    ses.extensions.removeExtension(extension.extensionId);
-    store.state.extensions = store.state.extensions.filter((item) => item.id !== extension.id);
-    await fsp.rm(extension.path, { recursive: true, force: true });
-  } else if (action === 'extension:toggle') {
-    if (extension.enabled) ses.extensions.removeExtension(extension.extensionId);
-    else {
-      const loaded = await ses.extensions.loadExtension(extension.path, { allowFileAccess: false });
-      extension.extensionId = loaded.id;
-      extension.error = null;
-    }
-    extension.enabled = !extension.enabled;
-  }
-  store.changed();
-  return null;
-}
-async function restoreExtensions() {
-  for (const extension of store.state.extensions) {
-    if (
-      !extension.enabled ||
-      !managedExtensionPath(extension.path) ||
-      !store.state.profiles.some((profile) => profile.id === extension.profileId && !profile.private)
-    )
-      continue;
-    try {
-      const loaded = await profileSession(extension.profileId).extensions.loadExtension(extension.path, {
-        allowFileAccess: false,
-      });
-      extension.extensionId = loaded.id;
-      extension.error = null;
-    } catch {
-      extension.enabled = false;
-      extension.error = 'This extension could not be loaded. Remove and reinstall it from a trusted source.';
-    }
-  }
-  store.changed();
-}
 
 async function exportData() {
   const selection = await dialog.showSaveDialog(win, {
@@ -1356,6 +1312,19 @@ async function getPageContext(ids, signal) {
       // Form controls and editing surfaces are removed before extracting text.
       const contextURL = entry.contents.getURL();
       const contextTitle = entry.contents.getTitle() || tab.title;
+      // Read the selected document on demand. Electron's webRequest slots are
+      // shared with extensions; a MIME observer there would replace listeners.
+      entry.mimeType = await entry.contents.executeJavaScriptInIsolatedWorld(
+        1001,
+        [{ code: 'document.contentType' }],
+        false,
+      );
+      if (
+        entry.contents.isDestroyed() ||
+        entry.contents.getURL() !== contextURL ||
+        activeSpace()?.profileId !== profile.id
+      )
+        throw new Error('The page or profile changed while reading its type.');
       if (entry.mimeType === 'application/pdf' || /\.pdf(?:[?#]|$)/i.test(contextURL)) {
         const pdf = await readPDFContext(entry, contextURL, signal);
         if (
@@ -1488,6 +1457,8 @@ const CORE_ACTIONS = new Set([
 async function invoke(action, payload = {}) {
   if (typeof action !== 'string' || !payload || typeof payload !== 'object' || Array.isArray(payload))
     throw new Error('Invalid browser action.');
+  if (action.startsWith('sync:')) return syncAccount.handle(action, payload);
+  if (action.startsWith('extension:')) return extensionHost.handle(action, payload);
   if (CORE_ACTIONS.has(action)) {
     const leavesPreview =
       ['tab:activate', 'tab:restore', 'space:activate', 'space:create', 'profile:create'].includes(action) ||
@@ -1516,6 +1487,7 @@ async function invoke(action, payload = {}) {
         cancelId: 0,
       });
       if (answer.response !== 1) return null;
+      if (!profile.private) await syncAccount?.client.unlinkProfile(profile.id);
       if (peek?.profileId === profile.id) closePeek(false);
       if (activeSpace()?.profileId === profile.id) await ai?.handle('ai:reset', {});
       for (const record of store.state.downloads.filter((item) => item.profileId === profile.id))
@@ -1527,10 +1499,7 @@ async function invoke(action, payload = {}) {
         }
       const ses = profileSession(profile.id);
       faviconLoader.clear(ses);
-      for (const ext of store.state.extensions.filter((item) => item.profileId === profile.id)) {
-        if (ext.enabled) ses.extensions.removeExtension(ext.extensionId);
-        if (managedExtensionPath(ext.path)) await fsp.rm(ext.path, { recursive: true, force: true });
-      }
+      if (!profile.private) await extensionHost.removeProfile(profile.id);
       await ses.clearStorageData();
       await ses.clearCache();
       await ses.clearAuthCache();
@@ -1590,15 +1559,21 @@ async function invoke(action, payload = {}) {
       }
       const tab = activeTab() || store.dispatch('tab:create', { url });
       if (url === NEW_TAB) {
-        const entry = views.get(tab.id);
-        if (entry) {
-          entry.replacing = true;
-          if (!(await requestCloseEntry(entry))) {
-            entry.replacing = false;
-            return null;
+        const entry = reserveView(tab);
+        if (entry.contents.getURL() && entry.contents.getURL() !== 'about:blank') {
+          try {
+            await entry.contents.loadURL('about:blank');
+          } catch (error) {
+            if (error.code === 'ERR_ABORTED') return null;
+            throw error;
           }
+          if (entry.contents.isDestroyed() || entry.contents.getURL() !== 'about:blank') return null;
         }
+        entry.dormant = true;
+        entry.requestedURL = null;
+        entry.error = null;
         store.dispatch('tab:update', { id: tab.id, url, title: 'New tab' });
+        focusContentOrChrome();
         break;
       }
       store.dispatch('tab:update', { id: tab.id, url });
@@ -1756,10 +1731,6 @@ async function invoke(action, payload = {}) {
       return importData();
     case 'data:clear':
       return clearProfileData(payload.profileId || activeSpace().profileId);
-    case 'extension:install':
-    case 'extension:remove':
-    case 'extension:toggle':
-      return extensionAction(action, payload);
     case 'external:open': {
       const url = webURL(payload.url);
       if (!url) throw new Error('Only web links may be opened externally.');
@@ -2203,10 +2174,16 @@ async function createWindow() {
   win.on('maximize', publish);
   win.on('unmaximize', publish);
   win.on('focus', () => {
+    if (extensionHost && activeProfile())
+      extensionHost.api.publish(activeProfile().id, 'windows.onFocusChanged', [win.id]);
     refreshDefaultBrowser();
     publish();
   });
-  win.on('blur', publish);
+  win.on('blur', () => {
+    if (extensionHost && activeProfile())
+      extensionHost.api.publish(activeProfile().id, 'windows.onFocusChanged', [-1]);
+    publish();
+  });
   const fullscreenChanged = () => {
     // Native full-screen transitions can arrive before the renderer publishes
     // its matching layout. Preserve the 40px toolbar/Find reservation; otherwise
@@ -2324,6 +2301,8 @@ app.on('will-quit', () => {
   for (const item of liveDownloads.values()) item.cancel();
   finishAuth();
   ai?.close();
+  syncAccount?.close();
+  extensionHost?.close().catch(console.error);
   try {
     store?.flush();
   } catch (error) {
@@ -2337,6 +2316,47 @@ if (singleInstance)
     .whenReady()
     .then(async () => {
       store = new BrowserStore(app.getPath('userData'));
+      syncAccount = new SyncController({
+        directory: path.join(app.getPath('userData'), 'sync'),
+        getProfile: (id) => store.state.profiles.find((profile) => profile.id === id),
+        activeProfile,
+        getWindow: () => win,
+        getPortableLibrary: (profile) => extensionHost?.portableLibrary(profile) || [],
+        onStorageChange: (event) => extensionHost?.storageChanged(event),
+        onLibraryChange: () => extensionHost?.refreshRemote(),
+        publish,
+      });
+      await syncAccount.ready;
+      extensionBrowser = createBrowserAdapter({
+        store,
+        views,
+        getWindow: () => win,
+        activeProfile,
+        reserveView,
+        ensureView,
+        navigate: safeNavigate,
+        closeTab: requestCloseTab,
+        publish,
+        reloadDocument: async (entry) => {
+          try {
+            await entry.contents.loadURL(entry.contents.getURL());
+          } catch (error) {
+            if (error.code !== 'ERR_ABORTED') throw error;
+          }
+        },
+      });
+      extensionHost = new ExtensionHost({
+        root: managedExtensionRoot(),
+        getProfile: (id) => store.state.profiles.find((profile) => profile.id === id),
+        getProfiles: () => store.state.profiles,
+        activeProfile,
+        getSession: profileSession,
+        getWindow: () => win,
+        browser: extensionBrowser,
+        syncClient: () => syncAccount.client,
+        publish,
+        report,
+      });
       layout.sidebarWidth = store.state.settings.sidebarWidth || 224;
       for (const download of store.state.downloads)
         if (['progressing', 'interrupted'].includes(download.state)) {
@@ -2368,10 +2388,19 @@ if (singleInstance)
       refreshDefaultBrowser();
       await ensureWindow();
       if (store.recoveryWarning) toast(store.recoveryWarning);
-      await restoreExtensions();
-      store.dispatch('tab:archive-stale', { excludeIds: [...views.keys()] });
+      await extensionHost.start(store.state.extensions);
+      store.state.extensions = [];
+      store.changed();
+      extensionsReady = true;
+      reconcile();
+      store.dispatch('tab:archive-stale', {
+        excludeIds: [...views].filter(([, entry]) => !entry.dormant).map(([id]) => id),
+      });
       archiveTimer = setInterval(
-        () => store.dispatch('tab:archive-stale', { excludeIds: [...views.keys()] }),
+        () =>
+          store.dispatch('tab:archive-stale', {
+            excludeIds: [...views].filter(([, entry]) => !entry.dormant).map(([id]) => id),
+          }),
         60_000,
       );
       startupReady = true;

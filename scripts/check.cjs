@@ -16,6 +16,6 @@ function visit(dir) {
     }
   }
 }
-for (const dir of ['src', 'scripts', 'test']) visit(dir);
+for (const dir of ['src', 'scripts', 'services', 'test']) visit(dir);
 console.log(failed ? 'Syntax validation failed.' : 'All JavaScript files passed syntax validation.');
 process.exitCode = failed ? 1 : 0;

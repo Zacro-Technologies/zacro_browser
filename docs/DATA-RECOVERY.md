@@ -13,3 +13,12 @@ The same operation removes files matching Zacro's exact reserved damaged-recover
 “Clear browsing data” additionally clears the selected Chromium session's cookies, site storage, cache, and authentication cache. Saved tabs and bookmarks remain. Ordinary metadata recovery files do not contain Chromium cookies or AI API keys.
 
 These operations remove application-managed records. They do not securely erase disk blocks, operating-system backups, filesystem snapshots, or exports the user saved elsewhere.
+
+
+## Extension and account data
+
+Managed extension records and original/derived packages live separately from portable browser state. Legacy extension migration records imported profile/extension IDs durably before clearing the old browser record. These receipts survive uninstall so an old browser recovery copy cannot resurrect the removed installation. They do not grant new permissions or import arbitrary extension paths.
+
+Account tokens use OS credential protection; settings and pending sync operations use separate transactional local SQLite storage. Neither enters the normal Zacro JSON export. Unlinking or signing out keeps a local settings copy; signing into a different account isolates it rather than uploading it automatically. Rejected changes have an explicit settings export action. Local extension folders and downloaded files remain device-local.
+
+Cloud account/profile deletion is separate from browser data clearing. The service's current security ledger must accompany restoration to preserve deletions, password changes and consumed recovery codes; all restored devices require login. Backups expire within seven days under operator policy. See [service backup and restore](../services/sync/README.md#backups-restore-and-keys). Deletion or device revocation cannot erase copies already retained by another computer.

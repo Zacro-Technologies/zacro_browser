@@ -76,6 +76,23 @@ function webUrl(value) {
     return null;
   }
 }
+function extensionUrl(value) {
+  try {
+    const url = new URL(value);
+    return typeof value === 'string' &&
+      value.length <= 8192 &&
+      url.protocol === 'chrome-extension:' &&
+      /^[a-p]{32}$/.test(url.hostname) &&
+      !url.username &&
+      !url.password &&
+      !url.port &&
+      !url.pathname.startsWith('/zacro-compat-')
+      ? url.href
+      : null;
+  } catch {
+    return null;
+  }
+}
 
 function createInitialState() {
   const now = Date.now();
@@ -183,7 +200,7 @@ function hydrate(raw) {
     profileId: spaces.get(t.spaceId).profileId,
     title: str(t.customTitle, 500) || str(t.title, 500) || 'New tab',
     ...(str(t.customTitle, 500) ? { customTitle: str(t.customTitle, 500) } : {}),
-    url: webUrl(t.url) || 'zacro://newtab',
+    url: webUrl(t.url) || extensionUrl(t.url) || 'zacro://newtab',
     pinned: Boolean(t.pinned),
     folderId: folders.get(t.folderId)?.spaceId === t.spaceId ? t.folderId : null,
     createdAt: time(t.createdAt),
@@ -453,6 +470,14 @@ class BrowserStore extends EventEmitter {
         s.activeSpaceId = tab.spaceId;
         tab.lastActiveAt = now;
         this.require('spaces', tab.spaceId, 'Space').lastActiveTabId = tab.id;
+        result = tab;
+        break;
+      }
+      case 'tab:extension-page': {
+        const tab = this.require('tabs', p.id, 'Tab');
+        const url = extensionUrl(p.url);
+        if (!url) throw new Error('Invalid extension page.');
+        tab.url = url;
         result = tab;
         break;
       }
