@@ -2,7 +2,9 @@
 
 This is the development record for `extensions-and-sync`, based on the
 [approved design](superpowers/specs/2026-10-25-extensions-and-sync-design.md).
-It records observed results; it is not a claim that the feature is complete.
+Implementation is committed through `cae78db`; local acceptance remains incomplete
+because the Mac is locked and the rebuilt development app needs an OS Keychain
+confirmation. The record below separates passing checks from these open gates.
 
 ## Environment and baseline
 
@@ -93,6 +95,27 @@ publisher verifier rejects that synthetic publisher. There is no substitute
 service, storage implementation, or extension API. Live publisher/package
 acceptance below is separate, and no production test IPC was introduced.
 
+## Native execution evidence
+
+These rows summarize demonstrated execution contexts. The API method boundary
+is listed separately in [Extensions](EXTENSIONS.md); a row does not imply every
+Chrome API works in that context.
+
+| Context | Demonstrated behavior | Principal fixture |
+| --- | --- | --- |
+| MV3 classic and module workers | Authenticated adapter calls, native messaging, sync events, genuine stop then native wake with command/settings delivery | `extension-api.test.cjs`, `extension-context.test.cjs` |
+| MV2 persistent scripts and full HTML background | Original entry paths, native-runtime facade, storage/API calls and genuine two-product sync | `extension-context.test.cjs`, `extensions-sync.test.cjs` |
+| MV2 lazy event page | Native context count reaches zero, then host command or real remote settings change wakes it; idle-retirement notification arrives once | `extension-capabilities.test.cjs`, `extensions-sync.test.cjs` |
+| Own extension pages, options and action popup | Real sync API, tab identity/relative URLs, action/options UI and events | `extension-api.test.cjs`, `extensions-sync.test.cjs` |
+| Isolated content contexts | Static, registered dynamic and programmatic bootstrap; permitted sync calls, immediate first listener and trusted-only exclusion | `extension-context.test.cjs`, `extension-api.test.cjs`, `extension-events.test.cjs` |
+| Untrusted or obsolete senders | Ordinary page/main world excluded; forged identity, old document challenge, disable/profile/generation and delayed access changes rejected | `extension-context.test.cjs`, `extension-api.test.cjs` |
+
+All files are under `test/e2e/`. Genuine native permission tests verify a narrowed
+optional host after grant, restart and removal, including denial on a separate
+loaded host and preservation of an unsaved page. The final rollback regression additionally proves that revoked optional
+scripting/network access stays denied after both enabled rollback and disabled
+rollback followed by enable.
+
 ## Representative public packages
 
 All originals below were fetched over the production HTTPS path and verified
@@ -121,10 +144,10 @@ with a disposable profile and a local JSON page. It approves only the pinned
 manifest version. A changed version requires fresh review. No personal browsing
 profile or real external account is used.
 
-## Final gate record (in progress)
+## Final local gate record
 
-- Final formatting and JavaScript syntax checks passed. `npm test`: **215/215**
-  passed after the live-event, Unicode grant and pending-update intent fixes.
+- Final formatting and JavaScript syntax checks passed. `npm test`: **240/240**
+  passed after the lifecycle fixes and final active-profile deletion amendment.
 - First `npm run verify`: formatting/syntax and **212/212** then-current Node
   checks passed; native **61/85** passed. All five complete two-desktop variants
   and extension/API/context/capability tests passed. The 24 failures comprise
@@ -139,19 +162,54 @@ profile or real external account is used.
   content scripts, and trusted-only suppression for content scripts.
 - `npm run test:soak`: **1/1**, 40 cycles, passed. Only the shell and retained
   page remained after each cycle; the original draft and reading position
-  survived. Median cycle 285ms, p95 578ms on this host. These timings are
+  survived. The post-review rerun passed again: median cycle 277ms, p95 285ms on this host. These timings are
   observations, not a cross-machine performance guarantee.
-- `npm run pack:mac` passed for arm64. This is a local ad-hoc development build,
-  not a Developer ID signed/notarized release. `npm run test:package`: **1/1**
-  passed against its actual executable: security fuses, normal browsing, AI
-  runtime startup, packaged PDF worker, packaged adapter dependencies/bootstrap,
-  SQLite persistence and OS credential protection. Packaged clients rejected
-  plaintext HTTP even with the development environment flag. The service and
-  test-only package provider were absent from the ASAR.
+- `npm run pack:mac` passed again for the final arm64 source. Exact source bytes
+  for seven affected modules match the ASAR; all six configured security fuses
+  pass inspection. This is an ad-hoc development build, not a Developer ID
+  signed/notarized release.
+- The earlier `fc4a901` package passed **1/1** actual executable acceptance:
+  security fuses, normal browsing, AI runtime startup, packaged PDF worker,
+  adapter dependencies/bootstrap, SQLite persistence and OS credential
+  protection; plaintext sync HTTP rejected; service/test-only provider absent.
+  **The final rebuilt executable has not passed this gate.** Its rerun stalled
+  before the first local page loaded. Narrow macOS `securityd` diagnostics
+  explicitly show a pending “Zacro Safe Storage” access confirmation for the
+  rebuilt app. Its ad-hoc CDHash differs from the existing Keychain ACL's
+  requirement. The Mac is locked, so the confirmation cannot be handled.
+  No Keychain item, credential or OS protection was changed. A disposable
+  browser profile does not isolate the app-scoped Keychain encryption key.
+- The final full-product native file passed **9/9**, including all five
+  two-Electron variants, against the actual service and OS-protected credentials.
+  The review-fix native group passed **6/6**; the final active-profile deletion
+  amendment passed **3/3** (one overlaps that group), including interrupted
+  deletion and retry. These are programmatic native/product checks, not a
+  substitute for physical keyboard/focus/paint acceptance.
 - `npm audit --omit=dev`: zero reported production dependency vulnerabilities.
   This is not an independent security assessment.
 
-Whole-branch review and unlocked-desktop reruns remain open. Windows and Intel macOS CI are configured but have not run for this
+Whole-branch review identified eight material lifecycle defects. Fixes in
+`21d632a` and `cae78db` cover rollback authority, consent/refresh races, repeated
+tab IDs, stale missing-dataset responses, restored commands, dataset deletion
+across backup restoration, local-profile deletion through asynchronous teardown,
+and warnings for scripts remaining after uninstall. Each has a reproduced
+failure and passing regression. The independent scoped rereview approved all eight fixes at `cae78db`, with no
+remaining code findings. This approval does not certify the open platform gates. Windows and Intel macOS CI are configured but have not run for this
 branch. Docker CLI is unavailable locally, so the service container build is
 unverified. No public service, production deployment or release publication
 was performed.
+
+Implementation choices and their costs are recorded in [the decision record](EXTENSIONS-SYNC-DECISIONS.md).
+
+## Resume the remaining local gates
+
+Unlock the Mac manually first. Run `npm run verify` with the normal native
+focus/paint assertions intact. The previously failing files are
+`compact-layout.test.cjs`, `mac.test.cjs`, `polish.test.cjs`, and
+`startup.test.cjs` under `test/e2e/`.
+
+For the final packaged executable, review and handle the genuine macOS
+“Zacro Safe Storage” confirmation if it appears, then rerun
+`npm run test:package`. Rebuilding an ad-hoc app can change its signature again;
+never delete the Keychain entry or disable encryption/fuses just to bypass this
+gate. The final local artifact is `dist/mac-arm64/Zacro.app`.

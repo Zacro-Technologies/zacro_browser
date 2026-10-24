@@ -45,12 +45,25 @@
 - [x] Run the two-browser fixture against the actual service, including writes from frame/worker/content contexts and remote change events.
 - [ ] Run `npm run verify`, `npm run test:soak`, then `npm run pack:mac` and `npm run test:package`. Expected: baseline and new assertions pass; isolate any platform failures with evidence instead of weakening tests.
 - [x] Update CI to include new suites for Windows and both Mac architectures. Remote CI and public provider checks are reported only if actually run.
-- [ ] Commit.
+- [x] Commit.
 
 ### Task 3: Acceptance record and whole-branch review
 
 **Files:** update README, roadmap, security and validation documentation; create extension compatibility and sync operator/user documentation.
 
-- [ ] Record exact implemented APIs, tested extension versions, successful commands and any blocked/unverified contexts/providers/platforms. Do not label unsupported APIs complete.
-- [ ] Obtain an independent whole-branch review of security, protocol, lifecycle and integration changes. Resolve material findings with reproducing tests.
+- [x] Record exact implemented APIs, tested extension versions, successful commands and any blocked/unverified contexts/providers/platforms. Do not label unsupported APIs complete.
+- [x] Obtain an independent whole-branch review of security, protocol, lifecycle and integration changes. Resolve material findings with reproducing tests.
 - [ ] Run the appropriate final suites after fixes, inspect the diff and status, and commit reviewed work on the existing branch without merging/publishing.
+
+## Current acceptance status
+
+Implementation and review fixes are committed through `cae78db` on the requested
+branch. Independent whole-branch/scoped review has no remaining code findings.
+Final Node240/240, full-product native9/9, focused native lifecycle/permissions,
+soak40cycles, arm64 build and packaged-source/fuse checks pass. The local full
+UI gate still needs an unlocked Mac; the final actual packaged run also needs
+the genuine macOS Keychain confirmation after the ad-hoc signature changed.
+Windows/Intel Mac CI and the Docker image have not been run for this branch.
+The unchecked verification items remain open; see
+[the validation record](../../EXTENSIONS-SYNC-VALIDATION.md). No merge or
+publication was performed. Keep the checkout and validation evidence for resume.
