@@ -33,10 +33,10 @@ Protocol: JSON `/v1`, bearer access tokens, errors `{error:{code,message}}`. Reg
 
 Dataset creation `{name}` returns `{id,name,epoch,revision}`. Snapshot returns `{dataset,extensions,settings,cursor}`. Changes return `{changes,cursor,through,hasMore}`. Operations body `{epoch,operations}`; each operation `{id,kind,extensionId,generation,baseRevision,payload}`. Library kind `extension` payload `{source:{kind:'web-store',id},state:'enabled'|'disabled'|'removed'}`. Settings kind `settings` payload `{set?,remove?,clear?}` with JSON values. Replies `{results:[{id,status:'applied'|'duplicate'|'conflict'|'quota',revision?,code?}],revision}`. Settings events include key changes with old/new values; removal/clear tombstones are retained. Each change includes revision/kind/extensionId/generation/payload. Endpoint refinements must be documented and sent to integrator before consumer work.
 
-- [ ] Write and run failing HTTP integration tests for registration/login/recovery/password change, device revocation and refresh reuse using actual persistence.
-- [ ] Implement versioned password hashing, bounded authentication, credential rotation and ownership-scoped account/device/dataset operations with encrypted persisted values.
-- [ ] Write/run failing convergence tests for duplicate requests, concurrent keys, removal precedence, stale reinstall, epochs, quota, stable paging and cross-account denial.
-- [ ] Implement transactional reconciliation and replay-safe change feeds, preserving actionable quota/conflict responses.
-- [ ] Add and test backup/restore/deletion ledger, wrong-key startup failure, process restart persistence, request limits and service readiness.
-- [ ] Run `node --test test/sync-service.test.cjs test/sync-reconciliation.test.cjs` and `npm test`. Expected: all focused and existing unit tests pass; disclose any unresolved protocol or runtime gap.
-- [ ] Document CLI, container/HTTPS deployment, key rotation, backup retention and production boundaries. Commit only owned files; report exact protocol and test evidence.
+- [x] Write and run failing HTTP integration tests for registration/login/recovery/password change, device revocation and refresh reuse using actual persistence.
+- [x] Implement versioned password hashing, bounded authentication, credential rotation and ownership-scoped account/device/dataset operations with encrypted persisted values.
+- [x] Write/run failing convergence tests for duplicate requests, concurrent keys, removal precedence, stale reinstall, epochs, quota, stable paging and cross-account denial.
+- [x] Implement transactional reconciliation and replay-safe change feeds, preserving actionable quota/conflict responses.
+- [x] Add and test backup/restore/deletion ledger, wrong-key startup failure, process restart persistence, request limits and service readiness.
+- [x] Run `node --test test/sync-service.test.cjs test/sync-reconciliation.test.cjs` and `npm test`. Expected: all focused and existing unit tests pass; disclose any unresolved protocol or runtime gap.
+- [x] Document CLI, container/HTTPS deployment, key rotation, backup retention and production boundaries. Commit only owned files; report exact protocol and test evidence.
