@@ -1,6 +1,6 @@
 # Extensions and device sync on Electron
 
-Status: proposed design, awaiting design approval. No implementation is claimed by this document.
+Status: approved by the user on 2026-10-25, with explicit authorization to implement and verify on `extensions-and-sync`. This document describes requirements, not completed implementation.
 
 Date: 2026-10-25. Branch: `extensions-and-sync`. Inspected baseline: `722404a` / Zacro 0.4.0.
 
