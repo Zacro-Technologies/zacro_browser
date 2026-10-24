@@ -139,7 +139,7 @@ class SyncProtocol {
         ),
       }));
   }
-  snapshot(account, id) {
+  snapshot(account, id, includeSettings = true) {
     const row = this.dataset(account, id);
     const extensions = this.store
       .all('SELECT * FROM extensions WHERE dataset_id = ? ORDER BY extension_id', id)
@@ -150,7 +150,7 @@ class SyncProtocol {
         ...this.store.decode(account, `extension/${id}/${e.extension_id}`, e.payload),
       }));
     const settings = [];
-    for (const e of extensions.filter((e) => e.state !== 'removed')) {
+    for (const e of extensions.filter((e) => includeSettings && e.state !== 'removed')) {
       const rows = this.settingRows(account, id, e.extensionId, e.generation).filter((r) => !r.deleted);
       if (rows.length)
         settings.push({
@@ -181,9 +181,9 @@ class SyncProtocol {
       through,
       limit,
     );
-    const changes = rows.map((row) =>
-      this.store.decode(account, `change/${id}/${row.revision}`, row.payload),
-    );
+    const changes = rows
+      .map((row) => this.store.decode(account, `change/${id}/${row.revision}`, row.payload))
+      .filter((change) => query.get('settings') !== '0' || change.kind !== 'settings');
     const cursor = rows.at(-1)?.revision || after;
     return { changes, cursor, through, hasMore: cursor < through };
   }

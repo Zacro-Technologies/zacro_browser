@@ -29,11 +29,11 @@
 **Files:** create `src/main/sync/{vault,client,storage}.cjs`, `src/core/sync/model.cjs`; tests `test/sync-client.test.cjs`, `test/sync-storage.test.cjs`.
 **Interfaces:** `SyncClient({directory,protect,unprotect,onLibraryChange,onStorageChange})`; `configure({endpoint})`, `register`, `login`, `logout`, `status`, `devices`, `revokeDevice`, `datasets`, `linkProfile({profileId,datasetId,settingsSync,settingsChoice})`, `unlinkProfile`, `syncNow`, `queueExtension`, `callStorage(context,method,args)`, `close`. `status()` contains safe UI state only. The protected credential backend is passed by the host using Electron safeStorage and fails closed if unavailable. HTTP follows the service plan and its recorded refinements.
 
-- [ ] Write failing tests for secret exclusion, real account linkage, offline setting writes, atomic outbox persistence and namespace separation.
-- [ ] Implement the vault and distinct local sync storage with complete storage API serialization/quotas/events; connect the real HTTP protocol with cancellation, paging and jittered backoff.
-- [ ] Test deletion, reinstall generations, quota conflicts, account switches and service URL changes using two actual clients and the service.
-- [ ] Run `node --test test/sync-client.test.cjs test/sync-storage.test.cjs` and `npm test`; expected: all pass with no secret leakage.
-- [ ] Commit.
+- [x] Write failing tests for secret exclusion, real account linkage, offline setting writes, atomic outbox persistence and namespace separation.
+- [x] Implement the vault and distinct local sync storage with complete storage API serialization/quotas/events; connect the real HTTP protocol with cancellation, paging and jittered backoff.
+- [x] Test deletion, reinstall generations, quota conflicts, account switches and service URL changes using two actual clients and the service.
+- [x] Run `node --test test/sync-client.test.cjs test/sync-storage.test.cjs` and `npm test`; expected: all pass with no secret leakage.
+- [x] Commit.
 
 ### Task 2: Browser integration and UI
 

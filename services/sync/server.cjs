@@ -270,7 +270,8 @@ async function createSyncService({
     const datasetMatch = /^\/datasets\/([a-f0-9-]{36})(?:\/(snapshot|changes|operations))?$/.exec(path);
     if (datasetMatch) {
       const [, id, action] = datasetMatch;
-      if (method === 'GET' && action === 'snapshot') return { status: 200, body: protocol.snapshot(a, id) };
+      if (method === 'GET' && action === 'snapshot')
+        return { status: 200, body: protocol.snapshot(a, id, url.searchParams.get('settings') !== '0') };
       if (method === 'GET' && action === 'changes')
         return { status: 200, body: protocol.changes(a, id, url.searchParams) };
       if (method === 'POST' && action === 'operations')

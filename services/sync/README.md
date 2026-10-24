@@ -139,6 +139,10 @@ to 1 MiB. Browser-origin requests are rejected; the desktop main process is the
 client. Recovery codes appear only in explicit registration/recovery/regeneration
 responses and must never become routine browser snapshots or logs.
 
+Snapshots and change feeds accept `settings=0` for library-only synchronization.
+Those replies omit setting values while still advancing the revision cursor;
+the desktop uses this whenever separate settings consent is off.
+
 Each account supports at most 100 active datasets and 100 active devices. A
 dataset supports 100 installed extension identities and 1,000 identities across
 its lifetime, including removals. These bounds keep snapshots finite; a full

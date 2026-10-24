@@ -212,3 +212,20 @@ test('bounded libraries and nested JSON reject excess without blocking independe
   assert.equal((await f.mutate([f.settings({ set: { nested } })])).status, 400);
   assert.equal((await f.snapshot()).status, 200);
 });
+
+test('library-only snapshot and changefeed never transmit extension setting values', async (t) => {
+  const f = await fixture(t);
+  await f.mutate([f.library()]);
+  await f.mutate([f.settings({ set: { personal: 'private-setting' } }, 1)]);
+  const snapshot = (await f.request(`/datasets/${f.dataset.id}/snapshot?settings=0`, f.a.accessToken)).data;
+  assert.deepEqual(snapshot.settings, []);
+  assert.equal(JSON.stringify(snapshot).includes('private-setting'), false);
+  const changes = (await f.request(`/datasets/${f.dataset.id}/changes?after=0&settings=0`, f.a.accessToken))
+    .data;
+  assert.equal(changes.cursor, 2);
+  assert.equal(changes.hasMore, false);
+  assert.deepEqual(
+    changes.changes.map((c) => c.kind),
+    ['extension'],
+  );
+});
