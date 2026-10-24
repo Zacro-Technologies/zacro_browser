@@ -93,6 +93,20 @@ async function launch(t, existingDirectory) {
   shell.on('pageerror', (error) => errors.push(error.message));
   await shell.waitForFunction(() => Boolean(window.zacro));
   await expect(shell.locator('[data-key="address"]')).toBeVisible();
+  if (process.platform === 'darwin') {
+    // The BrowserWindow starts hidden. Activate only after it has been shown;
+    // DOM focus alone does not establish macOS's native first responder.
+    await expect
+      .poll(() => app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].isVisible()))
+      .toBe(true);
+    await app.evaluate(({ app, BrowserWindow }) => {
+      app.focus({ steal: true });
+      BrowserWindow.getAllWindows()[0].focus();
+    });
+    await expect
+      .poll(() => app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].isFocused()))
+      .toBe(true);
+  }
   const invoke = (action, payload = {}) =>
     shell.evaluate(([action, payload]) => window.zacro.invoke(action, payload), [action, payload]);
   const state = () => invoke('state:get');
@@ -208,11 +222,12 @@ test(
     await browser.app.evaluate(({ webContents }, url) => {
       const contents = webContents.getAllWebContents().find((item) => item.getURL() === url);
       contents.focus();
-      contents.sendInputEvent({ type: 'keyDown', keyCode: 'B', modifiers: ['control', 'shift'] });
-      contents.sendInputEvent({ type: 'keyUp', keyCode: 'B', modifiers: ['control', 'shift'] });
+      const modifiers = [process.platform === 'darwin' ? 'meta' : 'control', 'shift'];
+      contents.sendInputEvent({ type: 'keyDown', keyCode: 'B', modifiers });
+      contents.sendInputEvent({ type: 'keyUp', keyCode: 'B', modifiers });
     }, url);
     await expect(shell.locator('#sidebar')).toBeHidden();
-    const restore = shell.getByRole('button', { name: 'Show sidebar (Ctrl + Shift + B)', exact: true });
+    const restore = shell.getByRole('button', { name: /^Show sidebar \(/ });
     await expect(restore).toBeVisible();
     await expect.poll(async () => (await surface())?.x).toBe(8);
     const expanded = await surface();
@@ -276,11 +291,11 @@ test(
     await expect(home.locator(`.home-link[data-url="${url}"]`)).toHaveCount(0);
     await expect(home.locator('.home-link')).toHaveCount(1);
     await shell.locator('#home-query').fill('Keep this search draft');
-    await shell.getByRole('button', { name: 'Hide sidebar (Ctrl + Shift + B)', exact: true }).click();
+    await shell.getByRole('button', { name: /^Hide sidebar \(/ }).click();
     await expect(home.locator(`.home-link[data-url="${url}"]`)).toHaveCount(1);
     await expect(home.locator('.home-link')).toHaveCount(2);
     await expect(shell.locator('#home-query')).toHaveValue('Keep this search draft');
-    await shell.getByRole('button', { name: 'Show sidebar (Ctrl + Shift + B)', exact: true }).click();
+    await shell.getByRole('button', { name: /^Show sidebar \(/ }).click();
     await expect(home.locator(`.home-link[data-url="${url}"]`)).toHaveCount(0);
     await expect(shell.locator('#home-query')).toHaveValue('Keep this search draft');
   },
@@ -403,7 +418,7 @@ test(
     await shell.keyboard.press('Escape');
     await expect(shell.getByRole('dialog')).toHaveCount(0);
     await expect(address).toBeFocused();
-    await shell.keyboard.press('Control+l');
+    await shell.keyboard.press('ControlOrMeta+l');
     await expect(input).toBeFocused();
     await input.fill(`${base}/composition`);
     await shell.keyboard.press('Enter');
@@ -554,7 +569,7 @@ test(
       .poll(async () => (await browser.state()).spaces.some((space) => space.name === 'Keyboard Space'))
       .toBe(true);
     await expect(picker).toBeFocused();
-    await shell.keyboard.press('Control+t');
+    await shell.keyboard.press('ControlOrMeta+t');
     await expect(shell.locator('#command-input')).toBeFocused();
     await shell.locator('#command-input').fill(`${base}/keyboard-rename`);
     await shell.keyboard.press('Enter');
@@ -817,8 +832,9 @@ test(
       .toBe('target');
     await browser.app.evaluate(({ webContents }, url) => {
       const contents = webContents.getAllWebContents().find((item) => item.getURL() === url);
-      contents.sendInputEvent({ type: 'keyDown', keyCode: 'F', modifiers: ['control'] });
-      contents.sendInputEvent({ type: 'keyUp', keyCode: 'F', modifiers: ['control'] });
+      const modifiers = [process.platform === 'darwin' ? 'meta' : 'control'];
+      contents.sendInputEvent({ type: 'keyDown', keyCode: 'F', modifiers });
+      contents.sendInputEvent({ type: 'keyUp', keyCode: 'F', modifiers });
     }, parentURL);
     const find = browser.shell.locator('#find-input');
     await expect(find).toBeFocused();

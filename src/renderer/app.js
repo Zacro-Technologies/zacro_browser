@@ -2484,6 +2484,19 @@ document.addEventListener('change', (event) => {
 document.addEventListener('keydown', (event) => {
   if (event.isComposing || event.keyCode === 229) return;
   const cmd = primaryModifier(event);
+  if (
+    !ui.dialog &&
+    (event.key === 'ContextMenu' || (event.key === 'F10' && event.shiftKey && !cmd && !event.altKey))
+  ) {
+    const tab = event.target.closest('[data-tab-id]');
+    const folder = event.target.closest('[data-folder-id]');
+    if (tab || folder) {
+      event.preventDefault();
+      if (tab) showTabMenu(tab.dataset.tabId);
+      else showFolderMenu(folder.dataset.folderId);
+      return;
+    }
+  }
   if (ui.dialog === 'command' && event.target.id === 'command-input') {
     if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
       event.preventDefault();
