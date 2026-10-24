@@ -140,6 +140,7 @@
   },
   "dependencies": {
     "@openai/codex": "0.164.0",
+    "parse5": "7.3.0",
     "pdfjs-dist": "6.4.299",
     "yauzl": "3.4.0"
   }
