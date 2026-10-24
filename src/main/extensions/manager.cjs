@@ -147,6 +147,7 @@ class ExtensionManager {
     this.queues = new Map();
     this.runtime = new Map();
     this.timers = new Map();
+    this.scheduleRuns = new Map();
     this.restored = new Set();
     this.localEpochs = new Map();
     this.closed = false;
@@ -544,6 +545,8 @@ class ExtensionManager {
   }
   async _nativeLoad(context, record, version, grants) {
     this._guard(context);
+    if (version.inspection?.compatible !== true)
+      throw new Error('Extension requires unsupported capabilities');
     const session = await this._prepareSession(context.profileId);
     this._guard(context);
     const metadata = {
@@ -589,27 +592,44 @@ class ExtensionManager {
       wasEnabled = !!record.enabled;
     let needsReload = record.requiresPageReload || false;
     await this._checkVersion(context, version);
-    if (wasEnabled) needsReload = await this._unload(context, rollback ? 'rollback' : 'update');
-    const reduced = reducedGrants(record.grants, grants);
-    if (record.permissionReloadPending || (reduced && needsReload)) {
-      const next = this._save(context, {
-        ...record,
-        current: version,
-        pending: null,
-        previous: rollback ? null : old,
-        enabled: false,
-        status: 'pending-reload',
-        grants: clone(grants),
-        generation: context.generation,
-        requiresPageReload: true,
-        permissionReloadPending: true,
-      });
-      await this._discard(context, record.previous);
-      await this._discard(context, record.pending);
-      return next;
-    }
-    let committed = false;
+    let committed = false,
+      nativeTouched = false;
     try {
+      if (wasEnabled) {
+        // Publish the recoverable state before native unload or an awaited host
+        // callback. A successor can cancel this operation at either boundary;
+        // it must never inherit an enabled record with no native runtime.
+        this._save(context, {
+          ...record,
+          enabled: false,
+          status: 'disabled',
+          generation: context.generation,
+          requiresPageReload: true,
+        });
+        nativeTouched = true;
+        needsReload = true;
+        needsReload = await this._unload(context, rollback ? 'rollback' : 'update');
+      }
+      const reduced = reducedGrants(record.grants, grants);
+      if (record.permissionReloadPending || (reduced && needsReload)) {
+        const next = this._save(context, {
+          ...record,
+          current: version,
+          pending: null,
+          previous: rollback ? null : old,
+          enabled: false,
+          status: 'pending-reload',
+          grants: clone(grants),
+          generation: context.generation,
+          requiresPageReload: true,
+          permissionReloadPending: true,
+        });
+        committed = true;
+        await this._discard(context, record.previous);
+        await this._discard(context, record.pending);
+        return next;
+      }
+      nativeTouched = true;
       await this._nativeLoad(context, record, version, grants);
       this._guard(context);
       const next = {
@@ -632,25 +652,43 @@ class ExtensionManager {
         await this._discard(context, record.pending);
       return clone(next);
     } catch (error) {
-      if (committed) throw error; // Cleanup cannot undo a durable activation.
+      if (committed || !nativeTouched) throw error;
       this.runtime.delete(context.key);
       this.getSession(context.profileId).extensions.removeExtension(record.id);
-      if (
-        wasEnabled &&
-        old &&
-        !context.signal.aborted &&
-        this.epochs.get(context.profileId) === context.epoch
-      ) {
+      let current = false;
+      try {
+        this._guard(context);
+        current = true;
+      } catch {
+        /* A newer lifecycle owns state now. */
+      }
+      if (wasEnabled && old && current) {
         try {
           await this._nativeLoad(context, record, old, record.grants);
-        } catch {
-          this.runtime.delete(context.key);
           this._save(context, {
             ...record,
-            enabled: false,
-            status: 'load-failed',
-            error: 'Replacement and restoration failed',
+            generation: context.generation,
+            requiresPageReload: needsReload,
+            error: String(error.message).slice(0, 500),
           });
+        } catch {
+          this.runtime.delete(context.key);
+          this.getSession(context.profileId).extensions.removeExtension(record.id);
+          // The disabled state was already durable before unload. Do not replace
+          // a newer disable/remove, even if restoration failed while awaiting load.
+          try {
+            this._guard(context);
+            this._save(context, {
+              ...record,
+              enabled: false,
+              status: 'load-failed',
+              generation: context.generation,
+              requiresPageReload: true,
+              error: 'Replacement and restoration failed',
+            });
+          } catch {
+            /* Preserve the durable disabled state or the newer intent. */
+          }
         }
       }
       throw error;
@@ -836,6 +874,9 @@ class ExtensionManager {
   enable(profileId, id) {
     return this._run(profileId, id, async (context) => {
       const record = this._record(profileId, id);
+      if (!record.current) throw new Error('Approve extension permissions before enabling');
+      if (record.current.inspection?.compatible !== true)
+        throw new Error('Extension requires unsupported capabilities');
       if (record.enabled) return record;
       if (record.permissionReloadPending) {
         const result = await this.onDeactivated({
@@ -850,7 +891,6 @@ class ExtensionManager {
         record.permissionReloadPending = false;
         record.requiresPageReload = false;
       }
-      if (!record.current) throw new Error('Approve extension permissions before enabling');
       if (requiresReview(record.current.inspection, record.current.inspection, record.grants))
         throw new Error('Extension permissions require approval');
       await this._checkVersion(context, record.current);
@@ -986,17 +1026,23 @@ class ExtensionManager {
   startUpdates(profileId) {
     this._profile(profileId);
     this.stopUpdates(profileId);
-    const epoch = this.epochs.get(profileId);
+    const epoch = this.epochs.get(profileId),
+      run = Symbol('extension-update-schedule');
+    this.scheduleRuns.set(profileId, run);
+    const live = () =>
+      !this.closed && epoch === this.epochs.get(profileId) && this.scheduleRuns.get(profileId) === run;
     const schedule = () => {
-      if (this.closed || epoch !== this.epochs.get(profileId)) return;
+      if (!live()) return;
       const delay = Math.min(0x7fffffff, Math.max(0, this.schedule(profileId).nextCheck - this.now()));
       const timer = setTimeout(async () => {
+        if (!live()) return;
+        if (this.timers.get(profileId) === timer) this.timers.delete(profileId);
         try {
           await this.checkUpdates(profileId);
         } catch {
           /* Teardown cancels checks. Errors are reflected by checkUpdates. */
         }
-        schedule();
+        if (live()) schedule();
       }, delay);
       timer.unref?.();
       this.timers.set(profileId, timer);
@@ -1004,6 +1050,7 @@ class ExtensionManager {
     schedule();
   }
   stopUpdates(profileId) {
+    this.scheduleRuns.delete(profileId);
     clearTimeout(this.timers.get(profileId));
     this.timers.delete(profileId);
   }

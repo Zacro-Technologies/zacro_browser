@@ -642,3 +642,238 @@ test('each native session is prepared exactly once before any load, including pr
   await h.manager.restore('p1');
   assert.equal(h.manager.list('p1')[0].enabled, true);
 });
+
+for (const declaration of [{ optional_permissions: ['tabs'] }, { permissions: ['nativeMessaging'] }]) {
+  test(`incompatible legacy rights cannot activate through enable: ${JSON.stringify(declaration)}`, async (t) => {
+    const legacyId = 'abcdefghijklmnopabcdefghijklmnop',
+      h = await setup(t, { legacyId });
+    const source = path.join(h.options.root, 'legacy-incompatible');
+    await fs.mkdir(source);
+    await fs.writeFile(
+      path.join(source, 'manifest.json'),
+      JSON.stringify({ manifest_version: 3, name: 'Legacy incompatible', version: '1', ...declaration }),
+    );
+    h.profiles.set('old', { id: 'old' });
+    await h.manager.restore('old', {
+      legacy: [{ profileId: 'old', extensionId: legacyId, path: source, enabled: true }],
+    });
+    assert.equal(h.manager.list('old')[0].status, 'incompatible');
+    await assert.rejects(h.manager.enable('old', legacyId), /unsupported|incompatible/i);
+    assert.equal(h.manager.list('old')[0].enabled, false);
+    assert.equal(h.manager.resolveExtension('old', legacyId), null);
+    assert.equal(
+      h.events.some((event) => event[0] === 'load'),
+      false,
+    );
+  });
+}
+
+test('restore rejects an incompatible saved current version at the common native-load boundary', async (t) => {
+  const legacyId = 'abcdefghijklmnopabcdefghijklmnop',
+    h = await setup(t, { legacyId });
+  const source = path.join(h.options.root, 'legacy-restore-incompatible');
+  await fs.mkdir(source);
+  await fs.writeFile(
+    path.join(source, 'manifest.json'),
+    JSON.stringify({
+      manifest_version: 3,
+      name: 'Legacy incompatible',
+      version: '1',
+      optional_permissions: ['tabs'],
+    }),
+  );
+  h.profiles.set('old', { id: 'old' });
+  await h.manager.restore('old', {
+    legacy: [{ profileId: 'old', extensionId: legacyId, path: source, enabled: true }],
+  });
+  const file = path.join(h.manager.profilePath('old'), 'state.json');
+  await h.manager.close();
+  const state = JSON.parse(await fs.readFile(file, 'utf8'));
+  state.extensions[0].enabled = true; // A previously persisted incompatible activation must not recur.
+  await fs.writeFile(file, JSON.stringify(state));
+  const restarted = new ExtensionManager(h.options);
+  h.setManager(restarted);
+  await restarted.restore('old');
+  assert.equal(restarted.list('old')[0].enabled, false);
+  assert.match(restarted.list('old')[0].error, /unsupported|incompatible/i);
+  assert.equal(restarted.resolveExtension('old', legacyId), null);
+  assert.equal(
+    h.events.some((event) => event[0] === 'load'),
+    false,
+  );
+});
+
+test('superseded replacement unload followed by an offline update leaves a recoverable coherent record', async (t) => {
+  const deactivated = deferred(),
+    release = deferred();
+  let downloads = 0;
+  const h = await setup(t, {
+    fetchPackage: async () => {
+      downloads++;
+      if (downloads > 2) throw new Error('offline replacement');
+      return fixture(downloads === 1 ? '1' : '2');
+    },
+    onDeactivated: async (context) => {
+      if (context.reason === 'update') {
+        deactivated.resolve();
+        await release.promise;
+      }
+      return { requiresPageReload: false };
+    },
+  });
+  const id = fixture().id;
+  await h.manager.installStore('p1', id);
+  const first = h.manager.update('p1', id);
+  await deactivated.promise;
+  const second = h.manager.update('p1', id);
+  const firstRejected = assert.rejects(first, /stale|cancel|abort/i),
+    secondRejected = assert.rejects(second, /offline/);
+  release.resolve();
+  await Promise.all([firstRejected, secondRejected]);
+  const record = h.manager.list('p1')[0];
+  const disk = JSON.parse(await fs.readFile(path.join(h.manager.profilePath('p1'), 'state.json'), 'utf8'))
+    .extensions[0];
+  assert.equal(record.current.manifest.version, '1');
+  assert.equal(record.enabled, Boolean(h.manager.resolveExtension('p1', id)));
+  assert.equal(disk.enabled, record.enabled);
+  await h.manager.enable('p1', id);
+  assert.equal(h.manager.resolveExtension('p1', id)?.enabled, true);
+  assert.equal(h.manager.list('p1')[0].enabled, true);
+});
+
+test('a throwing replacement deactivation callback leaves coherent old state and normal enable recovery', async (t) => {
+  let next = fixture();
+  const h = await setup(t, {
+    fetchPackage: async () => next,
+    onDeactivated: async () => {
+      throw new Error('page inspection failed');
+    },
+  });
+  const id = next.id;
+  await h.manager.installStore('p1', id);
+  next = fixture('2');
+  await assert.rejects(h.manager.update('p1', id), /page inspection failed/);
+  const record = h.manager.list('p1')[0];
+  const disk = JSON.parse(await fs.readFile(path.join(h.manager.profilePath('p1'), 'state.json'), 'utf8'))
+    .extensions[0];
+  assert.equal(record.current.manifest.version, '1');
+  assert.equal(record.enabled, Boolean(h.manager.resolveExtension('p1', id)));
+  assert.equal(disk.enabled, record.enabled);
+  await h.manager.enable('p1', id);
+  assert.equal(h.manager.resolveExtension('p1', id)?.enabled, true);
+});
+
+for (const action of ['disable', 'remove'])
+  test(`newer ${action} wins while replacement is awaiting page deactivation`, async (t) => {
+    const deactivated = deferred(),
+      release = deferred();
+    let next = fixture();
+    const h = await setup(t, {
+      fetchPackage: async () => next,
+      onDeactivated: async (context) => {
+        if (context.reason === 'update') {
+          deactivated.resolve();
+          await release.promise;
+        }
+        return { requiresPageReload: false };
+      },
+    });
+    const id = next.id;
+    await h.manager.installStore('p1', id);
+    next = fixture('2');
+    const updating = h.manager.update('p1', id);
+    await deactivated.promise;
+    const newer = h.manager[action]('p1', id),
+      rejected = assert.rejects(updating, /stale|cancel|abort/i);
+    release.resolve();
+    await Promise.all([newer, rejected]);
+    const records = h.manager.list('p1');
+    const disk = JSON.parse(
+      await fs.readFile(path.join(h.manager.profilePath('p1'), 'state.json'), 'utf8'),
+    ).extensions;
+    assert.equal(h.manager.resolveExtension('p1', id), null);
+    assert.equal(h.events.filter((event) => event[0] === 'load').length, 1);
+    if (action === 'remove') {
+      assert.deepEqual(records, []);
+      assert.deepEqual(disk, []);
+    } else {
+      assert.equal(records[0].enabled, false);
+      assert.equal(disk[0].enabled, false);
+      assert.equal(records[0].current.manifest.version, '1');
+    }
+  });
+
+test('stopping a schedule during its check prevents late timer rearming', async (t) => {
+  const started = deferred(),
+    release = deferred(),
+    completed = deferred();
+  let h,
+    hold = false;
+  h = await setup(t, {
+    fetchPackage: async () => {
+      if (hold) {
+        started.resolve();
+        return release.promise;
+      }
+      return fixture();
+    },
+    onChange: (profileId) => {
+      if (h?.manager.schedule(profileId).nextCheck > 0) completed.resolve();
+    },
+  });
+  await h.manager.installStore('p1', fixture().id);
+  hold = true;
+  h.manager.startUpdates('p1');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  await started.promise;
+  h.manager.stopUpdates('p1');
+  release.resolve(fixture());
+  await completed.promise;
+  await new Promise(setImmediate);
+  assert.equal(h.manager.timers.has('p1'), false);
+});
+
+test('restarting during an old scheduled check leaves exactly one future checking loop', async (t) => {
+  const started = deferred(),
+    release = deferred();
+  let now = 1000000,
+    downloads = 0,
+    checks = 0;
+  const h = await setup(t, {
+    now: () => now,
+    fetchPackage: async () => {
+      downloads++;
+      if (downloads === 2) {
+        started.resolve();
+        return release.promise;
+      }
+      return fixture();
+    },
+  });
+  const id = fixture().id;
+  await h.manager.installStore('p1', id);
+  const originalCheck = h.manager.checkUpdates.bind(h.manager);
+  h.manager.checkUpdates = (...args) => {
+    checks++;
+    return originalCheck(...args);
+  };
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  h.manager.startUpdates('p1');
+  t.mock.timers.tick(1);
+  await started.promise;
+  h.manager.startUpdates('p1');
+  t.mock.timers.tick(1);
+  assert.equal(checks, 2);
+  const current = h.manager.queues.get(JSON.stringify(['p1', id]));
+  release.resolve(fixture());
+  await current;
+  await new Promise(setImmediate);
+  now = h.manager.schedule('p1').nextCheck;
+  try {
+    t.mock.timers.tick(6 * 60 * 60 * 1000 + 1);
+    assert.equal(checks, 3, 'only the restarted schedule should check at the next interval');
+  } finally {
+    h.manager.stopUpdates('p1');
+    await h.manager.invalidateProfile('p1');
+  }
+});
