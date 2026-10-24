@@ -5,18 +5,29 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const os = require('node:os');
 const http = require('node:http');
-const { spawn } = require('node:child_process');
+const { spawn, execFile } = require('node:child_process');
 const { once } = require('node:events');
+const { promisify } = require('node:util');
 const { _electron, chromium, expect } = require('@playwright/test');
 const { getCurrentFuseWire, FuseV1Options } = require('@electron/fuses');
 const { makePDF } = require('../fixtures/pdf.cjs');
 const { packagedPaths } = require('../../scripts/platform-build.cjs');
+const execFileAsync = promisify(execFile);
 
 test(
   'native package has hardened fuses, browses, parses PDFs and starts its isolated Codex runtime',
   { timeout: 90000, skip: !['win32', 'darwin'].includes(process.platform) },
   async (t) => {
     const root = path.resolve(__dirname, '../..');
+    const captureMacDesktop = async (name) => {
+      // Capture only the disposable CI desktop. The native traffic lights,
+      // menu bar and sibling website views are outside a CDP shell screenshot.
+      if (process.platform !== 'darwin' || process.env.CI !== 'true' || process.env.GITHUB_ACTIONS !== 'true')
+        return;
+      await execFileAsync('/usr/sbin/screencapture', ['-x', path.join(root, 'test-results', name)], {
+        timeout: 5000,
+      }).catch((error) => console.warn(`Optional native desktop capture unavailable: ${error.message}`));
+    };
     const { executable, resources } = packagedPaths(root);
     await fs.access(executable);
     const fuses = await getCurrentFuseWire(executable);
@@ -105,6 +116,7 @@ test(
       .toBe('Packaged browser acceptance');
     await fs.mkdir(path.join(root, 'test-results'), { recursive: true });
     await shell.screenshot({ path: path.join(root, 'test-results/packaged-browser.png') });
+    await captureMacDesktop('packaged-mac-browser-desktop.png');
     await shell.evaluate(() => window.zacro.invoke('navigate', { url: 'zacro://newtab' }));
     await expect(shell.locator('#home-query')).toBeVisible();
     for (const theme of ['light', 'dark']) {
@@ -112,6 +124,7 @@ test(
       await expect(shell.locator('html')).toHaveAttribute('data-theme', theme);
       await shell.emulateMedia({ reducedMotion: 'reduce' });
       await shell.screenshot({ path: path.join(root, `test-results/packaged-home-${theme}.png`) });
+      await captureMacDesktop(`packaged-mac-home-${theme}-desktop.png`);
     }
     const exited = once(child, 'exit');
     await shell.evaluate(() => window.zacro.invoke('app:quit')).catch(() => {});
