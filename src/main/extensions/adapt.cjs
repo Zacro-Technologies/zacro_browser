@@ -3,7 +3,8 @@
 // callers retain the verified archive and provenance separately from this copy.
 const fs = require('node:fs/promises');
 const path = require('node:path');
-const TRANSFORM_VERSION = 1;
+const { parse } = require('parse5');
+const TRANSFORM_VERSION = 2;
 const BOOTSTRAP = 'zacro-compat-bootstrap.js';
 
 async function adaptExtension(source, destination, { publicKey } = {}) {
@@ -49,11 +50,30 @@ async function adaptExtension(source, destination, { publicKey } = {}) {
     const filename = path.join(destination, name);
     const relative = path.posix.relative(path.posix.dirname(name), BOOTSTRAP);
     const specifier = relative.startsWith('.') ? relative : './' + relative;
-    const prefix =
-      background.type === 'module'
-        ? `import ${JSON.stringify(specifier)};\n`
-        : `importScripts(${JSON.stringify(specifier)});\n`;
-    await fs.writeFile(filename, prefix + (await fs.readFile(filename, 'utf8')));
+    if (background.type === 'module') {
+      await fs.writeFile(
+        filename,
+        `import ${JSON.stringify(specifier)};\n` + (await fs.readFile(filename, 'utf8')),
+      );
+    } else {
+      // A separate Script keeps the original directive prologue. Both files
+      // remain in the entry's directory, so native importScripts resolution and
+      // the ServiceWorkerGlobalScope URL are unchanged.
+      const companion = 'zacro-compat-original-' + path.basename(name);
+      const companionPath = path.join(path.dirname(filename), companion);
+      if (
+        await fs.access(companionPath).then(
+          () => true,
+          () => false,
+        )
+      )
+        throw new Error('Reserved classic worker companion path');
+      await fs.copyFile(filename, companionPath);
+      await fs.writeFile(
+        filename,
+        `importScripts(${JSON.stringify(specifier)});\nimportScripts(${JSON.stringify('./' + companion)});\n`,
+      );
+    }
   } else if (background?.scripts) {
     background.scripts = [BOOTSTRAP, ...background.scripts];
   } else if (background?.page) {
@@ -62,13 +82,25 @@ async function adaptExtension(source, destination, { publicKey } = {}) {
       throw new Error('Invalid background entry path');
     const filename = path.join(destination, name);
     const html = await fs.readFile(filename, 'utf8');
-    const tags = /<!--[\s\S]*?-->|<\/?[a-zA-Z][^>"']*(?:(?:"[^"]*"|'[^']*')[^>"']*)*>/g;
-    let position = html.length;
-    for (const token of html.matchAll(tags))
-      if (/^<script\b/i.test(token[0]) || /^<\/head\s*>/i.test(token[0])) {
-        position = token.index;
-        break;
-      }
+    const document = parse(html, { sourceCodeLocationInfo: true });
+    const scripts = [];
+    let head, body;
+    const visit = (node, foreignRoot) => {
+      if (node.tagName === 'head') head = node;
+      if (node.tagName === 'body') body = node;
+      if (node.namespaceURI && node.namespaceURI !== 'http://www.w3.org/1999/xhtml' && !foreignRoot)
+        foreignRoot = node;
+      if (node.tagName === 'script') scripts.push((foreignRoot || node).sourceCodeLocation?.startOffset);
+      // Template contents are inert DocumentFragments, not childNodes. Deliberately
+      // do not traverse node.content; raw-text elements are handled by the parser.
+      for (const child of node.childNodes || []) visit(child, foreignRoot);
+    };
+    visit(document);
+    const positions = scripts.filter(Number.isInteger);
+    const position = positions.length
+      ? Math.min(...positions)
+      : (head?.sourceCodeLocation?.endTag?.startOffset ?? body?.sourceCodeLocation?.startTag?.endOffset);
+    if (!Number.isInteger(position)) throw new Error('Background HTML has no safe bootstrap insertion point');
     await fs.writeFile(
       filename,
       html.slice(0, position) + '<script src="/zacro-compat-bootstrap.js"></script>' + html.slice(position),

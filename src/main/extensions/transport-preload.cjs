@@ -7,6 +7,7 @@ connected.catch(() => {});
 // the extension Window. Same-origin extension views cannot read a relay API.
 contextBridge.executeInMainWorld({
   func: (transport) => {
+    const sendToDocument = chrome.tabs.sendMessage.bind(chrome.tabs);
     chrome.runtime.onConnect.addListener((port) => {
       if (port.name !== 'zacro.extension.transport.v1') return;
       const native = port.sender;
@@ -18,7 +19,21 @@ contextBridge.executeInMainWorld({
         frameId: native?.frameId,
         documentId: native?.documentId,
       };
-      const bound = transport.bind(sender);
+      const bound = transport.bind(sender).then(async (binding) => {
+        try {
+          const live = await sendToDocument(
+            binding.tabId,
+            { namespace: 'zacro.extension.document.v1' },
+            { documentId: binding.documentId },
+          );
+          if (live !== true) throw new Error('Native origin document is unavailable');
+          await transport.activate(binding.originToken);
+          return binding.originToken;
+        } catch (error) {
+          await transport.release(binding.originToken).catch(() => {});
+          throw error;
+        }
+      });
       bound.catch(() => {});
       let disconnected = false;
       port.onDisconnect.addListener(() => {
@@ -34,6 +49,7 @@ contextBridge.executeInMainWorld({
           )
             throw new Error('Invalid transport envelope');
           const token = await bound;
+          if (disconnected) throw new Error('Native origin port disconnected');
           const value =
             message.hello === true ? true : await transport.invoke(token, message.method, message.args);
           if (!disconnected) port.postMessage({ id: message.id, value });
@@ -47,6 +63,9 @@ contextBridge.executeInMainWorld({
     {
       async bind(runtimeSender) {
         return ipcRenderer.invoke(channel, { operation: 'bind', token: await connected, runtimeSender });
+      },
+      async activate(originToken) {
+        return ipcRenderer.invoke(channel, { operation: 'activate', token: await connected, originToken });
       },
       async invoke(originToken, method, args) {
         return ipcRenderer.invoke(channel, {

@@ -4,9 +4,67 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const os = require('node:os');
+const vm = require('node:vm');
+const fsSync = require('node:fs');
 const { _electron: electron, expect } = require('@playwright/test');
 
 const root = path.resolve(__dirname, '../..');
+
+test('adapted classic worker preserves its original strict directive and relative imports', async (t) => {
+  const { adaptExtension } = require(path.join(root, 'src/main/extensions/adapt.cjs'));
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'zacro-classic-strict-'));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const source = path.join(dir, 'source');
+  await fs.mkdir(path.join(source, 'worker'), { recursive: true });
+  await fs.writeFile(
+    path.join(source, 'manifest.json'),
+    JSON.stringify({
+      manifest_version: 3,
+      name: 'Strict',
+      version: '1',
+      background: { service_worker: 'worker/main.js' },
+    }),
+  );
+  await fs.writeFile(
+    path.join(source, 'worker/main.js'),
+    "'use strict';\nimportScripts('./dependency.js');\nglobalThis.originalStrict = (function () { return this; })() === undefined;\n",
+  );
+  await fs.writeFile(path.join(source, 'worker/dependency.js'), 'globalThis.relativeImport = 42;');
+  const destination = path.join(dir, 'derived');
+  await adaptExtension(source, destination);
+  const context = vm.createContext({});
+  context.importScripts = (...files) => {
+    for (const file of files)
+      vm.runInContext(fsSync.readFileSync(path.resolve(destination, 'worker', file), 'utf8'), context);
+  };
+  vm.runInContext(await fs.readFile(path.join(destination, 'worker/main.js'), 'utf8'), context);
+  assert.equal(context.originalStrict, true);
+  assert.equal(context.relativeImport, 42);
+});
+
+for (const stage of ['bind', 'activate'])
+  test(
+    `queued native Port ${stage} rejects its old document after same-URL reload`,
+    { timeout: 30000 },
+    async (t) => {
+      const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'zacro-queued-'));
+      const env = { ...process.env, ZACRO_CONTEXT_ROOT: directory, ZACRO_QUEUE_STAGE: stage };
+      delete env.ELECTRON_RUN_AS_NODE;
+      const app = await electron.launch({
+        args: [path.join(root, 'test/fixtures/extensions/queued-bind-host.cjs')],
+        env,
+      });
+      t.after(async () => {
+        await app.close();
+        await fs.rm(directory, { recursive: true, force: true });
+      });
+      await expect.poll(() => app.evaluate(() => globalThis.contextResult), { timeout: 10000 }).toBeTruthy();
+      const result = await app.evaluate(() => globalThis.contextResult);
+      t.diagnostic(JSON.stringify(result));
+      assert.equal(result.error, undefined);
+      assert.equal(result.calls.length, 0, 'The old native document must never reach dispatch');
+    },
+  );
 
 test('adaptation rejects symlinks and leaves existing destinations untouched', async (t) => {
   const adaptPath = path.join(root, 'src/main/extensions/adapt.cjs');
@@ -84,7 +142,7 @@ test('adaptation preserves source and relative worker imports and is determinist
 // The focused MV2 command remains available; the normal suite includes every kind.
 for (const kind of process.env.ZACRO_CONTEXT_MV2_PROBE === '1'
   ? ['mv2']
-  : ['mv2', 'mv2-page', 'classic', 'module']) {
+  : ['mv2', 'mv2-page', 'mv2-page-rawtext', 'mv2-page-template', 'classic', 'module']) {
   test(
     `native ${kind} extension frame, background and isolated content script authenticate host round trips`,
     { timeout: 60000 },
@@ -149,6 +207,7 @@ for (const kind of process.env.ZACRO_CONTEXT_MV2_PROBE === '1'
       assert.equal(result.disabledReuseRejected, true);
       assert.equal(result.forgedRejected, true);
       assert.equal(result.originalImport, true);
+      if (kind === 'classic' || kind === 'module') assert.equal(result.calls.background.strict, true);
       assert.equal(result.unloadedRejected, true);
       assert.equal(result.staleContentRejected, true);
       assert.equal(result.invalidOriginRejected, true);

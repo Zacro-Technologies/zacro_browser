@@ -4,6 +4,34 @@
   const runtime = globalThis.chrome?.runtime;
   if (!runtime?.id) return;
   const namespace = 'zacro.extension.transport.v1';
+  // Native document-targeted messaging is a liveness check, not an identity
+  // claim from page data. Chromium selects the recipient by documentId.
+  const messageEvent = runtime.onMessage;
+  const messageAdd = messageEvent.addListener.bind(messageEvent);
+  const messageRemove = messageEvent.removeListener.bind(messageEvent);
+  const messageHas = messageEvent.hasListener.bind(messageEvent);
+  const documentCheck = (message) => message?.namespace === 'zacro.extension.document.v1';
+  messageAdd((message, sender, reply) => {
+    if (
+      documentCheck(message) &&
+      sender.id === runtime.id &&
+      sender.url === runtime.getURL('zacro-compat-transport.html')
+    )
+      reply(true);
+  });
+  const messageListeners = new WeakMap();
+  messageEvent.addListener = (listener) => {
+    let wrapper = messageListeners.get(listener);
+    if (!wrapper) {
+      wrapper = (...args) => {
+        if (!documentCheck(args[0])) return listener(...args);
+      };
+      messageListeners.set(listener, wrapper);
+    }
+    return messageAdd(wrapper);
+  };
+  messageEvent.removeListener = (listener) => messageRemove(messageListeners.get(listener) || listener);
+  messageEvent.hasListener = (listener) => messageHas(messageListeners.get(listener) || listener);
   const event = runtime.onConnect;
   const add = event.addListener.bind(event),
     remove = event.removeListener.bind(event),

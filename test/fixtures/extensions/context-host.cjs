@@ -42,7 +42,7 @@ app.whenReady().then(async () => {
     app.on('will-quit', () => server.close());
     const url = `http://127.0.0.1:${server.address().port}/`;
     const background = kind.startsWith('mv2')
-      ? kind === 'mv2-page'
+      ? kind.startsWith('mv2-page')
         ? { page: 'background.html', persistent: true }
         : { scripts: ['scripts/background.js'], persistent: true }
       : { service_worker: 'scripts/background.js', ...(kind === 'module' ? { type: 'module' } : {}) };
@@ -58,12 +58,12 @@ app.whenReady().then(async () => {
     await fs.writeFile(path.join(source, 'manifest.json'), JSON.stringify(manifest));
     await fs.writeFile(
       path.join(source, 'background.html'),
-      '<!doctype html><html><head><meta charset="utf-8"><script src="scripts/background.js"></script></head></html>',
+      `<!doctype html><html><head><meta charset="utf-8">${kind === 'mv2-page-rawtext' ? '<style>.x::after {content: "<script>"}</style>' : kind === 'mv2-page-template' ? '<template><script>throw new Error("inert");</script></template>' : ''}<script src="scripts/background.js"></script></head></html>`,
     );
     await fs.writeFile(path.join(source, 'scripts/dependency.js'), 'globalThis.originalImport = true;');
     await fs.writeFile(
       path.join(source, 'scripts/background.js'),
-      `${kind === 'module' ? "import './dependency.js';" : kind === 'classic' ? "importScripts('./dependency.js');" : 'globalThis.originalImport = true;'}\nglobalThis.backgroundCount = (globalThis.backgroundCount || 0) + 1;\nchrome.runtime.onMessage.addListener((message, sender, reply) => { reply(message === 'native-probe' ? 'native-reply' : 'catch-all-reply'); });\nchrome.runtime.onConnect.addListener(port => { port.onMessage.addListener(() => port.postMessage({ error: 'catch-all-port' })); });\nglobalThis.zacroExtension?.invoke('probe', ['background', globalThis.originalImport, globalThis.backgroundCount]).catch(console.error);`,
+      `${kind === 'classic' ? "'use strict';\n" : ''}${kind === 'module' ? "import './dependency.js';" : kind === 'classic' ? "importScripts('./dependency.js');" : 'globalThis.originalImport = true;'}\nglobalThis.backgroundCount = (globalThis.backgroundCount || 0) + 1;\nchrome.runtime.onMessage.addListener((message, sender, reply) => { reply(message === 'native-probe' ? 'native-reply' : 'catch-all-reply'); });\nchrome.runtime.onConnect.addListener(port => { port.onMessage.addListener(() => port.postMessage({ error: 'catch-all-port' })); });\nglobalThis.zacroExtension?.invoke('probe', ['background', globalThis.originalImport, globalThis.backgroundCount, (function () { return this; })() === undefined]).catch(console.error);`,
     );
     await fs.writeFile(
       path.join(source, 'content.js'),
@@ -109,8 +109,11 @@ app.whenReady().then(async () => {
           nativeSender: Boolean(context.sender),
           originalImport: args[1],
           count: args[2],
+          strict: args[3],
           transportKind: context.transportKind,
           originUrl: context.runtimeSender?.url,
+          documentId: context.runtimeSender?.documentId,
+          sourceContentsId: context.sourceContents?.id,
         };
         return calls[args[0]];
       },
@@ -196,6 +199,12 @@ app.whenReady().then(async () => {
       );
     const brokerPreferences = broker?.getLastWebPreferences();
     const brokerGlobal = await broker.executeJavaScript('typeof zacroTransport');
+    const backgroundDocProbe =
+      kind.startsWith('mv2') && calls.background
+        ? await broker.executeJavaScript(
+            `chrome.tabs.sendMessage(${calls.background.sourceContentsId}, 'native-probe', { documentId: ${JSON.stringify(calls.background.documentId)} }).catch(error => error.message)`,
+          )
+        : null;
     const leakedViewCapability = await frame.webContents.executeJavaScript(
       "typeof chrome.extension?.getViews === 'function' && chrome.extension.getViews().some(view => typeof view.zacroTransport !== 'undefined')",
     );
@@ -283,6 +292,7 @@ app.whenReady().then(async () => {
       originalImport: calls.background?.originalImport,
       brokerPreferences,
       brokerGlobal,
+      backgroundDocProbe,
       leakedViewCapability,
       duplicateBrokerRejected,
       contentTrustedRejected: Boolean(calls['trusted-rejected']) && !calls['trusted-broken'],

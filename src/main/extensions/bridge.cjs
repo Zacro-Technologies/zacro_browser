@@ -202,6 +202,7 @@ class ExtensionBridge {
           : 'extension-frame'
         : 'content-script',
       transportKind: 'host-frame',
+      active: false,
     };
     this.origins.set(token, origin);
     const revoke = () => {
@@ -212,12 +213,13 @@ class ExtensionBridge {
     contents.once('did-start-navigation', revoke);
     contents.once('destroyed', revoke);
     origin.revoke = revoke;
-    return token;
+    return { originToken: token, tabId: contents.id, documentId: sender.documentId };
   }
 
-  validateOrigin(origin, context) {
+  validateOrigin(origin, context, allowPending = false) {
     if (
       !origin ||
+      (!allowPending && !origin.active) ||
       origin.session !== context.session ||
       origin.extensionId !== context.extensionId ||
       origin.epoch !== context.epoch ||
@@ -288,6 +290,13 @@ class ExtensionBridge {
     )
       throw new Error('Expired extension context');
     if (request.operation === 'bind') return this.bindOrigin(context, event, request.runtimeSender);
+    if (request.operation === 'activate') {
+      this.brokerFor(context, event);
+      const origin = this.origins.get(request.originToken);
+      this.validateOrigin(origin, context, true);
+      origin.active = true;
+      return;
+    }
     if (request.operation === 'release') {
       this.brokerFor(context, event);
       const origin = this.origins.get(request.originToken);
