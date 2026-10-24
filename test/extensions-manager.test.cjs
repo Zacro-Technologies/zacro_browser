@@ -147,7 +147,7 @@ test('install waits for profile-bound permission and exposes synchronous metadat
     await fs.readFile(h.manager.versionPath('p1', record.current, 'original/manifest.json'), 'utf8'),
   );
   assert.equal(sourceManifest.key, undefined);
-  assert.equal(record.current.transformVersion, 2);
+  assert.equal(record.current.transformVersion, 3);
   assert.equal(record.current.derivedSha256.length, 64);
 });
 test('uninstall wins over late download or late permission and private profiles cannot install', async (t) => {
@@ -876,4 +876,70 @@ test('restarting during an old scheduled check leaves exactly one future checkin
     h.manager.stopUpdates('p1');
     await h.manager.invalidateProfile('p1');
   }
+});
+test('captured external lifecycle guard cancels a deferred install before native activation', async (t) => {
+  let current = true;
+  const download = deferred(),
+    started = deferred();
+  const h = await setup(t, {
+    captureOperationGuard: () => () => {
+      if (!current) throw new Error('Stale external sync context');
+    },
+    fetchPackage: async () => {
+      started.resolve();
+      return download.promise;
+    },
+  });
+  const id = fixture().id;
+  const installing = h.manager.installStore('p1', id);
+  await started.promise;
+  current = false;
+  download.resolve(fixture());
+  await assert.rejects(installing, /Stale external sync context/);
+  assert.equal(h.manager.resolveExtension('p1', id), null);
+  assert.equal(h.manager.list('p1').length, 0);
+  assert.equal(
+    h.events.some((event) => event[0] === 'load'),
+    false,
+  );
+});
+test('local install captures external owner before asynchronous manifest inspection', async (t) => {
+  let valid = true,
+    owner = () => {
+      if (!valid) throw new Error('Stale local owner');
+    };
+  const h = await setup(t, { captureOperationGuard: () => owner });
+  const source = path.join(h.root, 'source');
+  await fs.mkdir(source);
+  await fs.writeFile(
+    path.join(source, 'manifest.json'),
+    JSON.stringify({ manifest_version: 3, name: 'Local', version: '1' }),
+  );
+  const installing = h.manager.installLocal('p1', source);
+  owner = () => {};
+  valid = false;
+  await assert.rejects(installing, /Stale local owner/);
+  assert.equal(h.manager.list('p1').length, 0);
+});
+test('restore rechecks current capability policy instead of trusting a historic compatible flag', async (t) => {
+  const h = await setup(t, { fetchPackage: async () => fixture('1', ['activeTab']) });
+  const record = await h.manager.installStore('p1', fixture().id);
+  const file = path.join(h.manager.profilePath('p1'), 'state.json');
+  await h.manager.close();
+  const state = JSON.parse(await fs.readFile(file, 'utf8'));
+  const old = state.extensions[0];
+  old.current = old.pending;
+  old.pending = null;
+  old.enabled = true;
+  old.status = 'enabled';
+  old.grants = { permissions: ['activeTab'], origins: [] };
+  old.current.inspection.compatible = true;
+  old.current.inspection.unsupported = [];
+  await fs.writeFile(file, JSON.stringify(state));
+  const restarted = new ExtensionManager(h.options);
+  h.setManager(restarted);
+  await restarted.restore('p1');
+  assert.equal(restarted.resolveExtension('p1', record.id), null);
+  assert.equal(restarted.list('p1')[0].enabled, false);
+  assert.match(restarted.list('p1')[0].error, /temporary|activeTab/i);
 });

@@ -116,6 +116,7 @@ class ExtensionManager {
     now = Date.now,
     random = Math.random,
     onChange = () => {},
+    captureOperationGuard = () => () => {},
     onDeactivated = async () => ({ requiresPageReload: true }),
   }) {
     if (
@@ -138,6 +139,7 @@ class ExtensionManager {
       now,
       random,
       onChange,
+      captureOperationGuard,
       onDeactivated,
     });
     this.states = new Map();
@@ -190,6 +192,7 @@ class ExtensionManager {
       epoch: this.epochs.get(profileId),
       generation: crypto.randomUUID(),
       controller: new AbortController(),
+      externalGuard: this.captureOperationGuard(profileId, id),
     };
     context.signal = context.controller.signal;
     this.operations.set(key, context);
@@ -197,6 +200,7 @@ class ExtensionManager {
   }
   _guard(context) {
     context.signal.throwIfAborted();
+    context.externalGuard();
     this._profile(context.profileId);
     if (this.epochs.get(context.profileId) !== context.epoch || this.operations.get(context.key) !== context)
       throw new Error('Stale extension lifecycle');
@@ -545,13 +549,21 @@ class ExtensionManager {
   }
   async _nativeLoad(context, record, version, grants) {
     this._guard(context);
-    if (version.inspection?.compatible !== true)
-      throw new Error('Extension requires unsupported capabilities');
+    const currentInspection = inspectManifest(version.manifest);
+    if (version.inspection?.compatible !== true || !currentInspection.compatible)
+      throw new Error(
+        'Extension requires unsupported capabilities: ' +
+          currentInspection.unsupported
+            .filter((item) => item.required)
+            .map((item) => item.capability + ': ' + item.reason)
+            .join('; '),
+      );
     const session = await this._prepareSession(context.profileId);
     this._guard(context);
     const metadata = {
       enabled: true,
       manifest: version.effectiveManifest || version.manifest,
+      originalManifest: clone(version.manifest),
       grants: clone(grants),
       generation: context.generation,
       adapted: !version.legacyPath,
@@ -753,6 +765,8 @@ class ExtensionManager {
   }
   async installLocal(profileId, directory) {
     this._profile(profileId);
+    const externalGuard = this.captureOperationGuard(profileId, '*');
+    externalGuard();
     directory = path.resolve(directory);
     if (
       this.root === directory ||
@@ -764,6 +778,7 @@ class ExtensionManager {
     const epoch = this.epochs.get(profileId),
       localEpoch = this.localEpochs.get(profileId),
       manifest = await readManifest(directory);
+    externalGuard();
     this._profile(profileId);
     if (epoch !== this.epochs.get(profileId) || localEpoch !== this.localEpochs.get(profileId))
       throw new Error('Stale local installation');
@@ -776,20 +791,31 @@ class ExtensionManager {
         .publicKey.export({ format: 'der', type: 'spki' })
         .toString('base64');
     const id = idFromKey(Buffer.from(publicKey, 'base64'));
-    return this._run(profileId, id, async (context) => {
-      if (this.list(profileId).some((item) => item.id === id))
-        throw new Error('Extension is already installed');
-      const version = await this._stage(context, {
-        sourceDirectory: directory,
-        publicKey,
-        source: { kind: 'local-unpacked', portable: false },
-      });
-      try {
-        return await this._install(context, version);
-      } finally {
-        await this._discard(context, version);
-      }
-    });
+    return this._run(
+      profileId,
+      id,
+      async (context) => {
+        if (this.list(profileId).some((item) => item.id === id))
+          throw new Error('Extension is already installed');
+        const version = await this._stage(context, {
+          sourceDirectory: directory,
+          publicKey,
+          source: { kind: 'local-unpacked', portable: false },
+        });
+        try {
+          return await this._install(context, version);
+        } finally {
+          await this._discard(context, version);
+        }
+      },
+      (context) => {
+        const extensionGuard = context.externalGuard;
+        context.externalGuard = () => {
+          externalGuard();
+          extensionGuard();
+        };
+      },
+    );
   }
   update(profileId, id) {
     return this._run(profileId, id, async (context) => {
@@ -990,6 +1016,63 @@ class ExtensionManager {
       }
       await this._discard(context, record.current);
       return result;
+    });
+  }
+  changePermissions(profileId, id, requested) {
+    return this._run(profileId, id, async (context) => {
+      const record = this.list(profileId).find((item) => item.id === id);
+      if (!record?.enabled || record.current.legacyPath)
+        throw new Error('Native permission rebuild requires an enabled adapted extension');
+      const { permissionDetails } = require('./permissions.cjs');
+      const grants = permissionDetails(requested),
+        inspection = record.current.inspection;
+      for (const key of ['permissions', 'origins']) {
+        if (inspection.required[key].some((value) => !grants[key].includes(value)))
+          throw new Error('Required permissions cannot be removed');
+        if (
+          grants[key].some(
+            (value) =>
+              ![...inspection.required[key], ...inspection.optional[key]].includes(value) ||
+              inspection.unsupported.some((item) => item.capability === value),
+          )
+        )
+          throw new Error('Unsupported or undeclared permission');
+      }
+      if (JSON.stringify(grants) === JSON.stringify(record.grants)) return record;
+      await this._checkVersion(context, record.current);
+      let version;
+      try {
+        version = await this._stage(context, {
+          sourceDirectory: this.versionPath(profileId, record.current, 'original'),
+          publicKey: record.current.publicKey,
+          source: record.source,
+        });
+        const manifest = version.effectiveManifest;
+        manifest.permissions = [
+          ...grants.permissions,
+          ...(manifest.manifest_version === 2 ? grants.origins : []),
+        ];
+        if (manifest.manifest_version === 3) manifest.host_permissions = grants.origins;
+        manifest.optional_permissions = [];
+        manifest.optional_host_permissions = [];
+        await fs.writeFile(
+          path.join(this.versionPath(profileId, version), 'manifest.json'),
+          JSON.stringify(manifest, null, 2) + '\n',
+        );
+        if (record.current.verification?.signatureVerified)
+          await fs.copyFile(
+            this.versionPath(profileId, record.current, 'original.crx'),
+            this.versionPath(profileId, version, 'original.crx'),
+          );
+        version.verification = clone(record.current.verification);
+        version.sha256 = record.current.sha256;
+        version.derivedSha256 = await treeHash(this.versionPath(profileId, version), context.signal);
+        this._guard(context);
+        return await this._activate(context, record, version, { grants });
+      } catch (error) {
+        await this._discard(context, version);
+        throw error;
+      }
     });
   }
   async checkUpdates(profileId, { force = false } = {}) {

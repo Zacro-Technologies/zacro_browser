@@ -3,7 +3,6 @@
 const API_PERMISSIONS = new Set([
   'storage',
   'tabs',
-  'activeTab',
   'scripting',
   'contextMenus',
   'webRequest',
@@ -78,8 +77,17 @@ function inspectManifest(manifest) {
       unsupported.push({
         capability: permission,
         required: true,
-        reason: 'This API is not supported by the current extension host.',
+        reason:
+          permission === 'activeTab'
+            ? 'Electron cannot grant native one-tab temporary host access; activeTab is unsupported.'
+            : 'This API is not supported by the current extension host.',
       });
+  if (manifest.manifest_version === 2 && required.permissions.includes('scripting'))
+    unsupported.push({
+      capability: 'scripting',
+      required: true,
+      reason: 'Native scripting is available only to Manifest V3 extensions.',
+    });
   for (const origin of required.origins)
     if (!supportedHost(origin))
       unsupported.push({
@@ -94,6 +102,12 @@ function inspectManifest(manifest) {
         required: false,
         reason: 'This optional API cannot be granted.',
       });
+  if (manifest.manifest_version === 2 && optional.permissions.includes('scripting'))
+    unsupported.push({
+      capability: 'scripting',
+      required: false,
+      reason: 'Native scripting is available only to Manifest V3 extensions.',
+    });
   for (const origin of optional.origins)
     if (!supportedHost(origin))
       unsupported.push({

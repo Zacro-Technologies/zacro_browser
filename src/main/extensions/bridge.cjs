@@ -15,32 +15,7 @@ function extensionId(url) {
   }
 }
 
-function permitsOrigin(pattern, url) {
-  try {
-    const target = new URL(url);
-    if (!['http:', 'https:'].includes(target.protocol)) return false;
-    if (pattern === '<all_urls>') return true;
-    const match = /^(\*|https?):\/\/(\*|\*\.[^/]+|[^/]+)(\/.*)$/.exec(pattern);
-    if (!match || (match[1] !== '*' && target.protocol !== match[1] + ':')) return false;
-    const host = match[2];
-    if (
-      host !== '*' &&
-      target.hostname !== host &&
-      !(
-        host.startsWith('*.') &&
-        (target.hostname === host.slice(2) || target.hostname.endsWith(host.slice(1)))
-      )
-    )
-      return false;
-    const expression = match[3]
-      .split('*')
-      .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
-      .join('.*');
-    return new RegExp('^' + expression + '$').test(target.pathname + target.search);
-  } catch {
-    return false;
-  }
-}
+const { matches: permitsOrigin } = require('./permissions.cjs');
 
 class ExtensionBridge {
   constructor({ resolveExtension, dispatch }) {
@@ -69,7 +44,7 @@ class ExtensionBridge {
       entry.revoked.add(extension.id);
       entry.epochs.set(extension.id, (entry.epochs.get(extension.id) || 0) + 1);
       for (const [key, lease] of this.leases)
-        if (lease.session === session && lease.extensionId === extension.id) this.leases.delete(key);
+        if (lease.session === session && lease.extensionId === extension.id) this.releaseLease(key);
       for (const origin of this.origins.values())
         if (origin.session === session && origin.extensionId === extension.id) origin.revoke();
       const broker = entry.brokers.get(extension.id);
@@ -207,10 +182,18 @@ class ExtensionBridge {
     this.origins.set(token, origin);
     const revoke = () => {
       this.origins.delete(token);
-      contents.off('did-start-navigation', revoke);
+      contents.off('did-start-navigation', navigating);
       contents.off('destroyed', revoke);
     };
-    contents.once('did-start-navigation', revoke);
+    const navigating = (details, _url, _inPlace, isMainFrame, processId, routingId) => {
+      if (
+        (details.isMainFrame ?? isMainFrame) ||
+        ((details.frameProcessId ?? processId) === frame.processId &&
+          (details.frameRoutingId ?? routingId) === frame.routingId)
+      )
+        revoke();
+    };
+    contents.on('did-start-navigation', navigating);
     contents.once('destroyed', revoke);
     origin.revoke = revoke;
     return { originToken: token, tabId: contents.id, documentId: sender.documentId };
@@ -261,6 +244,7 @@ class ExtensionBridge {
       profileId: entry.profileId,
       extensionId: id,
       sender,
+      sourceContents: worker ? undefined : event.sender,
       session,
       kind,
       url,
@@ -270,12 +254,39 @@ class ExtensionBridge {
     };
   }
 
+  releaseLease(token) {
+    const lease = this.leases.get(token);
+    if (!lease) return;
+    this.leases.delete(token);
+    lease.cleanup?.();
+  }
+
   async handle(event, request) {
     const context = this.authenticate(event);
     if (!request || typeof request !== 'object') throw new Error('Invalid transport request');
     if (request.operation === 'connect') {
       const token = randomUUID();
       this.leases.set(token, context);
+      if (context.sourceContents) {
+        const contents = context.sourceContents,
+          frame = context.sender;
+        const gone = () => this.releaseLease(token);
+        const navigation = (details, _url, inPlace, isMainFrame, processId, routingId) => {
+          if (details.isSameDocument ?? inPlace) return;
+          if (
+            (details.isMainFrame ?? isMainFrame) ||
+            ((details.frameProcessId ?? processId) === frame.processId &&
+              (details.frameRoutingId ?? routingId) === frame.routingId)
+          )
+            gone();
+        };
+        contents.on('did-start-navigation', navigation);
+        contents.once('destroyed', gone);
+        context.cleanup = () => {
+          contents.off('did-start-navigation', navigation);
+          contents.off('destroyed', gone);
+        };
+      }
       return token;
     }
     const lease = this.leases.get(request.token);
@@ -316,8 +327,23 @@ class ExtensionBridge {
       origin = this.origins.get(request.originToken);
       this.validateOrigin(origin, context);
     } else if (request.operation !== 'invoke') throw new Error('Invalid transport operation');
+    const assertCurrent = () => {
+      const current = this.authenticate(event);
+      if (
+        this.leases.get(request.token) !== lease ||
+        current.generation !== lease.generation ||
+        current.epoch !== lease.epoch ||
+        current.url !== lease.url
+      )
+        throw new Error('Expired extension context');
+      if (origin) {
+        if (!this.origins.has(request.originToken)) throw new Error('Expired originating context');
+        this.validateOrigin(origin, current);
+      }
+    };
+    assertCurrent();
     const result = await this.dispatch(
-      Object.freeze(origin ? { ...origin, metadata: context.metadata } : context),
+      Object.freeze({ ...(origin ? { ...origin, metadata: context.metadata } : context), assertCurrent }),
       request.method,
       request.args,
     );
@@ -336,11 +362,57 @@ class ExtensionBridge {
     return result;
   }
 
+  emit(profileId, id, event, args, { filter = () => true } = {}) {
+    if (this.closed || typeof event !== 'string' || !Array.isArray(args)) return;
+    const current = (context) => {
+      const metadata = this.resolveExtension(profileId, id),
+        entry = this.sessions.get(context.session);
+      if (
+        context.profileId !== profileId ||
+        context.extensionId !== id ||
+        !metadata?.enabled ||
+        metadata.generation !== context.generation ||
+        !entry ||
+        entry.revoked.has(id) ||
+        (entry.epochs.get(id) !== undefined && entry.epochs.get(id) !== context.epoch)
+      )
+        return null;
+      if (context.kind === 'content-script' && event !== 'storage.onChanged') return null;
+      const next = { ...context, metadata };
+      return filter(next) === true ? next : null;
+    };
+    for (const [token, context] of this.leases) {
+      try {
+        const next = current(context);
+        if (!next || context.url.endsWith('/zacro-compat-transport.html')) continue;
+        if (
+          context.kind === 'service-worker'
+            ? context.sender.isDestroyed()
+            : context.sender.detached || context.sender.url !== context.url
+        )
+          continue;
+        context.sender.send(CHANNEL + ':event', { token, event, args });
+      } catch {
+        /* Destroyed contexts are not event destinations. */
+      }
+    }
+    for (const [originToken, context] of this.origins) {
+      try {
+        const next = current(context);
+        if (!next) continue;
+        this.validateOrigin(context, next);
+        context.broker.webContents.mainFrame.send(CHANNEL + ':event', { originToken, event, args });
+      } catch {
+        /* A revoked native document receives no notification. */
+      }
+    }
+  }
+
   close() {
     if (this.closed) return;
     this.closed = true;
     ipcMain.removeHandler(CHANNEL);
-    this.leases.clear();
+    for (const token of this.leases.keys()) this.releaseLease(token);
     for (const origin of this.origins.values()) origin.revoke();
     this.origins.clear();
     for (const [session, entry] of this.sessions) {

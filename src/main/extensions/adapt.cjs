@@ -4,7 +4,7 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { parse } = require('parse5');
-const TRANSFORM_VERSION = 2;
+const TRANSFORM_VERSION = 3;
 const BOOTSTRAP = 'zacro-compat-bootstrap.js';
 
 async function adaptExtension(source, destination, { publicKey } = {}) {
@@ -101,6 +101,32 @@ async function adaptExtension(source, destination, { publicKey } = {}) {
       ? Math.min(...positions)
       : (head?.sourceCodeLocation?.endTag?.startOffset ?? body?.sourceCodeLocation?.startTag?.endOffset);
     if (!Number.isInteger(position)) throw new Error('Background HTML has no safe bootstrap insertion point');
+    await fs.writeFile(
+      filename,
+      html.slice(0, position) + '<script src="/zacro-compat-bootstrap.js"></script>' + html.slice(position),
+    );
+  }
+  // Extension documents have the same facade before their first executable
+  // script. Include ordinary popup/options and nested HTML resources, not only
+  // the manifest's initial view; original bytes outside insertion stay intact.
+  for (const name of await fs.readdir(destination, { recursive: true })) {
+    if (!/\.html?$/i.test(name) || name === 'zacro-compat-transport.html' || name === background?.page)
+      continue;
+    const filename = path.join(destination, name);
+    if (!(await fs.stat(filename)).isFile()) continue;
+    const html = await fs.readFile(filename, 'utf8'),
+      document = parse(html, { sourceCodeLocationInfo: true });
+    let position;
+    const visit = (node) => {
+      if (node.tagName === 'script' && Number.isInteger(node.sourceCodeLocation?.startOffset))
+        position = Math.min(position ?? Infinity, node.sourceCodeLocation.startOffset);
+      for (const child of node.childNodes || []) visit(child);
+    };
+    visit(document);
+    if (!Number.isInteger(position))
+      position =
+        document.childNodes.find((node) => node.nodeName === '#documentType')?.sourceCodeLocation
+          ?.endOffset || 0;
     await fs.writeFile(
       filename,
       html.slice(0, position) + '<script src="/zacro-compat-bootstrap.js"></script>' + html.slice(position),

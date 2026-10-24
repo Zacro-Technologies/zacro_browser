@@ -36,8 +36,17 @@ contextBridge.executeInMainWorld({
       });
       bound.catch(() => {});
       let disconnected = false;
+      const unsubscribe = transport.onEvent((message) => {
+        bound
+          .then((token) => {
+            if (!disconnected && message.originToken === token)
+              port.postMessage({ event: message.event, args: message.args });
+          })
+          .catch(() => {});
+      });
       port.onDisconnect.addListener(() => {
         disconnected = true;
+        unsubscribe();
         bound.then((token) => transport.release(token)).catch(() => {});
       });
       port.onMessage.addListener(async (message) => {
@@ -61,6 +70,11 @@ contextBridge.executeInMainWorld({
   },
   args: [
     {
+      onEvent(listener) {
+        const handler = (_event, message) => listener(message);
+        ipcRenderer.on(channel + ':event', handler);
+        return () => ipcRenderer.removeListener(channel + ':event', handler);
+      },
       async bind(runtimeSender) {
         return ipcRenderer.invoke(channel, { operation: 'bind', token: await connected, runtimeSender });
       },
