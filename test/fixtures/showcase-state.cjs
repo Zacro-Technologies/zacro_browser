@@ -105,7 +105,7 @@ function createShowcaseState(localUrl) {
       visitedAt: now - 300000,
     },
   ];
-  state.settings = { ...state.settings, theme: 'light', archiveAfterHours: 0, sidebarWidth: 230 };
+  state.settings = { ...state.settings, theme: 'light', archiveAfterHours: 0, sidebarWidth: 224 };
   return state;
 }
 

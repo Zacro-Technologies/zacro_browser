@@ -207,7 +207,8 @@ test('macOS uses native window chrome, menu conventions and keyboard navigation'
       );
     assert.equal(native.menu.find((item) => item.id === 'preferences')?.accelerator, 'Command+,');
     assert.equal(native.menu.find((item) => item.id === 'close-window')?.accelerator, 'Command+Shift+W');
-    assert((await b.shell.locator('.space-picker').boundingBox()).x >= 88);
+    assert((await b.shell.locator('[data-key="sidebar-toggle"]').boundingBox()).x >= 88);
+    assert((await b.shell.locator('.space-picker').boundingBox()).x < 30);
     await b.shell.screenshot({ path: path.join(results, `mac-${process.arch}-shell.png`) });
     // Only capture the disposable CI desktop; local developers may have personal
     // windows visible. Native window controls are outside the shell screenshot.
@@ -279,7 +280,7 @@ test('macOS uses native window chrome, menu conventions and keyboard navigation'
     );
     await b.invoke('window:fullscreen');
     await expect(b.shell.locator('html')).toHaveAttribute('data-fullscreen', 'false', { timeout: 15000 });
-    assert((await b.shell.locator('.space-picker').boundingBox()).x >= 88);
+    assert((await b.shell.locator('[data-key="sidebar-toggle"]').boundingBox()).x >= 88);
   } catch (error) {
     const diagnostics = await b.app
       .evaluate(({ BrowserWindow, webContents }) => ({

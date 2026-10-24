@@ -161,13 +161,16 @@ test(
         })),
       };
     });
-    assert.equal(geometry.sidebarWidth, 230);
-    assert(geometry.rows[0].top < geometry.viewportHeight / 5, 'The first tab belongs in the upper fifth');
-    assert(geometry.rows.every((row) => row.height <= 36 && row.bottom < geometry.footerTop));
+    assert.equal(geometry.sidebarWidth, 224);
+    assert(
+      geometry.rows[0].top <= 190,
+      'Navigation, favorites and a folder must leave the working tabs near the top',
+    );
+    assert(geometry.rows.every((row) => row.height === 32 && row.bottom < geometry.footerTop));
     for (const favorite of geometry.favorites) {
       assert.match(favorite.name, /^Favorite [1-4]$/);
       assert(favorite.title.includes(base), 'Icon-only favorites retain a full destination tooltip');
-      assert(favorite.height >= 40 && favorite.height <= 44);
+      assert.equal(favorite.height, 40);
       assert.equal(favorite.labels, 0);
     }
     await shell.locator(`[data-key="folder-${folder.id}"]`).click();
@@ -197,11 +200,11 @@ test(
           ? { id: view.webContents.id, ...view.getBounds(), viewport: window.getContentSize() }
           : null;
       }, url);
-    await expect.poll(async () => (await surface())?.x).toBe(230);
+    await expect.poll(async () => (await surface())?.x).toBe(224);
     const before = await surface();
     const loads = requests.get('/sidebar-draft');
-    assert.equal(before.y, 44);
-    assert.equal(before.width, before.viewport[0] - 230 - 8);
+    assert.equal(before.y, process.platform === 'darwin' ? 8 : 36);
+    assert.equal(before.width, before.viewport[0] - 224 - 8);
     await browser.app.evaluate(({ webContents }, url) => {
       const contents = webContents.getAllWebContents().find((item) => item.getURL() === url);
       contents.focus();
@@ -213,8 +216,8 @@ test(
     await expect(restore).toBeVisible();
     await expect.poll(async () => (await surface())?.x).toBe(8);
     const expanded = await surface();
-    assert.equal(expanded.y, 44);
-    assert.equal(expanded.width, before.width + 222);
+    assert.equal(expanded.y, 40);
+    assert.equal(expanded.width, before.width + 216);
     assert.equal(expanded.id, before.id);
     await expect
       .poll(() => browser.guest(url, 'document.hasFocus() && document.activeElement.id'))
@@ -222,7 +225,7 @@ test(
     assert.equal(await browser.guest(url, 'document.getElementById("draft").value'), 'A draft worth keeping');
     await restore.click();
     await expect(shell.locator('#sidebar')).toBeVisible();
-    await expect.poll(async () => (await surface())?.x).toBe(230);
+    await expect.poll(async () => (await surface())?.x).toBe(224);
     assert.equal((await surface()).width, before.width);
     assert.equal(requests.get('/sidebar-draft'), loads, 'Changing chrome never reloads the page');
     assert.equal(await browser.guest(url, 'document.getElementById("draft").value'), 'A draft worth keeping');
@@ -237,7 +240,7 @@ test(
     const library = shell.getByRole('button', { name: 'Library', exact: true });
     await library.click();
     const menu = shell.getByRole('dialog', { name: 'Library', exact: true });
-    await expect(menu.getByRole('button')).toHaveCount(4);
+    await expect(menu.getByRole('button')).toHaveCount(6);
     await menu.getByRole('button', { name: 'Bookmarks', exact: true }).click();
     const navigation = shell.getByRole('navigation', { name: 'Library sections' });
     await expect(navigation.getByRole('button')).toHaveCount(4);
@@ -313,7 +316,7 @@ test(
         return original.call(this, action, payload);
       };
     });
-    await shell.getByRole('button', { name: 'Settings', exact: true }).click();
+    await openLibrarySection(shell, 'settings');
     await expect(shell.locator('select[data-setting="theme"]')).toBeVisible();
     const disclosures = shell.locator('#side-panel details');
     await expect(disclosures).toHaveCount(4);
@@ -601,7 +604,11 @@ test(
     await shell.keyboard.press('Escape');
     await expect(shell.locator('#side-panel')).toBeHidden();
     await expect(library).toBeFocused();
-    const settings = shell.locator('[data-key="panel-settings"]');
+    await library.focus();
+    await shell.keyboard.press('Enter');
+    const settings = shell
+      .getByRole('dialog', { name: 'Library', exact: true })
+      .locator('[data-key="panel-settings"]');
     await settings.focus();
     await shell.keyboard.press('Enter');
     await expect
@@ -610,7 +617,7 @@ test(
       )
       .toBe(true);
     await shell.keyboard.press('Escape');
-    await expect(settings).toBeFocused();
+    await expect(library).toBeFocused();
   },
 );
 
@@ -621,7 +628,7 @@ test(
     const browser = await launch(t);
     const { shell } = browser;
     await shell.emulateMedia({ reducedMotion: 'reduce', colorScheme: 'light' });
-    await shell.locator('[data-key="panel-settings"]').click();
+    await openLibrarySection(shell, 'settings');
     const appearance = shell.locator('select[data-setting="theme"]');
     for (const theme of ['light', 'dark']) {
       await appearance.selectOption(theme);
@@ -643,26 +650,49 @@ test(
             b = luminance(background);
           return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
         };
-        const background = (element) => {
+        const backgrounds = (element) => {
           const ancestors = [];
           while (element) {
             ancestors.unshift(element);
             element = element.parentElement;
           }
-          context.fillStyle = '#fff';
-          context.fillRect(0, 0, 1, 1);
+          let candidates = [[255, 255, 255]];
           for (const ancestor of ancestors) {
-            context.fillStyle = getComputedStyle(ancestor).backgroundColor;
-            context.fillRect(0, 0, 1, 1);
+            const style = getComputedStyle(ancestor);
+            // Test every gradient endpoint, including alpha compositing, so
+            // the weakest painted background still meets the text threshold.
+            const stops =
+              style.backgroundImage === 'none'
+                ? []
+                : style.backgroundImage.match(/color\([^)]+\)|rgba?\([^)]+\)|#[\da-f]{3,8}\b/gi) || [];
+            if (style.backgroundImage !== 'none' && !stops.length)
+              throw new Error(`Unsupported contrast background: ${style.backgroundImage}`);
+            candidates = candidates.flatMap((behind) =>
+              (stops.length ? stops : [null]).map((stop) => {
+                context.fillStyle = `rgb(${behind.join(',')})`;
+                context.fillRect(0, 0, 1, 1);
+                context.fillStyle = style.backgroundColor;
+                context.fillRect(0, 0, 1, 1);
+                if (stop) {
+                  context.fillStyle = stop;
+                  context.fillRect(0, 0, 1, 1);
+                }
+                return pixel();
+              }),
+            );
           }
-          return pixel();
+          return candidates;
         };
         return ['.space-title', '.new-tab', '.provider-note', '.setting-section h3'].map((selector) => {
           const element = document.querySelector(selector);
-          const behind = background(element);
-          context.fillStyle = getComputedStyle(element).color;
-          context.fillRect(0, 0, 1, 1);
-          return { selector, ratio: ratio(pixel(), behind) };
+          const values = backgrounds(element).map((behind) => {
+            context.fillStyle = `rgb(${behind.join(',')})`;
+            context.fillRect(0, 0, 1, 1);
+            context.fillStyle = getComputedStyle(element).color;
+            context.fillRect(0, 0, 1, 1);
+            return ratio(pixel(), behind);
+          });
+          return { selector, ratio: Math.min(...values) };
         });
       });
       for (const sample of contrast)
@@ -1056,7 +1086,7 @@ test(
       true,
     );
     await shell.keyboard.press('Escape');
-    await shell.locator('[data-key="panel-settings"]').click();
+    await openLibrarySection(shell, 'settings');
     const toggle = shell.locator('input[data-setting="restoreSession"]');
     assert.equal(await toggle.evaluate((element) => getComputedStyle(element).appearance), 'auto');
     await shell.keyboard.press('Tab');
@@ -1107,7 +1137,8 @@ test(
     const opening = await shell.evaluate(() => {
       const panel = document.querySelector('#side-panel');
       document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
-      document.querySelector('[data-key="panel-settings"]').focus();
+      document.querySelector('[data-key="library"]').focus();
+      document.querySelector('[data-key="library"]').click();
       document.querySelector('[data-key="panel-settings"]').click();
       const animations = panel.getAnimations();
       // Hold this real transition so the OS preference switches while it runs.
@@ -1129,7 +1160,7 @@ test(
       return document.querySelector('#side-panel').hidden;
     });
     assert(closedImmediately, 'Closing a panel must restore layout without waiting for an outro');
-    await expect(shell.getByRole('button', { name: 'Settings', exact: true })).toBeFocused();
+    await expect(shell.getByRole('button', { name: 'Library', exact: true })).toBeFocused();
   },
 );
 
@@ -1275,7 +1306,7 @@ test(
         return original.call(this, action, payload);
       };
     });
-    await shell.locator('[data-key="panel-ai"]').click();
+    await openLibrarySection(shell, 'ai');
     await expect(shell.getByRole('button', { name: 'Connect Codex', exact: true })).toBeVisible();
     await shell.getByRole('button', { name: 'Connect Codex', exact: true }).click();
     await expect(shell.getByRole('button', { name: 'Sign in with ChatGPT', exact: true })).toBeVisible();
@@ -1304,7 +1335,7 @@ test(
     });
     await expect(shell.getByLabel('Model', { exact: true })).toHaveValue('fixture-one');
     await expect(shell.getByRole('button', { name: 'Sign out', exact: true })).toBeVisible();
-    await shell.locator('[data-key="panel-ai"]').click();
+    await openLibrarySection(shell, 'ai');
     await shell.locator('#ai-question').fill('Keep this follow-up draft');
     await shell.locator('#ai-question').focus();
     await shell.evaluate(() => {
@@ -1466,11 +1497,11 @@ test(
       ),
       2,
     );
-    await shell.locator('[data-key="panel-settings"]').click();
+    await openLibrarySection(shell, 'settings');
     await shell.locator('#ai-settings summary').click();
     await shell.getByRole('button', { name: 'Sign out', exact: true }).click();
     await expect(shell.getByRole('button', { name: 'Sign in with ChatGPT', exact: true })).toBeVisible();
-    await shell.locator('[data-key="panel-ai"]').click();
+    await openLibrarySection(shell, 'ai');
     await expect(shell.locator('.message')).toHaveCount(0);
     await expect(shell.locator('#ai-form')).toHaveCount(0);
     const calls = await browser.app.evaluate(() => globalThis.__subscriptionActions);

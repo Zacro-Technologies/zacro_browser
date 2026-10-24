@@ -23,7 +23,7 @@ test(
     });
     const shell = await app.firstWindow();
     await shell.emulateMedia({ reducedMotion: 'no-preference' });
-    await expect(shell.locator('[data-key="panel-settings"]')).toBeVisible();
+    await expect(shell.locator('[data-key="library"]')).toBeVisible();
     await shell.evaluate(() => {
       window.motionSamples = [];
       const animate = Element.prototype.animate;
@@ -38,7 +38,8 @@ test(
     // Stretch an entrance: closing must still release the layout and focus in
     // the click turn rather than waiting for the visual animation's promise.
     const close = await shell.evaluate(() => {
-      document.querySelector('[data-key="panel-settings"]').focus();
+      document.querySelector('[data-key="library"]').focus();
+      document.querySelector('[data-key="library"]').click();
       document.querySelector('[data-key="panel-settings"]').click();
       const panel = document.querySelector('#side-panel');
       const entrance = panel.getAnimations();
@@ -54,13 +55,17 @@ test(
     assert(close.entered > 0);
     assert(close.hidden);
     assert.equal(close.layoutOpen, 'false');
-    assert.equal(close.focus, 'panel-settings');
+    assert.equal(close.focus, 'library');
 
     const rapid = await shell.evaluate(() => {
-      document.querySelector('[data-key="panel-settings"]').click();
-      document.querySelector('[data-key="panel-ai"]').click();
+      const open = (panel) => {
+        document.querySelector('[data-key="library"]').click();
+        document.querySelector(`[data-key="panel-${panel}"]`).click();
+      };
+      open('settings');
+      open('ai');
       document.querySelector('[data-key="panel-close"]').click();
-      document.querySelector('[data-key="panel-settings"]').click();
+      open('settings');
       return {
         title: document.querySelector('#panel-title').textContent,
         hidden: document.querySelector('#side-panel').hidden,
@@ -143,6 +148,7 @@ test(
     assert(samples.every((sample) => sample.duration >= 100 && sample.duration <= 170 && sample.delay === 0));
 
     await shell.emulateMedia({ reducedMotion: 'reduce' });
+    await shell.locator('[data-key="library"]').click();
     await shell.locator('[data-key="panel-settings"]').click();
     await expect(shell.locator('#panel-title')).toBeFocused();
     const reduced = await shell.evaluate(() => ({

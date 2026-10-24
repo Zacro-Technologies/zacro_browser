@@ -9,36 +9,56 @@ const {
   restoreWindowPlacement,
 } = require('../src/main/layout.cjs');
 
-test('native pages align with shell toolbar, sidebar, and open panels without fractional seams', () => {
+test('native pages align with compact chrome, sidebar, and open panels without fractional seams', () => {
   const layout = browserLayout({ width: 1441, height: 941, sidebarWidth: 260, panelWidth: 400, split: true });
-  assert.deepEqual(layout.primary, { x: 260, y: 44, width: 379, height: 889 });
-  assert.deepEqual(layout.secondary, { x: 645, y: 44, width: 380, height: 889 });
+  assert.deepEqual(layout.primary, { x: 260, y: 36, width: 379, height: 897 });
+  assert.deepEqual(layout.secondary, { x: 645, y: 36, width: 380, height: 897 });
   assert.equal(layout.secondary.x + layout.secondary.width + 400 + 16, 1441);
   assert.equal(layout.secondary.x - layout.primary.x - layout.primary.width, 6);
-  assert.deepEqual(layout.peek, { x: 296, y: 96, width: 693, height: 801 });
+  assert.deepEqual(layout.peek, { x: 284, y: 92, width: 717, height: 817 });
 });
 
 test('hiding the sidebar reclaims its width while keeping the page, panel and split frame aligned', () => {
-  const full = browserLayout({ width: 1000, height: 700, sidebarWidth: 0 });
-  assert.deepEqual(full.primary, { x: 8, y: 44, width: 984, height: 648 });
+  const full = browserLayout({ width: 1000, height: 700, sidebarWidth: 0, contentTop: 40 });
+  assert.deepEqual(full.primary, { x: 8, y: 40, width: 984, height: 652 });
   assert.equal(full.secondary, null);
-  assert.deepEqual(full.peek, { x: 44, y: 96, width: 912, height: 560 });
+  assert.deepEqual(full.peek, { x: 32, y: 96, width: 936, height: 572 });
 
   const split = browserLayout({
     width: 1000,
     height: 700,
     sidebarWidth: 0,
+    contentTop: 40,
     panelWidth: 360,
     split: true,
   });
-  assert.deepEqual(split.primary, { x: 8, y: 44, width: 305, height: 648 });
-  assert.deepEqual(split.secondary, { x: 319, y: 44, width: 305, height: 648 });
+  assert.deepEqual(split.primary, { x: 8, y: 40, width: 305, height: 652 });
+  assert.deepEqual(split.secondary, { x: 319, y: 40, width: 305, height: 652 });
   assert.equal(split.secondary.x + split.secondary.width + 360 + 16, 1000);
-  assert.deepEqual(split.peek, { x: 44, y: 96, width: 544, height: 560 });
+  assert.deepEqual(split.peek, { x: 32, y: 96, width: 568, height: 572 });
 
   const restored = browserLayout({ width: 1000, height: 700, sidebarWidth: 300 });
   assert.equal(restored.primary.x, 300, 'A custom sidebar width remains available after focus mode');
-  assert.equal(browserLayout({ width: 1000, height: 700 }).primary.x, 230);
+  assert.equal(browserLayout({ width: 1000, height: 700 }).primary.x, 224);
+});
+
+test('sidebar navigation, caption rail and Find reserve only their supported content insets', () => {
+  for (const contentTop of [8, 36, 40]) {
+    const layout = browserLayout({ width: 1001, height: 701, sidebarWidth: 224, contentTop });
+    assert.equal(layout.primary.y, contentTop);
+    assert.equal(layout.primary.y + layout.primary.height, 693, 'The page retains its 8px bottom frame');
+    assert.equal(layout.peek.y, contentTop + 56, 'Peek has a 24px inset and 32px header');
+    assert.equal(layout.peek.y + layout.peek.height, 669, 'Peek ends 24px inside the page frame');
+  }
+  for (const contentTop of [-1, 0, 8.5, 44, 10000, NaN, Infinity])
+    assert.equal(browserLayout({ width: 1000, height: 700, contentTop }).primary.y, 36);
+  for (const [sidebarWidth, expected] of [
+    [100, 200],
+    [224, 224],
+    [300, 300],
+    [400, 380],
+  ])
+    assert.equal(browserLayout({ width: 1000, height: 700, sidebarWidth }).primary.x, expected);
 });
 
 test('resizing and malformed dimensions keep native bounds finite and positive', () => {

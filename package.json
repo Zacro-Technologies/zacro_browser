@@ -1,6 +1,6 @@
 {
   "name": "zacro-browser",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "A sidebar-first Chromium browser with Spaces, profiles, Peek, and optional AI.",
   "main": "src/main/main.cjs",
   "private": true,
@@ -24,7 +24,7 @@
     "prepack": "node scripts/prepare-runtime.cjs",
     "pack:mac": "node scripts/build-mac.cjs --dir",
     "dist:mac": "node scripts/build-mac.cjs",
-    "test:mac": "node --test --test-concurrency=1 test/e2e/mac.test.cjs test/e2e/browser.test.cjs test/e2e/platform-shell.test.cjs test/e2e/motion.test.cjs test/e2e/space-swipe.test.cjs test/e2e/security.test.cjs test/e2e/startup.test.cjs",
+    "test:mac": "node --test --test-concurrency=1 test/e2e/mac.test.cjs test/e2e/browser.test.cjs test/e2e/compact-layout.test.cjs test/e2e/platform-shell.test.cjs test/e2e/motion.test.cjs test/e2e/space-swipe.test.cjs test/e2e/security.test.cjs test/e2e/startup.test.cjs",
     "dist": "electron-builder --win nsis --x64",
     "predist": "node scripts/prepare-runtime.cjs",
     "dist:release": "node scripts/release.cjs",

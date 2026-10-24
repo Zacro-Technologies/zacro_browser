@@ -326,7 +326,11 @@ test(
   async (t) => {
     const b = await launch(t);
     const sidebar = b.page.locator('#sidebar');
-    await sidebar.getByRole('button', { name: 'New Space', exact: true }).click();
+    await sidebar.locator('[data-key="add-menu"]').click();
+    await b.page
+      .getByRole('dialog', { name: 'Add', exact: true })
+      .getByRole('button', { name: 'New Space', exact: true })
+      .click();
     const createSpace = b.page.getByRole('dialog', { name: 'New Space' });
     await createSpace.getByLabel('Space name', { exact: true }).fill('Research lab');
     await createSpace.getByRole('button', { name: 'Create Space', exact: true }).click();
@@ -337,7 +341,11 @@ test(
       })
       .toBe('Research lab');
     await expect(b.page.getByRole('dialog')).toHaveCount(0);
-    await sidebar.getByRole('button', { name: 'New folder', exact: true }).click();
+    await sidebar.locator('[data-key="add-menu"]').click();
+    await b.page
+      .getByRole('dialog', { name: 'Add', exact: true })
+      .getByRole('button', { name: 'New folder', exact: true })
+      .click();
     const createFolder = b.page.getByRole('dialog', { name: 'New folder' });
     await createFolder.getByLabel('Folder name', { exact: true }).fill('Evidence');
     await createFolder.getByRole('button', { name: 'Create folder', exact: true }).click();
@@ -369,7 +377,11 @@ test(
       .getByRole('button', { name: 'Pin to favorites', exact: true })
       .click();
     await expect.poll(async () => (await b.state()).tabs.find((tab) => tab.id === tabId)?.pinned).toBe(true);
-    await sidebar.getByRole('button', { name: 'Settings', exact: true }).click();
+    await sidebar.getByRole('button', { name: 'Library', exact: true }).click();
+    await b.page
+      .getByRole('dialog', { name: 'Library', exact: true })
+      .locator('[data-key="panel-settings"]')
+      .click();
     await b.page.locator('select[data-setting="searchEngine"]').selectOption('brave');
     await expect.poll(async () => (await b.state()).settings.searchEngine).toBe('brave');
     await b.page.locator('#side-panel summary').filter({ hasText: 'About Zacro' }).click();
@@ -377,5 +389,103 @@ test(
     await expect(b.page.getByRole('dialog', { name: 'About Zacro' })).toContainText('Chromium');
     await b.page.keyboard.press('Escape');
     await expect(b.page.getByRole('dialog')).toHaveCount(0);
+  },
+);
+
+test(
+  'compact menus stay beside their controls and keep bookmark and split workflows accessible',
+  { timeout: 60000 },
+  async (t) => {
+    const b = await launch(t);
+    const pageActions = b.page.locator('[data-key="page-menu"]');
+    const menuAtControl = async (control, title, placement) => {
+      const anchor = await control.boundingBox();
+      assert(anchor, `${title} must have a visible opener`);
+      await control.click();
+      const dialog = b.page.getByRole('dialog', { name: title, exact: true });
+      await expect(dialog).toBeVisible();
+      await expect
+        .poll(async () => {
+          const box = await dialog.boundingBox();
+          if (!box) return false;
+          const gap =
+            placement === 'above' ? anchor.y - box.y - box.height : box.y - anchor.y - anchor.height;
+          return gap >= 0 && gap <= 8;
+        })
+        .toBe(true);
+      const box = await dialog.boundingBox();
+      const viewport = await b.page.evaluate(() => ({ width: innerWidth, height: innerHeight }));
+      assert(box.x >= 8 && box.y >= 8, `${title} must stay inside the window`);
+      assert(box.x + box.width <= viewport.width - 8 && box.y + box.height <= viewport.height - 8);
+      assert(Math.abs(box.x - anchor.x) <= 8, `${title} must align to its sidebar opener`);
+      return dialog;
+    };
+
+    let menu = await menuAtControl(pageActions, 'Page actions', 'below');
+    await expect(menu.locator('[data-key="bookmark"]')).toBeDisabled();
+    await menu.focus();
+    await b.page.keyboard.press('ArrowDown');
+    await expect(menu.getByRole('button', { name: 'Split view', exact: true })).toBeFocused();
+    await b.page.keyboard.press('End');
+    await expect(menu.getByRole('button', { name: 'Zoom in', exact: true })).toBeFocused();
+    await b.page.keyboard.press('Home');
+    await expect(menu.getByRole('button', { name: 'Split view', exact: true })).toBeFocused();
+    await b.page.keyboard.press('ArrowUp');
+    await expect(menu.getByRole('button', { name: 'Zoom in', exact: true })).toBeFocused();
+    await b.page.keyboard.press('Escape');
+    await expect(pageActions).toBeFocused();
+
+    await b.navigate(`${base}/a`);
+    const first = (await b.state()).activeTabId;
+    await b.guest('window.menuMarker = "retained while menus open"', `${base}/a`);
+    menu = await menuAtControl(pageActions, 'Page actions', 'below');
+    const bookmark = menu.locator('[data-key="bookmark"]');
+    await bookmark.focus();
+    const focusedBookmark = await bookmark.elementHandle();
+    for (const saved of [true, false]) {
+      // Host changes can arrive after the menu opens. Reconcile this existing
+      // control without replacing it or stealing keyboard focus.
+      await b.invoke('bookmark:toggle');
+      await expect(bookmark).toHaveAttribute('aria-pressed', String(saved));
+      await expect(bookmark).toHaveText(saved ? /^Remove bookmark/ : /^Bookmark this page/);
+      await expect(bookmark).toBeFocused();
+      assert.equal(
+        await bookmark.evaluate((element, original) => element === original, focusedBookmark),
+        true,
+      );
+    }
+    await focusedBookmark.dispose();
+    await menu.getByRole('button', { name: /^Bookmark this page/ }).click();
+    await expect(b.page.getByRole('dialog')).toHaveCount(0);
+    await expect.poll(async () => (await b.state()).bookmarks.map((item) => item.url)).toEqual([`${base}/a`]);
+    menu = await menuAtControl(pageActions, 'Page actions', 'below');
+    await expect(menu.locator('[data-key="bookmark"]')).toHaveAttribute('aria-pressed', 'true');
+    await menu.getByRole('button', { name: /^Remove bookmark/ }).click();
+    await expect.poll(async () => (await b.state()).bookmarks.length).toBe(0);
+
+    menu = await menuAtControl(b.page.locator('[data-key="add-menu"]'), 'Add', 'above');
+    await menu.getByRole('button', { name: /^New tab(?:\s|$)/ }).click();
+    await expect(b.page.getByRole('dialog')).toHaveCount(0);
+    await expect.poll(async () => (await b.state()).activeTabId).not.toBe(first);
+    await b.navigate(`${base}/b`);
+    menu = await menuAtControl(pageActions, 'Page actions', 'below');
+    await menu.getByRole('button', { name: 'Split view', exact: true }).click();
+    await b.page
+      .getByRole('dialog', { name: 'Choose split view tab', exact: true })
+      .getByRole('button', { name: 'Page A', exact: true })
+      .click();
+    await expect.poll(async () => (await b.state()).runtime.splitTabId).toBe(first);
+    await expect(b.page.getByRole('dialog')).toHaveCount(0);
+    assert.equal(await b.guest('window.menuMarker', `${base}/a`), 'retained while menus open');
+
+    menu = await menuAtControl(pageActions, 'Page actions', 'below');
+    await menu.getByRole('button', { name: 'Close split view', exact: true }).click();
+    await expect.poll(async () => (await b.state()).runtime.splitTabId).toBe(null);
+
+    menu = await menuAtControl(b.page.locator('[data-key="library"]'), 'Library', 'above');
+    await menu.getByRole('button', { name: 'Bookmarks', exact: true }).click();
+    await expect(b.page.locator('#panel-title')).toHaveText('Bookmarks');
+    await b.page.keyboard.press('Escape');
+    await expect(b.page.locator('[data-key="library"]')).toBeFocused();
   },
 );

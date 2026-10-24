@@ -171,7 +171,7 @@ function onSpaceScroll(event) {
     event.ctrlKey ||
     event.metaKey ||
     event.altKey ||
-    event.target.closest('input, textarea, select, [contenteditable="true"]')
+    event.target.closest('#toolbar, input, textarea, select, [contenteditable="true"]')
   ) {
     interruptSpaceScroll();
     return;
@@ -232,9 +232,7 @@ function favicon(url, tabId) {
       (value) =>
         typeof value === 'string' && /^data:image\/(?:png|x-icon);base64,[A-Za-z0-9+/=]+$/.test(value),
     );
-  const domain = hostname(url);
-  const tone = [...domain].reduce((sum, char) => sum + char.charCodeAt(0), 0) % 6;
-  return `<span class="favicon favicon-tone-${tone}" aria-hidden="true">${data ? `<img src="${data}" alt="" draggable="false" data-fallback="${esc(domain.slice(0, 1).toUpperCase())}">` : esc(domain.slice(0, 1).toUpperCase())}</span>`;
+  return `<span class="favicon ${data ? '' : 'favicon-placeholder'}" aria-hidden="true">${data ? `<img src="${data}" alt="" draggable="false">` : icon('globe')}</span>`;
 }
 function dateLabel(time) {
   const d = new Date(time);
@@ -383,7 +381,7 @@ function restoreFocus(descriptor) {
   element?.focus({ preventScroll: true });
 }
 function isolateDialog(active) {
-  for (const selector of ['#sidebar', '#toolbar', '#workspace', '#side-panel', '#findbar'])
+  for (const selector of ['#sidebar', '#toolbar', '#captionbar', '#workspace', '#side-panel', '#findbar'])
     $(selector).inert = active;
 }
 function restoreFocusAround(callback) {
@@ -484,6 +482,7 @@ function render() {
     renderToolbar();
     renderWorkspace();
     renderPanel();
+    renderPageMenu();
   });
   syncLayout();
 }
@@ -528,16 +527,13 @@ function renderSidebar() {
     const page = state.runtime?.pages?.[tab.id];
     return `<div class="tab-row ${tab.id === state.activeTabId ? 'active' : ''}" draggable="true" data-tab-id="${esc(tab.id)}" data-drop-tab="${esc(tab.id)}"><button type="button" class="tab-main" data-action="tab:activate" data-id="${esc(tab.id)}" data-key="tab-${esc(tab.id)}" ${tab.id === state.activeTabId ? 'aria-current="page"' : ''} title="${esc(tab.title)} — ${esc(tab.url)}">${page?.loading ? '<span class="spinner"></span>' : favicon(tab.url)}<span class="title">${esc(tab.title || 'New tab')}</span>${state.runtime?.splitTabId === tab.id ? icon('split') : ''}</button>${page?.audible || page?.muted ? button('tab:mute', page.muted ? 'Unmute tab' : 'Mute tab', page.muted ? 'muted' : 'volume', `data-id="${esc(tab.id)}"`, 'tab-audio') : ''}${button('tab:close', `Close ${tab.title || 'tab'}`, 'close', `data-id="${esc(tab.id)}" data-key="close-${esc(tab.id)}"`, 'tab-close')}</div>`;
   };
-  $('#sidebar').innerHTML =
-    `<div class="brand space-header"><button type="button" class="brand-button" data-action="ui:menu" data-key="browser-menu" aria-label="Browser menu" title="Zacro menu">${mark}</button><button type="button" class="space-picker" data-action="ui:spaces" data-key="space-picker" aria-label="Switch Space or profile" title="${esc(space?.name)} · ${esc(profile?.name)}${profile?.private ? ' · Private session' : ''}">${profile?.private ? icon('shield') : ''}<span class="space-title">${esc(space?.name || 'My Space')}</span>${icon('down')}</button></div>
-    ${profile?.private ? '<div class="private-indicator">Private session</div>' : ''}
-    <div class="tabs-scroll">
+  $('#sidebar-content').innerHTML = `<div class="tabs-scroll">
     ${pins.length ? `<div class="favorites" aria-label="Pinned tabs">${pins.map((tab) => `<button type="button" class="favorite ${tab.id === state.activeTabId ? 'active' : ''}" draggable="true" data-tab-id="${esc(tab.id)}" data-action="tab:activate" data-id="${esc(tab.id)}" data-key="pin-${esc(tab.id)}" ${tab.id === state.activeTabId ? 'aria-current="page"' : ''} aria-label="${esc(tab.title || hostname(tab.url))}" title="${esc(tab.title)} — ${esc(tab.url)}">${favicon(tab.url, tab.id)}</button>`).join('')}</div>` : ''}
-    <div class="tabs-section-header"><button type="button" class="new-tab" data-action="ui:new-tab" data-key="new-tab">${icon('plus')}<span>New tab</span><kbd>${shortcut('Mod+T')}</kbd></button>${button('ui:new-folder', 'New folder', 'folderPlus', '', 'small-button')}</div>
+    <div class="space-header"><button type="button" class="space-picker" data-action="ui:spaces" data-key="space-picker" aria-label="Switch Space or profile" title="${esc(space?.name)} · ${esc(profile?.name)}${profile?.private ? ' · Private session' : ''}">${profile?.private ? icon('shield') : '<span class="space-color" aria-hidden="true"></span>'}<span class="space-title">${esc(space?.name || 'My Space')}</span>${profile?.private ? '<span class="private-indicator">Private</span>' : ''}${icon('down')}</button></div>
     ${folders
       .map(
         (folder) =>
-          `<div class="folder" data-folder-id="${esc(folder.id)}" data-drop-folder="${esc(folder.id)}"><button type="button" class="folder-heading" data-action="ui:folder-toggle" data-id="${esc(folder.id)}" data-key="folder-${esc(folder.id)}" aria-expanded="${!ui.closedFolders.has(folder.id)}">${icon('down')}${icon('folder')}<span class="truncate">${esc(folder.name)}</span><span class="folder-count">${tabs.filter((t) => t.folderId === folder.id).length}</span></button>${
+          `<div class="folder" data-folder-id="${esc(folder.id)}" data-drop-folder="${esc(folder.id)}"><button type="button" class="folder-heading" data-action="ui:folder-toggle" data-id="${esc(folder.id)}" data-key="folder-${esc(folder.id)}" aria-expanded="${!ui.closedFolders.has(folder.id)}"><span class="folder-icon">${icon('folder')}${icon('down')}</span><span class="truncate">${esc(folder.name)}</span><span class="folder-count">${tabs.filter((t) => t.folderId === folder.id).length}</span></button>${
             ui.closedFolders.has(folder.id)
               ? ''
               : `<div class="folder-tabs">${
@@ -549,8 +545,13 @@ function renderSidebar() {
           }</div>`,
       )
       .join('')}
+    <div class="tabs-section-header"><button type="button" class="new-tab" data-action="ui:new-tab" data-key="new-tab">${icon('plus')}<span>New tab</span><kbd>${shortcut('Mod+T')}</kbd></button></div>
     <div class="loose-tabs" data-drop-folder="">${loose.map(tabRow).join('')}</div></div>
-    <footer class="sidebar-footer">${button('ui:library', 'Library', 'library', 'data-key="library" aria-haspopup="dialog"')}<div class="space-dots" aria-label="Your Spaces">${spaces.map((s) => `<button type="button" class="space-dot ${s.id === space?.id ? 'active' : ''}" data-action="space:activate" data-id="${esc(s.id)}" title="${esc(s.name)}" aria-label="Switch to ${esc(s.name)}" ${s.id === space?.id ? 'aria-current="true"' : ''}>${esc(s.name.slice(0, 1).toUpperCase())}</button>`).join('')}${button('ui:new-space', 'New Space', 'plus', '', 'small-button')}</div>${button('ui:panel', 'Settings', 'settings', `data-panel="settings" data-key="panel-settings" aria-pressed="${ui.panel === 'settings'}"`)}</footer>`;
+    <footer class="sidebar-footer">${button('ui:library', 'Library', 'library', 'data-key="library" aria-haspopup="dialog"')}<div class="space-dots" aria-label="Your Spaces">${spaces.map((s) => `<button type="button" class="space-dot ${s.id === space?.id ? 'active' : ''}" data-action="space:activate" data-id="${esc(s.id)}" title="${esc(s.name)}" aria-label="Switch to ${esc(s.name)}" ${s.id === space?.id ? 'aria-current="true"' : ''}><span aria-hidden="true"></span></button>`).join('')}</div>${button('ui:add-menu', 'New tab, folder or Space', 'plus', 'data-key="add-menu" aria-haspopup="dialog"')}</footer>`;
+  for (const dot of $$('.space-dot')) {
+    const color = spaces.find((item) => item.id === dot.dataset.id)?.color;
+    if (/^#[\da-f]{6}$/i.test(color || '')) dot.style.setProperty('--dot-color', color);
+  }
   $('.tabs-scroll').scrollTop = scroll;
   if (!sameSpace) $('.space-dot.active')?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
   if (sameSpace)
@@ -592,13 +593,23 @@ function renderToolbar() {
     bookmarked,
     state.runtime?.splitTabId,
     state.runtime?.maximized,
+    state.runtime?.fullScreen,
     ui.panel,
     ui.sidebarHidden,
   ]);
   if (signature === ui.toolbarSignature) return;
   ui.toolbarSignature = signature;
+  const toolbar = $('#toolbar');
+  const parent = ui.sidebarHidden ? $('.main') : $('#sidebar');
+  if (toolbar.parentElement !== parent) parent.prepend(toolbar);
+  const controls =
+    !isMac && !state.runtime?.fullScreen
+      ? `<div class="window-controls">${button('window:minimize', 'Minimize', 'minimize')}${button('window:maximize', 'Maximize or restore', state.runtime?.maximized ? 'restore' : 'maximize')}${button('window:close', 'Close window', 'close', '', 'close-window')}</div>`
+      : '';
+  $('#captionbar').innerHTML = ui.sidebarHidden ? '' : controls;
+  $('#captionbar').hidden = ui.sidebarHidden || !controls;
   $('#toolbar').innerHTML =
-    `<div class="navigation">${button('ui:sidebar-toggle', `${ui.sidebarHidden ? 'Show' : 'Hide'} sidebar (${shortcut('Mod+Shift+B')})`, 'sidebar', `data-key="sidebar-toggle" aria-pressed="${!ui.sidebarHidden}"`)}${button('back', `Back (${shortcut(isMac ? 'Mod+[' : 'Alt+Left')})`, 'back', `data-key="back" ${page.canGoBack ? '' : 'disabled'}`)}${button('forward', `Forward (${shortcut(isMac ? 'Mod+]' : 'Alt+Right')})`, 'forward', `data-key="forward" ${page.canGoForward ? '' : 'disabled'}`)}${button(page.loading ? 'stop' : 'reload', page.loading ? 'Stop loading' : `Reload (${shortcut('Mod+R')})`, page.loading ? 'close' : 'reload', `data-key="reload" ${blank ? 'disabled' : ''}`)}</div><button type="button" class="address-button" data-action="ui:address" data-key="address" title="${esc(tab?.url || 'Search or enter a URL')}" aria-label="Address bar: ${esc(tab?.url || 'New tab')}">${icon(blank ? 'search' : secure ? 'lock' : 'globe')}<span class="address-text">${esc(blank ? 'Search or enter a URL' : displayURL(tab.url))}</span></button><div class="toolbar-actions">${button('bookmark:toggle', bookmarked ? 'Remove bookmark' : 'Bookmark this page', 'star', `data-key="bookmark" data-url="${esc(tab?.url || '')}" data-title="${esc(tab?.title || '')}" aria-pressed="${bookmarked}" ${blank ? 'disabled' : ''}`)}${button('ui:split', state.runtime?.splitTabId ? 'Close split view' : 'Split view', 'split', `data-key="split" aria-pressed="${Boolean(state.runtime?.splitTabId)}"`, 'optional')}${button('ui:panel', 'Ask Zacro', 'sparkle', `data-panel="ai" data-key="panel-ai" aria-pressed="${ui.panel === 'ai'}"`)}</div>${isMac ? '' : `<div class="window-controls" aria-label="Window controls">${button('window:minimize', 'Minimize', 'minimize')}${button('window:maximize', 'Maximize or restore', state.runtime?.maximized ? 'restore' : 'maximize')}${button('window:close', 'Close window', 'close', '', 'close-window')}</div>`}`;
+    `<div class="navigation">${!isMac ? `<button type="button" class="brand-button" data-action="ui:menu" data-key="browser-menu" aria-label="Browser menu" title="Zacro menu">${mark}</button>` : ''}${button('ui:sidebar-toggle', `${ui.sidebarHidden ? 'Show' : 'Hide'} sidebar (${shortcut('Mod+Shift+B')})`, 'sidebar', `data-key="sidebar-toggle" aria-pressed="${!ui.sidebarHidden}"`)}<span class="navigation-spacer"></span>${button('back', `Back (${shortcut(isMac ? 'Mod+[' : 'Alt+Left')})`, 'back', `data-key="back" ${page.canGoBack ? '' : 'disabled'}`)}${button('forward', `Forward (${shortcut(isMac ? 'Mod+]' : 'Alt+Right')})`, 'forward', `data-key="forward" ${page.canGoForward ? '' : 'disabled'}`)}${button(page.loading ? 'stop' : 'reload', page.loading ? 'Stop loading' : `Reload (${shortcut('Mod+R')})`, page.loading ? 'close' : 'reload', `data-key="reload" ${blank ? 'disabled' : ''}`)}</div><div class="address-row"><button type="button" class="address-button" data-action="ui:address" data-key="address" title="${esc(tab?.url || 'Search or enter a URL')}" aria-label="Address bar: ${esc(tab?.url || 'New tab')}">${icon(blank ? 'search' : secure ? 'lock' : 'globe')}<span class="address-text">${esc(blank ? 'Search or enter URL' : ui.sidebarHidden ? displayURL(tab.url) : hostname(tab.url))}</span></button>${button('ui:page-menu', 'Page actions', 'more', 'data-key="page-menu" aria-haspopup="dialog"')}</div>${ui.sidebarHidden ? controls : ''}`;
 }
 function renderWorkspace() {
   const tab = activeTab();
@@ -685,17 +696,26 @@ function syncLayout() {
   if (!state) return;
   const width = ui.sidebarHidden
     ? 0
-    : Math.max(210, Math.min(340, Number(state.settings.sidebarWidth) || 230));
-  const panel = ui.panel ? Math.max(300, Math.min(360, window.innerWidth - width - 328)) : 0;
+    : Math.max(200, Math.min(380, Number(state.settings.sidebarWidth) || 224));
+  const panel = ui.panel
+    ? Math.min(
+        Math.max(0, window.innerWidth - width - 316),
+        Math.max(288, Math.min(336, window.innerWidth - width - 328)),
+      )
+    : 0;
+  const contentTop =
+    ui.sidebarHidden || !$('#findbar').hidden ? 40 : isMac || state.runtime?.fullScreen ? 8 : 36;
   $('#app').dataset.panelOpen = String(Boolean(ui.panel));
   $('#app').dataset.sidebarHidden = String(ui.sidebarHidden);
   $('#sidebar').inert = ui.sidebarHidden || Boolean(ui.dialog);
   $('#sidebar').setAttribute('aria-hidden', String(ui.sidebarHidden));
   document.documentElement.style.setProperty('--sidebar', `${width}px`);
   document.documentElement.style.setProperty('--panel', `${panel}px`);
+  document.documentElement.style.setProperty('--page-top', `${contentTop}px`);
   const layout = {
     sidebarWidth: width,
     panelWidth: panel,
+    contentTop,
     overlay: Boolean(ui.dialog),
     peek: Boolean(state.runtime?.peek),
   };
@@ -952,9 +972,12 @@ function renderSettings() {
     'sidebarWidth',
     'Sidebar width',
     [
-      [230, 'Compact'],
+      [224, 'Compact'],
       [260, 'Comfortable'],
       [300, 'Spacious'],
+      ...(![224, 260, 300].includes(settings.sidebarWidth)
+        ? [[settings.sidebarWidth, `${settings.sidebarWidth}px`]]
+        : []),
     ],
   )}<label class="setting-toggle"><span>Restore session</span><input type="checkbox" data-setting="restoreSession" ${settings.restoreSession ? 'checked' : ''}></label><div class="setting-actions">${secondary('ui:edit-space', 'Customize Space', 'edit')}${secondary('ui:profiles', 'Profiles', 'user')}</div></section><details class="setting-section" id="ai-settings"><summary>Codex subscription</summary>${renderAIConnection()}${settingSelect(
     'openSourcesLimit',
@@ -1124,7 +1147,13 @@ function openDialog(kind, html, { title, focus } = {}) {
     // A fast keyboard/pointer action may already have chosen a control before
     // the first painted frame. Initial focus must not overwrite that choice.
     if (ui.dialogToken === focusToken && !root.contains(document.activeElement))
-      ($(focus || 'input, select, button, textarea', root) || $('.dialog', root))?.focus();
+      (
+        $(
+          focus ||
+            'input:not(:disabled), select:not(:disabled), button:not(:disabled), textarea:not(:disabled)',
+          root,
+        ) || $('.dialog', root)
+      )?.focus();
   });
 }
 function closeDialog({ restore = true } = {}) {
@@ -1143,6 +1172,21 @@ function closeDialog({ restore = true } = {}) {
   syncLayout();
   if (restore) restoreFocus(focus);
   ui.dialogReturn = null;
+}
+function openPopover(kind, html, { title, anchor } = {}) {
+  const rect = (anchor || document.activeElement)?.getBoundingClientRect?.();
+  openDialog(kind, html, { title });
+  const backdrop = $('.dialog-backdrop');
+  const dialog = $('.dialog', backdrop);
+  backdrop.classList.add('popover-backdrop');
+  dialog.classList.add('popover-panel');
+  const bounds = dialog.getBoundingClientRect();
+  const edge = 8;
+  const left = Math.max(edge, Math.min(rect?.left || edge, innerWidth - bounds.width - edge));
+  let top = (rect?.bottom || 36) + 5;
+  if (top + bounds.height > innerHeight - edge) top = (rect?.top || innerHeight) - bounds.height - 5;
+  dialog.style.left = `${left}px`;
+  dialog.style.top = `${Math.max(edge, Math.min(top, innerHeight - bounds.height - edge))}px`;
 }
 function dismissDialog() {
   if (!ui.dialog) return;
@@ -1187,7 +1231,7 @@ function field(name, label, value = '', type = 'text', extra = '') {
   return `<label class="field">${esc(label)}<input name="${name}" type="${type}" value="${esc(value)}" ${extra}></label>`;
 }
 function showSpaces() {
-  openDialog(
+  openPopover(
     'spaces',
     `<div class="dialog-header"><h2>Your Spaces</h2>${button('ui:dialog-close', 'Close', 'close')}</div><div class="dialog-body">${state.spaces
       .map((space) => {
@@ -1197,7 +1241,7 @@ function showSpaces() {
       .join(
         '',
       )}<div class="space-manager-actions">${primary('ui:new-space', 'New Space', 'plus')}${secondary('ui:profiles', 'Manage profiles', 'user')}</div></div>`,
-    { title: 'Your Spaces' },
+    { title: 'Your Spaces', anchor: $('[data-key="space-picker"]') },
   );
 }
 function showSpaceForm(id) {
@@ -1244,17 +1288,56 @@ function showProfiles() {
 function showMenu() {
   const action = (name, label, symbol, key = '') =>
     `<button type="button" class="context-action" data-action="${name}">${icon(symbol)}${label}${key ? `<kbd>${key}</kbd>` : ''}</button>`;
-  openDialog(
+  openPopover(
     'menu',
     `<div class="dialog-body">${action('ui:new-tab', 'New tab', 'plus', shortcut('Mod+T'))}${action('ui:new-private', 'New private session', 'shield')}${action('ui:spaces', 'Spaces & profiles', 'user')}<hr class="context-separator">${action('ui:find', 'Find on page', 'search', shortcut('Mod+F'))}${action('ui:zoom-in', 'Zoom in', 'plus', shortcut('Mod+='))}${action('ui:zoom-out', 'Zoom out', 'minimize', shortcut('Mod+−'))}${action('ui:zoom-reset', 'Reset zoom', 'monitor', shortcut('Mod+0'))}${action('ui:print', 'Print page', 'print', shortcut('Mod+P'))}${action('ui:devtools', 'Developer tools', 'terminal')}<hr class="context-separator">${action('ui:extensions', 'Extensions', 'extension')}${action('ui:settings', 'Settings', 'settings')}${action('ui:shortcuts', 'Keyboard shortcuts', 'keyboard')}${action('ui:about', 'About Zacro', 'info')}</div>`,
-    { title: 'Browser menu' },
+    { title: 'Browser menu', anchor: $('[data-key="browser-menu"]') },
   );
 }
+function showAddMenu() {
+  const action = (name, label, symbol, key = '') =>
+    `<button type="button" class="context-action" data-action="${name}">${icon(symbol)}<span>${label}</span>${key ? `<kbd>${key}</kbd>` : ''}</button>`;
+  openPopover(
+    'menu',
+    `<div class="dialog-body">${action('ui:new-tab', 'New tab', 'plus', shortcut('Mod+T'))}${action('ui:new-folder', 'New folder', 'folderPlus')}${action('ui:new-space', 'New Space', 'layers')}<hr class="context-separator">${action('ui:new-private', 'Private session', 'shield')}</div>`,
+    { title: 'Add', anchor: $('[data-key="add-menu"]') },
+  );
+}
+function showPageMenu() {
+  const tab = state.runtime?.peek || activeTab();
+  const blank = !tab || tab.url === 'zacro://newtab';
+  const saved = profileItems('bookmarks').some((item) => item.url === tab?.url);
+  const action = (name, label, symbol, attrs = '', key = '') =>
+    `<button type="button" class="context-action" data-action="${name}" ${attrs}>${icon(symbol)}<span>${label}</span>${key ? `<kbd>${key}</kbd>` : ''}</button>`;
+  openPopover(
+    'page-actions',
+    `<div class="dialog-body">${action('ui:bookmark', saved ? 'Remove bookmark' : 'Bookmark this page', 'star', `data-key="bookmark" aria-pressed="${saved}" ${blank ? 'disabled' : ''}`, shortcut('Mod+D'))}${action('ui:split', state.runtime?.splitTabId ? 'Close split view' : 'Split view', 'split', 'data-key="split"')}${action('ui:find', 'Find on page', 'search', blank ? 'disabled' : '', shortcut('Mod+F'))}${action('ui:print', 'Print page', 'print', blank ? 'disabled' : '', shortcut('Mod+P'))}<hr class="context-separator"><div class="menu-zoom" aria-label="Page zoom">${button('ui:zoom-out', 'Zoom out', 'minimize')}${action('ui:zoom-reset', `${Math.round((state.runtime?.page?.zoom || 1) * 100)}%`, 'monitor')}${button('ui:zoom-in', 'Zoom in', 'plus')}</div></div>`,
+    { title: 'Page actions', anchor: $('[data-key="page-menu"]') },
+  );
+}
+function renderPageMenu() {
+  if (ui.dialog !== 'page-actions') return;
+  const root = $('.popover-panel');
+  if (!root) return;
+  const tab = state.runtime?.peek || activeTab();
+  const blank = !tab || tab.url === 'zacro://newtab';
+  const saved = profileItems('bookmarks').some((item) => item.url === tab?.url);
+  const bookmark = $('[data-key="bookmark"]', root);
+  bookmark.disabled = blank;
+  bookmark.setAttribute('aria-pressed', String(saved));
+  $('span', bookmark).textContent = saved ? 'Remove bookmark' : 'Bookmark this page';
+  $('[data-key="split"] span', root).textContent = state.runtime?.splitTabId
+    ? 'Close split view'
+    : 'Split view';
+  for (const action of ['ui:find', 'ui:print']) $(`[data-action="${action}"]`, root).disabled = blank;
+  $('[data-action="ui:zoom-reset"] span', root).textContent =
+    `${Math.round((state.runtime?.page?.zoom || 1) * 100)}%`;
+}
 function showLibrary() {
-  openDialog(
+  openPopover(
     'library',
-    `<div class="dialog-body">${['bookmarks', 'history', 'downloads', 'archive'].map((panel) => `<button type="button" class="context-action" data-action="ui:panel" data-panel="${panel}" data-key="panel-${panel}">${icon(panelNames[panel][0])}<span>${panelNames[panel][1]}</span>${panel === 'history' ? `<kbd>${shortcut(isMac ? 'Mod+Y' : 'Mod+H')}</kbd>` : panel === 'downloads' ? `<kbd>${shortcut(isMac ? 'Mod+Shift+J' : 'Mod+J')}</kbd>` : ''}</button>`).join('')}</div>`,
-    { title: 'Library' },
+    `<div class="dialog-body">${['bookmarks', 'history', 'downloads', 'archive'].map((panel) => `<button type="button" class="context-action" data-action="ui:panel" data-panel="${panel}" data-key="panel-${panel}">${icon(panelNames[panel][0])}<span>${panelNames[panel][1]}</span>${panel === 'history' ? `<kbd>${shortcut(isMac ? 'Mod+Y' : 'Mod+H')}</kbd>` : panel === 'downloads' ? `<kbd>${shortcut(isMac ? 'Mod+Shift+J' : 'Mod+J')}</kbd>` : ''}</button>`).join('')}<hr class="context-separator">${['ai', 'settings'].map((panel) => `<button type="button" class="context-action" data-action="ui:panel" data-panel="${panel}" data-key="panel-${panel}">${icon(panelNames[panel][0])}<span>${panelNames[panel][1]}</span>${panel === 'settings' ? `<kbd>${shortcut('Mod+,')}</kbd>` : ''}</button>`).join('')}</div>`,
+    { title: 'Library', anchor: $('[data-key="library"]') },
   );
 }
 function toggleSidebar(fromPage = false) {
@@ -1279,19 +1362,19 @@ function showTabMenu(id) {
   if (!tab) return;
   const action = (name, label, symbol) =>
     `<button type="button" class="context-action" data-action="${name}" data-id="${esc(id)}">${icon(symbol)}${esc(label)}</button>`;
-  openDialog(
+  openPopover(
     'menu',
     `<div class="dialog-body"><div class="section-label truncate">${esc(tab.title || 'New tab')}</div>${action('ui:tab-pin', tab.pinned ? 'Unpin from favorites' : 'Pin to favorites', 'pin')}${action('ui:tab-duplicate', 'Duplicate tab', 'copy')}${action('ui:tab-split', 'Open in split view', 'split')}${action('ui:tab-move', 'Move to Space or folder', 'folder')}${action('ui:tab-rename', 'Rename tab', 'edit')}<hr class="context-separator">${action('ui:tab-close', 'Close tab', 'close')}</div>`,
-    { title: 'Tab actions' },
+    { title: 'Tab actions', anchor: $(`[data-tab-id="${CSS.escape(id)}"]`) },
   );
 }
 function showFolderMenu(id) {
   const folder = state.folders.find((f) => f.id === id);
   if (!folder) return;
-  openDialog(
+  openPopover(
     'menu',
     `<div class="dialog-body"><div class="section-label truncate">${esc(folder.name)}</div><button type="button" class="context-action" data-action="ui:folder-rename" data-id="${esc(id)}">${icon('edit')}Rename folder</button><button type="button" class="context-action" data-action="ui:folder-delete" data-id="${esc(id)}">${icon('trash')}Remove folder</button></div>`,
-    { title: 'Folder actions' },
+    { title: 'Folder actions', anchor: $(`[data-key="folder-${CSS.escape(id)}"]`) },
   );
 }
 function showMoveTab(id) {
@@ -1471,6 +1554,7 @@ function commandOptions(query) {
   }
   const actions = [
     ['New tab', 'plus', () => newTab()],
+    ['New folder', 'folderPlus', () => handleAction('ui:new-folder')],
     ['New Space', 'folderPlus', () => showSpaceForm()],
     [ui.sidebarHidden ? 'Show sidebar' : 'Hide sidebar', 'sidebar', () => toggleSidebar()],
     [
@@ -1503,6 +1587,14 @@ function commandOptions(query) {
       () => {
         closeDialog();
         openPanel('archive');
+      },
+    ],
+    [
+      'Ask Zacro',
+      'sparkle',
+      () => {
+        closeDialog();
+        openPanel('ai');
       },
     ],
     [
@@ -1600,10 +1692,12 @@ function openFind() {
     `<input id="find-input" type="text" value="${esc(ui.findText)}" placeholder="Find in page" aria-label="Find in page"><span id="find-count" class="find-count" role="status" aria-live="polite" aria-atomic="true"></span>${button('ui:find-prev', 'Previous match', 'up')}${button('ui:find-next', 'Next match', 'down')}${button('ui:find-close', 'Close find', 'close')}`;
   $('#find-input').focus();
   $('#find-input').select();
+  syncLayout();
 }
 function closeFind() {
   safely(invoke('find:stop'));
   $('#findbar').hidden = true;
+  syncLayout();
   if (!activeTab() || activeTab().url === 'zacro://newtab') restoreFocus(ui.findReturn);
   ui.findReturn = null;
 }
@@ -1879,6 +1973,17 @@ async function handleAction(action, data = {}, target) {
     case 'ui:library':
       showLibrary();
       return;
+    case 'ui:add-menu':
+      showAddMenu();
+      return;
+    case 'ui:page-menu':
+      showPageMenu();
+      return;
+    case 'ui:bookmark': {
+      const tab = state.runtime?.peek || activeTab();
+      closeDialog();
+      return invoke('bookmark:toggle', { url: tab?.url, title: tab?.title });
+    }
     case 'ui:ai-connect':
       if (ui.dialog) closeDialog();
       openPanel('settings');
@@ -2003,7 +2108,7 @@ async function handleAction(action, data = {}, target) {
       restoreFocusAround(renderSidebar);
       const heading = $$('.folder-heading').find((element) => element.dataset.id === id);
       motion(
-        heading?.firstElementChild,
+        heading?.querySelector('.folder-icon > svg:last-child'),
         [{ transform: `rotate(${opening ? -90 : 0}deg)` }, { transform: `rotate(${opening ? 0 : -90}deg)` }],
         120,
       );
@@ -2070,6 +2175,7 @@ async function handleAction(action, data = {}, target) {
       return;
     }
     case 'ui:split':
+      if (ui.dialog) closeDialog();
       showSplitPicker();
       return;
     case 'ui:split-select':
@@ -2407,6 +2513,23 @@ document.addEventListener('keydown', (event) => {
     else if (ui.panel) closePanel();
     return;
   }
+  const popover = ui.dialog && $('.popover-panel');
+  if (popover && ['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
+    const items = $$('button:not(:disabled)', popover).filter((item) => item.getClientRects().length);
+    if (items.length) {
+      event.preventDefault();
+      const focused = items.indexOf(document.activeElement);
+      const current = focused < 0 && event.key === 'ArrowUp' ? 0 : focused;
+      const next =
+        event.key === 'Home'
+          ? 0
+          : event.key === 'End'
+            ? items.length - 1
+            : (current + (event.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length;
+      items[next].focus();
+    }
+    return;
+  }
   if (ui.dialog && event.key === 'Tab') {
     const focusable = $$(
       'button:not(:disabled),input:not(:disabled),select:not(:disabled),textarea:not(:disabled),[tabindex="0"]',
@@ -2609,8 +2732,10 @@ document.addEventListener(
   'error',
   (event) => {
     const image = event.target;
-    if (image instanceof HTMLImageElement && image.closest('.favicon'))
-      image.parentElement.textContent = image.dataset.fallback || '·';
+    if (image instanceof HTMLImageElement && image.closest('.favicon')) {
+      image.parentElement.classList.add('favicon-placeholder');
+      image.parentElement.innerHTML = icon('globe');
+    }
   },
   true,
 );
@@ -2620,6 +2745,12 @@ window.addEventListener('blur', interruptSpaceScroll);
 window.addEventListener('resize', () => {
   interruptSpaceScroll();
   syncLayout();
+  const popover = $('.popover-panel');
+  if (popover) {
+    const rect = popover.getBoundingClientRect();
+    popover.style.left = `${Math.max(8, Math.min(rect.left, innerWidth - rect.width - 8))}px`;
+    popover.style.top = `${Math.max(8, Math.min(rect.top, innerHeight - rect.height - 8))}px`;
+  }
 });
 matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
   if (state) setTheme();

@@ -3,15 +3,26 @@
 const clamp = (value, minimum, maximum) => Math.min(maximum, Math.max(minimum, value));
 const finite = (value, fallback) => (Number.isFinite(value) ? value : fallback);
 
-function browserLayout({ width, height, sidebarWidth = 230, panelWidth = 0, split = false }) {
+function browserLayout({
+  width,
+  height,
+  sidebarWidth = 224,
+  panelWidth = 0,
+  contentTop = 36,
+  split = false,
+}) {
   width = Math.max(1, Math.round(finite(width, 1440)));
   height = Math.max(1, Math.round(finite(height, 940)));
   // A deliberately hidden sidebar still leaves the web canvas an 8px outer frame.
   const left =
-    sidebarWidth === 0 ? 8 : Math.round(clamp(finite(sidebarWidth, 230), 180, Math.max(180, width - 400)));
+    sidebarWidth === 0
+      ? 8
+      : Math.round(clamp(finite(sidebarWidth, 224), 200, Math.min(380, Math.max(200, width - 400))));
   const right = Math.round(clamp(finite(panelWidth, 0), 0, Math.max(0, width - left - 316)));
   const available = Math.max(1, width - left - (right > 0 ? right + 16 : 8));
-  const top = Math.min(44, height - 1);
+  // The sidebar owns navigation in the compact layout. Only the Windows
+  // caption rail, hidden-sidebar toolbar or an active Find row reserve height.
+  const top = Math.min([8, 36, 40].includes(contentTop) ? contentTop : 36, height - 1);
   const gap = 6;
   const secondaryVisible = split && available >= gap + 2;
   const firstWidth = secondaryVisible ? Math.floor((available - gap) / 2) : available;
@@ -26,10 +37,10 @@ function browserLayout({ width, height, sidebarWidth = 230, panelWidth = 0, spli
         }
       : null,
     peek: {
-      x: left + 36,
-      y: Math.min(96, height - 1),
-      width: Math.max(1, available - 72),
-      height: Math.max(1, height - 140),
+      x: left + 24,
+      y: Math.min(top + 24 + 32, height - 1),
+      width: Math.max(1, available - 48),
+      height: Math.max(1, height - top - 8 - 24 - 32 - 24),
     },
   };
 }

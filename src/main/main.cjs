@@ -48,7 +48,12 @@ let splitTabId = null;
 let splitPair = null;
 let normalWindowBounds = null;
 let peek = null;
-let layout = { sidebarWidth: 230, panelWidth: 0, overlay: false };
+let layout = {
+  sidebarWidth: 224,
+  panelWidth: 0,
+  contentTop: process.platform === 'darwin' ? 8 : 36,
+  overlay: false,
+};
 let quitting = false;
 let lastProfileId = null;
 let closingWindow = false;
@@ -1637,11 +1642,16 @@ async function invoke(action, payload = {}) {
       break;
     case 'layout': {
       const previousOverlay = layout.overlay;
+      const previousSidebarWidth = layout.sidebarWidth;
       if (Number.isFinite(payload.sidebarWidth))
         layout.sidebarWidth =
-          payload.sidebarWidth === 0 ? 0 : Math.max(180, Math.min(420, payload.sidebarWidth));
+          payload.sidebarWidth === 0 ? 0 : Math.max(200, Math.min(380, payload.sidebarWidth));
       if (Number.isFinite(payload.panelWidth))
         layout.panelWidth = Math.max(0, Math.min(650, payload.panelWidth));
+      if ([8, 36, 40].includes(payload.contentTop)) layout.contentTop = payload.contentTop;
+      else if (payload.contentTop !== undefined || layout.sidebarWidth === 0) layout.contentTop = 40;
+      else if (previousSidebarWidth === 0)
+        layout.contentTop = process.platform === 'darwin' || win.isFullScreen() ? 8 : 36;
       if (typeof payload.overlay === 'boolean') layout.overlay = payload.overlay;
       if (layout.overlay && !previousOverlay) void captureBackdrop();
       else if (!layout.overlay && previousOverlay) clearBackdrop();
@@ -2093,7 +2103,12 @@ async function createWindow() {
   allowWindowClose = false;
   splitTabId = null;
   splitPair = null;
-  layout = { sidebarWidth: store.state.settings.sidebarWidth || 230, panelWidth: 0, overlay: false };
+  layout = {
+    sidebarWidth: store.state.settings.sidebarWidth || 224,
+    panelWidth: 0,
+    contentTop: process.platform === 'darwin' ? 8 : 36,
+    overlay: false,
+  };
   clearTimeout(publishTimer);
   publishTimer = null;
   const primary = screen.getPrimaryDisplay();
@@ -2193,6 +2208,11 @@ async function createWindow() {
   });
   win.on('blur', publish);
   const fullscreenChanged = () => {
+    // Native full-screen transitions can arrive before the renderer publishes
+    // its matching layout. Preserve the 40px toolbar/Find reservation; otherwise
+    // drop or restore the Windows caption rail immediately with the OS state.
+    if (layout.contentTop !== 40)
+      layout.contentTop = process.platform === 'darwin' || win.isFullScreen() ? 8 : 36;
     sizeShell();
     arrangeViews();
     const item = Menu.getApplicationMenu()?.getMenuItemById('fullscreen');
@@ -2317,7 +2337,7 @@ if (singleInstance)
     .whenReady()
     .then(async () => {
       store = new BrowserStore(app.getPath('userData'));
-      layout.sidebarWidth = store.state.settings.sidebarWidth || 230;
+      layout.sidebarWidth = store.state.settings.sidebarWidth || 224;
       for (const download of store.state.downloads)
         if (['progressing', 'interrupted'].includes(download.state)) {
           download.state = 'interrupted';

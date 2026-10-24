@@ -109,7 +109,7 @@ function createInitialState() {
       theme: 'system',
       searchEngine: 'duckduckgo',
       archiveAfterHours: 24,
-      sidebarWidth: 230,
+      sidebarWidth: 224,
       restoreSession: true,
       openSourcesLimit: 3,
       aiProvider: 'codex',

@@ -2,7 +2,7 @@
 
 // Run the real host without a debugger or Playwright's visibility switches.
 // Those switches can make a hidden native page appear healthy in an E2E test.
-const { app, BrowserWindow, webContents } = require('electron');
+const { app, BrowserWindow, webContents, powerMonitor } = require('electron');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 
@@ -137,12 +137,24 @@ async function inspect(contents, label, paint = true) {
       JSON.stringify({
         records,
         error: error.stack || error.message,
+        desktop: {
+          idleSeconds: powerMonitor.getSystemIdleTime(),
+          idleState: powerMonitor.getSystemIdleState(300),
+        },
         windows: BrowserWindow.getAllWindows().map((item) => ({
           id: item.id,
           visible: item.isVisible(),
           focused: item.isFocused(),
           url: item.webContents.getURL(),
           loading: item.webContents.isLoading(),
+          bounds: item.getBounds(),
+          host: { visible: item.contentView.getVisible(), bounds: item.contentView.getBounds() },
+          children: item.contentView.children.map((view) => ({
+            visible: view.getVisible(),
+            bounds: view.getBounds(),
+            id: view.webContents?.id,
+            url: view.webContents?.getURL(),
+          })),
         })),
         pages: webContents
           .getAllWebContents()

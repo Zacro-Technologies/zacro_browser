@@ -30,19 +30,20 @@ test(
     await expect(shell.locator('.space-picker')).toBeVisible();
     await expect(shell.locator('html')).toHaveAttribute('data-platform', 'darwin');
     assert.equal(await shell.locator('.window-controls').count(), 0);
-    assert((await shell.locator('.space-picker').boundingBox()).x >= 88);
+    assert((await shell.locator('[data-key="sidebar-toggle"]').boundingBox()).x >= 88);
+    assert((await shell.locator('.space-picker').boundingBox()).x < 30);
     await expect(shell.locator('[data-key="sidebar-toggle"]')).toHaveAttribute('title', 'Hide sidebar (⇧⌘B)');
     await expect(shell.locator('[data-key="back"]')).toHaveAttribute('title', 'Back (⌘[)');
     await shell.locator('[data-key="sidebar-toggle"]').click();
-    assert((await shell.locator('.navigation').boundingBox()).x >= 88);
+    assert((await shell.locator('[data-key="sidebar-toggle"]').boundingBox()).x >= 88);
     await app.evaluate(({ app }) => app.emit('fixture:runtime', null, { fullScreen: true }));
     await expect(shell.locator('html')).toHaveAttribute('data-fullscreen', 'true');
-    assert((await shell.locator('.navigation').boundingBox()).x < 30);
+    assert((await shell.locator('[data-key="sidebar-toggle"]').boundingBox()).x < 30);
     await shell.locator('[data-key="sidebar-toggle"]').click();
-    assert((await shell.locator('.space-picker').boundingBox()).x < 30);
+    assert((await shell.locator('[data-key="sidebar-toggle"]').boundingBox()).x < 30);
     await app.evaluate(({ app }) => app.emit('fixture:runtime', null, { fullScreen: false }));
     await expect
-      .poll(async () => (await shell.locator('.space-picker').boundingBox()).x)
+      .poll(async () => (await shell.locator('[data-key="sidebar-toggle"]').boundingBox()).x)
       .toBeGreaterThanOrEqual(88);
 
     const key = (options) =>
