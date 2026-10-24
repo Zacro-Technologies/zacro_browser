@@ -620,8 +620,14 @@ function createEntry(profileId, tabId = null, suppliedOptions = {}) {
     try {
       if (validWindow()) win.contentView.removeChildView(entry.view);
     } catch {}
-    if (!closingWindow && !entry.replacing && store.state.tabs.some((tab) => tab.id === entry.tabId))
+    if (!closingWindow && !entry.replacing && store.state.tabs.some((tab) => tab.id === entry.tabId)) {
+      const wasActive = store.state.activeTabId === entry.tabId;
       store.dispatch('tab:close', { id: entry.tabId });
+      // The closing native view may still be Cocoa's first responder. Move
+      // keyboard input to the surviving page (or shell for New Tab) only when
+      // the active tab closed; background closes must not steal input focus.
+      if (wasActive) focusContentOrChrome();
+    }
   });
   wc.on('enter-html-full-screen', () => {
     // Keep browser chrome visible, and a persistent escape path available.
@@ -989,7 +995,10 @@ async function cycleTab(direction) {
   const tabs = store.state.tabs.filter((tab) => tab.spaceId === store.state.activeSpaceId);
   if (!tabs.length) return;
   const index = tabs.findIndex((tab) => tab.id === store.state.activeTabId);
-  return invoke('tab:activate', { id: tabs[(index + direction + tabs.length) % tabs.length].id });
+  const id = tabs[(index + direction + tabs.length) % tabs.length].id;
+  const result = await invoke('tab:activate', { id });
+  if (result && store.state.activeTabId === id) focusContentOrChrome();
+  return result;
 }
 function zoom(contents, payload) {
   if (!contents) return;
@@ -2160,8 +2169,12 @@ async function createWindow() {
     publish();
   });
   const rememberNormalBounds = () => {
-    if (!validWindow() || win.isMaximized() || win.isFullScreen() || win.isMinimized()) return;
-    const { x, y, width, height } = win.getBounds();
+    if (!validWindow()) return;
+    // Windows can emit moved/resize before its maximized flag settles. Reading
+    // the visible rectangle then can replace a user's restore position with
+    // the screen origin. The native restore rectangle remains authoritative in
+    // maximized, minimized and fullscreen states, including the final close.
+    const { x, y, width, height } = win.getNormalBounds();
     normalWindowBounds = { x, y, width, height };
   };
   rememberNormalBounds();

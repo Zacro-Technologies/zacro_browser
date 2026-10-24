@@ -1121,7 +1121,9 @@ function openDialog(kind, html, { title, focus } = {}) {
   const focusToken = ui.dialogToken;
   requestAnimationFrame(() => {
     const root = $('#dialog-root');
-    if (ui.dialogToken === focusToken)
+    // A fast keyboard/pointer action may already have chosen a control before
+    // the first painted frame. Initial focus must not overwrite that choice.
+    if (ui.dialogToken === focusToken && !root.contains(document.activeElement))
       ($(focus || 'input, select, button, textarea', root) || $('.dialog', root))?.focus();
   });
 }

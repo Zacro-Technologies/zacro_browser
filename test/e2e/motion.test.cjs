@@ -80,6 +80,20 @@ test(
     assert(parseFloat(disclosure.duration) <= 0.17);
     await shell.locator('[data-key="panel-close"]').click();
 
+    // Focus chosen before the entrance frame must survive deferred autofocus.
+    // Otherwise a fast Enter on Rename can activate the first menu item instead.
+    const earlyFocus = await shell.evaluate(async () => {
+      document
+        .querySelector('[data-key="tab-welcome"]')
+        .dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true }));
+      const rename = document.querySelector('[data-action="ui:tab-rename"]');
+      rename.focus();
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      return document.activeElement === rename;
+    });
+    assert.equal(earlyFocus, true, 'A menu entrance must preserve the user-selected control');
+    await shell.keyboard.press('Escape');
+
     // Folder toggling updates the rows and preserves keyboard position at once.
     const folder = await invoke('folder:create', { name: 'Motion review' });
     const tab = await invoke('tab:create', { url: 'zacro://newtab', active: false });

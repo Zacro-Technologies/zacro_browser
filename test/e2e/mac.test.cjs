@@ -98,69 +98,166 @@ load('electron').app.emit('open-url', { preventDefault() {} }, ${JSON.stringify(
 
 test('macOS uses native window chrome, menu conventions and keyboard navigation', macOnly, async (t) => {
   const b = await launch(t);
-  await expect(b.shell.locator('html')).toHaveAttribute('data-platform', 'darwin');
-  await expect(b.shell.locator('html')).toHaveAttribute('data-fullscreen', 'false');
-  await expect(b.shell.locator('.window-controls')).toHaveCount(0);
-  const native = await b.app.evaluate(({ BrowserWindow, Menu }) => {
-    const win = BrowserWindow.getAllWindows()[0];
-    const flatten = (menu) =>
-      menu.items.flatMap((item) => [
-        { id: item.id, label: item.label, role: item.role, accelerator: item.accelerator },
-        ...(item.submenu ? flatten(item.submenu) : []),
-      ]);
-    return {
-      buttons: win.getWindowButtonPosition(),
-      fullscreen: win.isFullScreen(),
-      menu: flatten(Menu.getApplicationMenu()),
-    };
+  const results = path.resolve(__dirname, '../../test-results');
+  await fs.mkdir(results, { recursive: true });
+  await b.app.evaluate(({ BrowserWindow, Menu }) => {
+    globalThis.macShortcutTrace = [];
+    BrowserWindow.getAllWindows()[0].webContents.on('before-input-event', (event, input) => {
+      globalThis.macShortcutTrace.push({ source: 'host', ...input, prevented: event.defaultPrevented });
+      if (globalThis.macShortcutTrace.length > 80) globalThis.macShortcutTrace.shift();
+    });
+    for (const id of ['new-tab', 'next-tab', 'previous-tab', 'close-tab', 'reopen-tab']) {
+      const item = Menu.getApplicationMenu().getMenuItemById(id);
+      const click = item.click;
+      item.click = (...args) => {
+        globalThis.macShortcutTrace.push({ source: 'menu', id });
+        return click.apply(item, args);
+      };
+    }
   });
-  assert.deepEqual(native.buttons, { x: 16, y: 16 });
-  assert.equal(native.fullscreen, false);
-  for (const role of ['services', 'hide', 'hideothers', 'quit', 'minimize', 'zoom', 'front'])
-    assert(
-      native.menu.some((item) => item.role?.toLowerCase() === role),
-      `Native ${role} menu role`,
+  await b.shell.evaluate(() => {
+    window.macDOMKeys = [];
+    document.addEventListener(
+      'keydown',
+      (event) => {
+        window.macDOMKeys.push({
+          key: event.key,
+          code: event.code,
+          meta: event.metaKey,
+          control: event.ctrlKey,
+          shift: event.shiftKey,
+          focus: document.activeElement?.id,
+        });
+      },
+      true,
     );
-  assert.equal(native.menu.find((item) => item.id === 'preferences')?.accelerator, 'Command+,');
-  assert.equal(native.menu.find((item) => item.id === 'close-window')?.accelerator, 'Command+Shift+W');
-  assert((await b.shell.locator('.space-picker').boundingBox()).x >= 88);
+  });
+  const active = async (id) => {
+    await expect.poll(async () => (await b.state()).activeTabId).toBe(id);
+    await expect(b.shell.locator(`#sidebar .tab-main[data-id="${id}"]`)).toHaveAttribute(
+      'aria-current',
+      'page',
+    );
+  };
+  const focusChrome = async () => {
+    await b.app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].webContents.focus());
+    await b.shell.locator('[data-key="address"]').focus();
+    await expect(b.shell.locator('[data-key="address"]')).toBeFocused();
+  };
+  try {
+    await expect(b.shell.locator('html')).toHaveAttribute('data-platform', 'darwin');
+    await expect(b.shell.locator('html')).toHaveAttribute('data-fullscreen', 'false');
+    await expect(b.shell.locator('.window-controls')).toHaveCount(0);
+    const native = await b.app.evaluate(({ BrowserWindow, Menu }) => {
+      const win = BrowserWindow.getAllWindows()[0];
+      const flatten = (menu) =>
+        menu.items.flatMap((item) => [
+          { id: item.id, label: item.label, role: item.role, accelerator: item.accelerator },
+          ...(item.submenu ? flatten(item.submenu) : []),
+        ]);
+      return {
+        buttons: win.getWindowButtonPosition(),
+        fullscreen: win.isFullScreen(),
+        menu: flatten(Menu.getApplicationMenu()),
+      };
+    });
+    assert.deepEqual(native.buttons, { x: 16, y: 16 });
+    assert.equal(native.fullscreen, false);
+    for (const role of ['services', 'hide', 'hideothers', 'quit', 'minimize', 'zoom', 'front'])
+      assert(
+        native.menu.some((item) => item.role?.toLowerCase() === role),
+        `Native ${role} menu role`,
+      );
+    assert.equal(native.menu.find((item) => item.id === 'preferences')?.accelerator, 'Command+,');
+    assert.equal(native.menu.find((item) => item.id === 'close-window')?.accelerator, 'Command+Shift+W');
+    assert((await b.shell.locator('.space-picker').boundingBox()).x >= 88);
+    await b.shell.screenshot({ path: path.join(results, `mac-${process.arch}-shell.png`) });
 
-  await b.shell.locator('[data-key="sidebar-toggle"]').click();
-  assert((await b.shell.locator('[data-key="sidebar-toggle"]').boundingBox()).x >= 88);
-  await b.shell.locator('[data-key="sidebar-toggle"]').click();
-  await b.shell.keyboard.press('Meta+,');
-  await expect(b.shell.locator('#panel-title')).toHaveText('Settings');
-  await b.shell.keyboard.press('Escape');
-  await b.shell.keyboard.press('Meta+l');
-  await expect(b.shell.locator('#command-input')).toBeFocused();
-  await b.shell.keyboard.press('Escape');
+    await b.shell.locator('[data-key="sidebar-toggle"]').click();
+    assert((await b.shell.locator('[data-key="sidebar-toggle"]').boundingBox()).x >= 88);
+    await b.shell.screenshot({ path: path.join(results, `mac-${process.arch}-sidebar-hidden.png`) });
+    await b.shell.locator('[data-key="sidebar-toggle"]').click();
+    await b.shell.keyboard.press('Meta+,');
+    await expect(b.shell.locator('#panel-title')).toHaveText('Settings');
+    await b.shell.screenshot({ path: path.join(results, `mac-${process.arch}-settings.png`) });
+    await b.shell.keyboard.press('Escape');
+    await b.shell.keyboard.press('Meta+l');
+    await expect(b.shell.locator('#command-input')).toBeFocused();
+    await b.shell.keyboard.press('Escape');
 
-  const initial = (await b.state()).activeTabId;
-  await b.shell.keyboard.press('Meta+t');
-  await expect(b.shell.locator('#command-input')).toBeFocused();
-  await b.shell.keyboard.press('Escape');
-  await expect.poll(async () => (await b.state()).activeTabId).not.toBe(initial);
-  const second = (await b.state()).activeTabId;
-  assert.notEqual(initial, second);
-  await b.shell.keyboard.press('Control+Tab');
-  await expect.poll(async () => (await b.state()).activeTabId).toBe(initial);
-  await b.shell.keyboard.press('Control+Shift+Tab');
-  await expect.poll(async () => (await b.state()).activeTabId).toBe(second);
-  await b.navigate(`${b.base}/restore`);
-  await b.shell.keyboard.press('Meta+w');
-  await expect.poll(async () => (await b.state()).tabs.some((tab) => tab.id === second)).toBe(false);
-  await b.shell.keyboard.press('Meta+Shift+t');
-  await expect.poll(async () => (await b.state()).tabs.some((tab) => tab.id === second)).toBe(true);
+    const initial = (await b.state()).activeTabId;
+    await active(initial);
+    await focusChrome();
+    await b.shell.keyboard.press('Meta+t');
+    await expect(b.shell.locator('#command-input')).toBeFocused();
+    await b.shell.keyboard.press('Escape');
+    await expect.poll(async () => (await b.state()).activeTabId).not.toBe(initial);
+    const second = (await b.state()).activeTabId;
+    assert.notEqual(initial, second);
+    await active(second);
+    await focusChrome();
+    await b.shell.keyboard.press('Control+Tab');
+    await active(initial);
+    await focusChrome();
+    await b.shell.keyboard.press('Control+Shift+Tab');
+    await active(second);
+    await b.navigate(`${b.base}/restore`);
+    await b.app.evaluate(({ webContents }, url) => {
+      const contents = webContents.getAllWebContents().find((item) => item.getURL() === url);
+      contents.focus();
+      contents.sendInputEvent({ type: 'keyDown', keyCode: 'W', modifiers: ['meta'] });
+      contents.sendInputEvent({ type: 'keyUp', keyCode: 'W', modifiers: ['meta'] });
+    }, `${b.base}/restore`);
+    await expect.poll(async () => (await b.state()).tabs.some((tab) => tab.id === second)).toBe(false);
+    await active(initial);
+    // Closing the native guest must restore the shell as first responder without
+    // a test click/focus override. Otherwise the physical reopen shortcut is lost.
+    await expect
+      .poll(() =>
+        b.app.evaluate(
+          ({ BrowserWindow, webContents }) =>
+            webContents.getFocusedWebContents()?.id === BrowserWindow.getAllWindows()[0].webContents.id,
+        ),
+      )
+      .toBe(true);
+    await b.shell.keyboard.press('Meta+Shift+t');
+    await expect.poll(async () => (await b.state()).tabs.some((tab) => tab.id === second)).toBe(true);
 
-  await b.invoke('window:fullscreen');
-  await expect(b.shell.locator('html')).toHaveAttribute('data-fullscreen', 'true', { timeout: 15000 });
-  assert.equal(
-    await b.app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].isFullScreen()),
-    true,
-  );
-  await b.invoke('window:fullscreen');
-  await expect(b.shell.locator('html')).toHaveAttribute('data-fullscreen', 'false', { timeout: 15000 });
-  assert((await b.shell.locator('.space-picker').boundingBox()).x >= 88);
+    await b.invoke('window:fullscreen');
+    await expect(b.shell.locator('html')).toHaveAttribute('data-fullscreen', 'true', { timeout: 15000 });
+    assert.equal(
+      await b.app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].isFullScreen()),
+      true,
+    );
+    await b.invoke('window:fullscreen');
+    await expect(b.shell.locator('html')).toHaveAttribute('data-fullscreen', 'false', { timeout: 15000 });
+    assert((await b.shell.locator('.space-picker').boundingBox()).x >= 88);
+  } catch (error) {
+    const diagnostics = await b.app
+      .evaluate(({ BrowserWindow, webContents }) => ({
+        inputs: globalThis.macShortcutTrace,
+        shell: BrowserWindow.getAllWindows()[0]?.webContents.id,
+        focused: webContents.getFocusedWebContents()?.id,
+        contents: webContents
+          .getAllWebContents()
+          .map((contents) => ({ id: contents.id, url: contents.getURL() })),
+      }))
+      .catch(() => null);
+    const state = await b.state().catch(() => null);
+    const domKeys = await b.shell.evaluate(() => window.macDOMKeys).catch(() => null);
+    console.error(
+      'Mac shortcut diagnostics:',
+      JSON.stringify({
+        diagnostics,
+        domKeys,
+        activeTab: state?.activeTabId,
+        tabs: state?.tabs,
+        archive: state?.archive,
+      }),
+    );
+    await b.shell.screenshot({ path: path.join(results, `mac-${process.arch}-failure.png`) }).catch(() => {});
+    throw error;
+  }
 });
 
 test('macOS native edit actions and browser shortcuts target the focused web page', macOnly, async (t) => {

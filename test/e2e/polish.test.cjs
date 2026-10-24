@@ -444,6 +444,9 @@ test(
           return { x, y, width, height };
         }),
       );
+      const normalOuter = await first.app.evaluate(({ BrowserWindow }) =>
+        BrowserWindow.getAllWindows()[0].getNormalBounds(),
+      );
       await first.app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].maximize());
       await expect
         .poll(() => first.app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].isMaximized()))
@@ -452,6 +455,12 @@ test(
       const savedBounds = JSON.parse(
         await fs.readFile(path.join(first.directory, 'browser-state.json'), 'utf8'),
       ).windowBounds;
+      assert.equal(savedBounds.sizeKind, 'window');
+      for (const key of ['x', 'y', 'width', 'height'])
+        assert(
+          Math.abs(savedBounds[key] - normalOuter[key]) <= 2,
+          `Saved normal ${key} ${savedBounds[key]} must match native restore ${normalOuter[key]}`,
+        );
       second = await launch(t, first.directory);
       await expect
         .poll(() =>
@@ -482,6 +491,35 @@ test(
     }
   },
 );
+
+test('closing from fullscreen persists the native normal window rectangle', { timeout: 45000 }, async (t) => {
+  const browser = await launch(t);
+  const normal = await browser.app.evaluate(({ BrowserWindow, screen }) => {
+    const window = BrowserWindow.getAllWindows()[0];
+    const work = screen.getPrimaryDisplay().workArea;
+    window.setBounds({
+      x: work.x + 20,
+      y: work.y + 20,
+      width: Math.min(1100, work.width - 40),
+      height: Math.min(760, work.height - 40),
+    });
+    return window.getNormalBounds();
+  });
+  await browser.app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].setFullScreen(true));
+  await expect
+    .poll(() => browser.app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].isFullScreen()))
+    .toBe(true);
+  await browser.close();
+  const saved = JSON.parse(
+    await fs.readFile(path.join(browser.directory, 'browser-state.json'), 'utf8'),
+  ).windowBounds;
+  assert.equal(saved.sizeKind, 'window');
+  for (const key of ['x', 'y', 'width', 'height'])
+    assert(
+      Math.abs(saved[key] - normal[key]) <= 2,
+      `Fullscreen close must preserve normal ${key}: ${saved[key]} versus ${normal[key]}`,
+    );
+});
 
 test(
   'Space forms and tab context actions are usable with the keyboard and restore focus',

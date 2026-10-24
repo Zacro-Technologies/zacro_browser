@@ -10,20 +10,20 @@ Zacro's menu bar exposes browser actions without adding another menu row inside 
 
 Page context menus include spelling suggestions and macOS Look Up for selected text. Native pages use macOS scroll bounce. The Dock menu offers the browser window, a new tab and a new private Space without requiring an existing window.
 
-| Action | Mac shortcut |
-| --- | --- |
-| Address / command bar | ⌘L or ⌘K |
-| New tab / reopen closed tab | ⌘T / ⇧⌘T |
-| Close tab / close window | ⌘W / ⇧⌘W |
-| Open or bring forward browser window | ⌘N |
-| New private Space | ⇧⌘N |
-| Previous / next tab | ⌃⇧Tab / ⌃Tab, or ⌥⌘← / ⌥⌘→ |
-| Back / forward | ⌘[ / ⌘] |
-| Settings / History / Downloads | ⌘, / ⌘Y / ⇧⌘J |
-| Toggle sidebar / full screen | ⇧⌘B / ⌃⌘F |
-| Find / print / reload | ⌘F / ⌘P / ⌘R |
-| Reload without cache | ⇧⌘R |
-| Quit | ⌘Q |
+| Action                               | Mac shortcut               |
+| ------------------------------------ | -------------------------- |
+| Address / command bar                | ⌘L or ⌘K                   |
+| New tab / reopen closed tab          | ⌘T / ⇧⌘T                   |
+| Close tab / close window             | ⌘W / ⇧⌘W                   |
+| Open or bring forward browser window | ⌘N                         |
+| New private Space                    | ⇧⌘N                        |
+| Previous / next tab                  | ⌃⇧Tab / ⌃Tab, or ⌥⌘← / ⌥⌘→ |
+| Back / forward                       | ⌘[ / ⌘]                    |
+| Settings / History / Downloads       | ⌘, / ⌘Y / ⇧⌘J              |
+| Toggle sidebar / full screen         | ⇧⌘B / ⌃⌘F                  |
+| Find / print / reload                | ⌘F / ⌘P / ⌘R               |
+| Reload without cache                 | ⇧⌘R                        |
+| Quit                                 | ⌘Q                         |
 
 ⌘Tab remains the system application switcher, and ⌘H hides the application. Horizontal scrolling over the sidebar switches Spaces within the current profile; ordinary webpage scrolling remains with the page. Each gesture moves one Space, respects the endpoints and restores that Space's tab-list position. Reduced-motion users get the same immediate state changes without the decorative transition.
 
@@ -65,7 +65,7 @@ Passing a build is only one release gate. A Mac release still needs clean-machin
 
 The GitHub Actions workflow has separate `macos-15` Apple silicon and `macos-15-intel` jobs. They install native dependencies, check source formatting/syntax, run unit tests and `test:mac`, build DMG/ZIP development artifacts, and test the packaged application. Artifacts are retained with an explicit architecture and development label. The workflow's existence is not evidence of a successful run; inspect its result for the exact commit.
 
-The Darwin-only suite covers native traffic-light position and layout, menu conventions, Cmd-based shortcuts, Ctrl-Tab, native full screen, guest-page editing, window close/Dock reopen, validated web links, pre-ready link delivery, cancellation of Quit with unsaved work, and private-session cleanup after the last window closes. It is skipped on non-Mac hosts. The Mac command also runs shared motion, Space-scroll and security tests. The packaged suite checks actual browsing, security fuses, PDF parsing and an isolated signed-out Codex handshake; it does not make authenticated model requests.
+The Darwin-only suite covers native traffic-light position and layout, menu conventions, Cmd-based shortcuts, Ctrl-Tab, native full screen, guest-page editing, window close/Dock reopen, validated web links, pre-ready link delivery, cancellation of Quit with unsaved work, and private-session cleanup after the last window closes. It is skipped on non-Mac hosts. The Mac command also runs shared browser, renderer contract, motion, Space-scroll, security and startup native-paint tests. The packaged suite checks actual browsing, security fuses, PDF parsing and an isolated signed-out Codex handshake; it does not make authenticated model requests.
 
 Before release, test on physical Apple silicon and Intel Macs with a keyboard and trackpad, multiple displays, full screen, Spaces/Mission Control, Finder file dialogs, camera/microphone/location consent, printing, VoiceOver, keyboard-only navigation, reduced motion and display scaling. Complete ChatGPT authentication yourself to validate subscription behavior; tests never automate a personal login. Record OS versions, architecture, exact commit and observed limitations in [the validation record](VALIDATION.md).
 

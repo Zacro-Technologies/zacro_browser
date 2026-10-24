@@ -150,7 +150,7 @@ test(
     assert(Math.abs((await b.state()).runtime.page.zoom - 1.2) < 0.01);
     await b.invoke('zoom', { reset: true });
     await b.invoke('tab:create');
-    await b.page.keyboard.press('Control+l');
+    await b.page.keyboard.press(process.platform === 'darwin' ? 'Meta+l' : 'Control+l');
     await expect(b.page.locator('[role="dialog"]')).toBeVisible();
     await b.page.keyboard.press('Escape');
     await expect(b.page.locator('[role="dialog"]')).toHaveCount(0);
