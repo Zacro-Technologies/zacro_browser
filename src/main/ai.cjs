@@ -4,9 +4,9 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 
-const DEFAULT_MODELS = Object.freeze({ openai: 'gpt-5-mini', anthropic: 'claude-sonnet-4-6' });
+const { CodexClient, CodexError } = require('./codex.cjs');
+const DEFAULT_MODELS = Object.freeze({ codex: '' });
 const MAX_QUESTION = 8000;
-const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 const MAX_CONTEXT_CHARS = 60000;
 const MAX_HISTORY_TURNS = 8;
 const MAX_HISTORY_CHARS = 160000;
@@ -90,103 +90,6 @@ function sanitizeSuggestedFilename(suggestion, original) {
   return proposed + extension;
 }
 
-function parseOpenAI(data) {
-  if (data.status && data.status !== 'completed') {
-    throw new AIError(
-      'The provider did not finish this answer. Try a shorter question or a different model.',
-      'INCOMPLETE',
-    );
-  }
-  let answer = '';
-  const citations = [];
-  for (const item of data.output || []) {
-    if (item.type !== 'message') continue;
-    for (const block of item.content || []) {
-      if (block.type === 'refusal')
-        throw new AIError(cleanText(block.refusal, 600) || 'The provider declined this request.', 'REFUSAL');
-      if (block.type !== 'output_text' || typeof block.text !== 'string') continue;
-      const offset = answer.length;
-      answer += block.text + '\n';
-      for (const annotation of block.annotations || []) {
-        if (annotation.type !== 'url_citation') continue;
-        const url = safeSourceUrl(annotation.url);
-        const start = Number(annotation.start_index);
-        const end = Number(annotation.end_index);
-        if (
-          url &&
-          Number.isInteger(start) &&
-          Number.isInteger(end) &&
-          start >= 0 &&
-          end > start &&
-          end <= block.text.length
-        ) {
-          citations.push({
-            start: offset + start,
-            end: offset + end,
-            url,
-            title: cleanText(annotation.title, 300) || new URL(url).hostname,
-          });
-        }
-      }
-    }
-  }
-  if (!answer && typeof data.output_text === 'string') answer = data.output_text;
-  return {
-    answer: answer.trimEnd(),
-    citations,
-    sources: dedupeSources(citations),
-    usage: {
-      inputTokens: Number(data.usage?.input_tokens) || 0,
-      outputTokens: Number(data.usage?.output_tokens) || 0,
-      totalTokens: Number(data.usage?.total_tokens) || 0,
-    },
-  };
-}
-
-function parseAnthropic(data) {
-  if (data.stop_reason === 'max_tokens' || data.stop_reason === 'pause_turn') {
-    throw new AIError(
-      'The provider did not finish this answer. Try a shorter question or a different model.',
-      'INCOMPLETE',
-    );
-  }
-  let answer = '';
-  const citations = [];
-  let searchError = false;
-  for (const block of data.content || []) {
-    if (block.type === 'web_search_tool_result' && !Array.isArray(block.content)) searchError = true;
-    if (block.type !== 'text' || typeof block.text !== 'string') continue;
-    answer += block.text;
-    for (const citation of block.citations || []) {
-      if (citation.type !== 'web_search_result_location') continue;
-      const url = safeSourceUrl(citation.url);
-      if (!url) continue;
-      const marker = ` [${citations.length + 1}]`;
-      const start = answer.length;
-      answer += marker;
-      citations.push({
-        start,
-        end: answer.length,
-        url,
-        title: cleanText(citation.title, 300) || new URL(url).hostname,
-        quote: cleanText(citation.cited_text, 500),
-      });
-    }
-    answer += '\n';
-  }
-  return {
-    answer: answer.trimEnd(),
-    citations,
-    sources: dedupeSources(citations),
-    searchError,
-    usage: {
-      inputTokens: Number(data.usage?.input_tokens) || 0,
-      outputTokens: Number(data.usage?.output_tokens) || 0,
-      searchRequests: Number(data.usage?.server_tool_use?.web_search_requests) || 0,
-    },
-  };
-}
-
 function pageCitations(answer, pages) {
   const citations = [];
   const expression = /\[(\d+):(\d+)\]/g;
@@ -213,76 +116,39 @@ function pageCitations(answer, pages) {
   return { citations, sources: dedupeSources(citations) };
 }
 
-async function readJSONResponse(response) {
-  if (Number(response.headers?.get('content-length')) > MAX_RESPONSE_BYTES) {
-    throw new AIError('The provider response was too large.', 'RESPONSE_SIZE');
-  }
-  let raw = '';
-  let size = 0;
-  if (response.body && Symbol.asyncIterator in response.body) {
-    const decoder = new TextDecoder();
-    for await (const chunk of response.body) {
-      size += chunk.byteLength;
-      if (size > MAX_RESPONSE_BYTES)
-        throw new AIError('The provider response was too large.', 'RESPONSE_SIZE');
-      raw += decoder.decode(chunk, { stream: true });
-    }
-    raw += decoder.decode();
-  } else {
-    raw = await response.text();
-    if (Buffer.byteLength(raw) > MAX_RESPONSE_BYTES)
-      throw new AIError('The provider response was too large.', 'RESPONSE_SIZE');
-  }
-  try {
-    return JSON.parse(raw);
-  } catch {
-    throw new AIError('The provider returned an unreadable response. Please try again.', 'INVALID_RESPONSE');
-  }
-}
-
-function providerError(status) {
-  if (status === 401 || status === 403)
-    return new AIError(
-      'The provider rejected this connection. Check your API key, model access, and web-search permissions in Settings.',
-      'AUTH',
-    );
-  if (status === 429)
-    return new AIError(
-      'The provider usage limit has been reached. Check your API balance or rate limit, then try again. Zacro will not switch providers or billing methods.',
-      'LIMIT',
-    );
-  if (status === 400 || status === 404 || status === 422)
-    return new AIError(
-      'This model or request is not supported by your provider. Check the model name and web-search availability in Settings.',
-      'MODEL',
-    );
-  if (status >= 500)
-    return new AIError('The AI provider is temporarily unavailable. Please try again later.', 'UNAVAILABLE');
-  return new AIError(`The AI request failed (HTTP ${Number(status) || 0}).`, 'REQUEST');
-}
-
 class AIService {
   constructor({
     getState,
     getPageContext,
     emit,
     userDataPath,
-    fetch: fetchImpl = globalThis.fetch,
-    safeStorage,
+    openExternal,
+    client,
     timeoutMs = REQUEST_TIMEOUT_MS,
   }) {
     this.getState = getState;
     this.getPageContext = getPageContext;
     this.emit = typeof emit === 'function' ? emit : () => {};
-    this.fetch = fetchImpl;
-    this.safeStorage = safeStorage || require('electron').safeStorage;
-    this.credentialPath = path.join(userDataPath, 'ai-credentials.enc');
+    this.openExternal = openExternal;
+    this.client = client || new CodexClient({ userDataPath });
+    this.preferencePath = path.join(userDataPath, 'ai-model.json');
+    this.model = '';
     this.timeoutMs = timeoutMs;
-    this.credentials = null;
     this.conversations = new Map();
     this.request = null;
-    this.loadError = null;
-    this.ready = this.loadCredentials();
+    this.client.on('status', () => this.emit({ type: 'ai:status', ...this.status() }));
+    this.ready = this.loadPreference();
+  }
+
+  async loadPreference() {
+    // Legacy API credential files are deliberately never opened or imported.
+    try {
+      const stat = await fs.stat(this.preferencePath);
+      if (stat.size > 4096) return;
+      const value = JSON.parse(await fs.readFile(this.preferencePath, 'utf8'));
+      if (typeof value.model === 'string' && /^[a-zA-Z0-9._:-]{0,120}$/.test(value.model))
+        this.model = value.model;
+    } catch {}
   }
 
   activeProfile() {
@@ -292,13 +158,34 @@ class AIService {
   }
 
   status() {
-    return {
-      configured: Boolean(this.credentials),
-      provider: this.credentials?.provider || 'openai',
-      model: this.credentials?.model || DEFAULT_MODELS.openai,
-      busy: Boolean(this.request),
-      ...(this.loadError ? { error: this.loadError } : {}),
-    };
+    const status = this.client.status();
+    const model =
+      this.model || status.models.find((entry) => entry.isDefault)?.id || status.models[0]?.id || '';
+    return { ...status, provider: 'codex', model, busy: Boolean(this.request) };
+  }
+
+  async refreshStatus() {
+    try {
+      await this.client.refresh();
+    } catch (error) {
+      return { ...this.status(), error: error.message };
+    }
+    return this.status();
+  }
+
+  async login() {
+    if (this.activeProfile()?.private) throw new AIError('AI is unavailable in private profiles.', 'PRIVATE');
+    const url = await this.client.login();
+    try {
+      if (url) {
+        if (!this.openExternal) throw new Error('External browser unavailable');
+        await this.openExternal(url);
+      }
+    } catch {
+      await this.client.cancelLogin();
+      throw new AIError('Unable to open ChatGPT sign-in in your system browser.', 'AUTH');
+    }
+    return this.status();
   }
 
   get latestSources() {
@@ -306,78 +193,25 @@ class AIService {
     return this.conversations.get(this.activeProfile()?.id)?.latest?.sources || [];
   }
 
-  async encryptionAvailable() {
-    const storage = this.safeStorage;
-    if (
-      typeof storage?.getSelectedStorageBackend === 'function' &&
-      storage.getSelectedStorageBackend() === 'basic_text'
-    )
-      return false;
-    if (typeof storage?.isAsyncEncryptionAvailable === 'function')
-      return storage.isAsyncEncryptionAvailable();
-    return Boolean(storage?.isEncryptionAvailable?.());
-  }
-
-  async loadCredentials() {
-    try {
-      const stat = await fs.stat(this.credentialPath);
-      if (stat.size > 65536) throw new Error('Invalid credential file');
-      if (!(await this.encryptionAvailable())) throw new Error('Credential storage unavailable');
-      const encrypted = await fs.readFile(this.credentialPath);
-      const storage = this.safeStorage;
-      const decrypted =
-        typeof storage.decryptStringAsync === 'function'
-          ? await storage.decryptStringAsync(encrypted)
-          : storage.decryptString(encrypted);
-      const parsed = JSON.parse(typeof decrypted === 'string' ? decrypted : decrypted.result);
-      if (
-        !DEFAULT_MODELS[parsed.provider] ||
-        typeof parsed.apiKey !== 'string' ||
-        typeof parsed.model !== 'string'
-      )
-        throw new Error('Invalid credentials');
-      this.credentials = parsed;
-    } catch (error) {
-      if (error.code !== 'ENOENT')
-        this.loadError = 'Your saved AI connection could not be unlocked. Reconnect in Settings.';
-    }
-    this.emit({ type: 'ai:status', ...this.status() });
-  }
-
   async configure(payload) {
-    if (this.request) throw new AIError('Stop the current answer before changing your connection.', 'BUSY');
-    const provider = payload.provider === 'claude' ? 'anthropic' : payload.provider;
-    if (!DEFAULT_MODELS[provider]) throw new AIError('Choose OpenAI or Claude.', 'INPUT');
-    const apiKey = typeof payload.apiKey === 'string' ? payload.apiKey.trim() : '';
-    if (!apiKey || apiKey.length > 8192 || /[\r\n\u0000]/.test(apiKey))
-      throw new AIError('Enter a valid API key.', 'INPUT');
-    const model =
-      typeof payload.model === 'string' && payload.model.trim()
-        ? payload.model.trim()
-        : DEFAULT_MODELS[provider];
-    if (!/^[a-zA-Z0-9._:-]{1,120}$/.test(model))
-      throw new AIError('Enter a valid provider model identifier.', 'INPUT');
-    if (!(await this.encryptionAvailable()))
+    if (this.request) throw new AIError('Stop the current answer before changing models.', 'BUSY');
+    if (Object.keys(payload).some((key) => key !== 'model'))
       throw new AIError(
-        'Secure operating-system credential storage is unavailable. The API key was not saved.',
-        'STORAGE',
+        'Zacro uses ChatGPT subscription sign-in. API credentials are not supported.',
+        'INPUT',
       );
-    const credentials = { provider, apiKey, model };
-    const storage = this.safeStorage;
-    const encrypted =
-      typeof storage.encryptStringAsync === 'function'
-        ? await storage.encryptStringAsync(JSON.stringify(credentials))
-        : storage.encryptString(JSON.stringify(credentials));
-    const temporary = `${this.credentialPath}.${randomUUID()}.tmp`;
-    await fs.mkdir(path.dirname(this.credentialPath), { recursive: true });
+    const model = typeof payload.model === 'string' ? payload.model.trim() : '';
+    if (model && !this.client.status().models.some((entry) => entry.id === model))
+      throw new AIError('Choose a model available to your Codex account.', 'MODEL');
+    await fs.mkdir(path.dirname(this.preferencePath), { recursive: true });
+    const temporary = this.preferencePath + '.' + randomUUID() + '.tmp';
     try {
-      await fs.writeFile(temporary, encrypted, { mode: 0o600, flag: 'wx' });
-      await fs.rename(temporary, this.credentialPath);
+      await fs.writeFile(temporary, JSON.stringify({ model }), { mode: 0o600, flag: 'wx' });
+      await fs.rename(temporary, this.preferencePath);
     } finally {
       await fs.rm(temporary, { force: true }).catch(() => {});
     }
-    this.credentials = credentials;
-    this.loadError = null;
+    this.model = model;
     this.conversations.clear();
     this.emit({ type: 'ai:status', ...this.status() });
     return this.status();
@@ -385,12 +219,15 @@ class AIService {
 
   async disconnect() {
     this.cancel();
-    await fs.rm(this.credentialPath, { force: true });
-    this.credentials = null;
-    this.loadError = null;
+    await this.client.logout();
     this.conversations.clear();
     this.emit({ type: 'ai:status', ...this.status() });
     return this.status();
+  }
+
+  close() {
+    this.cancel();
+    this.client.close();
   }
 
   cancel() {
@@ -483,66 +320,55 @@ class AIService {
     return { pages, unreadable, scope: `pages:${[...ids].sort().join(',')}` };
   }
 
-  async requestProvider(messages, research, signal, instructions = SYSTEM) {
-    const { provider, apiKey, model } = this.credentials;
-    const openai = provider === 'openai';
-    const headers = openai
-      ? { Authorization: `Bearer ${apiKey}` }
-      : { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' };
-    const body = openai
-      ? {
-          model,
-          instructions,
-          input: messages,
-          store: false,
-          max_output_tokens: 4500,
-          ...(research
-            ? {
-                tools: [{ type: 'web_search', search_context_size: 'medium' }],
-                tool_choice: 'required',
-                include: ['web_search_call.action.sources'],
-              }
-            : {}),
-        }
-      : {
-          model,
-          system: instructions,
-          messages,
-          max_tokens: 3500,
-          ...(research ? { tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 4 }] } : {}),
-        };
-    const response = await this.fetch(
-      openai ? 'https://api.openai.com/v1/responses' : 'https://api.anthropic.com/v1/messages',
-      {
-        method: 'POST',
-        headers: { ...headers, 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-        signal,
-        redirect: 'error',
+  async requestProvider(messages, research, signal, instructions = SYSTEM, { stream = true } = {}) {
+    const profileId = this.request?.profileId;
+    const items = await this.client.run({
+      model: this.status().model || undefined,
+      messages,
+      research,
+      signal,
+      instructions,
+      onDelta: (delta) => {
+        if (stream && !signal.aborted && this.activeProfile()?.id === profileId)
+          this.emit({ type: 'ai:delta', delta, profileId });
       },
-    );
-    // Provider errors may contain user input or credentials. Never copy their body into UI/logs.
-    if (!response.ok) {
-      await response.body?.cancel?.().catch(() => {});
-      throw providerError(response.status);
+    });
+    const answers = items.filter((item) => item.type === 'agentMessage' && item.phase !== 'commentary');
+    const answer = answers
+      .map((item) => cleanText(item.text, 2000000))
+      .join('\n')
+      .trim();
+    if (!answer) throw new AIError('Codex returned no answer. Try a more specific question.', 'EMPTY');
+    const sources = [];
+    // Only URLs exposed by completed web-search actions/results are source evidence.
+    // A model-written Markdown URL alone is not proof that the page was researched.
+    const collect = (value, depth = 0) => {
+      if (!value || depth > 8) return;
+      if (Array.isArray(value)) return value.forEach((item) => collect(item, depth + 1));
+      if (typeof value !== 'object') return;
+      if (safeSourceUrl(value.url)) sources.push({ url: value.url, title: value.title });
+      for (const [key, child] of Object.entries(value)) if (key !== 'url') collect(child, depth + 1);
+    };
+    for (const item of items)
+      if (item.type === 'webSearch') {
+        collect(item.action);
+        collect(item.results);
+      }
+    const verified = dedupeSources(sources);
+    const citations = [];
+    const links = /\[([^\]\n]{1,300})\]\((https?:\/\/[^\s)]+)\)/g;
+    let match;
+    while ((match = links.exec(answer))) {
+      const url = safeSourceUrl(match[2]);
+      const source = url && verified.find((entry) => sourceKey(entry.url) === sourceKey(url));
+      if (source) citations.push({ start: match.index, end: match.index + match[0].length, ...source });
     }
-    const data = await readJSONResponse(response);
-    if (signal.aborted) throw signal.reason;
-    if (data.error || data.type === 'error')
-      throw new AIError(
-        'The provider could not complete the request. Check your connection and usage limits.',
-        'PROVIDER',
-      );
-    const result = openai ? parseOpenAI(data) : parseAnthropic(data);
-    if (!result.answer.trim())
-      throw new AIError('The provider returned no answer. Try a more specific question.', 'EMPTY');
-    result.historyContent = openai ? result.answer : data.content;
-    return result;
+    return { answer, sources: verified, citations, usage: {}, historyContent: answer };
   }
 
   async ask(payload) {
-    if (!this.credentials)
-      throw new AIError('Connect an OpenAI or Claude API key in Settings to use AI.', 'NOT_CONFIGURED');
+    if (!this.status().configured)
+      throw new AIError('Sign in with ChatGPT in Settings to use your Codex subscription.', 'NOT_CONFIGURED');
     if (this.request)
       throw new AIError('An answer is already running. Stop it before asking another question.', 'BUSY');
     const question = cleanText(payload.question, MAX_QUESTION + 1).trim();
@@ -609,7 +435,7 @@ class AIService {
       const instructions =
         SYSTEM +
         (research
-          ? '\nResearch this question using web search before answering. Cite the evidence with the provider citation format. If no credible sources are available, say so. Do not state that opening source tabs or other browser actions has occurred.'
+          ? '\nResearch this question using web search before answering. Open the evidence pages with web search and cite them using Markdown links with their actual URLs. If no credible sources are available, say so. Do not state that opening source tabs or other browser actions has occurred.'
           : '\nAnswer only from the explicitly shared page extracts and the conversation. Do not use outside research or pretend to read a full PDF or truncated content. Cite factual claims with exact paragraph identifiers such as [1:3]. Quote short passages where helpful. Say when the answer is absent. Identify pages that cannot be compared due to missing information.');
       const result = await this.requestProvider(messages, research, controller.signal, instructions);
       this.assertProfile(profile.id);
@@ -627,8 +453,8 @@ class AIService {
         mode: research ? 'research' : 'pages',
         complete: true,
         profileId: profile.id,
-        provider: this.credentials.provider,
-        model: this.credentials.model,
+        provider: 'codex',
+        model: this.status().model,
       };
       if (research && !result.sources.length) {
         complete.warning = result.searchError
@@ -645,7 +471,7 @@ class AIService {
     } catch (error) {
       const failure = controller.signal.aborted ? controller.signal.reason : error;
       const message =
-        failure instanceof AIError
+        failure instanceof AIError || failure instanceof CodexError
           ? failure.message
           : 'Unable to reach the AI provider. Check your internet connection and try again.';
       this.emit({ type: 'ai:error', message, code: failure?.code || 'NETWORK', profileId: profile.id });
@@ -658,7 +484,8 @@ class AIService {
   }
 
   async suggestName(payload) {
-    if (!this.credentials) throw new AIError('Connect an AI provider in Settings first.', 'NOT_CONFIGURED');
+    if (!this.status().configured)
+      throw new AIError('Sign in with ChatGPT in Settings first.', 'NOT_CONFIGURED');
     if (this.request) throw new AIError('Stop the current answer before requesting a filename.', 'BUSY');
     const profile = this.activeProfile();
     if (!profile || profile.private) throw new AIError('AI is unavailable in private profiles.', 'PRIVATE');
@@ -689,6 +516,8 @@ class AIService {
         [{ role: 'user', content: prompt }],
         false,
         controller.signal,
+        SYSTEM,
+        { stream: false },
       );
       this.assertProfile(profile.id);
       return {
@@ -699,7 +528,7 @@ class AIService {
       };
     } catch (error) {
       const failure = controller.signal.aborted ? controller.signal.reason : error;
-      throw failure instanceof AIError
+      throw failure instanceof AIError || failure instanceof CodexError
         ? failure
         : new AIError('Unable to reach the AI provider. Please try again.', 'NETWORK');
     } finally {
@@ -714,6 +543,11 @@ class AIService {
     if (!payload || typeof payload !== 'object' || Array.isArray(payload))
       throw new AIError('Invalid AI request.', 'INPUT');
     switch (action) {
+      case 'ai:login':
+        return this.login();
+      case 'ai:login-cancel':
+        await this.client.cancelLogin();
+        return this.status();
       case 'ai:configure':
         return this.configure(payload);
       case 'ai:disconnect':
@@ -728,7 +562,7 @@ class AIService {
         this.emit({ type: 'ai:reset', profileId: this.activeProfile()?.id });
         return null;
       case 'ai:status':
-        return this.status();
+        return this.refreshStatus();
       case 'ai:suggest-name':
         return this.suggestName(payload);
       default:
@@ -744,7 +578,5 @@ module.exports = {
   safeSourceUrl,
   dedupeSources,
   sanitizeSuggestedFilename,
-  parseOpenAI,
-  parseAnthropic,
   pageCitations,
 };

@@ -12,7 +12,7 @@ const { getCurrentFuseWire, FuseV1Options } = require('@electron/fuses');
 const { makePDF } = require('../fixtures/pdf.cjs');
 
 test(
-  'Windows package has hardened fuses, starts, browses and contains working ASAR PDF resources',
+  'Windows package has hardened fuses, browses, parses PDFs and starts its isolated Codex runtime',
   { timeout: 90000, skip: process.platform !== 'win32' },
   async (t) => {
     const root = path.resolve(__dirname, '../..');
@@ -48,7 +48,7 @@ test(
     delete env.ELECTRON_RUN_AS_NODE;
     child = spawn(executable, ['--remote-debugging-address=127.0.0.1', '--remote-debugging-port=0'], {
       env,
-      windowsHide: true,
+      windowsHide: false,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let diagnostics = '';
@@ -87,6 +87,13 @@ test(
     const about = await shell.evaluate(() => window.zacro.invoke('app:about'));
     assert.equal(about.packaged, true);
     assert.equal(about.name, 'Zacro');
+    // No login and no model request: verify the shipped ASAR-unpacked native
+    // runtime actually initializes from the hardened executable with its own home.
+    const aiStatus = await shell.evaluate(() => window.zacro.invoke('ai:status'));
+    assert.equal(aiStatus.available, true);
+    assert.equal(aiStatus.configured, false);
+    assert.equal(aiStatus.account, null);
+    assert.equal(aiStatus.error, undefined);
     const url = `http://127.0.0.1:${server.address().port}/`;
     await shell.evaluate((url) => window.zacro.invoke('navigate', { url }), url);
     await expect

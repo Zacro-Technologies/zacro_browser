@@ -11,11 +11,34 @@ const {
 
 test('native pages align with shell toolbar, sidebar, and open panels without fractional seams', () => {
   const layout = browserLayout({ width: 1441, height: 941, sidebarWidth: 260, panelWidth: 400, split: true });
-  assert.deepEqual(layout.primary, { x: 260, y: 60, width: 379, height: 873 });
-  assert.deepEqual(layout.secondary, { x: 645, y: 60, width: 380, height: 873 });
+  assert.deepEqual(layout.primary, { x: 260, y: 44, width: 379, height: 889 });
+  assert.deepEqual(layout.secondary, { x: 645, y: 44, width: 380, height: 889 });
   assert.equal(layout.secondary.x + layout.secondary.width + 400 + 16, 1441);
   assert.equal(layout.secondary.x - layout.primary.x - layout.primary.width, 6);
-  assert.deepEqual(layout.peek, { x: 296, y: 112, width: 693, height: 785 });
+  assert.deepEqual(layout.peek, { x: 296, y: 96, width: 693, height: 801 });
+});
+
+test('hiding the sidebar reclaims its width while keeping the page, panel and split frame aligned', () => {
+  const full = browserLayout({ width: 1000, height: 700, sidebarWidth: 0 });
+  assert.deepEqual(full.primary, { x: 8, y: 44, width: 984, height: 648 });
+  assert.equal(full.secondary, null);
+  assert.deepEqual(full.peek, { x: 44, y: 96, width: 912, height: 560 });
+
+  const split = browserLayout({
+    width: 1000,
+    height: 700,
+    sidebarWidth: 0,
+    panelWidth: 360,
+    split: true,
+  });
+  assert.deepEqual(split.primary, { x: 8, y: 44, width: 305, height: 648 });
+  assert.deepEqual(split.secondary, { x: 319, y: 44, width: 305, height: 648 });
+  assert.equal(split.secondary.x + split.secondary.width + 360 + 16, 1000);
+  assert.deepEqual(split.peek, { x: 44, y: 96, width: 544, height: 560 });
+
+  const restored = browserLayout({ width: 1000, height: 700, sidebarWidth: 300 });
+  assert.equal(restored.primary.x, 300, 'A custom sidebar width remains available after focus mode');
+  assert.equal(browserLayout({ width: 1000, height: 700 }).primary.x, 230);
 });
 
 test('resizing and malformed dimensions keep native bounds finite and positive', () => {

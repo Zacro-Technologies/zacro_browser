@@ -21,7 +21,7 @@ before(async () => {
     }
     response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
     response.end(
-      `<!doctype html><html><head><link rel="icon" href="/favicon.ico" type="image/png"><title>Polish fixture ${request.url.replace(/[^a-z0-9/-]/gi, '')}</title></head><body><h1>Keyboard fixture</h1><p>Find this phrase twice. Find this phrase twice.</p><button id="target">Page target</button></body></html>`,
+      `<!doctype html><html><head><link rel="icon" href="/favicon.ico" type="image/png"><title>Polish fixture ${request.url.replace(/[^a-z0-9/-]/gi, '')}</title></head><body><h1>Keyboard fixture</h1><p>Find this phrase twice. Find this phrase twice.</p><button id="target">Page target</button><label>Draft <textarea id="draft"></textarea></label></body></html>`,
     );
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -111,6 +111,248 @@ async function launch(t, existingDirectory) {
   };
   return { app, shell, invoke, state, guest, navigate, close, directory };
 }
+
+async function openLibrarySection(shell, section) {
+  await shell.getByRole('button', { name: 'Library', exact: true }).click();
+  const menu = shell.getByRole('dialog', { name: 'Library', exact: true });
+  await expect(menu).toBeVisible();
+  await menu.locator(`[data-key="panel-${section}"]`).click();
+  await expect(menu).toHaveCount(0);
+}
+
+test(
+  'a working Space keeps eight tabs and folders visible below compact icon favorites',
+  { timeout: 45000 },
+  async (t) => {
+    const browser = await launch(t);
+    const { shell } = browser;
+    await shell.emulateMedia({ reducedMotion: 'reduce' });
+    await browser.app.evaluate(({ BrowserWindow }) => {
+      BrowserWindow.getAllWindows()[0].setContentSize(1440, 900);
+    });
+    const folder = await browser.invoke('folder:create', { name: 'Research' });
+    for (let index = 0; index < 4; index++) {
+      const tab = await browser.invoke('tab:create', { url: `${base}/favorite-${index}`, active: false });
+      await browser.invoke('tab:update', { id: tab.id, title: `Favorite ${index + 1}` });
+      await browser.invoke('tab:pin', { id: tab.id });
+    }
+    for (let index = 0; index < 8; index++) {
+      const tab = await browser.invoke('tab:create', { url: `${base}/research-${index}`, active: false });
+      await browser.invoke('tab:update', { id: tab.id, title: `Research document ${index + 1}` });
+      if (index < 2) await browser.invoke('tab:move', { id: tab.id, folderId: folder.id });
+    }
+    await expect(shell.locator('.favorite')).toHaveCount(4);
+    await expect(shell.locator('.tab-row')).toHaveCount(9);
+    const geometry = await shell.evaluate(() => {
+      const rows = [...document.querySelectorAll('.tab-row')].map((row) => {
+        const box = row.getBoundingClientRect();
+        return { top: box.top, bottom: box.bottom, height: box.height };
+      });
+      return {
+        viewportHeight: innerHeight,
+        sidebarWidth: document.querySelector('#sidebar').getBoundingClientRect().width,
+        footerTop: document.querySelector('.sidebar-footer').getBoundingClientRect().top,
+        rows,
+        favorites: [...document.querySelectorAll('.favorite')].map((button) => ({
+          name: button.getAttribute('aria-label'),
+          title: button.title,
+          height: button.getBoundingClientRect().height,
+          labels: button.querySelectorAll('.title,.favorite-label').length,
+        })),
+      };
+    });
+    assert.equal(geometry.sidebarWidth, 230);
+    assert(geometry.rows[0].top < geometry.viewportHeight / 5, 'The first tab belongs in the upper fifth');
+    assert(geometry.rows.every((row) => row.height <= 36 && row.bottom < geometry.footerTop));
+    for (const favorite of geometry.favorites) {
+      assert.match(favorite.name, /^Favorite [1-4]$/);
+      assert(favorite.title.includes(base), 'Icon-only favorites retain a full destination tooltip');
+      assert(favorite.height >= 40 && favorite.height <= 44);
+      assert.equal(favorite.labels, 0);
+    }
+    await shell.locator(`[data-key="folder-${folder.id}"]`).click();
+    await expect(shell.locator('.tab-row')).toHaveCount(7);
+    await shell.locator(`[data-key="folder-${folder.id}"]`).click();
+    await expect(shell.locator('.tab-row')).toHaveCount(9);
+  },
+);
+
+test(
+  'the guest sidebar shortcut reclaims page width without reloading or losing a draft',
+  { timeout: 45000 },
+  async (t) => {
+    const browser = await launch(t);
+    const { shell } = browser;
+    const url = `${base}/sidebar-draft`;
+    await browser.navigate(url);
+    await browser.guest(
+      url,
+      'document.getElementById("draft").value = "A draft worth keeping"; document.getElementById("draft").focus(); undefined',
+    );
+    const surface = () =>
+      browser.app.evaluate(({ BrowserWindow }, url) => {
+        const window = BrowserWindow.getAllWindows()[0];
+        const view = window.contentView.children.find((view) => view.webContents?.getURL() === url);
+        return view
+          ? { id: view.webContents.id, ...view.getBounds(), viewport: window.getContentSize() }
+          : null;
+      }, url);
+    await expect.poll(async () => (await surface())?.x).toBe(230);
+    const before = await surface();
+    const loads = requests.get('/sidebar-draft');
+    assert.equal(before.y, 44);
+    assert.equal(before.width, before.viewport[0] - 230 - 8);
+    await browser.app.evaluate(({ webContents }, url) => {
+      const contents = webContents.getAllWebContents().find((item) => item.getURL() === url);
+      contents.focus();
+      contents.sendInputEvent({ type: 'keyDown', keyCode: 'B', modifiers: ['control', 'shift'] });
+      contents.sendInputEvent({ type: 'keyUp', keyCode: 'B', modifiers: ['control', 'shift'] });
+    }, url);
+    await expect(shell.locator('#sidebar')).toBeHidden();
+    const restore = shell.getByRole('button', { name: 'Show sidebar (Ctrl + Shift + B)', exact: true });
+    await expect(restore).toBeVisible();
+    await expect.poll(async () => (await surface())?.x).toBe(8);
+    const expanded = await surface();
+    assert.equal(expanded.y, 44);
+    assert.equal(expanded.width, before.width + 222);
+    assert.equal(expanded.id, before.id);
+    await expect
+      .poll(() => browser.guest(url, 'document.hasFocus() && document.activeElement.id'))
+      .toBe('draft');
+    assert.equal(await browser.guest(url, 'document.getElementById("draft").value'), 'A draft worth keeping');
+    await restore.click();
+    await expect(shell.locator('#sidebar')).toBeVisible();
+    await expect.poll(async () => (await surface())?.x).toBe(230);
+    assert.equal((await surface()).width, before.width);
+    assert.equal(requests.get('/sidebar-draft'), loads, 'Changing chrome never reloads the page');
+    assert.equal(await browser.guest(url, 'document.getElementById("draft").value'), 'A draft worth keeping');
+  },
+);
+
+test(
+  'Library sections remain one click apart and closing returns focus to the Library opener',
+  { timeout: 45000 },
+  async (t) => {
+    const { shell } = await launch(t);
+    const library = shell.getByRole('button', { name: 'Library', exact: true });
+    await library.click();
+    const menu = shell.getByRole('dialog', { name: 'Library', exact: true });
+    await expect(menu.getByRole('button')).toHaveCount(4);
+    await menu.getByRole('button', { name: 'Bookmarks', exact: true }).click();
+    const navigation = shell.getByRole('navigation', { name: 'Library sections' });
+    await expect(navigation.getByRole('button')).toHaveCount(4);
+    for (const section of ['History', 'Downloads', 'Archived tabs', 'Bookmarks']) {
+      await navigation.getByRole('button', { name: section, exact: true }).click();
+      await expect(shell.locator('#panel-title')).toHaveText(section);
+      await expect(navigation.getByRole('button', { name: section, exact: true })).toHaveAttribute(
+        'aria-pressed',
+        'true',
+      );
+      await expect(shell.locator('#panel-search')).toBeFocused();
+    }
+    await shell.getByRole('button', { name: 'Close panel', exact: true }).click();
+    await expect(shell.locator('#side-panel')).toBeHidden();
+    await expect(library).toBeFocused();
+  },
+);
+
+test(
+  'new tab avoids repeating sidebar favorites and offers them when the sidebar is hidden',
+  { timeout: 45000 },
+  async (t) => {
+    const browser = await launch(t);
+    const { shell } = browser;
+    const url = `${base}/saved-favorite`;
+    const tab = await browser.invoke('tab:create', { url, active: false });
+    await browser.invoke('tab:update', { id: tab.id, title: 'Saved favorite' });
+    await browser.invoke('tab:pin', { id: tab.id });
+    await browser.invoke('bookmark:toggle', { url, title: 'Saved favorite' });
+    await browser.invoke('bookmark:toggle', { url: `${base}/saved-page`, title: 'Saved page' });
+    const home = shell.locator('#newtab');
+    await expect(home).toBeVisible();
+    await expect(home.locator(`.home-link[data-url="${url}"]`)).toHaveCount(0);
+    await expect(home.locator('.home-link')).toHaveCount(1);
+    await shell.locator('#home-query').fill('Keep this search draft');
+    await shell.getByRole('button', { name: 'Hide sidebar (Ctrl + Shift + B)', exact: true }).click();
+    await expect(home.locator(`.home-link[data-url="${url}"]`)).toHaveCount(1);
+    await expect(home.locator('.home-link')).toHaveCount(2);
+    await expect(shell.locator('#home-query')).toHaveValue('Keep this search draft');
+    await shell.getByRole('button', { name: 'Show sidebar (Ctrl + Shift + B)', exact: true }).click();
+    await expect(home.locator(`.home-link[data-url="${url}"]`)).toHaveCount(0);
+    await expect(shell.locator('#home-query')).toHaveValue('Keep this search draft');
+  },
+);
+
+test(
+  'Settings disclosures work with the keyboard and preserve an open section and draft across updates',
+  { timeout: 45000 },
+  async (t) => {
+    const browser = await launch(t);
+    const { shell } = browser;
+    await shell.emulateMedia({ reducedMotion: 'reduce' });
+    await browser.app.evaluate(({ BrowserWindow }) =>
+      BrowserWindow.getAllWindows()[0].setContentSize(960, 640),
+    );
+    await browser.app.evaluate(({ app }) => {
+      const { AIService } = process
+        .getBuiltinModule('module')
+        .createRequire(app.getAppPath() + '/package.json')('./src/main/ai.cjs');
+      const original = AIService.prototype.handle;
+      AIService.prototype.handle = function (action, payload) {
+        if (action === 'ai:status')
+          return Promise.resolve({
+            configured: true,
+            provider: 'codex',
+            model: 'fixture-one',
+            models: [
+              { id: 'fixture-one', name: 'Fixture one' },
+              { id: 'fixture-two', name: 'Fixture two' },
+            ],
+            account: { email: 'test@example.invalid', planType: 'plus' },
+          });
+        return original.call(this, action, payload);
+      };
+    });
+    await shell.getByRole('button', { name: 'Settings', exact: true }).click();
+    await expect(shell.locator('select[data-setting="theme"]')).toBeVisible();
+    const disclosures = shell.locator('#side-panel details');
+    await expect(disclosures).toHaveCount(4);
+    assert.deepEqual(await disclosures.evaluateAll((items) => items.map((item) => item.open)), [
+      false,
+      false,
+      false,
+      false,
+    ]);
+    const connection = shell.locator('#ai-settings');
+    await connection.locator('summary').focus();
+    await shell.keyboard.press('Enter');
+    await expect(connection).toHaveAttribute('open', '');
+    await expect(shell.getByLabel('Model', { exact: true })).toBeVisible();
+    await shell.getByLabel('Model', { exact: true }).focus();
+    await shell.getByLabel('Model', { exact: true }).selectOption('fixture-two');
+    await browser.invoke('settings:update', { values: { searchEngine: 'bing' } });
+    await expect(connection).toHaveAttribute('open', '');
+    await expect(shell.getByLabel('Model', { exact: true })).toHaveValue('fixture-two');
+    await expect(shell.getByLabel('Model', { exact: true })).toBeFocused();
+    for (const heading of ['Your data', 'Extensions', 'About Zacro']) {
+      const summary = shell.locator('#side-panel summary').filter({ hasText: heading });
+      await summary.focus();
+      await shell.keyboard.press('Enter');
+      await expect(summary.locator('..')).toHaveAttribute('open', '');
+      const geometry = await shell.locator('#side-panel').evaluate((panel) => ({
+        right: panel.getBoundingClientRect().right,
+        viewport: innerWidth,
+        bodyWidth: panel.querySelector('.panel-body').clientWidth,
+        scrollWidth: panel.querySelector('.panel-body').scrollWidth,
+      }));
+      assert(geometry.right <= geometry.viewport + 1);
+      assert(
+        geometry.scrollWidth <= geometry.bodyWidth + 1,
+        'Disclosure content must not overflow horizontally',
+      );
+    }
+  },
+);
 
 test(
   'command bar supports composition, selection, modal focus containment and return after state updates',
@@ -255,7 +497,7 @@ test(
       .getByRole('button', { name: 'New Space', exact: true })
       .focus();
     await shell.keyboard.press('Enter');
-    const dialog = shell.getByRole('dialog', { name: 'Create a Space' });
+    const dialog = shell.getByRole('dialog', { name: 'New Space', exact: true });
     await expect(dialog.getByRole('textbox', { name: 'Space name' })).toBeFocused();
     await dialog.getByRole('textbox', { name: 'Space name' }).fill('Keyboard Space');
     const close = dialog.getByRole('button', { name: 'Close', exact: true });
@@ -303,8 +545,11 @@ test(
   async (t) => {
     const browser = await launch(t);
     const { shell } = browser;
-    const history = shell.locator('[data-key="panel-history"]');
-    await history.focus();
+    const library = shell.getByRole('button', { name: 'Library', exact: true });
+    await library.focus();
+    await shell.keyboard.press('Enter');
+    const menu = shell.getByRole('dialog', { name: 'Library', exact: true });
+    await menu.getByRole('button', { name: /History/ }).focus();
     await shell.keyboard.press('Enter');
     const search = shell.locator('#panel-search');
     await expect(search).toBeFocused();
@@ -317,7 +562,7 @@ test(
     await expect(search).toBeFocused();
     await shell.keyboard.press('Escape');
     await expect(shell.locator('#side-panel')).toBeHidden();
-    await expect(history).toBeFocused();
+    await expect(library).toBeFocused();
     const settings = shell.locator('[data-key="panel-settings"]');
     await settings.focus();
     await shell.keyboard.press('Enter');
@@ -374,15 +619,13 @@ test(
           }
           return pixel();
         };
-        return ['.profile-caption', '.section-label', '.provider-note', '.setting-section h3'].map(
-          (selector) => {
-            const element = document.querySelector(selector);
-            const behind = background(element);
-            context.fillStyle = getComputedStyle(element).color;
-            context.fillRect(0, 0, 1, 1);
-            return { selector, ratio: ratio(pixel(), behind) };
-          },
-        );
+        return ['.space-title', '.new-tab', '.provider-note', '.setting-section h3'].map((selector) => {
+          const element = document.querySelector(selector);
+          const behind = background(element);
+          context.fillStyle = getComputedStyle(element).color;
+          context.fillRect(0, 0, 1, 1);
+          return { selector, ratio: ratio(pixel(), behind) };
+        });
       });
       for (const sample of contrast)
         assert(sample.ratio >= 4.5, `${theme} ${sample.selector} contrast is ${sample.ratio.toFixed(2)}:1`);
@@ -764,7 +1007,7 @@ test(
       });
     await shell.locator('#home-query').focus();
     assert.equal(await visibleOutline(shell.locator('#home-query')), true);
-    await shell.locator('[data-key="panel-history"]').click();
+    await openLibrarySection(shell, 'history');
     await expect(shell.locator('.empty-state h3')).toBeVisible();
     assert.equal(
       await shell.locator('.empty-state p').evaluate((element) => {
@@ -821,27 +1064,34 @@ test(
     assert(errorBorder.style !== 'none' && parseFloat(errorBorder.width) > 0, JSON.stringify(errorBorder));
     await browser.invoke('navigate', { url: 'zacro://newtab' });
     await shell.emulateMedia({ forcedColors: 'none', reducedMotion: 'no-preference' });
-    await shell.locator('[data-key="panel-history"]').click();
+    await openLibrarySection(shell, 'history');
     await expect(shell.locator('#panel-search')).toBeFocused();
-    const closing = await shell.evaluate(() => {
+    const opening = await shell.evaluate(() => {
       const panel = document.querySelector('#side-panel');
-      for (const animation of panel.getAnimations()) animation.finish();
       document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+      document.querySelector('[data-key="panel-settings"]').focus();
+      document.querySelector('[data-key="panel-settings"]').click();
       const animations = panel.getAnimations();
       // Hold this real transition so the OS preference switches while it runs.
       for (const animation of animations) animation.effect.updateTiming({ duration: 10000 });
       return animations.length;
     });
-    assert(closing > 0, 'A panel close transition must be in flight before changing the preference');
+    assert(opening > 0, 'A panel opening transition must be in flight before changing the preference');
     await shell.emulateMedia({ reducedMotion: 'reduce' });
-    await expect(shell.locator('#side-panel')).toBeHidden({ timeout: 2000 });
-    await expect(shell.locator('[data-key="panel-history"]')).toBeFocused();
-    assert.equal(
-      await shell.evaluate(
-        () => document.getAnimations().filter((animation) => animation.playState === 'running').length,
-      ),
-      0,
-    );
+    await expect(shell.locator('#side-panel')).toBeVisible();
+    await expect
+      .poll(() =>
+        shell.evaluate(
+          () => document.getAnimations().filter((animation) => animation.playState === 'running').length,
+        ),
+      )
+      .toBe(0);
+    const closedImmediately = await shell.evaluate(() => {
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+      return document.querySelector('#side-panel').hidden;
+    });
+    assert(closedImmediately, 'Closing a panel must restore layout without waiting for an outro');
+    await expect(shell.getByRole('button', { name: 'Settings', exact: true })).toBeFocused();
   },
 );
 
@@ -940,5 +1190,257 @@ test(
       .toBe(true);
     await browser.shell.keyboard.press('Escape');
     assert.equal((await browser.state()).runtime.page.url, parent);
+  },
+);
+
+test(
+  'Codex sign-in UI, cancellation, streamed answers and sign-out preserve drafts without API key fields',
+  { timeout: 45000 },
+  async (t) => {
+    const browser = await launch(t);
+    const { shell } = browser;
+    await browser.app.evaluate(({ app, BrowserWindow }) => {
+      const { AIService } = process
+        .getBuiltinModule('module')
+        .createRequire(app.getAppPath() + '/package.json')('./src/main/ai.cjs');
+      const original = AIService.prototype.handle;
+      globalThis.__subscriptionFixture = {
+        configured: false,
+        provider: 'codex',
+        loginPending: false,
+        models: [],
+        busy: false,
+      };
+      globalThis.__subscriptionActions = [];
+      globalThis.__subscriptionStatusQueue = [];
+      AIService.prototype.handle = async function (action, payload) {
+        globalThis.__subscriptionActions.push({ action, payload });
+        const status = globalThis.__subscriptionFixture;
+        if (action === 'ai:status') {
+          if (globalThis.__deferSubscriptionStatus)
+            return new Promise((resolve) => globalThis.__subscriptionStatusQueue.push(resolve));
+          return status;
+        }
+        if (action === 'ai:ask') return { accepted: true };
+        if (action === 'ai:reset' || action === 'ai:cancel') {
+          BrowserWindow.getAllWindows()[0].webContents.send('zacro:event', {
+            type: action === 'ai:reset' ? 'ai:reset' : 'ai:cancelled',
+          });
+          return { cancelled: true };
+        }
+        if (action === 'ai:login' || action === 'ai:login-cancel' || action === 'ai:disconnect') {
+          status.loginPending = action === 'ai:login';
+          status.configured = false;
+          BrowserWindow.getAllWindows()[0].webContents.send('zacro:event', { type: 'ai:status', ...status });
+          return status;
+        }
+        return original.call(this, action, payload);
+      };
+    });
+    await shell.locator('[data-key="panel-ai"]').click();
+    await expect(shell.getByRole('button', { name: 'Connect Codex', exact: true })).toBeVisible();
+    await shell.getByRole('button', { name: 'Connect Codex', exact: true }).click();
+    await expect(shell.getByRole('button', { name: 'Sign in with ChatGPT', exact: true })).toBeVisible();
+    assert.equal(await shell.locator('input[type=password], #api-key, #provider').count(), 0);
+    await shell.getByRole('button', { name: 'Sign in with ChatGPT', exact: true }).click();
+    await expect(shell.getByRole('button', { name: 'Cancel sign-in', exact: true })).toBeVisible();
+    await shell.getByRole('button', { name: 'Cancel sign-in', exact: true }).click();
+    await expect(shell.getByRole('button', { name: 'Sign in with ChatGPT', exact: true })).toBeVisible();
+    const emit = (event) =>
+      browser.app.evaluate(
+        ({ BrowserWindow }, event) => BrowserWindow.getAllWindows()[0].webContents.send('zacro:event', event),
+        event,
+      );
+    await browser.app.evaluate(({ BrowserWindow }) => {
+      Object.assign(globalThis.__subscriptionFixture, {
+        configured: true,
+        loginPending: false,
+        account: { email: 'test@example.invalid', planType: 'plus' },
+        model: 'fixture-one',
+        models: [{ id: 'fixture-one', name: 'Fixture model' }],
+      });
+      BrowserWindow.getAllWindows()[0].webContents.send('zacro:event', {
+        type: 'ai:status',
+        ...globalThis.__subscriptionFixture,
+      });
+    });
+    await expect(shell.getByLabel('Model', { exact: true })).toHaveValue('fixture-one');
+    await expect(shell.getByRole('button', { name: 'Sign out', exact: true })).toBeVisible();
+    await shell.locator('[data-key="panel-ai"]').click();
+    await shell.locator('#ai-question').fill('Keep this follow-up draft');
+    await shell.locator('#ai-question').focus();
+    await shell.evaluate(() => {
+      window.originalComposer = document.querySelector('#ai-question');
+      window.originalContextSelect = document.querySelector('#ai-context');
+      window.originalComposer.setSelectionRange(2, 9, 'backward');
+      window.originalComposer.dispatchEvent(new CompositionEvent('compositionstart', { data: '試' }));
+    });
+    await emit({ type: 'ai:delta', delta: 'First streaming sentence. ' });
+    await emit({ type: 'ai:delta', delta: 'Second sentence.' });
+    await expect(shell.locator('.message.assistant .message-content')).toHaveText(
+      'First streaming sentence. Second sentence.',
+    );
+    await expect(shell.locator('#ai-question')).toHaveValue('Keep this follow-up draft');
+    await expect(shell.locator('#ai-question')).toBeFocused();
+    assert.deepEqual(
+      await shell.evaluate(() => ({
+        sameComposer: window.originalComposer === document.querySelector('#ai-question'),
+        sameSelect: window.originalContextSelect === document.querySelector('#ai-context'),
+        selection: [
+          document.querySelector('#ai-question').selectionStart,
+          document.querySelector('#ai-question').selectionEnd,
+          document.querySelector('#ai-question').selectionDirection,
+        ],
+      })),
+      { sameComposer: true, sameSelect: true, selection: [2, 9, 'backward'] },
+    );
+    await shell.evaluate(() =>
+      window.originalComposer.dispatchEvent(new CompositionEvent('compositionend', { data: '試' })),
+    );
+    await shell.locator('#ai-submit').focus();
+    await emit({ type: 'ai:progress', message: 'Writing…' });
+    await emit({ type: 'ai:delta', delta: ' More detail.' });
+    const active = (await browser.state()).activeTabId;
+    await browser.invoke('tab:update', { id: active, title: 'A title update during a stream' });
+    await expect(shell.locator('#ai-submit')).toBeFocused();
+    await expect(shell.locator('#ai-submit')).toHaveAttribute('aria-label', 'Stop response');
+    await shell.locator('#ai-context').focus();
+    const longAnswer = Array.from(
+      { length: 45 },
+      (_, index) =>
+        `Paragraph ${index + 1}: useful reference material with enough text to fill this conversation.`,
+    ).join('\n\n');
+    await emit({ type: 'ai:delta', delta: longAnswer });
+    await expect(shell.locator('.message.assistant .message-content')).toContainText('Paragraph 45:');
+    await shell.evaluate(() => {
+      document.querySelector('#conversation').scrollTop = 0;
+    });
+    await emit({ type: 'ai:answer', answer: longAnswer, sources: [], citations: [] });
+    await expect(shell.locator('.message.assistant')).toHaveCount(1);
+    await expect(shell.locator('.message.assistant .message-content')).toHaveText(longAnswer);
+    await expect(shell.locator('#ai-context')).toBeFocused();
+    assert.equal(await shell.evaluate(() => document.querySelector('#conversation').scrollTop), 0);
+    assert(
+      await shell.evaluate(() => window.originalContextSelect === document.querySelector('#ai-context')),
+    );
+    await emit({ type: 'ai:delta', delta: 'Interrupted answer' });
+    await emit({ type: 'ai:error', code: 'CANCELLED', message: 'Cancelled' });
+    await expect(shell.locator('.message.assistant').last()).toContainText('Response incomplete.');
+
+    // Losing authentication keeps completed work readable and offers a direct
+    // route back to sign-in even though the welcome screen is no longer shown.
+    await emit({ type: 'ai:error', code: 'AUTH', message: 'Sign in with ChatGPT again.' });
+    await emit({ type: 'ai:status', configured: false, busy: false, loginPending: false, models: [] });
+    await expect(shell.locator('.message.assistant').first()).toHaveText(`Zacro${longAnswer}`);
+    await expect(shell.locator('.message.assistant').last()).toContainText('Sign in with ChatGPT again.');
+    await expect(shell.locator('#ai-form')).toHaveCount(0);
+    await expect(shell.getByRole('button', { name: 'Connect Codex', exact: true })).toBeVisible();
+    await emit({ type: 'ai:status', configured: false, busy: false, loginPending: true, models: [] });
+    await expect(shell.getByRole('button', { name: 'Continue sign-in', exact: true })).toBeVisible();
+    await emit({ type: 'ai:status', configured: true, busy: false, loginPending: false, models: [] });
+    await expect(shell.locator('#ai-form')).toBeVisible();
+
+    // Hold the status reply to exercise two Enter presses in the same turn.
+    // The draft remains visible until one request is accepted, and Enter while
+    // a response is running must not erase a new follow-up draft.
+    await emit({ type: 'ai:reset' });
+    await browser.app.evaluate(() => {
+      globalThis.__deferSubscriptionStatus = true;
+    });
+    await shell.evaluate(() => {
+      const question = document.querySelector('#ai-question');
+      question.value = 'One question, twice pressed';
+      question.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+      question.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    });
+    await expect.poll(() => browser.app.evaluate(() => globalThis.__subscriptionStatusQueue.length)).toBe(1);
+    await expect(shell.locator('#ai-question')).toHaveValue('One question, twice pressed');
+    await browser.app.evaluate(() => {
+      globalThis.__deferSubscriptionStatus = false;
+      globalThis.__subscriptionStatusQueue.shift()(globalThis.__subscriptionFixture);
+    });
+    await expect
+      .poll(() =>
+        browser.app.evaluate(
+          () => globalThis.__subscriptionActions.filter((call) => call.action === 'ai:ask').length,
+        ),
+      )
+      .toBe(1);
+    await shell.locator('#ai-question').fill('Do not erase this follow-up');
+    await shell.locator('#ai-question').press('Enter');
+    await expect(shell.locator('#ai-question')).toHaveValue('Do not erase this follow-up');
+    await emit({ type: 'ai:answer', answer: 'The single request completed.', sources: [], citations: [] });
+
+    // A pending status reply must not submit against a newly selected page or
+    // carry a question across a profile boundary.
+    await browser.navigate(`${base}/ai-page-before`);
+    await shell.locator('#ai-context').selectOption('page');
+    await browser.app.evaluate(() => {
+      globalThis.__deferSubscriptionStatus = true;
+    });
+    await shell.locator('#ai-question').fill('Question for the original page');
+    await shell.locator('#ai-question').press('Enter');
+    await expect.poll(() => browser.app.evaluate(() => globalThis.__subscriptionStatusQueue.length)).toBe(1);
+    await browser.navigate(`${base}/ai-page-after`);
+    await browser.app.evaluate(() => {
+      globalThis.__deferSubscriptionStatus = false;
+      globalThis.__subscriptionStatusQueue.shift()(globalThis.__subscriptionFixture);
+    });
+    await expect(shell.locator('#toast-root')).toContainText('The browsing context changed');
+    await expect(shell.locator('#ai-question')).toHaveValue('Question for the original page');
+    assert.equal(
+      await browser.app.evaluate(
+        () => globalThis.__subscriptionActions.filter((call) => call.action === 'ai:ask').length,
+      ),
+      1,
+    );
+
+    await shell.locator('#ai-question').press('Enter');
+    await expect
+      .poll(() =>
+        browser.app.evaluate(
+          () => globalThis.__subscriptionActions.filter((call) => call.action === 'ai:ask').length,
+        ),
+      )
+      .toBe(2);
+    const acceptedPage = await browser.app.evaluate(
+      () => globalThis.__subscriptionActions.filter((call) => call.action === 'ai:ask').at(-1).payload,
+    );
+    assert.deepEqual(acceptedPage.tabIds, [(await browser.state()).activeTabId]);
+    await emit({ type: 'ai:answer', answer: 'Answer for the captured page.', sources: [], citations: [] });
+
+    await browser.app.evaluate(() => {
+      globalThis.__deferSubscriptionStatus = true;
+    });
+    await shell.locator('#ai-question').fill('Keep this question out of another profile');
+    await shell.locator('#ai-question').press('Enter');
+    await expect.poll(() => browser.app.evaluate(() => globalThis.__subscriptionStatusQueue.length)).toBe(1);
+    await browser.invoke('profile:create', { name: 'Other test profile' });
+    await expect(shell.locator('.space-title')).toHaveText('Other test profile');
+    await browser.app.evaluate(() => {
+      globalThis.__deferSubscriptionStatus = false;
+      globalThis.__subscriptionStatusQueue.shift()(globalThis.__subscriptionFixture);
+    });
+    await expect(shell.locator('#ai-question')).toHaveValue('');
+    assert.equal(
+      await browser.app.evaluate(
+        () => globalThis.__subscriptionActions.filter((call) => call.action === 'ai:ask').length,
+      ),
+      2,
+    );
+    await shell.locator('[data-key="panel-settings"]').click();
+    await shell.locator('#ai-settings summary').click();
+    await shell.getByRole('button', { name: 'Sign out', exact: true }).click();
+    await expect(shell.getByRole('button', { name: 'Sign in with ChatGPT', exact: true })).toBeVisible();
+    await shell.locator('[data-key="panel-ai"]').click();
+    await expect(shell.locator('.message')).toHaveCount(0);
+    await expect(shell.locator('#ai-form')).toHaveCount(0);
+    const calls = await browser.app.evaluate(() => globalThis.__subscriptionActions);
+    assert.equal(
+      calls.some((c) => c.payload?.apiKey),
+      false,
+    );
+    assert(calls.some((c) => c.action === 'ai:login'));
+    assert(calls.some((c) => c.action === 'ai:login-cancel'));
   },
 );

@@ -1,6 +1,6 @@
 {
   "name": "zacro-browser",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A sidebar-first Chromium browser with Spaces, profiles, Peek, and optional AI.",
   "main": "src/main/main.cjs",
   "private": true,
@@ -38,6 +38,9 @@
     "appId": "com.zacro.browser",
     "productName": "Zacro",
     "asar": true,
+    "asarUnpack": [
+      "node_modules/@openai/codex-*/vendor/**/*"
+    ],
     "electronDist": "node_modules/electron/dist",
     "electronFuses": {
       "runAsNode": false,
@@ -87,6 +90,7 @@
     }
   },
   "dependencies": {
+    "@openai/codex": "0.164.0",
     "pdfjs-dist": "6.4.299"
   }
 }

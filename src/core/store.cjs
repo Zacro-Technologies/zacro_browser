@@ -109,10 +109,10 @@ function createInitialState() {
       theme: 'system',
       searchEngine: 'duckduckgo',
       archiveAfterHours: 24,
-      sidebarWidth: 260,
+      sidebarWidth: 230,
       restoreSession: true,
       openSourcesLimit: 3,
-      aiProvider: 'openai',
+      aiProvider: 'codex',
       aiModel: '',
       sharePageContext: false,
     },
@@ -133,8 +133,9 @@ function validateSettings(values, base = createInitialState().settings) {
     next.openSourcesLimit = Math.min(10, Math.max(1, values.openSourcesLimit));
   for (const key of ['restoreSession', 'sharePageContext'])
     if (typeof values[key] === 'boolean') next[key] = values[key];
-  if (['openai', 'anthropic'].includes(values.aiProvider)) next.aiProvider = values.aiProvider;
-  if (typeof values.aiModel === 'string') next.aiModel = str(values.aiModel, 100);
+  next.aiProvider = 'codex';
+  if (values.aiProvider === 'codex' && typeof values.aiModel === 'string')
+    next.aiModel = str(values.aiModel, 100);
   return next;
 }
 

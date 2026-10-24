@@ -16,9 +16,11 @@ Acceptance: exercise every exposed control, keyboard-only flows, narrow/large wi
 
 ## 3. Optional AI with explicit data boundaries
 
-Implement supported OpenAI and Anthropic API connections with OS-encrypted local credentials, cancellation, separate research and page-context modes, citations, follow-up conversation and current-answer source opening without duplicate tabs. No network requests to providers before an explicit question. No claims of subscription billing compatibility without an implemented supported flow.
+Use the signed-in user's Codex subscription through a supported ChatGPT authentication flow, with cancellation, separate research and page-context modes, citations, follow-up conversation and current-answer source opening without duplicate tabs. Keep the connection isolated from an existing developer Codex setup. Inference requires an explicit question; ordinary browsing remains independent of AI. Do not add an API-key or separate API-billing fallback.
 
-Acceptance: mocked provider protocol tests, profile/private-tab guards, cancellation races, rate-limit and malformed responses, source URL validation, no key leakage, provider/context disclosures. Direct PDF text extraction runs in a bounded local worker with physical-page citations; its unit, real-browser, and packaged-resource tests pass. Live paid-provider acceptance requires credentials supplied by a tester and an approved spend. Scoped consequential browser agents still require a separate verified permission and execution system.
+Acceptance: app-server protocol tests, profile/private-tab guards, cancellation races, usage limits, malformed responses, source URL validation, credential isolation and context disclosures. Direct PDF text extraction runs in a bounded local worker with physical-page citations. Live subscription acceptance requires the tester to finish ChatGPT sign-in and confirm account access, real answers, citations, cancellation, and limit handling. Local commands, filesystem tools, plugins, MCP servers, and skills must remain unavailable to browsing questions. Scoped consequential browser agents still require a separate verified permission and execution system.
+
+The local open-source build uses Codex app-server authentication. OpenAI distinguishes that integration from commercial or hosted services, which require the supported Sign in with ChatGPT path. Any change to that distribution model must pass the authentication/distribution review before release. See the [official app-server authentication guidance](https://learn.chatgpt.com/docs/app-server#authentication-endpoints).
 
 ## 4. Extension compatibility and Zacro sync
 

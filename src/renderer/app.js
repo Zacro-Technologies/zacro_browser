@@ -8,6 +8,8 @@ const esc = (value = '') =>
 const icons = {
   plus: 'M12 5v14M5 12h14',
   layers: 'm12 3 10 6-10 6L2 9zM2 13l10 6 10-6M2 17l10 6 10-6',
+  sidebar: 'M3 4h18v16H3zM9 4v16',
+  library: 'M4 4v16M9 4v16M14 4v16M18 4l3 16',
   volume: 'M4 9h4l5-5v16l-5-5H4zM16 8a6 6 0 0 1 0 8M19 5a10 10 0 0 1 0 14',
   muted: 'M4 9h4l5-5v16l-5-5H4zM17 9l5 6M22 9l-5 6',
   close: 'm6 6 12 12M18 6 6 18',
@@ -86,6 +88,7 @@ let state = null;
 let toastTimer;
 const ui = {
   panel: null,
+  sidebarHidden: false,
   panelQuery: '',
   dialog: null,
   dialogReturn: null,
@@ -97,6 +100,8 @@ const ui = {
   dragTab: null,
   aiMessages: [],
   aiBusy: false,
+  aiSubmitting: false,
+  aiSubmissionSerial: 0,
   aiProgress: '',
   aiSources: [],
   aiContext: 'research',
@@ -236,21 +241,27 @@ function showPageBackdrop(frames) {
 }
 const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
 const activeMotions = new Set();
+const elementMotions = new WeakMap();
 reducedMotion.addEventListener('change', (event) => {
   if (!event.matches) return;
-  // Finishing preserves close/focus callbacks when the OS preference changes
-  // midway through a transition. Cancelling would leave closing panels open.
+  // Finish presentation immediately when the preference changes. UI state and
+  // native page geometry never wait for an animation to complete.
   for (const animation of activeMotions) animation.finish();
 });
-function motion(element, frames, duration = 200) {
+function motion(element, frames, duration = 140) {
+  elementMotions.get(element)?.cancel();
   if (!element || reducedMotion.matches || !element.animate) return null;
   const animation = element.animate(frames, {
     duration,
-    easing: 'cubic-bezier(.2,.8,.2,1)',
+    easing: 'cubic-bezier(.16,1,.3,1)',
     fill: 'none',
   });
   activeMotions.add(animation);
-  const forget = () => activeMotions.delete(animation);
+  elementMotions.set(element, animation);
+  const forget = () => {
+    activeMotions.delete(animation);
+    if (elementMotions.get(element) === animation) elementMotions.delete(element);
+  };
   animation.finished.then(forget, forget);
   return animation;
 }
@@ -336,9 +347,12 @@ function applyState(next) {
   setTheme();
   if (previousSpace !== state.activeSpaceId || previousTab !== state.activeTabId) clearPageBackdrop();
   if (previousProfile && previousProfile !== activeProfile()?.id) {
+    invalidateAIRequest();
     ui.aiMessages = [];
     ui.aiSources = [];
     ui.aiTabs = [];
+    ui.aiBusy = false;
+    ui.aiProgress = '';
     ui.aiContext = 'research';
     ui.aiProfileId = activeProfile()?.id;
     ui.panelSignature = '';
@@ -349,26 +363,26 @@ function applyState(next) {
     motion(
       $('.space-header'),
       [
-        { opacity: 0.35, transform: 'translateY(5px)' },
+        { opacity: 0.65, transform: 'translateY(2px)' },
         { opacity: 1, transform: 'translateY(0)' },
       ],
-      260,
+      120,
     );
     motion(
       $('.tabs-scroll'),
       [
-        { opacity: 0, transform: 'translateX(10px)' },
+        { opacity: 0.45, transform: 'translateX(5px)' },
         { opacity: 1, transform: 'translateX(0)' },
       ],
-      280,
+      150,
     );
     motion(
       $('.newtab-inner'),
       [
-        { opacity: 0.3, transform: 'translateY(8px)' },
+        { opacity: 0.6, transform: 'translateY(4px)' },
         { opacity: 1, transform: 'translateY(0)' },
       ],
-      320,
+      150,
     );
   }
 }
@@ -414,51 +428,35 @@ function renderSidebar() {
   const oldRows = new Map(
     $$('[data-tab-id]', $('#sidebar')).map((row) => [row.dataset.tabId, row.getBoundingClientRect().top]),
   );
+  const previousActive = $('[data-tab-id].active', $('#sidebar'))?.dataset.tabId;
   const sameSpace = ui.sidebarSpaceId === space?.id;
   const tabRow = (tab) => {
     const page = state.runtime?.pages?.[tab.id];
     return `<div class="tab-row ${tab.id === state.activeTabId ? 'active' : ''}" draggable="true" data-tab-id="${esc(tab.id)}" data-drop-tab="${esc(tab.id)}"><button type="button" class="tab-main" data-action="tab:activate" data-id="${esc(tab.id)}" data-key="tab-${esc(tab.id)}" ${tab.id === state.activeTabId ? 'aria-current="page"' : ''} title="${esc(tab.title)} — ${esc(tab.url)}">${page?.loading ? '<span class="spinner"></span>' : favicon(tab.url)}<span class="title">${esc(tab.title || 'New tab')}</span>${state.runtime?.splitTabId === tab.id ? icon('split') : ''}</button>${page?.audible || page?.muted ? button('tab:mute', page.muted ? 'Unmute tab' : 'Mute tab', page.muted ? 'muted' : 'volume', `data-id="${esc(tab.id)}"`, 'tab-audio') : ''}${button('tab:close', `Close ${tab.title || 'tab'}`, 'close', `data-id="${esc(tab.id)}" data-key="close-${esc(tab.id)}"`, 'tab-close')}</div>`;
   };
   $('#sidebar').innerHTML =
-    `<div class="brand">${mark}<span class="brand-name">Zacro</span>${button('ui:menu', 'Browser menu', 'more', 'data-key="browser-menu"')}</div>
-    <div class="space-header"><button type="button" class="space-picker" data-action="ui:spaces" data-key="space-picker" aria-label="Switch Space or profile"><span class="space-emblem">${profile?.private ? icon('shield') : esc((space?.name || 'S').slice(0, 1).toUpperCase())}</span><span class="grow"><span class="space-title">${esc(space?.name || 'My Space')}</span><span class="profile-caption">${profile?.private ? 'Private session' : esc(profile?.name || 'Default') + ' profile'}</span></span>${icon('down')}</button></div>
-    <button type="button" class="sidebar-search" data-action="ui:command" data-key="sidebar-search">${icon('search')}<span>Search or jump to…</span><kbd>${mod} K</kbd></button>
-    <div class="tabs-scroll"><div class="section-label">Favorites${button('ui:pin-help', 'Pin the current tab', 'plus', '', 'small-button')}</div>
-    ${pins.length ? `<div class="favorites">${pins.map((tab) => `<button type="button" class="favorite ${tab.id === state.activeTabId ? 'active' : ''}" draggable="true" data-tab-id="${esc(tab.id)}" data-action="tab:activate" data-id="${esc(tab.id)}" data-key="pin-${esc(tab.id)}" aria-label="${esc(tab.title || hostname(tab.url))}" title="${esc(tab.title)} — ${esc(tab.url)}">${favicon(tab.url)}<span>${esc(tab.title || hostname(tab.url))}</span></button>`).join('')}</div>` : `<button type="button" class="favorites-empty" data-action="ui:pin-help">${icon('pin')}<span>Keep your go-to pages here.</span></button>`}
-    <div class="tabs-section-header"><div class="section-label">Your tabs<span class="tab-count">${tabs.filter((t) => !t.pinned).length}</span></div>${button('ui:new-folder', 'New folder', 'folderPlus', '', 'small-button')}</div>
+    `<div class="brand space-header"><button type="button" class="brand-button" data-action="ui:menu" data-key="browser-menu" aria-label="Browser menu" title="Zacro menu">${mark}</button><button type="button" class="space-picker" data-action="ui:spaces" data-key="space-picker" aria-label="Switch Space or profile" title="${esc(space?.name)} · ${esc(profile?.name)}${profile?.private ? ' · Private session' : ''}">${profile?.private ? icon('shield') : ''}<span class="space-title">${esc(space?.name || 'My Space')}</span>${icon('down')}</button></div>
+    ${profile?.private ? '<div class="private-indicator">Private session</div>' : ''}
+    <div class="tabs-scroll">
+    ${pins.length ? `<div class="favorites" aria-label="Pinned tabs">${pins.map((tab) => `<button type="button" class="favorite ${tab.id === state.activeTabId ? 'active' : ''}" draggable="true" data-tab-id="${esc(tab.id)}" data-action="tab:activate" data-id="${esc(tab.id)}" data-key="pin-${esc(tab.id)}" ${tab.id === state.activeTabId ? 'aria-current="page"' : ''} aria-label="${esc(tab.title || hostname(tab.url))}" title="${esc(tab.title)} — ${esc(tab.url)}">${favicon(tab.url, tab.id)}</button>`).join('')}</div>` : ''}
+    <div class="tabs-section-header"><button type="button" class="new-tab" data-action="ui:new-tab" data-key="new-tab">${icon('plus')}<span>New tab</span><kbd>${mod} T</kbd></button>${button('ui:new-folder', 'New folder', 'folderPlus', '', 'small-button')}</div>
     ${folders
       .map(
         (folder) =>
-          `<div class="folder" data-folder-id="${esc(folder.id)}" data-drop-folder="${esc(folder.id)}"><button type="button" class="folder-heading" data-action="ui:folder-toggle" data-id="${esc(folder.id)}" data-key="folder-${esc(folder.id)}" aria-expanded="${!ui.closedFolders.has(folder.id)}">${icon(ui.closedFolders.has(folder.id) ? 'forward' : 'down')}${icon('folder')}<span class="truncate">${esc(folder.name)}</span><span class="folder-count">${tabs.filter((t) => t.folderId === folder.id).length}</span></button>${
+          `<div class="folder" data-folder-id="${esc(folder.id)}" data-drop-folder="${esc(folder.id)}"><button type="button" class="folder-heading" data-action="ui:folder-toggle" data-id="${esc(folder.id)}" data-key="folder-${esc(folder.id)}" aria-expanded="${!ui.closedFolders.has(folder.id)}">${icon('down')}${icon('folder')}<span class="truncate">${esc(folder.name)}</span><span class="folder-count">${tabs.filter((t) => t.folderId === folder.id).length}</span></button>${
             ui.closedFolders.has(folder.id)
               ? ''
               : `<div class="folder-tabs">${
                   tabs
                     .filter((t) => t.folderId === folder.id && !t.pinned)
                     .map(tabRow)
-                    .join('') || '<div class="empty-tabs">Drop a tab into this folder</div>'
+                    .join('') || '<div class="empty-tabs">Drop tabs here</div>'
                 }</div>`
           }</div>`,
       )
       .join('')}
-    <div class="loose-tabs" data-drop-folder="">${loose.map(tabRow).join('')}${!loose.length && !folders.length ? '<p class="empty-tabs">A fresh start for this Space.</p>' : ''}</div>
-    <button type="button" class="new-tab" data-action="ui:new-tab" data-key="new-tab">${icon('plus')}<span>New tab</span><kbd>${mod} T</kbd></button></div>
-    <footer class="sidebar-footer">${profile?.private ? '<div class="private-indicator">Private tabs stay in this session.</div>' : ''}<div class="space-switcher"><div class="space-dots" aria-label="Your Spaces">${spaces.map((s) => `<button type="button" class="space-dot ${s.id === space?.id ? 'active' : ''}" data-action="space:activate" data-id="${esc(s.id)}" title="${esc(s.name)}" aria-label="Switch to ${esc(s.name)}" ${s.id === space?.id ? 'aria-current="true"' : ''}>${esc(s.name.slice(0, 1).toUpperCase())}</button>`).join('')}${button('ui:new-space', 'New Space', 'plus', '', 'small-button')}</div>${button('ui:spaces', 'Manage Spaces', 'layers', 'data-key="manage-spaces"', 'small-button')}</div><div class="footer-actions">${[
-      ['history', 'History', 'history'],
-      ['bookmarks', 'Bookmarks', 'bookmark'],
-      ['downloads', 'Downloads', 'download'],
-      ['archive', 'Archived tabs', 'archive'],
-      ['settings', 'Settings', 'settings'],
-    ]
-      .map(([panel, label, symbol]) =>
-        button(
-          'ui:panel',
-          label,
-          symbol,
-          `data-panel="${panel}" data-key="panel-${panel}" aria-pressed="${ui.panel === panel}"`,
-        ),
-      )
-      .join('')}</div></footer>`;
+    <div class="loose-tabs" data-drop-folder="">${loose.map(tabRow).join('')}</div></div>
+    <footer class="sidebar-footer">${button('ui:library', 'Library', 'library', 'data-key="library" aria-haspopup="dialog"')}<div class="space-dots" aria-label="Your Spaces">${spaces.map((s) => `<button type="button" class="space-dot ${s.id === space?.id ? 'active' : ''}" data-action="space:activate" data-id="${esc(s.id)}" title="${esc(s.name)}" aria-label="Switch to ${esc(s.name)}" ${s.id === space?.id ? 'aria-current="true"' : ''}>${esc(s.name.slice(0, 1).toUpperCase())}</button>`).join('')}${button('ui:new-space', 'New Space', 'plus', '', 'small-button')}</div>${button('ui:panel', 'Settings', 'settings', `data-panel="settings" data-key="panel-settings" aria-pressed="${ui.panel === 'settings'}"`)}</footer>`;
   $('.tabs-scroll').scrollTop = scroll;
   if (sameSpace)
     for (const row of $$('[data-tab-id]', $('#sidebar'))) {
@@ -467,15 +465,17 @@ function renderSidebar() {
         motion(
           row,
           [
-            { opacity: 0, transform: 'translateY(-5px) scale(.97)' },
+            { opacity: 0.3, transform: 'translateY(-3px) scale(.985)' },
             { opacity: 1, transform: 'translateY(0) scale(1)' },
           ],
-          220,
+          140,
         );
       else {
         const dy = before - row.getBoundingClientRect().top;
         if (Math.abs(dy) > 1 && Math.abs(dy) < 300)
-          motion(row, [{ transform: `translateY(${dy}px)` }, { transform: 'translateY(0)' }], 190);
+          motion(row, [{ transform: `translateY(${dy}px)` }, { transform: 'translateY(0)' }], 140);
+        else if (row.dataset.tabId === state.activeTabId && previousActive !== state.activeTabId)
+          motion(row, [{ opacity: 0.7 }, { opacity: 1 }], 110);
       }
     }
   ui.sidebarSpaceId = space?.id;
@@ -498,11 +498,12 @@ function renderToolbar() {
     state.runtime?.splitTabId,
     state.runtime?.maximized,
     ui.panel,
+    ui.sidebarHidden,
   ]);
   if (signature === ui.toolbarSignature) return;
   ui.toolbarSignature = signature;
   $('#toolbar').innerHTML =
-    `<div class="navigation">${button('back', 'Back (Alt + Left)', 'back', `data-key="back" ${page.canGoBack ? '' : 'disabled'}`)}${button('forward', 'Forward (Alt + Right)', 'forward', `data-key="forward" ${page.canGoForward ? '' : 'disabled'}`)}${button(page.loading ? 'stop' : 'reload', page.loading ? 'Stop loading' : 'Reload (Ctrl + R)', page.loading ? 'close' : 'reload', `data-key="reload" ${blank ? 'disabled' : ''}`)}</div><button type="button" class="address-button" data-action="ui:address" data-key="address" title="${esc(tab?.url || 'Search or enter a URL')}" aria-label="Address bar: ${esc(tab?.url || 'New tab')}">${icon(blank ? 'search' : secure ? 'lock' : 'globe')}<span class="address-text">${esc(blank ? 'Search or enter a URL' : displayURL(tab.url))}</span></button><div class="toolbar-actions">${button('bookmark:toggle', bookmarked ? 'Remove bookmark' : 'Bookmark this page', 'star', `data-key="bookmark" data-url="${esc(tab?.url || '')}" data-title="${esc(tab?.title || '')}" aria-pressed="${bookmarked}" ${blank ? 'disabled' : ''}`)}${button('ui:split', state.runtime?.splitTabId ? 'Close split view' : 'Split view', 'split', `data-key="split" aria-pressed="${Boolean(state.runtime?.splitTabId)}"`, 'optional')}${button('ui:panel', 'Ask Zacro', 'sparkle', `data-panel="ai" data-key="panel-ai" aria-pressed="${ui.panel === 'ai'}"`)}</div><div class="window-controls" aria-label="Window controls">${button('window:minimize', 'Minimize', 'minimize')}${button('window:maximize', 'Maximize or restore', state.runtime?.maximized ? 'restore' : 'maximize')}${button('window:close', 'Close window', 'close', '', 'close-window')}</div>`;
+    `<div class="navigation">${button('ui:sidebar-toggle', ui.sidebarHidden ? 'Show sidebar (Ctrl + Shift + B)' : 'Hide sidebar (Ctrl + Shift + B)', 'sidebar', `data-key="sidebar-toggle" aria-pressed="${!ui.sidebarHidden}"`)}${button('back', 'Back (Alt + Left)', 'back', `data-key="back" ${page.canGoBack ? '' : 'disabled'}`)}${button('forward', 'Forward (Alt + Right)', 'forward', `data-key="forward" ${page.canGoForward ? '' : 'disabled'}`)}${button(page.loading ? 'stop' : 'reload', page.loading ? 'Stop loading' : 'Reload (Ctrl + R)', page.loading ? 'close' : 'reload', `data-key="reload" ${blank ? 'disabled' : ''}`)}</div><button type="button" class="address-button" data-action="ui:address" data-key="address" title="${esc(tab?.url || 'Search or enter a URL')}" aria-label="Address bar: ${esc(tab?.url || 'New tab')}">${icon(blank ? 'search' : secure ? 'lock' : 'globe')}<span class="address-text">${esc(blank ? 'Search or enter a URL' : displayURL(tab.url))}</span></button><div class="toolbar-actions">${button('bookmark:toggle', bookmarked ? 'Remove bookmark' : 'Bookmark this page', 'star', `data-key="bookmark" data-url="${esc(tab?.url || '')}" data-title="${esc(tab?.title || '')}" aria-pressed="${bookmarked}" ${blank ? 'disabled' : ''}`)}${button('ui:split', state.runtime?.splitTabId ? 'Close split view' : 'Split view', 'split', `data-key="split" aria-pressed="${Boolean(state.runtime?.splitTabId)}"`, 'optional')}${button('ui:panel', 'Ask Zacro', 'sparkle', `data-panel="ai" data-key="panel-ai" aria-pressed="${ui.panel === 'ai'}"`)}</div><div class="window-controls" aria-label="Window controls">${button('window:minimize', 'Minimize', 'minimize')}${button('window:maximize', 'Maximize or restore', state.runtime?.maximized ? 'restore' : 'maximize')}${button('window:close', 'Close window', 'close', '', 'close-window')}</div>`;
 }
 function renderWorkspace() {
   const tab = activeTab();
@@ -520,6 +521,7 @@ function renderWorkspace() {
     currentTabs().filter((tab) => tab.pinned),
     state.settings.searchEngine,
     activeProfile()?.private,
+    ui.sidebarHidden,
   ]);
   if (blank && signature !== ui.homeSignature) {
     ui.homeSignature = signature;
@@ -549,31 +551,23 @@ function renderWorkspace() {
   if (peek && peekSignature !== ui.peekSignature) {
     $('#peek').innerHTML =
       `<div class="peek-bar"><span class="peek-label">Peek</span><span class="peek-url">${esc(peek.title || peek.url)}</span>${button('peek:promote', 'Open preview as a tab', 'external')}${button('peek:close', 'Close preview (Escape)', 'close', 'data-key="peek-close"')}</div><div class="peek-body">${peek.error ? `<div class="error-card"><div class="error-symbol">${icon('globe')}</div><h2>This preview couldn’t be loaded.</h2><p>${esc(peek.error.description || peek.error.message || 'Check the address and your connection.')}</p>${primary('reload', 'Try again', 'reload')}</div>` : ''}</div>`;
+    if (!ui.peekSignature) motion($('.peek-bar'), [{ opacity: 0.55 }, { opacity: 1 }], 120);
   }
   ui.peekSignature = peekSignature;
 }
 function renderHome() {
   const draft = $('#home-query')?.value || '';
   const focused = document.activeElement?.id === 'home-query';
-  const now = new Date();
   const profile = activeProfile();
-  const greeting =
-    now.getHours() < 12 ? 'Good morning.' : now.getHours() < 18 ? 'Good afternoon.' : 'Good evening.';
-  const saved = [...currentTabs().filter((tab) => tab.pinned), ...profileItems('bookmarks')];
-  const seen = new Set();
-  const links = saved
+  const pins = currentTabs().filter((tab) => tab.pinned);
+  const seen = new Set(ui.sidebarHidden ? [] : pins.map((tab) => tab.url));
+  const links = [...(ui.sidebarHidden ? pins : []), ...profileItems('bookmarks')]
     .filter((item) => {
       if (seen.has(item.url)) return false;
       seen.add(item.url);
       return true;
     })
-    .slice(0, 4);
-  const suggestions = [
-    { title: 'Wikipedia', url: 'https://www.wikipedia.org/' },
-    { title: 'GitHub', url: 'https://github.com/' },
-    { title: 'Hacker News', url: 'https://news.ycombinator.com/' },
-    { title: 'Are.na', url: 'https://www.are.na/' },
-  ];
+    .slice(0, 6);
   const recentSeen = new Set();
   const recent = profileItems('history')
     .filter((item) => {
@@ -582,16 +576,11 @@ function renderHome() {
       return true;
     })
     .slice(0, 3);
-  const artwork = `<div class="home-art" aria-hidden="true"><div class="art-glow"></div><svg class="ribbon-art" viewBox="0 0 240 180"><defs><linearGradient id="ribbon-front" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#f2d6bc"/><stop offset=".38" stop-color="#dba7b3"/><stop offset=".7" stop-color="#a17ca1"/><stop offset="1" stop-color="#655b88"/></linearGradient><linearGradient id="ribbon-back" x1="1" y1="0" x2="0" y2="1"><stop stop-color="#c6b9e5"/><stop offset=".55" stop-color="#826e9d"/><stop offset="1" stop-color="#4b405f"/></linearGradient><linearGradient id="ribbon-highlight" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#fff3e2" stop-opacity=".8"/><stop offset="1" stop-color="#d8bbda" stop-opacity="0"/></linearGradient></defs><path class="ribbon-back" d="M69 132C24 110 39 53 77 49c36-4 52 62 88 53 31-8 36-48 13-66" stroke="url(#ribbon-back)"/><path class="ribbon-front" d="M67 133c36 18 43-45 77-40 37 6 58-20 35-55" stroke="url(#ribbon-front)"/><path class="ribbon-highlight" d="M66 123c30 14 43-47 77-40 24 4 38-8 38-25" stroke="url(#ribbon-highlight)"/></svg><span class="art-spark art-spark-one"></span><span class="art-spark art-spark-two"></span></div>`;
   $('#newtab').innerHTML =
-    `<div class="newtab-inner"><div class="newtab-meta"><button type="button" class="home-space" data-action="ui:spaces" data-key="home-space">${profile?.private ? icon('shield') : '<span class="space-status-dot"></span>'}${esc(activeSpace()?.name || 'My Space')}${icon('down')}</button><div class="home-date"><span class="time-label">${esc(now.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' }))}</span><span class="date-line">${esc(now.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' }))}</span></div></div>
-    <div class="hero home-header"><div><h1>${profile?.private ? 'A little privacy.' : greeting}</h1><p class="hero-copy">${profile?.private ? 'Your history and tabs stay in this session.' : 'Where will your curiosity take you?'}</p></div>${artwork}</div>
-    <form id="home-search" class="home-search" autocomplete="off">${icon('search')}<input id="home-query" name="query" aria-label="Search the web or enter a URL" placeholder="Search the web or enter a URL" spellcheck="false"><kbd>${mod} L</kbd><button type="submit" class="icon-button" title="Go" aria-label="Go">${icon('arrow')}</button></form>
-    <div class="search-caption"><span><kbd>Enter</kbd> to search or navigate</span><button type="button" class="home-ask" data-action="ui:home-ask">${icon('sparkle')}Ask Zacro<kbd>${mod} ↵</kbd></button></div>
-    <div class="home-links-title"><h2>${links.length ? 'Your go-to places' : 'Start exploring'}</h2><button type="button" class="text-button" data-action="ui:panel" data-panel="bookmarks" data-key="home-bookmarks">${links.length ? 'All bookmarks' : 'Save your favorites'}${icon('forward')}</button></div>
-    <div class="home-links">${(links.length ? links : suggestions).map((link) => `<button type="button" class="home-link" data-action="navigate" data-url="${esc(link.url)}" title="${esc(link.url)}">${favicon(link.url)}<span class="home-link-label">${esc(link.title || hostname(link.url))}</span><span class="home-link-domain">${esc(hostname(link.url))}</span>${icon('external')}</button>`).join('')}</div>
-    ${recent.length ? `<div class="home-recent"><div class="home-links-title"><h2>Pick up where you left off</h2><button type="button" class="text-button" data-action="ui:panel" data-panel="history" data-key="home-history">History${icon('forward')}</button></div><div class="recent-list">${recent.map((item) => `<button type="button" class="recent-page" data-action="navigate" data-url="${esc(item.url)}">${favicon(item.url)}<span class="grow"><span class="recent-title">${esc(item.title || hostname(item.url))}</span><span class="recent-domain">${esc(hostname(item.url))}</span></span><span class="recent-time">${esc(dateLabel(item.visitedAt))}</span>${icon('arrow')}</button>`).join('')}</div></div>` : `<div class="home-discover"><span class="discover-symbol">${icon('layers')}</span><span class="grow"><strong>A Space for every part of your day.</strong><span>Keep work, projects, and the good stuff together.</span></span><button type="button" class="text-button" data-action="ui:new-space">New Space${icon('plus')}</button></div>`}
-    <div class="home-bottom"><div class="home-quick-actions"><button type="button" data-action="ui:panel" data-panel="downloads" data-key="home-downloads">${icon('download')}Downloads</button><button type="button" data-action="ui:panel" data-panel="archive" data-key="home-archive">${icon('archive')}Archived tabs</button></div><button type="button" class="text-button" data-action="ui:shortcuts">${icon('keyboard')}Shortcuts</button></div></div>`;
+    `<div class="newtab-inner">${profile?.private ? '<div class="private-home">' + icon('shield') + '<h1>Private browsing</h1><p>History and tabs stay in this session.</p></div>' : ''}
+    <form id="home-search" class="home-search" autocomplete="off">${icon('search')}<input id="home-query" name="query" aria-label="Search the web or enter a URL" placeholder="Search or enter a URL" spellcheck="false"><button type="submit" class="icon-button" title="Go" aria-label="Go">${icon('arrow')}</button></form>
+    ${links.length ? '<div class="home-links" aria-label="Saved pages">' + links.map((link) => `<button type="button" class="home-link" data-action="navigate" data-url="${esc(link.url)}" title="${esc(link.title)} — ${esc(link.url)}">${favicon(link.url)}<span class="home-link-label">${esc(link.title || hostname(link.url))}</span></button>`).join('') + '</div>' : ''}
+    ${recent.length ? `<div class="home-recent"><div class="home-links-title"><h2>Recent</h2>${button('ui:panel', 'History', 'history', 'data-panel="history" data-key="home-history"', 'small-button')}</div><div class="recent-list">${recent.map((item) => `<button type="button" class="recent-page" data-action="navigate" data-url="${esc(item.url)}" title="${esc(item.url)}">${favicon(item.url)}<span class="recent-title">${esc(item.title || hostname(item.url))}</span><span class="recent-domain">${esc(hostname(item.url))}</span>${icon('arrow')}</button>`).join('')}</div></div>` : ''}</div>`;
   if (draft) $('#home-query').value = draft;
   if (focused) $('#home-query').focus({ preventScroll: true });
 }
@@ -599,9 +588,14 @@ function renderHome() {
 let lastLayout = '';
 function syncLayout() {
   if (!state) return;
-  const width = Math.max(210, Math.min(340, Number(state.settings.sidebarWidth) || 260));
-  const panel = ui.panel ? Math.max(300, Math.min(400, window.innerWidth - width - 328)) : 0;
+  const width = ui.sidebarHidden
+    ? 0
+    : Math.max(210, Math.min(340, Number(state.settings.sidebarWidth) || 230));
+  const panel = ui.panel ? Math.max(300, Math.min(360, window.innerWidth - width - 328)) : 0;
   $('#app').dataset.panelOpen = String(Boolean(ui.panel));
+  $('#app').dataset.sidebarHidden = String(ui.sidebarHidden);
+  $('#sidebar').inert = ui.sidebarHidden || Boolean(ui.dialog);
+  $('#sidebar').setAttribute('aria-hidden', String(ui.sidebarHidden));
   document.documentElement.style.setProperty('--sidebar', `${width}px`);
   document.documentElement.style.setProperty('--panel', `${panel}px`);
   const layout = {
@@ -630,7 +624,50 @@ const panelNames = {
 };
 function panelHeader() {
   const [symbol, title] = panelNames[ui.panel] || ['info', 'Library'];
-  return `<header class="panel-header">${icon(symbol)}<h2 id="panel-title" tabindex="-1">${title}</h2>${ui.panel === 'ai' ? button('ui:ai-reset', 'New conversation', 'plus') : ''}${button('ui:panel-close', 'Close panel', 'close', 'data-key="panel-close"')}</header>`;
+  const library = ['bookmarks', 'history', 'downloads', 'archive'].includes(ui.panel);
+  return `<header class="panel-header">${icon(symbol)}<h2 id="panel-title" tabindex="-1">${title}</h2>${ui.panel === 'ai' ? button('ui:ai-reset', 'New conversation', 'plus') : ''}${button('ui:panel-close', 'Close panel', 'close', 'data-key="panel-close"')}</header>${library ? `<nav class="panel-tabs" aria-label="Library sections">${['bookmarks', 'history', 'downloads', 'archive'].map((panel) => button('ui:panel', panelNames[panel][1], panelNames[panel][0], `data-panel="${panel}" data-key="panel-${panel}" aria-pressed="${ui.panel === panel}"`)).join('')}</nav>` : ''}`;
+}
+function patchAIContent(current, incoming) {
+  // Keep the composer, native select, focused controls, and unchanged messages
+  // alive while tokens arrive. Replacing this subtree interrupts IME input and
+  // drops keyboard focus from the Stop button even if its value is restored.
+  const key = (node) =>
+    node.nodeType === Node.ELEMENT_NODE
+      ? node.id ||
+        node.dataset.key ||
+        (node.dataset.messageIndex !== undefined ? `message-${node.dataset.messageIndex}` : '')
+      : '';
+  if (current.nodeType !== incoming.nodeType || current.nodeName !== incoming.nodeName) {
+    current.replaceWith(incoming.cloneNode(true));
+    return;
+  }
+  if (current.isEqualNode(incoming)) return;
+  if (current.nodeType !== Node.ELEMENT_NODE) {
+    current.nodeValue = incoming.nodeValue;
+    return;
+  }
+  for (const attribute of [...current.attributes])
+    if (!incoming.hasAttribute(attribute.name)) current.removeAttribute(attribute.name);
+  for (const attribute of [...incoming.attributes])
+    if (current.getAttribute(attribute.name) !== attribute.value)
+      current.setAttribute(attribute.name, attribute.value);
+  const keyed = new Map([...current.childNodes].filter(key).map((node) => [key(node), node]));
+  const kept = new Set();
+  [...incoming.childNodes].forEach((next, index) => {
+    const nextKey = key(next);
+    let existing = nextKey ? keyed.get(nextKey) : current.childNodes[index];
+    if (existing && (kept.has(existing) || (!nextKey && key(existing)))) existing = null;
+    if (!existing || existing.nodeType !== next.nodeType || existing.nodeName !== next.nodeName) {
+      existing = next.cloneNode(true);
+      current.insertBefore(existing, current.childNodes[index] || null);
+    } else {
+      if (existing !== current.childNodes[index])
+        current.insertBefore(existing, current.childNodes[index] || null);
+      patchAIContent(existing, next);
+    }
+    kept.add(existing);
+  });
+  for (const child of [...current.childNodes]) if (!kept.has(child)) child.remove();
 }
 function renderPanel(force = false) {
   const element = $('#side-panel');
@@ -644,18 +681,27 @@ function renderPanel(force = false) {
         ? [
             ui.aiMessages,
             ui.aiBusy,
+            ui.aiSubmitting,
             ui.aiProgress,
             ui.aiStatus,
             ui.aiContext,
             ui.aiTabs,
             state.runtime?.aiConfigured,
+            activeProfile()?.id,
           ]
         : [state[ui.panel === 'archive' ? 'archive' : ui.panel], ui.panelQuery, activeProfile()?.id];
   const signature = JSON.stringify([ui.panel, data]);
   if (!force && signature === ui.panelSignature) return;
   ui.panelSignature = signature;
   const scroll = $('.panel-body', element)?.scrollTop || 0;
-  const draft = $('#ai-question', element)?.value;
+  const sameAIProfile = ui.aiPanelProfile === activeProfile()?.id;
+  const draft = sameAIProfile ? $('#ai-question', element)?.value : undefined;
+  const disclosures = new Map(
+    $$('details.setting-section', element).map((details) => [
+      details.id || $('summary', details)?.textContent,
+      details.open,
+    ]),
+  );
   const providerDraft = Object.fromEntries(
     $$('#provider-form input,#provider-form select', element).map((el) => [el.id, el.value]),
   );
@@ -668,7 +714,13 @@ function renderPanel(force = false) {
   } else if (ui.panel === 'extensions') {
     element.innerHTML = panelHeader() + `<div class="panel-body">${renderExtensions()}</div>`;
   } else if (ui.panel === 'ai') {
-    element.innerHTML = panelHeader() + renderAI();
+    const html = panelHeader() + renderAI();
+    if (sameAIProfile && $('#conversation', element)) {
+      const next = element.cloneNode(false);
+      next.innerHTML = html;
+      patchAIContent(element, next);
+    } else element.innerHTML = html;
+    ui.aiPanelProfile = activeProfile()?.id;
   } else {
     const label = panelNames[ui.panel][1];
     element.innerHTML =
@@ -677,14 +729,19 @@ function renderPanel(force = false) {
   }
   const body = $('.panel-body', element);
   if (body) body.scrollTop = scroll;
-  if (draft !== undefined && $('#ai-question', element)) $('#ai-question', element).value = draft;
+  const composer = $('#ai-question', element);
+  if (draft !== undefined && composer && composer.value !== draft) composer.value = draft;
+  for (const details of $$('details.setting-section', element)) {
+    const key = details.id || $('summary', details)?.textContent;
+    if (disclosures.has(key)) details.open = disclosures.get(key);
+  }
   for (const [id, value] of Object.entries(providerDraft)) {
     const field = $('#' + id, element);
     if (field) field.value = value;
   }
   if (focusedId) {
     const replacement = $(`#${focusedId}`);
-    if (replacement) {
+    if (replacement && replacement !== document.activeElement) {
       replacement.focus({ preventScroll: true });
       if (selection && replacement.setSelectionRange)
         try {
@@ -703,21 +760,9 @@ function renderResourcePanel() {
   if (!records.length) {
     if (query) return empty('search', 'No matches', 'Try a different title or address.');
     const messages = {
-      history: [
-        'history',
-        'A fresh start',
-        'The pages you visit will appear here. Private browsing never adds history.',
-      ],
-      bookmarks: [
-        'bookmark',
-        'Keep the good finds',
-        'Use the star in the address bar to save a page for later.',
-      ],
-      archive: [
-        'archive',
-        'Nothing left behind',
-        'Closed and automatically archived tabs wait here, ready to reopen.',
-      ],
+      history: ['history', 'No history yet', 'Pages you visit appear here.'],
+      bookmarks: ['bookmark', 'No bookmarks yet', 'Use the star to save a page.'],
+      archive: ['archive', 'No archived tabs', 'Closed tabs will appear here.'],
     };
     return empty(...messages[key]);
   }
@@ -737,12 +782,7 @@ function renderResourcePanel() {
     .join('');
 }
 function renderDownloads(records) {
-  if (!records.length)
-    return empty(
-      'download',
-      'Your downloads live here',
-      'Download a file from any page to track its progress and find it again.',
-    );
+  if (!records.length) return empty('download', 'No downloads yet', 'Files you download appear here.');
   return records
     .map((file) => {
       const name = file.name || file.filename || 'Download';
@@ -769,30 +809,43 @@ function selectOptions(values, current) {
 function settingSelect(key, label, values) {
   return `<div class="setting-field"><label for="setting-${key}">${label}</label><select id="setting-${key}" data-setting="${key}">${selectOptions(values, state.settings[key])}</select></div>`;
 }
+function renderAIConnection() {
+  const status = ui.aiStatus || {};
+  const connected = Boolean(status.configured ?? state.runtime?.aiConfigured);
+  const pending = Boolean(status.loginPending || ui.aiSigningIn);
+  const account = status.account || {};
+  if (activeProfile()?.private) return '<p class="provider-note">AI is unavailable in private browsing.</p>';
+  const identity = account.email || 'ChatGPT account';
+  const models = Array.isArray(status.models) ? status.models : [];
+  return `<div id="ai-connection-status" class="connection-status" role="status"><span class="status-dot ${connected ? 'connected' : ''}"></span>${connected ? esc(identity) : pending ? 'Waiting for sign-in…' : 'Not connected'}</div>${connected && account.planType ? `<p class="provider-note">${esc(account.planType)} · Codex subscription</p>` : ''}${status.error ? `<p class="provider-note danger" role="alert">${esc(status.error)}</p>` : ''}<div class="setting-actions">${connected ? secondary('ui:ai-disconnect', 'Sign out', '', 'id="ai-account-action"') : pending ? secondary('ui:ai-login-cancel', 'Cancel sign-in', '', 'id="ai-account-action"') : primary('ui:ai-login', 'Sign in with ChatGPT', 'user', 'id="ai-account-action"')}</div><p class="provider-note">Uses your Codex subscription and its usage limits. No API key required.</p>${
+    connected && models.length
+      ? `<form id="provider-form"><div class="setting-field"><label for="ai-model">Model</label><select id="ai-model" name="model">${selectOptions(
+          models.map((m) => [m.id, m.name || m.id]),
+          status.model,
+        )}</select></div><button type="submit" class="secondary">Use model</button></form>`
+      : ''
+  }`;
+}
 function renderSettings() {
   const settings = state.settings;
   const profile = activeProfile();
-  return `<div class="panel-intro">Make a browser that feels like yours.</div><section class="setting-section"><h3>Appearance & browsing</h3>${settingSelect(
-    'theme',
-    'Appearance',
-    [
-      ['system', 'Follow system'],
-      ['light', 'Light'],
-      ['dark', 'Dark'],
-    ],
-  )}${settingSelect('searchEngine', 'Search engine', [
+  return `<section class="setting-section"><h3>Appearance</h3>${settingSelect('theme', 'Appearance', [
+    ['system', 'Follow system'],
+    ['light', 'Light'],
+    ['dark', 'Dark'],
+  ])}${settingSelect('searchEngine', 'Search engine', [
     ['duckduckgo', 'DuckDuckGo'],
     ['google', 'Google'],
     ['bing', 'Bing'],
     ['brave', 'Brave Search'],
-  ])}${settingSelect('archiveAfterHours', 'Archive inactive, unpinned tabs', [
+  ])}${settingSelect('archiveAfterHours', 'Archive inactive tabs', [
     [0, 'Never'],
     [12, 'After 12 hours'],
     [24, 'After 24 hours'],
     [72, 'After 3 days'],
     [168, 'After 7 days'],
     [720, 'After 30 days'],
-  ])}<p class="provider-note">Automatic cleanup applies to inactive tabs restored in the background. Open pages are kept to protect unsaved work.</p>${settingSelect(
+  ])}<p class="provider-note">Live pages stay open to protect unsaved work.</p>${settingSelect(
     'sidebarWidth',
     'Sidebar width',
     [
@@ -800,13 +853,7 @@ function renderSettings() {
       [260, 'Comfortable'],
       [300, 'Spacious'],
     ],
-  )}<label class="setting-toggle"><span>Restore previous session<small>Pick up with your saved Spaces and tabs.</small></span><input type="checkbox" data-setting="restoreSession" ${settings.restoreSession ? 'checked' : ''}></label><div class="setting-actions">${secondary('ui:edit-space', 'Customize Space', 'edit')}${secondary('ui:profiles', 'Profiles', 'user')}</div></section><section class="setting-section"><h3>AI connection</h3><div id="ai-connection-status" class="connection-status"><span class="status-dot ${(ui.aiStatus?.configured ?? state.runtime?.aiConfigured) ? 'connected' : ''}"></span>${(ui.aiStatus?.configured ?? state.runtime?.aiConfigured) ? 'Provider connected' : 'No provider connected'}</div><form id="provider-form"><div class="setting-field"><label for="provider">Provider</label><select id="provider" name="provider">${selectOptions(
-    [
-      ['openai', 'OpenAI API'],
-      ['anthropic', 'Claude API'],
-    ],
-    state.runtime?.aiProvider || settings.aiProvider || 'openai',
-  )}</select></div><div class="setting-field"><label for="api-key">API key</label><input id="api-key" name="apiKey" type="password" autocomplete="off" spellcheck="false" placeholder="Paste your provider API key" required><small>Encrypted with your operating system. Never included in exports or sent to other providers.</small></div><div class="setting-field"><label for="ai-model">Model (optional)</label><input id="ai-model" name="model" value="${esc(state.runtime?.aiModel || settings.aiModel || '')}" placeholder="Use provider default" autocomplete="off" spellcheck="false"></div><div class="setting-actions"><button type="submit" class="primary">${icon('lock')}Save connection</button>${secondary('ui:ai-disconnect', 'Disconnect')}</div></form><p class="provider-note">API usage is billed by your provider. A ChatGPT or Claude subscription does not supply an API key. Your connection is used only when you ask a question.</p>${settingSelect(
+  )}<label class="setting-toggle"><span>Restore session</span><input type="checkbox" data-setting="restoreSession" ${settings.restoreSession ? 'checked' : ''}></label><div class="setting-actions">${secondary('ui:edit-space', 'Customize Space', 'edit')}${secondary('ui:profiles', 'Profiles', 'user')}</div></section><details class="setting-section" id="ai-settings"><summary>Codex subscription</summary>${renderAIConnection()}${settingSelect(
     'openSourcesLimit',
     'Pages to open from each answer',
     [
@@ -815,11 +862,11 @@ function renderSettings() {
       [3, '3 sources'],
       [5, '5 sources'],
     ],
-  )}<p class="provider-note">Page sharing is off by default. Choose “Current page” or select tabs in the conversation to share page or PDF text for a question. Password and form fields are excluded. Scanned and encrypted PDFs cannot be read.</p></section><section class="setting-section"><h3>Your data</h3><p class="panel-intro">Active profile: <strong>${esc(profile?.name)}</strong>. Cookies, browsing data, and permissions are isolated by profile.</p><div class="setting-actions">${secondary('data:export', 'Export data', 'external')}${secondary('data:import', 'Import data', 'download')}</div><p class="provider-note">Export your Spaces, tabs, and bookmarks. Import a Zacro backup or browser bookmark HTML file. Private sessions and AI keys are excluded.</p><div class="setting-actions">${secondary('ui:data-clear', 'Clear browsing data', 'trash')}${secondary('ui:permissions', 'Site permissions', 'shield')}</div></section><section class="setting-section"><h3>Extensions</h3><p class="panel-intro">Load compatible unpacked extensions into this profile. Supported APIs vary; Chrome Web Store installation and extension sync are not available.</p>${secondary('ui:panel', 'Manage extensions', 'extension', 'data-panel="extensions"')}</section><section class="setting-section"><h3>About Zacro</h3><p class="panel-intro">An independent, open-source browser.<br>Version ${esc(state.runtime?.version || '0.1.0')} · Built on Chromium</p><div class="setting-actions">${secondary('app:about', 'Version details', 'info')}${secondary('ui:shortcuts', 'Shortcuts', 'keyboard')}</div></section>`;
+  )}<p class="provider-note">Page sharing is off by default. Choose “Current page” or select tabs in the conversation to share page or PDF text for a question. Password and form fields are excluded. Scanned and encrypted PDFs cannot be read.</p></details><details class="setting-section"><summary>Your data</summary><p class="panel-intro"><strong>${esc(profile?.name)}</strong> profile</p><div class="setting-actions">${secondary('data:export', 'Export data', 'external')}${secondary('data:import', 'Import data', 'download')}</div><p class="provider-note">Zacro backups and bookmark HTML. Private sessions and sign-in credentials are excluded.</p><div class="setting-actions">${secondary('ui:data-clear', 'Clear browsing data', 'trash')}${secondary('ui:permissions', 'Site permissions', 'shield')}</div></details><details class="setting-section"><summary>Extensions</summary><p class="panel-intro">Load compatible unpacked extensions into this profile. Supported APIs vary; Chrome Web Store installation and extension sync are not available.</p>${secondary('ui:panel', 'Manage extensions', 'extension', 'data-panel="extensions"')}</details><details class="setting-section"><summary>About Zacro</summary><p class="panel-intro">An independent, open-source browser.<br>Version ${esc(state.runtime?.version || '0.1.0')} · Built on Chromium</p><div class="setting-actions">${secondary('app:about', 'Version details', 'info')}${secondary('ui:shortcuts', 'Shortcuts', 'keyboard')}</div></details>`;
 }
 function renderExtensions() {
   const extensions = profileItems('extensions');
-  return `<p class="panel-intro">Extensions are isolated to <strong>${esc(activeProfile()?.name)}</strong>. Install only extensions you trust and review their requested access.</p>${primary('extension:install', 'Load unpacked extension', 'plus')}<p class="provider-note">Select a local folder containing manifest.json. Electron supports a subset of Chrome extension APIs; storage.sync and Web Store installation are unavailable.</p>${extensions.length ? extensions.map((ext) => `<article class="extension-card"><div class="row"><div class="extension-icon">${icon('extension')}</div><div class="grow"><h3>${esc(ext.name || ext.id)}</h3><span class="small muted">${esc(ext.version || '')} · ${ext.enabled === false ? 'Disabled' : 'Enabled'}</span></div></div>${ext.description ? `<p>${esc(ext.description)}</p>` : ''}${ext.error ? `<p class="danger">${esc(ext.error)}</p>` : ''}<div class="row between"><button type="button" class="text-button" data-action="extension:toggle" data-id="${esc(ext.id)}">${ext.enabled === false ? 'Enable' : 'Disable'}</button><button type="button" class="text-button danger" data-action="ui:extension-remove" data-id="${esc(ext.id)}">Remove</button></div></article>`).join('') : empty('extension', 'A little extra capability', 'Your installed extensions will appear here.')}`;
+  return `<p class="panel-intro">Extensions are isolated to <strong>${esc(activeProfile()?.name)}</strong>. Install only extensions you trust and review their requested access.</p>${primary('extension:install', 'Load unpacked extension', 'plus')}<p class="provider-note">Select a local folder containing manifest.json. Electron supports a subset of Chrome extension APIs; storage.sync and Web Store installation are unavailable.</p>${extensions.length ? extensions.map((ext) => `<article class="extension-card"><div class="row"><div class="extension-icon">${icon('extension')}</div><div class="grow"><h3>${esc(ext.name || ext.id)}</h3><span class="small muted">${esc(ext.version || '')} · ${ext.enabled === false ? 'Disabled' : 'Enabled'}</span></div></div>${ext.description ? `<p>${esc(ext.description)}</p>` : ''}${ext.error ? `<p class="danger">${esc(ext.error)}</p>` : ''}<div class="row between"><button type="button" class="text-button" data-action="extension:toggle" data-id="${esc(ext.id)}">${ext.enabled === false ? 'Enable' : 'Disable'}</button><button type="button" class="text-button danger" data-action="ui:extension-remove" data-id="${esc(ext.id)}">Remove</button></div></article>`).join('') : empty('extension', 'No extensions', 'Installed extensions appear here.')}`;
 }
 function renderAnswer(message) {
   const text = String(message.text || '');
@@ -871,36 +918,42 @@ function renderAI() {
   const messages = ui.aiMessages;
   let body;
   if (!messages.length) {
-    body = `<div class="ai-welcome"><div class="ai-welcome-symbol">${icon('sparkle')}</div><h3>Let curiosity<br>lead the way.</h3><p>${privateSession ? 'AI is unavailable in private sessions. Switch to a regular profile to start a conversation.' : configured ? 'Ask a question, explore a topic, or find another perspective. Answers come with sources you can open when you’re ready.' : 'Connect your own AI provider to research the web and ask questions about pages. Browsing stays yours, with or without AI.'}</p>${configured ? `<button type="button" class="prompt-suggestion" data-action="ui:ai-prompt" data-prompt="What are some interesting ideas in science this week?">Explore something new${icon('arrow')}</button><button type="button" class="prompt-suggestion" data-action="ui:ai-page">Ask about this page${icon('arrow')}</button><button type="button" class="prompt-suggestion" data-action="ui:ai-select-tabs">Compare selected tabs${icon('arrow')}</button>` : privateSession ? primary('ui:spaces', 'Switch profile', 'user') : primary('ui:panel', 'Connect a provider', 'settings', 'data-panel="settings"')}</div>`;
+    body = `<div class="ai-welcome">${icon('sparkle')}<h3>${privateSession ? 'Private session' : configured ? 'Ask Zacro' : 'Your Codex, here'}</h3><p>${privateSession ? 'AI is unavailable in private browsing.' : configured ? 'Research the web or ask about a page.' : 'Use your subscription to research the web and ask about your tabs.'}</p>${configured ? `<button type="button" class="prompt-suggestion" data-action="ui:ai-page">Ask about this page${icon('arrow')}</button><button type="button" class="prompt-suggestion" data-action="ui:ai-select-tabs">Compare tabs${icon('arrow')}</button>` : privateSession ? primary('ui:spaces', 'Switch profile', 'user') : primary('ui:ai-connect', 'Connect Codex', 'user')}</div>`;
   } else {
     body = messages
       .map(
-        (message) =>
-          `<article class="message ${message.role}"><div class="message-role">${message.role === 'user' ? 'You' : message.error ? 'Something went wrong' : 'Zacro'}</div><div class="message-content ${message.error ? 'danger' : ''}">${message.role === 'assistant' ? renderAnswer(message) : esc(message.text)}</div>${message.warning ? `<p class="provider-note danger">${esc(message.warning)}</p>` : ''}${message.usage ? `<p class="provider-note">${Number(message.usage.inputTokens || 0).toLocaleString()} input · ${Number(message.usage.outputTokens || 0).toLocaleString()} output tokens${message.usage.searchRequests ? ' · ' + Number(message.usage.searchRequests) + ' searches' : ''}</p>` : ''}${message.sharedTabs?.length ? `<p class="provider-note">Shared: ${esc(message.sharedTabs.map((t) => t.title || t.url || t).join(', '))}</p>` : ''}${message.unreadable?.length ? `<p class="provider-note">Couldn’t read: ${esc(message.unreadable.map((t) => t.title || t.url || t.reason || t).join(', '))}</p>` : ''}${message.sources?.length ? `<div class="source-list">${message.sources.map((source, i) => `<button type="button" class="source-item" data-action="ui:open-url" data-url="${esc(source.url)}" title="${esc(source.url)}"><span class="source-index">${i + 1}</span><span class="grow truncate">${esc(source.title || hostname(source.url))}</span>${icon('external')}</button>`).join('')}</div>` : ''}${message.searchUrl ? `<button type="button" class="text-button" data-action="ui:open-url" data-url="${esc(message.searchUrl)}">${icon('search')}Open ordinary search results</button>` : ''}</article>`,
+        (message, index) =>
+          `<article class="message ${message.role}" data-message-index="${index}"><div class="message-role">${message.role === 'user' ? 'You' : message.error ? 'Something went wrong' : 'Zacro'}</div><div class="message-content ${message.error ? 'danger' : ''}">${message.role === 'assistant' ? renderAnswer(message) : esc(message.text)}</div>${message.warning ? `<p class="provider-note danger">${esc(message.warning)}</p>` : ''}${message.sharedTabs?.length ? `<p class="provider-note">Shared: ${esc(message.sharedTabs.map((t) => t.title || t.url || t).join(', '))}</p>` : ''}${message.unreadable?.length ? `<p class="provider-note">Couldn’t read: ${esc(message.unreadable.map((t) => t.title || t.url || t.reason || t).join(', '))}</p>` : ''}${message.sources?.length ? `<div class="source-list">${message.sources.map((source, i) => `<button type="button" class="source-item" data-action="ui:open-url" data-url="${esc(source.url)}" title="${esc(source.url)}"><span class="source-index">${i + 1}</span><span class="grow truncate">${esc(source.title || hostname(source.url))}</span>${icon('external')}</button>`).join('')}</div>` : ''}${message.searchUrl ? `<button type="button" class="text-button" data-action="ui:open-url" data-url="${esc(message.searchUrl)}">${icon('search')}Open ordinary search results</button>` : ''}</article>`,
       )
       .join('');
   }
-  return `<div class="panel-body conversation" id="conversation">${body}${ui.aiBusy ? `<div class="ai-progress" role="status"><span class="spinner"></span>${esc(ui.aiProgress || 'Looking into it…')}</div>` : ''}</div><div class="ai-footer">${ui.aiSources.length && !ui.aiBusy ? `<button type="button" class="secondary ai-source-action" data-action="ai:open-sources">${icon('external')}Open sources <kbd>${mod} Enter</kbd></button>` : ''}<div class="ai-context">${icon('shield')}<label for="ai-context" class="sr-only">Content to share</label><select id="ai-context" ${activeProfile()?.private ? 'disabled' : ''}>${selectOptions(
-    [
-      ['research', 'Web research · no page sharing'],
-      ['page', 'Current page'],
-      ['tabs', `Selected tabs${ui.aiTabs.length ? ' (' + ui.aiTabs.length + ')' : ''}`],
-    ],
-    ui.aiContext,
-  )}</select>${ui.aiContext === 'tabs' ? button('ui:ai-select-tabs', 'Choose tabs', 'plus', '', 'small-button') : ''}</div>${
-    ui.aiContext !== 'research'
-      ? `<p class="provider-note">Sharing with ${esc(ui.aiStatus?.provider || state.settings.aiProvider || 'your provider')}: ${esc(
-          ui.aiContext === 'page'
-            ? activeTab()?.title || 'Current page'
-            : state.tabs
-                .filter((t) => ui.aiTabs.includes(t.id))
-                .map((t) => t.title)
-                .join(', ') || 'No tabs selected',
-        )}</p>`
-      : ''
-  }<form id="ai-form" class="ai-composer"><textarea id="ai-question" name="question" rows="2" placeholder="${configured ? 'Ask anything…' : 'Connect a provider in Settings'}" aria-label="Ask Zacro" ${configured ? '' : 'disabled'}></textarea>${ui.aiBusy ? button('ai:cancel', 'Stop response', 'stop') : '<button type="submit" class="primary" aria-label="Send question" ' + (configured ? '' : 'disabled') + '>' + icon('arrow') + '</button>'}</form><p class="ai-help">${activeProfile()?.private ? 'AI is unavailable in private sessions.' : 'Enter to send · Shift + Enter for a new line. Answers can be mistaken; check the sources.'}</p></div>`;
+  return `<div class="panel-body conversation" id="conversation">${body}${ui.aiBusy ? `<div class="ai-progress" role="status"><span class="spinner"></span>${esc(ui.aiProgress || 'Looking into it…')}</div>` : ''}</div>${
+    configured
+      ? `<div class="ai-footer" id="ai-footer">${ui.aiSources.length && !ui.aiBusy ? `<button type="button" class="secondary ai-source-action" id="ai-open-sources" data-action="ai:open-sources">${icon('external')}Open sources <kbd>${mod} Enter</kbd></button>` : ''}<div class="ai-context" id="ai-context-controls">${icon('shield')}<label for="ai-context" class="sr-only">Content to share</label><select id="ai-context" ${activeProfile()?.private ? 'disabled' : ''}>${selectOptions(
+          [
+            ['research', 'Web research · no page sharing'],
+            ['page', 'Current page'],
+            ['tabs', `Selected tabs${ui.aiTabs.length ? ' (' + ui.aiTabs.length + ')' : ''}`],
+          ],
+          ui.aiContext,
+        )}</select>${ui.aiContext === 'tabs' ? button('ui:ai-select-tabs', 'Choose tabs', 'plus', '', 'small-button') : ''}</div>${
+          ui.aiContext !== 'research'
+            ? `<p class="provider-note" id="ai-sharing">Sharing with Codex: ${esc(
+                ui.aiContext === 'page'
+                  ? activeTab()?.title || 'Current page'
+                  : state.tabs
+                      .filter((t) => ui.aiTabs.includes(t.id))
+                      .map((t) => t.title)
+                      .join(', ') || 'No tabs selected',
+              )}</p>`
+            : ''
+        }<form id="ai-form" class="ai-composer"><textarea id="ai-question" name="question" rows="2" placeholder="${configured ? 'Ask anything…' : 'Sign in with ChatGPT in Settings'}" aria-label="Ask Zacro" ${configured ? '' : 'disabled'}></textarea>${ui.aiBusy ? button('ai:cancel', 'Stop response', 'stop', 'id="ai-submit"') : '<button type="submit" class="primary" id="ai-submit" aria-label="Send question" ' + (configured && !ui.aiSubmitting ? '' : 'disabled') + '>' + icon('arrow') + '</button>'}</form><p class="ai-help" id="ai-help">${activeProfile()?.private ? 'AI is unavailable in private sessions.' : 'Check sources. Shift + Enter for a new line.'}</p></div>`
+      : !privateSession && messages.length
+        ? `<div class="ai-footer" id="ai-footer">${primary('ui:ai-connect', ui.aiStatus?.loginPending || ui.aiSigningIn ? 'Continue sign-in' : 'Connect Codex', 'user', 'id="ai-reconnect"')}</div>`
+        : ''
+  }`;
 }
-function openPanel(panel) {
+function openPanel(panel, { refreshStatus = true } = {}) {
   if (!panelNames[panel]) return;
   const changed = ui.panel !== panel;
   if (!ui.panel || !$('#side-panel').contains(document.activeElement)) ui.panelReturn = focusDescriptor();
@@ -916,12 +969,12 @@ function openPanel(panel) {
     motion(
       $('#side-panel'),
       [
-        { opacity: 0.35, transform: 'translateX(18px)' },
+        { opacity: 0.65, transform: 'translateX(6px)' },
         { opacity: 1, transform: 'translateX(0)' },
       ],
-      240,
+      140,
     );
-  if (panel === 'ai')
+  if (refreshStatus && (panel === 'ai' || panel === 'settings'))
     safely(
       invoke('ai:status').then((status) => {
         ui.aiStatus = status;
@@ -937,25 +990,16 @@ function openPanel(panel) {
 }
 function closePanel() {
   if (!ui.panel) return;
-  const token = (ui.panelMotion = (ui.panelMotion || 0) + 1);
-  const finish = () => {
-    if (token !== ui.panelMotion) return;
-    ui.panel = null;
-    ui.panelSignature = '';
-    render();
-    restoreFocus(ui.panelReturn);
-    ui.panelReturn = null;
-  };
-  const animation = motion(
-    $('#side-panel'),
-    [
-      { opacity: 1, transform: 'translateX(0)' },
-      { opacity: 0, transform: 'translateX(14px)' },
-    ],
-    130,
-  );
-  if (animation) animation.finished.then(finish).catch(() => {});
-  else finish();
+  ui.panelMotion = (ui.panelMotion || 0) + 1;
+  $('#side-panel')
+    .getAnimations()
+    .forEach((animation) => animation.cancel());
+  const focus = ui.panelReturn;
+  ui.panel = null;
+  ui.panelSignature = '';
+  ui.panelReturn = null;
+  render();
+  restoreFocus(focus);
 }
 function openDialog(kind, html, { title, focus } = {}) {
   if (ui.authRequest) {
@@ -967,7 +1011,7 @@ function openDialog(kind, html, { title, focus } = {}) {
   ui.dialogToken = (ui.dialogToken || 0) + 1;
   ui.dialog = kind;
   $('#dialog-root').innerHTML =
-    `<div class="dialog-backdrop" data-action="ui:backdrop"><section class="dialog ${kind === 'command' ? 'command-dialog' : kind === 'menu' ? 'context-menu' : ''}" role="dialog" aria-modal="true" aria-label="${esc(title || kind)}" tabindex="-1">${html}</section></div>`;
+    `<div class="dialog-backdrop" data-action="ui:backdrop"><section class="dialog ${kind === 'command' ? 'command-dialog' : kind === 'menu' ? 'context-menu' : kind === 'library' ? 'library-dialog' : ''}" role="dialog" aria-modal="true" aria-label="${esc(title || kind)}" tabindex="-1">${html}</section></div>`;
   isolateDialog(true);
   syncLayout();
   const focusToken = ui.dialogToken;
@@ -996,24 +1040,9 @@ function closeDialog({ restore = true } = {}) {
 }
 function dismissDialog() {
   if (!ui.dialog) return;
-  const token = ui.dialogToken;
-  const backdrop = $('.dialog-backdrop');
-  const animation = motion(
-    $('.dialog'),
-    [
-      { opacity: 1, transform: 'translateY(0) scale(1)' },
-      { opacity: 0, transform: 'translateY(6px) scale(.985)' },
-    ],
-    120,
-  );
-  motion(backdrop, [{ opacity: 1 }, { opacity: 0 }], 120);
-  if (animation)
-    animation.finished
-      .then(() => {
-        if (token === ui.dialogToken) closeDialog();
-      })
-      .catch(() => {});
-  else closeDialog();
+  // Closing returns the live document and keyboard focus in this turn. An
+  // outro would otherwise hold the native page behind its captured backdrop.
+  closeDialog();
 }
 
 function formDialog(title, description, fields, submitLabel, onSubmit, { danger = false } = {}) {
@@ -1054,7 +1083,7 @@ function field(name, label, value = '', type = 'text', extra = '') {
 function showSpaces() {
   openDialog(
     'spaces',
-    `<div class="dialog-header"><h2>Your Spaces</h2>${button('ui:dialog-close', 'Close', 'close')}</div><div class="dialog-body"><p class="dialog-description">Different worlds. A little space for each.</p>${state.spaces
+    `<div class="dialog-header"><h2>Your Spaces</h2>${button('ui:dialog-close', 'Close', 'close')}</div><div class="dialog-body">${state.spaces
       .map((space) => {
         const profile = state.profiles.find((p) => p.id === space.profileId);
         return `<div class="space-option-wrapper"><button type="button" class="space-option ${space.id === state.activeSpaceId ? 'current' : ''}" data-action="ui:switch-space" data-id="${esc(space.id)}"><span class="space-emblem">${esc(space.name.slice(0, 1).toUpperCase())}</span><span class="grow"><div class="space-option-name">${esc(space.name)}</div><div class="space-option-profile">${esc(profile?.name)}${profile?.private ? ' · Private' : ''} · ${state.tabs.filter((t) => t.spaceId === space.id).length} tabs</div></span>${space.id === state.activeSpaceId ? icon('check') : ''}</button><div class="space-option-actions">${button('ui:edit-space', 'Edit Space', 'edit', `data-id="${esc(space.id)}"`)}${button('ui:delete-space', 'Delete Space', 'trash', `data-id="${esc(space.id)}"`)}</div></div>`;
@@ -1069,8 +1098,8 @@ function showSpaceForm(id) {
   const space = id ? state.spaces.find((s) => s.id === id) : null;
   ui.selectedColor = space?.color || colors[0][1];
   formDialog(
-    space ? 'Customize your Space' : 'Create a Space',
-    'A place for a project, a passion, or a different part of your day.',
+    space ? 'Customize Space' : 'New Space',
+    '',
     field(
       'name',
       'Space name',
@@ -1114,6 +1143,29 @@ function showMenu() {
     `<div class="dialog-body">${action('ui:new-tab', 'New tab', 'plus', mod + ' T')}${action('ui:new-private', 'New private session', 'shield')}${action('ui:spaces', 'Spaces & profiles', 'user')}<hr class="context-separator">${action('ui:find', 'Find on page', 'search', mod + ' F')}${action('ui:zoom-in', 'Zoom in', 'plus', mod + ' +')}${action('ui:zoom-out', 'Zoom out', 'minimize', mod + ' −')}${action('ui:zoom-reset', 'Reset zoom', 'monitor', mod + ' 0')}${action('ui:print', 'Print page', 'print', mod + ' P')}${action('ui:devtools', 'Developer tools', 'terminal')}<hr class="context-separator">${action('ui:extensions', 'Extensions', 'extension')}${action('ui:settings', 'Settings', 'settings')}${action('ui:shortcuts', 'Keyboard shortcuts', 'keyboard')}${action('ui:about', 'About Zacro', 'info')}</div>`,
     { title: 'Browser menu' },
   );
+}
+function showLibrary() {
+  openDialog(
+    'library',
+    `<div class="dialog-body">${['bookmarks', 'history', 'downloads', 'archive'].map((panel) => `<button type="button" class="context-action" data-action="ui:panel" data-panel="${panel}" data-key="panel-${panel}">${icon(panelNames[panel][0])}<span>${panelNames[panel][1]}</span>${panel === 'history' ? `<kbd>${mod} H</kbd>` : panel === 'downloads' ? `<kbd>${mod} J</kbd>` : ''}</button>`).join('')}</div>`,
+    { title: 'Library' },
+  );
+}
+function toggleSidebar(fromPage = false) {
+  if (ui.dialog) closeDialog({ restore: false });
+  ui.sidebarHidden = !ui.sidebarHidden;
+  render();
+  if (!ui.sidebarHidden)
+    motion(
+      $('#sidebar'),
+      [
+        { opacity: 0.65, transform: 'translateX(-4px)' },
+        { opacity: 1, transform: 'translateX(0)' },
+      ],
+      140,
+    );
+  if (fromPage) safely(invoke('page:focus'));
+  else $('[data-key="sidebar-toggle"]')?.focus({ preventScroll: true });
 }
 function showTabMenu(id) {
   const tab = state.tabs.find((t) => t.id === id);
@@ -1187,7 +1239,7 @@ function showTabSelection() {
   }
   formDialog(
     'Ask selected tabs',
-    'Choose up to six pages. Only the checked pages will be shared with your AI provider for your next question.',
+    'Choose up to six pages. Only the checked pages will be shared with Codex for your next question.',
     `<div class="tab-selector">${tabs.map((tab) => `<label class="tab-select-row"><input type="checkbox" name="tabId" value="${esc(tab.id)}" ${ui.aiTabs.includes(tab.id) ? 'checked' : ''}>${favicon(tab.url)}<span class="grow truncate" title="${esc(tab.url)}">${esc(tab.title || hostname(tab.url))}</span></label>`).join('') || '<p class="dialog-description">Open some pages first, then select the ones you want to share.</p>'}</div>`,
     'Use selected tabs',
     async (data, context) => {
@@ -1195,6 +1247,7 @@ function showTabSelection() {
       const selected = data.getAll('tabId');
       if (selected.length > 6) throw new Error('Choose up to six tabs for one question.');
       if (ui.aiContext !== 'tabs' || JSON.stringify(ui.aiTabs) !== JSON.stringify(selected)) {
+        invalidateAIRequest();
         await invoke('ai:reset');
         if (!context.isCurrent()) return;
         ui.aiMessages = [];
@@ -1219,6 +1272,7 @@ function showShortcuts() {
   const shortcuts = [
     ['Search or enter an address', mod + ' L'],
     ['New tab', mod + ' T'],
+    ['Toggle sidebar', mod + ' Shift B'],
     ['Close current tab', mod + ' W'],
     ['Restore closed tab', mod + ' Shift T'],
     ['Ask AI / open sources', mod + ' Enter'],
@@ -1243,21 +1297,22 @@ function commandOptions(query) {
   if (query.trim()) {
     options.push({
       label: query.trim(),
-      description: 'Navigate or search the web',
+      description: '',
       symbol: 'search',
       type: 'Go',
       run: () => commitNavigation(query),
     });
-    options.push({
-      label: `Ask Zacro: ${query.trim()}`,
-      description: 'Research with your AI provider',
-      symbol: 'sparkle',
-      type: mod + ' Enter',
-      run: () => {
-        closeDialog();
-        askAI(query);
-      },
-    });
+    if (!activeProfile()?.private && (ui.aiStatus?.configured ?? state.runtime?.aiConfigured))
+      options.push({
+        label: `Ask Zacro: ${query.trim()}`,
+        description: '',
+        symbol: 'sparkle',
+        type: mod + ' Enter',
+        run: () => {
+          closeDialog();
+          askAI(query);
+        },
+      });
   }
   const tabs = state.tabs
     .filter(
@@ -1267,7 +1322,12 @@ function commandOptions(query) {
   options.push(
     ...tabs.map((tab) => ({
       label: tab.title || 'New tab',
-      description: `${state.spaces.find((s) => s.id === tab.spaceId)?.name} · ${hostname(tab.url)}`,
+      description:
+        tab.spaceId !== state.activeSpaceId
+          ? state.spaces.find((s) => s.id === tab.spaceId)?.name
+          : tab.url === 'zacro://newtab'
+            ? ''
+            : hostname(tab.url),
       symbol: 'globe',
       type: 'Tab',
       run: () => {
@@ -1293,6 +1353,7 @@ function commandOptions(query) {
   const actions = [
     ['New tab', 'plus', () => newTab()],
     ['New Space', 'folderPlus', () => showSpaceForm()],
+    [ui.sidebarHidden ? 'Show sidebar' : 'Hide sidebar', 'sidebar', () => toggleSidebar()],
     [
       'History',
       'history',
@@ -1355,9 +1416,9 @@ function commandOptions(query) {
   options.push(
     ...actions
       .filter(([label]) => !q || label.toLowerCase().includes(q))
-      .map(([label, symbol, run]) => ({ label, description: 'Browser action', symbol, type: 'Action', run })),
+      .map(([label, symbol, run]) => ({ label, description: '', symbol, type: '', run })),
   );
-  return options.slice(0, 16);
+  return options.slice(0, q ? 12 : 8);
 }
 function openCommand(mode = 'navigate', query) {
   ui.commandMode = mode;
@@ -1369,7 +1430,7 @@ function openCommand(mode = 'navigate', query) {
   ui.commandIndex = 0;
   openDialog(
     'command',
-    `<div class="command-input-wrap">${icon('search')}<input id="command-input" type="text" role="combobox" aria-autocomplete="list" aria-expanded="true" aria-controls="command-results" aria-label="Search tabs, enter a URL, or ask a question" placeholder="Search, go somewhere, or ask a question…" value="${esc(ui.commandQuery)}" autocomplete="off" spellcheck="false"><kbd>Esc</kbd></div><div id="command-results" class="command-results" role="listbox" aria-label="Suggestions"></div><footer class="command-footer"><span class="row"><kbd>↑</kbd><kbd>↓</kbd> to select <kbd>Enter</kbd> to open</span><span class="row">${icon('sparkle')}<kbd>${mod} Enter</kbd> Ask Zacro</span></footer>`,
+    `<div class="command-input-wrap">${icon('search')}<input id="command-input" type="text" role="combobox" aria-autocomplete="list" aria-expanded="true" aria-controls="command-results" aria-label="Search tabs, enter a URL, or ask a question" placeholder="Search tabs or enter a URL" value="${esc(ui.commandQuery)}" autocomplete="off" spellcheck="false"><kbd>Esc</kbd></div><div id="command-results" class="command-results" role="listbox" aria-label="Suggestions"></div><footer class="command-footer"><span class="row"><kbd>↑↓</kbd> Navigate</span><span class="row"><kbd>↵</kbd> Open</span></footer>`,
     { title: 'Command bar', focus: '#command-input' },
   );
   renderCommands();
@@ -1381,7 +1442,7 @@ function renderCommands() {
   $('#command-results').innerHTML = ui.commandItems
     .map(
       (item, i) =>
-        `<button type="button" class="command-result ${i === ui.commandIndex ? 'selected' : ''}" data-action="ui:command-select" data-index="${i}" role="option" tabindex="-1" aria-selected="${i === ui.commandIndex}" id="command-option-${i}"><span class="command-result-icon">${icon(item.symbol)}</span><span class="grow"><div class="command-result-label truncate">${esc(item.label)}</div><div class="command-result-description">${esc(item.description)}</div></span><span class="command-result-type">${esc(item.type)}</span></button>`,
+        `<button type="button" class="command-result ${i === ui.commandIndex ? 'selected' : ''}" data-action="ui:command-select" data-index="${i}" role="option" tabindex="-1" aria-selected="${i === ui.commandIndex}" id="command-option-${i}"><span class="command-result-icon">${icon(item.symbol)}</span><span class="grow command-result-copy"><span class="command-result-label truncate">${esc(item.label)}</span>${item.description ? `<span class="command-result-description">${esc(item.description)}</span>` : ''}</span><span class="command-result-type">${esc(item.type)}</span></button>`,
     )
     .join('');
   $('#command-input')?.setAttribute('aria-activedescendant', `command-option-${ui.commandIndex}`);
@@ -1427,47 +1488,103 @@ function closeFind() {
   if (!activeTab() || activeTab().url === 'zacro://newtab') restoreFocus(ui.findReturn);
   ui.findReturn = null;
 }
+function cancelAIStreamFrame() {
+  if (ui.aiStreamFrame) cancelAnimationFrame(ui.aiStreamFrame);
+  ui.aiStreamFrame = null;
+}
+function invalidateAIRequest() {
+  ui.aiSubmissionSerial++;
+  ui.aiSubmitting = false;
+  cancelAIStreamFrame();
+}
+function shouldFollowAI() {
+  const body = $('#conversation');
+  return !body || body.scrollHeight - body.scrollTop - body.clientHeight < 80;
+}
+function renderAIUpdate(follow = shouldFollowAI()) {
+  renderPanel(true);
+  const body = $('#conversation');
+  if (ui.panel === 'ai' && follow && body) body.scrollTop = body.scrollHeight;
+}
 async function askAI(question) {
   question = String(question || '').trim();
-  if (!question || ui.aiBusy) return;
+  if (!question || ui.aiBusy || ui.aiSubmitting) return false;
+  const serial = ++ui.aiSubmissionSerial;
+  const context = {
+    profileId: activeProfile()?.id,
+    kind: ui.aiContext,
+    tabId: activeTab()?.id,
+    tabUrl: activeTab()?.url,
+    tabIds: [...ui.aiTabs],
+  };
+  const current = () => serial === ui.aiSubmissionSerial && context.profileId === activeProfile()?.id;
+  ui.aiSubmitting = true;
   closeDialog({ restore: false });
-  openPanel('ai');
-  const status = await invoke('ai:status');
-  ui.aiStatus = status;
-  if (!status?.configured) {
-    renderPanel(true);
-    toast('Connect an AI provider in Settings to ask Zacro.');
-    return;
-  }
-  if (ui.aiContext === 'tabs' && !ui.aiTabs.length) {
-    showTabSelection();
-    return;
-  }
-  if (ui.aiContext === 'page' && (!activeTab() || activeTab().url === 'zacro://newtab')) {
-    toast('Open a page first, or choose web research.');
-    return;
-  }
-  ui.aiMessages.push({ role: 'user', text: question });
-  ui.aiBusy = true;
-  ui.aiSources = [];
-  ui.aiProgress = 'Looking into it…';
-  ui.aiProfileId = activeProfile()?.id;
-  renderPanel(true);
-  const args = { question };
-  if (ui.aiContext === 'page') args.usePageContext = true;
-  if (ui.aiContext === 'tabs') args.tabIds = ui.aiTabs;
+  openPanel('ai', { refreshStatus: false });
   try {
-    await invoke('ai:ask', args);
-  } catch (error) {
-    if (ui.aiBusy) {
-      ui.aiBusy = false;
-      ui.aiMessages.push({ role: 'assistant', text: error.message, error: true });
+    const status = await invoke('ai:status');
+    if (!current()) return false;
+    if (
+      context.kind !== ui.aiContext ||
+      (context.kind === 'page' &&
+        (context.tabId !== activeTab()?.id || context.tabUrl !== activeTab()?.url)) ||
+      (context.kind === 'tabs' && JSON.stringify(context.tabIds) !== JSON.stringify(ui.aiTabs))
+    ) {
+      toast('The browsing context changed. Send your question again.');
+      return false;
+    }
+    ui.aiStatus = status;
+    if (!status?.configured || activeProfile()?.private) {
+      toast(
+        activeProfile()?.private
+          ? 'AI is unavailable in private browsing.'
+          : 'Sign in with ChatGPT in Settings to ask Zacro.',
+      );
+      return false;
+    }
+    if (context.kind === 'tabs' && !context.tabIds.length) {
+      showTabSelection();
+      return false;
+    }
+    if (context.kind === 'page' && (!context.tabId || context.tabUrl === 'zacro://newtab')) {
+      toast('Open a page first, or choose web research.');
+      return false;
+    }
+    const composer = $('#ai-question');
+    if (composer?.value.trim() === question) composer.value = '';
+    ui.aiMessages.push({ role: 'user', text: question });
+    ui.aiBusy = true;
+    ui.aiSubmitting = false;
+    ui.aiSources = [];
+    ui.aiProgress = 'Looking into it…';
+    ui.aiProfileId = context.profileId;
+    renderAIUpdate(true);
+    const args = { question };
+    if (context.kind === 'page') args.tabIds = [context.tabId];
+    if (context.kind === 'tabs') args.tabIds = context.tabIds;
+    try {
+      await invoke('ai:ask', args);
+    } catch (error) {
+      if (current() && ui.aiBusy) {
+        ui.aiBusy = false;
+        ui.aiMessages.push({ role: 'assistant', text: error.message, error: true });
+        renderAIUpdate();
+      }
+    }
+    return true;
+  } finally {
+    if (current()) {
+      ui.aiSubmitting = false;
       renderPanel(true);
     }
   }
 }
+
 function handleEvent(event) {
   switch (event.type) {
+    case 'sidebar:toggle':
+      toggleSidebar(event.fromPage === true);
+      break;
     case 'page:backdrop':
       showPageBackdrop(event.frames);
       break;
@@ -1512,13 +1629,34 @@ function handleEvent(event) {
       if (event.profileId && event.profileId !== activeProfile()?.id) break;
       ui.aiBusy = true;
       ui.aiProgress = event.message || 'Looking into it…';
-      if (ui.panel === 'ai') renderPanel(true);
+      if (ui.panel === 'ai') renderAIUpdate();
       break;
-    case 'ai:answer':
+    case 'ai:delta': {
       if (event.profileId && event.profileId !== activeProfile()?.id) break;
+      let message = ui.aiMessages.at(-1);
+      if (!message?.streaming) {
+        message = { role: 'assistant', text: '', streaming: true };
+        ui.aiMessages.push(message);
+      }
+      message.text += event.delta || '';
+      ui.aiBusy = true;
+      ui.aiProgress = 'Writing…';
+      if (!ui.aiStreamFrame)
+        ui.aiStreamFrame = requestAnimationFrame(() => {
+          ui.aiStreamFrame = null;
+          if (ui.panel !== 'ai') return;
+          renderAIUpdate();
+        });
+      break;
+    }
+    case 'ai:answer': {
+      if (event.profileId && event.profileId !== activeProfile()?.id) break;
+      const follow = shouldFollowAI();
+      cancelAIStreamFrame();
       ui.aiBusy = false;
       ui.aiProgress = '';
       ui.aiSources = event.sources || [];
+      if (ui.aiMessages.at(-1)?.streaming) ui.aiMessages.pop();
       ui.aiMessages.push({
         role: 'assistant',
         text: event.answer || event.text || '',
@@ -1530,16 +1668,18 @@ function handleEvent(event) {
         warning: event.warning,
         usage: event.usage,
       });
-      renderPanel(true);
-      requestAnimationFrame(() => {
-        const c = $('#conversation');
-        if (c) c.scrollTop = c.scrollHeight;
-      });
+      renderAIUpdate(follow);
       break;
+    }
     case 'ai:error':
       if (event.profileId && event.profileId !== activeProfile()?.id) break;
+      cancelAIStreamFrame();
       ui.aiBusy = false;
       ui.aiProgress = '';
+      if (ui.aiMessages.at(-1)?.streaming) {
+        ui.aiMessages.at(-1).streaming = false;
+        ui.aiMessages.at(-1).warning = 'Response incomplete.';
+      }
       if (event.code === 'CANCELLED') {
         renderPanel(true);
         toast('Response stopped.');
@@ -1553,18 +1693,26 @@ function handleEvent(event) {
       renderPanel(true);
       break;
     case 'ai:cancelled':
+      if (event.profileId && event.profileId !== activeProfile()?.id) break;
+      cancelAIStreamFrame();
       ui.aiBusy = false;
       ui.aiProgress = '';
+      if (ui.aiMessages.at(-1)?.streaming) {
+        ui.aiMessages.at(-1).streaming = false;
+        ui.aiMessages.at(-1).warning = 'Response stopped.';
+      }
       renderPanel(true);
       toast('Response stopped.');
       break;
     case 'ai:status':
       ui.aiStatus = event;
+      if (state.runtime) state.runtime.aiConfigured = Boolean(event.configured);
       ui.aiBusy = Boolean(event.busy);
       renderPanel(true);
       break;
     case 'ai:reset':
       if (event.profileId && event.profileId !== activeProfile()?.id) break;
+      invalidateAIRequest();
       ui.aiMessages = [];
       ui.aiSources = [];
       ui.aiBusy = false;
@@ -1590,6 +1738,21 @@ document.addEventListener('click', (event) => {
 async function handleAction(action, data = {}, target) {
   const id = data.id;
   switch (action) {
+    case 'ui:sidebar-toggle':
+      toggleSidebar();
+      return;
+    case 'ui:library':
+      showLibrary();
+      return;
+    case 'ui:ai-connect':
+      if (ui.dialog) closeDialog();
+      openPanel('settings');
+      if ($('#ai-settings')) {
+        $('#ai-settings').open = true;
+        $('#ai-settings').scrollIntoView({ block: 'start' });
+        $('#ai-settings [data-action="ui:ai-login"]')?.focus({ preventScroll: true });
+      }
+      return;
     case 'ui:panel':
       if (ui.dialog) closeDialog();
       if (ui.panel === data.panel && target?.closest('.sidebar,.toolbar')) closePanel();
@@ -1651,7 +1814,7 @@ async function handleAction(action, data = {}, target) {
       return;
     case 'ui:new-profile':
       formDialog(
-        'A different side of you',
+        'New profile',
         'Profiles keep accounts and browsing data separate.',
         field(
           'name',
@@ -1687,8 +1850,8 @@ async function handleAction(action, data = {}, target) {
     }
     case 'ui:new-folder':
       formDialog(
-        'Give your tabs a home',
-        'Group related tabs in a folder in this Space.',
+        'New folder',
+        '',
         field('name', 'Folder name', '', 'text', 'required maxlength="60"'),
         'Create folder',
         async (d, context) => {
@@ -1699,10 +1862,18 @@ async function handleAction(action, data = {}, target) {
         },
       );
       return;
-    case 'ui:folder-toggle':
-      ui.closedFolders.has(id) ? ui.closedFolders.delete(id) : ui.closedFolders.add(id);
-      renderSidebar();
+    case 'ui:folder-toggle': {
+      const opening = ui.closedFolders.has(id);
+      opening ? ui.closedFolders.delete(id) : ui.closedFolders.add(id);
+      restoreFocusAround(renderSidebar);
+      const heading = $$('.folder-heading').find((element) => element.dataset.id === id);
+      motion(
+        heading?.firstElementChild,
+        [{ transform: `rotate(${opening ? -90 : 0}deg)` }, { transform: `rotate(${opening ? 0 : -90}deg)` }],
+        120,
+      );
       return;
+    }
     case 'ui:folder-rename': {
       const folder = state.folders.find((f) => f.id === id);
       formDialog(
@@ -1881,7 +2052,7 @@ async function handleAction(action, data = {}, target) {
       const profileId = activeProfile()?.id;
       let result = ui.downloadSuggestions.get(id);
       if (!result) {
-        toast('Asking your provider for a filename suggestion…');
+        toast('Asking Codex for a filename suggestion…');
         result = await invoke('ai:suggest-name', {
           id,
           name: file.name || file.filename,
@@ -1920,6 +2091,7 @@ async function handleAction(action, data = {}, target) {
       return;
     case 'ui:ai-page':
       if (ui.aiContext !== 'page') {
+        invalidateAIRequest();
         await invoke('ai:reset');
         ui.aiMessages = [];
         ui.aiSources = [];
@@ -1931,6 +2103,7 @@ async function handleAction(action, data = {}, target) {
       showTabSelection();
       return;
     case 'ui:ai-reset':
+      invalidateAIRequest();
       await invoke('ai:reset');
       ui.aiMessages = [];
       ui.aiSources = [];
@@ -1938,18 +2111,36 @@ async function handleAction(action, data = {}, target) {
       ui.aiProgress = '';
       renderPanel(true);
       return;
+    case 'ui:ai-login':
+      if (ui.aiSigningIn || ui.aiStatus?.loginPending) return;
+      ui.aiSigningIn = true;
+      renderPanel(true);
+      try {
+        ui.aiStatus = await invoke('ai:login');
+      } finally {
+        ui.aiSigningIn = false;
+        renderPanel(true);
+      }
+      return;
+    case 'ui:ai-login-cancel':
+      ui.aiStatus = await invoke('ai:login-cancel');
+      ui.aiSigningIn = false;
+      renderPanel(true);
+      return;
     case 'ui:ai-disconnect':
+      invalidateAIRequest();
       await invoke('ai:disconnect');
-      ui.aiStatus = { configured: false };
+      ui.aiStatus = await invoke('ai:status');
       ui.aiMessages = [];
       ui.aiSources = [];
       ui.aiBusy = false;
       if (state.runtime) state.runtime.aiConfigured = false;
       ui.panelSignature = '';
       renderPanel(true);
-      toast('AI provider disconnected.');
+      toast('Signed out of Codex.');
       return;
     case 'ai:cancel':
+      invalidateAIRequest();
       await invoke('ai:cancel');
       ui.aiBusy = false;
       ui.aiProgress = '';
@@ -1973,33 +2164,16 @@ document.addEventListener('submit', (event) => {
     if (url) safely(invoke('navigate', { url }));
   } else if (form.id === 'ai-form') {
     const question = data.get('question');
-    if ($('#ai-question')) $('#ai-question').value = '';
     safely(askAI(question));
   } else if (form.id === 'provider-form') {
-    const panelToken = ui.panelMotion;
     const submit = $('button[type=submit]', form);
     submit.disabled = true;
     safely(
-      invoke('ai:configure', {
-        provider: data.get('provider'),
-        apiKey: data.get('apiKey'),
-        model: data.get('model'),
-      })
+      invoke('ai:configure', { model: data.get('model') })
         .then((status) => {
-          ui.aiStatus =
-            status?.configured !== undefined
-              ? status
-              : { configured: true, provider: data.get('provider'), model: data.get('model') };
-          if (state.runtime) state.runtime.aiConfigured = true;
-          ui.aiMessages = [];
-          ui.aiSources = [];
-          if (ui.panel === 'settings' && ui.panelMotion === panelToken) {
-            const key = $('#api-key');
-            if (key && key.value === data.get('apiKey')) key.value = '';
-            const status = $('#ai-connection-status');
-            if (status) status.innerHTML = '<span class="status-dot connected"></span>Provider connected';
-          }
-          toast('Provider connection saved.');
+          ui.aiStatus = status;
+          renderPanel(true);
+          toast('Model updated.');
         })
         .finally(() => {
           submit.disabled = false;
@@ -2056,6 +2230,7 @@ document.addEventListener('change', (event) => {
       showTabSelection();
     } else {
       if (ui.aiContext !== next) {
+        invalidateAIRequest();
         ui.aiMessages = [];
         ui.aiSources = [];
         safely(invoke('ai:reset'));
@@ -2121,7 +2296,6 @@ document.addEventListener('keydown', (event) => {
   if (event.target.id === 'ai-question' && event.key === 'Enter' && !event.shiftKey && !cmd) {
     event.preventDefault();
     const question = event.target.value;
-    event.target.value = '';
     safely(askAI(question));
     return;
   }
@@ -2237,7 +2411,7 @@ async function showAbout() {
   if (token !== ui.dialogToken || panelToken !== ui.panelMotion || profileId !== activeProfile()?.id) return;
   openDialog(
     'about',
-    `<div class="dialog-header">${mark}<h2>Made for the curious.</h2>${button('ui:dialog-close', 'Close', 'close')}</div><div class="dialog-body"><p class="dialog-description">Zacro is an independent, open-source browser by Zacro Technologies. A little more space for the web, and for you.</p><div class="shortcut-grid"><span>Zacro</span><span>${esc(details.version)}</span><span>Chromium</span><span>${esc(details.chromium)}</span><span>Electron</span><span>${esc(details.electron)}</span><span>Platform</span><span>${esc(details.platform)}</span></div><p class="provider-note">Original code is licensed under MIT. Chromium and other components retain their respective licenses. Zacro is not affiliated with The Browser Company.</p><div class="dialog-footer">${secondary('app:check-updates', 'View releases', 'external')}${primary('ui:dialog-close', 'Done')}</div></div>`,
+    `<div class="dialog-header">${mark}<h2>Zacro</h2>${button('ui:dialog-close', 'Close', 'close')}</div><div class="dialog-body"><p class="dialog-description">An independent, open-source browser by Zacro Technologies.</p><div class="shortcut-grid"><span>Zacro</span><span>${esc(details.version)}</span><span>Chromium</span><span>${esc(details.chromium)}</span><span>Electron</span><span>${esc(details.electron)}</span><span>Platform</span><span>${esc(details.platform)}</span></div><p class="provider-note">Original code is licensed under MIT. Chromium and other components retain their respective licenses. Zacro is not affiliated with The Browser Company.</p><div class="dialog-footer">${secondary('app:check-updates', 'View releases', 'external')}${primary('ui:dialog-close', 'Done')}</div></div>`,
     { title: 'About Zacro' },
   );
 }
@@ -2304,23 +2478,6 @@ document.addEventListener(
   },
   true,
 );
-function updateHomeClock() {
-  if (!state || $('#newtab').hidden) return;
-  const now = new Date();
-  const time = $('.home-date .time-label');
-  if (time) time.textContent = now.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
-  const date = $('.home-date .date-line');
-  if (date)
-    date.textContent = now.toLocaleDateString(undefined, {
-      weekday: 'short',
-      month: 'short',
-      day: 'numeric',
-    });
-  if (!activeProfile()?.private && $('.home-header h1'))
-    $('.home-header h1').textContent =
-      now.getHours() < 12 ? 'Good morning.' : now.getHours() < 18 ? 'Good afternoon.' : 'Good evening.';
-}
-setInterval(updateHomeClock, 30_000);
 window.addEventListener('resize', syncLayout);
 matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
   if (state) setTheme();

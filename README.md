@@ -10,43 +10,47 @@ Zacro is an independent project, not an official continuation of Arc or an affil
 
 ## Project status
 
-**Desktop development build.** This repository now contains a runnable Chromium browser built with Electron, targeting Windows 11 x64 first. It includes real page rendering, sandboxed tabs, Spaces, separate profiles, Peek, split view, local session recovery, library panels, compatible unpacked extensions, and optional API-based AI assistance.
+**Desktop development build.** This repository contains a runnable Chromium browser built with Electron, targeting Windows 11 x64 first. It includes real page rendering, sandboxed tabs, Spaces, separate profiles, Peek, split view, local session recovery, library panels, compatible unpacked extensions, and optional AI through your Codex subscription.
 
-This is **not yet a complete implementation of the vision or a commercial release**. Zacro account sync, full Chrome extension compatibility and `chrome.storage.sync`, subscription AI sign-in, consequential browser agents, signed automatic updates, and operational/security release gates remain open. The [implementation roadmap](docs/ROADMAP.md) separates working features from required release work; [AI documentation](docs/AI.md) describes the implemented provider and data boundaries.
+This is **not yet a complete implementation of the vision or a commercial release**. Zacro account sync, full Chrome extension compatibility and `chrome.storage.sync`, consequential browser agents, signed automatic updates, and operational/security release gates remain open. Subscription sign-in is implemented; live account and inference acceptance still requires a user to finish ChatGPT sign-in. The [implementation roadmap](docs/ROADMAP.md) separates working features from required release work; [AI documentation](docs/AI.md) describes the connection and data boundaries.
 
 See the [validation record](docs/VALIDATION.md) for tests performed, package checks, and remaining acceptance work.
 
-The 0.2 interface adds Space-tinted chrome, rounded native pages, a practical home screen, real raster site icons, and coordinated tab, panel, and dialog motion. Keyboard focus, IME composition, reduced motion, and split-pane targeting are covered by regression checks. See the [release notes](docs/RELEASE-NOTES-0.2.md) and [design and interaction notes](docs/DESIGN.md).
+The 0.3 redesign puts the page first: compact chrome, icon favorites, single-line tabs, a minimal new-tab page, and a sidebar you can hide. Library and Settings reveal secondary controls when needed. Short 100–160ms feedback makes changes clear; dismissal and page resizing happen immediately. See the [design study](docs/DESIGN-REVIEW-0.3.md), [release notes](docs/RELEASE-NOTES-0.3.md), and [interaction notes](docs/DESIGN.md).
 
 ## Screenshots
 
-Captured from the packaged **Zacro 0.2 Windows development build**. The example web pages and browsing data were prepared locally for this tour.
+Captured from the packaged **Zacro 0.3 Windows development build**, using an isolated demo workspace and local journal pages.
 
-![Zacro's dark home screen with a Design studio Space, pinned favorites, folders, search, and recent pages](docs/screenshots/home-dark.jpg)
+![Zacro 0.3 with a compact Design studio sidebar, four icon favorites, folders, and single-line tabs beside a live web page](docs/screenshots/workspace.jpg)
 
-The home screen brings search, favorites, and recent pages together inside a Space-tinted frame.
+A 44px toolbar, compact sidebar, and thin page frame leave room for the web.
 
-| Light theme and personalization | Spaces, favorites, and folders |
+| New tab · dark | Settings · light |
 | --- | --- |
-| ![Light appearance with the Settings panel open](docs/screenshots/appearance-light.jpg) | ![A live journal page beside a sidebar containing favorites and an Inspiration folder](docs/screenshots/workspace.jpg) |
-| Switch between light, dark, and system appearance, and customize each Space. | Keep frequent destinations pinned and group project tabs into folders. |
+| ![Minimal dark new-tab page with search, saved destinations, and recent pages](docs/screenshots/home-dark.jpg) | ![Compact light Settings with inline controls and expandable groups](docs/screenshots/appearance-light.jpg) |
+| Search, saved pages, and recents. | Everyday preferences first; details on demand. |
 
 | Peek | Split view |
 | --- | --- |
-| ![A link opened in Peek with controls to close it or promote it to a tab](docs/screenshots/peek.jpg) | ![Two live journal pages arranged side by side in native split view](docs/screenshots/split-view.jpg) |
-| Follow a link in a focused preview, then dismiss it or promote the live page to a tab. | Keep two pages in view while navigation controls follow the focused pane. |
+| ![Live link preview with promote and close controls](docs/screenshots/peek.jpg) | ![Two native web pages arranged side by side](docs/screenshots/split-view.jpg) |
+| Follow a link without losing your place. | Compare pages with stable panes. |
 
-| Command palette | Bookmarks and library panels |
+| Command palette | Library |
 | --- | --- |
-| ![The command palette finding an open Design references tab over a blurred page backdrop](docs/screenshots/command-palette.jpg) | ![The searchable Bookmarks panel open beside the home screen](docs/screenshots/bookmarks.jpg) |
-| Search tabs, enter an address, or start a web search with **Ctrl/Command + L**. | Revisit saved pages and reach history, downloads, and archived tabs from the sidebar. |
+| ![Compact command palette with tab results over the current page](docs/screenshots/command-palette.jpg) | ![Bookmarks panel with search and quick Library section switching](docs/screenshots/bookmarks.jpg) |
+| Find a tab or enter an address. | Bookmarks, history, downloads, and archived tabs. |
 
 <details>
-<summary>Optional AI workspace</summary>
+<summary>Focus mode and optional AI</summary>
 
-![Ask Zacro before a provider has been connected, showing its connection prompt and context controls](docs/screenshots/optional-ai.jpg)
+![The same page with the sidebar hidden and more width available for reading](docs/screenshots/focus-mode.jpg)
 
-Ask Zacro supports optional OpenAI and Claude API-key connections. This screenshot shows the unconnected interface; no generated answer is simulated. Page sharing requires an explicit choice, and API usage is billed by the selected provider. See [AI workflows and limits](docs/AI.md).
+**Ctrl/Command + Shift + B** hides or shows the sidebar without reloading pages.
+
+![Compact Ask Zacro panel with ChatGPT sign-in for a Codex subscription](docs/screenshots/optional-ai.jpg)
+
+AI is optional. Choose **Sign in with ChatGPT** to use your account's Codex allowance. Zacro has no API-key or separate API-billing fallback. Page sharing requires an explicit choice. This capture shows the unconnected interface. See [AI workflows and limits](docs/AI.md).
 
 </details>
 
@@ -59,13 +63,14 @@ npm ci
 npm start
 ```
 
-Dependency installation downloads the pinned Electron runtime from its official release source. Local browsing does not require an account or API key. `npm run dev` launches the same development application. Do not use `--no-sandbox` or disable web security.
+Dependency installation downloads the pinned Electron and official Codex runtimes. Local browsing does not require an account. `npm run dev` launches the same development application. Do not use `--no-sandbox` or disable web security.
 
 ```powershell
 npm run check      # JavaScript syntax validation
 npm test           # State, import, security and provider protocol tests
 npm run test:e2e   # Real Chromium desktop integration tests
 npm run test:interactive # Disposable browser + local site for hands-on review
+npm run test:interactive -- --showcase # Populated design-review workspace
 npm run test:soak  # Repeated native tab/Peek/split lifecycle checks
 npm run pack       # Runnable application folder under dist/
 npm run test:package # Verify the packaged executable, security fuses and PDF worker
@@ -76,7 +81,7 @@ Tests create temporary profiles and local fixture servers; they do not use your 
 
 Browser data lives in Electron's per-user Zacro application-data directory. For an isolated development profile, set `ZACRO_USER_DATA` to a separate absolute directory. Export/import in Settings supports Zacro JSON and standard browser bookmark HTML. Arc migration currently uses supported bookmark exports; native Arc sidebar databases are not imported.
 
-Use **Ctrl/Command + L** for the command bar, **Ctrl/Command + T** for a new tab, **F6** to move between page and browser controls, **Alt + click** or a link's context menu for Peek, and **Escape** to dismiss it. Right-click a tab to pin it, rename it, move it to a folder/Space, or split it beside another page. AI is optional: connect an API key in Settings, then use **Ctrl/Command + Enter** to ask a research question; use it again in the answer panel to open the current answer's sources.
+Use **Ctrl/Command + L** for the command bar, **Ctrl/Command + T** for a new tab, **F6** to move between page and browser controls, **Ctrl/Command + Shift + B** to toggle the sidebar, **Alt + click** or a link's context menu for Peek, and **Escape** to dismiss it. Right-click a tab to pin it, rename it, move it to a folder/Space, or split it beside another page. For optional AI, sign in with ChatGPT in Settings or Ask Zacro, then use **Ctrl/Command + Enter** to ask a research question; use it again in the answer panel to open the current answer's sources.
 
 ## The experience
 
@@ -89,7 +94,7 @@ Use **Ctrl/Command + L** for the command bar, **Ctrl/Command + T** for a new tab
 - **Tab cleanup.** Automatically archive unpinned tabs, with controls for timing and recovery.
 - **Personalization.** Make the browser feel like yours through themes and thoughtful interface details.
 - **Zacro account sync (planned).** Bring extensions and supported extension settings across compatible devices, with separate sync data for each linked browser profile. Account sync is not implemented in the development build.
-- **AI where you browse.** Find useful sources, ask questions about selected pages and PDFs, and suggest download names through an optional API provider connection. Browser-task delegation remains planned work.
+- **AI where you browse.** Use your Codex subscription to research questions, ask about selected pages and PDFs, and suggest download names. Browser-task delegation remains planned work.
 
 ## Peek is a core feature
 
@@ -118,7 +123,7 @@ The design must cover encrypted transport and storage, device revocation, cloud-
 
 ## AI that fits the workflow
 
-AI is an optional layer across the command bar and browsing workflow. The development build implements API-key connections, web-grounded answers, follow-ups, selected-page questions, source opening, and metadata-based download name suggestions. The broader vision below includes work still to be implemented; see [current AI workflows and limits](docs/AI.md) for exact availability. Browsing works normally without an AI connection.
+AI is an optional layer across the command bar and browsing workflow. The development build implements ChatGPT sign-in through a Zacro-managed Codex runtime, web research, follow-ups, selected-page questions, source opening, and metadata-based download name suggestions. Browsing works normally without an AI connection. See [current AI workflows and limits](docs/AI.md) for exact availability and live-verification requirements.
 
 ### Ask first, open sources with Command + Enter
 
@@ -130,11 +135,10 @@ Users can ask follow-up questions in the same conversation. Enter in the follow-
 
 Source ranking should consider relevance, primary evidence, authorship, freshness when it matters, and independent corroboration. Trustworthiness is an assessment, not a guarantee; the answer should acknowledge weak or conflicting evidence. If no strong matches are found, say so and offer ordinary search results.
 
-### Initial AI features
+### Further AI work
 
 - **Content-aware download names.** Suggest descriptive filenames using the source page and supported file contents, such as `invoice_2026-10_acme.pdf`. Preserve the extension, avoid collisions, and provide one-step undo. File-content uploads require an explicit user setting or action.
-- **Page and PDF Q&A.** Ask questions about the current page, selected text, or a supported PDF. Cite passages and jump to the evidence; distinguish page content from outside research and say when the answer is absent.
-- **Ask selected tabs.** Compare or synthesize a user-selected group of tabs, with citations back to each source and clear identification of pages that could not be read.
+- **More precise page context.** Current-page, selected-tab and supported-PDF questions are implemented with evidence links. Selected-text questions and richer evidence highlighting remain planned work.
 - **Browser agent.** Research, navigate, extract information, and prepare forms within explicitly granted tabs and sites. Show progress, allow interruption, and request confirmation before sending messages, purchasing, deleting, or submitting consequential changes unless the user has already explicitly authorized that exact action.
 
 ### Further ideas to explore
@@ -148,18 +152,15 @@ Source ranking should consider relevance, primary evidence, authorship, freshnes
 - **Selection actions.** Explain, translate, or extract dates and tables from selected content into a copyable format.
 - **Reusable browser tasks.** Save an explicitly configured workflow, such as collecting weekly reports, with site permissions, a visible run history, and controls for any recurring runs.
 
-### Bring your AI connection
+### Use your Codex subscription
 
-The goal is to support **Codex/OpenAI and Claude**, including existing subscriptions wherever the provider supports this integration, plus separately billed API-key connections. A Zacro sync account is separate from an AI provider connection; it does not include model usage.
+Choose **Sign in with ChatGPT** in Settings or Ask Zacro and finish the official sign-in in your system browser. Zacro manages its own bundled Codex app-server and separate credential-store entry. It does not reuse credentials from the Codex desktop app or an existing command-line setup. The model list comes from the signed-in Codex connection; account access and limits still apply.
 
-Provider documentation reviewed on October 23, 2026:
+Questions use your account's Codex allowance. There is no API-key field, Claude connection, or automatic switch to separate API billing. No inference request is made merely by connecting. A Zacro sync account is separate from this AI connection.
 
-- **OpenAI:** [Sign in with ChatGPT](https://developers.openai.com/siwc/token-sharing-open-source) documents eligible ChatGPT plan usage for open-source, locally hosted apps, including a [Codex app-server integration](https://developers.openai.com/siwc/token-sharing-open-source/codex-app-server). This is the proposed subscription path, subject to account eligibility, supported capabilities, and usage limits. Paid or remotely hosted offerings require a separate provider path.
-- **Claude:** The [Agent SDK subscription guidance](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan) describes subscription-backed third-party usage, while the [account authentication guidance](https://support.claude.com/en/articles/13189465-log-in-to-your-claude-account) directs developers building products for others to API authentication and makes third-party subscription access discretionary. Zacro must verify a supported integration before promising Claude subscription access; API authentication is the fallback.
+Only explicitly chosen page/PDF text is shared for page questions; private profiles are excluded. Research enables hosted web search without access to open pages. Local command execution, filesystem access, installed skills, plugins, and MCP integrations are unavailable to the assistant. See [AI security and privacy](docs/AI.md#credentials-and-privacy) for the enforced boundaries and current verification limits.
 
-Connections should use each provider's supported authentication flow, protect credentials in the operating system's credential store, and show the active provider and available usage information. Never silently switch to a paid API connection when a subscription limit is reached. Search, file processing, and other services may have separate costs or limits.
-
-Users should see which tabs, selections, or files are shared with a provider. Page content is untrusted input, not permission to execute instructions. Agent access must remain within the selected profile and granted scope; private browsing and sensitive fields are excluded by default. AI credentials must not be included in ordinary Zacro sync data.
+This local open-source build uses the authentication flow documented for [Codex app-server](https://learn.chatgpt.com/docs/app-server#authentication-endpoints). Commercial or hosted distribution requires a separate supported Sign in with ChatGPT integration review before release.
 
 ## Built on Chromium
 
@@ -219,9 +220,9 @@ The initial integration uses Electron 45, a sandboxed HTML/CSS/JavaScript interf
 
 ### 4. Add optional AI assistance
 
-- [x] Implement OpenAI and Claude API-key authentication with OS-encrypted credentials.
-- [ ] Implement supported subscription authentication and validate entitlement, billing and live provider behavior.
-- [x] Build provider selection, context controls, cancellation, and usage-limit handling.
+- [x] Implement managed ChatGPT subscription sign-in with isolated Codex credentials and no API-key fallback.
+- [ ] Complete live sign-in, account-access, usage-limit and inference acceptance with a user-authorized account.
+- [x] Build model selection, context controls, cancellation, and usage-limit handling.
 - [x] Implement Command + Enter web-grounded answers and contextual follow-up chat.
 - [x] Add Open sources via a second Command + Enter, reusing matching tabs in the current Space.
 - [x] Add cited page/PDF Q&A, selected-tab questions and metadata-based download naming with undo.

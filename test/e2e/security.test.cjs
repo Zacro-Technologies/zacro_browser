@@ -493,6 +493,20 @@ test(
         .getBuiltinModule('module')
         .createRequire(app.getAppPath() + '/package.json');
       const { AIService } = requireModule('./src/main/ai.cjs');
+      const { CodexClient } = requireModule('./src/main/codex.cjs');
+      CodexClient.prototype.status = () => ({
+        available: true,
+        configured: true,
+        account: { email: 'fixture@example.test', planType: 'plus' },
+        models: [{ id: 'fixture-model', name: 'Fixture' }],
+        loginPending: false,
+      });
+      CodexClient.prototype.refresh = async function () {
+        return this.status();
+      };
+      CodexClient.prototype.logout = async function () {
+        return {};
+      };
       AIService.prototype.requestProvider = async function (messages, research) {
         globalThis.__zacroCapturedAI = { messages, research };
         return {
@@ -504,7 +518,7 @@ test(
         };
       };
     });
-    await browser.invoke('ai:configure', { provider: 'openai', apiKey: 'test-key-never-transmitted' });
+    await browser.invoke('ai:configure', { model: 'fixture-model' });
     const count = (await browser.state()).tabs.length;
     const answer = await browser.invoke('ai:ask', {
       question: 'Explain the visible evidence.',
@@ -549,6 +563,20 @@ test(
         .getBuiltinModule('module')
         .createRequire(app.getAppPath() + '/package.json');
       const { AIService } = requireModule('./src/main/ai.cjs');
+      const { CodexClient } = requireModule('./src/main/codex.cjs');
+      CodexClient.prototype.status = () => ({
+        available: true,
+        configured: true,
+        account: { email: 'fixture@example.test', planType: 'plus' },
+        models: [{ id: 'fixture-model', name: 'Fixture' }],
+        loginPending: false,
+      });
+      CodexClient.prototype.refresh = async function () {
+        return this.status();
+      };
+      CodexClient.prototype.logout = async function () {
+        return {};
+      };
       AIService.prototype.requestProvider = async function (messages, research) {
         globalThis.__zacroCapturedPDF = { messages, research };
         return {
@@ -560,7 +588,7 @@ test(
         };
       };
     });
-    await browser.invoke('ai:configure', { provider: 'openai', apiKey: 'test-pdf-key-never-transmitted' });
+    await browser.invoke('ai:configure', { model: 'fixture-model' });
     const answer = await browser.invoke('ai:ask', {
       question: 'What is the cancellation fee?',
       usePageContext: true,

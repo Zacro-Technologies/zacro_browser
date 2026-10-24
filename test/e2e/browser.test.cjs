@@ -113,7 +113,8 @@ test(
     const b = await launch(t);
     await expect(b.page.locator('#sidebar')).toBeVisible();
     await expect(b.page.locator('#newtab')).toBeVisible();
-    await expect.poll(async () => (await b.page.locator('#sidebar').innerText()).length).toBeGreaterThan(20);
+    await expect(b.page.locator('[data-key="space-picker"]')).toBeVisible();
+    await expect(b.page.getByRole('button', { name: /New tab/, exact: false }).first()).toBeVisible();
     await b.navigate(`${base}/a`);
     assert.equal(await b.guest('typeof window.zacro'), 'undefined');
     assert.equal(await b.guest('typeof require'), 'undefined');
@@ -326,7 +327,7 @@ test(
     const b = await launch(t);
     const sidebar = b.page.locator('#sidebar');
     await sidebar.getByRole('button', { name: 'New Space', exact: true }).click();
-    const createSpace = b.page.getByRole('dialog', { name: 'Create a Space' });
+    const createSpace = b.page.getByRole('dialog', { name: 'New Space' });
     await createSpace.getByLabel('Space name', { exact: true }).fill('Research lab');
     await createSpace.getByRole('button', { name: 'Create Space', exact: true }).click();
     await expect
@@ -337,7 +338,7 @@ test(
       .toBe('Research lab');
     await expect(b.page.getByRole('dialog')).toHaveCount(0);
     await sidebar.getByRole('button', { name: 'New folder', exact: true }).click();
-    const createFolder = b.page.getByRole('dialog', { name: 'Give your tabs a home' });
+    const createFolder = b.page.getByRole('dialog', { name: 'New folder' });
     await createFolder.getByLabel('Folder name', { exact: true }).fill('Evidence');
     await createFolder.getByRole('button', { name: 'Create folder', exact: true }).click();
     await expect.poll(async () => (await b.state()).folders[0]?.name).toBe('Evidence');
@@ -371,6 +372,7 @@ test(
     await sidebar.getByRole('button', { name: 'Settings', exact: true }).click();
     await b.page.locator('select[data-setting="searchEngine"]').selectOption('brave');
     await expect.poll(async () => (await b.state()).settings.searchEngine).toBe('brave');
+    await b.page.locator('#side-panel summary').filter({ hasText: 'About Zacro' }).click();
     await b.page.locator('#side-panel').getByRole('button', { name: 'Version details', exact: true }).click();
     await expect(b.page.getByRole('dialog', { name: 'About Zacro' })).toContainText('Chromium');
     await b.page.keyboard.press('Escape');

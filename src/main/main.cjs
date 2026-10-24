@@ -3,6 +3,7 @@
 const {
   app,
   BrowserWindow,
+  View,
   WebContentsView,
   ipcMain,
   session,
@@ -45,7 +46,7 @@ let splitTabId = null;
 let splitPair = null;
 let normalWindowBounds = null;
 let peek = null;
-let layout = { sidebarWidth: 260, panelWidth: 0, overlay: false };
+let layout = { sidebarWidth: 230, panelWidth: 0, overlay: false };
 let quitting = false;
 let lastProfileId = null;
 let closingWindow = false;
@@ -425,7 +426,7 @@ function createEntry(profileId, tabId = null, suppliedOptions = {}) {
     presentation: { visible: false, bounds: null, attached: false },
   };
   const wc = view.webContents;
-  view.setBorderRadius(14);
+  view.setBorderRadius(10);
   view.setBackgroundColor(nativeTheme.shouldUseDarkColors ? '#1b1a1d' : '#ffffff');
   view.setVisible(false);
   wc.setWindowOpenHandler((details) => {
@@ -679,6 +680,9 @@ function ensureView(tabId) {
   if (!views.has(tabId)) {
     const entry = createEntry(tab.profileId, tabId);
     views.set(tabId, entry);
+    // Establish the native parent and visible bounds before the first load.
+    // A newly created renderer must inherit the page's actual presentation.
+    arrangeViews();
     safeNavigate(entry, tab.url);
   }
   return views.get(tabId);
@@ -762,8 +766,8 @@ async function openPeek(url, source = activeTab()) {
     spaceId: source.spaceId,
     sourceTabId: source.sourceTabId || source.id,
   };
-  safeNavigate(entry, url);
   arrangeViews();
+  safeNavigate(entry, url);
   publish();
   focusContentOrChrome(entry.contents);
 }
@@ -890,6 +894,8 @@ function handleShortcut(event, input, contents) {
       }
     });
   }
+  if (mod && input.shift && key === 'b')
+    return run(() => emit({ type: 'sidebar:toggle', fromPage: contents !== win.webContents }));
   // The shell owns focused fields and command-panel shortcuts itself.
   if (contents === win.webContents && !['f5', 'f11', 'f12'].includes(key)) return;
   if (contents === win.webContents && ['f5', 'f12'].includes(key)) {
@@ -1486,7 +1492,7 @@ async function invoke(action, payload = {}) {
       sessions.delete(profile.id);
     }
     const result = store.dispatch(action, payload);
-    if (action === 'settings:update' && payload.values?.sidebarWidth)
+    if (action === 'settings:update' && payload.values?.sidebarWidth && layout.sidebarWidth !== 0)
       layout.sidebarWidth = store.state.settings.sidebarWidth;
     return result;
   }
@@ -1579,7 +1585,8 @@ async function invoke(action, payload = {}) {
     case 'layout': {
       const previousOverlay = layout.overlay;
       if (Number.isFinite(payload.sidebarWidth))
-        layout.sidebarWidth = Math.max(180, Math.min(420, payload.sidebarWidth));
+        layout.sidebarWidth =
+          payload.sidebarWidth === 0 ? 0 : Math.max(180, Math.min(420, payload.sidebarWidth));
       if (Number.isFinite(payload.panelWidth))
         layout.panelWidth = Math.max(0, Math.min(650, payload.panelWidth));
       if (typeof payload.overlay === 'boolean') layout.overlay = payload.overlay;
@@ -1882,6 +1889,19 @@ async function createWindow() {
       win.setBounds(requested);
     }
   }
+  // Website views and the shell must be native siblings. Nesting websites
+  // inside BrowserWindow's original content view can leave their renderer
+  // hidden on first navigation even when the native child reports visible.
+  // A debugger masks that failure by keeping pages rendering.
+  const shellView = win.contentView;
+  const pageHost = new View();
+  win.setContentView(pageHost);
+  pageHost.addChildView(shellView);
+  const sizeShell = () => {
+    const [width, height] = win.getContentSize();
+    shellView.setBounds({ x: 0, y: 0, width, height });
+  };
+  sizeShell();
   win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   win.webContents.on('will-navigate', (event) => event.preventDefault());
   win.webContents.on('will-redirect', (event) => event.preventDefault());
@@ -1902,6 +1922,7 @@ async function createWindow() {
   rememberNormalBounds();
   win.on('resize', () => {
     rememberNormalBounds();
+    sizeShell();
     arrangeViews();
     publish();
   });
@@ -1982,7 +2003,7 @@ app.on('will-quit', () => {
   clearTimeout(publishTimer);
   for (const item of liveDownloads.values()) item.cancel();
   finishAuth();
-  ai?.handle('ai:cancel', {}).catch(() => {});
+  ai?.close();
   try {
     store?.flush();
   } catch (error) {
@@ -1996,7 +2017,7 @@ if (singleInstance)
     .whenReady()
     .then(async () => {
       store = new BrowserStore(app.getPath('userData'));
-      layout.sidebarWidth = store.state.settings.sidebarWidth || 260;
+      layout.sidebarWidth = store.state.settings.sidebarWidth || 230;
       for (const download of store.state.downloads)
         if (['progressing', 'interrupted'].includes(download.state)) {
           download.state = 'interrupted';
@@ -2009,9 +2030,10 @@ if (singleInstance)
           getPageContext,
           emit: (event) => {
             emit(event);
-            publish();
+            if (event.type !== 'ai:delta') publish();
           },
           userDataPath: app.getPath('userData'),
+          openExternal: (url) => shell.openExternal(url),
         });
         await ai.ready;
       } catch (error) {
