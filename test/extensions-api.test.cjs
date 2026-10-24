@@ -449,3 +449,121 @@ test('unknown method suffixes cannot alias a supported API method', async () => 
   const { api, context } = setup();
   await assert.rejects(api.call(context, 'tabs.get.extra', [10]), /Unsupported/);
 });
+
+test('R2 packaged relative URLs resolve for create/update while foreign and unsafe URLs reject', async () => {
+  const { api, context, data } = setup();
+  for (const value of ['onboarding.html', '/options.html', 'nested/start.html']) {
+    const tab = await api.call(context, 'tabs.create', [{ url: value }]);
+    assert.equal(data.at(-1).url, `chrome-extension://${id}/${value.replace(/^\//, '')}`);
+    await api.call(context, 'tabs.update', [tab.id, { url: value }]);
+  }
+  for (const value of [
+    `chrome-extension://${'b'.repeat(32)}/x`,
+    'zacro-compat-transport.html',
+    'javascript:alert(1)',
+    'data:text/html,x',
+    'https://user:password@example.com/',
+    `chrome-extension://user:password@${id}/options.html`,
+  ])
+    await assert.rejects(api.call(context, 'tabs.create', [{ url: value }]), /URL|resource/);
+});
+test('R3 optional wildcard declarations grant only requested narrower hosts and contains honors coverage', async () => {
+  const { optionalGrants, hostContains } = require('../src/main/extensions/permissions.cjs');
+  const manifest = {
+    manifest_version: 3,
+    name: 'Sites',
+    version: '1',
+    optional_host_permissions: ['https://*/*'],
+  };
+  assert.deepEqual(
+    optionalGrants(
+      manifest,
+      { permissions: [], origins: [] },
+      { permissions: [], origins: ['https://example.com/*'] },
+    ),
+    { permissions: [], origins: ['https://example.com/*'] },
+  );
+  assert.equal(hostContains('https://*.example.com/path/*', 'https://sub.example.com/path/child/*'), true);
+  for (const [outer, inner] of [
+    ['https://example.com/*', 'https://*/*'],
+    ['https://*.example.com/*', 'https://other.com/*'],
+    ['https://*/*', 'http://example.com/*'],
+    ['https://example.com/path/*', 'https://example.com/other/*'],
+    ['http://localhost:123/*', 'http://localhost:456/*'],
+  ])
+    assert.equal(hostContains(outer, inner), false, `${outer} vs ${inner}`);
+  const { api, context, metadata } = setup();
+  metadata.grants.origins = ['https://*.example.com/*'];
+  assert.equal(
+    await api.call(context, 'permissions.contains', [{ origins: ['https://sub.example.com/*'] }]),
+    true,
+  );
+  assert.equal(await api.call(context, 'permissions.contains', [{ origins: ['https://*/*'] }]), false);
+  assert.throws(
+    () =>
+      optionalGrants(
+        { ...manifest, host_permissions: ['https://example.com/*'] },
+        { permissions: [], origins: ['https://example.com/*'] },
+        { permissions: [], origins: ['https://*/*'] },
+        true,
+      ),
+    /Required/,
+  );
+});
+test('R4 checkbox clicks toggle canonical state and ignore caller checked claims', async () => {
+  const { api, context, events } = setup();
+  await api.call(context, 'contextMenus.create', [
+    { id: 'c', type: 'checkbox', title: 'Check', checked: false },
+  ]);
+  await api.clickMenu('p1', id, 'c', { wasChecked: true, checked: false }, 10);
+  assert.equal(api.menuItems('p1', id)[0].checked, true);
+  assert.deepEqual(events.at(-1)[3][0], { menuItemId: 'c', wasChecked: false, checked: true });
+  await api.clickMenu('p1', id, 'c', {}, 10);
+  assert.equal(api.menuItems('p1', id)[0].checked, false);
+  assert.deepEqual(events.at(-1)[3][0], { menuItemId: 'c', wasChecked: true, checked: false });
+});
+test('R4 radios remain exclusive only within contiguous sibling groups and reject stale clicks', async () => {
+  const { api, context, metadata } = setup();
+  for (const item of [
+    { id: 'a', type: 'radio', checked: true },
+    { id: 'b', type: 'radio' },
+    { id: 'sep', type: 'separator' },
+    { id: 'c', type: 'radio', checked: true },
+    { id: 'disabled', type: 'checkbox', enabled: false },
+  ])
+    await api.call(context, 'contextMenus.create', [{ title: 'item', ...item }]);
+  await api.clickMenu('p1', id, 'b', {}, 10);
+  assert.deepEqual(
+    api
+      .menuItems('p1', id)
+      .filter((item) => item.type === 'radio')
+      .map((item) => [item.id, item.checked]),
+    [
+      ['a', false],
+      ['b', true],
+      ['c', true],
+    ],
+  );
+  await assert.rejects(api.clickMenu('p1', id, 'disabled', {}, 10), /menu/i);
+  api.tabs.get = async () => {
+    metadata.generation = 'new';
+    return { id: 10, url: 'https://example.com/' };
+  };
+  await assert.rejects(api.clickMenu('p1', id, 'a', {}, 10), /Expired/);
+});
+test('R5 submenu removal is atomic across descendants, supports ID reuse, and rejects cycles', async () => {
+  const { api, context } = setup();
+  for (const item of [{ id: 'p' }, { id: 'c', parentId: 'p' }, { id: 'g', parentId: 'c' }, { id: 'keep' }])
+    await api.call(context, 'contextMenus.create', [{ title: 'item', ...item }]);
+  await assert.rejects(api.call(context, 'contextMenus.update', ['p', { parentId: 'p' }]), /cycle|parent/i);
+  await assert.rejects(api.call(context, 'contextMenus.update', ['p', { parentId: 'g' }]), /cycle|parent/i);
+  assert.equal(api.menuItems('p1', id).find((item) => item.id === 'p').parentId, undefined);
+  await api.call(context, 'contextMenus.remove', ['p']);
+  assert.deepEqual(
+    api.menuItems('p1', id).map((item) => item.id),
+    ['keep'],
+  );
+  for (const item of [{ id: 'p' }, { id: 'c', parentId: 'p' }, { id: 'g', parentId: 'c' }])
+    await api.call(context, 'contextMenus.create', [{ title: 'new', ...item }]);
+  assert.equal(api.menuItems('p1', id).length, 4);
+});

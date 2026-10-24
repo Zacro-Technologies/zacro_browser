@@ -122,12 +122,6 @@ function inspectManifest(manifest) {
         required: true,
         reason: 'This extension context or engine feature is not supported.',
       });
-  if (manifest.background?.persistent === false)
-    unsupported.push({
-      capability: 'event-page',
-      required: true,
-      reason: 'Lazy MV2 event page lifecycle is not yet verified.',
-    });
   return {
     required,
     optional,

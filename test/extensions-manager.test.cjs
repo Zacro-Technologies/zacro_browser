@@ -943,3 +943,62 @@ test('restore rechecks current capability policy instead of trusting a historic 
   assert.equal(restarted.list('p1')[0].enabled, false);
   assert.match(restarted.list('p1')[0].error, /temporary|activeTab/i);
 });
+test('R3 narrower optional host survives native manifest rebuild and restore without wildcard escalation', async (t) => {
+  const h = await setup(t);
+  const source = path.join(h.root, 'narrow-host');
+  await fs.mkdir(source);
+  await fs.writeFile(
+    path.join(source, 'manifest.json'),
+    JSON.stringify({
+      manifest_version: 3,
+      name: 'Narrow host',
+      version: '1',
+      permissions: ['scripting'],
+      optional_host_permissions: ['https://*/*'],
+    }),
+  );
+  let record = await h.manager.installLocal('p1', source);
+  record = await h.manager.changePermissions('p1', record.id, {
+    permissions: ['scripting'],
+    origins: ['https://example.com/*'],
+  });
+  assert.deepEqual(record.grants.origins, ['https://example.com/*']);
+  assert.deepEqual(h.manager.resolveExtension('p1', record.id).manifest.host_permissions, [
+    'https://example.com/*',
+  ]);
+  await h.manager.invalidateProfile('p1');
+  await h.manager.restore('p1');
+  assert.deepEqual(h.manager.resolveExtension('p1', record.id).manifest.host_permissions, [
+    'https://example.com/*',
+  ]);
+  await assert.rejects(
+    h.manager.changePermissions('p1', record.id, {
+      permissions: ['scripting'],
+      origins: ['http://example.com/*'],
+    }),
+    /undeclared/,
+  );
+  await assert.rejects(
+    h.manager.changePermissions('p1', record.id, { permissions: ['scripting'], origins: ['*://*/*'] }),
+    /undeclared/,
+  );
+  await h.manager.changePermissions('p1', record.id, { permissions: ['scripting'], origins: [] });
+  assert.deepEqual(h.manager.resolveExtension('p1', record.id).manifest.host_permissions, []);
+});
+test('metadata writes reject unreadable size before replacing the durable profile state', async (t) => {
+  const h = await setup(t);
+  const filename = path.join(h.manager.profilePath('p1'), 'state.json');
+  const before = await fs.readFile(filename, 'utf8');
+  assert.throws(
+    () =>
+      h.manager._persist('p1', (state) => {
+        state.oversized = 'x'.repeat(16 * 1024 * 1024);
+      }),
+    /too large/,
+  );
+  assert.equal(await fs.readFile(filename, 'utf8'), before);
+  assert.equal(h.manager.states.get('p1').oversized, undefined);
+  await h.manager.invalidateProfile('p1');
+  await h.manager.restore('p1');
+  assert.deepEqual(h.manager.list('p1'), []);
+});

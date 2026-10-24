@@ -16,7 +16,7 @@ app.whenReady().then(async () => {
       res.setHeader('Content-Type', req.url === '/data' ? 'application/json' : 'text/html');
       res.end(req.url === '/data' ? '42' : '<input id="draft" value="unsaved">');
     });
-    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    await new Promise((resolve) => server.listen(0, resolve));
     app.on('will-quit', () => server.close());
     const url = `http://127.0.0.1:${server.address().port}/`,
       source = path.join(process.env.ZACRO_CONTEXT_ROOT, 'source');
@@ -26,7 +26,7 @@ app.whenReady().then(async () => {
       name: 'Optional rights',
       version: '1',
       permissions: ['storage', 'scripting'],
-      optional_host_permissions: ['http://127.0.0.1/*'],
+      optional_host_permissions: ['http://*/*'],
     };
     await fs.writeFile(path.join(source, 'manifest.json'), JSON.stringify(manifest));
     await fs.writeFile(
@@ -61,6 +61,12 @@ app.whenReady().then(async () => {
       webPreferences: { session: ses, sandbox: true, contextIsolation: true, nodeIntegration: false },
     });
     await tab.loadURL(url);
+    const otherURL = `http://localhost:${server.address().port}/`;
+    const other = new BrowserWindow({
+      show: false,
+      webPreferences: { session: ses, sandbox: true, contextIsolation: true, nodeIntegration: false },
+    });
+    await other.loadURL(otherURL);
     let view;
     const open = async () => {
       if (view && !view.isDestroyed()) view.destroy();
@@ -71,9 +77,9 @@ app.whenReady().then(async () => {
       await view.loadURL(`chrome-extension://${record.id}/page.html`);
     };
     await open();
-    const probe = () =>
+    const probe = (target = tab, address = url) =>
       view.webContents.executeJavaScript(
-        `(async()=>{let injected,network;try{injected=await chrome.scripting.executeScript({target:{tabId:${tab.webContents.id}},func:()=>document.querySelector('#draft').value});}catch(error){injected={error:error.message}}try{network=await(await fetch(${JSON.stringify(url + 'data')})).json()}catch(error){network={error:error.message}}return {injected,network};})()`,
+        `(async()=>{let injected,network;try{injected=await chrome.scripting.executeScript({target:{tabId:${target.webContents.id}},func:()=>document.querySelector('#draft').value});}catch(error){injected={error:error.message}}try{network=await(await fetch(${JSON.stringify(address + 'data')})).json()}catch(error){network={error:error.message}}return {injected,network};})()`,
       );
     const before = await probe();
     record = await manager.changePermissions('p1', record.id, {
@@ -81,7 +87,14 @@ app.whenReady().then(async () => {
       origins: ['http://127.0.0.1/*'],
     });
     await open();
-    const granted = await probe();
+    const granted = await probe(),
+      unrelatedGranted = await probe(other, otherURL);
+    const narrowManifest = manager.resolveExtension('p1', record.id).manifest.host_permissions;
+    await manager.invalidateProfile('p1');
+    await manager.restore('p1');
+    await open();
+    const restored = await probe(),
+      unrelatedRestored = await probe(other, otherURL);
     await view.webContents.executeJavaScript(
       `chrome.scripting.executeScript({target:{tabId:${tab.webContents.id}},func:()=>{document.querySelector('#draft').value='draft remains';globalThis.injectedMarker=true;}})`,
     );
@@ -107,10 +120,16 @@ app.whenReady().then(async () => {
     reloadPending = false;
     record = await manager.enable('p1', record.id);
     await open();
-    const removed = await probe();
+    const removed = await probe(),
+      unrelatedRemoved = await probe(other, otherURL);
     globalThis.contextResult = {
       before,
       granted,
+      unrelatedGranted,
+      restored,
+      unrelatedRestored,
+      unrelatedRemoved,
+      narrowManifest,
       pending,
       removed,
       effective: manager.resolveExtension('p1', record.id).manifest,

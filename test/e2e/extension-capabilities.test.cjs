@@ -5,7 +5,7 @@ const test = require('node:test'),
   os = require('node:os'),
   path = require('node:path');
 const { _electron: electron, expect } = require('@playwright/test');
-for (const capability of ['activeTab', 'brokerFailure', 'lazy'])
+for (const capability of ['activeTab', 'brokerFailure', 'lazy', 'idleRace'])
   test(`native capability boundary: ${capability}`, { timeout: 65000 }, async (t) => {
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'zacro-capability-'));
     const env = { ...process.env, ZACRO_CONTEXT_ROOT: directory, ZACRO_CAPABILITY: capability };
@@ -30,10 +30,22 @@ for (const capability of ['activeTab', 'brokerFailure', 'lazy'])
       assert.equal(result.calls, 0);
       assert.equal(result.brokerCount, 0);
       assert.equal(result.pageCapability, 'undefined');
+    } else if (capability === 'idleRace') {
+      assert.deepEqual(
+        result.adapterEvents,
+        [['idle-race', 1]],
+        'event at Port retirement must be delivered once',
+      );
     } else {
       assert.equal(result.results.length, 2);
       assert.equal(result.results[0].backgroundsAfterIdle, 0);
       assert.equal(result.results[0].wake.starts, 2);
+      assert.equal(result.results[1].backgroundsAfterIdle, 0, 'adapted event page must actually suspend');
+      assert.deepEqual(
+        result.adapterEvents,
+        [['adapter-wake', 2]],
+        'host event must wake genuine background exactly once',
+      );
       for (const entry of result.results) {
         assert.ok(entry.first);
         assert.ok(entry.wake);

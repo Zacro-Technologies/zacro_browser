@@ -5,6 +5,8 @@
   if (!runtime?.id || globalThis.__zacroFacadeInstalled) return;
   Object.defineProperty(globalThis, '__zacroFacadeInstalled', { value: true });
   const namespace = 'zacro.extension.transport.v1';
+  let resubscribe = () => {};
+  const wakeCheck = (message) => message?.namespace === 'zacro.extension.wake.v1';
   // Native document-targeted messaging is a liveness check, not an identity
   // claim from page data. Chromium selects the recipient by documentId.
   const messageEvent = runtime.onMessage;
@@ -14,18 +16,20 @@
   const documentCheck = (message) => message?.namespace === 'zacro.extension.document.v1';
   messageAdd((message, sender, reply) => {
     if (
-      documentCheck(message) &&
+      (documentCheck(message) || wakeCheck(message)) &&
       sender.id === runtime.id &&
       sender.url === runtime.getURL('zacro-compat-transport.html')
-    )
+    ) {
+      if (wakeCheck(message)) resubscribe();
       reply(true);
+    }
   });
   const messageListeners = new WeakMap();
   messageEvent.addListener = (listener) => {
     let wrapper = messageListeners.get(listener);
     if (!wrapper) {
       wrapper = (...args) => {
-        if (!documentCheck(args[0])) return listener(...args);
+        if (!documentCheck(args[0]) && !wakeCheck(args[0])) return listener(...args);
       };
       messageListeners.set(listener, wrapper);
     }
@@ -54,13 +58,26 @@
   if (!globalThis.zacroExtension) {
     const connect = runtime.connect.bind(runtime);
     let ready,
+      active,
       nextId = 1;
     function open() {
       const port = connect({ name: namespace });
       const pending = new Map();
-      let closed = false;
+      let closed = false,
+        idle,
+        background = false;
+      const settle = () => {
+        clearTimeout(idle);
+        if (background && !pending.size && !closed && !connection.retiring)
+          idle = setTimeout(() => connection.retire(), 100);
+      };
       const fail = () => {
         closed = true;
+        clearTimeout(idle);
+        if (active === connection) {
+          active = null;
+          ready = null;
+        }
         for (const { reject, timer } of pending.values()) {
           clearTimeout(timer);
           reject(new Error('Extension transport disconnected'));
@@ -81,19 +98,36 @@
         pending.delete(message.id);
         clearTimeout(request.timer);
         message.error ? request.reject(new Error(message.error)) : request.resolve(message.value);
+        settle();
       });
-      return {
+      const connection = {
+        retiring: null,
+        retire() {
+          if (closed || pending.size || connection.retiring) return;
+          // The host first removes this event destination. Its acknowledgement
+          // follows all earlier Port events, so none can be stranded by close.
+          connection.retiring = connection.request({ method: 'zacro.events.idle', args: [] }).then(
+            () => connection.close(),
+            () => connection.close(),
+          );
+        },
+        setKind(kind) {
+          background = kind === 'background-page';
+          settle();
+        },
         close() {
           port.disconnect();
           fail();
         },
         request(payload, timeout = 10000) {
           if (closed) return Promise.reject(new Error('Extension transport disconnected'));
+          clearTimeout(idle);
           const id = nextId++;
           return new Promise((resolve, reject) => {
             const timer = setTimeout(() => {
               pending.delete(id);
               reject(new Error('Extension transport deadline exceeded'));
+              settle();
             }, timeout);
             pending.set(id, { resolve, reject, timer });
             try {
@@ -106,6 +140,7 @@
           });
         },
       };
+      return connection;
     }
     async function initialize() {
       const deadline = Date.now() + 3000;
@@ -113,7 +148,10 @@
         let connection;
         try {
           connection = open();
-          await connection.request({ hello: true }, 150);
+          const context = await connection.request({ hello: true }, 150);
+          active = connection;
+          connection.setKind(context.kind);
+          setTimeout(() => resubscribe(), 0);
           return connection;
         } catch {
           connection?.close();
@@ -135,7 +173,12 @@
         async invoke(method, args, ...extra) {
           if (extra.length) throw new Error('Caller identity is not accepted');
           ready ||= initialize();
-          return (await ready).request({ method, args });
+          const connection = await ready;
+          if (connection.retiring) {
+            await connection.retiring;
+            return globalThis.zacroExtension.invoke(method, args);
+          }
+          return connection.request({ method, args });
         },
       }),
     });
@@ -151,6 +194,28 @@
       get: () => callbackError || nativeError?.get?.call(runtime),
     });
     const events = new Map();
+    let subscriptionTimer;
+    resubscribe = () => {
+      if (subscriptionTimer) return;
+      subscriptionTimer = setTimeout(() => {
+        subscriptionTimer = null;
+        // MV2 executes the bootstrap and original background scripts in separate
+        // document tasks. Wait for their native document load barrier before
+        // declaring the listener snapshot ready (including an empty snapshot).
+        if (
+          typeof document !== 'undefined' &&
+          location.protocol === 'chrome-extension:' &&
+          document.readyState === 'loading'
+        ) {
+          document.addEventListener('DOMContentLoaded', resubscribe, { once: true });
+          return;
+        }
+        const names = [...events]
+          .filter(([, item]) => item.listeners.size)
+          .map(([name]) => (name === 'storage.sync.onChanged' ? 'storage.onChanged' : name));
+        host.invoke('zacro.events.subscribe', [[...new Set(names)]]).catch(() => {});
+      }, 0);
+    };
     function event(name, native) {
       if (events.has(name)) return events.get(name).api;
       const listeners = new Set();
@@ -160,12 +225,13 @@
           if (!listeners.has(listener)) {
             listeners.add(listener);
             native?.addListener(listener);
-            host.connectEvents?.();
+            resubscribe();
           }
         },
         removeListener(listener) {
           listeners.delete(listener);
           native?.removeListener(listener);
+          resubscribe();
         },
         hasListener(listener) {
           return listeners.has(listener) || !!native?.hasListener(listener);
@@ -318,6 +384,8 @@
     };
     for (const name of ['get', 'getKeys', 'getBytesInUse', 'set', 'remove', 'clear', 'setAccessLevel'])
       chrome.storage.sync[name] = (...args) => invoke('storage.sync.' + name, args);
+    if (typeof document === 'undefined' || chrome.extension?.getBackgroundPage?.() === globalThis)
+      resubscribe();
     // The engine still performs scripting, argument serialization, frame targeting,
     // CSS insertion, and permission checks. Only add our isolated-world bootstrap.
     const scripting = chrome.scripting;

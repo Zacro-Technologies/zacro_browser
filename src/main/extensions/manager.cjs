@@ -81,11 +81,13 @@ async function copyLocal(source, destination, signal) {
   await visit(source, destination, 0);
 }
 function atomicJson(filename, value) {
+  const serialized = JSON.stringify(value, null, 2) + '\n';
+  if (Buffer.byteLength(serialized) > 16 * 1024 * 1024) throw new Error('Extension state is too large');
   const temporary = filename + '.' + crypto.randomUUID() + '.tmp';
   try {
     const fd = sync.openSync(temporary, 'wx', 0o600);
     try {
-      sync.writeFileSync(fd, JSON.stringify(value, null, 2) + '\n');
+      sync.writeFileSync(fd, serialized);
       sync.fsyncSync(fd);
     } finally {
       sync.closeSync(fd);
@@ -1023,16 +1025,16 @@ class ExtensionManager {
       const record = this.list(profileId).find((item) => item.id === id);
       if (!record?.enabled || record.current.legacyPath)
         throw new Error('Native permission rebuild requires an enabled adapted extension');
-      const { permissionDetails } = require('./permissions.cjs');
+      const { permissionDetails, covers } = require('./permissions.cjs');
       const grants = permissionDetails(requested),
         inspection = record.current.inspection;
       for (const key of ['permissions', 'origins']) {
-        if (inspection.required[key].some((value) => !grants[key].includes(value)))
+        if (inspection.required[key].some((value) => !covers(grants[key], value, key)))
           throw new Error('Required permissions cannot be removed');
         if (
           grants[key].some(
             (value) =>
-              ![...inspection.required[key], ...inspection.optional[key]].includes(value) ||
+              !covers([...inspection.required[key], ...inspection.optional[key]], value, key) ||
               inspection.unsupported.some((item) => item.capability === value),
           )
         )

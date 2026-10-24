@@ -30,6 +30,64 @@ function matches(pattern, url) {
     return false;
   }
 }
+// Decide inclusion of two supported match-pattern languages. A bounded glob
+// automaton avoids treating wildcard declarations as literal strings, or using
+// a few example URLs as an unsafe proof that one pattern contains another.
+function globContains(outer, inner) {
+  if (outer === inner || outer === '/*') return true;
+  const alphabet = [...new Set([...outer, ...inner].filter((char) => char !== '*')), '\0'];
+  const closure = (pattern, values) => {
+    const states = new Set(values);
+    for (const position of states) if (pattern[position] === '*') states.add(position + 1);
+    return [...states].sort((a, b) => a - b);
+  };
+  const step = (pattern, states, char) =>
+    closure(
+      pattern,
+      states.flatMap((position) =>
+        pattern[position] === '*' ? [position] : pattern[position] === char ? [position + 1] : [],
+      ),
+    );
+  const pending = [[closure(outer, [0]), closure(inner, [0])]],
+    seen = new Set();
+  while (pending.length) {
+    const [left, right] = pending.pop(),
+      key = left.join(',') + '/' + right.join(',');
+    if (seen.has(key)) continue;
+    if (seen.size >= 8192) return false; // Fail closed for pathological patterns.
+    seen.add(key);
+    if (right.includes(inner.length) && !left.includes(outer.length)) return false;
+    for (const char of alphabet) {
+      const next = step(inner, right, char);
+      if (next.length) pending.push([step(outer, left, char), next]);
+    }
+  }
+  return true;
+}
+function hostContains(outer, inner) {
+  if (!supportedHost(outer) || !supportedHost(inner)) return false;
+  const parse = (value) => {
+    if (value === '<all_urls>') return { scheme: '*', host: '*', port: '', path: '/*' };
+    const match = /^(\*|https?):\/\/([^/]+)(\/.*)$/i.exec(value);
+    if (!match) return null;
+    const [host, port = ''] = match[2].toLowerCase().split(':');
+    if (port && (!/^\d+$/.test(port) || Number(port) < 1 || Number(port) > 65535)) return null;
+    return { scheme: match[1].toLowerCase(), host, port: port ? String(Number(port)) : '', path: match[3] };
+  };
+  const a = parse(outer),
+    b = parse(inner);
+  if (!a || !b || (a.scheme !== '*' && a.scheme !== b.scheme) || (a.port && a.port !== b.port)) return false;
+  const host =
+    a.host === '*' ||
+    a.host === b.host ||
+    (a.host.startsWith('*.') &&
+      b.host !== '*' &&
+      (b.host === a.host.slice(2) || b.host.endsWith(a.host.slice(1))));
+  return host && globContains(a.path, b.path);
+}
+function covers(values, value, key) {
+  return key === 'origins' ? values.some((pattern) => hostContains(pattern, value)) : values.includes(value);
+}
 function permissionDetails(value) {
   if (
     !value ||
@@ -56,9 +114,15 @@ function optionalGrants(manifest, current, requested, remove = false) {
   });
   for (const key of ['permissions', 'origins'])
     for (const value of requested[key]) {
-      if (remove && inspection.required[key].includes(value))
+      if (
+        remove &&
+        inspection.required[key].some((required) =>
+          key === 'origins' ? hostContains(value, required) : value === required,
+        )
+      )
         throw new Error('Required permissions cannot be removed');
-      if (!inspection.optional[key].includes(value)) throw new Error('Permission was not declared optional');
+      if (!covers(inspection.optional[key], value, key))
+        throw new Error('Permission was not declared optional');
       if (
         inspection.unsupported.some((item) => item.capability === value) ||
         (key === 'origins' && !supportedHost(value))
@@ -69,9 +133,9 @@ function optionalGrants(manifest, current, requested, remove = false) {
     ['permissions', 'origins'].map((key) => [
       key,
       remove
-        ? current[key].filter((value) => !requested[key].includes(value))
+        ? current[key].filter((value) => !covers(requested[key], value, key))
         : [...new Set([...current[key], ...requested[key]])].sort(),
     ]),
   );
 }
-module.exports = { matches, permissionDetails, optionalGrants };
+module.exports = { matches, hostContains, covers, permissionDetails, optionalGrants };

@@ -48,7 +48,7 @@ app.whenReady().then(async () => {
     await fs.writeFile(
       path.join(source, 'background.js'),
       probe +
-        "probe('background');chrome.runtime.onMessage.addListener((message,sender,reply)=>{if(message==='native')reply('native-reply')});",
+        "chrome.commands.onCommand.addListener(name=>zacroExtension.invoke('test.event',['command',name]));chrome.storage.sync.onChanged.addListener(changes=>{if(changes.wakeKey)zacroExtension.invoke('test.event',['sync',changes.wakeKey.newValue]);});probe('background');chrome.runtime.onMessage.addListener((message,sender,reply)=>{if(message==='native')reply('native-reply')});",
     );
     await fs.writeFile(
       path.join(source, 'content.js'),
@@ -70,12 +70,17 @@ app.whenReady().then(async () => {
     );
     const ses = session.fromPartition('persist:api');
     let manager;
-    const reports = {};
+    const reports = {},
+      events = [];
     let api;
     const bridge = new ExtensionBridge({
       resolveExtension: (p, id) => manager?.resolveExtension(p, id),
       dispatch: (context, method, args) =>
-        method === 'test.report' ? (reports[args[0]] = args[1]) : api.call(context, method, args),
+        method === 'test.report'
+          ? (reports[args[0]] = args[1])
+          : method === 'test.event'
+            ? events.push(args)
+            : api.call(context, method, args),
     });
     const store = new SyncStorage({
       directory: path.join(process.env.ZACRO_CONTEXT_ROOT, 'sync'),
@@ -130,7 +135,7 @@ app.whenReady().then(async () => {
     const tabs = await frame.webContents
       .executeJavaScript('chrome.tabs.query({})')
       .catch((error) => ({ error: error.message }));
-    globalThis.apiFixture = { frame, page, manager, bridge, record, api, store, reports };
+    globalThis.apiFixture = { frame, page, manager, bridge, record, api, store, reports, events };
     globalThis.contextResult = { reports, tabs, pageId: page.webContents.id };
   } catch (error) {
     globalThis.contextResult = { error: error.stack };

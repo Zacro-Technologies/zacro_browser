@@ -122,7 +122,9 @@ app.whenReady().then(async () => {
       bridge.close();
       return;
     }
-    const runs = [];
+    const runs = [],
+      adapterEvents = [],
+      diagnostics = [];
     let bridge;
     for (const adapted of [false, true]) {
       const source = path.join(process.env.ZACRO_CONTEXT_ROOT, adapted ? 'adapted-source' : 'raw-source');
@@ -138,7 +140,7 @@ app.whenReady().then(async () => {
       await fs.writeFile(path.join(source, 'manifest.json'), JSON.stringify(manifest));
       await fs.writeFile(
         path.join(source, 'background.js'),
-        `localStorage.starts=String(Number(localStorage.starts||0)+1);chrome.runtime.onMessage.addListener((message,sender,reply)=>{reply({starts:Number(localStorage.starts),suspend:typeof chrome.runtime.onSuspend});});${adapted ? "zacroExtension.invoke('probe',[]).catch(console.error);" : ''}`,
+        `localStorage.starts=String(Number(localStorage.starts||0)+1);chrome.runtime.onMessage.addListener((message,sender,reply)=>{reply({starts:Number(localStorage.starts),suspend:typeof chrome.runtime.onSuspend});});${adapted ? "chrome.commands.onCommand.addListener(name=>zacroExtension.invoke('adapter.event',[name,Number(localStorage.starts)]));zacroExtension.invoke('probe',[]).catch(console.error);" : ''}`,
       );
       await fs.writeFile(
         path.join(source, 'content.js'),
@@ -148,14 +150,31 @@ app.whenReady().then(async () => {
       let extension;
       if (adapted) {
         bridge = new ExtensionBridge({
+          onError: (error, context) => diagnostics.push({ error: error.message, ...context }),
           resolveExtension: () => ({
             enabled: true,
             generation: 'lazy',
             manifest,
             grants: { permissions: ['storage'], origins: ['http://127.0.0.1/*'] },
           }),
-          dispatch: () => true,
+          dispatch: (context, method, args) => {
+            if (method === 'adapter.event') adapterEvents.push(args);
+            return true;
+          },
         });
+        if (process.env.ZACRO_CAPABILITY === 'idleRace') {
+          const handle = bridge.handle.bind(bridge);
+          let retired = false;
+          bridge.handle = async (event, request) => {
+            const value = await handle(event, request);
+            if (request.method === 'zacro.events.idle' && !retired) {
+              retired = true;
+              bridge.emit('lazy', extension.id, 'commands.onCommand', ['idle-race']);
+              await new Promise((resolve) => setTimeout(resolve, 20));
+            }
+            return value;
+          };
+        }
         bridge.attachSession(ses, 'lazy');
       }
       const directory = adapted ? path.join(process.env.ZACRO_CONTEXT_ROOT, 'derived') : source;
@@ -176,12 +195,24 @@ app.whenReady().then(async () => {
       }
       runs.push({ adapted, ses, extension, page, first: first ? JSON.parse(first) : null });
     }
-    await new Promise((resolve) => setTimeout(resolve, 35000));
+    const idleMilliseconds = process.env.ZACRO_CAPABILITY === 'idleRace' ? 1000 : 35000;
+    await new Promise((resolve) => setTimeout(resolve, idleMilliseconds));
     const results = [];
     for (const run of runs) {
       const backgrounds = webContents
         .getAllWebContents()
         .filter((w) => w.getType() === 'backgroundPage' && w.session === run.ses);
+      if (run.adapted && process.env.ZACRO_CAPABILITY !== 'idleRace') {
+        diagnostics.push({
+          before: [...bridge.sessions.values()][0].backgrounds.get(run.extension.id)?.events
+            ? [...[...bridge.sessions.values()][0].backgrounds.get(run.extension.id).events]
+            : null,
+        });
+        bridge.emit('lazy', run.extension.id, 'commands.onCommand', ['adapter-wake']);
+        const deadline = Date.now() + 5000;
+        while (!adapterEvents.length && Date.now() < deadline)
+          await new Promise((resolve) => setTimeout(resolve, 20));
+      }
       await run.page.webContents.executeJavaScript(
         `document.documentElement.removeAttribute('data-reply');document.dispatchEvent(new Event('test-wake'));`,
       );
@@ -193,6 +224,14 @@ app.whenReady().then(async () => {
         if (wake) break;
         await new Promise((resolve) => setTimeout(resolve, 20));
       }
+      if (run.adapted)
+        diagnostics.push({
+          after: [...bridge.sessions.values()][0].backgrounds.get(run.extension.id)?.queue.length,
+          origins: [...bridge.origins.values()].map((x) => ({
+            kind: x.kind,
+            subscriptions: [...(x.subscriptions || [])],
+          })),
+        });
       results.push({
         adapted: run.adapted,
         first: run.first,
@@ -200,7 +239,7 @@ app.whenReady().then(async () => {
         wake: wake ? JSON.parse(wake) : null,
       });
     }
-    globalThis.contextResult = { idleMilliseconds: 35000, results };
+    globalThis.contextResult = { idleMilliseconds, results, adapterEvents, diagnostics };
   } catch (error) {
     globalThis.contextResult = { error: error.stack };
   }

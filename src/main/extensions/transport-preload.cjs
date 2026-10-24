@@ -8,6 +8,9 @@ connected.catch(() => {});
 contextBridge.executeInMainWorld({
   func: (transport) => {
     const sendToDocument = chrome.tabs.sendMessage.bind(chrome.tabs);
+    transport.onWake(() => {
+      chrome.runtime.sendMessage({ namespace: 'zacro.extension.wake.v1' }).catch(() => {});
+    });
     chrome.runtime.onConnect.addListener((port) => {
       if (port.name !== 'zacro.extension.transport.v1') return;
       const native = port.sender;
@@ -60,7 +63,9 @@ contextBridge.executeInMainWorld({
           const token = await bound;
           if (disconnected) throw new Error('Native origin port disconnected');
           const value =
-            message.hello === true ? true : await transport.invoke(token, message.method, message.args);
+            message.hello === true
+              ? await transport.invoke(token, 'zacro.events.context', [])
+              : await transport.invoke(token, message.method, message.args);
           if (!disconnected) port.postMessage({ id: message.id, value });
         } catch (error) {
           if (!disconnected) port.postMessage({ id: message?.id, error: error.message });
@@ -70,6 +75,9 @@ contextBridge.executeInMainWorld({
   },
   args: [
     {
+      onWake(listener) {
+        ipcRenderer.on(channel + ':wake', () => listener());
+      },
       onEvent(listener) {
         const handler = (_event, message) => listener(message);
         ipcRenderer.on(channel + ':event', handler);

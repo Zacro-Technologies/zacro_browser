@@ -18,9 +18,10 @@ function extensionId(url) {
 const { matches: permitsOrigin } = require('./permissions.cjs');
 
 class ExtensionBridge {
-  constructor({ resolveExtension, dispatch }) {
+  constructor({ resolveExtension, dispatch, onError = () => {} }) {
     this.resolveExtension = resolveExtension;
     this.dispatch = dispatch;
+    this.onError = onError;
     this.sessions = new Map();
     this.leases = new Map();
     this.origins = new Map();
@@ -38,10 +39,12 @@ class ExtensionBridge {
       preloads: [],
       brokers: new Map(),
       revoked: new Set(),
+      backgrounds: new Map(),
     };
     this.sessions.set(session, entry);
     entry.unloaded = (_event, extension) => {
       entry.revoked.add(extension.id);
+      this.clearBackground(entry, extension.id);
       entry.epochs.set(extension.id, (entry.epochs.get(extension.id) || 0) + 1);
       for (const [key, lease] of this.leases)
         if (lease.session === session && lease.extensionId === extension.id) this.releaseLease(key);
@@ -92,7 +95,17 @@ class ExtensionBridge {
       });
     };
     entry.started = ({ versionId, runningStatus }) => {
-      if (!['starting', 'running'].includes(runningStatus)) return;
+      if (!['starting', 'running'].includes(runningStatus)) {
+        if (['stopping', 'stopped'].includes(runningStatus))
+          for (const [token, lease] of this.leases)
+            if (
+              lease.session === session &&
+              lease.kind === 'service-worker' &&
+              lease.sender.versionId === versionId
+            )
+              this.releaseLease(token);
+        return;
+      }
       const worker = session.serviceWorkers.getWorkerFromVersionID(versionId);
       if (!worker || entry.workers.has(worker)) return;
       entry.workers.add(worker);
@@ -342,6 +355,41 @@ class ExtensionBridge {
       }
     };
     assertCurrent();
+    const source = origin || lease;
+    if (request.method === 'zacro.events.context') return { kind: source.kind };
+    if (request.method === 'zacro.events.idle') {
+      if (source.kind !== 'background-page')
+        throw new Error('Only native background pages can retire a Port');
+      const background = this.sessions.get(context.session).backgrounds.get(context.extensionId);
+      if (background?.target === source) background.target = null;
+      return;
+    }
+    if (request.method === 'zacro.events.subscribe') {
+      const names = request.args[0];
+      if (
+        !Array.isArray(names) ||
+        names.length > 32 ||
+        names.some(
+          (name) =>
+            typeof name !== 'string' ||
+            !/^(tabs\.(onCreated|onUpdated|onRemoved|onActivated|onMoved)|windows\.onFocusChanged|permissions\.(onAdded|onRemoved)|commands\.onCommand|action\.onClicked|contextMenus\.onClicked|storage\.onChanged)$/.test(
+              name,
+            ),
+        )
+      )
+        throw new Error('Invalid event subscriptions');
+      source.subscriptions = new Set(names);
+      source.assertCurrent = assertCurrent;
+      if (['service-worker', 'background-page'].includes(source.kind)) {
+        const entry = this.sessions.get(context.session);
+        const background = this.background(entry, context.extensionId, context.generation);
+        background.events = source.subscriptions;
+        background.target = source;
+        background.waking = false;
+        this.flush(entry, context.extensionId, background);
+      }
+      return;
+    }
     const result = await this.dispatch(
       Object.freeze({ ...(origin ? { ...origin, metadata: context.metadata } : context), assertCurrent }),
       request.method,
@@ -362,49 +410,176 @@ class ExtensionBridge {
     return result;
   }
 
+  background(entry, id, generation) {
+    let state = entry.backgrounds.get(id);
+    if (state && state.generation !== generation) this.clearBackground(entry, id);
+    state = entry.backgrounds.get(id);
+    if (!state) {
+      state = { generation, events: null, target: null, queue: [], bytes: 0, waking: false };
+      entry.backgrounds.set(id, state);
+    }
+    return state;
+  }
+
+  clearBackground(entry, id) {
+    const state = entry.backgrounds.get(id);
+    if (state) clearTimeout(state.timer);
+    entry.backgrounds.delete(id);
+  }
+
+  deliveryError(entry, id, event, message) {
+    try {
+      this.onError(new Error(message), { profileId: entry.profileId, extensionId: id, event });
+    } catch {
+      /* Reporting must not break lifecycle cleanup. */
+    }
+  }
+
+  destination(source, event, filter) {
+    source.assertCurrent?.();
+    const entry = this.sessions.get(source.session);
+    const metadata = this.resolveExtension(source.profileId, source.extensionId);
+    if (
+      !source.subscriptions?.has(event) ||
+      !metadata?.enabled ||
+      (metadata.generation ?? 0) !== source.generation ||
+      !entry ||
+      entry.revoked.has(source.extensionId) ||
+      (entry.epochs.get(source.extensionId) || 0) !== source.epoch
+    )
+      return null;
+    if (source.kind === 'content-script' && event !== 'storage.onChanged') return null;
+    const current = { ...source, metadata };
+    if (source.broker) this.validateOrigin(source, current);
+    else if (
+      source.kind === 'service-worker'
+        ? source.sender.isDestroyed()
+        : source.sender.detached || source.sender.url !== source.url
+    )
+      return null;
+    if (filter(current) !== true) return null;
+    source.assertCurrent?.();
+    return current;
+  }
+
+  deliver(source, event, args, filter) {
+    if (!this.destination(source, event, filter)) return false;
+    if (source.broker) {
+      const pair = [...this.origins].find(([, item]) => item === source);
+      if (!pair) return false;
+      source.broker.webContents.mainFrame.send(CHANNEL + ':event', { originToken: pair[0], event, args });
+    } else {
+      const pair = [...this.leases].find(([, item]) => item === source);
+      if (!pair) return false;
+      source.sender.send(CHANNEL + ':event', { token: pair[0], event, args });
+    }
+    return true;
+  }
+
+  flush(entry, id, state) {
+    if (entry.backgrounds.get(id) !== state || !state.target) return;
+    try {
+      state.target.assertCurrent();
+    } catch {
+      state.target = null;
+      return;
+    }
+    // Dequeue only once a fresh authenticated listener snapshot is available.
+    // Re-evaluate filters for each delivery, not at enqueue/wake time.
+    while (state.queue.length) {
+      const item = state.queue.shift();
+      state.bytes -= item.bytes;
+      try {
+        this.deliver(state.target, item.event, item.args, item.filter);
+      } catch {
+        state.target = null;
+      }
+      if (!state.target) break;
+    }
+    if (!state.queue.length) {
+      clearTimeout(state.timer);
+      state.timer = null;
+    }
+  }
+
+  wake(session, entry, id, state) {
+    if (state.waking || !state.queue.length) return;
+    state.waking = true;
+    const native = session.extensions.getExtension(id);
+    const wake = Promise.resolve().then(() => {
+      if (native?.manifest.background?.service_worker)
+        return session.serviceWorkers.startWorkerForScope(`chrome-extension://${id}/`);
+      const broker = entry.brokers.get(id);
+      if (!broker || broker.isDestroyed()) throw new Error('Background transport unavailable');
+      broker.webContents.mainFrame.send(CHANNEL + ':wake');
+    });
+    Promise.resolve(wake).catch(() => {
+      if (entry.backgrounds.get(id) !== state) return;
+      for (const item of state.queue)
+        this.deliveryError(entry, id, item.event, 'Native background wake failed');
+      state.queue.length = 0;
+      state.bytes = 0;
+      state.waking = false;
+      clearTimeout(state.timer);
+      state.timer = null;
+    });
+  }
+
   emit(profileId, id, event, args, { filter = () => true } = {}) {
     if (this.closed || typeof event !== 'string' || !Array.isArray(args)) return;
-    const current = (context) => {
-      const metadata = this.resolveExtension(profileId, id),
-        entry = this.sessions.get(context.session);
+    for (const source of [...this.leases.values(), ...this.origins.values()]) {
       if (
-        context.profileId !== profileId ||
-        context.extensionId !== id ||
-        !metadata?.enabled ||
-        metadata.generation !== context.generation ||
-        !entry ||
-        entry.revoked.has(id) ||
-        (entry.epochs.get(id) !== undefined && entry.epochs.get(id) !== context.epoch)
+        source.profileId !== profileId ||
+        source.extensionId !== id ||
+        ['service-worker', 'background-page'].includes(source.kind)
       )
-        return null;
-      if (context.kind === 'content-script' && event !== 'storage.onChanged') return null;
-      const next = { ...context, metadata };
-      return filter(next) === true ? next : null;
-    };
-    for (const [token, context] of this.leases) {
+        continue;
       try {
-        const next = current(context);
-        if (!next || context.url.endsWith('/zacro-compat-transport.html')) continue;
-        if (
-          context.kind === 'service-worker'
-            ? context.sender.isDestroyed()
-            : context.sender.detached || context.sender.url !== context.url
-        )
-          continue;
-        context.sender.send(CHANNEL + ':event', { token, event, args });
+        this.deliver(source, event, args, filter);
       } catch {
-        /* Destroyed contexts are not event destinations. */
+        /* Expired document. */
       }
     }
-    for (const [originToken, context] of this.origins) {
+    for (const [session, entry] of this.sessions) {
+      if (entry.profileId !== profileId || entry.revoked.has(id)) continue;
+      const metadata = this.resolveExtension(profileId, id);
+      const native = session.extensions.getExtension(id);
+      if (!metadata?.enabled || !native?.manifest.background) continue;
+      const state = this.background(entry, id, metadata.generation ?? 0);
+      if (state.events && !state.events.has(event)) continue;
+      let copy, bytes;
       try {
-        const next = current(context);
-        if (!next) continue;
-        this.validateOrigin(context, next);
-        context.broker.webContents.mainFrame.send(CHANNEL + ':event', { originToken, event, args });
+        copy = structuredClone(args);
+        bytes = Buffer.byteLength(JSON.stringify(copy));
       } catch {
-        /* A revoked native document receives no notification. */
+        this.deliveryError(entry, id, event, 'Invalid notification payload');
+        continue;
       }
+      const all = [...this.sessions.values()].flatMap((item) => [...item.backgrounds.values()]);
+      if (
+        state.queue.length >= 128 ||
+        state.bytes + bytes > 262144 ||
+        all.reduce((n, item) => n + item.queue.length, 0) >= 512 ||
+        all.reduce((n, item) => n + item.bytes, 0) + bytes > 1048576
+      ) {
+        this.deliveryError(entry, id, event, 'Notification queue limit exceeded');
+        continue;
+      }
+      state.queue.push({ event, args: copy, filter, bytes });
+      state.bytes += bytes;
+      if (!state.timer) {
+        state.timer = setTimeout(() => {
+          for (const item of state.queue)
+            this.deliveryError(entry, id, item.event, 'Notification readiness deadline exceeded');
+          state.queue.length = 0;
+          state.bytes = 0;
+          state.waking = false;
+          state.timer = null;
+        }, 10000);
+        state.timer.unref();
+      }
+      this.flush(entry, id, state);
+      this.wake(session, entry, id, state);
     }
   }
 
@@ -416,6 +591,7 @@ class ExtensionBridge {
     for (const origin of this.origins.values()) origin.revoke();
     this.origins.clear();
     for (const [session, entry] of this.sessions) {
+      for (const id of entry.backgrounds.keys()) this.clearBackground(entry, id);
       const registered = new Set(session.getPreloadScripts().map((script) => script.id));
       for (const id of entry.preloads) if (registered.has(id)) session.unregisterPreloadScript(id);
       session.extensions.off('extension-unloaded', entry.unloaded);

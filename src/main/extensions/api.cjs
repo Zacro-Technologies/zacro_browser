@@ -1,5 +1,5 @@
 'use strict';
-const { matches, permissionDetails, optionalGrants } = require('./permissions.cjs');
+const { matches, covers, permissionDetails, optionalGrants } = require('./permissions.cjs');
 const clone = (value) => structuredClone(value);
 const trusted = (context) => context.kind !== 'content-script';
 const reserved = new Set([
@@ -73,6 +73,8 @@ function resource(context, path) {
   if (typeof path !== 'string' || path.includes('\\')) throw new Error('Invalid extension resource');
   const url = new URL(path, `chrome-extension://${context.extensionId}/`);
   if (
+    url.username ||
+    url.password ||
     url.protocol !== 'chrome-extension:' ||
     url.hostname !== context.extensionId ||
     url.pathname === '/zacro-compat-transport.html'
@@ -81,8 +83,8 @@ function resource(context, path) {
   return url.href;
 }
 function navigation(context, url) {
-  const parsed = new URL(url);
-  if (!['http:', 'https:'].includes(parsed.protocol)) return resource(context, url);
+  const parsed = new URL(url, `chrome-extension://${context.extensionId}/`);
+  if (!['http:', 'https:'].includes(parsed.protocol)) return resource(context, parsed.href);
   if (parsed.username || parsed.password) throw new Error('Invalid navigation URL');
   return parsed.href;
 }
@@ -281,15 +283,38 @@ class ExtensionAPI {
       return [];
     }
   }
+  radioGroup(state, item) {
+    const siblings = [...state.menus.values()].filter((other) => other.parentId === item.parentId);
+    const index = siblings.findIndex((other) => other.id === item.id);
+    let first = index,
+      last = index;
+    while (first > 0 && siblings[first - 1].type === 'radio') first--;
+    while (last + 1 < siblings.length && siblings[last + 1].type === 'radio') last++;
+    return siblings.slice(first, last + 1);
+  }
   async clickMenu(profileId, id, itemId, info, tabId) {
     const context = this.context(profileId, id),
-      item = this.state(context).menus.get(itemId);
-    if (!item || item.enabled === false) throw new Error('Unknown menu');
+      state = this.state(context),
+      item = state.menus.get(itemId);
+    if (!item || item.enabled === false || item.visible === false)
+      throw new Error('Unknown or disabled menu');
     const tab = await this.gesture(context, tabId);
-    this.emit?.(profileId, id, 'contextMenus.onClicked', [
-      { ...clone(info), menuItemId: itemId },
-      this.sanitize(context, tab),
-    ]);
+    this.guard(context);
+    if (state.menus.get(itemId) !== item || item.enabled === false)
+      throw new Error('Menu changed before click');
+    const details = { ...clone(info), menuItemId: itemId };
+    delete details.wasChecked;
+    delete details.checked;
+    if (item.type === 'checkbox' || item.type === 'radio') {
+      details.wasChecked = item.checked === true;
+      if (item.type === 'radio')
+        for (const sibling of this.radioGroup(state, item)) sibling.checked = sibling.id === itemId;
+      else item.checked = !details.wasChecked;
+      details.checked = item.checked;
+      await this.host(context, 'menus', 'changed', [id, this.menuItems(profileId, id)]);
+    }
+    this.guard(context);
+    this.emit?.(profileId, id, 'contextMenus.onClicked', [details, this.sanitize(context, tab)]);
   }
   publish(profileId, event, args) {
     if (
@@ -555,7 +580,22 @@ class ExtensionAPI {
           throw new Error('Unsupported menu type');
         if (props.parentId !== undefined && !state.menus.has(props.parentId))
           throw new Error('Unknown parent menu');
-        state.menus.set(id, { ...state.menus.get(id), ...props, id });
+        if (props.parentId !== undefined) {
+          let ancestor = props.parentId;
+          const visited = new Set([id]);
+          while (ancestor !== undefined) {
+            if (visited.has(ancestor)) throw new Error('Menu parenting cycle');
+            visited.add(ancestor);
+            ancestor = state.menus.get(ancestor)?.parentId;
+          }
+        }
+        if (state.menus.size >= 1000 && name === 'create') throw new Error('Too many context menu entries');
+        if (props.checked !== undefined && typeof props.checked !== 'boolean')
+          throw new Error('Invalid menu checked state');
+        const item = { ...state.menus.get(id), ...props, id };
+        state.menus.set(id, item);
+        if (item.type === 'radio' && item.checked === true)
+          for (const sibling of this.radioGroup(state, item)) sibling.checked = sibling.id === id;
         await this.host(context, 'menus', 'changed', [
           context.extensionId,
           this.menuItems(context.profileId, context.extensionId),
@@ -563,7 +603,13 @@ class ExtensionAPI {
         return name === 'create' ? id : undefined;
       }
       if (name === 'remove' || name === 'removeAll') {
-        if (name === 'remove' && !state.menus.delete(args[0])) throw new Error('Unknown menu');
+        if (name === 'remove') {
+          if (!state.menus.has(args[0])) throw new Error('Unknown menu');
+          const removed = new Set([args[0]]);
+          for (const parent of removed)
+            for (const item of state.menus.values()) if (item.parentId === parent) removed.add(item.id);
+          for (const id of removed) state.menus.delete(id);
+        }
         if (name === 'removeAll') state.menus.clear();
         await this.host(context, 'menus', 'changed', [
           context.extensionId,
@@ -579,7 +625,7 @@ class ExtensionAPI {
       const details = permissionDetails(args[0]);
       if (name === 'contains')
         return ['permissions', 'origins'].every((key) =>
-          details[key].every((value) => grants[key].includes(value)),
+          details[key].every((value) => covers(grants[key], value, key)),
         );
       if (name === 'request' || name === 'remove') {
         const next = optionalGrants(
