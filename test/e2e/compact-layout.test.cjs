@@ -278,11 +278,54 @@ test(
         const contents = webContents.getAllWebContents().find((contents) => contents.getURL() === url);
         const capture = contents.capturePage.bind(contents);
         globalThis.popoverCaptureCount = 0;
+        globalThis.popoverCaptures = [];
         contents.capturePage = (...args) => {
           globalThis.popoverCaptureCount++;
-          return capture(...args);
+          const record = { startedAt: Date.now(), visibility: contents.mainFrame.visibilityState };
+          globalThis.popoverCaptures.push(record);
+          return capture(...args).then(
+            (image) => {
+              Object.assign(record, {
+                duration: Date.now() - record.startedAt,
+                empty: image.isEmpty(),
+                size: image.getSize(),
+              });
+              return image;
+            },
+            (error) => {
+              Object.assign(record, { duration: Date.now() - record.startedAt, error: error.message });
+              throw error;
+            },
+          );
         };
       }, url);
+    const expectBackdrop = async (label) => {
+      try {
+        await expect(shell.locator('#page-backdrop img')).toHaveCount(1);
+      } catch (error) {
+        const diagnostics = await app.evaluate(({ BrowserWindow }) => {
+          const window = BrowserWindow.getAllWindows()[0];
+          return {
+            captures: globalThis.popoverCaptures,
+            windowVisible: window.isVisible(),
+            windowFocused: window.isFocused(),
+            children: window.contentView.children.map((view) => ({
+              visible: view.getVisible(),
+              bounds: view.getBounds(),
+              url: view.webContents?.getURL(),
+              visibility: view.webContents?.mainFrame.visibilityState,
+            })),
+          };
+        });
+        t.diagnostic(JSON.stringify({ label, ...diagnostics }));
+        const results = path.resolve(__dirname, '../../test-results');
+        await fs.mkdir(results, { recursive: true });
+        await shell.screenshot({
+          path: path.join(results, `popover-backdrop-${process.platform}-${process.arch}.png`),
+        });
+        throw error;
+      }
+    };
     const url = `${base}/regular`;
     await invoke('navigate', { url });
     await expect.poll(() => guest(url, 'document.readyState')).toBe('complete');
@@ -300,7 +343,7 @@ test(
     ]) {
       await shell.locator(`[data-key="${key}"]`).click();
       await expect(shell.getByRole('dialog', { name: title, exact: true })).toBeVisible();
-      await expect(shell.locator('#page-backdrop img')).toHaveCount(1);
+      await expectBackdrop(title);
       assert.equal(
         await app.evaluate(() => globalThis.popoverCaptureCount),
         ++expectedCaptures,
@@ -334,11 +377,11 @@ test(
     const tabId = (await invoke('state:get')).activeTabId;
     await shell.locator(`[data-key="tab-${tabId}"]`).dispatchEvent('contextmenu');
     await expect(shell.getByRole('dialog', { name: 'Tab actions', exact: true })).toBeVisible();
-    await expect(shell.locator('#page-backdrop img')).toHaveCount(1);
+    await expectBackdrop('Tab actions');
     const beforeNestedForm = await app.evaluate(() => globalThis.popoverCaptureCount);
     await shell.getByRole('button', { name: 'Rename tab', exact: true }).click();
     await expect(shell.getByRole('dialog', { name: 'Rename tab', exact: true })).toBeVisible();
-    await expect(shell.locator('#page-backdrop img')).toHaveCount(1);
+    await expectBackdrop('Rename tab');
     assert.equal(
       await app.evaluate(() => globalThis.popoverCaptureCount),
       beforeNestedForm,

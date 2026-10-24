@@ -399,7 +399,15 @@ test(
     const b = await launch(t);
     const pageActions = b.page.locator('[data-key="page-menu"]');
     const menuAtControl = async (control, title, placement) => {
-      const anchor = await control.boundingBox();
+      let anchor;
+      // Host state can arrive before the sidebar's replacement node is ready.
+      // Wait for the actual opener rectangle before testing menu placement.
+      await expect
+        .poll(async () => {
+          anchor = await control.boundingBox();
+          return Boolean(anchor);
+        })
+        .toBe(true);
       assert(anchor, `${title} must have a visible opener`);
       await control.click();
       const dialog = b.page.getByRole('dialog', { name: title, exact: true });
