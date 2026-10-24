@@ -16,15 +16,15 @@ This is **not yet a complete implementation of the vision or a commercial releas
 
 See the [validation record](docs/VALIDATION.md) for tests performed, package checks, and remaining acceptance work.
 
-The 0.3 redesign puts the page first: compact chrome, icon favorites, single-line tabs, a minimal new-tab page, and a sidebar you can hide. Library and Settings reveal secondary controls when needed. Short 100–160ms feedback makes changes clear; dismissal and page resizing happen immediately. See the [design study](docs/DESIGN-REVIEW-0.3.md), [release notes](docs/RELEASE-NOTES-0.3.md), and [interaction notes](docs/DESIGN.md).
+The 0.4 interface revision brings navigation and the address field into the sidebar. Icon favorites sit above the Space name, followed by folders, a quiet New Tab row and single-line tabs. Library, Space indicators and one creation menu share the footer; page actions live in compact menus. The default sidebar is 224px wide, with 32px tab rows and footer; existing custom widths are preserved. Short feedback, immediate dismissal and immediate native-page resizing keep the interface responsive. See the [0.4 design study](docs/DESIGN-REVIEW-0.4.md), [validation record](docs/VALIDATION.md#04-interface-revision), and [interaction notes](docs/DESIGN.md).
 
 ## Screenshots
 
-Captured from the packaged **Zacro 0.3 Windows development build**, using an isolated demo workspace and local journal pages.
+Captured from the packaged **Zacro 0.4 Windows development build** through native Computer interactions and window capture, using an isolated demo workspace and local journal pages. See [capture provenance](docs/screenshots/README.md).
 
-![Zacro 0.3 with a compact Design studio sidebar, four icon favorites, folders, and single-line tabs beside a live web page](docs/screenshots/workspace.jpg)
+![Zacro 0.4 with navigation and address in the compact Design studio sidebar, four icon favorites, folders and single-line tabs beside a live web page](docs/screenshots/workspace.jpg)
 
-A 44px toolbar, compact sidebar, and thin page frame leave room for the web.
+Navigation and the address field share the sidebar. A thin page frame leaves room for the web, with Windows window controls above it. [Download the illustrated feature guide (PDF)](docs/Zacro-0.4-Design-and-Feature-Guide.pdf).
 
 | New tab · dark                                                                                                 | Settings · light                                                                                            |
 | -------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
@@ -46,18 +46,18 @@ A 44px toolbar, compact sidebar, and thin page frame leave room for the web.
 
 ![The same page with the sidebar hidden and more width available for reading](docs/screenshots/focus-mode.jpg)
 
-**Ctrl/Command + Shift + B** hides or shows the sidebar without reloading pages.
+**Ctrl/Command + Shift + B** hides or shows the sidebar without reloading pages. When hidden, a compact navigation row keeps the address and sidebar toggle available.
 
-![Compact Ask Zacro panel with ChatGPT sign-in for a Codex subscription](docs/screenshots/optional-ai.jpg)
+![Unconnected Ask Zacro panel with a Connect Codex button leading to subscription settings](docs/screenshots/optional-ai.jpg)
 
-AI is optional. Choose **Sign in with ChatGPT** to use your account's Codex allowance. Zacro has no API-key or separate API-billing fallback. Page sharing requires an explicit choice. This capture shows the unconnected interface. See [AI workflows and limits](docs/AI.md).
+AI is optional. This capture shows **Connect Codex** before connection; it opens Settings, where **Sign in with ChatGPT** connects your account's Codex allowance. Zacro has no API-key or separate API-billing fallback. Page sharing requires an explicit choice. See [AI workflows and limits](docs/AI.md).
 
 </details>
 
 <details>
 <summary>Native macOS · light and dark</summary>
 
-Captured from the packaged Apple silicon build on macOS 15.7.9 in CI. Native traffic lights, the Zacro menu bar and Dock icon are visible; the recent page is the local acceptance fixture.
+These 0.4 captures come from the packaged Apple silicon build on macOS 15.7.9 in [CI](https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40099796398). Native traffic lights, the Zacro menu bar and Dock icon are visible; the recent page is the local acceptance fixture. Both Mac architectures passed native integration and packaged-application checks. Physical-device review remains open.
 
 ![Zacro on macOS in light appearance with native window controls, application menu and Dock icon](docs/screenshots/macos-light.png)
 
@@ -96,11 +96,11 @@ Mac touches include native traffic lights, a full application menu with Services
 
 Browser data lives in Electron's per-user Zacro application-data directory. For an isolated development profile, set `ZACRO_USER_DATA` to a separate absolute directory. Export/import in Settings supports Zacro JSON and standard browser bookmark HTML. Arc migration currently uses supported bookmark exports; native Arc sidebar databases are not imported.
 
-Use **Ctrl/Command + L** for the command bar, **Ctrl/Command + T** for a new tab, **F6** to move between page and browser controls, **Ctrl/Command + Shift + B** to toggle the sidebar, **Alt + click** or a link's context menu for Peek, and **Escape** to dismiss it. **Scroll sideways over the sidebar** to switch Spaces within the current profile; **Shift + mouse wheel** works too. Each gesture moves one Space and stops at the ends. Right-click a tab to pin it, rename it, move it to a folder/Space, or split it beside another page. For optional AI, sign in with ChatGPT in Settings or Ask Zacro, then use **Ctrl/Command + Enter** to ask a research question; use it again in the answer panel to open the current answer's sources.
+Use **Ctrl/Command + L** for the command bar, **Ctrl/Command + T** for a new tab, **F6** to move between page and browser controls, **Ctrl/Command + Shift + B** to toggle the sidebar, **Alt + click** or a link's context menu for Peek, and **Escape** to dismiss it. **Scroll sideways over the sidebar** to switch Spaces within the current profile; **Shift + mouse wheel** works too. Each gesture moves one Space and stops at the ends. The sidebar footer opens Library or creates a tab, folder or Space. Right-click a tab to pin it, rename it, move it to a folder/Space, or split it beside another page. For optional AI, sign in with ChatGPT in Settings or Ask Zacro, then use **Ctrl/Command + Enter** to ask a research question; use it again in the answer panel to open the current answer's sources.
 
 ## The experience
 
-- **Sidebar-first browsing.** Vertical tabs, pinned favorites, and folders give your browsing a place to live.
+- **Sidebar-first browsing.** Navigation, the address field, icon favorites, folders and vertical tabs live together in a compact sidebar. Secondary actions appear in menus and on hover or keyboard focus.
 - **Spaces.** Separate work, personal projects, and everything in between, with distinct tab collections and themes.
 - **Profiles.** Keep accounts, cookies, and browsing data separate when you need a different identity.
 - **Command bar.** Open tabs, search, navigate, and trigger browser actions from the keyboard.

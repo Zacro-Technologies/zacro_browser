@@ -22,7 +22,7 @@ These changes preserve Zacro's own identity and implementation. Reference screen
 
 ## Layout contract
 
-The implementation uses a 224px default sidebar and preserves saved custom widths. Tab rows and the footer are 32px high. With the sidebar visible, the page begins 8px from the top on macOS; Windows reserves 36px for native caption controls. Full screen uses the 8px inset. Page content begins at 40px when the sidebar is hidden or Find is open. The shell and native Chromium views must use the same bounds, including split view and Peek. See the [validation record](VALIDATION.md#04-interface-revision--validation-pending) for current acceptance status.
+The implementation uses a 224px default sidebar and preserves saved custom widths. Tab rows and the footer are 32px high. With the sidebar visible, the page begins 8px from the top on macOS; Windows reserves 36px for window controls. Full screen uses the 8px inset. Page content begins at 40px when the sidebar is hidden or Find is open. The shell and native Chromium views must use the same bounds, including split view and Peek. See the [validation record](VALIDATION.md#04-interface-revision) for current acceptance status.
 
 ## Acceptance
 
