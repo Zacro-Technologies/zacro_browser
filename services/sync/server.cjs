@@ -382,7 +382,10 @@ async function createSyncService({
       res.writeHead(result.status);
       res.end(JSON.stringify(result.body));
     } catch (error) {
-      if (['data_integrity', 'storage_unavailable'].includes(error.code)) unhealthy = true;
+      if (['data_integrity', 'storage_unavailable'].includes(error.code)) {
+        unhealthy = true;
+        error.status = 503;
+      }
       res.writeHead(error.status || 500, {
         ...(error.status === 429 ? { 'retry-after': '60' } : {}),
       });
