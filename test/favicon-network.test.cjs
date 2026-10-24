@@ -14,6 +14,11 @@ before(async () => {
     response.once('close', () => {
       if (!response.writableEnded) abandoned.add(request.url);
     });
+    if (request.url === '/ready') {
+      response.writeHead(200, { 'Content-Type': 'text/plain', 'Content-Length': 5 });
+      response.end('ready');
+      return;
+    }
     if (request.url === '/stalled') return;
     if (request.url === '/header-limit') {
       response.writeHead(200, { 'Content-Type': 'image/png', 'Content-Length': MAX_BYTES + 1 });
@@ -35,6 +40,13 @@ before(async () => {
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   base = `http://127.0.0.1:${server.address().port}`;
+  // Listening does not initialize Node's lazy native-fetch implementation.
+  // Complete a real HTTP exchange before the loader's deliberately short
+  // deadline, so cold fetch startup cannot prevent the rejection fixture
+  // from receiving its request on a busy CI host.
+  const readiness = await fetch(`${base}/ready`, { signal: AbortSignal.timeout(5000) });
+  assert.equal(readiness.status, 200);
+  assert.equal(await readiness.text(), 'ready');
 });
 after(async () => {
   server.closeAllConnections();

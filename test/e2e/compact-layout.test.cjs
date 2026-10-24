@@ -67,8 +67,9 @@ test(
             .sort((a, b) => a.bounds.x - b.bounds.x),
         base,
       );
-    const rectangle = async (selector) => {
+    const rectangle = async (selector, { allowMissing = false } = {}) => {
       const box = await shell.locator(selector).boundingBox();
+      if (!box && allowMissing) return null;
       assert(box, `${selector} must have a visible rectangle`);
       return Object.fromEntries(['x', 'y', 'width', 'height'].map((key) => [key, Math.round(box[key])]));
     };
@@ -79,7 +80,14 @@ test(
           .poll(async () => {
             // Native window resizing and renderer resize delivery are asynchronous;
             // compare their current rectangles rather than freezing the first frame.
-            box = await rectangle(peek ? '.peek-body' : '#workspace');
+            const selector = peek ? '.peek-body' : '#workspace';
+            box = await rectangle(selector, { allowMissing: true });
+            if (!box) {
+              // A state publication may replace Peek between two observations.
+              // The geometry contract still has to match once its node returns.
+              lastGeometry = { selector, expected: null, actual: await native() };
+              return false;
+            }
             const expected = split
               ? [
                   { ...box, width: Math.floor((box.width - 6) / 2) },
@@ -101,7 +109,7 @@ test(
           })
           .toBe(true);
       } catch (error) {
-        t.diagnostic(JSON.stringify(lastGeometry));
+        t.diagnostic(JSON.stringify(lastGeometry || { error: 'No layout observation completed' }));
         throw error;
       }
       return box;
