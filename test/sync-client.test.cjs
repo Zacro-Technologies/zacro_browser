@@ -671,3 +671,76 @@ for (const code of ['not_found', 'epoch_changed'])
     await pending;
     assert.deepEqual(f.a.store.read().links.normal, before);
   });
+
+test('R7 deleting profile rejects still-live ExtensionAPI storage and fresh links until durable completion', async (t) => {
+  const f = await fixture(t);
+  const { ExtensionAPI } = require('../src/main/extensions/api.cjs');
+  const { ExtensionHost } = require('../src/main/extensions/host.cjs');
+  const metadata = {
+    enabled: true,
+    generation: 'still-native',
+    manifest: { manifest_version: 3 },
+    grants: { permissions: ['storage'], origins: [] },
+  };
+  let client = f.a;
+  const host = { manager: { resolveExtension: () => metadata }, getProfile: () => ({ id: 'normal' }) };
+  const api = new ExtensionAPI({
+    resolveExtension: () => metadata,
+    storage: {
+      call: (context, method, args) =>
+        client.callStorage(ExtensionHost.prototype.storageContext.call(host, context), method, args),
+    },
+  });
+  const context = api.context('normal', extensionId);
+  await api.call(context, 'storage.sync.set', [{ before: 'purge me' }]);
+  await client.deleteLocalProfile('normal');
+  // Main-process AI/session teardown is still awaiting; native metadata and getProfile remain live.
+  await assert.rejects(
+    api.call(context, 'storage.sync.set', [{ personal: 'written during deletion' }]),
+    /delet/i,
+  );
+  await assert.rejects(api.call(context, 'storage.sync.get', []), /delet/i);
+  assert.equal(client.canAccessStorage(f.ctx()), false);
+  let requests = 0;
+  client.fetch = (...args) => {
+    requests++;
+    return fetch(...args);
+  };
+  await assert.rejects(f.link(client), /delet/i);
+  assert.equal(requests, 0, 'retired profiles must reject before refresh or dataset fetch');
+  assert.equal(Object.keys(client.store.read().areas).length, 0);
+  client = f.restartClient(0);
+  await assert.rejects(api.call(context, 'storage.sync.set', [{ afterRestart: true }]), /delet/i);
+  await assert.rejects(f.link(client), /delet/i);
+  await client.deleteLocalProfile('normal'); // Retry after an interrupted teardown is allowed.
+  assert.throws(() => client.completeLocalProfileDeletion('normal'), /still|exist|remov/i);
+  client.getProfile = () => null; // Browser deletion and durable flush have completed.
+  client.completeLocalProfileDeletion('normal');
+  assert.deepEqual(client.store.read().retiredProfiles, []);
+  client.getProfile = (id) => ({ id }); // An explicitly restored profile begins with empty settings.
+  assert.deepEqual(await api.call(context, 'storage.sync.get', []), {});
+});
+
+test('R7 failed purge transaction leaves profile data, pending link intent and request authority intact', async (t) => {
+  const f = await fixture(t);
+  await f.link(f.a);
+  await f.a.callStorage(f.ctx(extensionId, 'other'), 'set', [{ keep: true }]);
+  await f.a.callStorage(f.ctx(), 'set', [{ before: 'must survive failure' }]);
+  const before = f.a.store.read(),
+    intent = f.a.profileIntents.get('normal');
+  const controller = new AbortController();
+  controller.profileId = 'normal';
+  f.a.controllers.add(controller);
+  f.a.store.db.exec(
+    "CREATE TEMP TRIGGER fail_purge BEFORE UPDATE ON state BEGIN SELECT RAISE(ABORT, 'Synthetic purge commit failure'); END",
+  );
+  await assert.rejects(f.a.deleteLocalProfile('normal'), /Synthetic purge commit failure/);
+  f.a.store.db.exec('DROP TRIGGER fail_purge');
+  assert.deepEqual(f.a.store.read(), before);
+  assert.equal(f.a.profileIntents.get('normal'), intent);
+  assert.equal(controller.signal.aborted, false);
+  assert.equal(f.a.canAccessStorage(f.ctx()), true);
+  await f.a.callStorage(f.ctx(), 'set', [{ afterFailure: true }]);
+  assert.equal((await f.a.callStorage(f.ctx(), 'get', [])).afterFailure, true);
+  assert.deepEqual(await f.a.callStorage(f.ctx(extensionId, 'other'), 'get', []), { keep: true });
+});

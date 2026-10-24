@@ -106,6 +106,7 @@ class SyncClient {
     fetch: fetcher = globalThis.fetch,
   }) {
     this.store = new SyncStorage({ directory });
+    this.retiredProfiles = new Set(this.store.read().retiredProfiles || []);
     this.vault = new CredentialVault({ directory, protect, unprotect });
     this.onLibraryChange = onLibraryChange;
     this.onStorageChange = onStorageChange;
@@ -184,12 +185,19 @@ class SyncClient {
   }
   profile(id) {
     if (typeof id !== 'string' || !idPattern.test(id)) throw new Error('Invalid profile.');
+    if (this.retiredProfiles.has(id))
+      throw Object.assign(
+        new Error(
+          "This profile's deletion is incomplete; delete this profile again to finish. Synchronization context changed.",
+        ),
+        { code: 'cancelled' },
+      );
     const profile = this.getProfile(id);
     if (!profile || profile.private) throw new Error('Private or unavailable profiles cannot synchronize.');
     return profile;
   }
   isCurrentLink({ profileId, linkId, endpoint, accountId }) {
-    if (this.closed) return false;
+    if (this.closed || this.retiredProfiles.has(profileId)) return false;
     const s = this.store.read(),
       l = s.links[profileId];
     return (
@@ -572,9 +580,9 @@ class SyncClient {
     return this.status();
   }
   async deleteLocalProfile(profileId) {
-    this.profile(profileId);
-    this.profileIntents.set(profileId, (this.profileIntents.get(profileId) || 0) + 1);
-    this.cancelProfileRequests(profileId);
+    // A later teardown failure may require repeating confirmed deletion. The
+    // retired profile remains closed to producers, but this operation is idempotent.
+    if (!this.retiredProfiles.has(profileId)) this.profile(profileId);
     this.store.transaction((s) => {
       delete s.links[profileId];
       for (const areas of [s.areas, ...Object.values(s.localCopies || {})])
@@ -582,9 +590,27 @@ class SyncClient {
           const namespace = JSON.parse(key);
           if (namespace[0] === 'local' && namespace[1] === profileId) delete areas[key];
         }
+      s.retiredProfiles ||= [];
+      if (!s.retiredProfiles.includes(profileId)) s.retiredProfiles.push(profileId);
     });
+    // No await separates the committed purge/retirement and cancellation. If
+    // the transaction failed, neither current work nor profile authority changes.
+    this.retiredProfiles.add(profileId);
+    this.profileIntents.set(profileId, (this.profileIntents.get(profileId) || 0) + 1);
+    this.cancelProfileRequests(profileId);
     this.notify();
     return this.status();
+  }
+  completeLocalProfileDeletion(profileId) {
+    if (!this.retiredProfiles.has(profileId)) return;
+    if (this.getProfile(profileId))
+      throw new Error('The browser profile still exists; finish removing it first.');
+    // The caller must durably remove browser metadata before clearing this
+    // marker. An interrupted teardown remains fail-closed across client restart.
+    this.store.transaction((s) => {
+      s.retiredProfiles = (s.retiredProfiles || []).filter((id) => id !== profileId);
+    });
+    this.retiredProfiles.delete(profileId);
   }
   async setSettingsSync(profileId, enabled, options = {}) {
     this.profile(profileId);

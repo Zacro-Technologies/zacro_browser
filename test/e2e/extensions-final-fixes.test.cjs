@@ -10,7 +10,7 @@ const { _electron: electron, expect } = require('@playwright/test');
 const { createSyncService } = require('../../services/sync/server.cjs');
 const { zip, crx, keyPair } = require('../fixtures/extensions/packages/builders.cjs');
 
-async function fixture(t) {
+async function fixture(t, { entry } = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'zacro-final-native-'));
   const server = http.createServer((_req, res) => {
     res.setHeader('Content-Type', 'text/html');
@@ -102,7 +102,7 @@ async function fixture(t) {
       delete env.ELECTRON_RUN_AS_NODE;
       delete env.ZACRO_SYNC_URL;
       app = await electron.launch({
-        args: [path.resolve(__dirname, '../fixtures/extensions/sync-browser.cjs')],
+        args: [entry || path.resolve(__dirname, '../fixtures/extensions/sync-browser.cjs')],
         env,
       });
       page = await app.firstWindow();
@@ -359,3 +359,98 @@ test(
     assert.equal(state.areas[JSON.stringify(['local', other.id, f.id])].values.keepOtherProfile, true);
   },
 );
+
+for (const failTeardown of [false, true])
+  test(
+    `R7 active profile retirement blocks native producers during ${failTeardown ? 'failed' : 'pending'} teardown`,
+    { timeout: 45000 },
+    async (t) => {
+      const f = await fixture(t, {
+        entry: path.resolve(__dirname, '../fixtures/extensions/profile-delete-browser.cjs'),
+      });
+      await f.install();
+      await f.options();
+      await f.native('chrome.storage.sync.set({beforeDeletion:"purge me"})');
+      const other = await f.invoke('profile:create', { name: 'Preserved profile' });
+      const initial = await f.invoke('state:get');
+      await f.invoke('space:activate', {
+        id: initial.spaces.find((space) => space.profileId === 'default').id,
+      });
+      await f.options();
+      await f.invoke('sync:configure', { endpoint: f.service.url });
+      await f.invoke('sync:register', {
+        username: 'retired.native',
+        password: 'Synthetic retirement password',
+        deviceName: 'Retirement test',
+      });
+      const dataset = await f.invoke('sync:create-dataset', { name: 'Must not relink' });
+      await f.app.evaluate(() => {
+        globalThis.pauseProfileDeletion = true;
+      });
+      const deleting = f.invoke('profile:delete', { id: 'default' }).then(
+        () => ({}),
+        (error) => ({ error: error.message }),
+      );
+      try {
+        await expect.poll(() => f.app.evaluate(() => globalThis.profileDeletionWaiting)).toBe(true);
+        assert.equal(
+          (await f.invoke('state:get')).profiles.some((profile) => profile.id === 'default'),
+          true,
+        );
+        const write = await f.native(
+          'chrome.storage.sync.set({personal:"written during deletion"}).then(()=>({}),error=>({error:error.message}))',
+        );
+        assert.match(write.error || '', /delet/i);
+        await assert.rejects(
+          f.invoke('sync:link', { datasetId: dataset.id, libraryChoice: 'remote-only', settingsSync: false }),
+          /delet/i,
+        );
+      } finally {
+        await f.app.evaluate((_electron, fail) => globalThis.releaseProfileDeletion?.(fail), failTeardown);
+      }
+      const result = await deleting;
+      if (failTeardown) {
+        assert.match(result.error, /Synthetic AI teardown failure/);
+        const write = await f.native(
+          'chrome.storage.sync.set({afterFailure:true}).then(()=>({}),error=>({error:error.message}))',
+        );
+        assert.match(write.error || '', /delete.*again/i);
+        await assert.rejects(
+          f.invoke('sync:link', { datasetId: dataset.id, libraryChoice: 'remote-only', settingsSync: false }),
+          /delet/i,
+        );
+        await f.invoke('profile:delete', { id: 'default' });
+      } else assert.equal(result.error, undefined);
+      const state = await f.invoke('state:get');
+      assert.equal(
+        state.profiles.some((profile) => profile.id === 'default'),
+        false,
+      );
+      assert.equal(
+        state.profiles.some((profile) => profile.id === other.id),
+        true,
+      );
+      const { DatabaseSync } = require('node:sqlite');
+      const db = new DatabaseSync(path.join(f.root, 'browser', 'sync', 'client.sqlite'), { readOnly: true });
+      const data = JSON.parse(db.prepare('SELECT value FROM state WHERE id=1').get().value);
+      db.close();
+      assert.equal(
+        Object.keys(data.areas).some((key) => JSON.parse(key)[1] === 'default'),
+        false,
+      );
+      assert.equal(data.links.default, undefined);
+      assert.equal(
+        data.retiredProfiles?.includes('default'),
+        false,
+        'completed durable deletion releases the retirement marker',
+      );
+      // Browser metadata was flushed before marker cleanup, so restart cannot silently restore it.
+      const persisted = JSON.parse(
+        await fs.readFile(path.join(f.root, 'browser', 'browser-state.json'), 'utf8'),
+      );
+      assert.equal(
+        persisted.profiles.some((profile) => profile.id === 'default'),
+        false,
+      );
+    },
+  );

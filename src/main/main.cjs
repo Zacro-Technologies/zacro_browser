@@ -1508,6 +1508,10 @@ async function invoke(action, payload = {}) {
       sessions.delete(profile.id);
     }
     const result = store.dispatch(action, payload);
+    if (action === 'profile:delete') {
+      store.flush();
+      syncAccount?.client.completeLocalProfileDeletion(payload.id);
+    }
     if (action === 'settings:update' && payload.values?.sidebarWidth && layout.sidebarWidth !== 0)
       layout.sidebarWidth = store.state.settings.sidebarWidth;
     return result;
