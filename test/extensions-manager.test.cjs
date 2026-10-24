@@ -1002,3 +1002,34 @@ test('metadata writes reject unreadable size before replacing the durable profil
   await h.manager.restore('p1');
   assert.deepEqual(h.manager.list('p1'), []);
 });
+
+test('F2 manager rejects astral paths outside optional declaration without changing granted state', async (t) => {
+  const h = await setup(t),
+    source = path.join(h.root, 'astral-host');
+  await fs.mkdir(source);
+  await fs.writeFile(
+    path.join(source, 'manifest.json'),
+    JSON.stringify({
+      manifest_version: 3,
+      name: 'Astral host',
+      version: '1',
+      permissions: ['scripting'],
+      optional_host_permissions: ['https://example.com/private/*', 'https://example.com/a😀'],
+    }),
+  );
+  const record = await h.manager.installLocal('p1', source);
+  for (const origin of ['https://example.com/public/😀', 'https://example.com/a😀/suffix']) {
+    await assert.rejects(
+      h.manager.changePermissions('p1', record.id, { permissions: ['scripting'], origins: [origin] }),
+      /undeclared/,
+    );
+    assert.deepEqual(h.manager.list('p1')[0].grants.origins, []);
+  }
+  await h.manager.changePermissions('p1', record.id, {
+    permissions: ['scripting'],
+    origins: ['https://example.com/private/😀'],
+  });
+  assert.deepEqual(h.manager.resolveExtension('p1', record.id).manifest.host_permissions, [
+    'https://example.com/private/😀',
+  ]);
+});

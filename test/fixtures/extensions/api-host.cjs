@@ -23,6 +23,7 @@ app.whenReady().then(async () => {
     await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
     app.on('will-quit', () => server.close());
     const url = `http://127.0.0.1:${server.address().port}/`;
+    const liveProbe = process.env.ZACRO_LIVE_EVENTS_PROBE === '1';
     const probe = `async function probe(label) { try { const key='value-'+label; await chrome.storage.sync.set({[key]:42}); const got=await chrome.storage.sync.get(key); const callback=await new Promise(resolve=>chrome.storage.sync.get(key,resolve)); let invalid=false;try{await chrome.storage.sync.set({bad:undefined})}catch{invalid=true} let error;await new Promise(resolve=>chrome.storage.sync.set({big:'x'.repeat(9000)},()=>{error=chrome.runtime.lastError?.message;resolve()}));await zacroExtension.invoke('test.report',[label,{got:got[key],callback:callback[key],invalid,error}]); } catch(error) { await zacroExtension.invoke('test.report',[label,{error:error.message}]); }}\n`;
     const manifest = {
       manifest_version: kind === 'mv2' ? 2 : 3,
@@ -53,7 +54,10 @@ app.whenReady().then(async () => {
     await fs.writeFile(
       path.join(source, 'content.js'),
       probe +
-        "probe('content');globalThis.changes=[];chrome.storage.onChanged.addListener((changes,area)=>globalThis.changes.push(area));",
+        "probe('content');globalThis.changes=[];" +
+        (liveProbe
+          ? ''
+          : 'chrome.storage.onChanged.addListener((changes,area)=>globalThis.changes.push(area));'),
     );
     await fs.writeFile(
       path.join(source, 'page.html'),
@@ -66,21 +70,27 @@ app.whenReady().then(async () => {
     await fs.writeFile(
       path.join(source, 'page.js'),
       probe +
-        "probe('page');globalThis.changes=[];chrome.storage.onChanged.addListener((changes,area)=>globalThis.changes.push(area));",
+        "probe('page');globalThis.changes=[];" +
+        (liveProbe
+          ? ''
+          : 'chrome.storage.onChanged.addListener((changes,area)=>globalThis.changes.push(area));'),
     );
     const ses = session.fromPartition('persist:api');
     let manager;
     const reports = {},
-      events = [];
+      events = [],
+      liveEvents = [];
     let api;
     const bridge = new ExtensionBridge({
       resolveExtension: (p, id) => manager?.resolveExtension(p, id),
       dispatch: (context, method, args) =>
         method === 'test.report'
           ? (reports[args[0]] = args[1])
-          : method === 'test.event'
-            ? events.push(args)
-            : api.call(context, method, args),
+          : method === 'test.liveEvent'
+            ? liveEvents.push(args)
+            : method === 'test.event'
+              ? events.push(args)
+              : api.call(context, method, args),
     });
     const store = new SyncStorage({
       directory: path.join(process.env.ZACRO_CONTEXT_ROOT, 'sync'),
@@ -135,7 +145,7 @@ app.whenReady().then(async () => {
     const tabs = await frame.webContents
       .executeJavaScript('chrome.tabs.query({})')
       .catch((error) => ({ error: error.message }));
-    globalThis.apiFixture = { frame, page, manager, bridge, record, api, store, reports, events };
+    globalThis.apiFixture = { frame, page, manager, bridge, record, api, store, reports, events, liveEvents };
     globalThis.contextResult = { reports, tabs, pageId: page.webContents.id };
   } catch (error) {
     globalThis.contextResult = { error: error.stack };

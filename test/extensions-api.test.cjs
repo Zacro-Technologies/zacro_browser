@@ -567,3 +567,52 @@ test('R5 submenu removal is atomic across descendants, supports ID reuse, and re
     await api.call(context, 'contextMenus.create', [{ title: 'new', ...item }]);
   assert.equal(api.menuItems('p1', id).length, 4);
 });
+
+test('F2 containment uses consistent Unicode units for astral path boundaries', async () => {
+  const { hostContains, optionalGrants } = require('../src/main/extensions/permissions.cjs');
+  for (const [outer, inner] of [
+    ['/private/*', '/public/😀'],
+    ['/a😀', '/a😀/suffix'],
+    ['/😀/private/*', '/😀/public/x'],
+    ['/prefix/*/😀end', '/prefix/a/😀other'],
+    ['/prefix/😀*end', '/prefix/😀xend/suffix'],
+  ])
+    assert.equal(
+      hostContains('https://example.com' + outer, 'https://example.com' + inner),
+      false,
+      `${outer} excludes ${inner}`,
+    );
+  for (const [outer, inner] of [
+    ['/a😀', '/a😀'],
+    ['/😀/*', '/😀/child'],
+    ['/prefix/*/😀end', '/prefix/a/😀end'],
+    ['/prefix/😀*end', '/prefix/😀xend'],
+    ['/*', '/public/😀'],
+  ])
+    assert.equal(
+      hostContains('https://example.com' + outer, 'https://example.com' + inner),
+      true,
+      `${outer} contains ${inner}`,
+    );
+  const manifest = {
+    manifest_version: 3,
+    name: 'Astral',
+    version: '1',
+    optional_host_permissions: ['https://example.com/private/*'],
+  };
+  assert.throws(
+    () =>
+      optionalGrants(
+        manifest,
+        { permissions: [], origins: [] },
+        { permissions: [], origins: ['https://example.com/public/😀'] },
+      ),
+    /declared optional/,
+  );
+  const { api, context, metadata } = setup();
+  metadata.grants.origins = ['https://example.com/private/*'];
+  assert.equal(
+    await api.call(context, 'permissions.contains', [{ origins: ['https://example.com/public/😀'] }]),
+    false,
+  );
+});

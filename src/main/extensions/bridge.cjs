@@ -439,8 +439,13 @@ class ExtensionBridge {
     source.assertCurrent?.();
     const entry = this.sessions.get(source.session);
     const metadata = this.resolveExtension(source.profileId, source.extensionId);
+    // Only backgrounds need a host-side listener snapshot to wake/replay. Live
+    // documents already have their local listener map before the async snapshot
+    // arrives, and can discard events without a listener themselves.
+    const background = ['service-worker', 'background-page'].includes(source.kind);
     if (
-      !source.subscriptions?.has(event) ||
+      (background && !source.subscriptions?.has(event)) ||
+      source.url === `chrome-extension://${source.extensionId}/zacro-compat-transport.html` ||
       !metadata?.enabled ||
       (metadata.generation ?? 0) !== source.generation ||
       !entry ||

@@ -35,7 +35,9 @@ function matches(pattern, url) {
 // a few example URLs as an unsafe proof that one pattern contains another.
 function globContains(outer, inner) {
   if (outer === inner || outer === '/*') return true;
-  const alphabet = [...new Set([...outer, ...inner].filter((char) => char !== '*')), '\0'];
+  // State offsets and the non-u URL matcher use UTF-16 code units. Keep the
+  // alphabet in those same units, including both halves of astral characters.
+  const alphabet = [...new Set((outer + inner).split('').filter((char) => char !== '*')), Symbol('other')];
   const closure = (pattern, values) => {
     const states = new Set(values);
     for (const position of states) if (pattern[position] === '*') states.add(position + 1);
