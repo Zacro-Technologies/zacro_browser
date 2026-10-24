@@ -1,6 +1,6 @@
 # Zacro implementation and commercial release gates
 
-This repository started with a vision and no implementation. The desktop implementation uses Electron 45's Chromium/Blink/V8 runtime. Windows 11 x64 has local acceptance evidence. macOS 13+ now has native window/menu/lifecycle integration, separate Apple silicon and Intel build paths, and native CI acceptance; passing Mac runner results and signed release acceptance are still required before claiming verified platform support. Linux remains a packaging target requiring implementation review and platform validation. The work below distinguishes runnable code from release acceptance. An unchecked gate is not a shipped capability. See [the Mac guide](MACOS.md).
+This repository started with a vision and no implementation. The desktop implementation uses Electron 45's Chromium/Blink/V8 runtime. Windows 11 x64 has local and CI acceptance evidence. macOS 13+ is the target for native window/menu/lifecycle integration and separate Apple silicon and Intel builds; native macOS 15 CI has passed on both architectures, including packaged browsing and development DMG/ZIP generation. Physical Mac and signed/notarized release acceptance remain open. Linux remains a packaging target requiring implementation review and platform validation. The work below distinguishes runnable code from release acceptance. An unchecked gate is not a shipped capability. See [the Mac guide](MACOS.md).
 
 ## 1. A reliable local browser
 

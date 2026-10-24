@@ -1,8 +1,12 @@
 # Zacro on macOS
 
-The Mac implementation targets **macOS 13 or later**, on **Apple silicon (`arm64`) and Intel (`x64`)**. It includes native window chrome and menus, Mac keyboard conventions, Dock reopening, safe web-link delivery, and architecture-matched application packaging. The current engineering session ran on Windows: source-level checks and Mac-specific renderer contracts can run there, but they do not verify AppKit behavior or Gatekeeper. Native CI jobs and the acceptance checklist below provide that separate evidence.
+The Mac implementation targets **macOS 13 or later**, on **Apple silicon (`arm64`) and Intel (`x64`)**. It includes native window chrome and menus, Mac keyboard conventions, Dock reopening, safe web-link delivery, and architecture-matched application packaging. Native CI has passed on macOS 15 for both architectures. macOS 13 is the declared minimum, not a completed physical-device test result; physical Mac review and signed/notarized release acceptance remain open.
 
 ## Everyday use
+
+![Packaged Zacro in dark appearance on macOS, with native traffic lights, menu bar and Dock icon](screenshots/macos-dark.png)
+
+This is an unedited native desktop capture of the Apple silicon development package on macOS 15.7.9, using a disposable CI profile. The [README](../README.md#screenshots) also shows light appearance.
 
 The red, yellow and green window controls are native macOS controls. Their reserved area remains clear when the sidebar is hidden. Full screen uses the operating system's transition and screen arrangement; returning to a window restores the controls' layout. The interface follows system light/dark appearance, reduced motion, reduced transparency and increased contrast, uses the system font, and dims chrome when inactive.
 
@@ -63,7 +67,7 @@ Passing a build is only one release gate. A Mac release still needs clean-machin
 
 ## Native verification
 
-The GitHub Actions workflow has separate `macos-15` Apple silicon and `macos-15-intel` jobs. They install native dependencies, check source formatting/syntax, run unit tests and `test:mac`, build DMG/ZIP development artifacts, and test the packaged application. Artifacts are retained with an explicit architecture and development label. The workflow's existence is not evidence of a successful run; inspect its result for the exact commit.
+The GitHub Actions workflow has separate `macos-15` Apple silicon and `macos-15-intel` jobs. Both passed on macOS **15.7.9 (24G830)** in [run 40094147848](https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40094147848) at commit `99eba6d9289d0c2a56038336c2215f419cdb62f1`: **98 unit/security tests, 29 desktop integration tests and one packaged-application test per architecture**, plus source formatting/syntax and native DMG/ZIP builds. The development artifacts are retained for seven days with explicit architecture labels; they are CI outputs, not a public signed/notarized release.
 
 The Darwin-only suite covers native traffic-light position and layout, menu conventions, Cmd-based shortcuts, Ctrl-Tab, native full screen, guest-page editing, window close/Dock reopen, validated web links, pre-ready link delivery, cancellation of Quit with unsaved work, and private-session cleanup after the last window closes. It is skipped on non-Mac hosts. The Mac command also runs shared browser, renderer contract, motion, Space-scroll, security and startup native-paint tests. The packaged suite checks actual browsing, security fuses, PDF parsing and an isolated signed-out Codex handshake; it does not make authenticated model requests.
 

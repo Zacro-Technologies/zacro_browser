@@ -10,7 +10,7 @@ Zacro is an independent project, not an official continuation of Arc or an affil
 
 ## Project status
 
-**Desktop development build.** This repository contains a runnable Chromium browser built with Electron, with Windows 11 x64 and native macOS integration for Apple silicon and Intel. It includes real page rendering, sandboxed tabs, Spaces, separate profiles, Peek, split view, local session recovery, library panels, compatible unpacked extensions, and optional AI through your Codex subscription. Windows has been exercised locally; macOS has dedicated native CI and acceptance checks. See [macOS setup and validation](docs/MACOS.md) for the exact support boundary.
+**Desktop development build.** This repository contains a runnable Chromium browser built with Electron, with Windows 11 x64 and native macOS integration for Apple silicon and Intel. It includes real page rendering, sandboxed tabs, Spaces, separate profiles, Peek, split view, local session recovery, library panels, compatible unpacked extensions, and optional AI through your Codex subscription. Windows has passed local and CI checks; native macOS 15 CI has passed on both architectures, including packaged-application acceptance and development DMG/ZIP builds. Physical Mac review and signed/notarized release acceptance remain open. See [macOS setup and validation](docs/MACOS.md) for the exact support boundary.
 
 This is **not yet a complete implementation of the vision or a commercial release**. Zacro account sync, full Chrome extension compatibility and `chrome.storage.sync`, consequential browser agents, signed automatic updates, and operational/security release gates remain open. Subscription sign-in is implemented; live account and inference acceptance still requires a user to finish ChatGPT sign-in. The [implementation roadmap](docs/ROADMAP.md) separates working features from required release work; [AI documentation](docs/AI.md) describes the connection and data boundaries.
 
@@ -26,20 +26,20 @@ Captured from the packaged **Zacro 0.3 Windows development build**, using an iso
 
 A 44px toolbar, compact sidebar, and thin page frame leave room for the web.
 
-| New tab · dark | Settings · light |
-| --- | --- |
+| New tab · dark                                                                                                 | Settings · light                                                                                            |
+| -------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
 | ![Minimal dark new-tab page with search, saved destinations, and recent pages](docs/screenshots/home-dark.jpg) | ![Compact light Settings with inline controls and expandable groups](docs/screenshots/appearance-light.jpg) |
-| Search, saved pages, and recents. | Everyday preferences first; details on demand. |
+| Search, saved pages, and recents.                                                                              | Everyday preferences first; details on demand.                                                              |
 
-| Peek | Split view |
-| --- | --- |
+| Peek                                                                            | Split view                                                                     |
+| ------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
 | ![Live link preview with promote and close controls](docs/screenshots/peek.jpg) | ![Two native web pages arranged side by side](docs/screenshots/split-view.jpg) |
-| Follow a link without losing your place. | Compare pages with stable panes. |
+| Follow a link without losing your place.                                        | Compare pages with stable panes.                                               |
 
-| Command palette | Library |
-| --- | --- |
+| Command palette                                                                                         | Library                                                                                            |
+| ------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
 | ![Compact command palette with tab results over the current page](docs/screenshots/command-palette.jpg) | ![Bookmarks panel with search and quick Library section switching](docs/screenshots/bookmarks.jpg) |
-| Find a tab or enter an address. | Bookmarks, history, downloads, and archived tabs. |
+| Find a tab or enter an address.                                                                         | Bookmarks, history, downloads, and archived tabs.                                                  |
 
 <details>
 <summary>Focus mode and optional AI</summary>
@@ -51,6 +51,17 @@ A 44px toolbar, compact sidebar, and thin page frame leave room for the web.
 ![Compact Ask Zacro panel with ChatGPT sign-in for a Codex subscription](docs/screenshots/optional-ai.jpg)
 
 AI is optional. Choose **Sign in with ChatGPT** to use your account's Codex allowance. Zacro has no API-key or separate API-billing fallback. Page sharing requires an explicit choice. This capture shows the unconnected interface. See [AI workflows and limits](docs/AI.md).
+
+</details>
+
+<details>
+<summary>Native macOS · light and dark</summary>
+
+Captured from the packaged Apple silicon build on macOS 15.7.9 in CI. Native traffic lights, the Zacro menu bar and Dock icon are visible; the recent page is the local acceptance fixture.
+
+![Zacro on macOS in light appearance with native window controls, application menu and Dock icon](docs/screenshots/macos-light.png)
+
+![Zacro on macOS in dark appearance with native window controls and a compact sidebar](docs/screenshots/macos-dark.png)
 
 </details>
 
