@@ -467,3 +467,207 @@ test('expired access credentials rotate through the real refresh endpoint withou
   assert.equal(raw.includes(Buffer.from(f.a.credentials.refreshToken)), false);
   assert.equal(JSON.stringify(f.a.status()).includes(f.a.credentials.accessToken), false);
 });
+
+const gate = () => {
+  let resolve;
+  const promise = new Promise((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+};
+for (const change of ['opt-out', 'unlink', 'relink']) {
+  for (const direction of ['upload', 'download']) {
+    test(`R2 refresh-gated ${direction} cannot cross ${change} consent/link boundary`, async (t) => {
+      const f = await fixture(t);
+      await f.link(f.a);
+      await f.link(f.b);
+      await f.a.queueExtension({
+        profileId: 'normal',
+        extensionId,
+        source: { kind: 'web-store', id: extensionId },
+        state: 'enabled',
+      });
+      await f.a.syncNow();
+      await f.b.syncNow();
+      const second = await f.b.createDataset('Replacement');
+      await f.a.callStorage(f.ctx(), 'set', [{ privatePending: true }]);
+      const entered = gate(),
+        release = gate();
+      const refresh = f.a.refresh.bind(f.a);
+      let armed = false;
+      f.a.fetch = async (url, options) => {
+        const response = await fetch(url, options);
+        // Expire after the account check (download) or the initial pull (upload).
+        if (!armed && url.includes(direction === 'upload' ? '/changes?' : '/account')) {
+          armed = true;
+          f.a.credentials.expiresAt = 0;
+        }
+        return response;
+      };
+      f.a.refresh = async (epoch) => {
+        entered.resolve();
+        await release.promise;
+        return refresh(epoch);
+      };
+      const requests = [];
+      const fetcher = f.a.fetch;
+      f.a.fetch = (url, options) => {
+        requests.push({ url, body: options.body });
+        return fetcher(url, options);
+      };
+      const pending = f.a.syncNow();
+      await entered.promise;
+      if (change === 'opt-out') await f.a.setSettingsSync('normal', false);
+      else {
+        await f.a.unlinkProfile('normal');
+        if (change === 'relink') {
+          // The replacement link uses valid current credentials; the old refresh remains suspended.
+          f.a.credentials.expiresAt = Date.now() + 600000;
+          await f.a.linkProfile({ profileId: 'normal', datasetId: second.id, libraryChoice: 'remote-only' });
+        }
+      }
+      const start = requests.length;
+      release.resolve();
+      await pending;
+      assert.equal(
+        requests
+          .slice(start)
+          .some(
+            (r) =>
+              r.url.includes(`/datasets/${f.dataset.id}/`) &&
+              (r.url.includes('settings=1') || r.body?.includes('privatePending')),
+          ),
+        false,
+      );
+      await f.b.syncNow();
+      assert.deepEqual(await f.b.callStorage(f.ctx(), 'get', []), {});
+      if (change === 'relink') assert.equal(f.a.status().profiles[0].datasetId, second.id);
+    });
+  }
+}
+for (const code of ['not_found', 'epoch_changed']) {
+  for (const change of ['relink', 'opt-out']) {
+    test(`R4 stale ${code} cannot detach ${change} generation or discard queued intent`, async (t) => {
+      const f = await fixture(t);
+      await f.link(f.a);
+      const second = await f.a.createDataset('Replacement');
+      const entered = gate(),
+        release = gate();
+      const original = f.a.syncProfile.bind(f.a);
+      f.a.syncProfile = async (...args) => {
+        entered.resolve();
+        await release.promise;
+        throw Object.assign(new Error('old request'), { code, status: code === 'not_found' ? 404 : 409 });
+      };
+      const pending = f.a.syncNow();
+      await entered.promise;
+      if (change === 'relink') {
+        await f.a.unlinkProfile('normal');
+        await f.a.linkProfile({ profileId: 'normal', datasetId: second.id, libraryChoice: 'remote-only' });
+      } else await f.a.setSettingsSync('normal', false);
+      await f.a.queueExtension({
+        profileId: 'normal',
+        extensionId,
+        source: { kind: 'web-store', id: extensionId },
+        state: 'enabled',
+      });
+      const before = f.a.store.read().links.normal;
+      release.resolve();
+      await pending;
+      assert.deepEqual(f.a.store.read().links.normal, before);
+      f.a.syncProfile = original;
+    });
+  }
+}
+test('R7 explicit local profile deletion purges live and archived database state without deleting other profiles or cloud data', async (t) => {
+  const f = await fixture(t);
+  await f.a.callStorage(f.ctx(extensionId, 'other'), 'set', [{ keep: true }]);
+  await f.a.callStorage(f.ctx(), 'set', [{ archived: 'first-account' }]);
+  await f.a.register({ username: 'delete.profile', password, deviceName: 'Second', platform: 'test' });
+  await f.a.callStorage(f.ctx(), 'set', [{ archived: 'second-account' }]);
+  await f.a.login({ username: 'desktop.test', password, deviceName: 'Return', platform: 'test' });
+  await f.link(f.a);
+  await f.a.queueExtension({
+    profileId: 'normal',
+    extensionId,
+    source: { kind: 'web-store', id: extensionId },
+    state: 'enabled',
+  });
+  await f.a.callStorage(f.ctx(), 'set', [{ cloud: true }]);
+  await f.a.syncNow();
+  await f.link(f.b);
+  const entered = gate(),
+    release = gate();
+  const fetcher = f.a.fetch;
+  f.a.fetch = async (...args) => {
+    const r = await fetcher(...args);
+    if (args[0].includes('/snapshot')) {
+      entered.resolve();
+      await release.promise;
+    }
+    return r;
+  };
+  const linking = f.link(f.a);
+  await entered.promise;
+  try {
+    await f.a.deleteLocalProfile('normal');
+  } finally {
+    release.resolve();
+  }
+  await assert.rejects(linking, /context changed/i);
+  const resumed = f.restartClient(0),
+    state = resumed.store.read();
+  assert.equal(state.links.normal, undefined);
+  for (const areas of [state.areas, ...Object.values(state.localCopies)])
+    assert.equal(
+      Object.keys(areas).some((k) => JSON.parse(k)[1] === 'normal'),
+      false,
+    );
+  assert.deepEqual(await resumed.callStorage(f.ctx(extensionId, 'other'), 'get', []), { keep: true });
+  assert.deepEqual(await f.b.callStorage(f.ctx(), 'get', []), { cloud: true });
+  assert.equal((await f.b.datasets()).length, 1);
+});
+
+for (const code of ['not_found', 'epoch_changed'])
+  test(`R4 delayed real-service ${code} response cannot remove the replacement link`, async (t) => {
+    const f = await fixture(t);
+    await f.link(f.a);
+    const second = await f.a.createDataset('Keep replacement');
+    if (code === 'not_found') await f.b.deleteDataset(f.dataset.id, password, true);
+    else {
+      await f.a.queueExtension({
+        profileId: 'normal',
+        extensionId,
+        source: { kind: 'web-store', id: extensionId },
+        state: 'enabled',
+      });
+      f.a.store.transaction((s) => {
+        s.links.normal.epoch = 'obsolete-epoch';
+      });
+    }
+    const entered = gate(),
+      release = gate();
+    f.a.fetch = async (...args) => {
+      const response = await fetch(...args);
+      if (args[0].includes(`/datasets/${f.dataset.id}/`) && !response.ok) {
+        assert.equal(response.status, code === 'not_found' ? 404 : 409);
+        entered.resolve();
+        await release.promise;
+      }
+      return response;
+    };
+    const pending = f.a.syncNow();
+    await entered.promise;
+    await f.a.unlinkProfile('normal');
+    await f.a.linkProfile({ profileId: 'normal', datasetId: second.id, libraryChoice: 'remote-only' });
+    await f.a.queueExtension({
+      profileId: 'normal',
+      extensionId,
+      source: { kind: 'web-store', id: extensionId },
+      state: 'enabled',
+    });
+    const before = f.a.store.read().links.normal;
+    release.resolve();
+    await pending;
+    assert.deepEqual(f.a.store.read().links.normal, before);
+  });

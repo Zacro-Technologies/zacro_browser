@@ -200,7 +200,8 @@ class SyncStore {
     const text = fs.readFileSync(this.ledgerPath, 'utf8');
     if (text && !text.endsWith('\n')) throw new Error('Incomplete deletion ledger; repair required');
     const deleted = new Set(),
-      credentials = new Map();
+      credentials = new Map(),
+      datasets = [];
     for (const line of text.split('\n').filter(Boolean)) {
       const record = JSON.parse(line);
       if (!/^[a-f0-9-]{36}$/.test(record.accountId)) throw new Error('Invalid security ledger account');
@@ -216,10 +217,22 @@ class SyncStore {
         if (previous?.version === record.version && previous.payload !== record.payload)
           throw new Error('Conflicting credential ledger records');
         if (!previous || record.version > previous.version) credentials.set(record.accountId, record);
-      } else throw new Error('Invalid security ledger');
+      } else if (
+        record.v === 3 &&
+        record.kind === 'dataset-deletion' &&
+        /^[a-f0-9-]{36}$/.test(record.datasetId) &&
+        /^[a-f0-9-]{36}$/.test(record.epoch) &&
+        Number.isSafeInteger(record.deletedAt)
+      )
+        datasets.push(record);
+      else throw new Error('Invalid security ledger');
     }
     this.transaction(() => {
       for (const id of deleted) this.run('DELETE FROM accounts WHERE id = ?', id);
+      // Dataset IDs are never reused. Delete every retained epoch for the same
+      // account-owned identity, including an already marked live tombstone.
+      for (const record of datasets)
+        this.run('DELETE FROM datasets WHERE account_id = ? AND id = ?', record.accountId, record.datasetId);
       for (const account of this.all('SELECT * FROM accounts')) {
         const record = credentials.get(account.id);
         if (!record || account.credential_version > record.version)
@@ -294,6 +307,16 @@ class SyncStore {
       payload: this.encode(account, `credential-ledger/${version}`, data).toString('base64'),
     });
     this.run('UPDATE accounts SET credential_version = ? WHERE id = ?', version, id);
+  }
+  recordDatasetDeletion(accountId, dataset) {
+    this.appendLedger({
+      v: 3,
+      kind: 'dataset-deletion',
+      accountId,
+      datasetId: dataset.id,
+      epoch: dataset.epoch,
+      deletedAt: Date.now(),
+    });
   }
   deleteAccount(id) {
     this.appendLedger({ v: 1, accountId: id, deletedAt: Date.now() });

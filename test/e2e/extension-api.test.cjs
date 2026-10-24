@@ -226,6 +226,11 @@ test(
     assert.equal(result.pending.draft, 'draft remains');
     assert.ok(result.removed.injected.error);
     assert.ok(result.removed.network.error);
+    for (const rollback of result.rollbacks) {
+      assert.deepEqual(rollback.grants.origins, []);
+      assert.ok(rollback.probe.injected.error, 'rollback must not regain native scripting rights');
+      assert.ok(rollback.probe.network.error, 'rollback must not regain native fetch rights');
+    }
     assert.deepEqual(result.effective.host_permissions, []);
     assert.deepEqual(result.effective.optional_host_permissions, []);
   },

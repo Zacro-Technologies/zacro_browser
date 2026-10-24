@@ -93,12 +93,17 @@ encryption**.
 
 Turning settings synchronization off keeps a local copy and stops setting
 uploads/downloads. Library synchronization continues. Cloud deletion is a
-separate action. Re-enabling presents the local/remote choice again.
+separate action. Requests waiting for token refresh or a retry recheck the
+originating link and consent before sending. Re-enabling presents the
+local/remote choice again.
 
 Unlinking keeps local extensions and a separate local settings copy. Signing
 out or changing the service stops the old links. Settings from different
 accounts remain separate; signing into a different account does not replay the
-previous account's queued changes. Relinking requires review.
+previous account's queued changes. Relinking requires review. Explicitly
+deleting a local browser profile also deletes its extension settings from the
+local sync database, including archived copies for other signed-in accounts.
+Other local profiles and cloud datasets remain intact.
 
 ## Pending, offline and conflicting changes
 
@@ -126,5 +131,7 @@ an explicit reinstall rather than retrying an obsolete generation.
 
 Deleting a cloud profile or account requires the current password and explicit
 confirmation. It does not delete local browser installations. The operator's
-seven-day backup retention and current durable security ledger remain necessary
-for production restoration guarantees.
+current durable security ledger prevents deleted cloud profiles and accounts
+from reappearing when a permitted older backup is restored. Historical encrypted
+backup expiry (at most seven days) and ledger durability remain operator
+responsibilities.

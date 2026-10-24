@@ -122,7 +122,26 @@ app.whenReady().then(async () => {
     await open();
     const removed = await probe(),
       unrelatedRemoved = await probe(other, otherURL);
+    const rollbacks = [];
+    for (const disabled of [false, true]) {
+      if (disabled) {
+        record = await manager.changePermissions('p1', record.id, {
+          permissions: ['storage', 'scripting'],
+          origins: ['http://127.0.0.1/*'],
+        });
+        record = await manager.changePermissions('p1', record.id, {
+          permissions: ['storage', 'scripting'],
+          origins: [],
+        });
+        await manager.disable('p1', record.id);
+      }
+      record = await manager.rollback('p1', record.id);
+      if (disabled) record = await manager.enable('p1', record.id);
+      await open();
+      rollbacks.push({ disabled, probe: await probe(), grants: record.grants });
+    }
     globalThis.contextResult = {
+      rollbacks,
       before,
       granted,
       unrelatedGranted,
@@ -135,6 +154,27 @@ app.whenReady().then(async () => {
       effective: manager.resolveExtension('p1', record.id).manifest,
     };
   } catch (error) {
-    globalThis.contextResult = { error: error.stack };
+    const rollbacks = [];
+    for (const disabled of [false, true]) {
+      if (disabled) {
+        record = await manager.changePermissions('p1', record.id, {
+          permissions: ['storage', 'scripting'],
+          origins: ['http://127.0.0.1/*'],
+        });
+        record = await manager.changePermissions('p1', record.id, {
+          permissions: ['storage', 'scripting'],
+          origins: [],
+        });
+        await manager.disable('p1', record.id);
+      }
+      record = await manager.rollback('p1', record.id);
+      if (disabled) record = await manager.enable('p1', record.id);
+      await open();
+      rollbacks.push({ disabled, probe: await probe(), grants: record.grants });
+    }
+    globalThis.contextResult = {
+      rollbacks,
+      error: error.stack,
+    };
   }
 });

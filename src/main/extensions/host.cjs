@@ -490,6 +490,50 @@ class ExtensionHost {
     this.syncClient().guard(epoch);
     return response === 1 && this.activeProfile()?.id === profile;
   }
+  pendingPageReloads(profileId) {
+    const warnings = new Map();
+    for (const [key, documents] of this.barriers) {
+      const pending = documents.filter(
+        ({ entry, epoch }) => !entry.contents.isDestroyed() && entry.documentEpoch === epoch,
+      );
+      if (pending.length) this.barriers.set(key, pending);
+      else this.barriers.delete(key);
+      if (JSON.parse(key)[0] !== profileId) continue;
+      for (const { entry, epoch } of pending)
+        warnings.set(entry.contents.id, {
+          tabId: entry.tabId || null,
+          documentId: entry.contents.id,
+          documentEpoch: epoch,
+          title: entry.contents.getTitle() || 'Open page',
+        });
+    }
+    return [...warnings.values()];
+  }
+  async reloadPendingPages(profileId, target, guard) {
+    this.pendingPageReloads(profileId);
+    const seen = new Set();
+    for (const [key, documents] of this.barriers) {
+      if (JSON.parse(key)[0] !== profileId) continue;
+      for (const { entry, epoch } of documents) {
+        guard();
+        if (
+          seen.has(entry) ||
+          entry.contents.isDestroyed() ||
+          entry.documentEpoch !== epoch ||
+          (target.tabId !== undefined && entry.tabId !== target.tabId) ||
+          (target.documentId !== undefined && entry.contents.id !== target.documentId) ||
+          (target.documentEpoch !== undefined && epoch !== target.documentEpoch)
+        )
+          continue;
+        seen.add(entry);
+        await this.browser.reloadDocument(entry);
+      }
+    }
+    guard();
+    const pending = this.pendingPageReloads(profileId);
+    this.publish();
+    return pending;
+  }
   async deactivated({ profileId, extensionId, reason }) {
     this.closeViews(profileId, extensionId);
     const key = this.key(profileId, extensionId);
@@ -621,6 +665,7 @@ class ExtensionHost {
     guard();
     await this.restore(profile.id);
     guard();
+    if (action === 'extension:reload-pages') return this.reloadPendingPages(profile.id, payload, guard);
     if (action === 'extension:check-updates') {
       await this.manager.checkUpdates(profile.id, { force: true });
       return null;
@@ -849,6 +894,7 @@ class ExtensionHost {
     this.closeViews(profile);
     await this.manager.invalidateProfile(profile);
     this.restores.delete(profile);
+    for (const key of this.barriers.keys()) if (JSON.parse(key)[0] === profile) this.barriers.delete(key);
     await fs.rm(this.manager.profilePath(profile), { recursive: true, force: true });
   }
   async close() {

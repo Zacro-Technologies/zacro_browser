@@ -61,6 +61,7 @@ function createBrowserAdapter({
     validateProps(props);
     targetWindow(props.windowId);
     if (!Number.isInteger(props.index)) throw new Error('Tab index is required.');
+    if (new Set(ids).size !== ids.length) throw new Error('Duplicate tab IDs are not allowed.');
     const items = ids.map((id) => tabRecord(profile, id));
     const profileTabs = tabsFor(profile).filter((tab) => !items.includes(tab));
     const index = props.index === -1 ? profileTabs.length : Math.min(props.index, profileTabs.length);

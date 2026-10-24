@@ -244,6 +244,7 @@ function snapshot() {
   };
   // Managed extension paths are operational details, not a renderer capability.
   result.extensions = extensionHost?.snapshot(activeProfile()?.id) || [];
+  result.extensionPageWarnings = extensionHost?.pendingPageReloads(activeProfile()?.id) || [];
   result.sync = syncAccount?.status() || { state: 'setup-required', account: null, profiles: [] };
   return result;
 }
@@ -1487,7 +1488,7 @@ async function invoke(action, payload = {}) {
         cancelId: 0,
       });
       if (answer.response !== 1) return null;
-      if (!profile.private) await syncAccount?.client.unlinkProfile(profile.id);
+      if (!profile.private) await syncAccount?.client.deleteLocalProfile(profile.id);
       if (peek?.profileId === profile.id) closePeek(false);
       if (activeSpace()?.profileId === profile.id) await ai?.handle('ai:reset', {});
       for (const record of store.state.downloads.filter((item) => item.profileId === profile.id))

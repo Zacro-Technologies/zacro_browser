@@ -405,3 +405,115 @@ test('restoring a backup cannot revive revoked sessions, old passwords or alread
     200,
   );
 });
+
+test('R6 dataset-only deletion survives a real disk backup restored with the current ledger', async (t) => {
+  const f = await setup(t),
+    token = f.user.accessToken;
+  const removed = (await f.request('/datasets', token, { name: 'Delete only this' })).data;
+  const kept = (await f.request('/datasets', token, { name: 'Keep this' })).data;
+  const other = (
+    await f.request('/accounts', null, {
+      username: 'other.operator',
+      password,
+      deviceName: 'Other',
+      platform: 'test',
+    })
+  ).data;
+  const otherDataset = (await f.request('/datasets', other.accessToken, { name: 'Other account' })).data;
+  const extensionId = 'a'.repeat(32);
+  for (const dataset of [removed, kept]) {
+    const result = await f.request(`/datasets/${dataset.id}/operations`, token, {
+      epoch: dataset.epoch,
+      operations: [
+        {
+          id: randomUUID(),
+          kind: 'extension',
+          extensionId,
+          generation: 'one',
+          baseRevision: 0,
+          payload: { state: 'enabled', source: { kind: 'web-store', id: extensionId } },
+        },
+        {
+          id: randomUUID(),
+          kind: 'settings',
+          extensionId,
+          generation: 'one',
+          baseRevision: 0,
+          payload: { set: { sensitive: dataset.id } },
+        },
+      ],
+    });
+    assert.equal(result.status, 200);
+  }
+  const backup = await f.service.backup(path.join(f.root, 'backups'));
+  assert.equal(
+    (await f.request(`/datasets/${removed.id}`, token, { password, confirm: true }, 'DELETE')).status,
+    200,
+  );
+  const ledgerPath = path.join(f.options.directory, 'deletions.jsonl');
+  const records = (await fs.readFile(ledgerPath, 'utf8')).trim().split('\n').map(JSON.parse);
+  const restored = path.join(f.root, 'restored-dataset');
+  await f.service.close();
+  await restoreSyncBackup({
+    directory: restored,
+    backupPath: backup.path,
+    ledgerPath,
+    masterKey: f.options.masterKey,
+  });
+  await f.restart({ directory: restored });
+  const login = async (username) =>
+    (
+      await f.request('/sessions', null, {
+        username,
+        password,
+        deviceName: 'After restore',
+        platform: 'test',
+      })
+    ).data.accessToken;
+  const current = await login('operator.test');
+  assert.deepEqual(
+    (await f.request('/datasets', current)).data.datasets.map((d) => d.id),
+    [kept.id],
+  );
+  assert.equal((await f.request(`/datasets/${removed.id}/snapshot?settings=1`, current)).status, 404);
+  assert.ok(
+    records.some(
+      (r) =>
+        r.kind === 'dataset-deletion' &&
+        r.accountId === f.user.account.id &&
+        r.datasetId === removed.id &&
+        r.epoch === removed.epoch,
+    ),
+  );
+
+  assert.equal(
+    (await f.request(`/datasets/${kept.id}/snapshot?settings=1`, current)).data.settings[0].values.sensitive,
+    kept.id,
+  );
+  assert.deepEqual(
+    (await f.request('/datasets', await login('other.operator'))).data.datasets.map((d) => d.id),
+    [otherDataset.id],
+  );
+  const db = new DatabaseSync(path.join(restored, 'sync.sqlite'), { readOnly: true });
+  for (const table of ['settings', 'extensions', 'changes', 'operations', 'generations'])
+    assert.equal(db.prepare(`SELECT count(*) AS n FROM ${table} WHERE dataset_id = ?`).get(removed.id).n, 0);
+  db.close();
+});
+test('R6 dataset deletion fails closed when the durable ledger cannot be written', async (t) => {
+  const f = await setup(t);
+  const dataset = (await f.request('/datasets', f.user.accessToken, { name: 'Do not acknowledge' })).data;
+  const ledger = path.join(f.options.directory, 'deletions.jsonl');
+  await fs.rename(ledger, ledger + '.retained');
+  await fs.mkdir(ledger);
+  const response = await f.request(
+    `/datasets/${dataset.id}`,
+    f.user.accessToken,
+    { password, confirm: true },
+    'DELETE',
+  );
+  assert.equal(response.status, 503);
+  assert.equal((await fetch(f.service.url + '/ready')).status, 503);
+  const db = new DatabaseSync(path.join(f.options.directory, 'sync.sqlite'), { readOnly: true });
+  assert.equal(db.prepare('SELECT deleted FROM datasets WHERE id = ?').get(dataset.id).deleted, 0);
+  db.close();
+});

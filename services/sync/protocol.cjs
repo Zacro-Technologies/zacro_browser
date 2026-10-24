@@ -110,7 +110,8 @@ class SyncProtocol {
     return this.view(account, this.dataset(account, id));
   }
   remove(account, id) {
-    this.dataset(account, id);
+    const dataset = this.dataset(account, id);
+    this.store.recordDatasetDeletion(account.id, dataset);
     this.store.transaction(() => {
       for (const table of ['settings', 'extensions', 'generations', 'changes', 'operations'])
         this.store.run(`DELETE FROM ${table} WHERE dataset_id = ?`, id);

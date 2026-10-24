@@ -1033,3 +1033,81 @@ test('F2 manager rejects astral paths outside optional declaration without chang
     'https://example.com/private/😀',
   ]);
 });
+
+for (const disabled of [false, true])
+  test(`R1 rollback cannot restore revoked optional native authority (${disabled ? 'disabled then enable' : 'enabled'})`, async (t) => {
+    const h = await setup(t),
+      source = path.join(h.root, 'rollback-optional');
+    await fs.mkdir(source);
+    await fs.writeFile(
+      path.join(source, 'manifest.json'),
+      JSON.stringify({
+        manifest_version: 3,
+        name: 'Rollback permissions',
+        version: '1',
+        permissions: ['scripting'],
+        optional_host_permissions: ['https://secret.example/*'],
+      }),
+    );
+    let record = await h.manager.installLocal('p1', source);
+    record = await h.manager.changePermissions('p1', record.id, {
+      permissions: ['scripting'],
+      origins: ['https://secret.example/*'],
+    });
+    record = await h.manager.changePermissions('p1', record.id, { permissions: ['scripting'], origins: [] });
+    if (disabled) await h.manager.disable('p1', record.id);
+    record = await h.manager.rollback('p1', record.id);
+    if (disabled) record = await h.manager.enable('p1', record.id);
+    assert.deepEqual(record.grants.origins, []);
+    assert.deepEqual(h.manager.resolveExtension('p1', record.id).manifest.host_permissions, []);
+    const manifest = JSON.parse(
+      await fs.readFile(path.join(h.manager.versionPath('p1', record.current), 'manifest.json'), 'utf8'),
+    );
+    assert.deepEqual(manifest.host_permissions, []);
+  });
+test('R5 restored runtime and persisted lifecycle generation agree; failed restore stays disabled', async (t) => {
+  const h = await setup(t);
+  const record = await h.manager.installStore('p1', fixture().id);
+  const oldGeneration = record.generation;
+  h.manager.close();
+  const restored = new ExtensionManager(h.options);
+  h.setManager(restored);
+  t.after(() => restored.close());
+  await restored.restore('p1');
+  const next = restored.list('p1')[0];
+  assert.notEqual(next.generation, oldGeneration);
+  assert.equal(next.generation, restored.resolveExtension('p1', next.id).generation);
+  restored.close();
+  const failed = new ExtensionManager({
+    ...h.options,
+    getSession: () => ({
+      extensions: {
+        loadExtension: async () => {
+          throw new Error('native failure');
+        },
+        removeExtension: () => {},
+      },
+    }),
+  });
+  t.after(() => failed.close());
+  await failed.restore('p1');
+  assert.equal(failed.list('p1')[0].enabled, false);
+  assert.equal(failed.resolveExtension('p1', next.id), null);
+});
+
+test('R5 restore unloads native code if committing its new lifecycle generation fails', async (t) => {
+  const h = await setup(t),
+    record = await h.manager.installStore('p1', fixture().id);
+  h.manager.close();
+  const restored = new ExtensionManager(h.options);
+  h.setManager(restored);
+  t.after(() => restored.close());
+  restored._save = () => {
+    throw new Error('Synthetic failed generation commit');
+  };
+  h.events.length = 0;
+  await restored.restore('p1');
+  assert.equal(restored.list('p1')[0].enabled, false);
+  assert.equal(restored.resolveExtension('p1', record.id), null);
+  assert.ok(h.events.some((e) => e[0] === 'unload' && e[2] === record.id));
+});

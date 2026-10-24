@@ -329,10 +329,12 @@ class ExtensionManager {
             await this._checkVersion(context, record.current);
             await this._nativeLoad(context, record, record.current, record.grants);
             this._guard(context);
+            this._save(context, { ...record, generation: context.generation });
           });
         } catch (error) {
           guard();
           this.runtime.delete(this._key(profileId, record.id));
+          this.getSession(profileId).extensions.removeExtension(record.id);
           this._persist(profileId, (value) => {
             const failed = value.extensions.find((item) => item.id === record.id);
             if (failed) {
@@ -994,12 +996,17 @@ class ExtensionManager {
     return this._run(profileId, id, async (context) => {
       const record = this._record(profileId, id);
       if (!record.previous) throw new Error('No rollback version available');
-      const previous = record.previous;
+      let previous = record.previous;
       if (
         requiresReview(record.current.inspection, previous.inspection, record.grants) &&
         !(await this._permission(context, 'rollback', previous, record))
       )
         return record;
+      // A retained effective copy may contain optional rights revoked since it
+      // was built. Re-derive from the verified original with reviewed required
+      // grants before either immediate activation or a later enable.
+      if (!previous.legacyPath)
+        previous = await this._deriveGrants(context, record, previous, previous.inspection.required);
       let result;
       if (record.enabled) result = await this._activate(context, record, previous, { rollback: true });
       else {
@@ -1017,8 +1024,45 @@ class ExtensionManager {
         await this._discard(context, record.pending);
       }
       await this._discard(context, record.current);
+      if (record.previous.token !== previous.token) await this._discard(context, record.previous);
       return result;
     });
+  }
+  async _deriveGrants(context, record, original, grants) {
+    await this._checkVersion(context, original);
+    let version;
+    try {
+      version = await this._stage(context, {
+        sourceDirectory: this.versionPath(context.profileId, original, 'original'),
+        publicKey: original.publicKey,
+        source: record.source,
+      });
+      const manifest = version.effectiveManifest;
+      manifest.permissions = [
+        ...grants.permissions,
+        ...(manifest.manifest_version === 2 ? grants.origins : []),
+      ];
+      if (manifest.manifest_version === 3) manifest.host_permissions = grants.origins;
+      manifest.optional_permissions = [];
+      manifest.optional_host_permissions = [];
+      await fs.writeFile(
+        path.join(this.versionPath(context.profileId, version), 'manifest.json'),
+        JSON.stringify(manifest, null, 2) + '\n',
+      );
+      if (original.verification?.signatureVerified)
+        await fs.copyFile(
+          this.versionPath(context.profileId, original, 'original.crx'),
+          this.versionPath(context.profileId, version, 'original.crx'),
+        );
+      version.verification = clone(original.verification);
+      version.sha256 = original.sha256;
+      version.derivedSha256 = await treeHash(this.versionPath(context.profileId, version), context.signal);
+      this._guard(context);
+      return version;
+    } catch (error) {
+      await this._discard(context, version);
+      throw error;
+    }
   }
   changePermissions(profileId, id, requested) {
     return this._run(profileId, id, async (context) => {
@@ -1044,32 +1088,7 @@ class ExtensionManager {
       await this._checkVersion(context, record.current);
       let version;
       try {
-        version = await this._stage(context, {
-          sourceDirectory: this.versionPath(profileId, record.current, 'original'),
-          publicKey: record.current.publicKey,
-          source: record.source,
-        });
-        const manifest = version.effectiveManifest;
-        manifest.permissions = [
-          ...grants.permissions,
-          ...(manifest.manifest_version === 2 ? grants.origins : []),
-        ];
-        if (manifest.manifest_version === 3) manifest.host_permissions = grants.origins;
-        manifest.optional_permissions = [];
-        manifest.optional_host_permissions = [];
-        await fs.writeFile(
-          path.join(this.versionPath(profileId, version), 'manifest.json'),
-          JSON.stringify(manifest, null, 2) + '\n',
-        );
-        if (record.current.verification?.signatureVerified)
-          await fs.copyFile(
-            this.versionPath(profileId, record.current, 'original.crx'),
-            this.versionPath(profileId, version, 'original.crx'),
-          );
-        version.verification = clone(record.current.verification);
-        version.sha256 = record.current.sha256;
-        version.derivedSha256 = await treeHash(this.versionPath(profileId, version), context.signal);
-        this._guard(context);
+        version = await this._deriveGrants(context, record, record.current, grants);
         return await this._activate(context, record, version, { grants });
       } catch (error) {
         await this._discard(context, version);

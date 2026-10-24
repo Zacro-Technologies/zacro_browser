@@ -213,15 +213,27 @@ class SyncClient {
     this.notify();
     return this.status();
   }
-  async raw(route, { method = 'GET', body, token, epoch = this.epoch, retryRead = true } = {}) {
-    this.guard(epoch);
+  cancelProfileRequests(profileId) {
+    for (const controller of this.controllers) if (controller.profileId === profileId) controller.abort();
+  }
+  async raw(
+    route,
+    { method = 'GET', body, token, epoch = this.epoch, retryRead = true, scopeGuard, profileId } = {},
+  ) {
+    const guard = () => {
+      this.guard(epoch);
+      scopeGuard?.();
+    };
+    guard();
     const endpoint = this.store.read().endpoint;
     if (!endpoint) throw new Error('Set up a synchronization service first.');
     const controller = new AbortController();
+    controller.profileId = profileId;
     this.controllers.add(controller);
     const timer = setTimeout(() => controller.abort(), 15000);
     timer.unref?.();
     try {
+      guard();
       const response = await this.fetch(endpoint + '/v1' + route, {
         method,
         redirect: 'error',
@@ -232,7 +244,7 @@ class SyncClient {
         },
         body: body === undefined ? undefined : JSON.stringify(body),
       });
-      this.guard(epoch);
+      guard();
       let size = 0;
       const chunks = [];
       for await (const chunk of response.body) {
@@ -243,7 +255,7 @@ class SyncClient {
         }
         chunks.push(chunk);
       }
-      this.guard(epoch);
+      guard();
       let data;
       try {
         data = JSON.parse(Buffer.concat(chunks).toString('utf8'));
@@ -257,9 +269,9 @@ class SyncClient {
         });
       return data;
     } catch (error) {
-      this.guard(epoch);
+      guard();
       if (retryRead && method === 'GET' && ['ECONNRESET', 'UND_ERR_SOCKET'].includes(error.cause?.code))
-        return this.raw(route, { method, body, token, epoch, retryRead: false });
+        return this.raw(route, { method, body, token, epoch, retryRead: false, scopeGuard, profileId });
       throw error;
     } finally {
       clearTimeout(timer);
@@ -287,6 +299,7 @@ class SyncClient {
   async request(route, options = {}) {
     const epoch = options.epoch ?? this.epoch;
     this.guard(epoch);
+    options.scopeGuard?.();
     if (!this.credentials) throw new Error('Sign in to synchronize.');
     try {
       if (this.credentials.expiresAt <= Date.now() + 30000) await this.refresh(epoch);
@@ -459,9 +472,18 @@ class SyncClient {
       oldLinkId = before.links[profileId]?.id;
     if (Object.entries(before.links).some(([p, l]) => p !== profileId && l.datasetId === datasetId))
       throw new Error('This dataset is already linked to another local profile.');
+    const scopeGuard = () => {
+      this.guard(epoch);
+      this.profile(profileId);
+      if (
+        this.profileIntents.get(profileId) !== intent ||
+        this.store.read().links[profileId]?.id !== oldLinkId
+      )
+        throw cancelled();
+    };
     const snapshot = await this.request(
       `/datasets/${encodeURIComponent(datasetId)}/snapshot?settings=${settingsSync ? 1 : 0}`,
-      { epoch },
+      { epoch, profileId, scopeGuard },
     );
     this.guard(epoch);
     this.profile(profileId);
@@ -518,6 +540,7 @@ class SyncClient {
             });
         }
     });
+    this.cancelProfileRequests(profileId);
     for (const extension of Object.values(library(link))) this.emitLibrary(profileId, link, extension);
     if (settingsSync)
       for (const [ext, values] of Object.entries(allVisible(link))) {
@@ -531,6 +554,7 @@ class SyncClient {
   async unlinkProfile(profileId) {
     this.profile(profileId);
     this.profileIntents.set(profileId, (this.profileIntents.get(profileId) || 0) + 1);
+    this.cancelProfileRequests(profileId);
     this.store.transaction((s) => {
       const link = s.links[profileId];
       if (!link) return;
@@ -543,6 +567,21 @@ class SyncClient {
             s.areas[localKey(profileId, ext)],
           );
       delete s.links[profileId];
+    });
+    this.notify();
+    return this.status();
+  }
+  async deleteLocalProfile(profileId) {
+    this.profile(profileId);
+    this.profileIntents.set(profileId, (this.profileIntents.get(profileId) || 0) + 1);
+    this.cancelProfileRequests(profileId);
+    this.store.transaction((s) => {
+      delete s.links[profileId];
+      for (const areas of [s.areas, ...Object.values(s.localCopies || {})])
+        for (const key of Object.keys(areas)) {
+          const namespace = JSON.parse(key);
+          if (namespace[0] === 'local' && namespace[1] === profileId) delete areas[key];
+        }
     });
     this.notify();
     return this.status();
@@ -562,6 +601,7 @@ class SyncClient {
         preserveLibrary: true,
       });
     this.profileIntents.set(profileId, (this.profileIntents.get(profileId) || 0) + 1);
+    this.cancelProfileRequests(profileId);
     this.store.transaction((s) => {
       const current = s.links[profileId];
       if (current.settingsSync)
@@ -728,7 +768,7 @@ class SyncClient {
     do {
       const page = await this.request(
         `/datasets/${encodeURIComponent(link.datasetId)}/changes?after=${after}&limit=100&settings=${link.settingsSync ? 1 : 0}${through === undefined ? '' : '&through=' + through}`,
-        { epoch },
+        { epoch, profileId, scopeGuard: () => this.linkGuard(identity, epoch) },
       );
       if (
         !Number.isSafeInteger(page.cursor) ||
@@ -800,6 +840,8 @@ class SyncClient {
         method: 'POST',
         body: { epoch: link.epoch, operations },
         epoch,
+        profileId,
+        scopeGuard: () => this.linkGuard(identity, epoch),
       });
       this.linkGuard(identity, epoch);
       if (
@@ -829,6 +871,7 @@ class SyncClient {
           try {
             await this.syncProfile(profile, link, epoch);
           } catch (error) {
+            if (epoch !== this.epoch || !this.isCurrentLink(this.identity(profile, link))) continue;
             if (error.status === 404 || error.code === 'epoch_changed') {
               await this.unlinkProfile(profile);
               this.state = 'dataset-removed';

@@ -113,3 +113,59 @@ test('approving an update that waits for page reload does not publish a user dis
   assert.equal(result.requiresPageReload, true);
   assert.deepEqual(queued, [], 'permission update review is not an explicit library enable/disable');
 });
+
+for (const remote of [false, true])
+  test(`R8 ${remote ? 'remote' : 'local'} removal warnings survive records and cancelled reloads until document replacement`, async () => {
+    const { ExtensionHost } = require('../src/main/extensions/host.cjs');
+    const id = 'a'.repeat(32);
+    let destroyed = false,
+      prompts = 0,
+      reloads = 0,
+      allowReload = false;
+    const entry = {
+      profileId: 'p',
+      tabId: 'tab',
+      documentEpoch: 1,
+      contents: { id: 11, isDestroyed: () => destroyed, getTitle: () => 'Draft' },
+    };
+    const host = Object.assign(Object.create(ExtensionHost.prototype), {
+      barriers: new Map(),
+      notificationErrors: new Map(),
+      remoteRuns: new Map(),
+      closeViews: () => {},
+      activeProfile: () => ({ id: 'p' }),
+      getProfile: () => ({ id: 'p' }),
+      getWindow: () => ({}),
+      publish: () => {},
+      native: {
+        dialog: {
+          showMessageBox: async () => {
+            prompts++;
+            return { response: 0 };
+          },
+        },
+      },
+      browser: {
+        documents: () => [entry],
+        reloadDocument: async () => {
+          reloads++;
+          if (allowReload) entry.documentEpoch++;
+        },
+      },
+    });
+    if (remote) host.remoteRuns.set(host.key('p', id), {});
+    await host.deactivated({ profileId: 'p', extensionId: id, reason: 'remove' });
+    assert.equal(prompts, remote ? 0 : 1);
+    assert.equal(host.pendingPageReloads('p').length, 1);
+    assert.equal(host.pendingPageReloads('other').length, 0);
+    await host.reloadPendingPages('p', { tabId: 'tab' }, () => {});
+    assert.equal(reloads, 1);
+    assert.equal(host.pendingPageReloads('p').length, 1, 'Stay preserves warning with the old document');
+    allowReload = true;
+    await host.reloadPendingPages('p', { tabId: 'tab' }, () => {});
+    assert.deepEqual(host.pendingPageReloads('p'), []);
+    await host.deactivated({ profileId: 'p', extensionId: id, reason: 'remove' });
+    destroyed = true;
+    assert.deepEqual(host.pendingPageReloads('p'), []);
+    assert.equal(host.barriers.size, 0);
+  });

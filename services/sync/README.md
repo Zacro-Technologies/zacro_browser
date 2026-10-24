@@ -101,15 +101,23 @@ encrypted data before the directory can become ready. It never overwrites an
 existing destination. Keep the authoritative ledger on durable storage outside
 the backup rollback domain; an older copy is not a valid restore ledger.
 The file is named `deletions.jsonl` and also contains encrypted credential
-continuity records. Keep the entire current file, including those records.
+continuity records and v3 dataset-deletion records (account ID, dataset ID,
+deleted epoch, and deletion time). Keep the entire current file. Older service
+versions that do not understand v3 records fail closed; do not remove records
+to make a downgrade start.
 Restoration always revokes every device and requires a fresh login. Applying
 the current ledger preserves password changes and consumed recovery codes made
 after the snapshot, even if the master key was rotated in the meantime.
 
 Account deletion fsyncs its ledger record before removing account-owned live
 data and sessions. Restoring an earlier database with the current ledger cannot
-recreate the deleted account. Deletion cannot erase copies already downloaded
-by disconnected clients. Historical encrypted backups are not instantly erased.
+recreate the deleted account. Dataset-only deletion likewise fsyncs its
+account/dataset/epoch tombstone before acknowledging deletion. Startup and
+restore apply these tombstones before readiness and purge the dataset and its
+settings, preserving unrelated datasets and accounts. A ledger write failure
+returns an error and makes readiness fail closed. This protection applies during
+the permitted backup window, independently of expiry. Deletion cannot erase
+copies already downloaded by disconnected clients. Historical encrypted backups are not instantly erased.
 
 **Configure backup storage expiry to at most seven days.** The backup command
 also prunes recognizable expired snapshots when it runs, and restore rejects

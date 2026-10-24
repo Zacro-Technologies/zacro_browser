@@ -30,12 +30,18 @@ limitations, action and options pages, update review, and rollback where a
 previous version exists. Updates are checked when due at startup and on a
 jittered six-hour schedule. **Check for updates** requests an immediate check.
 Additional permissions pause an update for review. A failed replacement retains
-the preceding usable version where restoration is possible.
+the preceding usable version where restoration is possible. Rollback rebuilds
+the retained original with the reviewed required permissions; optional access
+is not restored from an older native copy and must be granted again.
 
 Disabling or removing revokes native and adapter access immediately. Scripts
 already running inside pages may require a page reload. Zacro offers to reload;
 unsaved pages retain their normal leave confirmation. A reduction that still
-has affected documents remains disabled with **Reload pages to finish**.
+has affected documents remains disabled with **Reload pages to finish**. A page
+warning and **Reload page** control remain in the toolbar and Extensions panel
+after local or synchronized removal, even though the extension is no longer
+installed. Choosing Stay preserves both the draft and warning. Navigating,
+reloading, or closing the affected document clears its warning.
 
 ## Supported boundaries
 
