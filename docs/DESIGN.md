@@ -6,6 +6,8 @@ The new-tab page contains search, saved destinations, and recent pages. Pinned p
 
 Ctrl/Command + Shift + B toggles the sidebar. The toolbar always retains the toggle, and native pages reclaim the available width without reloading. There is no surprise edge-hover panel. Ordinary profile details live in the Space switcher; private browsing remains explicitly identified.
 
+Scroll horizontally over the sidebar to move between Spaces in the current profile, or hold Shift while using a vertical mouse wheel. A gesture moves one Space in the scroll direction and stops at either end. A 64px threshold, horizontal-axis preference, and an idle reset after momentum prevent accidental switches during tab-list scrolling. Webpage scrolling is unaffected. Each Space remembers its tab-list position; the active Space shortcut stays in view. Dialogs, tab dragging, pinch/zoom, and window resizing interrupt the gesture.
+
 Windows High Contrast uses system colors, explicit selection/focus outlines, native checkboxes and named Space-color choices. Decorative artwork and blurred page backdrops are omitted in forced-colors mode so controls remain distinct.
 
 ## Motion rules

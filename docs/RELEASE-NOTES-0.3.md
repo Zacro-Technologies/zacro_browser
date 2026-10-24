@@ -8,6 +8,7 @@ The interface has been redesigned after reviewing Arc, Pinterest browser referen
 - Library chooser with quick switching between bookmarks, history, downloads, and archived tabs.
 - Smaller panels and command results; expandable Settings groups.
 - Ctrl/Command + Shift + B hides or shows the sidebar while keeping live pages intact.
+- Horizontal scrolling over the sidebar switches Spaces within the current profile. Shift + mouse wheel works too. One switch per gesture, edge stops, directional motion, and remembered tab-list positions keep navigation predictable.
 - Refined light/dark colors, quick 100–160ms interface feedback, immediate dismissal, named icon controls, keyboard focus, reduced motion, and forced-color support.
 - Sidebar shortcuts preserve focus in page fields; Library returns focus to its opener; Settings preserves expanded groups and drafts.
 - Optional AI now uses ChatGPT sign-in and the user's Codex allowance through a bundled, isolated app-server. API-key and Claude connections have been removed; requests never fall back to separate API billing.

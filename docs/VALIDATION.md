@@ -2,7 +2,9 @@
 
 Validated locally on Windows 11 x64 (OS build 26200), Node.js 24.19.0, Electron 45.0.0 and Chromium 156.0.8078.48. This record describes engineering verification of the development build, not commercial certification or a security audit.
 
-The final 0.3 validation passed **90 unit/security tests, 38 desktop integration tests, one packaged-application test and one lifecycle soak test: 130 tests total**, plus formatting and syntax checks, on October 24, 2026. The desktop total includes the plain-window native-paint regression. The current soak completed 40 cycles.
+The initial 0.3 validation passed **90 unit/security tests, 38 desktop integration tests, one packaged-application test and one lifecycle soak test: 130 tests total**, plus formatting and syntax checks, on October 24, 2026. The desktop total includes the plain-window native-paint regression. That soak completed 40 cycles.
+
+The subsequent sidebar Space-scroll change passed `npm run verify`: **90 unit/security tests and 41 desktop integration tests**, plus formatting and syntax. Three new regressions cover native horizontal wheel input, directional/reduced motion, page identity and draft retention, per-Space tab-list scroll, intent thresholds, momentum, direction changes, wheel delta modes, Shift-wheel, profile boundaries, and interrupted gestures. A native Computer pass on the development application confirmed forward/back switching, the final-Space edge stop, and unchanged Space selection when scrolling over a webpage. The packaged and soak results below refer to the initial 0.3 build.
 
 The 0.3 checks cover compact tab density, native page bounds with the sidebar hidden, page-field focus and draft preservation, Library navigation and return focus, home-shortcut deduplication, Settings disclosure state, short motion and immediate dismissal, and the subscription connection UI/protocol. Account-change, cancellation and filename-stream regressions protect the AI lifecycle.
 

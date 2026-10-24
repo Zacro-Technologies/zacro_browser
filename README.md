@@ -81,7 +81,7 @@ Tests create temporary profiles and local fixture servers; they do not use your 
 
 Browser data lives in Electron's per-user Zacro application-data directory. For an isolated development profile, set `ZACRO_USER_DATA` to a separate absolute directory. Export/import in Settings supports Zacro JSON and standard browser bookmark HTML. Arc migration currently uses supported bookmark exports; native Arc sidebar databases are not imported.
 
-Use **Ctrl/Command + L** for the command bar, **Ctrl/Command + T** for a new tab, **F6** to move between page and browser controls, **Ctrl/Command + Shift + B** to toggle the sidebar, **Alt + click** or a link's context menu for Peek, and **Escape** to dismiss it. Right-click a tab to pin it, rename it, move it to a folder/Space, or split it beside another page. For optional AI, sign in with ChatGPT in Settings or Ask Zacro, then use **Ctrl/Command + Enter** to ask a research question; use it again in the answer panel to open the current answer's sources.
+Use **Ctrl/Command + L** for the command bar, **Ctrl/Command + T** for a new tab, **F6** to move between page and browser controls, **Ctrl/Command + Shift + B** to toggle the sidebar, **Alt + click** or a link's context menu for Peek, and **Escape** to dismiss it. **Scroll sideways over the sidebar** to switch Spaces within the current profile; **Shift + mouse wheel** works too. Each gesture moves one Space and stops at the ends. Right-click a tab to pin it, rename it, move it to a folder/Space, or split it beside another page. For optional AI, sign in with ChatGPT in Settings or Ask Zacro, then use **Ctrl/Command + Enter** to ask a research question; use it again in the answer panel to open the current answer's sources.
 
 ## The experience
 

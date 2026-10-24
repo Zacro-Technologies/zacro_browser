@@ -120,6 +120,67 @@ const activeProfile = () => state?.profiles.find((p) => p.id === activeSpace()?.
 const activeTab = () => state?.tabs.find((t) => t.id === state.activeTabId);
 const currentTabs = () => state?.tabs.filter((t) => t.spaceId === state.activeSpaceId) || [];
 const profileItems = (key) => (state?.[key] || []).filter((item) => item.profileId === activeProfile()?.id);
+const sidebarScroll = new Map();
+const spaceScroll = { lastEvent: -Infinity, distance: 0, consumed: false, pending: false };
+function interruptSpaceScroll() {
+  spaceScroll.distance = 0;
+  spaceScroll.consumed = true;
+  spaceScroll.lastEvent = performance.now();
+}
+function onSpaceScroll(event) {
+  const now = performance.now();
+  // Wheel events have no portable gesture-end event. Rearm only after the
+  // stream (including its inertial tail) stops, so a flick moves one Space.
+  if (now - spaceScroll.lastEvent > 220) {
+    spaceScroll.distance = 0;
+    spaceScroll.consumed = false;
+  }
+  spaceScroll.lastEvent = now;
+  const sidebar = $('#sidebar');
+  if (
+    !state ||
+    ui.sidebarHidden ||
+    sidebar.inert ||
+    ui.dialog ||
+    ui.dragTab ||
+    event.buttons ||
+    event.defaultPrevented ||
+    event.ctrlKey ||
+    event.metaKey ||
+    event.altKey ||
+    event.target.closest('input, textarea, select, [contenteditable="true"]')
+  ) {
+    interruptSpaceScroll();
+    return;
+  }
+  const scale = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? sidebar.clientWidth : 1;
+  const shifted = event.shiftKey && event.deltaX === 0;
+  const dx = (shifted ? event.deltaY : event.deltaX) * scale;
+  const dy = shifted ? 0 : event.deltaY * scale;
+  if (!dx || Math.abs(dx) < Math.abs(dy) * 1.5) {
+    // Once a gesture is vertical, leave it to the tab list even if its tail
+    // drifts sideways. Do not cancel normal scrolling or pinch-to-zoom.
+    if (dx || dy) interruptSpaceScroll();
+    return;
+  }
+  const spaces = state.spaces.filter((space) => space.profileId === activeProfile()?.id);
+  if (spaces.length < 2) return;
+  event.preventDefault();
+  if (spaceScroll.consumed || spaceScroll.pending) return;
+  if (Math.sign(dx) !== Math.sign(spaceScroll.distance)) spaceScroll.distance = 0;
+  spaceScroll.distance += dx;
+  if (Math.abs(spaceScroll.distance) < 64) return;
+  spaceScroll.consumed = true;
+  const index = spaces.findIndex((space) => space.id === state.activeSpaceId);
+  const next = spaces[index + Math.sign(spaceScroll.distance)];
+  if (index < 0 || !next) return; // Stop at the ends; never cross profiles.
+  spaceScroll.pending = true;
+  safely(
+    invoke('space:activate', { id: next.id }).finally(() => {
+      spaceScroll.pending = false;
+    }),
+  );
+}
 function hostname(url) {
   try {
     return new URL(url).hostname.replace(/^www\./, '') || 'New tab';
@@ -360,6 +421,11 @@ function applyState(next) {
   }
   render();
   if (previousSpace && previousSpace !== state.activeSpaceId) {
+    interruptSpaceScroll();
+    const spaces = state.spaces.filter((space) => space.profileId === activeProfile()?.id);
+    const previousIndex = spaces.findIndex((space) => space.id === previousSpace);
+    const nextIndex = spaces.findIndex((space) => space.id === state.activeSpaceId);
+    const direction = previousIndex < 0 ? 1 : Math.sign(nextIndex - previousIndex);
     motion(
       $('.space-header'),
       [
@@ -371,7 +437,7 @@ function applyState(next) {
     motion(
       $('.tabs-scroll'),
       [
-        { opacity: 0.45, transform: 'translateX(5px)' },
+        { opacity: 0.45, transform: `translateX(${direction * 10}px)` },
         { opacity: 1, transform: 'translateX(0)' },
       ],
       150,
@@ -424,7 +490,10 @@ function renderSidebar() {
   ]);
   if (signature === ui.sidebarSignature) return;
   ui.sidebarSignature = signature;
-  const scroll = $('.tabs-scroll')?.scrollTop || 0;
+  if (ui.sidebarSpaceId) sidebarScroll.set(ui.sidebarSpaceId, $('.tabs-scroll')?.scrollTop || 0);
+  for (const id of sidebarScroll.keys())
+    if (!state.spaces.some((item) => item.id === id)) sidebarScroll.delete(id);
+  const scroll = sidebarScroll.get(space?.id) || 0;
   const oldRows = new Map(
     $$('[data-tab-id]', $('#sidebar')).map((row) => [row.dataset.tabId, row.getBoundingClientRect().top]),
   );
@@ -458,6 +527,7 @@ function renderSidebar() {
     <div class="loose-tabs" data-drop-folder="">${loose.map(tabRow).join('')}</div></div>
     <footer class="sidebar-footer">${button('ui:library', 'Library', 'library', 'data-key="library" aria-haspopup="dialog"')}<div class="space-dots" aria-label="Your Spaces">${spaces.map((s) => `<button type="button" class="space-dot ${s.id === space?.id ? 'active' : ''}" data-action="space:activate" data-id="${esc(s.id)}" title="${esc(s.name)}" aria-label="Switch to ${esc(s.name)}" ${s.id === space?.id ? 'aria-current="true"' : ''}>${esc(s.name.slice(0, 1).toUpperCase())}</button>`).join('')}${button('ui:new-space', 'New Space', 'plus', '', 'small-button')}</div>${button('ui:panel', 'Settings', 'settings', `data-panel="settings" data-key="panel-settings" aria-pressed="${ui.panel === 'settings'}"`)}</footer>`;
   $('.tabs-scroll').scrollTop = scroll;
+  if (!sameSpace) $('.space-dot.active')?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
   if (sameSpace)
     for (const row of $$('[data-tab-id]', $('#sidebar'))) {
       const before = oldRows.get(row.dataset.tabId);
@@ -1002,6 +1072,7 @@ function closePanel() {
   restoreFocus(focus);
 }
 function openDialog(kind, html, { title, focus } = {}) {
+  interruptSpaceScroll();
   if (ui.authRequest) {
     const id = ui.authRequest;
     ui.authRequest = null;
@@ -1152,6 +1223,7 @@ function showLibrary() {
   );
 }
 function toggleSidebar(fromPage = false) {
+  interruptSpaceScroll();
   if (ui.dialog) closeDialog({ restore: false });
   ui.sidebarHidden = !ui.sidebarHidden;
   render();
@@ -2337,6 +2409,7 @@ document.addEventListener('contextmenu', (event) => {
 document.addEventListener('dragstart', (event) => {
   const tab = event.target.closest('[data-tab-id]');
   if (!tab) return;
+  interruptSpaceScroll();
   ui.dragTab = tab.dataset.tabId;
   event.dataTransfer.effectAllowed = 'move';
   event.dataTransfer.setData('text/plain', ui.dragTab);
@@ -2478,7 +2551,13 @@ document.addEventListener(
   },
   true,
 );
-window.addEventListener('resize', syncLayout);
+$('#sidebar').addEventListener('wheel', onSpaceScroll, { passive: false });
+$('#sidebar').addEventListener('pointerleave', interruptSpaceScroll);
+window.addEventListener('blur', interruptSpaceScroll);
+window.addEventListener('resize', () => {
+  interruptSpaceScroll();
+  syncLayout();
+});
 matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
   if (state) setTheme();
 });
