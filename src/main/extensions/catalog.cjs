@@ -8,6 +8,11 @@ const API_PERMISSIONS = new Set([
   'webRequest',
   'webRequestBlocking',
   'unlimitedStorage',
+  'declarativeNetRequest',
+  'declarativeNetRequestWithHostAccess',
+  'declarativeNetRequestFeedback',
+  'offscreen',
+  'alarms',
 ]);
 function list(value, name) {
   if (value === undefined) return [];
@@ -97,6 +102,12 @@ function inspectManifest(manifest) {
       required: true,
       reason: 'Native scripting is available only to Manifest V3 extensions.',
     });
+  if (manifest.manifest_version === 2 && required.permissions.includes('offscreen'))
+    unsupported.push({
+      capability: 'offscreen',
+      required: true,
+      reason: 'Native offscreen documents require Manifest V3.',
+    });
   for (const origin of required.origins)
     if (!supportedHost(origin))
       unsupported.push({
@@ -117,6 +128,12 @@ function inspectManifest(manifest) {
       required: false,
       reason: 'Native scripting is available only to Manifest V3 extensions.',
     });
+  if (manifest.manifest_version === 2 && optional.permissions.includes('offscreen'))
+    unsupported.push({
+      capability: 'offscreen',
+      required: false,
+      reason: 'Native offscreen documents require Manifest V3.',
+    });
   for (const origin of optional.origins)
     if (!supportedHost(origin))
       unsupported.push({
@@ -124,7 +141,27 @@ function inspectManifest(manifest) {
         required: false,
         reason: 'This optional origin cannot be granted.',
       });
-  for (const key of ['chrome_url_overrides', 'sandbox', 'declarative_net_request'])
+  if (manifest.declarative_net_request !== undefined) {
+    const resources = manifest.declarative_net_request?.rule_resources;
+    if (
+      !Array.isArray(resources) ||
+      resources.length > 100 ||
+      resources.some(
+        (resource) =>
+          !resource ||
+          typeof resource.id !== 'string' ||
+          !/^[A-Za-z0-9_-]{1,256}$/.test(resource.id) ||
+          typeof resource.enabled !== 'boolean' ||
+          typeof resource.path !== 'string' ||
+          !resource.path ||
+          /[\\\x00-\x20\x7f:%?#]/.test(resource.path) ||
+          resource.path.split('/').some((part) => !part || part === '.' || part === '..'),
+      ) ||
+      new Set(resources.map((resource) => resource.id)).size !== resources.length
+    )
+      throw new Error('Invalid declarative_net_request rule_resources');
+  }
+  for (const key of ['chrome_url_overrides', 'sandbox'])
     if (manifest[key])
       unsupported.push({
         capability: key,

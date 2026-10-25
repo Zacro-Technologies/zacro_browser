@@ -2,6 +2,11 @@
 const { ipcMain, BrowserWindow, webContents } = require('electron');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
+const {
+  getNativeServices,
+  NATIVE_SERVICES_PAGE,
+  registerNativeEventDelivery,
+} = require('./native-services.cjs');
 const CHANNEL = 'zacro:extension-transport:v1';
 
 function extensionId(url) {
@@ -42,6 +47,7 @@ class ExtensionBridge {
       backgrounds: new Map(),
     };
     this.sessions.set(session, entry);
+    registerNativeEventDelivery(session, (id, event, args) => this.emit(profileId, id, event, args));
     entry.unloaded = (_event, extension) => {
       entry.revoked.add(extension.id);
       // Electron removes the extension from its registry but retains open
@@ -143,7 +149,7 @@ class ExtensionBridge {
     return broker;
   }
 
-  bindOrigin(context, event, sender) {
+  async bindOrigin(context, event, sender) {
     const broker = this.brokerFor(context, event);
     if (
       !sender ||
@@ -156,6 +162,14 @@ class ExtensionBridge {
       !sender.documentId
     )
       throw new Error('Invalid native runtime sender');
+    const nativeContexts =
+      context.session.extensions.getExtension(context.extensionId)?.manifest?.manifest_version === 3
+        ? await broker.webContents.executeJavaScript(
+            `chrome.runtime.getContexts({contextTypes:['OFFSCREEN_DOCUMENT'],documentIds:[${JSON.stringify(sender.documentId)}]})`,
+          )
+        : [];
+    if (nativeContexts.length) throw new Error('Offscreen documents expose only native runtime');
+    this.brokerFor(context, event);
     const trusted =
       extensionId(sender.url) === context.extensionId &&
       sender.origin === `chrome-extension://${context.extensionId}`;
@@ -283,6 +297,21 @@ class ExtensionBridge {
 
   async handle(event, request) {
     const context = this.authenticate(event);
+    // Chromium's offscreen API and runtime.getContexts are MV3-only. MV2 event
+    // pages cannot create offscreen contexts and do not expose getContexts.
+    if (
+      context.session.extensions.getExtension(context.extensionId)?.manifest?.manifest_version === 3 &&
+      context.kind === 'extension-frame' &&
+      !context.url.endsWith('/zacro-compat-transport.html')
+    ) {
+      const broker = this.sessions.get(context.session)?.brokers.get(context.extensionId);
+      if (!broker || broker.isDestroyed()) throw new Error('Extension native context unavailable');
+      const contexts = await broker.webContents.executeJavaScript(
+        `chrome.runtime.getContexts({contextTypes:['OFFSCREEN_DOCUMENT'],documentUrls:[${JSON.stringify(context.url)}]})`,
+      );
+      if (contexts.length) throw new Error('Offscreen documents expose only native runtime');
+      this.authenticate(event);
+    }
     if (!request || typeof request !== 'object') throw new Error('Invalid transport request');
     if (request.operation === 'connect') {
       const token = randomUUID();
@@ -363,6 +392,23 @@ class ExtensionBridge {
     };
     assertCurrent();
     const source = origin || lease;
+    if (
+      request.method === 'zacro.nativeServices.ready' ||
+      request.method === 'zacro.nativeServices.checkpoint'
+    ) {
+      if (
+        source.kind === 'content-script' ||
+        source.url === `chrome-extension://${context.extensionId}/${NATIVE_SERVICES_PAGE}`
+      )
+        throw new Error('Native lifecycle requires a trusted extension context');
+      const services = getNativeServices(context.session, context.extensionId);
+      if (!services) throw new Error('Native extension services unavailable');
+      await services.ready;
+      assertCurrent();
+      if (request.method.endsWith('.checkpoint')) await services.checkpoint();
+      assertCurrent();
+      return;
+    }
     if (request.method === 'zacro.events.context') return { kind: source.kind };
     if (request.method === 'zacro.events.idle') {
       if (source.kind !== 'background-page')
@@ -379,7 +425,7 @@ class ExtensionBridge {
         names.some(
           (name) =>
             typeof name !== 'string' ||
-            !/^(tabs\.(onCreated|onUpdated|onRemoved|onActivated|onMoved)|windows\.onFocusChanged|permissions\.(onAdded|onRemoved)|commands\.onCommand|action\.onClicked|contextMenus\.onClicked|storage\.onChanged)$/.test(
+            !/^(tabs\.(onCreated|onUpdated|onRemoved|onActivated|onMoved)|windows\.onFocusChanged|permissions\.(onAdded|onRemoved)|commands\.onCommand|action\.onClicked|contextMenus\.onClicked|storage\.onChanged|alarms\.onAlarm)$/.test(
               name,
             ),
         )
@@ -603,6 +649,7 @@ class ExtensionBridge {
     for (const origin of this.origins.values()) origin.revoke();
     this.origins.clear();
     for (const [session, entry] of this.sessions) {
+      registerNativeEventDelivery(session, null);
       for (const id of entry.backgrounds.keys()) this.clearBackground(entry, id);
       const registered = new Set(session.getPreloadScripts().map((script) => script.id));
       for (const id of entry.preloads) if (registered.has(id)) session.unregisterPreloadScript(id);

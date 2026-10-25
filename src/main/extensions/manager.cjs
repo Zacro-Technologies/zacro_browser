@@ -6,6 +6,7 @@ const crypto = require('node:crypto');
 const { parseStoreId, fetchStorePackage, extractArchive, idFromKey, LIMITS } = require('./packages.cjs');
 const { inspectManifest, compareVersions, requiresReview } = require('./catalog.cjs');
 const { adaptExtension } = require('./adapt.cjs');
+const { NativeServices, needsNativeServices } = require('./native-services.cjs');
 const SIX_HOURS = 6 * 60 * 60 * 1000;
 const hash = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex');
 const clone = (value) => structuredClone(value);
@@ -21,12 +22,13 @@ async function readManifest(directory) {
   inspectManifest(manifest);
   return manifest;
 }
-async function treeHash(directory, signal) {
+async function treeHash(directory, signal, nativeMetadata = false) {
   const digest = crypto.createHash('sha256');
   async function visit(relative) {
     signal?.throwIfAborted();
     const names = (await fs.readdir(path.join(directory, relative))).sort();
     for (const name of names) {
+      if (nativeMetadata && !relative && name === '_metadata') continue;
       const child = path.join(relative, name),
         absolute = path.join(directory, child),
         stat = await fs.lstat(absolute);
@@ -480,7 +482,7 @@ class ExtensionManager {
         sha256: download?.sha256 || (await treeHash(path.join(staging, 'original'), context.signal)),
         verification: { signatureVerified: !!download, publisherVerified: !!download?.publisherVerified },
         transformVersion: adapted.transformVersion,
-        derivedSha256: await treeHash(path.join(staging, 'derived'), context.signal),
+        derivedSha256: await treeHash(path.join(staging, 'derived'), context.signal, true),
         createdAt: this.now(),
       };
       this._guard(context);
@@ -518,8 +520,11 @@ class ExtensionManager {
         throw new Error('Legacy local extension changed; reinstall for review');
     } else {
       if (
-        (await treeHash(this.versionPath(context.profileId, version), context.signal)) !==
-        version.derivedSha256
+        (await treeHash(
+          this.versionPath(context.profileId, version),
+          context.signal,
+          version.transformVersion >= 4,
+        )) !== version.derivedSha256
       )
         throw new Error('Managed extension integrity check failed');
       if (
@@ -573,7 +578,31 @@ class ExtensionManager {
       adapted: !version.legacyPath,
     };
     this.runtime.set(context.key, metadata);
+    let services;
     try {
+      if (needsNativeServices(metadata.manifest)) {
+        const directory = path.join(this.profilePath(context.profileId), 'native-services');
+        await fs.mkdir(directory, { recursive: true });
+        this._guard(context);
+        services = new NativeServices({
+          session,
+          id: record.id,
+          manifest: metadata.manifest,
+          filename: path.join(directory, record.id + '.json'),
+          persist: atomicJson,
+          guard: () => {
+            this._profile(context.profileId);
+            if (this.runtime.get(context.key) !== metadata)
+              throw new Error('Stale native extension lifecycle');
+          },
+        });
+      }
+      if (!version.legacyPath && version.transformVersion >= 4)
+        await fs.rm(path.join(this.versionPath(context.profileId, version), '_metadata'), {
+          recursive: true,
+          force: true,
+        });
+      this._guard(context);
       const loaded = await session.extensions.loadExtension(
         version.legacyPath || this.versionPath(context.profileId, version),
         { allowFileAccess: false },
@@ -583,7 +612,10 @@ class ExtensionManager {
         throw new Error('Native extension identity mismatch');
       }
       this._guard(context);
+      if (services) await services.initialize();
+      this._guard(context);
     } catch (error) {
+      services?.close();
       this.runtime.delete(context.key);
       session.extensions.removeExtension(record.id);
       throw error;
@@ -989,6 +1021,12 @@ class ExtensionManager {
           },
           context,
         );
+        // A successor may cancel queued teardown; discard removed native state
+        // synchronously so a reinstall cannot inherit obsolete rules or alarms.
+        if (record)
+          sync.rmSync(path.join(this.profilePath(profileId), 'native-services', record.id + '.json'), {
+            force: true,
+          });
       },
     );
   }
@@ -1056,7 +1094,11 @@ class ExtensionManager {
         );
       version.verification = clone(original.verification);
       version.sha256 = original.sha256;
-      version.derivedSha256 = await treeHash(this.versionPath(context.profileId, version), context.signal);
+      version.derivedSha256 = await treeHash(
+        this.versionPath(context.profileId, version),
+        context.signal,
+        version.transformVersion >= 4,
+      );
       this._guard(context);
       return version;
     } catch (error) {

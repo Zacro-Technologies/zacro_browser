@@ -256,7 +256,7 @@ test('manifest inspection lists required and optional access and blocks missing 
     permissions: ['nativeMessaging', 'identity', 'declarativeNetRequest'],
   });
   assert.equal(blocked.compatible, false);
-  assert.equal(blocked.unsupported.length, 3);
+  assert.equal(blocked.unsupported.length, 2);
   assert.equal(
     catalog.inspectManifest({
       manifest_version: 3,

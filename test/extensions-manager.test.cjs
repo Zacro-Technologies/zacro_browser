@@ -115,6 +115,28 @@ async function setup(t, overrides = {}) {
     },
   };
 }
+test('removal deletes native snapshots before asynchronous teardown can be cancelled', async (t) => {
+  const teardown = deferred();
+  const { manager } = await setup(t, {
+    onDeactivated: async () => {
+      await teardown.promise;
+      return { requiresPageReload: false };
+    },
+  });
+  const record = await manager.installStore('p1', fixture().id);
+  const directory = path.join(manager.profilePath('p1'), 'native-services');
+  await fs.mkdir(directory);
+  const filename = path.join(directory, record.id + '.json');
+  await fs.writeFile(filename, '{"schema":1}');
+  const removal = manager.remove('p1', record.id);
+  const exists = await fs.access(filename).then(
+    () => true,
+    () => false,
+  );
+  teardown.resolve();
+  await removal;
+  assert.equal(exists, false, 'a successor installation must not inherit removed rules');
+});
 test('install waits for profile-bound permission and exposes synchronous metadata before load', async (t) => {
   const permission = deferred(),
     started = deferred();
@@ -147,7 +169,7 @@ test('install waits for profile-bound permission and exposes synchronous metadat
     await fs.readFile(h.manager.versionPath('p1', record.current, 'original/manifest.json'), 'utf8'),
   );
   assert.equal(sourceManifest.key, undefined);
-  assert.equal(record.current.transformVersion, 3);
+  assert.equal(record.current.transformVersion, 4);
   assert.equal(record.current.derivedSha256.length, 64);
 });
 test('uninstall wins over late download or late permission and private profiles cannot install', async (t) => {

@@ -17,7 +17,7 @@ const manifest = {
 
 test('catalog accepts local DevTools documents while retaining unrelated unsupported boundaries', () => {
   assert.equal(inspectManifest(manifest).compatible, true);
-  for (const field of ['chrome_url_overrides', 'sandbox', 'declarative_net_request'])
+  for (const field of ['chrome_url_overrides', 'sandbox'])
     assert.equal(inspectManifest({ ...manifest, [field]: {} }).compatible, false, field);
 });
 

@@ -1,6 +1,17 @@
 'use strict';
 const { contextBridge, ipcRenderer } = require('electron');
-if (location.protocol === 'chrome-extension:' && process.contextIsolated) {
+const runtimeOnly =
+  location.protocol === 'chrome-extension:' &&
+  process.contextIsolated &&
+  contextBridge.executeInMainWorld({
+    func: () => !!globalThis.chrome?.runtime && !chrome.storage && !chrome.tabs,
+  });
+if (
+  location.protocol === 'chrome-extension:' &&
+  process.contextIsolated &&
+  !runtimeOnly &&
+  location.pathname !== '/zacro-native-services.html'
+) {
   if (location.pathname !== '/zacro-compat-transport.html')
     contextBridge.executeInMainWorld({
       func: () => {

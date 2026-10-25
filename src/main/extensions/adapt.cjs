@@ -5,7 +5,7 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const { parse } = require('parse5');
 const { inspectManifest } = require('./catalog.cjs');
-const TRANSFORM_VERSION = 3;
+const TRANSFORM_VERSION = 4;
 const BOOTSTRAP = 'zacro-compat-bootstrap.js';
 
 async function adaptExtension(source, destination, { publicKey } = {}) {
@@ -22,7 +22,7 @@ async function adaptExtension(source, destination, { publicKey } = {}) {
     if (!stat?.isFile() || !real?.startsWith((await fs.realpath(source)) + path.sep))
       throw new Error('Invalid devtools_page resource');
   }
-  for (const reserved of [BOOTSTRAP, 'zacro-compat-transport.html'])
+  for (const reserved of [BOOTSTRAP, 'zacro-compat-transport.html', 'zacro-native-services.html'])
     if (
       await fs.access(path.join(source, reserved)).then(
         () => true,
@@ -42,10 +42,18 @@ async function adaptExtension(source, destination, { publicKey } = {}) {
       errorOnExist: true,
       force: false,
     });
+  // Electron discards vendor metadata and Chromium writes native indexed DNR
+  // files here. Originals retain their full package hash; this generated tree
+  // is excluded from the transformed v4 code/resource integrity digest.
+  await fs.rm(path.join(destination, '_metadata'), { recursive: true, force: true });
   await fs.copyFile(path.join(__dirname, 'bootstrap.js'), path.join(destination, BOOTSTRAP));
   await fs.writeFile(
     path.join(destination, 'zacro-compat-transport.html'),
     '<!doctype html><html><head><meta charset="utf-8"></head><body></body></html>\n',
+  );
+  await fs.writeFile(
+    path.join(destination, 'zacro-native-services.html'),
+    '<!doctype html><meta charset="utf-8"><title>Native extension lifecycle</title>\n',
   );
   if (publicKey) manifest.key = publicKey;
   for (const entry of manifest.content_scripts || []) {
@@ -119,7 +127,11 @@ async function adaptExtension(source, destination, { publicKey } = {}) {
   // script. Include ordinary popup/options and nested HTML resources, not only
   // the manifest's initial view; original bytes outside insertion stay intact.
   for (const name of await fs.readdir(destination, { recursive: true })) {
-    if (!/\.html?$/i.test(name) || name === 'zacro-compat-transport.html' || name === background?.page)
+    if (
+      !/\.html?$/i.test(name) ||
+      ['zacro-compat-transport.html', 'zacro-native-services.html'].includes(name) ||
+      name === background?.page
+    )
       continue;
     const filename = path.join(destination, name);
     if (!(await fs.stat(filename)).isFile()) continue;
