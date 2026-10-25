@@ -60,6 +60,11 @@ Native tests use `src/out/Zacro-ARCH`. The build also creates `dist.zip` there.
 The `testing.gn` base retains DCHECKs and is a development runtime; it is not a
 signed release artifact. Native positive tests must run on the binary built
 from the patched source, not the npm stock runtime.
+The capability test phase uses a fresh profile directory under the build root
+and retains it for diagnostics. It suppresses the upstream runner's unrelated
+virtual-printer provisioning and cleanup of other running Electron instances;
+the runner still cleans up its own workers. The printer-name sentinel does not
+represent an installed printer, and these selected specs do not test printing.
 
 ## Install and validate a local artifact
 

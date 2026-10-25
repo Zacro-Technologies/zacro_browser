@@ -247,6 +247,8 @@ async function main(phase, options) {
     return;
   }
   if (phase === 'test') {
+    const profileRoot = await fs.mkdtemp(path.join(root, 'zacro-native-spec-'));
+    console.log(`Native spec profile root: ${profileRoot}`);
     await runPinned(
       process.execPath,
       [
@@ -255,9 +257,17 @@ async function main(phase, options) {
         '--skipYarnInstall',
         '--files',
         'spec/zacro-native-capabilities.spec.ts',
+        `--user-data-dir=${path.join(profileRoot, 'profile')}`,
       ],
       electron,
-      { ...env, ELECTRON_OUT_DIR: out },
+      {
+        ...env,
+        ELECTRON_OUT_DIR: out,
+        // These capability specs do not print. Suppress upstream's automatic
+        // printer provisioning and broad cleanup of other running instances.
+        ELECTRON_TEST_PRINTER_NAME: 'zacro-capability-specs-no-printer',
+        ELECTRON_SPEC_KEEP_RUNNING_INSTANCES: '1',
+      },
     );
     return;
   }

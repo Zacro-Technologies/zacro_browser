@@ -593,3 +593,24 @@ and no extra ai:ask. Restore normal publication before the remaining test.
 Run RED before the source change and GREEN after, followed by the affected
 polish file and static checks. Do not add sleeps or increase timeouts. Fresh
 scoped review follows the narrow commit.
+
+## Task 17: Bound the upstream native test harness side effects
+
+**Execution:** Root inline configuration, independent of extension source fixes.
+**Files:** scripts/build-electron-runtime.cjs, runtime/electron/README.md.
+
+Inspection of the pinned upstream runner before first native acceptance found
+that it unconditionally provisions a virtual printer (and sets it as default)
+and that Vitest global setup kills other processes using the same Electron
+executable. Its worker profile defaults to a persistent app-data path. None is
+needed by the selected Zacro capability specs.
+
+Configure this narrowly selected test phase with a unique profile directory
+inside the dedicated build root, the upstream keep-running-instances opt-out,
+and an explicit no-printer sentinel to skip printer provisioning. The sentinel
+is not an installed printer or a printing acceptance result. Preserve the real
+compiler, native spec selection, actual Electron worker, all capability checks
+and the worker pool's own child cleanup. Retain the unique profile root for
+diagnostics and document it. This is reversible harness configuration; no new
+mirrored tests are required. Run existing build-tool tests plus syntax/format
+and obtain scoped source review. Real native execution remains its later gate.
