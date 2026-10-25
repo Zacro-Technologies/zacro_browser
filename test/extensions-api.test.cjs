@@ -36,6 +36,7 @@ function setup(extra = {}) {
   const effects = [],
     events = [];
   const api = new ExtensionAPI({
+    grantActiveTab: async () => {},
     resolveExtension: (profile, extension) => (profile === 'p1' && extension === id ? metadata : null),
     tabs: {
       query: async (profile) => (profile === 'p1' ? structuredClone(data) : []),
@@ -686,4 +687,39 @@ test('F2 containment uses consistent Unicode units for astral path boundaries', 
     await api.call(context, 'permissions.contains', [{ origins: ['https://example.com/public/😀'] }]),
     false,
   );
+});
+
+test('native activeTab awaits the actual grant and rejects stock or navigation races', async () => {
+  let complete, entered;
+  const start = new Promise((resolve) => {
+    entered = resolve;
+  });
+  const native = new Promise((resolve) => {
+    complete = resolve;
+  });
+  const fixture = setup({
+    grantActiveTab: async () => {
+      entered();
+      await native;
+    },
+  });
+  const pending = fixture.api.activateAction('p1', id, 10);
+  await Promise.race([start, new Promise((resolve) => setTimeout(resolve, 20))]);
+  assert.equal((await fixture.api.call(fixture.context, 'tabs.get', [10])).url, undefined);
+  fixture.api.publish('p1', 'tabs.onUpdated', [10, { status: 'loading' }, fixture.data[0]]);
+  complete();
+  await assert.rejects(pending, /navigat/i);
+  assert.equal((await fixture.api.call(fixture.context, 'tabs.get', [10])).url, undefined);
+  const stock = setup({ grantActiveTab: undefined });
+  await stock.api.activateAction('p1', id, 10);
+  assert.equal((await stock.api.call(stock.context, 'tabs.get', [10])).url, undefined);
+});
+
+test('extensions cannot toggle local user scripts consent and native reductions clear temporary visibility', async () => {
+  const { api, context, metadata } = setup();
+  await assert.rejects(api.call(context, 'userScripts.setEnabled', [true]), /Unsupported API/);
+  await api.activateAction('p1', id, 10);
+  assert.ok((await api.call(context, 'tabs.get', [10])).url);
+  metadata.activeTabRevision = 1;
+  assert.equal((await api.call(context, 'tabs.get', [10])).url, undefined);
 });

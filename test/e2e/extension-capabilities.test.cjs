@@ -23,7 +23,7 @@ for (const capability of ['activeTab', 'brokerFailure', 'lazy', 'idleRace'])
     t.diagnostic(JSON.stringify(result));
     assert.equal(result.error, undefined);
     if (capability === 'activeTab') {
-      assert.equal(result.adapterAllowed, true);
+      assert.equal(result.adapterAllowed, false);
       assert.match(result.result.error, /permission|access/i);
     } else if (capability === 'brokerFailure') {
       assert.match(result.errorMessage, /transport unavailable/);

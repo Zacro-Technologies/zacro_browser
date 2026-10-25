@@ -104,6 +104,7 @@ test('approving an update that waits for page reload does not publish a user dis
       return action();
     },
     manager: {
+      capabilities: () => ({}),
       list: () => [record],
       approve: async () =>
         (record = { ...record, enabled: false, status: 'pending-reload', requiresPageReload: true }),
@@ -169,3 +170,110 @@ for (const remote of [false, true])
     assert.deepEqual(host.pendingPageReloads('p'), []);
     assert.equal(host.barriers.size, 0);
   });
+
+for (const successor of [false, true])
+  test(`profile change during native activeTab grant revokes only the original generation (successor ${successor})`, async () => {
+    const { ExtensionHost } = require('../src/main/extensions/host.cjs');
+    let finish, entered;
+    const gate = new Promise((resolve) => {
+        finish = resolve;
+      }),
+      start = new Promise((resolve) => {
+        entered = resolve;
+      });
+    let profile = 'p',
+      generation = 'original';
+    const disabled = [];
+    const host = Object.assign(Object.create(ExtensionHost.prototype), {
+      activeProfile: () => ({ id: profile }),
+      syncClient: () => ({ epoch: 1, guard: () => {} }),
+      api: { guard: () => {} },
+      manager: {
+        capabilities: () => ({ activeTab: true }),
+        resolveExtension: () => ({ enabled: true, generation }),
+        disable: async (...args) => disabled.push(args),
+      },
+      getSession: () => ({
+        extensions: {
+          grantZacroActiveTab: async () => {
+            entered();
+            await gate;
+          },
+        },
+      }),
+      report: () => {},
+    });
+    const pending = host.grantActiveTab(
+      { profileId: 'p', extensionId: 'a'.repeat(32), generation: 'original' },
+      7,
+    );
+    const rejected = assert.rejects(pending, /profile changed/i);
+    await start;
+    profile = 'other';
+    if (successor) generation = 'successor';
+    finish();
+    await rejected;
+    assert.equal(disabled.length, successor ? 0 : 1);
+  });
+
+test('trusted local user script control changes only local consent and rejects stale controls', async () => {
+  const { ExtensionHost } = require('../src/main/extensions/host.cjs');
+  const id = 'a'.repeat(32);
+  let record = {
+    id,
+    profileId: 'p',
+    generation: 'g',
+    enabled: true,
+    status: 'enabled',
+    source: { kind: 'local-unpacked' },
+    grants: { permissions: ['userScripts'], origins: [] },
+    current: {
+      manifest: { name: 'Scripts', version: '1', manifest_version: 3, permissions: ['userScripts'] },
+      verification: {},
+    },
+  };
+  let writes = 0;
+  const host = Object.assign(Object.create(ExtensionHost.prototype), {
+    activeProfile: () => ({ id: 'p' }),
+    started: Promise.resolve(),
+    restore: async () => {},
+    intents: () => [],
+    publish: () => {},
+    syncClient: () => ({
+      epoch: 1,
+      guard: () => {},
+      queueExtension: async () => {
+        throw Error('Local consent must not synchronize');
+      },
+    }),
+    operation: (_profile, _id, guard, action) => {
+      guard();
+      return action();
+    },
+    manager: {
+      capabilities: () => ({ reviewedPermissions: true, userScripts: true }),
+      list: () => [record],
+      setUserScriptsEnabled: async (profile, extension, enabled) => {
+        assert.equal(profile, 'p');
+        assert.equal(extension, id);
+        writes++;
+        record = { ...record, userScriptsEnabled: enabled };
+        return record;
+      },
+    },
+  });
+  const result = await host.handleLocal('extension:user-scripts-toggle', {
+    id,
+    profileId: 'p',
+    generation: 'g',
+  });
+  assert.equal(result.userScriptsAvailable, true);
+  assert.equal(result.userScriptsEnabled, true);
+  assert.equal(result.enabled, true);
+  assert.equal(writes, 1);
+  await assert.rejects(
+    host.handleLocal('extension:user-scripts-toggle', { id, profileId: 'p', generation: 'stale' }),
+    /changed/,
+  );
+  assert.equal(writes, 1);
+});

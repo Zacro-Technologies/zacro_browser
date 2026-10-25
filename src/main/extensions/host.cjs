@@ -13,19 +13,19 @@ const { parseStoreId } = require('./packages.cjs');
 const { matches, covers } = require('./permissions.cjs');
 const { inspectManifest } = require('./catalog.cjs');
 
-function publicRecord(record) {
+function publicRecord(record, capabilities = {}) {
   const version = record.pending || record.current,
     manifest = version?.manifest || {};
   let inspection = version?.inspection;
   try {
-    inspection = inspectManifest(manifest);
+    inspection = inspectManifest(manifest, capabilities);
   } catch {
     /* Retain the recorded diagnostic for invalid legacy metadata. */
   }
   let grantedInspection = inspection;
   if (record.current) {
     try {
-      grantedInspection = inspectManifest(record.current.manifest);
+      grantedInspection = inspectManifest(record.current.manifest, capabilities);
     } catch {}
   }
   return {
@@ -59,6 +59,9 @@ function publicRecord(record) {
     adapted: (version?.transformVersion || 0) > 0,
     requiresPageReload: record.requiresPageReload === true,
     canRollback: !!record.previous,
+    userScriptsAvailable:
+      capabilities.userScripts === true && record.grants?.permissions?.includes('userScripts'),
+    userScriptsEnabled: record.userScriptsEnabled === true,
     hasOptions: !!(manifest.options_ui?.page || manifest.options_page),
     hasAction: !!(manifest.action || manifest.browser_action),
     hasSidePanel: !!manifest.side_panel || record.grants?.permissions?.includes('sidePanel'),
@@ -190,6 +193,7 @@ class ExtensionHost {
       sidePanel: this.sidePanel,
       nativeMessaging: this.nativeMessaging,
       resolveExtension,
+      grantActiveTab: (context, tabId) => this.grantActiveTab(context, tabId),
       listExtensions: (profile) => this.manager.list(profile),
       tabs: browser.tabs,
       windows: browser.windows,
@@ -217,6 +221,7 @@ class ExtensionHost {
         guard();
         const epoch = this.syncClient().epoch;
         const ownership = () => {
+          guard();
           if (this.activeProfile()?.id !== profile) throw new Error('The active profile changed.');
           this.syncClient().guard(epoch);
         };
@@ -229,6 +234,35 @@ class ExtensionHost {
         publish();
       },
     });
+  }
+  async grantActiveTab(context, tabId) {
+    const epoch = this.syncClient().epoch;
+    const guard = () => {
+      this.api.guard(context);
+      this.syncClient().guard(epoch);
+      if (this.activeProfile()?.id !== context.profileId) throw new Error('The active profile changed.');
+    };
+    guard();
+    if (!this.manager.capabilities(context.profileId).activeTab)
+      throw new Error('Native activeTab unavailable');
+    await this.getSession(context.profileId).extensions.grantZacroActiveTab(context.extensionId, tabId);
+    try {
+      guard();
+    } catch (error) {
+      // No granular native revoke hook exists in ABI v1. Compensate only this
+      // still-living generation; never disable a replacement or another profile.
+      if (
+        this.manager.resolveExtension(context.profileId, context.extensionId)?.generation ===
+        context.generation
+      ) {
+        try {
+          await this.manager.disable(context.profileId, context.extensionId, { preservePages: true });
+        } catch (failure) {
+          this.report?.(failure);
+        }
+      }
+      throw error;
+    }
   }
   key(profile, id) {
     return JSON.stringify([profile, id]);
@@ -470,7 +504,7 @@ class ExtensionHost {
     const intents = this.intents(profileId),
       records = this.manager.list(profileId);
     const result = records.map((record) => {
-      const value = publicRecord(record),
+      const value = publicRecord(record, this.manager.capabilities(profileId)),
         intent = intents.find((item) => item.extension.extensionId === record.id);
       value.syncState =
         record.source.kind !== 'chrome-web-store'
@@ -509,6 +543,8 @@ class ExtensionHost {
           grants: { permissions: [], origins: [] },
           unsupported: [],
           hasAction: false,
+          userScriptsAvailable: false,
+          userScriptsEnabled: false,
           hasOptions: false,
         });
     return result;
@@ -826,6 +862,8 @@ class ExtensionHost {
             return previous?.enabled
               ? this.manager.disable(profile.id, id)
               : this.manager.enable(profile.id, id);
+          case 'extension:user-scripts-toggle':
+            return this.manager.setUserScriptsEnabled(profile.id, id, previous?.userScriptsEnabled !== true);
           case 'extension:remove':
             return this.manager.remove(profile.id, id);
           case 'extension:update':
@@ -901,7 +939,7 @@ class ExtensionHost {
         });
     }
     this.publish();
-    return record ? publicRecord(record) : null;
+    return record ? publicRecord(record, this.manager.capabilities(profile.id)) : null;
   }
   shortcut(input) {
     const shortcut = inputShortcut(input),

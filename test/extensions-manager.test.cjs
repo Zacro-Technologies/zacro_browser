@@ -21,12 +21,13 @@ const deferred = () => {
   return { promise, resolve, reject };
 };
 const keys = [keyPair()];
-function fixture(version = '1', permissions = ['storage']) {
+function fixture(version = '1', permissions = ['storage'], optionalPermissions = []) {
   const manifest = {
     manifest_version: 3,
     name: 'Synthetic',
     version,
     permissions,
+    optional_permissions: optionalPermissions,
     background: { service_worker: 'worker.js' },
   };
   const signed = crx(
@@ -64,6 +65,7 @@ async function setup(t, overrides = {}) {
       if (!sessions.has(id))
         sessions.set(id, {
           extensions: {
+            ...overrides.engine,
             async loadExtension(directory, opts) {
               const manifest = JSON.parse(await fs.readFile(path.join(directory, 'manifest.json'), 'utf8'));
               const extensionId = manifest.key
@@ -78,7 +80,7 @@ async function setup(t, overrides = {}) {
                 'metadata must exist before native load',
               );
               events.push(['load', id, extensionId, manifest.version]);
-              if (overrides.load) await overrides.load(directory);
+              if (overrides.load) await overrides.load(directory, opts);
               return { id: extensionId };
             },
             removeExtension(extensionId) {
@@ -1135,4 +1137,271 @@ test('R5 restore unloads native code if committing its new lifecycle generation 
   assert.equal(restored.list('p1')[0].enabled, false);
   assert.equal(restored.resolveExtension('p1', record.id), null);
   assert.ok(h.events.some((e) => e[0] === 'unload' && e[2] === record.id));
+});
+
+const nativeEngine = () => ({
+  getZacroCapabilities: () => ({
+    version: 1,
+    activeTab: true,
+    reviewedPermissions: true,
+    userScripts: true,
+    fontSettings: true,
+  }),
+  async grantZacroActiveTab() {},
+  async setZacroReviewedPermissions() {},
+  setZacroUserScriptsEnabled() {},
+  setZacroFontPreferences() {},
+  getZacroFontPreferences() {
+    return {};
+  },
+  async getZacroFontList() {
+    return [];
+  },
+});
+test('custom runtime loads original declarations with exact grants and preserves live generation during native permission updates', async (t) => {
+  const gate = deferred(),
+    started = deferred(),
+    calls = [];
+  const engine = nativeEngine();
+  engine.setZacroReviewedPermissions = async (...args) => {
+    calls.push(args);
+    started.resolve();
+    await gate.promise;
+  };
+  let initial;
+  const { manager, events } = await setup(t, {
+    engine,
+    load: async (directory, options) => {
+      initial = { manifest: JSON.parse(await fs.readFile(path.join(directory, 'manifest.json'))), options };
+    },
+  });
+  const local = path.join(await fs.mkdtemp(path.join(os.tmpdir(), 'zacro-native-')), 'extension');
+  t.after(() => fs.rm(path.dirname(local), { recursive: true, force: true }));
+  await fs.mkdir(local);
+  await fs.writeFile(
+    path.join(local, 'manifest.json'),
+    JSON.stringify({
+      name: 'Native',
+      version: '1',
+      manifest_version: 3,
+      permissions: ['storage', 'userScripts'],
+      optional_permissions: ['tabs'],
+      optional_host_permissions: ['https://example.com/*'],
+    }),
+  );
+  const installed = await manager.installLocal('p1', local);
+  assert.equal(installed.enabled, true);
+  assert.deepEqual(initial.manifest.optional_permissions, ['tabs']);
+  assert.deepEqual(initial.options.zacroReviewedPermissions, installed.grants);
+  const before = events.length;
+  const pending = manager.changePermissions('p1', installed.id, {
+    permissions: ['storage', 'tabs', 'userScripts'],
+    origins: [],
+  });
+  await started.promise;
+  assert.equal(manager.resolveExtension('p1', installed.id).generation, installed.generation);
+  assert.deepEqual(manager.list('p1')[0].grants, installed.grants);
+  gate.resolve();
+  const changed = await pending;
+  assert.equal(changed.generation, installed.generation);
+  assert.equal(events.length, before);
+  assert.deepEqual(manager.resolveExtension('p1', installed.id).grants, changed.grants);
+  assert.equal(calls.length, 1);
+});
+test('native user scripts require separate local consent and persist it before restart initialization', async (t) => {
+  const calls = [],
+    engine = nativeEngine();
+  engine.setZacroUserScriptsEnabled = (...args) => calls.push(args);
+  const { manager, options, setManager } = await setup(t, { engine });
+  const local = await fs.mkdtemp(path.join(os.tmpdir(), 'zacro-userscripts-'));
+  t.after(() => fs.rm(local, { recursive: true, force: true }));
+  await fs.writeFile(
+    path.join(local, 'manifest.json'),
+    JSON.stringify({ name: 'User scripts', version: '1', manifest_version: 3, permissions: ['userScripts'] }),
+  );
+  const record = await manager.installLocal('p1', local);
+  assert.equal(record.userScriptsEnabled, false);
+  assert.deepEqual(calls.at(-1), [record.id, false]);
+  await manager.setUserScriptsEnabled('p1', record.id, true);
+  assert.equal(manager.list('p1')[0].userScriptsEnabled, true);
+  await manager.close();
+  const restarted = new ExtensionManager(options);
+  setManager(restarted);
+  t.after(() => restarted.close());
+  await restarted.restore('p1');
+  assert.deepEqual(calls.at(-1), [record.id, true]);
+  assert.equal(restarted.list('p1')[0].userScriptsEnabled, true);
+});
+
+test('disable during native permission completion revokes immediately and a late callback cannot resurrect grants', async (t) => {
+  const gate = deferred(),
+    started = deferred(),
+    engine = nativeEngine();
+  engine.setZacroReviewedPermissions = async () => {
+    started.resolve();
+    await gate.promise;
+  };
+  const { manager, events } = await setup(t, {
+    engine,
+    fetchPackage: async () => fixture('1', ['storage'], ['tabs']),
+  });
+  const record = await manager.installStore('p1', fixture().id);
+  const pending = manager.changePermissions('p1', record.id, {
+    permissions: ['storage', 'tabs'],
+    origins: [],
+  });
+  const rejected = assert.rejects(pending, /cancel|Stale/i);
+  await started.promise;
+  const disabled = manager.disable('p1', record.id);
+  assert.equal(manager.resolveExtension('p1', record.id), null);
+  assert.equal(events.at(-1)[0], 'unload');
+  gate.resolve();
+  await rejected;
+  await disabled;
+  assert.equal(manager.list('p1')[0].enabled, false);
+  assert.deepEqual(manager.list('p1')[0].grants, record.grants);
+});
+test('runtime migration rederives verified original declarations and downgrade cannot retain native-only authority', async (t) => {
+  const h = await setup(t);
+  const record = await h.manager.installStore('p1', fixture().id);
+  const originalHash = record.current.originalSha256;
+  await h.manager.invalidateProfile('p1');
+  Object.assign(h.sessions.get('p1').extensions, nativeEngine());
+  await h.manager.restore('p1');
+  const migrated = h.manager.list('p1')[0];
+  assert.equal(migrated.current.nativeReviewedPermissions, true);
+  assert.notEqual(migrated.current.token, record.current.token);
+  assert.equal(migrated.current.originalSha256, originalHash);
+  assert.deepEqual(migrated.grants, record.grants);
+  await h.manager.invalidateProfile('p1');
+  delete h.sessions.get('p1').extensions.getZacroCapabilities;
+  await h.manager.restore('p1');
+  assert.equal(h.manager.list('p1')[0].current.nativeReviewedPermissions, false);
+  assert.deepEqual(h.manager.list('p1')[0].grants, record.grants);
+});
+test('historic copies without a verified original digest cannot migrate into native authority', async (t) => {
+  const h = await setup(t),
+    record = await h.manager.installStore('p1', fixture().id);
+  const filename = path.join(h.manager.profilePath('p1'), 'state.json');
+  const state = JSON.parse(await fs.readFile(filename));
+  delete state.extensions[0].current.originalSha256;
+  await fs.writeFile(filename, JSON.stringify(state));
+  await h.manager.invalidateProfile('p1');
+  Object.assign(h.sessions.get('p1').extensions, nativeEngine());
+  await h.manager.restore('p1');
+  assert.equal(h.manager.list('p1')[0].enabled, false);
+  assert.equal(h.manager.resolveExtension('p1', record.id), null);
+  assert.match(h.manager.list('p1')[0].error, /Reinstall/);
+});
+
+test('downgrade fails closed when a native-only optional permission was previously granted', async (t) => {
+  const h = await setup(t, {
+    engine: nativeEngine(),
+    fetchPackage: async () => fixture('1', ['storage'], ['userScripts']),
+  });
+  const record = await h.manager.installStore('p1', fixture().id);
+  await h.manager.changePermissions('p1', record.id, {
+    permissions: ['storage', 'userScripts'],
+    origins: [],
+  });
+  await h.manager.invalidateProfile('p1');
+  delete h.sessions.get('p1').extensions.getZacroCapabilities;
+  await h.manager.restore('p1');
+  assert.equal(h.manager.list('p1')[0].enabled, false);
+  assert.equal(h.manager.resolveExtension('p1', record.id), null);
+});
+
+test('native post-load initialization must finish before activation and failure unloads the runtime', async (t) => {
+  const started = deferred(),
+    gate = deferred();
+  const h = await setup(t, {
+    onNativeLoaded: async () => {
+      started.resolve();
+      await gate.promise;
+      throw Error('preference initialization failed');
+    },
+  });
+  const pending = h.manager.installStore('p1', fixture().id);
+  const rejected = assert.rejects(pending, /preference initialization/);
+  await Promise.race([started.promise, new Promise((resolve) => setTimeout(resolve, 30))]);
+  assert.equal(h.manager.list('p1').length, 0);
+  gate.resolve();
+  await rejected;
+  assert.equal(h.manager.resolveExtension('p1', fixture().id), null);
+  assert.equal(h.events.at(-1)[0], 'unload');
+});
+
+test('expired original caller during native permission await unloads and durably disables without granting rights', async (t) => {
+  let valid = true;
+  const gate = deferred(),
+    started = deferred(),
+    engine = nativeEngine();
+  engine.setZacroReviewedPermissions = async () => {
+    started.resolve();
+    await gate.promise;
+  };
+  const h = await setup(t, {
+    engine,
+    fetchPackage: async () => fixture('1', ['storage'], ['tabs']),
+    captureOperationGuard: () => () => {
+      if (!valid) throw Error('Original caller expired');
+    },
+  });
+  const record = await h.manager.installStore('p1', fixture().id);
+  const pending = h.manager.changePermissions('p1', record.id, {
+    permissions: ['storage', 'tabs'],
+    origins: [],
+  });
+  const rejected = assert.rejects(pending, /Original caller expired/);
+  await started.promise;
+  valid = false;
+  gate.resolve();
+  await rejected;
+  assert.equal(h.manager.resolveExtension('p1', record.id), null);
+  assert.equal(h.manager.list('p1')[0].enabled, false);
+  assert.deepEqual(h.manager.list('p1')[0].grants, record.grants);
+  const saved = JSON.parse(await fs.readFile(path.join(h.manager.profilePath('p1'), 'state.json')));
+  assert.equal(saved.extensions[0].enabled, false);
+});
+
+test('compensating native grant cancellation preserves page documents without asking to reload', async (t) => {
+  let reloads = 0;
+  const h = await setup(t, {
+    onDeactivated: async () => {
+      reloads++;
+      return { requiresPageReload: false };
+    },
+  });
+  const record = await h.manager.installStore('p1', fixture().id);
+  const disabled = await h.manager.disable('p1', record.id, { preservePages: true });
+  assert.equal(reloads, 0);
+  assert.equal(disabled.enabled, false);
+  assert.equal(disabled.requiresPageReload, true);
+  assert.equal(h.manager.resolveExtension('p1', record.id), null);
+});
+
+test('native callers can await committed manager readiness before reading startup extension state', async (t) => {
+  const started = deferred(),
+    gate = deferred();
+  t.after(() => gate.resolve());
+  const h = await setup(t, {
+    onNativeLoaded: async () => {
+      started.resolve();
+      await gate.promise;
+    },
+  });
+  const id = fixture().id,
+    pending = h.manager.installStore('p1', id);
+  await started.promise;
+  let ready = false;
+  const readiness = h.manager.whenReady('p1', id).then(() => {
+    ready = true;
+  });
+  await Promise.resolve();
+  assert.equal(ready, false);
+  assert.equal(h.manager.list('p1').length, 0);
+  gate.resolve();
+  await pending;
+  await readiness;
+  assert.equal(h.manager.list('p1')[0].enabled, true);
 });

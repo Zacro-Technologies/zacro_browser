@@ -120,8 +120,14 @@ class ExtensionAPI {
         actions: new Map(),
         active: new Map(),
         gesture: 0,
+        navigation: new Map(),
+        activeTabRevision: metadata.activeTabRevision,
       };
       this.states.set(key, state);
+    }
+    if (state.activeTabRevision !== metadata.activeTabRevision) {
+      state.active.clear();
+      state.activeTabRevision = metadata.activeTabRevision;
     }
     return state;
   }
@@ -254,7 +260,25 @@ class ExtensionAPI {
     this.guard(context);
     state.gesture = Date.now() + 5000;
     if (metadataSidePanel(context)) this.sidePanel?.recordGesture(context);
-    if (context.metadata.grants.permissions.includes('activeTab')) state.active.set(tabId, { url: tab.url });
+    if (
+      this.guard(context).grants.permissions.includes('activeTab') &&
+      typeof this.grantActiveTab === 'function'
+    ) {
+      const navigation = state.navigation.get(tabId),
+        revision = state.activeTabRevision;
+      await this.grantActiveTab(context, tabId);
+      this.guard(context);
+      const current = await this.tab(context, tabId);
+      const metadata = this.guard(context);
+      if (
+        !metadata.grants.permissions.includes('activeTab') ||
+        metadata.activeTabRevision !== revision ||
+        state.navigation.get(tabId) !== navigation ||
+        current.url !== tab.url
+      )
+        throw new Error('Tab navigated during native activeTab grant');
+      state.active.set(tabId, { url: tab.url });
+    }
     return tab;
   }
   async activateAction(profileId, id, tabId) {
@@ -353,12 +377,18 @@ class ExtensionAPI {
           let output = clone(args);
           if (event === 'tabs.onCreated') output = [this.sanitize(context, args[0])];
           if (event === 'tabs.onUpdated') {
-            if (args[1].status === 'loading' || Object.hasOwn(args[1], 'url')) state.active.delete(args[0]);
+            if (args[1].status === 'loading' || Object.hasOwn(args[1], 'url')) {
+              state.active.delete(args[0]);
+              state.navigation.set(args[0], Symbol('navigation'));
+            }
             output = [args[0], clone(args[1]), this.sanitize(context, args[2])];
             if (!this.allowed(context, args[2]))
               for (const key of ['url', 'title', 'favIconUrl']) delete output[1][key];
           }
-          if (event === 'tabs.onRemoved') state.active.delete(args[0]);
+          if (event === 'tabs.onRemoved') {
+            state.active.delete(args[0]);
+            state.navigation.set(args[0], Symbol('closed'));
+          }
           this.emit?.(profileId, state.extensionId, event, output);
         } catch {
           /* Revoked generations receive no events. */
@@ -718,6 +748,7 @@ class ExtensionAPI {
           grants,
           details,
           name === 'remove',
+          metadata.capabilities,
         );
         if (name === 'request') {
           if (state.gesture < Date.now()) throw new Error('Permission request requires a user gesture');
@@ -734,6 +765,7 @@ class ExtensionAPI {
         const result = await this.changePermissions(context.profileId, context.extensionId, next, () =>
           this.guard(context),
         );
+        if (metadata.capabilities?.reviewedPermissions) this.guard(context);
         const changed = Object.fromEntries(
           ['permissions', 'origins'].map((key) => [
             key,
@@ -749,8 +781,8 @@ class ExtensionAPI {
             name === 'remove' ? 'permissions.onRemoved' : 'permissions.onAdded',
             [changed],
           );
-        // Reload intentionally destroys the caller's generation. Its promise may
-        // disconnect; durable manager state is the authoritative completion.
+        // Native reviewed updates preserve the caller; the stock fallback may
+        // require a reload and reports its existing pending state explicitly.
         return result?.status !== 'pending-reload';
       }
     }

@@ -52,7 +52,10 @@ function compareVersions(a, b) {
   for (let i = 0; i < 4; i++) if (left[i] !== right[i]) return Math.sign(left[i] - right[i]);
   return 0;
 }
-function inspectManifest(manifest) {
+function inspectManifest(manifest, capabilities = {}) {
+  const supported = new Set(API_PERMISSIONS);
+  for (const name of ['activeTab', 'userScripts', 'fontSettings'])
+    if (capabilities[name] === true && capabilities.reviewedPermissions === true) supported.add(name);
   if (
     !manifest ||
     typeof manifest !== 'object' ||
@@ -96,7 +99,7 @@ function inspectManifest(manifest) {
     optional = make(optionalPermissions, optionalOrigins),
     unsupported = [];
   for (const permission of required.permissions)
-    if (!API_PERMISSIONS.has(permission))
+    if (!supported.has(permission))
       unsupported.push({
         capability: permission,
         required: true,
@@ -117,6 +120,16 @@ function inspectManifest(manifest) {
       required: true,
       reason: 'Native offscreen documents require Manifest V3.',
     });
+  for (const [requiredFlag, declarations] of [
+    [true, required],
+    [false, optional],
+  ])
+    if (manifest.manifest_version === 2 && declarations.permissions.includes('userScripts'))
+      unsupported.push({
+        capability: 'userScripts',
+        required: requiredFlag,
+        reason: 'Native user scripts require Manifest V3.',
+      });
   for (const origin of required.origins)
     if (!supportedHost(origin))
       unsupported.push({
@@ -125,7 +138,7 @@ function inspectManifest(manifest) {
         reason: 'Only HTTP and HTTPS host access is supported.',
       });
   for (const permission of optional.permissions)
-    if (!API_PERMISSIONS.has(permission))
+    if (!supported.has(permission))
       unsupported.push({
         capability: permission,
         required: false,

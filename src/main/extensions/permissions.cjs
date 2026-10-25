@@ -107,13 +107,16 @@ function permissionDetails(value) {
   }
   return out;
 }
-function optionalGrants(manifest, current, requested, remove = false) {
-  const inspection = inspectManifest({
-    name: 'Permission validation',
-    version: '1',
-    manifest_version: 3,
-    ...manifest,
-  });
+function optionalGrants(manifest, current, requested, remove = false, capabilities = {}) {
+  const inspection = inspectManifest(
+    {
+      name: 'Permission validation',
+      version: '1',
+      manifest_version: 3,
+      ...manifest,
+    },
+    capabilities,
+  );
   for (const key of ['permissions', 'origins'])
     for (const value of requested[key]) {
       if (

@@ -63,7 +63,7 @@ The adapter surface is deliberately bounded:
 | `runtime` | `openOptionsPage` | Declared own-extension page only; other runtime messaging stays native. |
 | `contextMenus` | `create`, `update`, `remove`, `removeAll`, click event and document `onclick` callbacks | Supported contexts/patterns and checkbox/radio groups; service workers use `onClicked`. Inline callbacks stay in their owning document. |
 | `commands` | `getAll`, command event, declared shortcut dispatch | Browser/system shortcuts keep priority; conflicts and unassigned commands are visible. |
-| `permissions` | `getAll`, `contains`, `request`, `remove`, added/removed events | Reviewed optional supported rights only; native manifest rebuild can disconnect the original caller. |
+| `permissions` | `getAll`, `contains`, `request`, `remove`, added/removed events | Reviewed optional supported rights only. ABI v1 updates the original living caller in place; stock native manifest rebuild can disconnect it. |
 
 These are implemented method boundaries, not proof of all Chrome overloads or
 all third-party extensions. The validation record identifies actual native
@@ -75,12 +75,15 @@ programmatic and registered scripting receive the compatibility bootstrap.
 Main-world scripts receive no privileged adapter. Native `webRequest` is not
 replaced by the browser's PDF detection; page content type is read on demand.
 
-Electron 45 cannot supply a native one-tab temporary `activeTab` grant through
-the host's extension action. Required `activeTab` is rejected before activation;
-optional `activeTab` cannot be granted. Zacro does not replace it with broad host
-permissions. MV2 native `scripting` is also unavailable. Native messaging,
-identity services, DNR/offscreen/userScripts and other absent engine features
-remain unsupported. `action.setIcon` accepts both packaged image paths and
+Stock Electron 45 rejects required `activeTab` and cannot grant optional
+`activeTab` or `userScripts`. The custom-runtime adapter negotiates actual native
+hooks before allowing these declarations, applies reviewed permissions without
+reloading the original caller, and provides separate local user script consent.
+Its positive custom-runtime acceptance remains outstanding. See
+[Native extension capability adapter](EXTENSION-NATIVE-CAPABILITIES.md) for the
+runtime, migration, cancellation and verification boundaries. MV2 native
+`scripting` and `userScripts` remain unavailable; provider account/token identity
+services still require provider support. `action.setIcon` accepts both packaged image paths and
 bounded ImageData, including size dictionaries. Extension-invoked `openPopup`
 opens the active tab's configured popup and replaces any existing action popup.
 

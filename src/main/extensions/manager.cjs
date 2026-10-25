@@ -7,6 +7,7 @@ const { parseStoreId, fetchStorePackage, extractArchive, idFromKey, LIMITS } = r
 const { inspectManifest, compareVersions, requiresReview } = require('./catalog.cjs');
 const { adaptExtension } = require('./adapt.cjs');
 const { NativeServices, needsNativeServices } = require('./native-services.cjs');
+const { negotiateEngineCapabilities } = require('./engine-capabilities.cjs');
 const SIX_HOURS = 6 * 60 * 60 * 1000;
 const hash = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex');
 const clone = (value) => structuredClone(value);
@@ -122,6 +123,7 @@ class ExtensionManager {
     onChange = () => {},
     captureOperationGuard = () => () => {},
     onDeactivated = async () => ({ requiresPageReload: true }),
+    onNativeLoaded = async () => {},
   }) {
     if (
       !root ||
@@ -145,6 +147,7 @@ class ExtensionManager {
       onChange,
       captureOperationGuard,
       onDeactivated,
+      onNativeLoaded,
     });
     this.states = new Map();
     this.preparedSessions = new WeakMap();
@@ -157,6 +160,15 @@ class ExtensionManager {
     this.restored = new Set();
     this.localEpochs = new Map();
     this.closed = false;
+  }
+  async whenReady(profileId, id) {
+    this._profile(profileId);
+    await this.queues.get(this._key(profileId, id));
+    this._profile(profileId);
+  }
+  capabilities(profileId) {
+    this._profile(profileId);
+    return negotiateEngineCapabilities(this.getSession(profileId));
   }
   profilePath(profileId) {
     if (typeof profileId !== 'string' || !profileId || profileId.length > 256)
@@ -328,10 +340,12 @@ class ExtensionManager {
       if (record.enabled && record.current) {
         try {
           await this._run(profileId, record.id, async (context) => {
-            await this._checkVersion(context, record.current);
-            await this._nativeLoad(context, record, record.current, record.grants);
+            const current = await this._runtimeVersion(context, record, record.current);
+            await this._checkVersion(context, current);
+            await this._nativeLoad(context, record, current, record.grants);
             this._guard(context);
-            this._save(context, { ...record, generation: context.generation });
+            this._save(context, { ...record, current, generation: context.generation });
+            await this._discard(context, record.current);
           });
         } catch (error) {
           guard();
@@ -363,7 +377,7 @@ class ExtensionManager {
     return this._run(profileId, entry.extensionId, async (context) => {
       await this._checkLegacyPath(entry.path);
       const manifest = await readManifest(entry.path),
-        inspection = inspectManifest(manifest);
+        inspection = inspectManifest(manifest, this.capabilities(profileId));
       this._guard(context);
       if (manifest.key && idFromKey(Buffer.from(manifest.key, 'base64')) !== entry.extensionId)
         throw new Error('Legacy public key does not match original native ID');
@@ -456,7 +470,7 @@ class ExtensionManager {
       } else await copyLocal(sourceDirectory, path.join(staging, 'original'), context.signal);
       this._guard(context);
       const manifest = await readManifest(path.join(staging, 'original')),
-        inspection = inspectManifest(manifest);
+        inspection = inspectManifest(manifest, this.capabilities(context.profileId));
       if (manifest.key && idFromKey(Buffer.from(manifest.key, 'base64')) !== context.id)
         throw new Error('Manifest key conflicts with verified extension identity');
       const adapted = await adaptExtension(path.join(staging, 'original'), path.join(staging, 'derived'), {
@@ -464,10 +478,13 @@ class ExtensionManager {
       });
       this._guard(context);
       // Optional rights start ungranted. Never let native Chrome grant them merely
-      // because the original manifest advertised them. A future permission change
-      // must rebuild this effective copy and unload/reload natively.
-      adapted.manifest.optional_permissions = [];
-      adapted.manifest.optional_host_permissions = [];
+      // because the original manifest advertised them. Stock runtimes require a
+      // reduced manifest; native runtimes enforce the exact privileged load option.
+      const nativeReviewedPermissions = this.capabilities(context.profileId).reviewedPermissions;
+      if (!nativeReviewedPermissions) {
+        adapted.manifest.optional_permissions = [];
+        adapted.manifest.optional_host_permissions = [];
+      }
       await fs.writeFile(
         path.join(staging, 'derived', 'manifest.json'),
         JSON.stringify(adapted.manifest, null, 2) + '\n',
@@ -482,6 +499,8 @@ class ExtensionManager {
         sha256: download?.sha256 || (await treeHash(path.join(staging, 'original'), context.signal)),
         verification: { signatureVerified: !!download, publisherVerified: !!download?.publisherVerified },
         transformVersion: adapted.transformVersion,
+        nativeReviewedPermissions,
+        originalSha256: await treeHash(path.join(staging, 'original'), context.signal),
         derivedSha256: await treeHash(path.join(staging, 'derived'), context.signal, true),
         createdAt: this.now(),
       };
@@ -520,6 +539,12 @@ class ExtensionManager {
         throw new Error('Legacy local extension changed; reinstall for review');
     } else {
       if (
+        version.originalSha256 &&
+        (await treeHash(this.versionPath(context.profileId, version, 'original'), context.signal)) !==
+          version.originalSha256
+      )
+        throw new Error('Original extension integrity check failed');
+      if (
         (await treeHash(
           this.versionPath(context.profileId, version),
           context.signal,
@@ -556,9 +581,45 @@ class ExtensionManager {
     }
     return session;
   }
+  async _runtimeVersion(context, record, version) {
+    const capabilities = this.capabilities(context.profileId);
+    const inspection = inspectManifest(version.manifest, capabilities);
+    if (!inspection.compatible)
+      throw new Error(
+        'Extension requires unsupported capabilities: ' +
+          inspection.unsupported
+            .filter((item) => item.required)
+            .map((item) => item.capability + ': ' + item.reason)
+            .join('; '),
+      );
+    const { covers } = require('./permissions.cjs');
+    for (const key of ['permissions', 'origins']) {
+      if (
+        inspection.required[key].some((value) => !covers(record.grants[key], value, key)) ||
+        record.grants[key].some(
+          (value) =>
+            !covers([...inspection.required[key], ...inspection.optional[key]], value, key) ||
+            inspection.unsupported.some((item) => item.capability === value),
+        )
+      )
+        throw new Error('Unsupported or undeclared persisted permission grants');
+    }
+    if (!!version.nativeReviewedPermissions === capabilities.reviewedPermissions)
+      return {
+        ...version,
+        inspection: version.inspection?.compatible === false ? version.inspection : inspection,
+      };
+    if (version.legacyPath || !version.originalSha256)
+      throw new Error('Reinstall extension to migrate verified original runtime declarations');
+    const migrated = await this._deriveGrants(context, record, version, record.grants);
+    return { ...migrated, inspection };
+  }
   async _nativeLoad(context, record, version, grants) {
     this._guard(context);
-    const currentInspection = inspectManifest(version.manifest);
+    const capabilities = this.capabilities(context.profileId);
+    if (!!version.nativeReviewedPermissions !== capabilities.reviewedPermissions)
+      throw new Error('Managed manifest requires runtime migration');
+    const currentInspection = inspectManifest(version.manifest, capabilities);
     if (version.inspection?.compatible !== true || !currentInspection.compatible)
       throw new Error(
         'Extension requires unsupported capabilities: ' +
@@ -571,11 +632,15 @@ class ExtensionManager {
     this._guard(context);
     const metadata = {
       enabled: true,
+      installedAt: record.installedAt,
       manifest: version.effectiveManifest || version.manifest,
       originalManifest: clone(version.manifest),
       grants: clone(grants),
       generation: context.generation,
       adapted: !version.legacyPath,
+      capabilities,
+      activeTabRevision: 0,
+      userScriptsEnabled: grants.permissions.includes('userScripts') && record.userScriptsEnabled === true,
     };
     this.runtime.set(context.key, metadata);
     let services;
@@ -605,14 +670,27 @@ class ExtensionManager {
       this._guard(context);
       const loaded = await session.extensions.loadExtension(
         version.legacyPath || this.versionPath(context.profileId, version),
-        { allowFileAccess: false },
+        {
+          allowFileAccess: false,
+          ...(capabilities.reviewedPermissions
+            ? {
+                zacroReviewedPermissions: clone(grants),
+                zacroUserScriptsEnabled:
+                  grants.permissions.includes('userScripts') && record.userScriptsEnabled === true,
+              }
+            : {}),
+        },
       );
       if (loaded.id !== record.id) {
         session.extensions.removeExtension(loaded.id);
         throw new Error('Native extension identity mismatch');
       }
       this._guard(context);
+      if (capabilities.userScripts && grants.permissions.includes('userScripts'))
+        session.extensions.setZacroUserScriptsEnabled(record.id, metadata.userScriptsEnabled);
       if (services) await services.initialize();
+      this._guard(context);
+      await this.onNativeLoaded(context.profileId, record.id);
       this._guard(context);
     } catch (error) {
       services?.close();
@@ -688,6 +766,7 @@ class ExtensionManager {
         enabled: true,
         status: 'enabled',
         grants: clone(grants),
+        userScriptsEnabled: grants.permissions.includes('userScripts') && record.userScriptsEnabled === true,
         generation: context.generation,
         error: null,
         requiresPageReload: needsReload,
@@ -771,6 +850,7 @@ class ExtensionManager {
       grants: { permissions: [], origins: [] },
       generation: context.generation,
       installedAt: this.now(),
+      userScriptsEnabled: false,
     };
     if (!version.inspection.compatible || !(await this._permission(context, 'install', version, null)))
       return this._save(context, record);
@@ -937,6 +1017,7 @@ class ExtensionManager {
     return this._run(profileId, id, async (context) => {
       const record = this._record(profileId, id);
       if (!record.current) throw new Error('Approve extension permissions before enabling');
+      record.current = await this._runtimeVersion(context, record, record.current);
       if (record.current.inspection?.compatible !== true)
         throw new Error('Extension requires unsupported capabilities');
       if (record.enabled) return record;
@@ -976,13 +1057,13 @@ class ExtensionManager {
     this.runtime.delete(this._key(profileId, id));
     this.getSession(profileId).extensions.removeExtension(id);
   }
-  disable(profileId, id) {
+  disable(profileId, id, { preservePages = false } = {}) {
     let record;
     return this._run(
       profileId,
       id,
       async (context) => {
-        const requiresPageReload = await this._unload(context, 'disable');
+        const requiresPageReload = preservePages ? true : await this._unload(context, 'disable');
         return this._save(context, { ...record, requiresPageReload });
       },
       (context) => {
@@ -1067,6 +1148,8 @@ class ExtensionManager {
     });
   }
   async _deriveGrants(context, record, original, grants) {
+    if (this.capabilities(context.profileId).reviewedPermissions && !original.originalSha256)
+      throw new Error('Reinstall extension to migrate verified original runtime declarations');
     await this._checkVersion(context, original);
     let version;
     try {
@@ -1076,13 +1159,15 @@ class ExtensionManager {
         source: record.source,
       });
       const manifest = version.effectiveManifest;
-      manifest.permissions = [
-        ...grants.permissions,
-        ...(manifest.manifest_version === 2 ? grants.origins : []),
-      ];
-      if (manifest.manifest_version === 3) manifest.host_permissions = grants.origins;
-      manifest.optional_permissions = [];
-      manifest.optional_host_permissions = [];
+      if (!version.nativeReviewedPermissions) {
+        manifest.permissions = [
+          ...grants.permissions,
+          ...(manifest.manifest_version === 2 ? grants.origins : []),
+        ];
+        if (manifest.manifest_version === 3) manifest.host_permissions = grants.origins;
+        manifest.optional_permissions = [];
+        manifest.optional_host_permissions = [];
+      }
       await fs.writeFile(
         path.join(this.versionPath(context.profileId, version), 'manifest.json'),
         JSON.stringify(manifest, null, 2) + '\n',
@@ -1127,6 +1212,55 @@ class ExtensionManager {
           throw new Error('Unsupported or undeclared permission');
       }
       if (JSON.stringify(grants) === JSON.stringify(record.grants)) return record;
+      if (this.capabilities(profileId).reviewedPermissions) {
+        if (!record.current.nativeReviewedPermissions)
+          throw new Error('Enable extension after runtime migration');
+        const live = this.runtime.get(context.key);
+        if (!live || live.generation !== record.generation) throw new Error('Stale native caller');
+        try {
+          await this.getSession(profileId).extensions.setZacroReviewedPermissions(id, clone(grants));
+          this._guard(context);
+          if (this.runtime.get(context.key) !== live) throw new Error('Stale native caller');
+          const saved = this._save(context, {
+            ...record,
+            grants,
+            userScriptsEnabled:
+              grants.permissions.includes('userScripts') && record.userScriptsEnabled === true,
+          });
+          if (reducedGrants(record.grants, grants)) live.activeTabRevision++;
+          live.grants = clone(grants);
+          live.userScriptsEnabled = saved.userScriptsEnabled;
+          if (this.capabilities(profileId).userScripts)
+            this.getSession(profileId).extensions.setZacroUserScriptsEnabled(id, saved.userScriptsEnabled);
+          return saved;
+        } catch (error) {
+          if (this.runtime.get(context.key) === live) {
+            this.runtime.delete(context.key);
+            this.getSession(profileId).extensions.removeExtension(id);
+            // The original document guard may have expired. Persist revocation
+            // only while this exact manager operation still owns the record;
+            // never overwrite a successor's disable, removal or reinstall.
+            if (
+              !this.closed &&
+              this.operations.get(context.key) === context &&
+              this.epochs.get(profileId) === context.epoch &&
+              this.states
+                .get(profileId)
+                ?.extensions.some((item) => item.id === id && item.generation === record.generation)
+            ) {
+              try {
+                this._persist(profileId, (state) => {
+                  const current = state.extensions.find((item) => item.id === id);
+                  current.enabled = false;
+                  current.status = 'load-failed';
+                  current.error = 'Native permission update cancelled or failed';
+                });
+              } catch {}
+            }
+          }
+          throw error;
+        }
+      }
       await this._checkVersion(context, record.current);
       let version;
       try {
@@ -1134,6 +1268,27 @@ class ExtensionManager {
         return await this._activate(context, record, version, { grants });
       } catch (error) {
         await this._discard(context, version);
+        throw error;
+      }
+    });
+  }
+  setUserScriptsEnabled(profileId, id, enabled) {
+    return this._run(profileId, id, async (context) => {
+      if (typeof enabled !== 'boolean') throw new Error('Invalid user scripts consent');
+      const record = this._record(profileId, id);
+      if (!this.capabilities(profileId).userScripts || !record.grants.permissions.includes('userScripts'))
+        throw new Error('Native user scripts permission unavailable');
+      const live = this.runtime.get(context.key);
+      if (record.enabled) {
+        if (!live || live.generation !== record.generation) throw new Error('Stale native caller');
+        this.getSession(profileId).extensions.setZacroUserScriptsEnabled(id, enabled);
+      }
+      try {
+        const saved = this._save(context, { ...record, userScriptsEnabled: enabled });
+        if (live) live.userScriptsEnabled = enabled;
+        return saved;
+      } catch (error) {
+        if (record.enabled) this.getSession(profileId).extensions.setZacroUserScriptsEnabled(id, false);
         throw error;
       }
     });
