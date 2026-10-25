@@ -28,6 +28,12 @@ Required permissions and undeclared
 or unsupported optional rights cannot be removed/granted. Stock Electron keeps
 its existing reduced-manifest/reload behavior.
 
+Committed removal of `nativeMessaging` immediately closes the extension's active
+and pending native connections. Later regrant cannot revive those connections.
+Native service initialization and delivery use effective grants, including
+optional permissions. A transition barrier updates the isolated service context
+without replacing the original extension caller.
+
 If the original requesting document expires, or a profile/lifecycle change
 invalidates an in-flight native operation, the adapter unloads that generation
 and persists a disabled state when it still owns the record. A later callback
@@ -69,6 +75,13 @@ give user script worlds Node or extension adapter credentials. Turning the
 toggle off prevents future runs; it cannot reverse a script's prior page changes.
 Manifest V2 user scripts remain unsupported.
 
+Permanent removal also awaits `resetZacroExtensionState`, which clears native
+registrations and their persistent matching metadata. A durable cleanup marker
+blocks same-ID native reinstallation until this completes, including after a
+failed cleanup, browser restart or temporary downgrade to stock Electron.
+Disabling or restarting an installed extension preserves its registrations.
+Runtimes missing the reset hook fail capability negotiation.
+
 ## Focused verification
 
 ```sh
@@ -86,5 +99,7 @@ On a custom runtime the fixture checks actual native scripting access to only
 the invoked tab, a same-origin negative tab, navigation/disable revocation,
 optional permission completion in the original living page, native network
 access/removal, preservation of unsaved page data, and separate user script
-worlds, local consent, restart persistence and disabled future execution.
+worlds, local consent, restart persistence, disabled future execution and clean
+same-ID reinstallation. The optional-native-services fixture additionally covers
+live permission transitions, worker wake and persistence across a process restart.
 These positive assertions remain unrun until a built custom binary is available.

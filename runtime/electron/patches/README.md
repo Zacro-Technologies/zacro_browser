@@ -52,6 +52,13 @@ session/extension/tab identity and reject invalid input.
   Registered scripts survive normal process restart. The application must pass
   its persisted reviewed consent at each managed load. This method does not
   reverse effects of scripts that already ran.
+- `resetZacroExtensionState(extensionId): Promise<void>` permanently removes
+  dynamic script registrations, persistent matching metadata and native user
+  script consent. It requires an unloaded extension in a non-private profile
+  and rejects a concurrent permission update. Resolution awaits the script
+  store roundtrip and preference write completion. Use it for permanent removal;
+  normal disable, reload and restart preserve registrations. ABI negotiation
+  requires this hook even when the reported capability version is 1.
 - `setZacroFontPreferences(overrides): void` atomically validates and replaces
   the profile override map, updates existing contents, and applies to new
   contents through native Blink WebPreferences. `{}` restores native defaults.
@@ -84,6 +91,8 @@ cancellation; living-caller permission changes and broad-optional/narrow-require
 revocation; pre-load stale rights; user-script world isolation, disabling, and
 actual process restart with stale consent disabled; font metrics, explicit CSS,
 profile isolation, new contents, getter values and default restoration.
+Permanent removal additionally requires same-ID reinstall and separate-process
+restart checks proving that removed registrations cannot return.
 
 Additional packaged Windows/x64/arm64 runs, artifact hashes/signing and real
 application identity/consent integration remain mandatory release gates.

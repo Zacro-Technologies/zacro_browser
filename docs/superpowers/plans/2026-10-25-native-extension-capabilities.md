@@ -287,6 +287,9 @@ grantZacroActiveTab(extensionId,webContentsId) => Promise<void> after native
 network/render dispatch; setZacroReviewedPermissions(extensionId, fullSet) =>
 Promise<void> with exact full reviewed permissions/origins;
 setZacroUserScriptsEnabled(extensionId,bool) => void;
+resetZacroExtensionState(extensionId) => Promise<void> clears permanent native
+script state for an unloaded extension and awaits durable completion; required
+by ABI negotiation so older custom runtimes cannot bypass uninstall cleanup;
 loadExtension(path,{zacroReviewedPermissions:fullSet}) validates/applies exact
 initial active/granted set BEFORE registration/worker/content scripts. Native
 permissions.request direct IPC is denied. Original required+optional manifest
