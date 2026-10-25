@@ -1,4 +1,5 @@
 import { createSpaceGesture } from './space-gesture.js';
+import { deriveSpaceTheme } from './theme.js';
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -8,6 +9,13 @@ const esc = (value = '') =>
     (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c],
   );
 const icons = {
+  circle: 'M20 12a8 8 0 1 1-16 0 8 8 0 0 1 16 0',
+  briefcase: 'M3 7h18v14H3zM8 7V3h8v4M3 12h18M10 12v3h4v-3',
+  home: 'm3 10 9-7 9 7M5 9v12h14V9M9 21v-8h6v8',
+  code: 'm8 6-6 6 6 6M16 6l6 6-6 6M14 3l-4 18',
+  book: 'M12 5v16M12 5C8 2 4 3 2 4v16c4-2 7-1 10 1 3-2 6-3 10-1V4c-2-1-6-2-10 1',
+  leaf: 'M20 3C10 2 3 7 4 14c1 7 12 8 15-2 1-3 1-6 1-9M4 21l11-12',
+  music: 'M9 18V5l12-3v13M9 8l12-3M9 18a3 3 0 1 1-6 0 3 3 0 0 1 6 0M21 15a3 3 0 1 1-6 0 3 3 0 0 1 6 0',
   plus: 'M12 5v14M5 12h14',
   layers: 'm12 3 10 6-10 6L2 9zM2 13l10 6 10-6M2 17l10 6 10-6',
   sidebar: 'M3 4h18v16H3zM9 4v16',
@@ -108,6 +116,26 @@ const colors = [
   ['clay', '#a56545'],
   ['lavender', '#786298'],
   ['slate', '#59646e'],
+  ['rose', '#cf667d'],
+  ['amber', '#b68535'],
+  ['mint', '#4f9485'],
+  ['sky', '#6192bd'],
+  ['orchid', '#a466b5'],
+  ['ink', '#353d60'],
+];
+const spaceIcons = [
+  'circle',
+  'briefcase',
+  'home',
+  'code',
+  'book',
+  'leaf',
+  'star',
+  'heart',
+  'globe',
+  'coffee',
+  'music',
+  'moon',
 ];
 let state = null;
 let toastTimer;
@@ -121,6 +149,7 @@ const ui = {
   commandIndex: 0,
   commandMode: 'navigate',
   commandItems: [],
+  commandFilter: 'all',
   commandAuto: false,
   commandBusy: false,
   blankPaletteContext: null,
@@ -137,6 +166,10 @@ const ui = {
   aiSources: [],
   aiContext: 'research',
   aiTabs: [],
+  aiGrantedPages: [],
+  aiDraft: '',
+  aiRequestId: null,
+  aiContextSerial: 0,
   downloadSuggestions: new Map(),
   aiStatus: null,
   aiProfileId: null,
@@ -175,25 +208,194 @@ const sidebarScroll = new Map();
 const spaceGesture = createSpaceGesture();
 let spaceGestureTimer;
 let spaceGesturePending = false;
-function resetSpaceFeedback() {
+let spaceGestureFeedback = null;
+let spaceTransition = null;
+function clearSpaceTransition() {
+  const previous = spaceTransition;
+  spaceTransition = null;
+  previous?.incoming?.cancel();
+  previous?.outgoing?.cancel();
+  previous?.wrapper?.remove();
+}
+function resetSpaceFeedback({ animate = false, preserveTransition = false, duration = 140 } = {}) {
   const list = $('.tabs-scroll');
+  const offset = spaceGestureFeedback?.offset || 0;
+  spaceGestureFeedback = null;
   if (list) {
     list.style.removeProperty('transform');
     list.style.removeProperty('opacity');
+    list.style.removeProperty('visibility');
     list.classList.remove('gesture-tracking');
+    if (animate && offset)
+      motion(list, [{ transform: `translateX(${offset}px)` }, { transform: 'translateX(0)' }], duration);
   }
   const preview = $('#space-gesture-preview');
   if (preview) preview.hidden = true;
+  if (!preserveTransition) clearSpaceTransition();
 }
-function interruptSpaceScroll() {
+function interruptSpaceScroll({ preserveTransition = false } = {}) {
   clearTimeout(spaceGestureTimer);
   spaceGesture.interrupt(performance.now());
-  resetSpaceFeedback();
+  resetSpaceFeedback({ preserveTransition });
+}
+function paintSpaceFeedback(result) {
+  const list = $('.tabs-scroll');
+  if (!spaceGestureFeedback) {
+    clearSpaceTransition();
+    elementMotions.get(list)?.cancel();
+  }
+  spaceGestureFeedback = { ...result, profileId: activeProfile()?.id, spaceId: state.activeSpaceId };
+  if (list) {
+    list.classList.add('gesture-tracking');
+    list.style.transform = `translateX(${result.offset}px)`;
+    list.style.opacity = String(1 - result.progress * 0.1);
+  }
+  const spaces = state.spaces.filter((space) => space.profileId === activeProfile()?.id);
+  const next = spaces[result.targetIndex];
+  const preview = $('#space-gesture-preview');
+  if (preview) {
+    preview.hidden = !next;
+    if (next) preview.innerHTML = `${icon(next.icon || 'circle')}<span>${esc(next.name)}</span>`;
+  }
+}
+function prepareSpaceTransition(nextId, result, gesture = false) {
+  clearSpaceTransition();
+  const list = $('.tabs-scroll');
+  const record = {
+    ...result,
+    gesture,
+    fromSpaceId: ui.sidebarSpaceId,
+    toSpaceId: nextId,
+    profileId: activeProfile()?.id,
+  };
+  spaceTransition = record;
+  if (!list || reducedMotion.matches) return record;
+  const bounds = list.getBoundingClientRect();
+  const wrapper = document.createElement('div');
+  wrapper.className = 'space-transition-snapshot';
+  wrapper.setAttribute('aria-hidden', 'true');
+  wrapper.inert = true;
+  Object.assign(wrapper.style, {
+    position: 'fixed',
+    left: `${bounds.left - result.fromOffset}px`,
+    top: `${bounds.top}px`,
+    width: `${list.clientWidth}px`,
+    height: `${list.clientHeight}px`,
+    overflow: 'hidden',
+    pointerEvents: 'none',
+    zIndex: '40',
+  });
+  const snapshot = list.cloneNode(true);
+  snapshot.classList.remove('tabs-scroll', 'gesture-tracking');
+  for (const node of [snapshot, ...snapshot.querySelectorAll('*')]) {
+    for (const attribute of [...node.attributes])
+      if (attribute.name === 'id' || attribute.name.startsWith('data-')) node.removeAttribute(attribute.name);
+    node.removeAttribute('draggable');
+  }
+  Object.assign(snapshot.style, {
+    width: '100%',
+    height: '100%',
+    overflow: 'hidden',
+    opacity: '1',
+    visibility: 'visible',
+    padding: getComputedStyle(list).padding,
+    transform: `translateX(${result.fromOffset}px)`,
+  });
+  wrapper.append(snapshot);
+  document.body.append(wrapper);
+  snapshot.scrollTop = list.scrollTop;
+  record.wrapper = wrapper;
+  record.snapshot = snapshot;
+  list.style.visibility = 'hidden';
+  return record;
+}
+function finishSpaceTransition(record, animation) {
+  if (spaceTransition === record && record.incoming === animation) clearSpaceTransition();
+}
+function animateSpaceTransition(
+  record,
+  offset = record.direction * record.travel + record.fromOffset,
+  duration = record.duration,
+) {
+  const list = $('.tabs-scroll');
+  if (!list || spaceTransition !== record) return;
+  list.style.removeProperty('visibility');
+  record.incomingDuration = duration;
+  record.incoming = motion(
+    list,
+    [{ transform: `translateX(${offset}px)` }, { transform: 'translateX(0)' }],
+    duration,
+  );
+  if (!record.outgoing && record.snapshot)
+    record.outgoing = motion(
+      record.snapshot,
+      [
+        { transform: `translateX(${record.fromOffset}px)` },
+        { transform: `translateX(${-record.direction * record.travel}px)` },
+      ],
+      record.duration,
+    );
+  const animation = record.incoming;
+  if (!animation) clearSpaceTransition();
+  else animation.finished.then(() => finishSpaceTransition(record, animation)).catch(() => {});
+}
+function captureSpacePresentation() {
+  const record = spaceTransition;
+  const list = $('.tabs-scroll');
+  if (record?.incoming?.playState !== 'running' || !list) return null;
+  const timing = record.incoming.effect.getComputedTiming();
+  return {
+    record,
+    offset: new DOMMatrix(getComputedStyle(list).transform).m41,
+    duration:
+      record.incomingDuration *
+      Math.max(0, 1 - Number(record.incoming.currentTime || 0) / Number(timing.duration)),
+  };
+}
+function restoreSpacePresentation(presentation) {
+  if (spaceTransition?.fromSpaceId === state.activeSpaceId && $('.tabs-scroll'))
+    $('.tabs-scroll').style.visibility = 'hidden';
+  else if (
+    spaceGestureFeedback?.spaceId === state.activeSpaceId &&
+    spaceGestureFeedback.profileId === activeProfile()?.id
+  )
+    paintSpaceFeedback(spaceGestureFeedback);
+  else if (presentation?.record === spaceTransition && spaceTransition.toSpaceId === state.activeSpaceId)
+    animateSpaceTransition(spaceTransition, presentation.offset, presentation.duration);
+}
+function handleSpaceGesture(result) {
+  clearTimeout(spaceGestureTimer);
+  if (result.idleDelay) spaceGestureTimer = setTimeout(settleSpaceGesture, result.idleDelay);
+  if (['tracking', 'edge'].includes(result.phase)) paintSpaceFeedback(result);
+  if (result.phase === 'settling') resetSpaceFeedback({ animate: true, duration: result.duration });
+  if (result.phase === 'idle' && spaceGestureFeedback) resetSpaceFeedback({ animate: true });
+  if (!result.commit) return;
+  const spaces = state?.spaces.filter((space) => space.profileId === activeProfile()?.id) || [];
+  const next = spaces[result.targetIndex];
+  if (
+    !next ||
+    result.contextKey !== activeProfile()?.id ||
+    result.originIndex !== spaces.findIndex((space) => space.id === state.activeSpaceId)
+  ) {
+    interruptSpaceScroll();
+    return;
+  }
+  prepareSpaceTransition(next.id, result, true);
+  spaceGesturePending = true;
+  $('#live-region').textContent = `Switching to ${next.name}`;
+  safely(
+    invoke('space:activate', { id: next.id })
+      .catch((error) => {
+        interruptSpaceScroll();
+        throw error;
+      })
+      .finally(() => {
+        spaceGesturePending = false;
+      }),
+  );
 }
 function settleSpaceGesture() {
-  const result = spaceGesture.settle(performance.now());
-  if (result.idleDelay) spaceGestureTimer = setTimeout(settleSpaceGesture, result.idleDelay);
-  else resetSpaceFeedback();
+  handleSpaceGesture(spaceGesture.settle(performance.now()));
 }
 function onSpaceScroll(event) {
   const sidebar = $('#sidebar');
@@ -209,6 +411,9 @@ function onSpaceScroll(event) {
     buttons: event.buttons,
     defaultPrevented: event.defaultPrevented,
     momentum: typeof event.momentum === 'boolean' ? event.momentum : undefined,
+    phase: ['began', 'begin', 'changed', 'ended', 'end', 'cancelled'].includes(event.phase)
+      ? event.phase
+      : undefined,
     time: performance.now(),
     width: sidebar.clientWidth,
     index: spaces.findIndex((space) => space.id === state?.activeSpaceId),
@@ -226,34 +431,9 @@ function onSpaceScroll(event) {
       ),
   });
   if (result.preventDefault) event.preventDefault();
-  clearTimeout(spaceGestureTimer);
-  if (result.idleDelay) spaceGestureTimer = setTimeout(settleSpaceGesture, result.idleDelay);
-  if (['tracking', 'edge'].includes(result.phase)) {
-    const list = $('.tabs-scroll');
-    list?.classList.add('gesture-tracking');
-    if (list) {
-      list.style.transform = `translateX(${result.offset}px)`;
-      list.style.opacity = String(1 - result.progress * 0.15);
-    }
-    const preview = $('#space-gesture-preview');
-    const next = spaces[result.targetIndex];
-    if (preview) {
-      preview.hidden = !next;
-      if (next)
-        preview.innerHTML = `${icon(result.direction > 0 ? 'forward' : 'back')}<span>${esc(next.name)}</span>`;
-    }
-  } else if (result.phase !== 'committed') resetSpaceFeedback();
-  if (result.commit && spaces[result.targetIndex]) {
-    spaceGesturePending = true;
-    const next = spaces[result.targetIndex];
-    $('#live-region').textContent = `Switching to ${next.name}`;
-    safely(
-      invoke('space:activate', { id: next.id }).finally(() => {
-        spaceGesturePending = false;
-        resetSpaceFeedback();
-      }),
-    );
-  }
+  if (['blocked', 'vertical'].includes(result.phase) && spaceGestureFeedback && !spaceGesturePending)
+    resetSpaceFeedback();
+  handleSpaceGesture(result);
 }
 function hostname(url) {
   try {
@@ -361,14 +541,17 @@ function showPageBackdrop(frames) {
     picture.alt = '';
     picture.draggable = false;
     picture.src = frame.dataUrl;
-    Object.assign(picture.style, {
+    const clip = document.createElement('div');
+    clip.className = 'page-backdrop-frame';
+    Object.assign(clip.style, {
       left: `${bounds.x}px`,
       top: `${bounds.y}px`,
       width: `${bounds.width}px`,
       height: `${bounds.height}px`,
     });
     picture.addEventListener('error', () => picture.remove(), { once: true });
-    root.append(picture);
+    clip.append(picture);
+    root.append(clip);
   }
   root.hidden = !root.children.length;
 }
@@ -385,7 +568,7 @@ function motion(element, frames, duration = 140) {
   elementMotions.get(element)?.cancel();
   if (!element || reducedMotion.matches || !element.animate) return null;
   const animation = element.animate(frames, {
-    duration,
+    duration: duration * (state?.settings.motionScale || 1),
     easing: 'cubic-bezier(.16,1,.3,1)',
     fill: 'none',
   });
@@ -451,28 +634,47 @@ function setTheme() {
   const theme = state.settings.theme;
   const dark = theme === 'dark' || (theme === 'system' && matchMedia('(prefers-color-scheme: dark)').matches);
   document.documentElement.dataset.theme = dark ? 'dark' : 'light';
-  const base = activeSpace()?.color;
+  const space = ui.themePreview || activeSpace();
+  const base = space?.color;
+  const material = space?.theme || {};
+  const root = document.documentElement;
+  root.dataset.tabDensity = state.settings.tabDensity || 'comfortable';
+  root.style.setProperty('--page-gutter', `${state.settings.pageGutter ?? 8}px`);
+  root.style.setProperty('--page-radius', `${state.settings.pageRadius ?? 12}px`);
+  root.style.setProperty('--sidebar-expanded', `${state.settings.sidebarWidth || 224}px`);
+  root.style.setProperty(
+    '--space-secondary',
+    /^#[\da-f]{6}$/i.test(material.secondaryColor || '') ? material.secondaryColor : base || '#786298',
+  );
+  root.style.setProperty('--space-gradient', `${material.gradient ?? 50}%`);
+  const tones = deriveSpaceTheme({
+    color: base,
+    secondaryColor: material.secondaryColor,
+    dark,
+    grain: material.grain,
+  });
+  for (const [token, key] of [
+    ['--chrome', 'chrome'],
+    ['--space-tint-primary', 'tintPrimary'],
+    ['--space-tint-secondary', 'tintSecondary'],
+    ['--hover', 'hover'],
+    ['--accent', 'accent'],
+    ['--accent-soft', 'accentSoft'],
+    ['--space-grain', 'grainOpacity'],
+  ])
+    root.style.setProperty(token, String(tones[key]));
+  root.style.setProperty('--space-opacity', `${material.opacity ?? 100}%`);
+  root.style.setProperty('--space-blur', `${material.blur || 0}px`);
+  for (const [name, duration] of [
+    ['fast', 100],
+    ['base', 160],
+    ['enter', 180],
+  ])
+    root.style.setProperty(`--motion-${name}`, `${duration * (state.settings.motionScale || 1)}ms`);
   document.documentElement.style.setProperty(
     '--space-color',
     /^#[\da-f]{6}$/i.test(base || '') ? base : '#9d4460',
   );
-  if (/^#[\da-f]{6}$/i.test(base || '')) {
-    const rgb = [1, 3, 5].map((i) => parseInt(base.slice(i, i + 2), 16));
-    if (dark) {
-      const light = rgb.map((v) => Math.round(v * 0.52 + 255 * 0.48));
-      document.documentElement.style.setProperty('--accent', `rgb(${light.join(',')})`);
-      document.documentElement.style.setProperty(
-        '--accent-soft',
-        `rgb(${rgb.map((v) => Math.round(v * 0.35 + 25)).join(',')})`,
-      );
-    } else {
-      document.documentElement.style.setProperty('--accent', base);
-      document.documentElement.style.setProperty(
-        '--accent-soft',
-        `rgb(${rgb.map((v) => Math.round(v * 0.15 + 255 * 0.85)).join(',')})`,
-      );
-    }
-  }
 }
 function applyState(next) {
   if (!next?.profiles || !next?.tabs) return;
@@ -480,6 +682,8 @@ function applyState(next) {
   const previousSpace = state?.activeSpaceId;
   const previousTab = state?.activeTabId;
   state = next;
+  if (ui.themePreview && (previousSpace !== state.activeSpaceId || previousProfile !== activeProfile()?.id))
+    closeDialog({ restore: false });
   if (ui.commandAuto && ui.dialog === 'command' && !isBlankPage()) closeDialog({ restore: false });
   if (!isBlankPage()) ui.blankPaletteContext = null;
   document.documentElement.dataset.fullscreen = String(Boolean(state.runtime?.fullScreen));
@@ -496,6 +700,10 @@ function applyState(next) {
     ui.aiMessages = [];
     ui.aiSources = [];
     ui.aiTabs = [];
+    ui.aiGrantedPages = [];
+    ui.aiDraft = '';
+    ui.aiContextSerial++;
+    ui.aiContextChanging = false;
     ui.aiBusy = false;
     ui.aiProgress = '';
     ui.aiContext = 'research';
@@ -524,27 +732,22 @@ function applyState(next) {
   render();
   maybeOpenBlankPalette();
   if (previousSpace && previousSpace !== state.activeSpaceId) {
-    interruptSpaceScroll();
+    const transition = spaceTransition?.toSpaceId === state.activeSpaceId ? spaceTransition : null;
+    interruptSpaceScroll({ preserveTransition: Boolean(transition) });
     const spaces = state.spaces.filter((space) => space.profileId === activeProfile()?.id);
     const previousIndex = spaces.findIndex((space) => space.id === previousSpace);
     const nextIndex = spaces.findIndex((space) => space.id === state.activeSpaceId);
     const direction = previousIndex < 0 ? 1 : Math.sign(nextIndex - previousIndex);
-    motion(
-      $('.space-header'),
-      [
-        { opacity: 0.65, transform: 'translateY(2px)' },
-        { opacity: 1, transform: 'translateY(0)' },
-      ],
-      120,
-    );
-    motion(
-      $('.tabs-scroll'),
-      [
-        { opacity: 0.45, transform: `translateX(${direction * 10}px)` },
-        { opacity: 1, transform: 'translateX(0)' },
-      ],
-      150,
-    );
+    if (transition) animateSpaceTransition(transition);
+    else
+      motion(
+        $('.tabs-scroll'),
+        [
+          { opacity: 0.65, transform: `translateX(${direction * $('#sidebar').clientWidth}px)` },
+          { opacity: 1, transform: 'translateX(0)' },
+        ],
+        220,
+      );
     motion(
       $('.newtab-inner'),
       [
@@ -591,6 +794,9 @@ function renderSidebar() {
       state.runtime?.pages?.[tab.id]?.audible,
       state.runtime?.pages?.[tab.id]?.muted,
       state.runtime?.pages?.[tab.id]?.favicon,
+      state.runtime?.pages?.[tab.id]?.loaded,
+      state.runtime?.pages?.[tab.id]?.sleeping,
+      state.runtime?.pages?.[tab.id]?.closed,
     ]),
     state.runtime?.splitTabId,
   ]);
@@ -605,13 +811,36 @@ function renderSidebar() {
   );
   const previousActive = $('[data-tab-id].active', $('#sidebar'))?.dataset.tabId;
   const sameSpace = ui.sidebarSpaceId === space?.id;
+  const presentation = sameSpace ? captureSpacePresentation() : null;
+  if (!sameSpace && ui.sidebarSpaceId && spaceTransition?.toSpaceId !== space?.id) {
+    const spaces = state.spaces.filter((item) => item.profileId === profile?.id);
+    const from = spaces.findIndex((item) => item.id === ui.sidebarSpaceId);
+    const to = spaces.findIndex((item) => item.id === space?.id);
+    if (from >= 0 && to >= 0)
+      prepareSpaceTransition(space.id, {
+        direction: Math.sign(to - from),
+        travel: $('#sidebar').clientWidth,
+        fromOffset: 0,
+        duration: 220,
+      });
+    else clearSpaceTransition();
+  }
   const tabRow = (tab) => {
     const page = state.runtime?.pages?.[tab.id];
     return `<div class="tab-row ${tab.id === state.activeTabId ? 'active' : ''}" draggable="true" data-tab-id="${esc(tab.id)}" data-drop-tab="${esc(tab.id)}"><button type="button" class="tab-main" data-action="tab:activate" data-id="${esc(tab.id)}" data-key="tab-${esc(tab.id)}" ${tab.id === state.activeTabId ? 'aria-current="page"' : ''} title="${esc(tab.title)} — ${esc(tab.url)}">${page?.loading ? '<span class="spinner"></span>' : favicon(tab.url)}<span class="title">${esc(tab.title || 'New tab')}</span>${state.runtime?.splitTabId === tab.id ? icon('split') : ''}</button>${page?.audible || page?.muted ? button('tab:mute', page.muted ? 'Unmute tab' : 'Mute tab', page.muted ? 'muted' : 'volume', `data-id="${esc(tab.id)}"`, 'tab-audio') : ''}${button('tab:close', `Close ${tab.title || 'tab'}`, 'close', `data-id="${esc(tab.id)}" data-key="close-${esc(tab.id)}"`, 'tab-close')}</div>`;
   };
-  $('#sidebar-content').innerHTML =
-    `${pins.length ? `<div class="favorites" aria-label="Pinned tabs" data-drop-pinned>${pins.map((tab) => `<button type="button" class="favorite ${tab.id === state.activeTabId ? 'active' : ''}" draggable="true" data-tab-id="${esc(tab.id)}" data-drop-tab="${esc(tab.id)}" data-action="tab:activate" data-id="${esc(tab.id)}" data-key="pin-${esc(tab.id)}" ${tab.id === state.activeTabId ? 'aria-current="page"' : ''} aria-label="${esc(tab.title || hostname(tab.url))}" title="${esc(tab.title)} — ${esc(tab.url)}">${favicon(tab.url, tab.id)}</button>`).join('')}</div>` : '<div class="favorites favorites-empty" aria-label="Pinned tabs" data-drop-pinned><span class="pin-drop-hint">Drop to pin</span></div>'}<div class="tabs-scroll">
-    <div class="space-header"><button type="button" class="space-picker" data-action="ui:spaces" data-key="space-picker" aria-label="Switch Space or profile" title="${esc(space?.name)} · ${esc(profile?.name)}${profile?.private ? ' · Private session' : ''}">${profile?.private ? icon('shield') : '<span class="space-color" aria-hidden="true"></span>'}<span class="space-title">${esc(space?.name || 'My Space')}</span>${profile?.private ? '<span class="private-indicator">Private</span>' : ''}${icon('down')}</button></div>
+  $('#sidebar-content').innerHTML = `${
+    pins.length
+      ? `<div class="favorites" aria-label="Pinned tabs" data-drop-pinned>${pins
+          .map((tab) => {
+            const page = state.runtime?.pages?.[tab.id];
+            const status = page?.closed || tab.closed ? 'Closed' : page?.loaded ? 'Loaded' : 'Sleeping';
+            return `<button type="button" class="favorite ${tab.id === state.activeTabId ? 'active' : ''} ${status.toLowerCase()}" draggable="true" data-tab-id="${esc(tab.id)}" data-drop-tab="${esc(tab.id)}" data-action="tab:activate" data-id="${esc(tab.id)}" data-key="pin-${esc(tab.id)}" ${tab.id === state.activeTabId ? 'aria-current="page"' : ''} aria-label="${esc(tab.title || hostname(tab.url))} — ${status}" title="${esc(tab.title)} — ${status}${status === 'Loaded' ? '' : ' · Click to open'}\n${esc(tab.url)}">${favicon(tab.url, tab.id)}<span class="favorite-status" aria-hidden="true">${status === 'Sleeping' ? icon('moon') : ''}</span></button>`;
+          })
+          .join('')}</div>`
+      : '<div class="favorites favorites-empty" aria-label="Pinned tabs" data-drop-pinned><span class="pin-drop-hint">Drop to pin</span></div>'
+  }<div class="tabs-scroll">
+    <div class="space-header"><button type="button" class="space-picker" data-action="ui:spaces" data-key="space-picker" aria-label="Switch Space or profile" title="${esc(space?.name)} · ${esc(profile?.name)}${profile?.private ? ' · Private session' : ''}">${icon(profile?.private ? 'shield' : space?.icon || 'circle')}<span class="space-title">${esc(space?.name || 'My Space')}</span>${profile?.private ? '<span class="private-indicator">Private</span>' : ''}${icon('down')}</button></div>
     ${folders
       .map(
         (folder) =>
@@ -628,14 +857,15 @@ function renderSidebar() {
       )
       .join('')}
     <div class="loose-tabs" data-drop-folder="">${loose.map(tabRow).join('')}</div></div>
-    <footer class="sidebar-footer">${button('ui:library', 'Library', 'library', 'data-key="library" aria-haspopup="dialog"')}<div class="space-dots" aria-label="Your Spaces">${spaces.map((s) => `<button type="button" class="space-dot ${s.id === space?.id ? 'active' : ''}" data-action="space:activate" data-id="${esc(s.id)}" title="${esc(s.name)}" aria-label="Switch to ${esc(s.name)}" ${s.id === space?.id ? 'aria-current="true"' : ''}><span aria-hidden="true"></span></button>`).join('')}</div>${button('ui:add-menu', 'New tab, folder or Space', 'plus', 'data-key="add-menu" aria-haspopup="dialog"')}</footer>`;
+    <footer class="sidebar-footer">${button('ui:library', 'Library', 'library', 'data-key="library" aria-haspopup="dialog"')}<div class="space-dots" aria-label="Your Spaces">${spaces.map((s) => `<button type="button" class="space-dot ${s.id === space?.id ? 'active' : ''}" data-action="space:activate" data-id="${esc(s.id)}" title="${esc(s.name)}" aria-label="Switch to ${esc(s.name)}" ${s.id === space?.id ? 'aria-current="true"' : ''}>${icon(s.icon || 'circle')}</button>`).join('')}</div>${button('ui:add-menu', 'New tab, folder or Space', 'plus', 'data-key="add-menu" aria-haspopup="dialog"')}</footer>`;
   for (const dot of $$('.space-dot')) {
     const color = spaces.find((item) => item.id === dot.dataset.id)?.color;
     if (/^#[\da-f]{6}$/i.test(color || '')) dot.style.setProperty('--dot-color', color);
   }
   $('.tabs-scroll').scrollTop = scroll;
+  restoreSpacePresentation(presentation);
   if (!sameSpace) $('.space-dot.active')?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
-  if (sameSpace)
+  if (sameSpace && !spaceGestureFeedback && !spaceTransition)
     for (const row of $$('[data-tab-id]', $('#sidebar'))) {
       const before = oldRows.get(row.dataset.tabId);
       if (before === undefined)
@@ -776,9 +1006,10 @@ function renderHome() {
 let lastLayout = '';
 function syncLayout() {
   if (!state) return;
-  const width = ui.sidebarHidden
-    ? 0
-    : Math.max(200, Math.min(380, Number(state.settings.sidebarWidth) || 224));
+  const width =
+    ui.sidebarAnimationWidth ??
+    (ui.sidebarHidden ? 0 : Math.max(200, Math.min(380, Number(state.settings.sidebarWidth) || 224)));
+  const gutter = state.settings.pageGutter ?? 8;
   const panel = ui.panel
     ? Math.min(
         Math.max(0, window.innerWidth - width - 316),
@@ -786,14 +1017,17 @@ function syncLayout() {
       )
     : 0;
   const contentTop =
-    ui.sidebarHidden || !$('#findbar').hidden ? 40 : isMac || state.runtime?.fullScreen ? 8 : 36;
+    ui.sidebarHidden || !$('#findbar').hidden ? 40 : isMac || state.runtime?.fullScreen ? gutter : 36;
   $('#app').dataset.panelOpen = String(Boolean(ui.panel));
   $('#app').dataset.sidebarHidden = String(ui.sidebarHidden);
+  $('#app').dataset.sidebarAnimating = String(ui.sidebarAnimationWidth != null);
+  $('#app').dataset.dialog = ui.dialog || '';
   $('#sidebar').inert = ui.sidebarHidden || Boolean(ui.dialog && ui.dialog !== 'command');
   $('#sidebar').setAttribute('aria-hidden', String(ui.sidebarHidden));
   document.documentElement.style.setProperty('--sidebar', `${width}px`);
   document.documentElement.style.setProperty('--panel', `${panel}px`);
   document.documentElement.style.setProperty('--page-top', `${contentTop}px`);
+  document.documentElement.style.setProperty('--canvas-right', `${panel ? panel + gutter * 2 : gutter}px`);
   const layout = {
     sidebarWidth: width,
     panelWidth: panel,
@@ -883,6 +1117,9 @@ function renderPanel(force = false) {
             ui.aiStatus,
             ui.aiContext,
             ui.aiTabs,
+            ui.aiGrantedPages,
+            ui.aiContextChanging,
+            ui.aiGrantedPages.map((page) => state.tabs.find((tab) => tab.id === page.id)?.url),
             state.runtime?.aiConfigured,
             activeProfile()?.id,
           ]
@@ -892,12 +1129,10 @@ function renderPanel(force = false) {
   ui.panelSignature = signature;
   const scroll = $('.panel-body', element)?.scrollTop || 0;
   const sameAIProfile = ui.aiPanelProfile === activeProfile()?.id;
-  const draft = sameAIProfile ? $('#ai-question', element)?.value : undefined;
+  const draft = sameAIProfile ? ($('#ai-question', element)?.value ?? ui.aiDraft) : ui.aiDraft;
+  if (sameAIProfile && $('#ai-question', element)) ui.aiDraft = draft;
   const disclosures = new Map(
-    $$('details.setting-section', element).map((details) => [
-      details.id || $('summary', details)?.textContent,
-      details.open,
-    ]),
+    $$('details', element).map((details) => [details.id || $('summary', details)?.textContent, details.open]),
   );
   const provider = ui.aiStatus?.provider || 'codex';
   const providerDraft =
@@ -936,7 +1171,7 @@ function renderPanel(force = false) {
   if (body) body.scrollTop = scroll;
   const composer = $('#ai-question', element);
   if (draft !== undefined && composer && composer.value !== draft) composer.value = draft;
-  for (const details of $$('details.setting-section', element)) {
+  for (const details of $$('details', element)) {
     const key = details.id || $('summary', details)?.textContent;
     if (disclosures.has(key)) details.open = disclosures.get(key);
   }
@@ -1117,6 +1352,64 @@ async function configureAIConnection(payload, message = 'Connection saved.') {
     }
   }
 }
+function renderCustomization() {
+  const customSelect = (key, label, values, format) => {
+    const current = state.settings[key];
+    return settingSelect(
+      key,
+      label,
+      values.some(([value]) => value === current) ? values : [...values, [current, format(current)]],
+    );
+  };
+  return `<details class="layout-settings"><summary>Layout & motion</summary>${settingSelect(
+    'tabDensity',
+    'Tab spacing',
+    [
+      ['compact', 'Compact'],
+      ['comfortable', 'Comfortable'],
+    ],
+  )}${customSelect(
+    'pageGutter',
+    'Page inset',
+    [
+      [4, '4px'],
+      [8, '8px'],
+      [12, '12px'],
+      [16, '16px'],
+      [20, '20px'],
+    ],
+    (value) => `${value}px`,
+  )}${customSelect(
+    'pageRadius',
+    'Page corners',
+    [
+      [0, 'Square'],
+      [8, 'Soft'],
+      [12, 'Rounded'],
+      [16, 'Rounder'],
+      [20, 'Pillowy'],
+    ],
+    (value) => `${value}px`,
+  )}${customSelect(
+    'motionScale',
+    'Motion',
+    [
+      [0.7, 'Quick'],
+      [1, 'Balanced'],
+      [1.25, 'Relaxed'],
+      [1.4, 'Gentle'],
+    ],
+    (value) => `Custom · ${value}×`,
+  )}${settingSelect('pinnedSleepMinutes', 'Sleep idle favorites', [
+    [0, 'Never'],
+    [5, 'After 5 minutes'],
+    [10, 'After 10 minutes'],
+    [20, 'After 20 minutes'],
+    [30, 'After 30 minutes'],
+    [60, 'After an hour'],
+    [120, 'After 2 hours'],
+  ])}<p class="provider-note">Active pages, media and unsaved edits stay awake.</p></details>`;
+}
 function renderSettings() {
   const settings = state.settings;
   const profile = activeProfile();
@@ -1124,7 +1417,7 @@ function renderSettings() {
     isMac && state.runtime?.defaultBrowser?.supported
       ? `<div class="setting-field"><span>Default browser</span>${state.runtime.defaultBrowser.configured ? '<span class="muted">Zacro</span>' : secondary('ui:default-browser', 'Make default')}</div>`
       : '';
-  return `<section class="setting-section"><h3>Appearance</h3>${defaultBrowser}${settingSelect(
+  return `<section class="setting-section"><h3>Appearance</h3>${defaultBrowser}${renderCustomization()}${settingSelect(
     'theme',
     'Appearance',
     [
@@ -1170,6 +1463,106 @@ function renderExtensions() {
   const extensions = profileItems('extensions');
   return `<p class="panel-intro">Extensions are isolated to <strong>${esc(activeProfile()?.name)}</strong>. Install only extensions you trust and review their requested access.</p>${primary('extension:install', 'Load unpacked extension', 'plus')}<p class="provider-note">Select a local folder containing manifest.json. Electron supports a subset of Chrome extension APIs; storage.sync and Web Store installation are unavailable.</p>${extensions.length ? extensions.map((ext) => `<article class="extension-card"><div class="row"><div class="extension-icon">${icon('extension')}</div><div class="grow"><h3>${esc(ext.name || ext.id)}</h3><span class="small muted">${esc(ext.version || '')} · ${ext.enabled === false ? 'Disabled' : 'Enabled'}</span></div></div>${ext.description ? `<p>${esc(ext.description)}</p>` : ''}${ext.error ? `<p class="danger">${esc(ext.error)}</p>` : ''}<div class="row between"><button type="button" class="text-button" data-action="extension:toggle" data-id="${esc(ext.id)}">${ext.enabled === false ? 'Enable' : 'Disable'}</button><button type="button" class="text-button danger" data-action="ui:extension-remove" data-id="${esc(ext.id)}">Remove</button></div></article>`).join('') : empty('extension', 'No extensions', 'Installed extensions appear here.')}`;
 }
+const aiIntentPrompts = {
+  summarize:
+    'Summarize this page in five concise points. Highlight the main conclusion, useful details, and any important caveats. Cite the page.',
+  explain:
+    'Explain the main ideas on this page in plain language. Define unfamiliar terms and distinguish what the page says from what it does not establish. Cite the page.',
+  compare:
+    'Compare these pages. Organize the key similarities, differences, tradeoffs, and missing information in a concise table. Cite each page and do not guess.',
+  research: 'Research ',
+};
+function aiPageGrant(tab) {
+  if (!tab || tab.profileId !== activeProfile()?.id || !/^https?:\/\//i.test(tab.url)) return null;
+  return { id: tab.id, url: tab.url, title: tab.title || hostname(tab.url) };
+}
+function aiContextStale(pages = ui.aiGrantedPages) {
+  return pages.some((page) => {
+    const tab = state.tabs.find((tab) => tab.id === page.id);
+    return !tab || tab.profileId !== activeProfile()?.id || tab.url !== page.url;
+  });
+}
+function rememberAIDraft(value) {
+  const composer = $('#ai-question');
+  const sameProfile = ui.aiPanelProfile === activeProfile()?.id;
+  if (value === undefined) value = (sameProfile ? composer?.value : undefined) ?? ui.aiDraft;
+  ui.aiDraft = String(value || '').slice(0, 8000);
+  if (sameProfile && composer && composer.value !== ui.aiDraft) composer.value = ui.aiDraft;
+}
+async function setAIContext(kind, pages = [], { force = false } = {}) {
+  const profile = activeProfile()?.id;
+  if (activeProfile()?.private) {
+    toast('Private pages cannot be shared with AI.');
+    return false;
+  }
+  rememberAIDraft();
+  const next = kind === 'research' ? [] : pages;
+  if (!force && kind === ui.aiContext && JSON.stringify(next) === JSON.stringify(ui.aiGrantedPages))
+    return true;
+  const token = ++ui.aiContextSerial;
+  ui.aiContextChanging = true;
+  invalidateAIRequest();
+  renderAIUpdate(false);
+  try {
+    await invoke('ai:reset');
+    if (token !== ui.aiContextSerial || profile !== activeProfile()?.id) return false;
+    ui.aiMessages = [];
+    ui.aiSources = [];
+    ui.aiContext = kind;
+    ui.aiGrantedPages = next;
+    ui.aiTabs = next.map((page) => page.id);
+    return true;
+  } finally {
+    if (token === ui.aiContextSerial && profile === activeProfile()?.id) {
+      ui.aiContextChanging = false;
+      renderAIUpdate(false);
+    }
+  }
+}
+async function openAIIntent(intent, tabIds = []) {
+  if (!Object.hasOwn(aiIntentPrompts, intent)) return;
+  if (activeProfile()?.private) {
+    toast('AI is unavailable in private browsing.');
+    return;
+  }
+  if (ui.aiBusy || ui.aiSubmitting) {
+    toast('Stop the current response before changing context.');
+    return;
+  }
+  if (intent === 'compare' && !tabIds.length) {
+    showTabSelection({ intent });
+    return;
+  }
+  const pages = (tabIds.length ? tabIds.map((id) => state.tabs.find((tab) => tab.id === id)) : [activeTab()])
+    .map(aiPageGrant)
+    .filter(Boolean);
+  if (intent !== 'research' && (!pages.length || (intent === 'compare' && pages.length < 2))) {
+    toast(
+      intent === 'compare'
+        ? 'Select at least two readable pages to compare.'
+        : 'Open a web page or text PDF first.',
+    );
+    return;
+  }
+  if (
+    !(await setAIContext(intent === 'research' ? 'research' : intent === 'compare' ? 'tabs' : 'page', pages))
+  )
+    return;
+  openPanel('ai');
+  // A prepared action must not silently erase an unfinished question.
+  if (!ui.aiDraft.trim()) rememberAIDraft(aiIntentPrompts[intent]);
+  else toast('Context updated. Your unfinished question was kept.');
+  $('#ai-question')?.focus();
+}
+function aiTurnContext(message) {
+  const request = message.request;
+  if (!request) return '';
+  return request.pages.length
+    ? request.pages.map((page) => page.title || hostname(page.url)).join(' · ')
+    : request.research
+      ? 'Web research · no page text'
+      : 'Chat · no page text';
+}
 function renderAnswer(message) {
   const text = String(message.text || '');
   const format = (raw) => {
@@ -1178,15 +1571,19 @@ function renderAnswer(message) {
     let match,
       last = 0;
     while ((match = expression.exec(raw))) {
-      parts.push(esc(raw.slice(last, match.index)));
+      parts.push(formatPlain(raw.slice(last, match.index)));
       parts.push(
         `<button type="button" class="text-button" data-action="ui:open-url" data-url="${esc(match[2])}">${esc(match[1])}</button>`,
       );
       last = match.index + match[0].length;
     }
-    parts.push(esc(raw.slice(last)));
+    parts.push(formatPlain(raw.slice(last)));
     return parts.join('');
   };
+  const formatPlain = (raw) =>
+    esc(raw)
+      .replace(/`([^`\n]+)`/g, '<code>$1</code>')
+      .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
   const citations = (message.citations || [])
     .filter(
       (c) =>
@@ -1218,20 +1615,68 @@ function renderAI() {
   const privateSession = Boolean(activeProfile()?.private);
   const configured = !privateSession && Boolean(ui.aiStatus?.configured ?? state.runtime?.aiConfigured);
   const messages = ui.aiMessages;
+  const locked = ui.aiBusy || ui.aiSubmitting || ui.aiContextChanging;
+  const stale = aiContextStale();
   let body;
   if (!messages.length) {
-    body = `<div class="ai-welcome">${icon('sparkle')}<h3>${privateSession ? 'Private session' : configured ? 'Ask Zacro' : 'AI, your way'}</h3><p>${privateSession ? 'AI is unavailable in private browsing.' : configured ? 'Ask a question or bring in a page.' : 'Connect a subscription or API provider in Settings.'}</p>${configured ? `<button type="button" class="prompt-suggestion" data-action="ui:ai-page">Ask about this page${icon('arrow')}</button><button type="button" class="prompt-suggestion" data-action="ui:ai-select-tabs">Compare tabs${icon('arrow')}</button>` : privateSession ? primary('ui:spaces', 'Switch profile', 'user') : primary('ui:ai-connect', 'Connect AI', 'user')}</div>`;
+    body = `<div class="ai-welcome">${icon('sparkle')}<h3>${privateSession ? 'Private session' : configured ? 'Understand what you’re browsing' : 'AI, your way'}</h3><p>${privateSession ? 'AI is unavailable in private browsing.' : configured ? 'Choose a starting point, review the context, then send your question.' : 'Connect a subscription or API provider in Settings.'}</p>${
+      configured
+        ? `<div class="ai-intents">${[
+            ['summarize', 'Summarize page', 'file'],
+            ['explain', 'Explain page', 'sparkle'],
+            ['compare', 'Compare tabs', 'split'],
+            [
+              'research',
+              ui.aiStatus?.researchSupported === false ? 'Start a chat' : 'Research a topic',
+              'search',
+            ],
+          ]
+            .map(
+              ([intent, label, symbol]) =>
+                `<button type="button" class="ai-intent prompt-suggestion" data-action="ui:ai-intent" data-intent="${intent}" ${locked ? 'disabled' : ''}>${icon(symbol)}${label}${icon('arrow')}</button>`,
+            )
+            .join(
+              '',
+            )}</div><p class="ai-empty-note">These actions prepare a question. Nothing is shared until you send.</p>`
+        : privateSession
+          ? primary('ui:spaces', 'Switch profile', 'user')
+          : primary('ui:ai-connect', 'Connect AI', 'user')
+    }</div>`;
   } else {
     body = messages
-      .map(
-        (message, index) =>
-          `<article class="message ${message.role}" data-message-index="${index}"><div class="message-role">${message.role === 'user' ? 'You' : message.error ? 'Something went wrong' : 'Zacro'}</div><div class="message-content ${message.error ? 'danger' : ''}">${message.role === 'assistant' ? renderAnswer(message) : esc(message.text)}</div>${message.warning ? `<p class="provider-note danger">${esc(message.warning)}</p>` : ''}${message.sharedTabs?.length ? `<p class="provider-note">Shared: ${esc(message.sharedTabs.map((t) => t.title || t.url || t).join(', '))}</p>` : ''}${message.unreadable?.length ? `<p class="provider-note">Couldn’t read: ${esc(message.unreadable.map((t) => t.title || t.url || t.reason || t).join(', '))}</p>` : ''}${message.sources?.length ? `<div class="source-list">${message.sources.map((source, i) => `<button type="button" class="source-item" data-action="ui:open-url" data-url="${esc(source.url)}" title="${esc(source.url)}"><span class="source-index">${i + 1}</span><span class="grow truncate">${esc(source.title || hostname(source.url))}</span>${icon('external')}</button>`).join('')}</div>` : ''}${message.searchUrl ? `<button type="button" class="text-button" data-action="ui:open-url" data-url="${esc(message.searchUrl)}">${icon('search')}Open ordinary search results</button>` : ''}</article>`,
-      )
+      .map((message, index) => {
+        const questionIndex =
+          message.role === 'user'
+            ? index
+            : messages.slice(0, index).findLastIndex((item) => item.role === 'user');
+        const actions = [];
+        if (message.role === 'user' && message.request)
+          actions.push(
+            secondary(
+              'ui:ai-edit',
+              'Edit question',
+              'edit',
+              `data-index="${index}" ${locked ? 'disabled' : ''}`,
+            ),
+          );
+        if (message.role === 'assistant' && message.text && !message.error && !message.streaming)
+          actions.push(secondary('ui:ai-copy', 'Copy answer', 'copy', `data-index="${index}"`));
+        if ((message.error || message.incomplete) && questionIndex >= 0 && messages[questionIndex]?.request)
+          actions.push(
+            secondary(
+              'ui:ai-retry',
+              'Retry question',
+              'reload',
+              `data-index="${questionIndex}" ${locked ? 'disabled' : ''}`,
+            ),
+          );
+        return `<article class="message ${message.role}" data-message-index="${index}"><div class="message-role">${message.role === 'user' ? 'You' : message.error ? 'Couldn’t finish' : 'Zacro'}</div>${message.request ? `<p class="ai-turn-context" title="${esc(message.request.pages.map((page) => page.url).join('\n'))}">${icon(message.request.pages.length ? 'file' : 'globe')}${esc(aiTurnContext(message))}</p>` : ''}<div class="message-content ${message.error ? 'danger' : ''}">${message.role === 'assistant' ? renderAnswer(message) : esc(message.text)}</div>${message.warning ? `<p class="provider-note danger">${esc(message.warning)}</p>` : ''}${message.sharedTabs?.length ? `<p class="provider-note">Read: ${esc(message.sharedTabs.map((tab) => (tab.title || tab.url) + (tab.truncated ? ' (partial text)' : '') + (tab.pdf ? ' · PDF text' : '')).join(', '))}</p>` : ''}${message.unreadable?.length ? `<p class="provider-note">Couldn’t read: ${esc(message.unreadable.map((tab) => `${tab.title || 'Page'} — ${tab.reason || 'unavailable'}`).join('; '))}</p>` : ''}${message.sources?.length ? `<div class="source-list">${message.sources.map((source, i) => `<button type="button" class="source-item" data-action="ui:citation" data-id="${esc(source.tabId || '')}" data-url="${esc(source.url)}" title="${esc(source.url)}"><span class="source-index">${i + 1}</span><span class="grow truncate">${esc(source.title || hostname(source.url))}</span>${icon('external')}</button>`).join('')}</div>` : ''}${message.searchUrl ? `<button type="button" class="text-button" data-action="ui:open-url" data-url="${esc(message.searchUrl)}">${icon('search')}Open ordinary search results</button>` : ''}${actions.length ? `<div class="ai-message-actions">${actions.join('')}</div>` : ''}</article>`;
+      })
       .join('');
   }
   return `<div class="panel-body conversation" id="conversation">${body}${ui.aiBusy ? `<div class="ai-progress" role="status"><span class="spinner"></span>${esc(ui.aiProgress || 'Looking into it…')}</div>` : ''}</div>${
     configured
-      ? `<div class="ai-footer" id="ai-footer">${ui.aiSources.length && !ui.aiBusy ? `<button type="button" class="secondary ai-source-action" id="ai-open-sources" data-action="ai:open-sources">${icon('external')}Open sources <kbd>${shortcut('Mod+Enter')}</kbd></button>` : ''}<div class="ai-context" id="ai-context-controls">${icon('shield')}<label for="ai-context" class="sr-only">Content to share</label><select id="ai-context" ${activeProfile()?.private ? 'disabled' : ''}>${selectOptions(
+      ? `<div class="ai-footer" id="ai-footer">${ui.aiSources.length && !ui.aiBusy ? `<button type="button" class="secondary ai-source-action" id="ai-open-sources" data-action="ai:open-sources">${icon('external')}Open sources <kbd>${shortcut('Mod+Enter')}</kbd></button>` : ''}<div class="ai-context" id="ai-context-controls">${icon('shield')}<label for="ai-context" class="sr-only">Content to share</label><select id="ai-context" ${ui.aiContextChanging || ui.aiSubmitting ? 'disabled' : ''}>${selectOptions(
           [
             [
               'research',
@@ -1239,22 +1684,15 @@ function renderAI() {
                 ? 'Chat · no page sharing'
                 : 'Web research · no page sharing',
             ],
-            ['page', 'Current page'],
+            ['page', 'One page'],
             ['tabs', `Selected tabs${ui.aiTabs.length ? ' (' + ui.aiTabs.length + ')' : ''}`],
           ],
           ui.aiContext,
-        )}</select>${ui.aiContext === 'tabs' ? button('ui:ai-select-tabs', 'Choose tabs', 'plus', '', 'small-button') : ''}</div>${
+        )}</select>${ui.aiContext === 'tabs' ? button('ui:ai-select-tabs', 'Choose tabs', 'plus', locked ? 'disabled' : '', 'small-button') : ''}${ui.aiContext !== 'research' ? button('ui:ai-clear-context', 'Clear shared context and conversation', 'close', locked ? 'disabled' : '', 'small-button') : ''}</div>${
           ui.aiContext !== 'research'
-            ? `<p class="provider-note" id="ai-sharing">Sharing with ${esc(aiProviderName())}: ${esc(
-                ui.aiContext === 'page'
-                  ? activeTab()?.title || 'Current page'
-                  : state.tabs
-                      .filter((t) => ui.aiTabs.includes(t.id))
-                      .map((t) => t.title)
-                      .join(', ') || 'No tabs selected',
-              )}</p>`
-            : ''
-        }<form id="ai-form" class="ai-composer"><textarea id="ai-question" name="question" rows="2" placeholder="${configured ? 'Ask anything…' : 'Connect a provider in Settings'}" aria-label="Ask Zacro" ${configured ? '' : 'disabled'}></textarea>${ui.aiBusy ? button('ai:cancel', 'Stop response', 'stop', 'id="ai-submit"') : '<button type="submit" class="primary" id="ai-submit" aria-label="Send question" ' + (configured && !ui.aiSubmitting ? '' : 'disabled') + '>' + icon('arrow') + '</button>'}</form><p class="ai-help" id="ai-help">${activeProfile()?.private ? 'AI is unavailable in private sessions.' : 'Check sources. Shift + Enter for a new line.'}</p></div>`
+            ? `<div class="ai-context-chips" aria-label="Pages selected for sharing">${ui.aiGrantedPages.map((page) => `<div class="ai-context-chip ${aiContextStale([page]) ? 'stale' : ''}" data-context-id="${esc(page.id)}" title="${esc(page.url)}"><span class="grow truncate"><strong>${esc(page.title)}</strong><small>${esc(hostname(page.url))}${aiContextStale([page]) ? ' · page changed' : ''}</small></span>${button('ui:ai-remove-context', `Remove ${page.title} from context`, 'close', `data-id="${esc(page.id)}" ${locked ? 'disabled' : ''}`, 'small-button')}</div>`).join('')}</div><p class="provider-note" id="ai-sharing">On send, readable page or PDF text goes to ${esc(aiProviderName())}. Forms and passwords are excluded.</p>${stale ? `<p class="provider-note danger" role="status">A selected page changed or closed. ${secondary('ui:ai-refresh-context', 'Review pages again', '', locked ? 'disabled' : '')}</p>` : ''}`
+            : `<p class="provider-note" id="ai-sharing">${ui.aiStatus?.researchSupported === false ? 'No web search on this connection.' : 'Searches the web for supporting sources.'} No open-page text is shared.</p>`
+        }<form id="ai-form" class="ai-composer"><textarea id="ai-question" name="question" rows="2" maxlength="8000" placeholder="${messages.length ? 'Ask a follow-up…' : 'Ask a question…'}" aria-label="Ask Zacro" aria-describedby="ai-sharing ai-help">${esc(ui.aiDraft)}</textarea>${ui.aiBusy ? button('ai:cancel', 'Stop response', 'stop', 'id="ai-submit"') : '<button type="submit" class="primary" id="ai-submit" aria-label="Send question" ' + (!locked && !stale ? '' : 'disabled') + '>' + icon('arrow') + '</button>'}</form><p class="ai-help" id="ai-help">Enter to send · Shift + Enter for a new line. Check sources.</p></div>`
       : !privateSession && messages.length
         ? `<div class="ai-footer" id="ai-footer">${primary('ui:ai-connect', ui.aiStatus?.loginPending || ui.aiSigningIn ? 'Continue sign-in' : 'Connect AI', 'user', 'id="ai-reconnect"')}</div>`
         : ''
@@ -1315,6 +1753,10 @@ function closePanel() {
 }
 function openDialog(kind, html, { title, focus } = {}) {
   stopShortcutRecording();
+  if (ui.themePreview) {
+    ui.themePreview = null;
+    setTheme();
+  }
   if (kind !== 'command') interruptSpaceScroll();
   if (ui.authRequest) {
     const id = ui.authRequest;
@@ -1355,6 +1797,10 @@ function closeDialog({ restore = true } = {}) {
   ui.dialog = null;
   ui.commandAuto = false;
   ui.modalSubmit = null;
+  if (ui.themePreview) {
+    ui.themePreview = null;
+    setTheme();
+  }
   ui.dialogToken = (ui.dialogToken || 0) + 1;
   $('#dialog-root').replaceChildren();
   clearPageBackdrop();
@@ -1427,7 +1873,7 @@ function showSpaces() {
     `<div class="dialog-header"><h2>Your Spaces</h2>${button('ui:dialog-close', 'Close', 'close')}</div><div class="dialog-body">${state.spaces
       .map((space) => {
         const profile = state.profiles.find((p) => p.id === space.profileId);
-        return `<div class="space-option-wrapper"><button type="button" class="space-option ${space.id === state.activeSpaceId ? 'current' : ''}" data-action="ui:switch-space" data-id="${esc(space.id)}"><span class="space-emblem">${esc(space.name.slice(0, 1).toUpperCase())}</span><span class="grow"><div class="space-option-name">${esc(space.name)}</div><div class="space-option-profile">${esc(profile?.name)}${profile?.private ? ' · Private' : ''} · ${state.tabs.filter((t) => t.spaceId === space.id).length} tabs</div></span>${space.id === state.activeSpaceId ? icon('check') : ''}</button><div class="space-option-actions">${button('ui:edit-space', 'Edit Space', 'edit', `data-id="${esc(space.id)}"`)}${button('ui:delete-space', 'Delete Space', 'trash', `data-id="${esc(space.id)}"`)}</div></div>`;
+        return `<div class="space-option-wrapper"><button type="button" class="space-option ${space.id === state.activeSpaceId ? 'current' : ''}" data-action="ui:switch-space" data-id="${esc(space.id)}"><span class="space-emblem">${icon(space.icon || 'circle')}</span><span class="grow"><div class="space-option-name">${esc(space.name)}</div><div class="space-option-profile">${esc(profile?.name)}${profile?.private ? ' · Private' : ''} · ${state.tabs.filter((t) => t.spaceId === space.id).length} tabs</div></span>${space.id === state.activeSpaceId ? icon('check') : ''}</button><div class="space-option-actions">${button('ui:edit-space', 'Edit Space', 'edit', `data-id="${esc(space.id)}"`)}${button('ui:delete-space', 'Delete Space', 'trash', `data-id="${esc(space.id)}"`)}</div></div>`;
       })
       .join(
         '',
@@ -1438,6 +1884,9 @@ function showSpaces() {
 function showSpaceForm(id) {
   const space = id ? state.spaces.find((s) => s.id === id) : null;
   ui.selectedColor = space?.color || colors[0][1];
+  const theme = { secondaryColor: '#b695b8', gradient: 50, grain: 0, opacity: 100, blur: 0, ...space?.theme };
+  const range = (key, label, min, max, suffix = '%') =>
+    `<label class="theme-range"><span>${label}<output data-theme-output="${key}">${theme[key]}${suffix}</output></span><input type="range" name="theme-${key}" min="${min}" max="${max}" value="${theme[key]}" aria-label="${label}"></label>`;
   formDialog(
     space ? 'Customize Space' : 'New Space',
     '',
@@ -1454,7 +1903,7 @@ function showSpaceForm(id) {
             activeProfile()?.id,
           )}</select></label>`
         : '') +
-      `<div class="field"><span>Space color</span><div class="color-options" role="group" aria-label="Space color">${colors.map(([name, color]) => `<button type="button" class="color-option swatch-${name} ${ui.selectedColor === color ? 'selected' : ''}" data-action="ui:color" data-color="${color}" aria-label="${name}" aria-pressed="${ui.selectedColor === color}"></button>`).join('')}</div></div>`,
+      `<input type="hidden" name="space-icon" value="${esc(space?.icon || 'circle')}"><div class="space-icon-options" role="group" aria-label="Space icon">${spaceIcons.map((name) => `<button type="button" data-action="ui:space-icon" data-icon="${name}" aria-label="${name} icon" title="${name}" aria-pressed="${(space?.icon || 'circle') === name}">${icon(name)}</button>`).join('')}</div><div class="theme-preview-tile" aria-hidden="true"><div class="theme-preview-sidebar">${icon(space?.icon || 'circle')}<i></i><i></i><i></i></div><div class="theme-preview-page"></div><span>Preview</span></div><div class="field"><span>Space color</span><div class="color-options" role="group" aria-label="Space color">${colors.map(([name, color]) => `<button type="button" class="color-option swatch-${name} ${ui.selectedColor === color ? 'selected' : ''}" data-action="ui:color" data-color="${color}" aria-label="${name}" aria-pressed="${ui.selectedColor === color}"></button>`).join('')}</div></div><div class="theme-colors"><label>Primary<input type="color" name="theme-color" value="${ui.selectedColor}" aria-label="Primary color"></label><label>Secondary<input type="color" name="theme-secondaryColor" value="${theme.secondaryColor}" aria-label="Secondary color"></label></div><details class="theme-material"><summary>Gradient & texture</summary>${range('gradient', 'Color blend', 0, 100)}${range('grain', 'Grain', 0, 100)}</details><details class="theme-material"><summary>Glass & transparency</summary>${range('opacity', 'Opacity', 40, 100)}${range('blur', 'Background blur', 0, 32, 'px')}<p class="provider-note">Glass blends with the Space colors. Reduced transparency follows your system preference.</p></details>`,
     space ? 'Save changes' : 'Create Space',
     async (data, context) => {
       if (!context.isCurrent()) return;
@@ -1462,13 +1911,53 @@ function showSpaceForm(id) {
         ...(space ? { id: space.id } : {}),
         name: data.get('name'),
         color: ui.selectedColor,
+        icon: data.get('space-icon'),
+        theme: readSpaceTheme(),
         ...(!space ? { profileId: data.get('profileId') } : {}),
       });
       if (!context.isCurrent()) return;
       if (!context.close()) return;
     },
   );
+  $('.dialog').classList.add('space-theme-dialog');
+  for (const swatch of $$('.color-option')) swatch.style.background = swatch.dataset.color;
+  updateSpacePreview();
 }
+function readSpaceTheme() {
+  const form = $('#modal-form');
+  return {
+    secondaryColor: form.elements['theme-secondaryColor'].value,
+    ...Object.fromEntries(
+      ['gradient', 'grain', 'opacity', 'blur'].map((key) => [
+        key,
+        Number(form.elements[`theme-${key}`].value),
+      ]),
+    ),
+  };
+}
+function updateSpacePreview() {
+  const form = $('#modal-form');
+  if (!form?.elements['theme-color']) return;
+  ui.selectedColor = form.elements['theme-color'].value;
+  ui.themePreview = { color: ui.selectedColor, theme: readSpaceTheme() };
+  for (const output of $$('[data-theme-output]', form)) {
+    const key = output.dataset.themeOutput;
+    output.value = `${ui.themePreview.theme[key]}${key === 'blur' ? 'px' : '%'}`;
+  }
+  for (const swatch of $$('.color-option', form)) {
+    const selected = swatch.dataset.color === ui.selectedColor;
+    swatch.classList.toggle('selected', selected);
+    swatch.setAttribute('aria-pressed', selected);
+  }
+  const symbol = form.elements['space-icon'].value;
+  $('.theme-preview-sidebar > svg')?.replaceWith(
+    document.createRange().createContextualFragment(icon(symbol)),
+  );
+  setTheme();
+}
+document.addEventListener('input', (event) => {
+  if (event.target.name?.startsWith('theme-')) updateSpacePreview();
+});
 function showProfiles() {
   openDialog(
     'profiles',
@@ -1534,17 +2023,32 @@ function showLibrary() {
 function toggleSidebar(fromPage = false) {
   interruptSpaceScroll();
   if (ui.dialog) closeDialog({ restore: false });
+  const start = ui.sidebarAnimationWidth ?? (ui.sidebarHidden ? 0 : state.settings.sidebarWidth || 224);
+  cancelAnimationFrame(ui.sidebarAnimationFrame);
   ui.sidebarHidden = !ui.sidebarHidden;
+  const target = ui.sidebarHidden ? 0 : state.settings.sidebarWidth || 224;
+  const duration = 240 * (state.settings.motionScale || 1);
+  const started = performance.now();
+  ui.sidebarAnimationWidth = reducedMotion.matches ? null : start;
   render();
-  if (!ui.sidebarHidden)
-    motion(
-      $('#sidebar'),
-      [
-        { opacity: 0.65, transform: 'translateX(-4px)' },
-        { opacity: 1, transform: 'translateX(0)' },
-      ],
-      140,
-    );
+  const tick = (now) => {
+    const progress = Math.min(1, (now - started) / duration);
+    if (progress === 1 || reducedMotion.matches) {
+      ui.sidebarAnimationWidth = null;
+      syncLayout();
+      return;
+    }
+    // A critically quick approach with one small rebound; native and shell
+    // geometry follow the same samples, with no screenshots or lost page state.
+    // Ease into the spring so a closing sidebar stays perceptible instead of
+    // collapsing within its first few frames, then retain the small rebound.
+    const springTime = progress * progress;
+    const spring = 1 - Math.exp(-7.5 * springTime) * Math.cos(10 * springTime);
+    ui.sidebarAnimationWidth = Math.round(Math.max(0, Math.min(380, start + (target - start) * spring)));
+    syncLayout();
+    ui.sidebarAnimationFrame = requestAnimationFrame(tick);
+  };
+  if (!reducedMotion.matches) ui.sidebarAnimationFrame = requestAnimationFrame(tick);
   if (fromPage) safely(invoke('page:focus'));
   else $('[data-key="sidebar-toggle"]')?.focus({ preventScroll: true });
 }
@@ -1555,7 +2059,7 @@ function showTabMenu(id) {
     `<button type="button" class="context-action" data-action="${name}" data-id="${esc(id)}">${icon(symbol)}${esc(label)}</button>`;
   openPopover(
     'menu',
-    `<div class="dialog-body"><div class="section-label truncate">${esc(tab.title || 'New tab')}</div>${action('ui:tab-pin', tab.pinned ? 'Unpin from favorites' : 'Pin to favorites', 'pin')}${action('ui:tab-duplicate', 'Duplicate tab', 'copy')}${action('ui:tab-split', 'Open in split view', 'split')}${action('ui:tab-move', 'Move to Space or folder', 'folder')}${action('ui:tab-rename', 'Rename tab', 'edit')}<hr class="context-separator">${action('ui:tab-close', 'Close tab', 'close')}</div>`,
+    `<div class="dialog-body"><div class="section-label truncate">${esc(tab.title || 'New tab')}</div>${action('ui:tab-pin', tab.pinned ? 'Remove pin' : 'Pin to favorites', 'pin')}${action('ui:tab-duplicate', 'Duplicate tab', 'copy')}${action('ui:tab-split', 'Open in split view', 'split')}${action('ui:tab-move', 'Move to Space or folder', 'folder')}${action('ui:tab-rename', 'Rename tab', 'edit')}${tab.pinned && state.runtime?.pages?.[id]?.loaded && id !== state.activeTabId ? action('ui:tab-sleep', 'Put to sleep', 'moon') : ''}<hr class="context-separator">${action('ui:tab-close', tab.pinned ? 'Close page · keep pin' : 'Close tab', 'close')}</div>`,
     { title: 'Tab actions', anchor: $(`[data-tab-id="${CSS.escape(id)}"]`) },
   );
 }
@@ -1612,32 +2116,34 @@ function showSplitPicker() {
     { title: 'Choose split view tab' },
   );
 }
-function showTabSelection() {
-  const tabs = state.tabs.filter((t) => t.profileId === activeProfile()?.id && t.url !== 'zacro://newtab');
+function showTabSelection({ intent } = {}) {
+  const tabs = state.tabs.filter((tab) => aiPageGrant(tab));
   if (activeProfile()?.private) {
     toast('Private pages cannot be shared with AI.');
     return;
   }
   formDialog(
     'Ask selected tabs',
-    `Choose up to six pages. Only the checked pages will be shared with ${aiProviderName()} for your next question.`,
+    `Choose ${intent === 'compare' ? 'two to six' : 'up to six'} pages. Their readable page or PDF text will be shared with ${aiProviderName()} only when you send a question.`,
     `<div class="tab-selector">${tabs.map((tab) => `<label class="tab-select-row"><input type="checkbox" name="tabId" value="${esc(tab.id)}" ${ui.aiTabs.includes(tab.id) ? 'checked' : ''}>${favicon(tab.url)}<span class="grow truncate" title="${esc(tab.url)}">${esc(tab.title || hostname(tab.url))}</span></label>`).join('') || '<p class="dialog-description">Open some pages first, then select the ones you want to share.</p>'}</div>`,
     'Use selected tabs',
     async (data, context) => {
       if (!context.isCurrent()) return;
       const selected = data.getAll('tabId');
+      if (!selected.length || (intent === 'compare' && selected.length < 2))
+        throw new Error(
+          intent === 'compare' ? 'Choose at least two pages to compare.' : 'Choose at least one page.',
+        );
       if (selected.length > 6) throw new Error('Choose up to six tabs for one question.');
-      if (ui.aiContext !== 'tabs' || JSON.stringify(ui.aiTabs) !== JSON.stringify(selected)) {
-        invalidateAIRequest();
-        await invoke('ai:reset');
-        if (!context.isCurrent()) return;
-        ui.aiMessages = [];
-        ui.aiSources = [];
-      }
-      ui.aiTabs = selected;
-      ui.aiContext = 'tabs';
+      const pages = selected
+        .map((id) => aiPageGrant(state.tabs.find((tab) => tab.id === id)))
+        .filter(Boolean);
+      if (pages.length !== selected.length)
+        throw new Error('A selected page closed. Choose the pages again.');
+      if (!(await setAIContext('tabs', pages)) || !context.isCurrent()) return;
       if (!context.close()) return;
       openPanel('ai');
+      if (intent && !ui.aiDraft.trim()) rememberAIDraft(aiIntentPrompts[intent]);
     },
   );
 }
@@ -1839,7 +2345,7 @@ function commandActionOptions() {
     'print',
   ]);
   const catalog = state.runtime?.shortcuts || [];
-  return catalog
+  const results = catalog
     .filter((entry) => commandSymbols[entry.id])
     .filter((entry) => !needsPage.has(entry.id) || real)
     .filter((entry) => !entry.id.startsWith('peek-') || state.runtime?.peek)
@@ -1860,6 +2366,62 @@ function commandActionOptions() {
         return invoke('shortcut:run', { id: entry.id });
       },
     }));
+  const extra = (id, label, symbol, keywords, run) =>
+    results.push({
+      id: `action:${id}`,
+      kind: 'action',
+      label,
+      symbol,
+      keywords,
+      type: 'Action',
+      priority: 5,
+      run: () => {
+        closeDialog({ restore: false });
+        return run();
+      },
+    });
+  extra(
+    'space-theme',
+    'Customize this Space',
+    'sun',
+    'color icon gradient grain transparency blur theme',
+    () => showSpaceForm(state.activeSpaceId),
+  );
+  extra(
+    'sleep-favorites',
+    'Sleep unused favorites',
+    'moon',
+    'memory suspend unload idle pinned tabs',
+    async () => {
+      let count = 0;
+      for (const pin of currentTabs().filter(
+        (item) => item.pinned && item.id !== state.activeTabId && state.runtime?.pages?.[item.id]?.loaded,
+      ))
+        if ((await invoke('tab:sleep', { id: pin.id }))?.slept) count++;
+      toast(
+        count
+          ? `${count} favorite${count === 1 ? '' : 's'} put to sleep.`
+          : 'No idle favorites to sleep. Active pages and unsaved work stay awake.',
+      );
+    },
+  );
+  if (!activeProfile()?.private) {
+    if (real) {
+      extra('ai-summarize', 'Summarize this page', 'sparkle', 'AI summarize page article PDF', () =>
+        openAIIntent('summarize', [tab.id]),
+      );
+      extra('ai-explain', 'Explain this page', 'book', 'AI explain understand page', () =>
+        openAIIntent('explain', [tab.id]),
+      );
+    }
+    extra('ai-compare', 'Compare pages', 'split', 'AI compare selected tabs sources', () =>
+      openAIIntent('compare'),
+    );
+    extra('ai-research', 'Research a question', 'globe', 'AI research web question', () =>
+      openAIIntent('research'),
+    );
+  }
+  return results;
 }
 function fuzzyScore(query, value) {
   const normalize = (text) =>
@@ -1894,10 +2456,13 @@ function fuzzyScore(query, value) {
 }
 function commandOptions(query) {
   const raw = query.trim();
-  const actionsOnly = raw.startsWith('>') || raw.startsWith('/');
-  const q = (actionsOnly ? raw.slice(1) : raw).trim();
+  const prefix = { '>': 'action', '/': 'action', '@': 'tab', '#': 'space' }[raw[0]];
+  const filter = prefix || ui.commandFilter || 'all';
+  const actionsOnly = filter === 'action';
+  const q = (prefix ? raw.slice(1) : raw).trim();
   const options = [];
   const add = (item) => {
+    if (filter !== 'all' && item.kind !== filter) return;
     const score = q
       ? Math.max(
           fuzzyScore(q, item.label),
@@ -1914,7 +2479,7 @@ function commandOptions(query) {
     );
     tabs.sort((a, b) => (b.lastActiveAt || 0) - (a.lastActiveAt || 0));
     for (const [index, tab] of tabs.entries()) {
-      if (!q && (tab.id === state.activeTabId || index > 5)) continue;
+      if (!q && filter === 'all' && (tab.id === state.activeTabId || index > 5)) continue;
       add({
         id: `tab:${tab.id}`,
         kind: 'tab',
@@ -1926,7 +2491,7 @@ function commandOptions(query) {
         keywords: tab.url,
         url: tab.url,
         symbol: 'globe',
-        type: 'Switch to tab',
+        type: tab.pinned && !state.runtime?.pages?.[tab.id]?.loaded ? 'Wake favorite' : 'Switch to tab',
         priority: q ? 14 : 100 - index,
         run: () => {
           closeDialog({ restore: false });
@@ -1941,7 +2506,7 @@ function commandOptions(query) {
     ]) {
       for (const [index, item] of items.entries()) {
         if (seen.has(item.url) || item.url === 'zacro://newtab') continue;
-        if (!q && index > 2) continue;
+        if (!q && filter === 'all' && index > 2) continue;
         const before = options.length;
         add({
           id: `${kind}:${item.url}`,
@@ -1973,7 +2538,7 @@ function commandOptions(query) {
         label: space.name,
         description: '',
         keywords: 'switch space workspace',
-        symbol: 'layers',
+        symbol: space.icon || 'circle',
         type: 'Space',
         priority: q ? 9 : 30,
         run: () => {
@@ -1991,7 +2556,7 @@ function commandOptions(query) {
       continue;
     add({ ...option, priority: q ? option.priority : 20 });
   }
-  if (q && !actionsOnly) {
+  if (q && filter === 'all') {
     const address =
       /^(?:[a-z][a-z\d+.-]*:\/\/|localhost(?::\d+)?(?:[/?#]|$)|(?:[\w-]+\.)+[a-z]{2,}(?:[:/?#]|$)|(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?(?:[/?#]|$))/i.test(
         q,
@@ -2026,9 +2591,12 @@ function commandOptions(query) {
         },
       });
   }
-  return options.sort((a, b) => b.score - a.score).slice(0, actionsOnly ? 80 : q ? 16 : 8);
+  return options
+    .sort((a, b) => b.score - a.score)
+    .slice(0, actionsOnly ? 80 : q || filter !== 'all' ? 32 : 8);
 }
 function openCommand(mode = 'newtab', query, { automatic = false } = {}) {
+  ui.commandFilter = 'all';
   ui.commandMode = mode === 'address' || mode === 'navigate' ? 'address' : 'newtab';
   ui.commandAuto = automatic;
   if (isBlankPage()) ui.blankPaletteContext = blankContext();
@@ -2053,6 +2621,30 @@ function renderCommands({ preserve = false } = {}) {
   const root = $('#command-results');
   if (!root) return;
   const selected = preserve ? ui.commandItems[ui.commandIndex]?.id : null;
+  let filters = $('.command-filters');
+  if (!filters) {
+    filters = document.createElement('div');
+    filters.className = 'command-filters';
+    filters.setAttribute('role', 'group');
+    filters.setAttribute('aria-label', 'Search scope');
+    filters.innerHTML = [
+      ['all', 'All'],
+      ['tab', 'Tabs'],
+      ['space', 'Spaces'],
+      ['bookmark', 'Bookmarks'],
+      ['history', 'History'],
+      ['action', 'Actions'],
+    ]
+      .map(
+        ([id, name]) =>
+          `<button type="button" data-action="ui:command-filter" data-filter="${id}">${name}</button>`,
+      )
+      .join('');
+    root.before(filters);
+  }
+  const prefixFilter = { '>': 'action', '/': 'action', '@': 'tab', '#': 'space' }[ui.commandQuery.trim()[0]];
+  for (const item of $$('button', filters))
+    item.setAttribute('aria-pressed', item.dataset.filter === (prefixFilter || ui.commandFilter));
   ui.commandItems = commandOptions(ui.commandQuery);
   if (selected && ui.commandItems.some((item) => item.id === selected))
     ui.commandIndex = ui.commandItems.findIndex((item) => item.id === selected);
@@ -2063,7 +2655,7 @@ function renderCommands({ preserve = false } = {}) {
         (item, index) =>
           `<button type="button" class="command-result ${index === ui.commandIndex ? 'selected' : ''}" data-action="ui:command-select" data-index="${index}" data-command-id="${esc(item.id)}" data-command-kind="${item.kind}" role="option" tabindex="-1" aria-selected="${index === ui.commandIndex}" id="command-option-${index}"><span class="command-result-icon">${item.url && item.kind !== 'navigation' ? favicon(item.url) : icon(item.symbol)}</span><span class="grow command-result-copy"><span class="command-result-label truncate">${esc(item.label)}</span>${item.description ? `<span class="command-result-description">${esc(item.description)}</span>` : ''}</span><span class="command-result-type">${esc(item.type)}</span></button>`,
       )
-      .join('') || '<div class="command-empty" role="presentation">No matching actions</div>';
+      .join('') || '<div class="command-empty" role="presentation">No matches in this scope</div>';
   const input = $('#command-input');
   if (ui.commandItems.length)
     input?.setAttribute('aria-activedescendant', `command-option-${ui.commandIndex}`);
@@ -2146,6 +2738,7 @@ function cancelAIStreamFrame() {
 function invalidateAIRequest() {
   ui.aiSubmissionSerial++;
   ui.aiSubmitting = false;
+  ui.aiRequestId = null;
   cancelAIStreamFrame();
 }
 function shouldFollowAI() {
@@ -2159,14 +2752,12 @@ function renderAIUpdate(follow = shouldFollowAI()) {
 }
 async function askAI(question) {
   question = String(question || '').trim();
-  if (!question || ui.aiBusy || ui.aiSubmitting) return false;
+  if (!question || ui.aiBusy || ui.aiSubmitting || ui.aiContextChanging) return false;
   const serial = ++ui.aiSubmissionSerial;
   const context = {
     profileId: activeProfile()?.id,
     kind: ui.aiContext,
-    tabId: activeTab()?.id,
-    tabUrl: activeTab()?.url,
-    tabIds: [...ui.aiTabs],
+    pages: ui.aiGrantedPages.map((page) => ({ ...page })),
   };
   const current = () => serial === ui.aiSubmissionSerial && context.profileId === activeProfile()?.id;
   ui.aiSubmitting = true;
@@ -2177,14 +2768,17 @@ async function askAI(question) {
     if (!current()) return false;
     if (
       context.kind !== ui.aiContext ||
-      (context.kind === 'page' &&
-        (context.tabId !== activeTab()?.id || context.tabUrl !== activeTab()?.url)) ||
-      (context.kind === 'tabs' && JSON.stringify(context.tabIds) !== JSON.stringify(ui.aiTabs))
+      JSON.stringify(context.pages) !== JSON.stringify(ui.aiGrantedPages) ||
+      aiContextStale(context.pages)
     ) {
-      toast('The browsing context changed. Send your question again.');
+      toast('The browsing context changed. Review the selected pages before sending.');
       return false;
     }
     ui.aiStatus = status;
+    if (status.busy) {
+      toast('The previous request is still stopping. Try again in a moment.');
+      return false;
+    }
     if (!status?.configured || activeProfile()?.private) {
       toast(
         activeProfile()?.private
@@ -2193,26 +2787,35 @@ async function askAI(question) {
       );
       return false;
     }
-    if (context.kind === 'tabs' && !context.tabIds.length) {
+    if (context.kind === 'tabs' && !context.pages.length) {
       showTabSelection();
       return false;
     }
-    if (context.kind === 'page' && (!context.tabId || context.tabUrl === 'zacro://newtab')) {
+    if (context.kind === 'page' && !context.pages.length) {
       toast('Open a page first, or choose web research.');
       return false;
     }
     const composer = $('#ai-question');
-    if (composer?.value.trim() === question) composer.value = '';
-    ui.aiMessages.push({ role: 'user', text: question });
+    if (composer?.value.trim() === question) rememberAIDraft('');
+    const request = {
+      ...context,
+      question,
+      research: context.kind === 'research' && status.researchSupported !== false,
+    };
+    const requestId = crypto.randomUUID();
+    ui.aiRequestId = requestId;
+    ui.aiMessages.push({ role: 'user', text: question, request });
     ui.aiBusy = true;
     ui.aiSubmitting = false;
     ui.aiSources = [];
     ui.aiProgress = 'Looking into it…';
     ui.aiProfileId = context.profileId;
     renderAIUpdate(true);
-    const args = { question };
-    if (context.kind === 'page') args.tabIds = [context.tabId];
-    if (context.kind === 'tabs') args.tabIds = context.tabIds;
+    const args = { question, requestId };
+    if (context.kind !== 'research') {
+      args.tabIds = context.pages.map((page) => page.id);
+      args.contextTabs = context.pages.map(({ id, url }) => ({ id, url }));
+    }
     try {
       await invoke('ai:ask', args);
     } catch (error) {
@@ -2232,6 +2835,16 @@ async function askAI(question) {
 }
 
 function handleEvent(event) {
+  // Provider responses can arrive after a reset or profile/context change.
+  // Production turn events carry an identifier; never attach an old turn to a
+  // newly prepared conversation. Untagged events remain usable for status and
+  // older host fixtures, which do not expose user content from another turn.
+  if (
+    ['ai:progress', 'ai:delta', 'ai:answer', 'ai:error', 'ai:cancelled'].includes(event.type) &&
+    event.requestId &&
+    event.requestId !== ui.aiRequestId
+  )
+    return;
   switch (event.type) {
     case 'newtab:show':
       closeDialog({ restore: false });
@@ -2352,8 +2965,15 @@ function handleEvent(event) {
       if (ui.aiMessages.at(-1)?.streaming) {
         ui.aiMessages.at(-1).streaming = false;
         ui.aiMessages.at(-1).warning = 'Response incomplete.';
+        ui.aiMessages.at(-1).incomplete = true;
       }
       if (event.code === 'CANCELLED') {
+        if (!ui.aiMessages.at(-1)?.incomplete)
+          ui.aiMessages.push({
+            role: 'assistant',
+            text: 'Response stopped before an answer was completed.',
+            incomplete: true,
+          });
         renderPanel(true);
         toast('Response stopped.');
         break;
@@ -2373,7 +2993,13 @@ function handleEvent(event) {
       if (ui.aiMessages.at(-1)?.streaming) {
         ui.aiMessages.at(-1).streaming = false;
         ui.aiMessages.at(-1).warning = 'Response stopped.';
-      }
+        ui.aiMessages.at(-1).incomplete = true;
+      } else if (!ui.aiMessages.at(-1)?.incomplete)
+        ui.aiMessages.push({
+          role: 'assistant',
+          text: 'Response stopped before an answer was completed.',
+          incomplete: true,
+        });
       renderPanel(true);
       toast('Response stopped.');
       break;
@@ -2457,6 +3083,15 @@ async function handleAction(action, data = {}, target) {
       ui.commandMode = ui.commandMode === 'address' ? 'newtab' : 'address';
       renderCommands({ preserve: true });
       $('#command-input')?.focus();
+      return;
+    case 'ui:command-filter':
+      if (!['all', 'tab', 'space', 'bookmark', 'history', 'action'].includes(data.filter)) return;
+      ui.commandFilter = data.filter;
+      ui.commandQuery = ui.commandQuery.replace(/^[\s]*[/>@#]\s*/, '');
+      $('#command-input').value = ui.commandQuery;
+      ui.commandIndex = 0;
+      renderCommands();
+      $('#command-input').focus();
       return;
     case 'ui:shortcut-record':
       return recordShortcut(id);
@@ -2554,6 +3189,16 @@ async function handleAction(action, data = {}, target) {
         b.classList.toggle('selected', b.dataset.color === data.color);
         b.setAttribute('aria-pressed', b.dataset.color === data.color);
       });
+      if ($('#modal-form')?.elements['theme-color'])
+        $('#modal-form').elements['theme-color'].value = data.color;
+      updateSpacePreview();
+      return;
+    case 'ui:space-icon':
+      if (!spaceIcons.includes(data.icon) || !$('#modal-form')?.elements['space-icon']) return;
+      $('#modal-form').elements['space-icon'].value = data.icon;
+      for (const item of $$('.space-icon-options button'))
+        item.setAttribute('aria-pressed', item.dataset.icon === data.icon);
+      updateSpacePreview();
       return;
     case 'ui:delete-space': {
       const s = state.spaces.find((s) => s.id === id);
@@ -2663,6 +3308,12 @@ async function handleAction(action, data = {}, target) {
     case 'ui:tab-close':
       closeDialog();
       return invoke('tab:close', { id });
+    case 'ui:tab-sleep': {
+      closeDialog();
+      const result = await invoke('tab:sleep', { id });
+      if (!result?.slept) toast('This page is in use or has unsaved work.');
+      return;
+    }
     case 'ui:tab-duplicate': {
       const tab = state.tabs.find((t) => t.id === id);
       closeDialog();
@@ -2703,7 +3354,19 @@ async function handleAction(action, data = {}, target) {
     case 'ui:open-url':
       return invoke('tab:create', { url: data.url });
     case 'ui:citation': {
-      const tab = state.tabs.find((t) => t.id === id && t.profileId === activeProfile()?.id);
+      const documentURL = (value) => {
+        try {
+          const url = new URL(value);
+          url.hash = '';
+          return url.href;
+        } catch {
+          return '';
+        }
+      };
+      const tab = state.tabs.find(
+        (t) =>
+          t.id === id && t.profileId === activeProfile()?.id && documentURL(t.url) === documentURL(data.url),
+      );
       if (tab) {
         await invoke('tab:activate', { id });
         if (data.pageNumber) await invoke('navigate', { url: data.url });
@@ -2843,31 +3506,82 @@ async function handleAction(action, data = {}, target) {
     }
     case 'ui:ai-prompt':
       openPanel('ai');
-      $('#ai-question').value = data.prompt || '';
-      $('#ai-question').focus();
+      if (!ui.aiDraft.trim()) rememberAIDraft(data.prompt || '');
+      $('#ai-question')?.focus();
       return;
-    case 'ui:ai-page':
-      if (ui.aiContext !== 'page') {
-        invalidateAIRequest();
-        await invoke('ai:reset');
-        ui.aiMessages = [];
-        ui.aiSources = [];
+    case 'ui:ai-intent':
+      return openAIIntent(data.intent);
+    case 'ui:ai-page': {
+      const page = aiPageGrant(activeTab());
+      if (!page) {
+        toast('Open a web page or text PDF first.');
+        return;
       }
-      ui.aiContext = 'page';
+      if (!(await setAIContext('page', [page]))) return;
       openPanel('ai');
       return;
+    }
     case 'ui:ai-select-tabs':
       showTabSelection();
       return;
     case 'ui:ai-reset':
-      invalidateAIRequest();
-      await invoke('ai:reset');
-      ui.aiMessages = [];
-      ui.aiSources = [];
-      ui.aiBusy = false;
-      ui.aiProgress = '';
-      renderPanel(true);
+      await setAIContext('research', [], { force: true });
+      $('#ai-question')?.focus();
       return;
+    case 'ui:ai-clear-context':
+      await setAIContext('research');
+      return;
+    case 'ui:ai-remove-context': {
+      const pages = ui.aiGrantedPages.filter((page) => page.id !== id);
+      await setAIContext(pages.length ? ui.aiContext : 'research', pages);
+      return;
+    }
+    case 'ui:ai-refresh-context': {
+      if (ui.aiContext === 'tabs') {
+        showTabSelection();
+        return;
+      }
+      const page = aiPageGrant(state.tabs.find((tab) => tab.id === ui.aiGrantedPages[0]?.id));
+      if (!page) {
+        toast('The selected page closed. Choose another page to share.');
+        return;
+      }
+      await setAIContext('page', [page]);
+      return;
+    }
+    case 'ui:ai-copy': {
+      const message = ui.aiMessages[Number(data.index)];
+      if (!message || message.role !== 'assistant' || message.error || message.streaming) return;
+      const sources = message.sources
+        ?.map((source, index) => `${index + 1}. ${source.title || hostname(source.url)} — ${source.url}`)
+        .join('\n');
+      await invoke('clipboard:write-text', {
+        text: [message.text, message.warning, sources ? 'Sources\n' + sources : '']
+          .filter(Boolean)
+          .join('\n\n'),
+      });
+      toast('Answer copied with its sources.');
+      return;
+    }
+    case 'ui:ai-edit':
+    case 'ui:ai-retry': {
+      const request = ui.aiMessages[Number(data.index)]?.request;
+      if (!request || request.profileId !== activeProfile()?.id || ui.aiBusy || ui.aiSubmitting) return;
+      if (aiContextStale(request.pages)) {
+        toast('Those pages changed or closed. Review the context before asking again.');
+        return;
+      }
+      rememberAIDraft();
+      if (action === 'ui:ai-edit' && ui.aiDraft.trim() && ui.aiDraft.trim() !== request.question) {
+        toast('Your unfinished question was kept. Clear it before editing an earlier question.');
+        return;
+      }
+      if (!(await setAIContext(request.kind, request.pages, { force: action === 'ui:ai-edit' }))) return;
+      if (action === 'ui:ai-retry') return askAI(request.question);
+      rememberAIDraft(request.question);
+      $('#ai-question')?.focus();
+      return;
+    }
     case 'ui:ai-login':
       if (ui.aiSigningIn || ui.aiStatus?.loginPending) return;
       ui.aiSigningIn = true;
@@ -2894,15 +3608,25 @@ async function handleAction(action, data = {}, target) {
         }
       }
       return;
-    case 'ui:ai-login-cancel':
-      ui.aiStatus = await invoke('ai:login-cancel');
+    case 'ui:ai-login-cancel': {
+      const profile = activeProfile()?.id,
+        serial = ui.aiProviderSerial;
+      const status = await invoke('ai:login-cancel');
+      if (profile !== activeProfile()?.id || serial !== ui.aiProviderSerial) return;
+      ui.aiStatus = status;
       ui.aiSigningIn = false;
       renderPanel(true);
       return;
-    case 'ui:ai-disconnect':
+    }
+    case 'ui:ai-disconnect': {
+      const profile = activeProfile()?.id,
+        serial = ui.aiProviderSerial;
       invalidateAIRequest();
       await invoke('ai:disconnect');
-      ui.aiStatus = await invoke('ai:status');
+      if (profile !== activeProfile()?.id || serial !== ui.aiProviderSerial) return;
+      const status = await invoke('ai:status');
+      if (profile !== activeProfile()?.id || serial !== ui.aiProviderSerial) return;
+      ui.aiStatus = status;
       ui.aiMessages = [];
       ui.aiSources = [];
       ui.aiBusy = false;
@@ -2911,13 +3635,28 @@ async function handleAction(action, data = {}, target) {
       renderPanel(true);
       toast('Disconnected AI provider.');
       return;
-    case 'ai:cancel':
+    }
+    case 'ai:cancel': {
       invalidateAIRequest();
+      const profile = activeProfile()?.id,
+        serial = ui.aiSubmissionSerial;
       await invoke('ai:cancel');
+      if (profile !== activeProfile()?.id || serial !== ui.aiSubmissionSerial) return;
+      if (ui.aiMessages.at(-1)?.streaming) {
+        ui.aiMessages.at(-1).streaming = false;
+        ui.aiMessages.at(-1).incomplete = true;
+        ui.aiMessages.at(-1).warning = 'Response stopped. This answer is incomplete.';
+      } else if (ui.aiMessages.at(-1)?.role === 'user')
+        ui.aiMessages.push({
+          role: 'assistant',
+          text: 'Response stopped before an answer was completed.',
+          incomplete: true,
+        });
       ui.aiBusy = false;
       ui.aiProgress = '';
       renderPanel(true);
       return;
+    }
     default: {
       const payload = {};
       if (id) payload.id = id;
@@ -2976,7 +3715,9 @@ document.addEventListener('submit', (event) => {
 });
 document.addEventListener('input', (event) => {
   const target = event.target;
-  if (target.id === 'command-input') {
+  if (target.id === 'ai-question') {
+    rememberAIDraft(target.value);
+  } else if (target.id === 'command-input') {
     ui.commandQuery = target.value;
     ui.commandIndex = 0;
     renderCommands();
@@ -3017,7 +3758,17 @@ document.addEventListener('change', (event) => {
   const target = event.target;
   if (target.dataset.setting) {
     let value = target.type === 'checkbox' ? target.checked : target.value;
-    if (['archiveAfterHours', 'openSourcesLimit', 'sidebarWidth'].includes(target.dataset.setting))
+    if (
+      [
+        'archiveAfterHours',
+        'openSourcesLimit',
+        'sidebarWidth',
+        'pinnedSleepMinutes',
+        'pageGutter',
+        'pageRadius',
+        'motionScale',
+      ].includes(target.dataset.setting)
+    )
       value = Number(value);
     safely(invoke('settings:update', { values: { [target.dataset.setting]: value } }));
   } else if (target.id === 'ai-auth-storage') {
@@ -3041,15 +3792,15 @@ document.addEventListener('change', (event) => {
     const next = target.value;
     if (next === 'tabs') {
       showTabSelection();
-    } else {
-      if (ui.aiContext !== next) {
-        invalidateAIRequest();
-        ui.aiMessages = [];
-        ui.aiSources = [];
-        safely(invoke('ai:reset'));
-      }
-      ui.aiContext = next;
       renderPanel(true);
+    } else {
+      const page = aiPageGrant(activeTab());
+      if (next === 'page' && !page) {
+        toast('Open a web page or text PDF first.');
+        renderPanel(true);
+        return;
+      }
+      safely(setAIContext(next, page ? [page] : []));
     }
   }
 });
@@ -3139,7 +3890,7 @@ document.addEventListener('keydown', (event) => {
   }
   if (ui.dialog && event.key === 'Tab') {
     const focusable = $$(
-      'button:not(:disabled),input:not(:disabled),select:not(:disabled),textarea:not(:disabled),[tabindex="0"]',
+      'button:not(:disabled),input:not(:disabled),select:not(:disabled),textarea:not(:disabled),summary,[tabindex="0"]',
       $('#dialog-root'),
     ).filter((el) => el.getClientRects().length && el.tabIndex >= 0);
     const first = focusable[0],

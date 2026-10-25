@@ -136,7 +136,7 @@ test(
       );
       const box = await aligned();
       assert.equal(box.y, baselineTop);
-      assert.equal(box.x, 224);
+      assert.equal(box.x, 232);
     }
     await shell.locator('[data-key="sidebar-toggle"]').click();
     await expect(shell.locator('#sidebar')).toBeHidden();
@@ -187,8 +187,8 @@ test(
     await emit({ type: 'panel', panel: 'settings' });
     await expect(shell.locator('#side-panel')).toBeVisible();
     const narrowPage = await aligned();
-    assert.equal(narrowPage.x, 380);
-    assert.equal(narrowPage.width, 300);
+    assert.equal(narrowPage.x, 388);
+    assert.equal(narrowPage.width, 292);
     await expect
       .poll(() => rectangle('#side-panel'))
       .toEqual({

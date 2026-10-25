@@ -40,9 +40,13 @@ test(
     assert((await shell.locator('[data-key="sidebar-toggle"]').boundingBox()).x >= 88);
     await app.evaluate(({ app }) => app.emit('fixture:runtime', null, { fullScreen: true }));
     await expect(shell.locator('html')).toHaveAttribute('data-fullscreen', 'true');
-    assert((await shell.locator('[data-key="sidebar-toggle"]').boundingBox()).x < 30);
+    await expect
+      .poll(async () => (await shell.locator('[data-key="sidebar-toggle"]').boundingBox()).x)
+      .toBeLessThan(30);
     await shell.locator('[data-key="sidebar-toggle"]').click();
-    assert((await shell.locator('[data-key="sidebar-toggle"]').boundingBox()).x < 30);
+    await expect
+      .poll(async () => (await shell.locator('[data-key="sidebar-toggle"]').boundingBox()).x)
+      .toBeLessThan(30);
     await app.evaluate(({ app }) => app.emit('fixture:runtime', null, { fullScreen: false }));
     await expect
       .poll(async () => (await shell.locator('[data-key="sidebar-toggle"]').boundingBox()).x)

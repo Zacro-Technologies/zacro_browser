@@ -15,6 +15,27 @@ const RECOVERY_PURGE_ACTIONS = new Set([
   'profile:delete',
 ]);
 const THEMES = new Set(['system', 'light', 'dark']);
+const SPACE_ICONS = new Set([
+  'circle',
+  'briefcase',
+  'home',
+  'code',
+  'book',
+  'leaf',
+  'star',
+  'heart',
+  'globe',
+  'coffee',
+  'music',
+  'moon',
+]);
+const DEFAULT_SPACE_THEME = Object.freeze({
+  secondaryColor: '#b695b8',
+  gradient: 50,
+  grain: 0,
+  opacity: 100,
+  blur: 0,
+});
 const SEARCH = Object.freeze({
   duckduckgo: 'https://duckduckgo.com/?q=',
   google: 'https://www.google.com/search?q=',
@@ -28,6 +49,20 @@ const color = (value) => (/^#[\da-f]{6}$/i.test(value || '') ? value : '#9d4460'
 const array = (value) => (Array.isArray(value) ? value : []);
 const safeId = (value) => typeof value === 'string' && /^[a-zA-Z0-9_-]{1,100}$/.test(value);
 const time = (value) => (Number.isFinite(value) && value > 0 ? value : Date.now());
+const spaceIcon = (value) => (SPACE_ICONS.has(value) ? value : 'circle');
+function spaceTheme(value, base = DEFAULT_SPACE_THEME) {
+  const next = { ...base };
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return next;
+  if (/^#[\da-f]{6}$/i.test(value.secondaryColor || '')) next.secondaryColor = value.secondaryColor;
+  for (const [key, minimum, maximum] of [
+    ['gradient', 0, 100],
+    ['grain', 0, 100],
+    ['opacity', 40, 100],
+    ['blur', 0, 32],
+  ])
+    if (Number.isFinite(value[key])) next[key] = Math.round(Math.max(minimum, Math.min(maximum, value[key])));
+  return next;
+}
 
 function normalizeAddress(input, searchEngine = 'duckduckgo') {
   const value = str(input, 8192);
@@ -82,7 +117,16 @@ function createInitialState() {
   return {
     version: 1,
     profiles: [{ id: 'default', name: 'Personal', private: false }],
-    spaces: [{ id: 'home', profileId: 'default', name: 'Personal', color: '#9d4460', icon: 'P' }],
+    spaces: [
+      {
+        id: 'home',
+        profileId: 'default',
+        name: 'Personal',
+        color: '#9d4460',
+        icon: 'circle',
+        theme: spaceTheme(),
+      },
+    ],
     activeSpaceId: 'home',
     activeTabId: null,
     tabs: [],
@@ -104,6 +148,11 @@ function createInitialState() {
       aiModel: '',
       sharePageContext: false,
       shortcutOverrides: {},
+      pinnedSleepMinutes: 20,
+      pageGutter: 8,
+      pageRadius: 12,
+      motionScale: 1,
+      tabDensity: 'comfortable',
     },
     windowBounds: { width: 1440, height: 940 },
   };
@@ -131,6 +180,17 @@ function validateSettings(values, base = createInitialState().settings) {
     next.aiModel = values.aiModel;
   if (Object.hasOwn(values, 'shortcutOverrides'))
     next.shortcutOverrides = sanitizeOverrides(values.shortcutOverrides);
+  if ([0, 5, 10, 20, 30, 60, 120].includes(values.pinnedSleepMinutes))
+    next.pinnedSleepMinutes = values.pinnedSleepMinutes;
+  for (const [key, minimum, maximum] of [
+    ['pageGutter', 4, 20],
+    ['pageRadius', 0, 20],
+  ])
+    if (Number.isFinite(values[key]))
+      next[key] = Math.round(Math.max(minimum, Math.min(maximum, values[key])));
+  if (Number.isFinite(values.motionScale))
+    next.motionScale = Math.round(Math.max(0.7, Math.min(1.4, values.motionScale)) * 100) / 100;
+  if (['compact', 'comfortable'].includes(values.tabDensity)) next.tabDensity = values.tabDensity;
   return next;
 }
 
@@ -154,7 +214,8 @@ function hydrate(raw) {
       profileId: s.profileId,
       name: str(s.name) || 'Space',
       color: color(s.color),
-      icon: str(s.icon, 4) || str(s.name, 1) || 'S',
+      icon: spaceIcon(s.icon),
+      theme: spaceTheme(s.theme),
       lastActiveTabId: str(s.lastActiveTabId, 100),
     }));
   for (const p of result.profiles)
@@ -164,7 +225,8 @@ function hydrate(raw) {
         profileId: p.id,
         name: p.name,
         color: '#9d4460',
-        icon: p.name[0],
+        icon: 'circle',
+        theme: spaceTheme(),
       });
   const spaces = new Map(result.spaces.map((s) => [s.id, s]));
   result.folders = array(raw.folders)
@@ -181,6 +243,7 @@ function hydrate(raw) {
     url: webUrl(t.url) || 'zacro://newtab',
     ...(t.homePage === true && !webUrl(t.url) ? { homePage: true } : {}),
     pinned: Boolean(t.pinned),
+    ...(t.pinned && t.closed === true ? { closed: true } : {}),
     folderId: folders.get(t.folderId)?.spaceId === t.spaceId ? t.folderId : null,
     createdAt: time(t.createdAt),
     lastActiveAt: time(t.lastActiveAt),
@@ -242,9 +305,11 @@ function hydrate(raw) {
     .slice(0, 200);
   result.settings = validateSettings(raw.settings);
   result.activeSpaceId = spaces.has(raw.activeSpaceId) ? raw.activeSpaceId : result.spaces[0].id;
-  result.activeTabId = result.tabs.some((t) => t.id === raw.activeTabId && t.spaceId === result.activeSpaceId)
+  result.activeTabId = result.tabs.some(
+    (t) => t.id === raw.activeTabId && t.spaceId === result.activeSpaceId && !t.closed,
+  )
     ? raw.activeTabId
-    : result.tabs.find((t) => t.spaceId === result.activeSpaceId)?.id || null;
+    : result.tabs.find((t) => t.spaceId === result.activeSpaceId && !t.closed)?.id || null;
   if (raw.windowBounds && typeof raw.windowBounds === 'object') {
     const { width, height, x, y } = raw.windowBounds;
     result.windowBounds = {
@@ -296,9 +361,13 @@ class BrowserStore extends EventEmitter {
         ...this.state.archive,
       ].slice(0, MAX_ARCHIVE);
       this.state.tabs = this.state.tabs.filter((t) => t.pinned);
-      this.state.activeTabId =
-        this.state.tabs.find((t) => t.spaceId === this.state.activeSpaceId)?.id || null;
+      this.state.activeTabId = null;
     }
+    // Favorites are destinations, not a request to start every saved renderer.
+    // Even a favorite selected at shutdown stays dormant until selected again.
+    if (this.state.tabs.find((tab) => tab.id === this.state.activeTabId)?.pinned)
+      this.state.activeTabId =
+        this.state.tabs.find((tab) => tab.spaceId === this.state.activeSpaceId && !tab.pinned)?.id || null;
   }
   readFile(file) {
     if (fs.statSync(file).size > 32 * 1024 * 1024) throw new Error('Browser data exceeds its safety limit.');
@@ -331,8 +400,8 @@ class BrowserStore extends EventEmitter {
     for (const key of ['tabs', 'history', 'archive', 'bookmarks', 'downloads', 'extensions', 'permissions'])
       s[key] = s[key].filter((r) => allowed.has(r.profileId));
     if (!spaces.has(s.activeSpaceId)) s.activeSpaceId = s.spaces[0]?.id;
-    if (!s.tabs.some((t) => t.id === s.activeTabId && t.spaceId === s.activeSpaceId))
-      s.activeTabId = s.tabs.find((t) => t.spaceId === s.activeSpaceId)?.id || null;
+    if (!s.tabs.some((t) => t.id === s.activeTabId && t.spaceId === s.activeSpaceId && !t.closed))
+      s.activeTabId = s.tabs.find((t) => t.spaceId === s.activeSpaceId && !t.pinned)?.id || null;
     return s;
   }
   save() {
@@ -394,11 +463,23 @@ class BrowserStore extends EventEmitter {
   }
   activateSpace(space) {
     this.state.activeSpaceId = space.id;
-    const tabs = this.state.tabs.filter((t) => t.spaceId === space.id);
+    const tabs = this.state.tabs.filter((t) => t.spaceId === space.id && !t.closed);
     this.state.activeTabId = tabs.find((t) => t.id === space.lastActiveTabId)?.id || tabs[0]?.id || null;
   }
   closeTab(tab, archive = true) {
     const position = this.state.tabs.indexOf(tab);
+    if (tab.pinned) {
+      tab.closed = true;
+      if (this.state.activeTabId === tab.id)
+        this.state.activeTabId =
+          this.state.tabs.slice(position + 1).find((item) => item.spaceId === tab.spaceId && !item.pinned)
+            ?.id ||
+          this.state.tabs.filter((item) => item.spaceId === tab.spaceId && !item.pinned).at(-1)?.id ||
+          null;
+      if (this.state.activeSpaceId === tab.spaceId)
+        this.require('spaces', tab.spaceId, 'Space').lastActiveTabId = this.state.activeTabId;
+      return;
+    }
     if (archive && tab.url !== 'zacro://newtab' && !this.private(tab.profileId))
       this.state.archive = [
         { ...tab, archivedAt: Date.now() },
@@ -406,9 +487,10 @@ class BrowserStore extends EventEmitter {
       ].slice(0, MAX_ARCHIVE);
     this.state.tabs.splice(position, 1);
     if (this.state.activeTabId === tab.id) {
-      const same = this.state.tabs.filter((t) => t.spaceId === tab.spaceId);
-      const candidate = this.state.tabs.slice(position).find((t) => t.spaceId === tab.spaceId);
+      const same = this.state.tabs.filter((t) => t.spaceId === tab.spaceId && !t.pinned);
+      const candidate = this.state.tabs.slice(position).find((t) => t.spaceId === tab.spaceId && !t.pinned);
       this.state.activeTabId = candidate?.id || same.at(-1)?.id || null;
+      this.require('spaces', tab.spaceId, 'Space').lastActiveTabId = this.state.activeTabId;
     }
   }
   dispatch(action, payload = {}) {
@@ -444,12 +526,16 @@ class BrowserStore extends EventEmitter {
         result = tab;
         break;
       }
-      case 'tab:activate': {
+      case 'tab:activate':
+      case 'tab:wake': {
         const tab = this.require('tabs', p.id, 'Tab');
-        s.activeTabId = tab.id;
-        s.activeSpaceId = tab.spaceId;
+        if (action === 'tab:activate') {
+          s.activeTabId = tab.id;
+          s.activeSpaceId = tab.spaceId;
+          this.require('spaces', tab.spaceId, 'Space').lastActiveTabId = tab.id;
+        }
         tab.lastActiveAt = now;
-        this.require('spaces', tab.spaceId, 'Space').lastActiveTabId = tab.id;
+        delete tab.closed;
         result = tab;
         break;
       }
@@ -477,6 +563,10 @@ class BrowserStore extends EventEmitter {
         const tab = this.require('tabs', p.id || s.activeTabId, 'Tab');
         tab.pinned = !tab.pinned;
         if (tab.pinned) tab.folderId = null;
+        else if (tab.closed) {
+          delete tab.closed;
+          this.closeTab(tab, false);
+        }
         result = tab;
         break;
       }
@@ -499,6 +589,7 @@ class BrowserStore extends EventEmitter {
           if (p.pinned) tab.folderId = null;
         }
         if (tab.folderId) tab.pinned = false;
+        if (!tab.pinned) delete tab.closed;
         if (Number.isInteger(p.index)) {
           s.tabs.splice(s.tabs.indexOf(tab), 1);
           s.tabs.splice(Math.min(s.tabs.length, Math.max(0, p.index)), 0, tab);
@@ -518,6 +609,7 @@ class BrowserStore extends EventEmitter {
         if (s.tabs.length >= MAX_TABS) throw new Error('Close some tabs before restoring more.');
         const tab = { ...match, lastActiveAt: now };
         delete tab.archivedAt;
+        delete tab.closed;
         if (s.tabs.some((t) => t.id === tab.id)) tab.id = id('tab');
         if (!s.folders.some((f) => f.id === tab.folderId && f.spaceId === tab.spaceId)) tab.folderId = null;
         s.archive = s.archive.filter((t) => t !== match);
@@ -547,7 +639,8 @@ class BrowserStore extends EventEmitter {
           profileId: profile.id,
           name: str(p.name),
           color: color(p.color),
-          icon: str(p.icon, 4) || str(p.name, 1).toUpperCase(),
+          icon: spaceIcon(p.icon),
+          theme: spaceTheme(p.theme),
         };
         s.spaces.push(space);
         this.activateSpace(space);
@@ -561,7 +654,8 @@ class BrowserStore extends EventEmitter {
           space.name = str(p.name);
         }
         if (p.color !== undefined) space.color = color(p.color);
-        if (p.icon !== undefined) space.icon = str(p.icon, 4) || space.name[0];
+        if (p.icon !== undefined) space.icon = spaceIcon(p.icon);
+        if (p.theme !== undefined) space.theme = spaceTheme(p.theme, space.theme || DEFAULT_SPACE_THEME);
         result = space;
         break;
       }
@@ -591,7 +685,8 @@ class BrowserStore extends EventEmitter {
           profileId: profile.id,
           name: profile.private ? 'Private' : profile.name,
           color: profile.private ? '#69519c' : color(p.color),
-          icon: profile.private ? '◇' : profile.name[0].toUpperCase(),
+          icon: profile.private ? 'moon' : 'circle',
+          theme: spaceTheme(),
         };
         s.profiles.push(profile);
         s.spaces.push(space);
@@ -807,4 +902,7 @@ module.exports = {
   hydrate,
   validateSettings,
   SEARCH,
+  SPACE_ICONS,
+  DEFAULT_SPACE_THEME,
+  spaceTheme,
 };

@@ -342,7 +342,10 @@ test('streaming and cancellation never publish a partial answer as complete', as
         signal.addEventListener('abort', () => reject(signal.reason), { once: true });
       }),
   });
-  const rejected = assert.rejects(ai.handle('ai:ask', { question: 'Long answer' }), { code: 'CANCELLED' });
+  const rejected = assert.rejects(
+    ai.handle('ai:ask', { question: 'Long answer', requestId: 'cancel-fixture' }),
+    { code: 'CANCELLED' },
+  );
   await started;
   assert.equal(ai.status().busy, true);
   await ai.handle('ai:cancel');
@@ -350,9 +353,96 @@ test('streaming and cancellation never publish a partial answer as complete', as
   assert.equal(ai.status().busy, false);
   assert.deepEqual(
     events.filter((event) => event.type === 'ai:delta'),
-    [{ type: 'ai:delta', delta: 'Partial', profileId: 'one' }],
+    [{ type: 'ai:delta', delta: 'Partial', profileId: 'one', requestId: 'cancel-fixture' }],
   );
   assert.equal(events.filter((event) => event.type === 'ai:answer').length, 0);
+  assert(
+    events
+      .filter((event) => ['ai:progress', 'ai:error'].includes(event.type))
+      .every((event) => event.requestId === 'cancel-fixture'),
+  );
+});
+
+test('explicit page grants reject navigation before or during extraction without sending content', async (t) => {
+  const before = await fixture(t);
+  before.state.tabs[0].url = 'https://example.com/changed';
+  await assert.rejects(
+    before.ai.handle('ai:ask', {
+      question: 'Read the page I selected',
+      tabIds: ['page-one'],
+      contextTabs: [{ id: 'page-one', url: 'https://example.com/original' }],
+    }),
+    { code: 'CONTEXT_CHANGED' },
+  );
+  assert.deepEqual(before.extracted, []);
+  assert.deepEqual(before.requests, []);
+
+  let during;
+  during = await fixture(t, {
+    getPageContext: async () => {
+      during.state.tabs[0].url = 'https://example.com/changed';
+      return [
+        { id: 'page-one', url: 'https://example.com/original', text: 'Do not share stale permission.' },
+      ];
+    },
+  });
+  during.state.tabs[0].url = 'https://example.com/original';
+  await assert.rejects(
+    during.ai.handle('ai:ask', {
+      question: 'Read this',
+      tabIds: ['page-one'],
+      contextTabs: [{ id: 'page-one', url: 'https://example.com/original' }],
+    }),
+    { code: 'CONTEXT_CHANGED' },
+  );
+  assert.deepEqual(during.requests, []);
+});
+
+test('history is reset when a selected tab navigates even though its tab ID is unchanged', async (t) => {
+  let url = 'https://example.com/first';
+  const { ai, state, requests, events } = await fixture(t, {
+    getPageContext: async () => [
+      {
+        id: 'page-one',
+        title: url,
+        url,
+        text: url.endsWith('/first') ? 'First document private detail.' : 'Second document fact.',
+      },
+    ],
+  });
+  state.tabs[0].url = url;
+  await ai.handle('ai:ask', { question: 'First question', tabIds: ['page-one'] });
+  await ai.handle('ai:ask', { question: 'Same-page follow-up', tabIds: ['page-one'] });
+  assert.equal(requests[1].messages.length, 3);
+  url = state.tabs[0].url = 'https://example.com/second';
+  const result = await ai.handle('ai:ask', {
+    question: 'New document',
+    requestId: 'new-document',
+    tabIds: ['page-one'],
+    contextTabs: [{ id: 'page-one', url }],
+  });
+  assert.equal(requests[2].messages.length, 1);
+  assert(!JSON.stringify(requests[2].messages).includes('First document private detail'));
+  assert.equal(result.requestId, 'new-document');
+  assert.equal(events.findLast((event) => event.type === 'ai:answer').requestId, 'new-document');
+});
+
+test('malformed or mismatched context grants fail before extraction', async (t) => {
+  const { ai, extracted, requests } = await fixture(t);
+  for (const contextTabs of [
+    null,
+    [],
+    [{ id: 'page-three', url: 'https://example.com/' }],
+    [{ id: 'page-one', url: 'file:///secret' }],
+  ])
+    await assert.rejects(ai.handle('ai:ask', { question: 'Read', tabIds: ['page-one'], contextTabs }), {
+      code: 'INPUT',
+    });
+  await assert.rejects(ai.handle('ai:ask', { question: 'Read', requestId: 'invalid\nidentifier' }), {
+    code: 'INPUT',
+  });
+  assert.deepEqual(extracted, []);
+  assert.deepEqual(requests, []);
 });
 test('subscription limits propagate without another provider or billing fallback', async (t) => {
   const { ai, requests } = await fixture(t, {

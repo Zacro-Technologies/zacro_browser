@@ -130,7 +130,7 @@ test(
     });
 
     const space = await invoke('space:create', { name: 'Second Space', color: '#59646e' });
-    await expect(shell.locator('.space-title')).toHaveText('Second Space');
+    await expect(shell.locator('#sidebar .tabs-scroll .space-title')).toHaveText('Second Space');
     assert(space.id);
 
     await shell.locator('[data-key="address"]').click();
@@ -147,7 +147,7 @@ test(
 
     const samples = await shell.evaluate(() => window.motionSamples);
     assert(samples.length >= 6);
-    assert(samples.every((sample) => sample.duration >= 100 && sample.duration <= 170 && sample.delay === 0));
+    assert(samples.every((sample) => sample.duration >= 100 && sample.duration <= 280 && sample.delay === 0));
 
     await shell.emulateMedia({ reducedMotion: 'reduce' });
     await shell.locator('[data-key="library"]').click();

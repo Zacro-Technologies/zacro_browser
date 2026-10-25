@@ -45,7 +45,8 @@ const sessions = new Map();
 const liveDownloads = new Map();
 const downloadReservations = new Set();
 const promptRequests = new Set();
-let store, win, ai, archiveTimer, publishTimer;
+let store, win, ai, archiveTimer, pinnedSleepTimer, publishTimer;
+let sleepingPins = false;
 let splitTabId = null;
 let splitPair = null;
 let normalWindowBounds = null;
@@ -194,9 +195,17 @@ function requestAuthentication(event, contents, details, authInfo, callback) {
   });
   win.webContents.focus();
 }
-function pageState(entry) {
+function pageState(entry, tab = null) {
   if (!entry || entry.contents.isDestroyed())
-    return { loading: false, canGoBack: false, canGoForward: false, zoom: 1 };
+    return {
+      loading: false,
+      canGoBack: false,
+      canGoForward: false,
+      zoom: 1,
+      loaded: false,
+      sleeping: Boolean(tab?.pinned),
+      closed: Boolean(tab?.closed),
+    };
   const wc = entry.contents;
   return {
     loading: wc.isLoading(),
@@ -208,6 +217,9 @@ function pageState(entry) {
     muted: wc.isAudioMuted(),
     favicon: entry.favicon || null,
     url: wc.getURL(),
+    loaded: true,
+    sleeping: false,
+    closed: false,
   };
 }
 function snapshot() {
@@ -215,8 +227,8 @@ function snapshot() {
   const status = ai?.status() || {};
   const preview = peek && !peek.entry.contents.isDestroyed() ? peek : null;
   result.runtime = {
-    page: pageState(activeEntry()),
-    pages: Object.fromEntries([...views].map(([id, entry]) => [id, pageState(entry)])),
+    page: pageState(activeEntry(), activeTab()),
+    pages: Object.fromEntries(result.tabs.map((tab) => [tab.id, pageState(views.get(tab.id), tab)])),
     splitTabId,
     peek: preview
       ? {
@@ -282,9 +294,11 @@ function profileSession(profileId) {
       .replace(/\sZacro\/\S+/gi, '')
       .replace(/\szacro-browser\/\S+/gi, ''),
   );
-  ses.setPermissionCheckHandler((_contents, permission, requestingOrigin) => {
+  ses.setPermissionCheckHandler((contents, permission, requestingOrigin) => {
     const origin = permissionOrigin(requestingOrigin);
-    return Boolean(origin && savedPermission(profileId, origin, permission)?.allowed);
+    const allowed = Boolean(origin && savedPermission(profileId, origin, permission)?.allowed);
+    if (allowed && permission === 'media') markMediaPermission(contents);
+    return allowed;
   });
   ses.setPermissionRequestHandler(async (contents, permission, callback, details) => {
     const origin = permissionOrigin(details.requestingUrl || details.securityOrigin || contents?.getURL());
@@ -313,6 +327,7 @@ function profileSession(profileId) {
     }
     const recorded = savedPermission(profileId, origin, permission);
     if (recorded) {
+      if (recorded.allowed && permission === 'media') markMediaPermission(contents);
       callback(Boolean(recorded.allowed));
       return;
     }
@@ -358,6 +373,7 @@ function profileSession(profileId) {
           contents.mainFrame.framesInSubtree.some((frame) => permissionOrigin(frame.url) === origin));
       if (answer.checkboxChecked && stillCurrent)
         store.dispatch('permission:set', { profileId, origin, permission, allowed });
+      if (stillCurrent && allowed && permission === 'media') markMediaPermission(contents);
       callback(stillCurrent && allowed);
     } catch {
       callback(false);
@@ -451,10 +467,14 @@ function createEntry(profileId, tabId = null, suppliedOptions = {}) {
     error: null,
     requestedURL: null,
     disposing: false,
+    inactiveSince: Date.now(),
+    activityVersion: 0,
+    navigationVersion: 0,
+    mediaPlaying: false,
     presentation: { visible: false, bounds: null, attached: false },
   };
   const wc = view.webContents;
-  view.setBorderRadius(10);
+  view.setBorderRadius(store.state.settings.pageRadius);
   view.setBackgroundColor(nativeTheme.shouldUseDarkColors ? '#1b1a1d' : '#ffffff');
   view.setVisible(false);
   wc.setWindowOpenHandler((details) => {
@@ -508,6 +528,7 @@ function createEntry(profileId, tabId = null, suppliedOptions = {}) {
     publish();
   });
   wc.on('did-start-navigation', (_event, url, _isInPlace, isMainFrame) => {
+    if (isMainFrame) entry.navigationVersion++;
     if (isMainFrame && !_isInPlace) {
       entry.faviconRequest?.abort();
       entry.favicon = null;
@@ -578,8 +599,14 @@ function createEntry(profileId, tabId = null, suppliedOptions = {}) {
   wc.on('unresponsive', () =>
     toast('A page is taking longer than expected. You can reload or close its tab.'),
   );
-  wc.on('media-started-playing', publish);
-  wc.on('media-paused', publish);
+  wc.on('media-started-playing', () => {
+    entry.mediaPlaying = true;
+    publish();
+  });
+  wc.on('media-paused', () => {
+    entry.mediaPlaying = false;
+    publish();
+  });
   wc.on('found-in-page', (_event, result) => emit({ type: 'find:result', ...result }));
   wc.on('before-input-event', (event, input) => handleShortcut(event, input, wc));
   wc.on('context-menu', (_event, params) => showPageMenu(entry, params));
@@ -589,6 +616,16 @@ function createEntry(profileId, tabId = null, suppliedOptions = {}) {
     }
   });
   wc.on('will-prevent-unload', (event) => {
+    // Automatic unloading never interrupts the user with a discard prompt.
+    // Let Chromium cancel the close and retain the entire living document.
+    if (entry.sleepRequest) {
+      const request = entry.closeRequest;
+      entry.closeRequest = null;
+      entry.sleepRequest = false;
+      entry.inactiveSince = Date.now();
+      request?.resolve(false);
+      return;
+    }
     const answer = dialog.showMessageBoxSync(win, {
       type: 'warning',
       title: 'Leave this page?',
@@ -634,6 +671,10 @@ function createEntry(profileId, tabId = null, suppliedOptions = {}) {
     try {
       if (validWindow()) win.contentView.removeChildView(entry.view);
     } catch {}
+    if (entry.sleepRequest) {
+      publish();
+      return;
+    }
     if (!closingWindow && !entry.replacing && store.state.tabs.some((tab) => tab.id === entry.tabId)) {
       const wasActive = store.state.activeTabId === entry.tabId;
       store.dispatch('tab:close', { id: entry.tabId });
@@ -651,9 +692,15 @@ function createEntry(profileId, tabId = null, suppliedOptions = {}) {
 }
 function navigated(entry, url, addHistory) {
   if (!webURL(url)) return;
+  entry.navigationVersion++;
   entry.requestedURL = url;
   entry.blankPopup = false;
   entry.error = null;
+  if (addHistory) {
+    entry.userEdited = false;
+    entry.mediaPermissionGranted = false;
+    entry.mediaPlaying = false;
+  }
   if (entry.tabId && store.state.tabs.some((tab) => tab.id === entry.tabId)) {
     const title = entry.contents.getTitle() || new URL(url).hostname;
     store.dispatch('tab:update', { id: entry.tabId, url, title });
@@ -671,14 +718,20 @@ function destroyEntry(entry) {
   }
   if (!entry.contents.isDestroyed()) entry.contents.close({ waitForBeforeUnload: false });
 }
-function requestCloseEntry(entry) {
+function requestCloseEntry(entry, { sleep = false } = {}) {
   if (!entry || entry.contents.isDestroyed()) return Promise.resolve(true);
-  if (entry.closeRequest) return entry.closeRequest.promise;
+  if (entry.closeRequest) {
+    // A user's Close takes precedence over an automatic unload already in
+    // flight, including its normal discard prompt and Closed pin state.
+    if (!sleep) entry.sleepRequest = false;
+    return entry.closeRequest.promise;
+  }
   const request = {};
   request.promise = new Promise((resolve) => {
     request.resolve = resolve;
   });
   entry.closeRequest = request;
+  entry.sleepRequest = sleep;
   entry.contents.close({ waitForBeforeUnload: true });
   return request.promise;
 }
@@ -691,6 +744,122 @@ async function requestCloseTab(id) {
     return true;
   }
   return requestCloseEntry(entry);
+}
+
+function pinProtected(entry) {
+  const tab = store.state.tabs.find((item) => item.id === entry.tabId);
+  if (
+    !tab?.pinned ||
+    tab.closed ||
+    views.get(entry.tabId) !== entry ||
+    entry.disposing ||
+    entry.closeRequest ||
+    entry.contents.isDestroyed()
+  )
+    return true;
+  if (quitting || closingWindow || !validWindow()) return true;
+  if (tab.id === store.state.activeTabId || splitPair?.includes(tab.id) || peek?.sourceTabId === tab.id)
+    return true;
+  const wc = entry.contents;
+  if (
+    wc.isLoading() ||
+    wc.isCurrentlyAudible() ||
+    wc.isBeingCaptured() ||
+    entry.mediaPlaying ||
+    entry.userEdited ||
+    entry.mediaPermissionGranted
+  )
+    return true;
+  if (pendingAuth?.contentsId === wc.id) return true;
+  return store.state.downloads.some(
+    (record) =>
+      liveDownloads.has(record.id) &&
+      record.profileId === tab.profileId &&
+      (record.sourceTabId === tab.id || (!record.sourceTabId && record.sourceUrl === tab.url)),
+  );
+}
+
+function markMediaPermission(contents) {
+  const entry = [...views.values(), ...(peek ? [peek.entry] : [])].find((item) => item.contents === contents);
+  if (entry) entry.mediaPermissionGranted = true;
+}
+
+function pinIsIdle(entry) {
+  const minutes = store.state.settings.pinnedSleepMinutes;
+  return Boolean(
+    minutes && entry.inactiveSince !== null && Date.now() - entry.inactiveSince >= minutes * 60000,
+  );
+}
+
+async function sleepPinnedEntry(entry, { automatic = false } = {}) {
+  if (!entry || pinProtected(entry) || (automatic && !pinIsIdle(entry))) return false;
+  const wc = entry.contents;
+  const { activityVersion, navigationVersion } = entry;
+  let timer;
+  try {
+    // Read in an isolated world so page-modified DOM prototypes cannot hide a
+    // draft. Unknown frames and editing surfaces are conservatively retained.
+    const safe = await Promise.race([
+      wc.executeJavaScriptInIsolatedWorld(1002, [
+        {
+          code: `(() => {
+        const inspect = (doc, depth = 0) => {
+          if (!doc || depth > 8 || doc.designMode === 'on' || doc.querySelector('[contenteditable]:not([contenteditable="false"])')) return false;
+          for (const input of doc.querySelectorAll('input')) {
+            if (input.type === 'checkbox' || input.type === 'radio') { if (input.checked !== input.defaultChecked) return false; }
+            else if (input.type === 'file') { if (input.files.length) return false; }
+            else if (input.value !== input.defaultValue) return false;
+          }
+          for (const input of doc.querySelectorAll('textarea')) if (input.value !== input.defaultValue) return false;
+          for (const select of doc.querySelectorAll('select')) {
+            const options = [...select.options];
+            const defaults = options.map((option, index) => option.defaultSelected ? index : -1).filter((index) => index >= 0);
+            if (!select.multiple && !defaults.length && options.length) defaults.push(0);
+            if (options.some((option, index) => option.selected !== defaults.includes(index))) return false;
+          }
+          for (const media of doc.querySelectorAll('audio,video')) if (!media.paused || media.srcObject) return false;
+          for (const frame of doc.querySelectorAll('iframe,frame')) { try { if (!inspect(frame.contentDocument, depth + 1)) return false; } catch { return false; } }
+          return true;
+        };
+        return inspect(document);
+      })()`,
+        },
+      ]),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(false), 1000);
+      }),
+    ]);
+    if (
+      safe !== true ||
+      pinProtected(entry) ||
+      entry.activityVersion !== activityVersion ||
+      entry.navigationVersion !== navigationVersion ||
+      (automatic && !pinIsIdle(entry))
+    )
+      return false;
+    const closed = await requestCloseEntry(entry, { sleep: true });
+    if (closed) {
+      // If a click selected this pin during the close, restore that selection
+      // immediately rather than leave an active tab without its native page.
+      if (store.state.activeTabId === entry.tabId || splitPair?.includes(entry.tabId)) reconcile();
+      publish();
+    }
+    return closed;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function sleepIdlePins() {
+  if (sleepingPins || !store?.state.settings.pinnedSleepMinutes || quitting || closingWindow) return;
+  sleepingPins = true;
+  try {
+    for (const entry of [...views.values()]) await sleepPinnedEntry(entry, { automatic: true });
+  } finally {
+    sleepingPins = false;
+  }
 }
 async function requestClosePeek() {
   if (!peek) return true;
@@ -710,7 +879,7 @@ async function requestClosePeek() {
 function ensureView(tabId) {
   if (views.has(tabId)) return views.get(tabId);
   const tab = store.state.tabs.find((item) => item.id === tabId);
-  if (!tab || tab.url === NEW_TAB || !webURL(tab.url)) return null;
+  if (!tab || tab.closed || tab.url === NEW_TAB || !webURL(tab.url)) return null;
   if (!views.has(tabId)) {
     const entry = createEntry(tab.profileId, tabId);
     views.set(tabId, entry);
@@ -760,7 +929,13 @@ function reconcile() {
 function arrangeViews() {
   if (!validWindow()) return;
   const [width, height] = win.getContentSize();
-  const rectangles = browserLayout({ width, height, ...layout, split: Boolean(splitPair) });
+  const rectangles = browserLayout({
+    width,
+    height,
+    ...layout,
+    pageGutter: store.state.settings.pageGutter,
+    split: Boolean(splitPair),
+  });
   const desired = new Map();
   if (!layout.overlay) {
     if (peek) desired.set(peek.entry, { bounds: rectangles.peek, visible: !peek.entry.error });
@@ -773,7 +948,18 @@ function arrangeViews() {
     }
   }
   for (const entry of [...views.values(), ...(peek ? [peek.entry] : [])]) {
-    if (!entry.contents.isDestroyed())
+    if (!entry.contents.isDestroyed()) {
+      if (entry.tabId === store.state.activeTabId || splitPair?.includes(entry.tabId)) {
+        if (entry.inactiveSince !== null) entry.activityVersion++;
+        entry.inactiveSince = null;
+      } else if (entry.inactiveSince === null) {
+        entry.activityVersion++;
+        entry.inactiveSince = Date.now();
+      }
+      if (entry.radius !== store.state.settings.pageRadius) {
+        entry.view.setBorderRadius(store.state.settings.pageRadius);
+        entry.radius = store.state.settings.pageRadius;
+      }
       entry.presentation = presentView(
         entry.view,
         entry.presentation,
@@ -786,6 +972,7 @@ function arrangeViews() {
         },
         win.contentView,
       );
+    }
   }
 }
 async function openPeek(url, source = activeTab()) {
@@ -1083,6 +1270,7 @@ async function onDownload(event, item, contents, profileId) {
     url: item.getURL(),
     sourceUrl: source?.url || '',
     sourceTitle: source?.title || '',
+    sourceTabId: source?.id || null,
     path: '',
     state: 'progressing',
     receivedBytes: 0,
@@ -1585,10 +1773,18 @@ async function invoke(action, payload = {}) {
     if (action === 'settings:update' && payload.values?.sidebarWidth && layout.sidebarWidth !== 0)
       layout.sidebarWidth = store.state.settings.sidebarWidth;
     if (action === 'settings:update' && payload.values?.shortcutOverrides) buildMenu();
+    if (action === 'settings:update') void sleepIdlePins();
     return result;
   }
   const contents = activeContents();
   switch (action) {
+    case 'clipboard:write-text':
+      if (typeof payload.text !== 'string' || Buffer.byteLength(payload.text, 'utf8') > 2 * 1024 * 1024)
+        throw new Error('Choose text of up to 2 MB to copy.');
+      clipboard.writeText(payload.text);
+      return null;
+    case 'tab:sleep':
+      return { slept: await sleepPinnedEntry(views.get(payload.id)) };
     case 'shortcut:set': {
       const overrides = updateShortcut(
         store.state.settings.shortcutOverrides,
@@ -1726,11 +1922,11 @@ async function invoke(action, payload = {}) {
       const previousOverlay = layout.overlay;
       const previousSidebarWidth = layout.sidebarWidth;
       if (Number.isFinite(payload.sidebarWidth))
-        layout.sidebarWidth =
-          payload.sidebarWidth === 0 ? 0 : Math.max(200, Math.min(380, payload.sidebarWidth));
+        layout.sidebarWidth = Math.max(0, Math.min(380, payload.sidebarWidth));
       if (Number.isFinite(payload.panelWidth))
         layout.panelWidth = Math.max(0, Math.min(650, payload.panelWidth));
-      if ([8, 36, 40].includes(payload.contentTop)) layout.contentTop = payload.contentTop;
+      if (Number.isFinite(payload.contentTop) && payload.contentTop >= 4 && payload.contentTop <= 40)
+        layout.contentTop = Math.round(payload.contentTop);
       else if (payload.contentTop !== undefined || layout.sidebarWidth === 0) layout.contentTop = 40;
       else if (previousSidebarWidth === 0)
         layout.contentTop = process.platform === 'darwin' || win.isFullScreen() ? 8 : 36;
@@ -1769,6 +1965,8 @@ async function invoke(action, payload = {}) {
         splitPair = null;
         break;
       }
+      if (!activeTab() || activeTab().url === NEW_TAB)
+        throw new Error('Open a web page in the current tab before starting split view.');
       const selected =
         store.state.tabs.find(
           (tab) =>
@@ -1784,8 +1982,7 @@ async function invoke(action, payload = {}) {
             tab.url !== NEW_TAB,
         );
       if (!selected) throw new Error('Open a second web page in this Space to use split view.');
-      if (activeTab()?.url === NEW_TAB)
-        throw new Error('Open a web page in the current tab before starting split view.');
+      if (selected.closed) store.dispatch('tab:wake', { id: selected.id });
       splitTabId = selected.id;
       splitPair = [store.state.activeTabId, selected.id];
       ensureView(splitTabId);
@@ -1907,13 +2104,28 @@ function registerIPC() {
     )
       throw new Error('Untrusted browser action.');
     // Reject excessively large messages before privileged work begins.
-    if (JSON.stringify(payload ?? {}).length > 1024 * 1024) throw new Error('This request is too large.');
+    if (action === 'clipboard:write-text') {
+      if (typeof payload?.text !== 'string' || Buffer.byteLength(payload.text, 'utf8') > 2 * 1024 * 1024)
+        throw new Error('Choose text of up to 2 MB to copy.');
+    } else if (JSON.stringify(payload ?? {}).length > 1024 * 1024)
+      throw new Error('This request is too large.');
     return invoke(action, payload || {});
   });
   ipcMain.on('zacro:peek-link', (event, url) => {
     const tab = tabForContents(event.sender);
     if (!tab || event.senderFrame !== event.sender.mainFrame || !webURL(url)) return;
     openPeek(url, tab).catch(report);
+  });
+  ipcMain.on('zacro:page-dirty', (event) => {
+    if (
+      !event.senderFrame ||
+      (event.senderFrame !== event.sender.mainFrame && event.senderFrame.top !== event.sender.mainFrame)
+    )
+      return;
+    const entry = [...views.values(), ...(peek ? [peek.entry] : [])].find(
+      (item) => item.contents === event.sender,
+    );
+    if (entry && !entry.contents.isDestroyed()) entry.userEdited = true;
   });
 }
 function buildMenu() {
@@ -2472,6 +2684,7 @@ app.on('before-quit', (event) => {
 app.on('will-quit', () => {
   quitting = true;
   clearInterval(archiveTimer);
+  clearInterval(pinnedSleepTimer);
   clearTimeout(publishTimer);
   for (const item of liveDownloads.values()) item.cancel();
   finishAuth();
@@ -2527,6 +2740,9 @@ if (singleInstance)
         () => store.dispatch('tab:archive-stale', { excludeIds: [...views.keys()] }),
         60_000,
       );
+      pinnedSleepTimer = setInterval(() => {
+        void sleepIdlePins();
+      }, 60000);
       startupReady = true;
       for (const url of process.argv.filter((value) => webURL(value)).slice(0, 32)) receiveExternalURL(url);
       await drainExternalURLs();

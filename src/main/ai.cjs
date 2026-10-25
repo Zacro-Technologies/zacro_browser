@@ -499,14 +499,40 @@ class AIService {
       ids.push(state.activeTabId);
     }
     if (ids.length > 6) throw new AIError('Choose up to six tabs for one question.', 'INPUT');
+    const grants = payload.contextTabs;
+    if (
+      grants !== undefined &&
+      (!Array.isArray(grants) ||
+        grants.length !== ids.length ||
+        grants.some((grant) => !grant || !ids.includes(grant.id) || !safeSourceUrl(grant.url)) ||
+        new Set(grants.map((grant) => grant.id)).size !== ids.length)
+    )
+      throw new AIError('Choose the pages to share again.', 'INPUT');
     for (const id of ids) {
       const tab = state.tabs.find((item) => item.id === id);
       if (!tab || tab.profileId !== profileId)
         throw new AIError('Only tabs in the current profile can be shared.', 'SCOPE');
+      if (grants && grants.find((grant) => grant.id === id).url !== tab.url)
+        throw new AIError(
+          'A selected page changed. Review the context and choose it again before sharing.',
+          'CONTEXT_CHANGED',
+        );
     }
     if (!ids.length) return { pages: [], unreadable: [], scope: 'research' };
     const received = await this.getPageContext(ids, signal);
     this.assertProfile(profileId);
+    if (
+      grants?.some(
+        (grant) =>
+          this.getState().tabs.find((tab) => tab.id === grant.id)?.url !== grant.url ||
+          (received.find((page) => page.id === grant.id)?.url &&
+            received.find((page) => page.id === grant.id).url !== grant.url),
+      )
+    )
+      throw new AIError(
+        'A selected page changed while it was being read. Review the context and try again.',
+        'CONTEXT_CHANGED',
+      );
     const unreadable = [];
     const pages = [];
     let remaining = MAX_CONTEXT_CHARS;
@@ -563,11 +589,18 @@ class AIService {
           : 'None of the selected pages could be read. Open readable pages or text PDFs and try again.',
         'NO_CONTEXT',
       );
-    return { pages, unreadable, scope: `pages:${[...ids].sort().join(',')}` };
+    // A tab retains its ID across navigation. Old page extracts must not become
+    // implicit context when the same tab now shows a different document.
+    return {
+      pages,
+      unreadable,
+      scope: `pages:${JSON.stringify(pages.map(({ id, url }) => [id, url]).sort())}`,
+    };
   }
 
   async requestProvider(messages, research, signal, instructions = SYSTEM, { stream = true } = {}) {
     const profileId = this.request?.profileId;
+    const requestId = this.request?.id;
     const provider = this.selection().provider;
     if (API_PROVIDERS[provider]) {
       const config = this.configFor(provider);
@@ -585,7 +618,7 @@ class AIService {
       instructions,
       onDelta: (delta) => {
         if (stream && !signal.aborted && this.activeProfile()?.id === profileId)
-          this.emit({ type: 'ai:delta', delta, profileId });
+          this.emit({ type: 'ai:delta', delta, profileId, requestId });
       },
     });
     const answers = items.filter((item) => item.type === 'agentMessage' && item.phase !== 'commentary');
@@ -630,6 +663,11 @@ class AIService {
     const question = cleanText(payload.question, MAX_QUESTION + 1).trim();
     if (!question || question.length > MAX_QUESTION)
       throw new AIError(`Enter a question of 1–${MAX_QUESTION} characters.`, 'INPUT');
+    if (
+      payload.requestId !== undefined &&
+      (typeof payload.requestId !== 'string' || !/^[\w-]{1,80}$/.test(payload.requestId))
+    )
+      throw new AIError('Invalid AI request identifier.', 'INPUT');
     const profile = this.activeProfile();
     if (!profile || profile.private)
       throw new AIError(
@@ -637,14 +675,19 @@ class AIService {
         'PRIVATE',
       );
     const controller = new AbortController();
-    const request = { id: randomUUID(), profileId: profile.id, controller };
+    const request = { id: payload.requestId || randomUUID(), profileId: profile.id, controller };
     this.request = request;
     const timer = setTimeout(
       () => controller.abort(new AIError('The provider took too long. Please try again.', 'TIMEOUT')),
       this.timeoutMs,
     );
     timer.unref?.();
-    this.emit({ type: 'ai:progress', message: 'Preparing your question…', profileId: profile.id });
+    this.emit({
+      type: 'ai:progress',
+      message: 'Preparing your question…',
+      profileId: profile.id,
+      requestId: request.id,
+    });
     try {
       const { pages, unreadable, scope } = await this.contextFor(payload, profile.id, controller.signal);
       if (controller.signal.aborted) throw controller.signal.reason;
@@ -671,6 +714,7 @@ class AIService {
         sharedTabs,
         unreadable,
         profileId: profile.id,
+        requestId: request.id,
       });
       let context = '';
       if (pages.length) {
@@ -716,6 +760,7 @@ class AIService {
         mode: research ? 'research' : general ? 'general' : 'pages',
         complete: true,
         profileId: profile.id,
+        requestId: request.id,
         provider,
         model: this.status().model,
       };
@@ -739,7 +784,13 @@ class AIService {
       const message = isKnownError(failure)
         ? failure.message
         : 'Unable to reach the AI provider. Check your internet connection and try again.';
-      this.emit({ type: 'ai:error', message, code: failure?.code || 'NETWORK', profileId: profile.id });
+      this.emit({
+        type: 'ai:error',
+        message,
+        code: failure?.code || 'NETWORK',
+        profileId: profile.id,
+        requestId: request.id,
+      });
       throw new AIError(message, failure?.code || 'NETWORK');
     } finally {
       clearTimeout(timer);

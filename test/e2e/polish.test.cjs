@@ -169,7 +169,7 @@ test(
     );
     assert(geometry.rows.every((row) => row.height === 32 && row.bottom < geometry.footerTop));
     for (const favorite of geometry.favorites) {
-      assert.match(favorite.name, /^Favorite [1-4]$/);
+      assert.match(favorite.name, /^Favorite [1-4] — Sleeping$/);
       assert(favorite.title.includes(base), 'Icon-only favorites retain a full destination tooltip');
       assert.equal(favorite.height, 40);
       assert.equal(favorite.labels, 0);
@@ -201,11 +201,11 @@ test(
           ? { id: view.webContents.id, ...view.getBounds(), viewport: window.getContentSize() }
           : null;
       }, url);
-    await expect.poll(async () => (await surface())?.x).toBe(224);
+    await expect.poll(async () => (await surface())?.x).toBe(232);
     const before = await surface();
     const loads = requests.get('/sidebar-draft');
     assert.equal(before.y, process.platform === 'darwin' ? 8 : 36);
-    assert.equal(before.width, before.viewport[0] - 224 - 8);
+    assert.equal(before.width, before.viewport[0] - 224 - 16);
     await browser.app.evaluate(({ webContents }, url) => {
       const contents = webContents.getAllWebContents().find((item) => item.getURL() === url);
       contents.focus();
@@ -218,7 +218,7 @@ test(
     await expect.poll(async () => (await surface())?.x).toBe(8);
     const expanded = await surface();
     assert.equal(expanded.y, 40);
-    assert.equal(expanded.width, before.width + 216);
+    assert.equal(expanded.width, before.width + 224);
     assert.equal(expanded.id, before.id);
     await expect
       .poll(() => browser.guest(url, 'document.hasFocus() && document.activeElement.id'))
@@ -226,7 +226,7 @@ test(
     assert.equal(await browser.guest(url, 'document.getElementById("draft").value'), 'A draft worth keeping');
     await restore.click();
     await expect(shell.locator('#sidebar')).toBeVisible();
-    await expect.poll(async () => (await surface())?.x).toBe(224);
+    await expect.poll(async () => (await surface())?.x).toBe(232);
     assert.equal((await surface()).width, before.width);
     assert.equal(requests.get('/sidebar-draft'), loads, 'Changing chrome never reloads the page');
     assert.equal(await browser.guest(url, 'document.getElementById("draft").value'), 'A draft worth keeping');
@@ -321,8 +321,9 @@ test(
     await openLibrarySection(shell, 'settings');
     await expect(shell.locator('select[data-setting="theme"]')).toBeVisible();
     const disclosures = shell.locator('#side-panel details');
-    await expect(disclosures).toHaveCount(4);
+    await expect(disclosures).toHaveCount(5);
     assert.deepEqual(await disclosures.evaluateAll((items) => items.map((item) => item.open)), [
+      false,
       false,
       false,
       false,
@@ -339,7 +340,7 @@ test(
     await expect(connection).toHaveAttribute('open', '');
     await expect(shell.getByLabel('Model', { exact: true })).toHaveValue('fixture-two');
     await expect(shell.getByLabel('Model', { exact: true })).toBeFocused();
-    for (const heading of ['Your data', 'Extensions', 'About Zacro']) {
+    for (const heading of ['Layout & motion', 'Your data', 'Extensions', 'About Zacro']) {
       const summary = shell.locator('#side-panel summary').filter({ hasText: heading });
       await summary.focus();
       await shell.keyboard.press('Enter');
@@ -398,7 +399,7 @@ test(
     await expect(input).toBeFocused();
     await expect(input).toHaveValue('/');
     await shell.keyboard.press('Shift+Tab');
-    await expect(shell.locator('.command-mode')).toBeFocused();
+    await expect(shell.getByRole('button', { name: 'Actions', exact: true })).toBeFocused();
     await shell.keyboard.press('Tab');
     await expect(input).toBeFocused();
     await address.evaluate((element) => element.focus());
@@ -1414,7 +1415,10 @@ test(
     // route back to sign-in even though the welcome screen is no longer shown.
     await emit({ type: 'ai:error', code: 'AUTH', message: 'Sign in with ChatGPT again.' });
     await emit({ type: 'ai:status', configured: false, busy: false, loginPending: false, models: [] });
-    await expect(shell.locator('.message.assistant').first()).toHaveText(`Zacro${longAnswer}`);
+    await expect(shell.locator('.message.assistant .message-content').first()).toHaveText(longAnswer);
+    await expect(
+      shell.locator('.message.assistant').first().getByRole('button', { name: 'Copy answer' }),
+    ).toBeVisible();
     await expect(shell.locator('.message.assistant').last()).toContainText('Sign in with ChatGPT again.');
     await expect(shell.locator('#ai-form')).toHaveCount(0);
     await expect(shell.getByRole('button', { name: 'Connect AI', exact: true })).toBeVisible();
@@ -1478,6 +1482,9 @@ test(
       1,
     );
 
+    await expect(shell.locator('#ai-submit')).toBeDisabled();
+    await shell.getByRole('button', { name: 'Review pages again', exact: true }).click();
+    await expect(shell.locator('#ai-submit')).toBeEnabled();
     await shell.locator('#ai-question').press('Enter');
     await expect
       .poll(() =>

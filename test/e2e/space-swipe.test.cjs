@@ -6,7 +6,6 @@ const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 const http = require('node:http');
-const { setTimeout: delay } = require('node:timers/promises');
 const { _electron: electron, expect } = require('@playwright/test');
 
 async function launch(t) {
@@ -40,6 +39,9 @@ async function launch(t) {
       ({ events, selector }) =>
         events.map((event) => {
           const wheel = new WheelEvent('wheel', { bubbles: true, cancelable: true, ...event });
+          for (const property of ['momentum', 'phase'])
+            if (event[property] !== undefined)
+              Object.defineProperty(wheel, property, { value: event[property] });
           document.querySelector(selector).dispatchEvent(wheel);
           return wheel.defaultPrevented;
         }),
@@ -48,9 +50,9 @@ async function launch(t) {
   // Keep the two parts of one gesture on the renderer clock. A main-process
   // assertion between them can take longer than the 240ms quiet period on CI,
   // accidentally turning the final sample into a separate gesture.
-  const measuredBurst = (before, after) =>
+  const measuredBurst = (before, after, tails = false) =>
     shell.evaluate(
-      ({ before, after }) => {
+      async ({ before, after, tails }) => {
         const list = document.querySelector('.tabs-scroll');
         const dispatch = (events) =>
           events.map((event) => {
@@ -65,9 +67,19 @@ async function launch(t) {
           transform: list.style.transform,
         };
         const finalEvents = dispatch(after);
-        return { firstEvents, finalEvents, intermediate };
+        const beforeRelease = document.querySelector('.space-dot[aria-current="true"]')?.dataset.id;
+        if (tails) {
+          // Schedule the fallback inertia stream on the same clock as release.
+          // Round trips to the main process may exceed the stream's quiet gap.
+          await new Promise((resolve) => setTimeout(resolve, 150));
+          for (let i = 0; i < 5; i++) {
+            dispatch([{ deltaX: 100 }]);
+            await new Promise((resolve) => setTimeout(resolve, 70));
+          }
+        }
+        return { firstEvents, finalEvents, intermediate, beforeRelease };
       },
-      { before, after },
+      { before, after, tails },
     );
   const idle = () =>
     shell.evaluate(async () => {
@@ -178,7 +190,7 @@ test(
     assert.deepEqual(await nativeBounds(), originalBounds, 'Returning to a Space restores exact page bounds');
     const samples = await b.shell.evaluate(() => window.spaceMotion);
     assert.equal(samples.length, 2);
-    assert(samples.every((sample) => sample.duration > 0 && sample.duration <= 170));
+    assert(samples.every((sample) => sample.duration >= 140 && sample.duration <= 240));
     assert.match(samples[0].frames[0].transform, /translateX\([\d.]+px\)/);
     assert.match(samples[1].frames[0].transform, /translateX\(-[\d.]+px\)/);
 
@@ -303,7 +315,7 @@ test(
     await b.changedTo(b.first);
     await b.idle();
 
-    const forward = await b.measuredBurst([{ deltaX: 20 }, { deltaX: 20 }], [{ deltaX: 30 }]);
+    const forward = await b.measuredBurst([{ deltaX: 40 }, { deltaX: 40 }], [{ deltaX: 40 }], true);
     assert.deepEqual(forward.firstEvents, [true, true]);
     assert.deepEqual(forward.finalEvents, [true]);
     assert.deepEqual(
@@ -311,16 +323,12 @@ test(
       {
         activeSpace: b.first,
         tracking: true,
-        transform: 'translateX(-40px)',
+        transform: 'translateX(-80px)',
       },
-      'Small movements must accumulate as feedback before navigation',
+      'Tracking continues beyond the former 64px threshold without navigation',
     );
+    assert.equal(forward.beforeRelease, b.first, 'Crossing the release distance cannot switch a live drag');
     await b.changedTo(b.second);
-    // Even continued high-magnitude inertia can switch only one Space per burst.
-    for (let i = 0; i < 5; i++) {
-      await delay(70);
-      await b.wheel([{ deltaX: 100 }]);
-    }
     assert.equal(await b.current(), b.second);
     await b.idle();
     await b.wheel([{ deltaX: 100 }]);
@@ -332,7 +340,7 @@ test(
     await b.idle();
     const reverse = await b.measuredBurst(
       [{ deltaX: -40 }, { deltaX: 30 }, { deltaX: -30 }],
-      [{ deltaX: -40 }],
+      [{ deltaX: -70 }],
     );
     assert.deepEqual(reverse.firstEvents, [true, true, true]);
     assert.deepEqual(reverse.finalEvents, [true]);
@@ -348,7 +356,7 @@ test(
     await b.changedTo(b.second);
 
     await b.idle();
-    await b.wheel([{ deltaX: -4, deltaMode: 1 }]);
+    await b.wheel([{ deltaX: -7, deltaMode: 1 }]);
     await b.changedTo(b.first);
     await b.idle();
     await b.wheel([{ deltaX: -100 }]);
@@ -461,44 +469,167 @@ test(
     await b.changedTo(b.second);
     if (await b.shell.locator('#command-input').count()) await b.shell.keyboard.press('Escape');
     await b.idle();
-    const offset = () =>
-      b.shell
-        .locator('.tabs-scroll')
-        .evaluate((element) => (element.style.transform ? new DOMMatrix(element.style.transform).m41 : 0));
-    assert.deepEqual(await b.wheel([{ deltaX: 18 }, { deltaX: 10 }]), [true, true]);
-    assert.equal(await b.current(), b.second);
-    assert.equal(await offset(), -28, 'Feedback is proportional to the accumulated finger displacement');
-    await expect(b.shell.locator('.tabs-scroll')).toHaveClass(/gesture-tracking/);
-    await expect(b.shell.locator('#space-gesture-preview')).toBeVisible();
-    await expect(b.shell.locator('#space-gesture-preview')).toHaveText('Third Space');
-
-    await b.wheel([{ deltaX: -18 }]);
-    assert.equal(await offset(), -10, 'A reversal unwinds the current preview instead of jumping sides');
-    await b.wheel([{ deltaX: -10 }]);
-    assert.equal(await offset(), 0);
-    assert.equal(await b.current(), b.second);
-    await expect(b.shell.locator('#space-gesture-preview')).toBeHidden();
+    // Observe the individual samples on one renderer clock. An IPC round trip
+    // between samples can exceed the fallback contact-release pause on CI.
+    const reversal = await b.shell.evaluate(() => {
+      const list = document.querySelector('.tabs-scroll');
+      const preview = document.querySelector('#space-gesture-preview');
+      const samples = [];
+      for (const deltaX of [18, 10, -18, -10]) {
+        const wheel = new WheelEvent('wheel', { deltaX, bubbles: true, cancelable: true });
+        list.dispatchEvent(wheel);
+        samples.push({
+          prevented: wheel.defaultPrevented,
+          offset: new DOMMatrix(list.style.transform).m41,
+          tracking: list.classList.contains('gesture-tracking'),
+          preview: preview.hidden ? null : preview.textContent,
+          active: document.querySelector('.space-dot[aria-current="true"]').dataset.id,
+        });
+      }
+      return samples;
+    });
+    assert.deepEqual(
+      reversal.map((sample) => sample.offset),
+      [-18, -28, -10, 0],
+    );
+    assert(reversal.every((sample) => sample.prevented && sample.tracking && sample.active === b.second));
+    assert.equal(reversal[1].preview, 'Third Space');
+    assert.equal(reversal[3].preview, null);
     await b.idle();
     await expect(b.shell.locator('.tabs-scroll')).not.toHaveClass(/gesture-tracking/);
 
-    await b.wheel([{ deltaX: 24 }]);
-    assert.equal(await offset(), -24);
-    await b.shell.locator('#sidebar').dispatchEvent('pointerleave');
-    assert.equal(await offset(), 0, 'Leaving the sidebar cancels a partial preview immediately');
+    const cancelled = await b.shell.evaluate(() => {
+      const list = document.querySelector('.tabs-scroll');
+      const wheel = (deltaX) =>
+        list.dispatchEvent(new WheelEvent('wheel', { deltaX, bubbles: true, cancelable: true }));
+      wheel(24);
+      const tracked = new DOMMatrix(list.style.transform).m41;
+      document.querySelector('#sidebar').dispatchEvent(new PointerEvent('pointerleave'));
+      const reset = list.style.transform;
+      wheel(100);
+      return { tracked, reset, tail: list.style.transform };
+    });
+    assert.deepEqual(cancelled, { tracked: -24, reset: '', tail: '' });
     await expect(b.shell.locator('#space-gesture-preview')).toBeHidden();
-    await b.wheel([{ deltaX: 100 }]);
+    await b.idle();
     assert.equal(await b.current(), b.second, 'A cancelled gesture cannot commit with its remaining tail');
 
     await b.invoke('space:activate', { id: b.first });
     await b.changedTo(b.first);
     await b.idle();
-    await b.wheel([{ deltaX: -180 }]);
-    const edge = await offset();
+    const edge = await b.shell.evaluate(() => {
+      const list = document.querySelector('.tabs-scroll');
+      list.dispatchEvent(new WheelEvent('wheel', { deltaX: -180, bubbles: true, cancelable: true }));
+      return new DOMMatrix(list.style.transform).m41;
+    });
     assert(edge > 0 && edge < 24, 'The first Space resists with a bounded rubber-band displacement');
     assert.equal(await b.current(), b.first);
     await expect(b.shell.locator('#space-gesture-preview')).toBeHidden();
     await b.idle();
-    assert.equal(await offset(), 0, 'Uncommitted feedback settles after the gesture ends');
+    assert.equal(
+      await b.shell.locator('.tabs-scroll').evaluate((element) => element.style.transform),
+      '',
+      'Uncommitted feedback settles after the gesture ends',
+    );
     await expect(b.shell.locator('.tabs-scroll')).not.toHaveClass(/gesture-tracking/);
+  },
+);
+
+test(
+  'Space dragging survives title redraws and settles both lists from the actual release position',
+  { timeout: 45000 },
+  async (t) => {
+    const b = await launch(t);
+    const tab = await b.invoke('tab:create', { homePage: true });
+    await expect(b.shell.locator(`.tab-row[data-tab-id="${tab.id}"]`)).toBeVisible();
+    await b.shell.emulateMedia({ reducedMotion: 'no-preference' });
+    await b.idle();
+    const result = await b.shell.evaluate(
+      async ({ tabId, nextId }) => {
+        const nextFrame = () => new Promise((resolve) => requestAnimationFrame(resolve));
+        const until = async (condition) => {
+          const deadline = performance.now() + 3000;
+          while (!condition()) {
+            if (performance.now() >= deadline) throw new Error('Timed out waiting for gesture paint');
+            await nextFrame();
+          }
+        };
+        const wheel = (deltaX, phase) => {
+          const event = new WheelEvent('wheel', { deltaX, bubbles: true, cancelable: true });
+          Object.defineProperty(event, 'phase', { value: phase });
+          document.querySelector('.tabs-scroll').dispatchEvent(event);
+        };
+        const frames = [];
+        const animate = Element.prototype.animate;
+        Element.prototype.animate = function (keyframes, options) {
+          if (this.matches('.tabs-scroll') || this.parentElement?.matches('.space-transition-snapshot'))
+            frames.push({ incoming: this.matches('.tabs-scroll'), keyframes, duration: options.duration });
+          return animate.call(this, keyframes, options);
+        };
+        try {
+          wheel(80, 'began');
+          const oldList = document.querySelector('.tabs-scroll');
+          await window.zacro.invoke('tab:update', { id: tabId, title: 'Changed while dragging' });
+          await until(() => document.querySelector('.tabs-scroll') !== oldList);
+          const list = document.querySelector('.tabs-scroll');
+          const afterRedraw = {
+            offset: new DOMMatrix(list.style.transform).m41,
+            tracking: list.classList.contains('gesture-tracking'),
+            title: list.querySelector('.tab-row .title').textContent,
+          };
+          wheel(40, 'changed');
+          const held = {
+            offset: new DOMMatrix(list.style.transform).m41,
+            active: document.querySelector('.space-dot[aria-current="true"]').dataset.id,
+          };
+          wheel(0, 'ended');
+          const snapshot = document.querySelector('.space-transition-snapshot');
+          const outgoing = {
+            inert: snapshot.inert,
+            hidden: snapshot.getAttribute('aria-hidden'),
+            interactiveAttributes: snapshot.querySelectorAll(
+              '[id], [data-action], [data-key], [data-tab-id], [draggable]',
+            ).length,
+            title: snapshot.querySelector('.title').textContent,
+            offset: new DOMMatrix(snapshot.firstElementChild.style.transform).m41,
+            width: snapshot.clientWidth,
+          };
+          await until(() => document.querySelector('.space-dot[aria-current="true"]')?.dataset.id === nextId);
+          const travel = document.querySelector('#sidebar').clientWidth;
+          await until(() => !document.querySelector('.space-transition-snapshot'));
+          return { afterRedraw, held, outgoing, frames, travel };
+        } finally {
+          Element.prototype.animate = animate;
+        }
+      },
+      { tabId: tab.id, nextId: b.second },
+    );
+    assert.deepEqual(result.afterRedraw, { offset: -80, tracking: true, title: 'Changed while dragging' });
+    assert.deepEqual(result.held, { offset: -120, active: b.first });
+    assert.deepEqual(
+      { ...result.outgoing, width: undefined },
+      {
+        inert: true,
+        hidden: 'true',
+        interactiveAttributes: 0,
+        title: 'Changed while dragging',
+        offset: -120,
+        width: undefined,
+      },
+    );
+    assert(result.outgoing.width > 150 && result.outgoing.width < result.travel);
+    const incoming = result.frames.find((sample) => sample.incoming);
+    const outgoing = result.frames.find((sample) => !sample.incoming);
+    assert.equal(incoming.keyframes[0].transform, `translateX(${result.travel - 120}px)`);
+    assert.equal(outgoing.keyframes[0].transform, 'translateX(-120px)');
+    assert.equal(outgoing.keyframes[1].transform, `translateX(${-result.travel}px)`);
+    assert.equal(
+      incoming.duration,
+      outgoing.duration,
+      'The outgoing and incoming lists share one settling clock',
+    );
+    assert(incoming.duration >= 140 && incoming.duration <= 240);
+    await expect(b.shell.locator('.tabs-scroll')).not.toHaveClass(/gesture-tracking/);
+    await expect(b.shell.locator('.space-transition-snapshot')).toHaveCount(0);
   },
 );
