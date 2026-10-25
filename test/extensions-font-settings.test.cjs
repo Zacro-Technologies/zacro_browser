@@ -351,3 +351,54 @@ test('startup calls wait for managed native activation readiness before changing
   await pending;
   assert.equal(f.native.get('one').defaultFontSize, 39);
 });
+
+test('stock uninstall discards durable ownership before same-ID reinstall and custom restart', async (t) => {
+  const f = fixture(t),
+    id = f.ids[0],
+    record = f.records.get('one')[0];
+  await f.call('setDefaultFontSize', { pixelSize: 44 });
+  const api = f.sessions.get('one').extensions,
+    nativeCapabilities = api.getZacroCapabilities;
+  api.getZacroCapabilities = () => ({ version: 0 });
+  const stock = new FontSettingsController(f.options);
+  let nativeWrites = 0;
+  const nativeSetter = api.setZacroFontPreferences;
+  api.setZacroFontPreferences = () => {
+    nativeWrites++;
+    throw new Error('Stock must not write native preferences');
+  };
+  f.records.get('one').shift();
+  const removal = stock.reconcile('one');
+  f.records.get('one').push({ ...record, generation: 2, installedAt: 900 });
+  await removal;
+  const saved = JSON.parse(fs.readFileSync(path.join(f.root, 'one', 'font-settings.json'), 'utf8'));
+  assert.equal(saved.owners[id], undefined);
+  assert.equal(nativeWrites, 0);
+  api.setZacroFontPreferences = nativeSetter;
+  api.getZacroCapabilities = nativeCapabilities;
+  const custom = new FontSettingsController(f.options);
+  await custom.reconcile('one');
+  assert.equal(f.native.get('one').defaultFontSize, 19);
+});
+
+test('stock disable retains durable owner for explicit enable on custom restart', async (t) => {
+  const f = fixture(t),
+    id = f.ids[0],
+    record = f.records.get('one')[0];
+  await f.call('setDefaultFontSize', { pixelSize: 44 });
+  const api = f.sessions.get('one').extensions,
+    nativeCapabilities = api.getZacroCapabilities;
+  api.getZacroCapabilities = () => ({ version: 0 });
+  const stock = new FontSettingsController(f.options);
+  record.enabled = false;
+  await stock.reconcile('one');
+  const saved = JSON.parse(fs.readFileSync(path.join(f.root, 'one', 'font-settings.json'), 'utf8'));
+  assert.equal(saved.owners[id].defaultFontSize, 44);
+  api.getZacroCapabilities = nativeCapabilities;
+  const custom = new FontSettingsController(f.options);
+  await custom.reconcile('one');
+  assert.equal(f.native.get('one').defaultFontSize, 19);
+  record.enabled = true;
+  await custom.reconcile('one');
+  assert.equal(f.native.get('one').defaultFontSize, 44);
+});

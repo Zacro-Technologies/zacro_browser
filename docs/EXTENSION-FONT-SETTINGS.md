@@ -30,7 +30,8 @@ wins, with extension ID as a deterministic tie break. Clearing removes only
 that caller's value. Disable and permission revocation remove an owner's
 current effect; an explicit enable or permission regrant can reactivate retained
 values. Uninstall discards that owner's stored values, including an immediate
-reinstall of the same ID. Private profiles are rejected.
+reinstall of the same ID. This local deletion also runs on stock Electron while
+native font calls remain denied. Private profiles are rejected.
 
 Calls wait for managed activation readiness and recheck the current profile,
 permission, extension generation and document context across native waits.

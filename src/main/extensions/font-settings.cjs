@@ -107,10 +107,13 @@ class FontSettingsController {
     this.epochs = new Map();
     this.closed = false;
   }
-  profile(profileId) {
+  assertProfile(profileId) {
     const profile = this.getProfile(profileId);
     if (this.closed || !profile || profile.private)
       throw new Error('Font settings profile unavailable or private');
+  }
+  profile(profileId) {
+    this.assertProfile(profileId);
     const session = this.getSession(profileId);
     if (
       !negotiateEngineCapabilities(session).fontSettings ||
@@ -129,10 +132,11 @@ class FontSettingsController {
     if (!metadata.grants?.permissions?.includes('fontSettings'))
       throw new Error('Missing fontSettings permission');
   }
-  enqueue(profileId, work) {
+  enqueue(profileId, work, { native = true } = {}) {
     const epoch = this.epochs.get(profileId);
     const guard = () => {
-      this.profile(profileId);
+      if (native) this.profile(profileId);
+      else this.assertProfile(profileId);
       if (this.epochs.get(profileId) !== epoch) throw new Error('Expired font settings profile');
     };
     const pending = (this.queues.get(profileId) || Promise.resolve())
@@ -281,21 +285,46 @@ class FontSettingsController {
   }
   reconcile(profileId) {
     try {
-      this.profile(profileId);
+      this.assertProfile(profileId);
     } catch (error) {
-      // An unmodified engine never receives a native write, even with a saved
-      // controller file. No extension can activate this capability there.
-      if (error.message === 'Native font settings unavailable') return Promise.resolve();
       return Promise.reject(error);
     }
     // Capture removal at notification time. A queued reconciliation must not
     // let an immediate reinstall with the same ID inherit the old owner's data.
     const installed = new Set(this.listExtensions(profileId).map((r) => r.id));
-    return this.enqueue(profileId, async (guard) => {
-      const durable = clone(this.state(profileId).durable);
-      for (const id of Object.keys(durable.owners)) if (!installed.has(id)) delete durable.owners[id];
-      await this.apply(profileId, durable, guard);
-    });
+    return this.enqueue(
+      profileId,
+      async (guard) => {
+        const state = this.state(profileId),
+          durable = clone(state.durable);
+        let removed = false;
+        for (const id of Object.keys(durable.owners)) {
+          if (!installed.has(id)) {
+            delete durable.owners[id];
+            removed = true;
+          }
+        }
+        // Uninstall invalidates local ownership even on stock Electron or when
+        // native application fails. Disabled installed owners remain retained.
+        if (removed) {
+          guard();
+          this.persist(profileId, durable);
+          state.durable = durable;
+        }
+        try {
+          this.profile(profileId);
+        } catch (error) {
+          // A stock session can prune local owners, but never invoke font hooks.
+          if (error.message === 'Native font settings unavailable') return;
+          throw error;
+        }
+        await this.apply(profileId, durable, () => {
+          guard();
+          this.profile(profileId);
+        });
+      },
+      { native: false },
+    );
   }
   call(context, method, args) {
     return Promise.resolve().then(async () => {
