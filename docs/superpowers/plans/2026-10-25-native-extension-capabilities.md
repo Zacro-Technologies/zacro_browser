@@ -617,3 +617,31 @@ and the worker pool's own child cleanup. Retain the unique profile root for
 diagnostics and document it. This is reversible harness configuration; no new
 mirrored tests are required. Run existing build-tool tests plus syntax/format
 and obtain scoped source review. Real native execution remains its later gate.
+
+## Task 18: Complete cross-context and equivalent native-service transitions
+
+The whole-change fix review accepted findings1,2,4 in source, but reproduced two
+load-bearing cases in optional native-service finding3. Carry these forward as
+a bounded completion task; do not park them while advertising optional services.
+Full evidence and exact locations are in integration-fix-review.md.
+
+1. Give every living background the facade's authenticated permission-transition
+   refresh independently of extension-authored permissions listeners. An options
+   page granting a permission must refresh an already-running worker that only
+   listens for storage/runtime messages. Require ready/checkpoint wrappers,
+   managed events and durability; preserve idle/wake and permission filtering.
+   Remove the native acceptance fixture's masking explicit permission listener
+   where it is meant to test this case.
+2. Treat declarativeNetRequest and declarativeNetRequestWithHostAccess as one
+   effective service group. Adding either spelling when the other is already
+   granted must preserve session rules, dynamic rules and static enabled sets.
+   Test both directions, while retaining true full-revocation/regrant cleanup.
+
+Resume the integration implementer, owning bootstrap/native-services and the
+focused tests/fixtures only; no native patch change is expected. First prepare
+read-only analysis while root's current full verification uses the immutable
+source. Begin edits after root explicitly releases the lane. Add meaningful
+RED/GREEN regressions and run affected Node/native tests only, coordinating the
+foreground lane. Record exact evidence in task-18-report.md, narrow commit, then
+fresh scoped review. Do not re-review the other three already-addressed findings
+or treat stock negatives as custom positive execution. No subagents.
