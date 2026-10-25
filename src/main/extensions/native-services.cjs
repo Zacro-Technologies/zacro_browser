@@ -100,18 +100,30 @@ class NativeServices {
       throw new Error('Native service permission unavailable');
   }
   async reconfigure(permissions, apply) {
-    const servicePermissions = (values) =>
-      values
-        .filter((value) =>
-          ['alarms', 'offscreen', 'declarativeNetRequest', 'declarativeNetRequestWithHostAccess'].includes(
-            value,
-          ),
-        )
-        .sort();
-    if (
-      JSON.stringify(servicePermissions(this.permissions)) === JSON.stringify(servicePermissions(permissions))
-    )
-      return apply();
+    const serviceGroups = (values) =>
+      [
+        ...new Set(
+          values
+            .filter((value) =>
+              [
+                'alarms',
+                'offscreen',
+                'declarativeNetRequest',
+                'declarativeNetRequestWithHostAccess',
+              ].includes(value),
+            )
+            .map((value) =>
+              value === 'declarativeNetRequestWithHostAccess' ? 'declarativeNetRequest' : value,
+            ),
+        ),
+      ].sort();
+    const previousGroups = serviceGroups(this.permissions),
+      nextGroups = serviceGroups(permissions);
+    if (JSON.stringify(previousGroups) === JSON.stringify(nextGroups)) {
+      const result = await apply();
+      this.permissions = [...permissions];
+      return result;
+    }
     const previous = [...this.permissions],
       oldReady = this.ready,
       oldQueue = this.queue;
@@ -159,7 +171,7 @@ class NativeServices {
       const result = await apply();
       this.permissions = [...permissions];
       this.guard();
-      await this.initialize({ added: permissions.filter((permission) => !previous.includes(permission)) });
+      await this.initialize({ added: nextGroups.filter((group) => !previousGroups.includes(group)) });
       return result;
     } catch (error) {
       this.rejectReady(error);
@@ -226,7 +238,7 @@ class NativeServices {
             throw new Error('Native alarms unavailable in this runtime');
           if (permissions.includes('offscreen') && !chrome.offscreen?.createDocument)
             throw new Error('Native offscreen documents unavailable in this runtime');
-          if (dnr && (!added || added.some((permission) => permission.startsWith('declarativeNetRequest')))) {
+          if (dnr && (!added || added.includes('declarativeNetRequest'))) {
             const sessions = await dnr.getSessionRules();
             if (sessions.length)
               await dnr.updateSessionRules({ removeRuleIds: sessions.map((rule) => rule.id) });

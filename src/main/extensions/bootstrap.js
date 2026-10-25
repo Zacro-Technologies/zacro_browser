@@ -238,6 +238,9 @@
         const names = [...events]
           .filter(([, item]) => item.listeners.size)
           .map(([name]) => (name === 'storage.sync.onChanged' ? 'storage.onChanged' : name));
+        // These subscriptions belong to the facade, independent of public
+        // listeners: another living context can grant an optional namespace.
+        names.push('permissions.onAdded', 'permissions.onRemoved');
         if (menuCallbacks.size) names.push('contextMenus.onClicked');
         host.invoke('zacro.events.subscribe', [[...new Set(names)]]).catch(() => {});
       }, 0);

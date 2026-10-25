@@ -24,12 +24,23 @@ app.whenReady().then(async () => {
       return;
     }
     let manager, api;
-    const alarms = [];
+    const alarms = [],
+      workerServiceCalls = [];
     const bridge = new ExtensionBridge({
       resolveExtension: (p, id) => manager.resolveExtension(p, id),
       dispatch: (context, method, args) =>
         method === 'fixture.alarm' ? alarms.push(args[0]) : api.call(context, method, args),
     });
+    const handle = bridge.handle.bind(bridge);
+    bridge.handle = async (event, request) => {
+      const result = await handle(event, request);
+      if (
+        request.method?.startsWith('zacro.nativeServices.') &&
+        bridge.authenticate(event).kind === 'service-worker'
+      )
+        workerServiceCalls.push(request.method);
+      return result;
+    };
     manager = new ExtensionManager({
       root: path.join(directory, 'managed'),
       getProfile: (id) => ({ id }),
@@ -69,9 +80,20 @@ app.whenReady().then(async () => {
       await fs.writeFile(
         path.join(source, 'worker.js'),
         `
-        function listen(){if(chrome.alarms)chrome.alarms.onAlarm.addListener(alarm=>zacroExtension.invoke('fixture.alarm',[alarm.name]));}
-        listen();chrome.permissions.onAdded.addListener(listen);
+        const workerIdentity=crypto.randomUUID();
+        const onAlarm=alarm=>zacroExtension.invoke('fixture.alarm',[alarm.name]);
+        function listen(){if(chrome.alarms)chrome.alarms.onAlarm.addListener(onAlarm);}
+        listen();
         chrome.storage.onChanged.addListener(()=>{});
+        chrome.runtime.onMessage.addListener((message,sender,reply)=>{
+          const probe=()=>({workerIdentity,permissionListeners:chrome.permissions.onAdded.hasListeners()||chrome.permissions.onRemoved.hasListeners()});
+          if(message==='worker-probe'){reply(probe());return;}
+          if(message==='worker-create'){
+            listen();
+            chrome.alarms.create('durable',{when:Date.now()+3600000}).then(()=>reply(probe()),error=>reply({error:error.message}));
+            return true;
+          }
+        });
       `,
       );
       record = await manager.installLocal('p', source);
@@ -91,8 +113,18 @@ app.whenReady().then(async () => {
       return run(`chrome.permissions.request({permissions:${JSON.stringify(permissions)}})`);
     };
     if (phase === 'register') {
+      const before = await run(`chrome.runtime.sendMessage('worker-probe')`);
       if (!(await grant())) throw new Error('Optional permission grant denied');
-      await run(`chrome.alarms.create('durable',{when:Date.now()+3600000});`);
+      workerServiceCalls.length = 0;
+      const after = await run(`chrome.runtime.sendMessage('worker-create')`);
+      if (after.error) throw new Error(after.error);
+      const crossContextWorker =
+        before.workerIdentity === after.workerIdentity &&
+        !before.permissionListeners &&
+        !after.permissionListeners;
+      const workerBarrier =
+        workerServiceCalls.includes('zacro.nativeServices.ready') &&
+        workerServiceCalls.includes('zacro.nativeServices.checkpoint');
       await run(
         `chrome.declarativeNetRequest.updateDynamicRules({addRules:[{id:17,action:{type:'block'},condition:{urlFilter:'optional-block',resourceTypes:['xmlhttprequest']}}]})`,
       );
@@ -115,6 +147,8 @@ app.whenReady().then(async () => {
       caller.webContents.debugger.detach();
       globalThis.optionalResult = {
         available: true,
+        crossContextWorker,
+        workerBarrier,
         offscreen,
         stopped,
         alarmDelivered: alarms.includes('wake'),

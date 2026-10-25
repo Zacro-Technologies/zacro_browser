@@ -36,7 +36,15 @@ test(
         return;
       }
       for (const property of phase === 'register'
-        ? ['offscreen', 'stopped', 'alarmDelivered', 'originalCaller', 'generationStable']
+        ? [
+            'crossContextWorker',
+            'workerBarrier',
+            'offscreen',
+            'stopped',
+            'alarmDelivered',
+            'originalCaller',
+            'generationStable',
+          ]
         : [
             'durable',
             'durableRules',
