@@ -47,6 +47,8 @@ a changed patch series and writes the native GN configuration. Existing source
 changes are never reset or deleted to force a phase through. Re-run a failed
 phase after addressing its specific error; do not rerun hooks over custom
 patches without first checking the upstream patch tool's state.
+Resumed phases recheck the depot_tools commit before running pinned tools;
+an unexpected checkout is rejected without resetting it.
 
 Native tests use `src/out/Zacro-ARCH`. The build also creates `dist.zip` there.
 The `testing.gn` base retains DCHECKs and is a development runtime; it is not a
@@ -72,6 +74,10 @@ regular-file hash and relative symlink target. Installation verifies the source
 and staged copy, then preserves the previous npm runtime at the printed backup
 path. Packaging checks the receipt again. `npm ci` reinstalls stock Electron;
 reinstall the verified artifact before custom acceptance or packaging.
+Sealing and verification also inspect the Electron executable and native runtime
+dependencies for matching Mach-O macOS arm64/x64 or PE Windows x64 headers.
+Mixed architectures and unsupported native formats are rejected; relative internal
+framework links are preserved and checked for containment.
 
 The receipt proves local content integrity against its recorded identity. It
 does not authenticate a third-party publisher, prove that compilation used

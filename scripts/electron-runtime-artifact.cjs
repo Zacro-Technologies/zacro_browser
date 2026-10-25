@@ -6,6 +6,7 @@ const { createReadStream } = require('node:fs');
 const path = require('node:path');
 const { createHash, randomUUID } = require('node:crypto');
 const build = require('../runtime/electron/build.json');
+const { binaryTarget } = require('./platform-build.cjs');
 const RECEIPT = 'zacro-runtime.json';
 const sha = (data) => createHash('sha256').update(data).digest('hex');
 
@@ -63,6 +64,42 @@ async function expected(options) {
   };
 }
 
+async function validateBinaries(directory, identity, files) {
+  const main = identity.platform === 'darwin' ? 'Electron.app/Contents/MacOS/Electron' : 'electron.exe';
+  async function check(relative, required = false) {
+    const file = await fs.open(path.join(directory, relative), 'r');
+    let header;
+    try {
+      if (!(await file.stat()).isFile()) throw new Error(`Invalid runtime binary: ${relative}`);
+      const bytes = Buffer.alloc(4096);
+      const { bytesRead } = await file.read(bytes, 0, bytes.length, 0);
+      header = bytes.subarray(0, bytesRead);
+    } finally {
+      await file.close();
+    }
+    // Examine magic as well as conventional names: framework executables and
+    // helpers may have no extension. Unsupported/fat native images also fail.
+    const magic = header.toString('hex', 0, 4);
+    const native =
+      /^(?:cefaedfe|feedface|cffaedfe|feedfacf|cafebabe|bebafeca|cafebabf|bfbafeca|7f454c46)$/.test(magic) ||
+      header.toString('ascii', 0, 2) === 'MZ';
+    const nativePath =
+      /\.(?:exe|dll|dylib|node|so(?:\.\d+)*)$/i.test(relative) ||
+      /(?:^|\/)Contents\/MacOS\/[^/]+$/.test(relative) ||
+      /(?:^|\/)([^/]+)\.framework\/(?:Versions\/[^/]+\/)?\1$/.test(relative);
+    if (!required && !native && !nativePath) return;
+    const target = binaryTarget(header);
+    if (target?.platform !== identity.platform || target?.arch !== identity.arch)
+      throw new Error(
+        `Runtime binary target/architecture mismatch: ${relative} (expected ${identity.platform}/${identity.arch})`,
+      );
+  }
+  // contents() has already checked every link's resolved containment. Inspect
+  // the main through its real framework/bundle layout, including internal links.
+  await check(main, true);
+  for (const entry of files) if (entry.type === 'file' && entry.path !== main) await check(entry.path);
+}
+
 async function sealRuntime(directory, options) {
   const identity = await expected(options);
   if (
@@ -70,7 +107,9 @@ async function sealRuntime(directory, options) {
     identity.electronVersion
   )
     throw new Error('Runtime version differs from pinned source identity');
-  const receipt = { schemaVersion: 1, ...identity, files: await contents(directory) };
+  const files = await contents(directory);
+  await validateBinaries(directory, identity, files);
+  const receipt = { schemaVersion: 1, ...identity, files };
   await fs.writeFile(path.join(directory, RECEIPT), JSON.stringify(receipt, null, 2) + '\n', { flag: 'wx' });
   return receipt;
 }
@@ -85,8 +124,10 @@ async function verifyRuntime(directory, options) {
     throw new Error('Runtime target mismatch');
   if (receipt.schemaVersion !== 1 || Object.keys(identity).some((key) => receipt[key] !== identity[key]))
     throw new Error('Runtime source identity mismatch');
-  if (JSON.stringify(await contents(directory)) !== JSON.stringify(receipt.files))
+  const files = await contents(directory);
+  if (JSON.stringify(files) !== JSON.stringify(receipt.files))
     throw new Error('Runtime content integrity mismatch');
+  await validateBinaries(directory, identity, files);
   return receipt;
 }
 

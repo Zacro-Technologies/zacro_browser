@@ -99,6 +99,14 @@ async function main(phase, options) {
   const suffix = process.platform === 'win32' ? '.bat' : '';
   const gclient = path.join(depot, 'gclient' + suffix);
   const git = (args, cwd = root) => run('git', args, cwd, env, true);
+  const assertDepotToolsPin = async () => {
+    if ((await git(['rev-parse', 'HEAD'], depot)) !== config.depotToolsCommit)
+      throw new Error('Existing depot_tools differs from pinned commit; refusing to reset it');
+  };
+  const runPinned = async (...args) => {
+    await assertDepotToolsPin();
+    return run(...args);
+  };
   if (phase === 'doctor') {
     const disk = await fs.statfs(root);
     console.log(
@@ -130,13 +138,11 @@ async function main(phase, options) {
         await git(['checkout', '--detach', config.depotToolsCommit], depot);
       }
     }
-    if ((await git(['rev-parse', 'HEAD'], depot)) !== config.depotToolsCommit)
-      throw new Error('Existing depot_tools differs from pinned commit; refusing to reset it');
     // Bootstrap the pinned tools without update_depot_tools moving Git to main.
     if (process.platform === 'win32') {
-      await run(path.join(depot, 'bootstrap/win_tools.bat'), [], depot, env);
+      await runPinned(path.join(depot, 'bootstrap/win_tools.bat'), [], depot, env);
     } else {
-      await run(
+      await runPinned(
         'bash',
         [
           '-e',
@@ -149,13 +155,12 @@ async function main(phase, options) {
         env,
       );
     }
-    if ((await git(['rev-parse', 'HEAD'], depot)) !== config.depotToolsCommit)
-      throw new Error('Tool bootstrap changed pinned depot_tools identity');
+    await assertDepotToolsPin();
     const gclientFile = path.join(root, '.gclient');
     try {
       await fs.access(gclientFile);
     } catch {
-      await run(
+      await runPinned(
         gclient,
         ['config', '--name', 'src/electron', '--unmanaged', 'https://github.com/electron/electron.git'],
         root,
@@ -168,7 +173,7 @@ async function main(phase, options) {
       !gclientConfig.includes('https://github.com/electron/electron.git')
     )
       throw new Error('Existing gclient configuration is not an Electron checkout');
-    await run(
+    await runPinned(
       gclient,
       [
         'sync',
@@ -183,11 +188,14 @@ async function main(phase, options) {
     );
     return;
   }
+  // Fail before source/build writes when resuming after the tools checkout
+  // changed. Each pinned execution also checks again, including within sync.
+  if (['hooks', 'build', 'test', 'test-app'].includes(phase)) await assertDepotToolsPin();
   if ((await git(['rev-parse', 'HEAD'], electron)) !== config.electronCommit)
     throw new Error('Electron checkout differs from pinned source');
   await git(['merge-base', '--is-ancestor', config.chromiumCommit, 'HEAD'], source);
   if (phase === 'hooks') {
-    await run(gclient, ['runhooks'], root, env);
+    await runPinned(gclient, ['runhooks'], root, env);
     return;
   }
   if (phase === 'patch') {
@@ -229,8 +237,8 @@ async function main(phase, options) {
       path.join(output, 'args.gn'),
       `import("//electron/build/args/testing.gn")\ntarget_cpu = "${arch === 'x64' ? 'x64' : 'arm64'}"\noverride_electron_version = "${config.electronVersion}"\nsymbol_level = 0\nblink_symbol_level = 0\nv8_symbol_level = 0\nuse_remoteexec = false\nuse_siso = false\n`,
     );
-    await run(path.join(depot, 'gn' + suffix), ['gen', `out/${out}`], source, env);
-    await run(
+    await runPinned(path.join(depot, 'gn' + suffix), ['gen', `out/${out}`], source, env);
+    await runPinned(
       path.join(depot, 'autoninja' + suffix),
       ['-C', `out/${out}`, '-j', '4', 'electron', 'electron:electron_dist_zip'],
       source,
@@ -239,7 +247,7 @@ async function main(phase, options) {
     return;
   }
   if (phase === 'test') {
-    await run(
+    await runPinned(
       process.execPath,
       [
         'script/spec-runner.js',
