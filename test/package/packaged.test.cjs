@@ -15,8 +15,9 @@ const { packagedPaths } = require('../../scripts/platform-build.cjs');
 const execFileAsync = promisify(execFile);
 // An ad-hoc macOS rebuild changes its code hash, so an existing Keychain
 // entry may need the user's approval. Only an explicit interactive run waits
-// for that OS dialog; ordinary CI keeps its existing navigation deadline.
-const keychainApprovalWait = process.env.ZACRO_INTERACTIVE_KEYCHAIN === '1' ? 300000 : 0;
+// for that OS dialog. A human may return after the short automated run would
+// have exited, so allow one hour; ordinary CI keeps its existing deadline.
+const keychainApprovalWait = process.env.ZACRO_INTERACTIVE_KEYCHAIN === '1' ? 3600000 : 0;
 
 test(
   'native package has hardened fuses, browses, parses PDFs and starts its isolated Codex runtime',

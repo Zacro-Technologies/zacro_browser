@@ -204,13 +204,23 @@ profile or real external account is used.
   305-second navigation deadline. The exact new process again generated the
   OS confirmation request; its user ID matched the console login, and normal
   app activation/tab selection did not unblock navigation. The disposable
-  process was closed by test cleanup. Why no confirmation appeared remains
-  unresolved; no packaged success is claimed.
+  process was closed by test cleanup. At that point the lack of a visible
+  confirmation remained unresolved; no packaged success was claimed.
   This run did not establish packaged browsing or the later executable checks.
   No Keychain item, credential or OS protection was changed. A disposable
   browser profile does not isolate the app-scoped Keychain encryption key.
   Test cleanup now waits for its own disposable process to exit before deleting
   the temporary profile; the blocked run ended without leaving that process.
+- The user later confirmed that the dialog appeared and was handled. OS logs
+  record an allow decision for the already-ended process, then two allow
+  decisions during a new ordinary run. That new run still failed **0/1** at
+  its five-second first-navigation deadline while the confirmations were being
+  handled. A subsequent five-minute interactive run also timed out **0/1**.
+  Interactive mode now permits one extra hour so the live process can survive
+  asynchronous manual confirmation. Independent review approved this deadline
+  change; formatting and syntax pass. Ordinary deadlines, cleanup, assertions
+  and security settings are unchanged. A new interactive run is awaiting
+  confirmation; its success must be verified before closing this gate.
 - The final full-product native file passed **9/9**, including all five
   two-Electron variants, against the actual service and OS-protected credentials.
   The review-fix native group passed **6/6**; the final active-profile deletion
@@ -233,11 +243,13 @@ was performed.
 
 Implementation choices and their costs are recorded in [the decision record](EXTENSIONS-SYNC-DECISIONS.md).
 
-## Resume packaged acceptance
+## Manual confirmation during packaged acceptance
 
-The user reports no visible confirmation dialog. Treat the gap between the
-OS confirmation request and a visible dialog as unresolved, not simply an
-unanswered approval request.
+The user initially saw no dialog, then later confirmed that it appeared and
+was handled. Some decisions arrived after the corresponding disposable app
+had already exited. A new process can request confirmation again; keep the
+interactive test running while handling its current OS dialog. A recorded
+allow decision alone does not establish that the package checks passed.
 The current app has an intact ad-hoc signature (`codesign --verify --deep
 --strict` passes), but its CDHash differs from the stored Keychain requirement.
 [Electron's code-signing documentation](https://www.electronjs.org/docs/latest/tutorial/code-signing#macos-apis-that-require-code-signing)
@@ -249,7 +261,7 @@ has a separate Developer ID/notarized release path; it has not been executed.
 
 For the final packaged executable, keep the Mac unlocked and run
 `ZACRO_INTERACTIVE_KEYCHAIN=1 npm run test:package`. This explicit local mode
-allows five extra minutes for the user to review and handle the genuine macOS
+allows up to one extra hour for the user to review and handle the genuine macOS
 “Zacro Safe Storage” confirmation. It does not approve the dialog or skip any
 assertion. The ordinary `npm run test:package` keeps its original deadlines.
 Rebuilding an ad-hoc app can change its signature again;
