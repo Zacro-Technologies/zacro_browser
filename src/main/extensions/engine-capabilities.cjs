@@ -17,7 +17,8 @@ function negotiateEngineCapabilities(session) {
       value.reviewedPermissions !== true ||
       typeof api.setZacroReviewedPermissions !== 'function' ||
       typeof api.grantZacroActiveTab !== 'function' ||
-      typeof api.setZacroUserScriptsEnabled !== 'function'
+      typeof api.setZacroUserScriptsEnabled !== 'function' ||
+      typeof api.resetZacroExtensionState !== 'function'
     )
       return STOCK_CAPABILITIES;
     return Object.freeze({

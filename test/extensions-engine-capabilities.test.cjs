@@ -14,6 +14,7 @@ const hooks = () => ({
   grantZacroActiveTab() {},
   setZacroReviewedPermissions() {},
   setZacroUserScriptsEnabled() {},
+  async resetZacroExtensionState() {},
   setZacroFontPreferences() {},
   getZacroFontPreferences() {
     return {};
@@ -32,6 +33,7 @@ test('stock, throwing, unknown-version and incomplete native contracts fail clos
     },
     { ...hooks(), getZacroCapabilities: () => ({ version: 2, activeTab: true }) },
     { ...hooks(), setZacroReviewedPermissions: undefined },
+    { ...hooks(), resetZacroExtensionState: undefined },
   ]) {
     const result = negotiateEngineCapabilities({ extensions });
     assert.equal(result.reviewedPermissions, false);
