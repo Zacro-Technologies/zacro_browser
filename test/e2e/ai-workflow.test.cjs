@@ -198,6 +198,34 @@ test(
     await expect(shell.locator('.ai-context-chip')).toContainText('page-one');
     await expect(shell.locator('.ai-context-chip')).toHaveAttribute('title', `${b.base}/page-one`);
     await expect(shell.locator('#ai-submit')).toBeDisabled();
+    assert(await shell.evaluate(() => CSS.supports('field-sizing', 'content')));
+    const composerSize = () =>
+      shell.locator('#ai-question').evaluate((element) => ({
+        height: element.getBoundingClientRect().height,
+        visible: element.clientHeight,
+        content: element.scrollHeight,
+        top: element.scrollTop,
+      }));
+    await expect
+      .poll(async () => {
+        const size = await composerSize();
+        return size.height > 53 && size.height <= 160 && size.content <= size.visible + 1 && size.top === 0;
+      })
+      .toBe(true);
+    const longDraft = Array.from(
+      { length: 30 },
+      (_, index) => `Line ${index + 1}: keep this entire long draft editable.`,
+    ).join('\n');
+    await shell.locator('#ai-question').fill(longDraft);
+    await expect
+      .poll(async () => {
+        const size = await composerSize();
+        return size.height <= 160 && size.content > size.visible;
+      })
+      .toBe(true);
+    await expect(shell.locator('#ai-question')).toHaveValue(longDraft);
+    await shell.locator('#ai-question').fill('Short question');
+    await expect.poll(async () => (await composerSize()).height).toBe(53);
     const draft = 'Keep my prepared question before connecting';
     await shell.locator('#ai-question').fill(draft);
     await shell.locator('#ai-question').press('Enter');

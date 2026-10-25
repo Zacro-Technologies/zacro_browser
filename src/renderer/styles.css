@@ -645,11 +645,13 @@ kbd {
 }
 
 .ai-composer textarea {
+  field-sizing: content;
   resize: none;
   border: 0;
   background: none;
   min-height: 53px;
-  max-height: 130px;
+  max-height: 160px;
+  overflow-y: auto;
   flex: 1;
   min-width: 0;
   padding: 6px;
