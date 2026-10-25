@@ -61,8 +61,17 @@ async function adaptExtension(source, destination, { publicKey } = {}) {
   }
   const background = manifest.background;
   if (background?.service_worker) {
-    const name = background.service_worker;
-    if (path.isAbsolute(name) || name.split(/[\\/]/).includes('..'))
+    // Chromium resolves service_worker against the extension origin. Preserve its
+    // manifest spelling, but use a validated package-relative filesystem name.
+    const entry = background.service_worker;
+    const name = typeof entry === 'string' && entry.startsWith('/') ? entry.slice(1) : entry;
+    if (
+      typeof name !== 'string' ||
+      !name ||
+      name.length > 2048 ||
+      /[\\\x00-\x20\x7f:%?#]/.test(name) ||
+      name.split('/').some((part) => !part || part === '.' || part === '..')
+    )
       throw new Error('Invalid worker entry path');
     const filename = path.join(destination, name);
     const relative = path.posix.relative(path.posix.dirname(name), BOOTSTRAP);
