@@ -45,7 +45,37 @@ async function launch(t) {
         }),
       { events, selector },
     );
-  const idle = () => delay(260);
+  // Keep the two parts of one gesture on the renderer clock. A main-process
+  // assertion between them can take longer than the 240ms quiet period on CI,
+  // accidentally turning the final sample into a separate gesture.
+  const measuredBurst = (before, after) =>
+    shell.evaluate(
+      ({ before, after }) => {
+        const list = document.querySelector('.tabs-scroll');
+        const dispatch = (events) =>
+          events.map((event) => {
+            const wheel = new WheelEvent('wheel', { bubbles: true, cancelable: true, ...event });
+            list.dispatchEvent(wheel);
+            return wheel.defaultPrevented;
+          });
+        const firstEvents = dispatch(before);
+        const intermediate = {
+          activeSpace: document.querySelector('.space-dot[aria-current="true"]')?.dataset.id,
+          tracking: list.classList.contains('gesture-tracking'),
+          transform: list.style.transform,
+        };
+        const finalEvents = dispatch(after);
+        return { firstEvents, finalEvents, intermediate };
+      },
+      { before, after },
+    );
+  const idle = () =>
+    shell.evaluate(async () => {
+      // Drain pending state-paint/automatic-palette work before starting the quiet
+      // period, so a late UI update cannot interrupt the next synthetic gesture.
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      await new Promise((resolve) => setTimeout(resolve, 260));
+    });
   const changedTo = async (id) => {
     await expect.poll(current).toBe(id);
     await expect(shell.locator(`.space-dot[data-id="${id}"]`)).toHaveAttribute('aria-current', 'true');
@@ -61,6 +91,7 @@ async function launch(t) {
     second: second.id,
     third: third.id,
     wheel,
+    measuredBurst,
     idle,
     changedTo,
   };
@@ -220,11 +251,21 @@ test(
     await b.invoke('profile:create', { name: 'Other profile' });
     const other = await b.current();
     await b.invoke('space:activate', { id: b.first });
+    await b.changedTo(b.first);
     await b.idle();
 
-    await b.wheel([{ deltaX: 20 }, { deltaX: 20 }]);
-    assert.equal(await b.current(), b.first, 'Small movements must accumulate before navigation');
-    await b.wheel([{ deltaX: 30 }]);
+    const forward = await b.measuredBurst([{ deltaX: 20 }, { deltaX: 20 }], [{ deltaX: 30 }]);
+    assert.deepEqual(forward.firstEvents, [true, true]);
+    assert.deepEqual(forward.finalEvents, [true]);
+    assert.deepEqual(
+      forward.intermediate,
+      {
+        activeSpace: b.first,
+        tracking: true,
+        transform: 'translateX(-40px)',
+      },
+      'Small movements must accumulate as feedback before navigation',
+    );
     await b.changedTo(b.second);
     // Even continued high-magnitude inertia can switch only one Space per burst.
     for (let i = 0; i < 5; i++) {
@@ -240,13 +281,21 @@ test(
     assert.equal(await b.current(), b.third, 'The last Space must not wrap or cross profiles');
 
     await b.idle();
-    await b.wheel([{ deltaX: -40 }, { deltaX: 30 }, { deltaX: -30 }]);
-    assert.equal(
-      await b.current(),
-      b.third,
-      'Reversing direction must unwind the accumulated displacement without a premature switch',
+    const reverse = await b.measuredBurst(
+      [{ deltaX: -40 }, { deltaX: 30 }, { deltaX: -30 }],
+      [{ deltaX: -40 }],
     );
-    await b.wheel([{ deltaX: -40 }]);
+    assert.deepEqual(reverse.firstEvents, [true, true, true]);
+    assert.deepEqual(reverse.finalEvents, [true]);
+    assert.deepEqual(
+      reverse.intermediate,
+      {
+        activeSpace: b.third,
+        tracking: true,
+        transform: 'translateX(40px)',
+      },
+      'Reversing direction must unwind displacement without a premature switch',
+    );
     await b.changedTo(b.second);
 
     await b.idle();

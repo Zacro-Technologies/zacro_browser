@@ -22,11 +22,30 @@ The 0.5 workflow opens a command palette in an empty Space instead of creating a
 
 ## Screenshots
 
-**Historical 0.4 captures:** these screenshots and the linked PDF show the previous packaged interface, before the current blank-Space, shortcut and gesture changes. Fresh captures are pending. They were taken through native Computer interactions and window capture, using an isolated demo workspace and local journal pages. See [capture provenance](docs/screenshots/README.md).
+The packaged 0.5 Windows interface, captured through native Computer interactions on October 25, 2026. These unretouched images use an isolated demo workspace and local pages. See [capture provenance](docs/screenshots/README.md) and the [0.5 design and feature guide (PDF)](docs/Zacro-0.5-Design-and-Feature-Guide.pdf).
+
+![Zacro 0.5 with compact sidebar navigation, icon favorites, folders and single-line tabs beside a live journal page](docs/screenshots/0.5/workspace.jpg)
+
+A 224px sidebar keeps navigation, Spaces and tabs within reach. Drag tabs into favorites to pin them, or back into the tab list to unpin them.
+
+| Command palette | Shortcuts |
+| --- | --- |
+| ![Zacro 0.5 command palette with browser actions and the sidebar still available](docs/screenshots/0.5/palette.jpg) | ![Searchable Zacro 0.5 shortcut editor with bindings and reset controls](docs/screenshots/0.5/shortcuts.jpg) |
+| New Tab opens a destination; the address field edits the current page. Type `/` for actions. | Familiar Arc defaults, with searchable bindings you can change, disable or reset. |
+
+| AI connections | An empty Space |
+| --- | --- |
+| ![Zacro 0.5 Settings with the OpenAI API connection form](docs/screenshots/0.5/ai-connections.jpg) | ![Zacro 0.5 opening the command palette in a Space without creating a blank tab](docs/screenshots/0.5/blank-space.jpg) |
+| Six explicit providers. Subscription usage and API billing stay separate; this capture does not demonstrate live sign-in or answers. | Start with the palette. A tab is created only when you submit a destination. |
+
+<details>
+<summary>Historical 0.4 · Windows and native macOS</summary>
+
+These earlier captures predate the 0.5 command palette, shortcut editor and provider selection. The Windows images were captured through Computer from a packaged development build on October 24, 2026. [Download the historical 0.4 feature guide (PDF)](docs/Zacro-0.4-Design-and-Feature-Guide.pdf); its shortcuts and new-tab descriptions describe that revision.
 
 ![Zacro 0.4 with navigation and address in the compact Design studio sidebar, four icon favorites, folders and single-line tabs beside a live web page](docs/screenshots/workspace.jpg)
 
-Navigation and the address field share the sidebar. A thin page frame leaves room for the web, with Windows window controls above it. [Download the historical 0.4 feature guide (PDF)](docs/Zacro-0.4-Design-and-Feature-Guide.pdf); its shortcut and new-tab descriptions predate the current workflow.
+Navigation and the address field share the sidebar. A thin page frame leaves room for the web, with Windows window controls above it.
 
 | New tab · dark                                                                                                 | Settings · light                                                                                            |
 | -------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
@@ -43,9 +62,6 @@ Navigation and the address field share the sidebar. A thin page frame leaves roo
 | ![Compact command palette with tab results over the current page](docs/screenshots/command-palette.jpg) | ![Bookmarks panel with search and quick Library section switching](docs/screenshots/bookmarks.jpg) |
 | Find a tab or enter an address.                                                                         | Bookmarks, history, downloads, and archived tabs.                                                  |
 
-<details>
-<summary>Focus mode and optional AI</summary>
-
 ![The same page with the sidebar hidden and more width available for reading](docs/screenshots/focus-mode.jpg)
 
 **Ctrl/Command + S** now hides or shows the sidebar without reloading pages. When hidden, a compact navigation row keeps the address and sidebar toggle available. The older capture predates this shortcut change.
@@ -54,12 +70,7 @@ Navigation and the address field share the sidebar. A thin page frame leaves roo
 
 AI is optional. This historical capture shows the earlier **Connect Codex** panel. Version 0.5 offers separate ChatGPT/Claude subscription connections and four API connections in Settings. Subscription usage and API billing remain distinct, with no automatic provider or billing fallback. Page sharing requires an explicit choice. See [AI workflows and limits](docs/AI.md).
 
-</details>
-
-<details>
-<summary>Native macOS · light and dark</summary>
-
-These 0.4 captures come from the packaged Apple silicon build on macOS 15.7.9 in [CI](https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40099796398). Native traffic lights, the Zacro menu bar and Dock icon are visible; the recent page is the local acceptance fixture. Both Mac architectures passed native integration and packaged-application checks. Physical-device review remains open.
+The following 0.4 captures come from the packaged Apple silicon build on macOS 15.7.9 in [CI](https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40099796398), at commit `f3101841f04cda2e9441734c0b711f6e63c697e2`. Native traffic lights, the Zacro menu bar and Dock icon are visible; the recent page is the local acceptance fixture. Both Mac architectures passed native integration and packaged-application checks at that revision. Physical-device review remains open.
 
 ![Zacro on macOS in light appearance with native window controls, application menu and Dock icon](docs/screenshots/macos-light.png)
 

@@ -343,7 +343,10 @@ test(
         return s.spaces.find((space) => space.id === s.activeSpaceId)?.name;
       })
       .toBe('Research lab');
-    await expect(b.page.getByRole('dialog')).toHaveCount(0);
+    await expect(createSpace).toHaveCount(0);
+    await expect(b.page.locator('#command-input')).toBeFocused();
+    const emptySpace = await b.state();
+    assert.equal(emptySpace.tabs.filter((tab) => tab.spaceId === emptySpace.activeSpaceId).length, 0);
     await sidebar.locator('[data-key="add-menu"]').click();
     await b.page
       .getByRole('dialog', { name: 'Add', exact: true })
@@ -353,6 +356,7 @@ test(
     await createFolder.getByLabel('Folder name', { exact: true }).fill('Evidence');
     await createFolder.getByRole('button', { name: 'Create folder', exact: true }).click();
     await expect.poll(async () => (await b.state()).folders[0]?.name).toBe('Evidence');
+    await expect(createFolder).toHaveCount(0);
     await b.page.locator('[data-key="address"]').click();
     await b.page.locator('#command-input').fill(`${base}/a`);
     await b.page.locator('#command-input').press('Enter');

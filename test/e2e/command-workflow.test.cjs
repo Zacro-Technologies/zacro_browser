@@ -327,21 +327,56 @@ test(
     );
     await b.invoke('shortcut:run', { id: 'shortcuts' });
     await expect(b.shell.getByRole('dialog', { name: 'Keyboard shortcuts' })).toBeVisible();
-    for (const [width, height] of [
-      [1440, 900],
-      [960, 640],
+    const sizes = await b.app.evaluate(({ BrowserWindow, screen }) => {
+      const window = BrowserWindow.getAllWindows()[0];
+      const outer = window.getBounds();
+      const content = window.getContentBounds();
+      const frameWidth = outer.width - content.width;
+      const frameHeight = outer.height - content.height;
+      const [minimumWidth, minimumHeight] = window.getMinimumSize();
+      const work = screen.getDisplayMatching(outer).workArea;
+      const minimum = {
+        width: minimumWidth - frameWidth,
+        height: minimumHeight - frameHeight,
+      };
+      return {
+        origin: { x: work.x, y: work.y },
+        normal: {
+          width: Math.max(minimum.width, Math.min(1440, work.width - frameWidth)),
+          height: Math.max(minimum.height, Math.min(900, work.height - frameHeight)),
+        },
+        minimum,
+      };
+    });
+    for (const [name, { width, height }] of [
+      ['normal', sizes.normal],
+      ['minimum', sizes.minimum],
     ]) {
       await b.app.evaluate(
-        ({ BrowserWindow }, { width, height }) => {
-          BrowserWindow.getAllWindows()[0].setContentSize(width, height);
+        ({ BrowserWindow }, { width, height, origin }) => {
+          const window = BrowserWindow.getAllWindows()[0];
+          window.setPosition(origin.x, origin.y);
+          window.setContentSize(width, height);
         },
-        { width, height },
+        { width, height, origin: sizes.origin },
       );
+      const accepted = await b.app.evaluate(({ BrowserWindow }) =>
+        BrowserWindow.getAllWindows()[0].getContentSize(),
+      );
+      t.diagnostic(
+        `${name} shortcut viewport: requested ${width}×${height}, native accepted ${accepted.join('×')}`,
+      );
+      if (name === 'minimum') {
+        assert(
+          Math.abs(accepted[0] - width) <= 2 && Math.abs(accepted[1] - height) <= 2,
+          'The second geometry check must exercise the real native minimum window',
+        );
+      }
       await expect
         .poll(() =>
           b.shell.evaluate(
             ({ width, height }) => Math.abs(innerWidth - width) <= 2 && Math.abs(innerHeight - height) <= 2,
-            { width, height },
+            { width: accepted[0], height: accepted[1] },
           ),
         )
         .toBe(true);
