@@ -7,6 +7,7 @@ const { ExtensionAPI } = require('./api.cjs');
 const { ExtensionBridge } = require('./bridge.cjs');
 const { SidePanelController } = require('./side-panel.cjs');
 const { IdentityController } = require('./identity.cjs');
+const { FontSettingsController } = require('./font-settings.cjs');
 const { NativeMessagingBroker } = require('./native-messaging.cjs');
 const { parseStoreId } = require('./packages.cjs');
 const { matches, covers } = require('./permissions.cjs');
@@ -147,13 +148,30 @@ class ExtensionHost {
         this.guards.get(this.key(profile, id)) || this.guards.get(this.key(profile, '*')) || (() => {}),
       confirmPermissions: (context) => this.confirm(context),
       onDeactivated: (context) => this.deactivated(context),
-      onChange: () => publish(),
+      onNativeLoaded: (profile) => this.fontSettings?.reconcile(profile),
+      onChange: (profile) => {
+        publish();
+        this.fontSettings?.reconcile(profile).catch(report);
+      },
     });
     this.nativeMessaging = new NativeMessagingBroker({
       approveHost: (review) => this.approveNativeHost(review),
       emit: (context, event) => this.bridge.emitNative(context, event),
     });
     this.identity = new IdentityController({ native, getSession, getProfile, resolveExtension });
+    this.fontSettings = new FontSettingsController({
+      ready: (context) => this.manager.whenReady(context.profileId, context.extensionId),
+      getProfile,
+      getSession,
+      resolveExtension,
+      listExtensions: (profile) => this.manager.list(profile),
+      profilePath: (profile) => this.manager.profilePath(profile),
+      emit: (profile, id, event, args) =>
+        this.bridge.emit(profile, id, event, args, {
+          filter: (context) =>
+            context.kind !== 'content-script' && context.metadata.grants.permissions.includes('fontSettings'),
+        }),
+    });
     this.sidePanel = new SidePanelController({
       native,
       resolveExtension,
@@ -167,6 +185,7 @@ class ExtensionHost {
       changed: panelChanged,
     });
     this.api = new ExtensionAPI({
+      fontSettings: this.fontSettings,
       identity: this.identity,
       sidePanel: this.sidePanel,
       nativeMessaging: this.nativeMessaging,
@@ -232,6 +251,7 @@ class ExtensionHost {
         this.manager.restore(profileId, { legacy }).then(() => this.manager.startUpdates(profileId)),
       );
     await this.restores.get(profileId);
+    await this.fontSettings.reconcile(profileId);
   }
   async start(legacy) {
     try {
@@ -605,6 +625,7 @@ class ExtensionHost {
     this.identity?.revoke({ profileId, extensionId });
     this.sidePanel?.revoke(profileId, extensionId, reason === 'remove');
     this.closeViews(profileId, extensionId);
+    await this.fontSettings?.reconcile(profileId);
     const key = this.key(profileId, extensionId);
     this.notificationErrors.delete(key);
     let documents = this.barriers.get(key) || [];
@@ -978,17 +999,20 @@ class ExtensionHost {
     return result;
   }
   async removeProfile(profile) {
+    this.fontSettings?.forgetProfile(profile);
     this.sidePanel?.revokeProfile(profile);
     this.nativeMessaging?.revoke({ profileId: profile });
     this.identity?.revoke({ profileId: profile });
     this.closeViews(profile);
     await this.manager.invalidateProfile(profile);
+    this.fontSettings?.forgetProfile(profile);
     this.restores.delete(profile);
     for (const key of this.barriers.keys()) if (JSON.parse(key)[0] === profile) this.barriers.delete(key);
     await fs.rm(this.manager.profilePath(profile), { recursive: true, force: true });
   }
   async close() {
     this.closed = true;
+    this.fontSettings?.close();
     this.nativeMessaging?.dispose();
     this.identity?.dispose();
     this.sidePanel?.close();

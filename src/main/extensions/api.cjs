@@ -382,6 +382,14 @@ class ExtensionAPI {
     if (!trusted(context)) throw new Error('Trusted extension contexts only');
     if (method.split('.').length !== 2) throw new Error(`Unsupported API: ${method}`);
     const [group, name] = method.split('.');
+    if (group === 'fontSettings') {
+      if (!metadata.grants.permissions.includes('fontSettings'))
+        throw new Error('Missing fontSettings permission');
+      if (!this.fontSettings) throw new Error('Native font settings unavailable');
+      const result = await this.fontSettings.call(context, name, args);
+      this.guard(context);
+      return result;
+    }
     if (group === 'identity') {
       if (!metadata.grants.permissions.includes('identity')) throw new Error('Missing identity permission');
       if (!this.identity) throw new Error('Identity unavailable');

@@ -441,6 +441,28 @@
     methods('windows', ['get', 'getCurrent', 'getAll', 'update', 'create', 'remove']);
     methods('permissions', ['contains', 'getAll', 'request', 'remove']);
     methods('commands', ['getAll']);
+    methods('fontSettings', [
+      'getFont',
+      'setFont',
+      'clearFont',
+      'getFontList',
+      'getDefaultFontSize',
+      'setDefaultFontSize',
+      'clearDefaultFontSize',
+      'getDefaultFixedFontSize',
+      'setDefaultFixedFontSize',
+      'clearDefaultFixedFontSize',
+      'getMinimumFontSize',
+      'setMinimumFontSize',
+      'clearMinimumFontSize',
+    ]);
+    for (const name of [
+      'onFontChanged',
+      'onDefaultFontSizeChanged',
+      'onDefaultFixedFontSizeChanged',
+      'onMinimumFontSizeChanged',
+    ])
+      chrome.fontSettings[name] = event('fontSettings.' + name);
     methods('identity', [
       'launchWebAuthFlow',
       'getProfileUserInfo',
