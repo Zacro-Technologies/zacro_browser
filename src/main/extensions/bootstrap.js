@@ -400,6 +400,7 @@
         ['updateDynamicRules', 'updateEnabledRulesets', 'updateStaticRules'],
       ],
       ['alarms', ['get', 'getAll'], ['create', 'clear', 'clearAll']],
+      ['offscreen', ['createDocument', 'hasDocument', 'closeDocument'], []],
     ]) {
       const native = chrome[group];
       if (!native) continue;

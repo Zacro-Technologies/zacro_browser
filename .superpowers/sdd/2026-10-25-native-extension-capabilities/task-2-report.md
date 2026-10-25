@@ -77,3 +77,19 @@ Documentation: `docs/EXTENSION-NATIVE-SERVICES.md`, this report.
 - Future one-shot alarms restore natively; elapsed one-shots are deliberately not replayed from snapshots. Recurring alarms restore with at most one immediate due event. Exactly-once alarm delivery across a process crash is not promised. The API and documentation expose this truthful lifetime boundary.
 - The lifecycle module is 270 lines and remains focused on initialization, persistence and native clock event delivery. No JS request engine, fake offscreen window, or JS clock was added.
 - Root bootstrap changes are required and tested together but committed separately by its owner. Root coordinates full-suite/platform acceptance and fresh review.
+
+## P2 review fix: preserve startup-created offscreen documents
+
+The review's concrete startup race was reproduced against actual managed native loading. The initializer legitimately removes prior native offscreen state, but the worker could previously complete a fresh `createDocument` during the interval after native load and before initialization. A focused fixture now holds exactly that asynchronous boundary, starts the real native MV3 worker, and observes raw native state from a sandboxed document that skips the facade. It proceeds only after the worker either attempts the ready barrier or genuinely creates the document. It then checks successful activation, the worker's resolved create result, a still-existing native document, and retained native disable cleanup.
+
+The production fix gates native `offscreen.createDocument`, `hasDocument`, and `closeDocument` through the existing readiness Promise. Their native implementations and Promise/callback behavior are preserved; they do not checkpoint or persist offscreen state. The initial tiny gate was supplied by the native-messaging owner and verified independently here. Only this gate hunk is part of the fix commit; the parallel sidePanel bootstrap hunk is excluded.
+
+RED: temporarily remove only that offscreen gate entry, then run:
+
+`node --test --test-name-pattern='startup offscreen creation' test/e2e/extension-native-services.test.cjs`
+
+Expected failure, 1/1: `before:true`, `readyRequested:false`, `after:{result:"created",has:false}`, while activation still reports enabled. Assertion failed because the successful startup creation had been closed by initialization. An initial fixture attempt hit native worker registration before it was ready; adding the same bounded startWorkerForScope retry used by the reviewer corrected that setup issue before capturing this behavioral RED.
+
+GREEN: restore the one-line offscreen readiness entry and run the identical command. 1/1 passed (~1.70s): `before:false`, `readyRequested:true`, `after:{result:"created",has:true}`, `enabled:true`, `heldBoundary:true`, and `disabledClosed:true`. The fixture proves the fresh startup document survives activation and native disable still removes it. No broad suite rerun was needed for this ordering fix; the focused native fixture validates the requested scheduling boundary directly.
+
+Files: the single readiness-array entry in `src/main/extensions/bootstrap.js`, the focused test in `test/e2e/extension-native-services.test.cjs`, new `test/fixtures/extensions/offscreen-startup-host.cjs`, and this appended report. Self-review confirmed initialization is still awaited and no post-load cleanup/persistence policy was weakened.

@@ -7,6 +7,38 @@ const path = require('node:path');
 const { _electron: electron, expect } = require('@playwright/test');
 
 test(
+  'startup offscreen creation waits for initialization and survives activation',
+  { timeout: 30000 },
+  async (t) => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'zacro-offscreen-startup-'));
+    const env = { ...process.env, ZACRO_CONTEXT_ROOT: directory };
+    delete env.ELECTRON_RUN_AS_NODE;
+    const app = await electron.launch({
+      args: [path.resolve(__dirname, '../fixtures/extensions/offscreen-startup-host.cjs')],
+      env,
+    });
+    t.after(async () => {
+      await app.close();
+      await fs.rm(directory, { recursive: true, force: true });
+    });
+    await expect.poll(() => app.evaluate(() => globalThis.contextResult), { timeout: 20000 }).toBeTruthy();
+    const result = await app.evaluate(() => globalThis.contextResult);
+    t.diagnostic(JSON.stringify(result));
+    assert.equal(result.error, undefined);
+    assert.equal(result.enabled, true);
+    assert.equal(
+      result.heldBoundary,
+      true,
+      'the real worker must attempt startup creation before initialization',
+    );
+    assert.deepEqual(result.after, { result: 'created', has: true });
+    assert.equal(result.before, false, 'native document creation must wait behind initialization');
+    assert.equal(result.readyRequested, true);
+    assert.equal(result.disabledClosed, true);
+  },
+);
+
+test(
   'managed native update reconciles rulesets and removes offscreen permission',
   { timeout: 30000 },
   async (t) => {
