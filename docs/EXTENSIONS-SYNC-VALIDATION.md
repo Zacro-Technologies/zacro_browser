@@ -13,8 +13,19 @@ passed acceptance after the user handled the OS Keychain confirmation.
 ## Current follow-up status, 2026-10-26
 
 - Independent library/settings sync, device activity times and the remaining
-  extension API slices now have implementation and focused validation. The
-  current full-product verification and integration review are in progress.
+  extension API slices now have implementation and focused validation. All four
+  material integration-review findings are resolved in source; the final
+  optional-service corrections at `94208a9` passed scoped independent review.
+- `npm run verify` at `94208a9` passed formatting, static checks, **398 Node
+  tests and 111 native application tests** on macOS arm64 with stock Electron
+  45.0.0. Engine-dependent fixtures in this run exercise their stock-negative
+  paths; these totals do not establish custom-runtime positive acceptance.
+  The real two-browser sync flow passed all five background variants.
+- An earlier full run at `1067838` failed the existing Mac close-tab
+  first-responder assertion once. Its unchanged isolated rerun, three bounded
+  focus-trace probes and the final full run passed. The probes observed the
+  shell regaining focus during the destroyed callback. The original cause is
+  unresolved; no speculative production change or relaxed assertion was used.
 - Real representative provider results are recorded separately in
   [Provider acceptance](EXTENSION-PROVIDER-VALIDATION.md). React Developer Tools
   now displays its genuine panels and component tree on stock Electron.
