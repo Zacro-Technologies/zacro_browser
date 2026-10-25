@@ -148,6 +148,7 @@ class SyncClient {
         profileId,
         datasetId: l.datasetId,
         name: l.name,
+        librarySync: l.librarySync !== false,
         settingsSync: l.settingsSync,
         pending: l.outbox.length,
         rejected: l.rejected.map((r) => ({
@@ -166,7 +167,7 @@ class SyncClient {
   extensionIntents(profileId) {
     this.profile(profileId);
     const link = this.store.read().links[profileId];
-    if (!link || !this.credentials) return [];
+    if (!link || link.librarySync === false || !this.credentials) return [];
     return Object.values(library(link)).map((extension) => ({
       ...this.identity(profileId, link),
       extension: clone(extension),
@@ -463,10 +464,12 @@ class SyncClient {
     datasetId,
     libraryChoice,
     localLibrary = [],
+    librarySync = true,
     settingsSync = false,
     settingsChoice,
     settingsConsent = false,
     preserveLibrary = false,
+    preserveSettings = false,
   }) {
     this.profile(profileId);
     if (!['remote-only', 'merge-local'].includes(libraryChoice))
@@ -504,6 +507,7 @@ class SyncClient {
       epoch: snapshot.dataset.epoch,
       endpoint: before.endpoint,
       accountId: before.account.id,
+      librarySync,
       settingsSync,
       cursor: snapshot.cursor,
       library: Object.fromEntries(snapshot.extensions.map((e) => [e.extensionId, e])),
@@ -532,10 +536,20 @@ class SyncClient {
         link.outbox = previous.outbox.filter((op) => op.kind === 'extension');
         link.rejected = previous.rejected.filter((r) => r.operation.kind === 'extension');
       }
-      if (libraryChoice === 'merge-local') for (const item of localLibrary) this.enqueueLibrary(link, item);
-      if (settingsSync && settingsChoice === 'upload-local')
+      if (preserveSettings && settingsSync && previous?.settingsSync && previous.datasetId === datasetId) {
+        link.areas = clone(previous.areas);
+        link.outbox.push(...previous.outbox.filter((op) => op.kind === 'settings'));
+        link.rejected.push(...previous.rejected.filter((r) => r.operation.kind === 'settings'));
+      }
+      if (librarySync && libraryChoice === 'merge-local')
+        for (const item of localLibrary) this.enqueueLibrary(link, item);
+      if (settingsSync && (preserveSettings || settingsChoice === 'upload-local'))
         for (const e of Object.values(library(link))) {
           if (e.state === 'removed') continue;
+          // Resuming library sync preserves existing cloud settings and queued
+          // writes. A newly shared local installation starts with its retained
+          // local values, under the settings consent that remains enabled.
+          if (preserveSettings && link.library[e.extensionId]?.generation === e.generation) continue;
           const values = s.areas[localKey(profileId, e.extensionId)]?.values;
           if (values && Object.keys(values).length)
             link.outbox.push({
@@ -552,7 +566,11 @@ class SyncClient {
     for (const extension of Object.values(library(link))) this.emitLibrary(profileId, link, extension);
     if (settingsSync)
       for (const [ext, values] of Object.entries(allVisible(link))) {
-        const changes = difference(before.areas[localKey(profileId, ext)]?.values || {}, values);
+        const previous = before.links[profileId];
+        const old = previous?.settingsSync
+          ? visible(previous, ext)
+          : before.areas[localKey(profileId, ext)]?.values || {};
+        const changes = difference(old, values);
         this.emitStorage(profileId, link, ext, changes);
       }
     this.schedule(100);
@@ -621,6 +639,7 @@ class SyncClient {
         profileId,
         datasetId: link.datasetId,
         libraryChoice: 'remote-only',
+        librarySync: link.librarySync !== false,
         settingsSync: true,
         settingsChoice: options.settingsChoice,
         settingsConsent: options.settingsConsent,
@@ -645,6 +664,61 @@ class SyncClient {
       current.base = {};
       current.areas = {};
     });
+    this.notify();
+    return this.status();
+  }
+  async setLibrarySync(profileId, enabled, options = {}) {
+    this.profile(profileId);
+    const link = this.store.read().links[profileId];
+    if (!link) throw new Error('Link this profile before enabling synchronization.');
+    if (enabled)
+      return this.linkProfile({
+        profileId,
+        datasetId: link.datasetId,
+        librarySync: true,
+        libraryChoice: options.libraryChoice,
+        localLibrary: options.localLibrary || [],
+        settingsSync: link.settingsSync,
+        settingsChoice: link.settingsSync ? 'use-remote' : undefined,
+        // This operation preserves previously granted settings consent and data.
+        settingsConsent: link.settingsSync,
+        preserveSettings: true,
+      });
+    this.profileIntents.set(profileId, (this.profileIntents.get(profileId) || 0) + 1);
+    this.cancelProfileRequests(profileId);
+    this.store.transaction((s) => {
+      const current = s.links[profileId],
+        previousLibrary = library(current),
+        values = allVisible(current);
+      current.id = randomUUID();
+      current.librarySync = false;
+      // Settings for an unuploaded addition must remain available locally after
+      // its installation intent is withdrawn. Never upload them without a cloud
+      // generation, or discard them along with the cancelled library operation.
+      for (const [extensionId, entry] of Object.entries(previousLibrary)) {
+        const remote = current.library[extensionId];
+        if (
+          current.settingsSync &&
+          (!remote || remote.state === 'removed' || remote.generation !== entry.generation)
+        ) {
+          s.areas[localKey(profileId, extensionId)] = independentArea(
+            current,
+            extensionId,
+            values[extensionId],
+            s.areas[localKey(profileId, extensionId)],
+          );
+          current.outbox = current.outbox.filter(
+            (op) => op.kind !== 'settings' || op.extensionId !== extensionId,
+          );
+          current.rejected = current.rejected.filter(
+            (r) => r.operation.kind !== 'settings' || r.operation.extensionId !== extensionId,
+          );
+        }
+      }
+      current.outbox = current.outbox.filter((op) => op.kind === 'settings');
+      current.rejected = current.rejected.filter((r) => r.operation.kind === 'settings');
+    });
+    this.schedule(100);
     this.notify();
     return this.status();
   }
@@ -673,7 +747,7 @@ class SyncClient {
     this.profile(profileId);
     this.store.transaction((s) => {
       const link = s.links[profileId];
-      if (link) this.enqueueLibrary(link, item);
+      if (link && link.librarySync !== false) this.enqueueLibrary(link, item);
     });
     this.schedule(250);
     this.notify();
@@ -785,6 +859,7 @@ class SyncClient {
     });
   }
   emitLibrary(profileId, link, extension) {
+    if (link.librarySync === false) return;
     const result = this.onLibraryChange({ ...this.identity(profileId, link), extension: clone(extension) });
     result?.catch?.(() => {});
   }

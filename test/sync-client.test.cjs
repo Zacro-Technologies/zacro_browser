@@ -430,6 +430,192 @@ test('turning off settings sync keeps library operations queued and preserves lo
   assert.deepEqual(await f.b.callStorage(f.ctx(), 'get', []), {});
 });
 
+const portable = (state = 'enabled', id = extensionId) => ({
+  extensionId: id,
+  source: { kind: 'web-store', id },
+  state,
+});
+async function linkedPair(t) {
+  const f = await fixture(t);
+  await f.link(f.a);
+  await f.link(f.b);
+  await f.a.queueExtension({ profileId: 'normal', ...portable() });
+  await f.a.syncNow();
+  await f.b.syncNow();
+  return f;
+}
+test('settings-only links never upload or project library intent and survive restart', async (t) => {
+  const f = await linkedPair(t);
+  await f.b.unlinkProfile('normal');
+  f.libraries.length = 0;
+  await f.b.linkProfile({
+    profileId: 'normal',
+    datasetId: f.dataset.id,
+    librarySync: false,
+    libraryChoice: 'merge-local',
+    localLibrary: [portable('enabled', otherExtensionId)],
+    settingsSync: true,
+    settingsChoice: 'use-remote',
+    settingsConsent: true,
+  });
+  assert.equal(f.b.status().profiles[0].librarySync, false);
+  assert.deepEqual(f.b.extensionIntents('normal'), []);
+  assert.equal(f.libraries.filter((e) => e.name === 'b').length, 0);
+  await f.b.queueExtension({ profileId: 'normal', ...portable('removed') });
+  await f.b.callStorage(f.ctx(), 'set', [{ onlySettings: true }]);
+  await f.b.syncNow();
+  await f.a.syncNow();
+  assert.deepEqual(await f.a.callStorage(f.ctx(), 'get', []), { onlySettings: true });
+  assert.equal(f.a.extensionIntents('normal')[0].extension.state, 'enabled');
+  assert.equal(f.a.extensionIntents('normal').length, 1);
+  await f.a.queueExtension({ profileId: 'normal', ...portable('disabled') });
+  await f.a.syncNow();
+  const resumed = f.restartClient(1);
+  await resumed.syncNow();
+  assert.equal(resumed.status().profiles[0].librarySync, false);
+  assert.equal(f.libraries.filter((e) => e.name === 'b').length, 0);
+  await resumed.setSettingsSync('normal', false);
+  await resumed.setSettingsSync('normal', true, { settingsChoice: 'use-remote', settingsConsent: true });
+  assert.equal(resumed.status().profiles[0].librarySync, false);
+  assert.equal(f.libraries.filter((e) => e.name === 'b').length, 0);
+});
+test('library pause cancels only library operations; resume retains pending settings and access control', async (t) => {
+  const f = await linkedPair(t);
+  await f.b.queueExtension({ profileId: 'normal', ...portable('disabled') });
+  await f.b.callStorage(f.ctx(), 'set', [{ pending: 'keep' }]);
+  await f.b.callStorage(f.ctx(), 'setAccessLevel', [{ accessLevel: 'TRUSTED_CONTEXTS' }]);
+  const oldIdentity = f.b.extensionIntents('normal')[0];
+  await f.b.setLibrarySync('normal', false);
+  assert.equal(f.b.isCurrentLink(oldIdentity), false);
+  assert.equal(f.b.status().profiles[0].settingsSync, true);
+  assert.equal(f.b.status().profiles[0].pending, 1);
+  await f.b.setLibrarySync('normal', true, { libraryChoice: 'remote-only' });
+  assert.deepEqual(await f.b.callStorage(f.ctx(), 'get', []), { pending: 'keep' });
+  await assert.rejects(f.b.callStorage({ ...f.ctx(), trusted: false }, 'get', []), /access/i);
+  await f.b.syncNow();
+  await f.a.syncNow();
+  assert.deepEqual(await f.a.callStorage(f.ctx(), 'get', []), { pending: 'keep' });
+  assert.equal(f.a.extensionIntents('normal')[0].extension.state, 'enabled');
+});
+test('library resume merges local intent only after review and preserves rejected settings', async (t) => {
+  const f = await linkedPair(t);
+  // Real independent writes fit locally, but their merged total exceeds server quota.
+  await f.a.callStorage(f.ctx(), 'set', [
+    Object.fromEntries(Array.from({ length: 8 }, (_, i) => ['a' + i, 'a'.repeat(7900)])),
+  ]);
+  await f.b.callStorage(f.ctx(), 'set', [
+    Object.fromEntries(Array.from({ length: 8 }, (_, i) => ['b' + i, 'b'.repeat(7900)])),
+  ]);
+  await f.a.syncNow();
+  await f.b.syncNow();
+  const rejected = f.b.status().profiles[0].rejected;
+  assert.equal(rejected[0].code, 'storage_quota');
+  await f.b.setLibrarySync('normal', false);
+  await assert.rejects(f.b.setLibrarySync('normal', true), /review|choose/i);
+  await f.b.setLibrarySync('normal', true, {
+    libraryChoice: 'merge-local',
+    localLibrary: [portable('disabled')],
+  });
+  assert.deepEqual(f.b.status().profiles[0].rejected, rejected);
+  assert.equal((await f.b.callStorage(f.ctx(), 'get', ['b0'])).b0, 'b'.repeat(7900));
+  await f.b.syncNow();
+  await f.a.syncNow();
+  assert.equal(f.a.extensionIntents('normal')[0].extension.state, 'disabled');
+});
+test('library pause retains settings of an addition cancelled before cloud installation', async (t) => {
+  const f = await fixture(t);
+  await f.link(f.a);
+  await f.a.queueExtension({ profileId: 'normal', ...portable() });
+  await f.a.callStorage(f.ctx(), 'set', [{ notLost: true }]);
+  await f.a.setLibrarySync('normal', false);
+  assert.deepEqual(await f.a.callStorage(f.ctx(), 'get', []), { notLost: true });
+  await f.a.syncNow();
+  assert.equal(
+    (await f.a.previewLink({ profileId: 'normal', datasetId: f.dataset.id })).extensions.length,
+    0,
+  );
+  await f.a.setLibrarySync('normal', true, { libraryChoice: 'merge-local', localLibrary: [portable()] });
+  assert.deepEqual(await f.a.callStorage(f.ctx(), 'get', []), { notLost: true });
+  await f.a.syncNow();
+  await f.link(f.b);
+  assert.deepEqual(await f.b.callStorage(f.ctx(), 'get', []), { notLost: true });
+});
+test('paused library still processes tombstones without installing/removing local extensions', async (t) => {
+  const f = await linkedPair(t);
+  await f.b.setLibrarySync('normal', false);
+  await f.b.callStorage(f.ctx(), 'set', [{ stale: true }]);
+  f.libraries.length = 0;
+  await f.a.queueExtension({ profileId: 'normal', ...portable('removed') });
+  await f.a.syncNow();
+  await f.b.syncNow();
+  await f.b.callStorage(f.ctx(), 'set', [{ nowLocal: true }]);
+  await f.b.syncNow();
+  assert.equal(f.libraries.filter((e) => e.name === 'b').length, 0);
+  await f.a.queueExtension({ profileId: 'normal', ...portable() });
+  await f.a.syncNow();
+  assert.deepEqual(await f.a.callStorage(f.ctx(), 'get', []), {});
+  assert.equal(f.b.status().profiles[0].librarySync, false);
+});
+test('legacy links default library on without rewriting unrelated profile state', async (t) => {
+  const f = await linkedPair(t);
+  f.a.store.transaction((s) => {
+    delete s.links.normal.librarySync;
+  });
+  const resumed = f.restartClient(0);
+  assert.equal(resumed.status().profiles[0].librarySync, true);
+  assert.equal(resumed.extensionIntents('normal').length, 1);
+});
+test('library opt-out invalidates a delayed remote library response and host identity', async (t) => {
+  const f = await linkedPair(t);
+  await f.a.queueExtension({ profileId: 'normal', ...portable('removed') });
+  await f.a.syncNow();
+  const entered = gate(),
+    release = gate();
+  f.b.fetch = async (url, options) => {
+    const response = await fetch(url, options);
+    if (url.includes('/changes?')) {
+      entered.resolve();
+      await release.promise;
+    }
+    return response;
+  };
+  const old = f.b.extensionIntents('normal')[0];
+  const pending = f.b.syncNow();
+  await entered.promise;
+  await f.b.setLibrarySync('normal', false);
+  f.libraries.length = 0;
+  release.resolve();
+  await pending;
+  assert.equal(f.b.isCurrentLink(old), false);
+  assert.equal(f.libraries.filter((e) => e.name === 'b').length, 0);
+  assert.equal(f.b.status().profiles[0].settingsSync, true);
+});
+test('a delayed library re-enable cannot override a newer settings or library choice', async (t) => {
+  const f = await linkedPair(t);
+  await f.b.setLibrarySync('normal', false);
+  const entered = gate(),
+    release = gate();
+  f.b.fetch = async (url, options) => {
+    const response = await fetch(url, options);
+    if (url.includes('/snapshot?')) {
+      entered.resolve();
+      await release.promise;
+    }
+    return response;
+  };
+  const pending = assert.rejects(
+    f.b.setLibrarySync('normal', true, { libraryChoice: 'remote-only' }),
+    /changed|abort/i,
+  );
+  await entered.promise;
+  await f.b.setSettingsSync('normal', false);
+  release.resolve();
+  await pending;
+  const current = f.b.status().profiles[0];
+  assert.equal(current.settingsSync, false);
+  assert.equal(current.librarySync, false);
+});
+
 test('client stale clear preserves unseen remote keys and cloud deletion detaches without recreating a dataset', async (t) => {
   const f = await fixture(t);
   await f.link(f.a);
