@@ -571,6 +571,8 @@ for (const replace of [false, true])
     }
     await f.b.syncNow();
     assert.deepEqual(await f.b.callStorage(f.ctx(), 'get', []), { secret: 'local installation survives' });
+    await f.b.setLibrarySync('normal', false);
+    assert.deepEqual(await f.b.callStorage(f.ctx(), 'get', []), { secret: 'local installation survives' });
     assert.equal(f.b.canAccessStorage({ ...f.ctx(), trusted: false }), false);
     await f.b.callStorage(f.ctx(), 'set', [{ secret: 'new local secret' }]);
     await assert.rejects(f.b.callStorage({ ...f.ctx(), trusted: false }, 'get', []), /access/i);

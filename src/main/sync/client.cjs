@@ -715,6 +715,8 @@ class SyncClient {
         const remote = current.library[extensionId];
         if (
           current.settingsSync &&
+          entry.state !== 'removed' &&
+          !current.detachedSettings?.[extensionId] &&
           (!remote || remote.state === 'removed' || remote.generation !== entry.generation)
         ) {
           s.areas[localKey(profileId, extensionId)] = independentArea(
