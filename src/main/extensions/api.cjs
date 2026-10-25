@@ -491,6 +491,23 @@ class ExtensionAPI {
       });
       return Array.isArray(result) ? result.map(sanitize) : sanitize(result);
     }
+    if (
+      group === 'runtime' &&
+      ['connectNative', 'postNativeMessage', 'disconnectNative', 'sendNativeMessage'].includes(name)
+    ) {
+      if (!metadata.grants.permissions.includes('nativeMessaging'))
+        throw new Error('Missing nativeMessaging permission');
+      if (!this.nativeMessaging) throw new Error('Native messaging unavailable');
+      const nativeContext = Object.freeze({
+        ...context,
+        permissions: metadata.grants.permissions,
+        guard: () => this.guard(context),
+      });
+      if (name === 'connectNative') return this.nativeMessaging.connect(nativeContext, args[0], args[1]);
+      if (name === 'postNativeMessage') return this.nativeMessaging.post(nativeContext, args[0], args[1]);
+      if (name === 'disconnectNative') return this.nativeMessaging.disconnect(nativeContext, args[0]);
+      return this.nativeMessaging.send(nativeContext, args[0], args[1]);
+    }
     if (method === 'runtime.openOptionsPage') {
       const page = metadata.manifest.options_ui?.page || metadata.manifest.options_page;
       if (!page) throw new Error('No options page declared');

@@ -64,6 +64,9 @@
   event.removeListener = (listener) => remove(listeners.get(listener) || listener);
   event.hasListener = (listener) => has(listeners.get(listener) || listener);
   const subscribers = new Set();
+  let nativePortCount = 0;
+  let settleNativeTransport = () => {};
+  let nativeTransportClosed = () => {};
   if (!globalThis.zacroExtension) {
     const connect = runtime.connect.bind(runtime);
     let ready,
@@ -77,13 +80,14 @@
         background = false;
       const settle = () => {
         clearTimeout(idle);
-        if (background && !pending.size && !closed && !connection.retiring)
+        if (background && !nativePortCount && !pending.size && !closed && !connection.retiring)
           idle = setTimeout(() => connection.retire(), 100);
       };
       const fail = () => {
         closed = true;
         clearTimeout(idle);
         if (active === connection) {
+          nativeTransportClosed();
           active = null;
           ready = null;
         }
@@ -111,8 +115,9 @@
       });
       const connection = {
         retiring: null,
+        settle,
         retire() {
-          if (closed || pending.size || connection.retiring) return;
+          if (closed || nativePortCount || pending.size || connection.retiring) return;
           // The host first removes this event destination. Its acknowledgement
           // follows all earlier Port events, so none can be stranded by close.
           connection.retiring = connection.request({ method: 'zacro.events.idle', args: [] }).then(
@@ -159,6 +164,7 @@
           connection = open();
           const context = await connection.request({ hello: true }, 150);
           active = connection;
+          settleNativeTransport = connection.settle;
           connection.setKind(context.kind);
           setTimeout(() => resubscribe(), 0);
           return connection;
@@ -187,7 +193,14 @@
             await connection.retiring;
             return globalThis.zacroExtension.invoke(method, args);
           }
-          return connection.request({ method, args });
+          return connection.request(
+            { method, args },
+            method === 'runtime.connectNative'
+              ? 300000
+              : method === 'runtime.sendNativeMessage'
+                ? 31000
+                : 10000,
+          );
         },
       }),
     });
@@ -491,6 +504,101 @@
           callback,
         );
       };
+    // These Ports are scoped by the main-process lease, never by their client ID.
+    const nativePorts = new Map();
+    const portEvent = () => {
+      const listeners = new Set();
+      return {
+        listeners,
+        api: {
+          addListener(listener) {
+            if (typeof listener !== 'function') throw new TypeError('Listener must be a function');
+            listeners.add(listener);
+          },
+          removeListener(listener) {
+            listeners.delete(listener);
+          },
+          hasListener(listener) {
+            return listeners.has(listener);
+          },
+          hasListeners() {
+            return listeners.size > 0;
+          },
+        },
+      };
+    };
+    function nativeDisconnected(saved, error, notify = true) {
+      if (saved.closed) return;
+      saved.closed = true;
+      nativePorts.delete(saved.id);
+      nativePortCount--;
+      if (error) callbackError = { message: error };
+      try {
+        for (const listener of notify ? saved.disconnected.listeners : []) {
+          try {
+            listener(saved.port);
+          } catch (error) {
+            console.error('Native messaging listener failed');
+          }
+        }
+      } finally {
+        callbackError = undefined;
+        settleNativeTransport();
+      }
+    }
+    nativeTransportClosed = () => {
+      for (const saved of nativePorts.values())
+        nativeDisconnected(saved, 'Native messaging transport disconnected');
+    };
+    host.onEvent?.((name, args) => {
+      if (name !== 'runtime.nativePort') return;
+      const incoming = args[0];
+      const saved = nativePorts.get(incoming?.portId);
+      if (!saved || saved.closed) return;
+      if (incoming.type === 'disconnect') nativeDisconnected(saved, incoming.error);
+      else if (incoming.type === 'message')
+        for (const listener of saved.message.listeners) {
+          try {
+            listener(incoming.message, saved.port);
+          } catch (error) {
+            console.error('Native messaging listener failed');
+          }
+        }
+    });
+    runtime.connectNative = (name) => {
+      const id = 'native-' + crypto.randomUUID();
+      const saved = { id, closed: false, message: portEvent(), disconnected: portEvent() };
+      const port = (saved.port = {
+        name,
+        onMessage: saved.message.api,
+        onDisconnect: saved.disconnected.api,
+        postMessage(value) {
+          if (saved.closed) throw new Error('Attempting to use a disconnected port object');
+          let copy;
+          try {
+            copy = JSON.parse(JSON.stringify(value));
+          } catch {
+            throw new Error('Native messaging message is not JSON serializable');
+          }
+          saved.ready
+            .then(() => {
+              if (!saved.closed) return host.invoke('runtime.postNativeMessage', [id, copy]);
+            })
+            .catch((error) => nativeDisconnected(saved, error.message));
+        },
+        disconnect() {
+          if (saved.closed) return;
+          nativeDisconnected(saved, undefined, false);
+          saved.ready.then(() => host.invoke('runtime.disconnectNative', [id])).catch(() => {});
+        },
+      });
+      nativePorts.set(id, saved);
+      nativePortCount++;
+      saved.ready = host.invoke('runtime.connectNative', [name, id]);
+      saved.ready.catch((error) => nativeDisconnected(saved, error.message));
+      return port;
+    };
+    runtime.sendNativeMessage = (...args) => invoke('runtime.sendNativeMessage', args);
     runtime.openOptionsPage = (...args) => invoke('runtime.openOptionsPage', args);
     for (const [group, names] of Object.entries({
       tabs: ['onCreated', 'onUpdated', 'onActivated', 'onRemoved'],

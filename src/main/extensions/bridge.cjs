@@ -23,10 +23,11 @@ function extensionId(url) {
 const { matches: permitsOrigin } = require('./permissions.cjs');
 
 class ExtensionBridge {
-  constructor({ resolveExtension, dispatch, onError = () => {} }) {
+  constructor({ resolveExtension, dispatch, onError = () => {}, onContextRevoked = () => {} }) {
     this.resolveExtension = resolveExtension;
     this.dispatch = dispatch;
     this.onError = onError;
+    this.onContextRevoked = onContextRevoked;
     this.sessions = new Map();
     this.leases = new Map();
     this.origins = new Map();
@@ -215,6 +216,13 @@ class ExtensionBridge {
     };
     this.origins.set(token, origin);
     const revoke = () => {
+      if (!this.origins.has(token)) return;
+      this.onContextRevoked({
+        profileId: origin.profileId,
+        extensionId: origin.extensionId,
+        generation: origin.generation,
+        contextId: 'origin:' + token,
+      });
       this.origins.delete(token);
       contents.off('did-start-navigation', navigating);
       contents.off('destroyed', revoke);
@@ -291,6 +299,12 @@ class ExtensionBridge {
   releaseLease(token) {
     const lease = this.leases.get(token);
     if (!lease) return;
+    this.onContextRevoked({
+      profileId: lease.profileId,
+      extensionId: lease.extensionId,
+      generation: lease.generation,
+      contextId: 'lease:' + token,
+    });
     this.leases.delete(token);
     lease.cleanup?.();
   }
@@ -443,8 +457,13 @@ class ExtensionBridge {
       }
       return;
     }
+    source.assertCurrent = assertCurrent;
     const result = await this.dispatch(
-      Object.freeze({ ...(origin ? { ...origin, metadata: context.metadata } : context), assertCurrent }),
+      Object.freeze({
+        ...(origin ? { ...origin, metadata: context.metadata } : context),
+        assertCurrent,
+        contextId: origin ? 'origin:' + request.originToken : 'lease:' + request.token,
+      }),
       request.method,
       request.args,
     );
@@ -638,6 +657,33 @@ class ExtensionBridge {
       }
       this.flush(entry, id, state);
       this.wake(session, entry, id, state);
+    }
+  }
+
+  emitNative(context, nativeEvent) {
+    const isOrigin = context.contextId?.startsWith('origin:');
+    const token = context.contextId?.slice(isOrigin ? 7 : 6);
+    const source = isOrigin ? this.origins.get(token) : this.leases.get(token);
+    if (
+      !source ||
+      source.profileId !== context.profileId ||
+      source.extensionId !== context.extensionId ||
+      source.generation !== context.generation
+    )
+      return false;
+    try {
+      // A terminal notification may reach the retiring document even after its
+      // extension generation is disabled. It grants no further host authority.
+      if (nativeEvent.type !== 'disconnect') source.assertCurrent?.();
+      const event = 'runtime.nativePort';
+      const args = [nativeEvent];
+      if (isOrigin) {
+        if (source.broker.isDestroyed()) return false;
+        source.broker.webContents.mainFrame.send(CHANNEL + ':event', { originToken: token, event, args });
+      } else source.sender.send(CHANNEL + ':event', { token, event, args });
+      return true;
+    } catch {
+      return false;
     }
   }
 

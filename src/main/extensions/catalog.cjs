@@ -13,6 +13,7 @@ const API_PERMISSIONS = new Set([
   'declarativeNetRequestFeedback',
   'offscreen',
   'alarms',
+  'nativeMessaging',
 ]);
 function list(value, name) {
   if (value === undefined) return [];

@@ -5,6 +5,7 @@ const files = require('node:fs');
 const { ExtensionManager } = require('./manager.cjs');
 const { ExtensionAPI } = require('./api.cjs');
 const { ExtensionBridge } = require('./bridge.cjs');
+const { NativeMessagingBroker } = require('./native-messaging.cjs');
 const { parseStoreId } = require('./packages.cjs');
 const { matches, covers } = require('./permissions.cjs');
 const { inspectManifest } = require('./catalog.cjs');
@@ -124,6 +125,7 @@ class ExtensionHost {
     this.bridge = new ExtensionBridge({
       resolveExtension,
       dispatch: (context, method, args) => this.api.call(context, method, args),
+      onContextRevoked: (context) => this.nativeMessaging?.revoke(context),
       onError: (_error, { profileId, extensionId }) => {
         this.notificationErrors.set(this.key(profileId, extensionId), true);
         publish();
@@ -140,7 +142,12 @@ class ExtensionHost {
       onDeactivated: (context) => this.deactivated(context),
       onChange: () => publish(),
     });
+    this.nativeMessaging = new NativeMessagingBroker({
+      approveHost: (review) => this.approveNativeHost(review),
+      emit: (context, event) => this.bridge.emitNative(context, event),
+    });
     this.api = new ExtensionAPI({
+      nativeMessaging: this.nativeMessaging,
       resolveExtension,
       listExtensions: (profile) => this.manager.list(profile),
       tabs: browser.tabs,
@@ -477,6 +484,39 @@ class ExtensionHost {
     });
     return response === 1 && !context.signal.aborted && this.activeProfile()?.id === context.profileId;
   }
+  async approveNativeHost(review) {
+    const current = () => {
+      const profile = this.getProfile(review.profileId);
+      const metadata = this.manager.resolveExtension(review.profileId, review.extensionId);
+      if (
+        this.closed ||
+        !profile ||
+        profile.private ||
+        this.activeProfile()?.id !== review.profileId ||
+        !metadata?.enabled ||
+        metadata.generation !== review.generation ||
+        !metadata.grants.permissions.includes('nativeMessaging')
+      )
+        throw new Error('Native messaging review expired');
+      return { profile, metadata };
+    };
+    try {
+      const { profile, metadata } = current();
+      const { response } = await this.native.dialog.showMessageBox(this.getWindow(), {
+        type: 'warning',
+        title: 'Allow native application access?',
+        message: `${metadata.manifest.name} wants to connect to ${review.name}`,
+        detail: `Profile: ${profile.name || profile.id}\nRegistered manifest: ${review.registeredManifestPath}\nCanonical manifest: ${review.manifestPath}\nManifest SHA-256: ${review.manifestSha256}\nRegistered executable: ${review.registeredExecutablePath}\nCanonical executable: ${review.executablePath}\nExecutable SHA-256: ${review.executableSha256}\n\nThis external application runs under your OS account and can access files and the network. Allow only an application you trust. Approval applies only while these exact host files remain unchanged.`,
+        buttons: ['Cancel', 'Allow host'],
+        defaultId: 0,
+        cancelId: 0,
+      });
+      current();
+      return response === 1;
+    } catch {
+      return false;
+    }
+  }
   async permissionDialog(profile, id, details, guard) {
     guard();
     const epoch = this.syncClient().epoch;
@@ -539,6 +579,7 @@ class ExtensionHost {
     return pending;
   }
   async deactivated({ profileId, extensionId, reason }) {
+    this.nativeMessaging?.revoke({ profileId, extensionId });
     this.closeViews(profileId, extensionId);
     const key = this.key(profileId, extensionId);
     this.notificationErrors.delete(key);
@@ -899,6 +940,7 @@ class ExtensionHost {
     return result;
   }
   async removeProfile(profile) {
+    this.nativeMessaging?.revoke({ profileId: profile });
     this.closeViews(profile);
     await this.manager.invalidateProfile(profile);
     this.restores.delete(profile);
@@ -907,6 +949,7 @@ class ExtensionHost {
   }
   async close() {
     this.closed = true;
+    this.nativeMessaging?.dispose();
     this.closeViews();
     this.bridge.close();
     await this.manager.close();
