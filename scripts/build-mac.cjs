@@ -3,7 +3,7 @@ const { build, Platform, Arch } = require('electron-builder');
 const { validateRuntime } = require('./prepare-runtime.cjs');
 
 async function buildMac({ directory = false, release = false } = {}) {
-  validateRuntime('darwin', process.arch);
+  await validateRuntime('darwin', process.arch);
   if (release) process.env.CSC_IDENTITY_AUTO_DISCOVERY = 'true';
   // Ad-hoc previews intentionally disable Hardened Runtime to avoid granting
   // disable-library-validation merely to run a local, unsigned test build.

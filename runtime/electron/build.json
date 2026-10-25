@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "electronVersion": "45.0.0",
+  "electronCommit": "54f961b44b83e4ece81065ab60a182fd0c38c01e",
+  "chromiumVersion": "156.0.8078.48",
+  "chromiumCommit": "d0c02bfad08ec92a6ffcf989e53cd995e6381a4c",
+  "depotToolsCommit": "b52fe87d04af61df3dd07748ff2c2c0b649dca09",
+  "capabilityVersion": 1,
+  "targets": ["darwin-arm64", "darwin-x64", "win32-x64"]
+}

@@ -158,3 +158,272 @@ Do not print host payloads/stderr or include them in errors.
 - No cross-profile or private extension installation.
 - Resource escape and generation revocation.
 - Packaged original signature/provenance remains untouched.
+
+## Task 5: Native extension side panels
+
+**Files:** New `src/main/extensions/side-panel.cjs`; `src/main/main.cjs`,
+`src/main/layout.cjs` only if needed; renderer `app.js`/CSS for real panel chrome;
+new unit/native tests and `docs/EXTENSION-SIDE-PANEL.md`. Coordinate API/bootstrap/
+host/catalog integration after native-messaging owner releases those files.
+
+**Interfaces:** sidePanel.getOptions/setOptions, getPanelBehavior/setPanelBehavior,
+open/close and getLayout. Maintain global default from manifest.side_panel and
+per-native-tab overrides, scoped by profile/extension/generation. Open supports
+the actual browser window/tab, requires a genuine host-recorded user gesture,
+and rejects foreign/closed/private/disabled contexts. Action-click behavior can
+open the configured panel; a visible browser control in Manage extensions opens
+the configured panel too. Do not fabricate activeTab to open it.
+
+Use one genuine sandboxed/context-isolated WebContentsView within the browser's
+existing right-panel region, displaying a same-extension packaged page. Keep
+the actual page WebContents and unsaved input intact; resize the page using the
+normal layout path. Renderer shows title/close control and mutually selects
+this panel versus Library/AI/Settings. Layout geometry comes only from trusted
+shell IPC and is clamped to the window. Hide/detach the native view for shell
+overlays so dialogs remain usable. Closing/replacing panel, switching profile,
+disabling/removing extension or closing its scoped tab destroys obsolete access.
+Global panels can remain open across same-profile tab switches. Offscreen/native
+messaging concerns remain separate; never turn this into a standalone window.
+Persist panel behavior/options under the managed profile directory if their
+Chrome lifetime requires it; do not persist transient open/gesture state.
+
+1. Add RED unit/native tests for options, tab/global selection and real attached
+   view geometry, host gesture enforcement, cross-profile denial, native API
+   use inside the panel, page input retention and teardown/overlay behavior.
+2. Implement controller + shell/native layout + compatibility routes under the
+   existing authorization guard. No page-driven install/panel control IPC.
+3. Run targeted native/unit and existing layout/profile regression tests. Record
+   exact supported methods and RED/GREEN, self-review, commit owned paths and
+   return report for fresh review. Final combined suite is root-coordinated.
+
+## Task 6: Extension identity web authentication
+
+**Files:** New `src/main/extensions/identity.cjs`, focused unit/native tests and
+`docs/EXTENSION-IDENTITY.md`; coordinate identity-only API/bootstrap/host/catalog
+integration after Task5 releases those files.
+
+Implement real `identity.launchWebAuthFlow` and synchronous `getRedirectURL`,
+using an owned sandboxed, context-isolated BrowserWindow in the extension's
+profile session. Require identity permission and validated context/generation;
+never expose Node/preload/compatibility APIs to provider content. Validate HTTPS
+provider URLs (no embedded credentials), extension-specific exact HTTPS host
+`<extensionId>.chromiumapp.org`, bounded redirect results/options. Intercept
+redirects before navigation, close window and return full redirect including
+query/fragment. Never accept another extension's callback or leak tokens in logs.
+The authorization window starts hidden; interactive mode shows after initial
+load unless already completed; noninteractive defaults to abort after load, with
+explicit abortOnLoadForNonInteractive=false and bounded timeout supporting JS
+redirects. Abort/destroy pending work on caller/context/extension/profile death
+and window close. Isolate concurrent flows and bound resources. Preserve normal
+certificate validation and block unrelated popup/new-window escape.
+
+`getProfileUserInfo` accurately returns empty Google account fields when Zacro
+has no Chrome Google identity; never substitute a Zacro account. Google
+`getAuthToken` requires genuine provider support; establish the pinned runtime
+and official provider prerequisites rather than return fake tokens or silently
+claim support. Keep a clear documented unsupported error if provider support
+cannot be verified, recorded as an OPEN external requirement.
+
+1. Add RED tests for same-ID HTTPS redirect, foreign/malformed URL rejection,
+   query/fragment return, concurrency, timeout/cancel and revocation.
+2. Implement and wire the facade with Promise/callback/lastError semantics.
+3. Real Electron acceptance uses only a local synthetic HTTPS provider with
+   fixture certificate handling restricted to that test's disposable session;
+   no production TLS bypass or real user authentication. Verify real window
+   isolation, redirects and lifecycle. Unit plus focused native regression,
+   self-review and task-owned commit/report; root requests fresh review.
+
+## Task 7: Approved native Electron hooks
+
+User approved custom Electron on 2026-10-26. Pinned Electron45.0.0 commit
+54f961b44b83e4ece81065ab60a182fd0c38c01e, Chromium156.0.8078.48.
+Source clone `.tmp/electron-patch-source` is task-owned read/write; selected
+Chromium originals in `.tmp/chromium-reference`. Root owns full build checkout
+on external APFS image and build/install infrastructure. Do not run a full
+gclient checkout yourself. Deliver Electron/Chromium patches in
+`runtime/electron/patches` with exact base and application order manifest.
+
+Implement privileged main-process session.extensions hooks with feature
+negotiation version1. The extension JS/pages must not gain direct access.
+Agree exact method names and return contract with root before adapter wiring.
+- `getZacroCapabilities`: version plus implemented capability flags only.
+- Real temporary activeTab grant to an actual WebContents in exact owning
+  session, using Chromium ActiveTabPermissionGranter and native WebContents ID.
+  Validate enabled extension, activeTab permission, HTTP(S) page and not private.
+  Resolve only after network/renderer grant dispatch; revoke by native navigation,
+  close, unload. Never add permanent manifest origins or grant other same-origin
+  tabs. Native return must indicate genuine grant, with async cancellation safe.
+- Update reviewed native permissions without replacing caller/extension object.
+  PermissionsUpdater must update native permission data, networking, renderers
+  and persistence before resolving. Root supplies already-reviewed exact
+  permission/origin set. API is privileged, validate bounds/native parse and
+  enabled same-session extension. Keep optional declaration metadata separate
+  from grants, preventing direct native permissions.request bypass. Do not
+  expose a native auto-grant route through retained optional manifest entries.
+- userScripts enable/disable uses UserScriptManager::SetUserScriptPrefEnabled;
+  add genuine SCRIPTS StateStore initialized before UserScriptManager. Ensure
+  registered scripts persist across normal restart but disable/removal stops
+  execution, separate USER_SCRIPT world with no extension credentials/Node.
+- Native font preference hooks: real per-profile/script generic font maps and
+  default/minimum sizes into Blink WebPreferences; update existing/new contents,
+  preserve explicit CSS families. Get fonts via native OS enumeration. Root
+  owns extension ownership/priority and persistence adapter. Native setter can
+  replace validated override map; empty map restores unmodified native defaults.
+
+Add native acceptance specs under Electron spec as part of patch: enabled grant
+vs same-origin negative tab/cross-profile/navigation/unload, alive caller
+permission continuation, user script isolation/persistence, font preference
+effect. RED native tests can only run once custom build exists; clearly report
+source-level checks vs compilation/run evidence. Source patch application on
+pinned original must pass; do not claim complete based on patch alone.
+Self-review, task-only commit, full report to task-7-report.md; no subagents.
+
+## Task 8: Consume the custom native runtime in Zacro
+
+Root builds Electron; Task7 owns native patch. Agreed v1 session.extensions
+contract: getZacroCapabilities() => {version:1,activeTab:true,
+reviewedPermissions:true,userScripts:true,fontSettings:true};
+grantZacroActiveTab(extensionId,webContentsId) => Promise<void> after native
+network/render dispatch; setZacroReviewedPermissions(extensionId, fullSet) =>
+Promise<void> with exact full reviewed permissions/origins;
+setZacroUserScriptsEnabled(extensionId,bool) => void;
+loadExtension(path,{zacroReviewedPermissions:fullSet}) validates/applies exact
+initial active/granted set BEFORE registration/worker/content scripts. Native
+permissions.request direct IPC is denied. Original required+optional manifest
+declarations must be retained for native validation. Native code enforces
+required access, exact session and enabled identity, no private profiles.
+
+Own new engine capability module, manager/permissions/catalog integration,
+activeTab API.gesture hookup, explicit userScripts local toggle UI/controller,
+focused tests/native custom-runtime acceptance/docs. Task7 owns native source;
+root owns build/artifact scripts and fontSettings adapter (coordinate shared
+api/bootstrap/host/renderer exact hunks).
+
+Requirements: negotiate hooks/version/method existence from actual session,
+fail closed on stock Electron; keep stock acceptance truthful and allow engine
+capabilities only on patched runtime. Manifest parsing must stay pure/testable
+with explicit capability inputs. Preserve verified original package/hashes;
+derive a new managed manifest for native mode retaining optional declarations
+while all grants are applied through privileged initial load option. Handle
+previous derived versions safely, never broaden access in migration/downgrade.
+
+Permission request/remove changes native permissions in-place and preserves
+original living caller/context/generation. No native unload/reload, no losing
+unsaved page data. After native completion current metadata/persistence and
+events reflect grants; cancellation/disable/profile transition at any async
+boundary must revoke/stay fail-closed. Required permissions never removed;
+no callback before native completion. Preserve current stock fallback.
+
+activeTab grants actual native tab after genuine host action/command/menu
+gesture only, never via API openPopup or extension fake gestures. Update adapter
+temporary visibility only once native grant resolves and revalidate context.
+Same-origin other tab negative; navigation/disable native revocation.
+
+userScripts permission availability requires runtime; provide trusted Manage
+extensions local enable/disable toggle (separate consent), persist it by managed
+profile/extension, apply before/background initialization and on restart.
+Extensions cannot toggle their own host setting. Existing script worlds remain
+native; do not implement scripting with unsafe evaluate/Node.
+
+RED unit tests cover runtime mismatch/stock denial, live permissions preserved
+through awaits and cancellation, migration, user consent. Native custom fixture
+must FAIL when demanded without custom runtime; regular stock suite can record
+explicit unsupported behavior rather than skip all assertions. Native execution
+awaits root built binary; report exact unrun boundaries, no mock-only completion.
+Record report task-8-report.md, task-owned commits; no subagents.
+
+## Task 9: Native fontSettings adapter
+
+Task7 custom hooks on session.extensions:
+getZacroFontPreferences() => native effective {fonts:[{script,genericFamily,
+fontId}],defaultFontSize,defaultFixedFontSize,minimumFontSize};
+setZacroFontPreferences(same shape,fonts required/sizes optional) replaces
+native overrides; empty fonts and absent sizes restores native defaults.
+getZacroFontList() => Promise<{fontId,displayName}[]> native OS enumeration.
+Task8 engine-capabilities.cjs negotiates actual v1 and all font hooks.
+
+Own new font-settings.cjs, focused unit/native tests/docs and fontSettings-only
+API/bootstrap/host integration; coordinate Task8 shared files. Implement Chrome
+fontSettings get/set/clear Font, DefaultFontSize, DefaultFixedFontSize and
+MinimumFontSize, getFontList and four onChanged events with accurate per-receiver
+levelOfControl. Validate generic families, script tags, sizes/font names and
+argument shapes with bounded state. Native getter supplies defaults; do not
+hardcode default fonts/sizes or substitute CSS. Require fontSettings permission,
+trusted enabled same-profile/generation context and genuine negotiated runtime.
+
+Settings persist locally per profile and extension, are not sync credentials.
+Use stable extension install order (manager record.installedAt, deterministic
+ID tie-breaker) for competing owners; latest installed enabled extension wins,
+so an older extension write cannot steal a newer extension's selection. Clear
+removes only own override; disable/remove or permission revoke recomputes and
+restores next owner/native default. Disabled extension's retained preferences
+can reactivate on explicit enable; uninstall removes them. No private/global
+profile bleed. Emit only meaningful effective/control transitions, bounded
+data, to enabled authorized receivers through bridge. Handle native set failure
+without committing a false successful persisted state.
+
+TDD: native-mock units for ownership/precedence, restart, cancellation, invalid
+args, stock denial, per-profile events/disable/revoke/native failure rollback.
+Real native fixture asserts computed generic selection/size changes, explicit
+CSS unaffected, other profile negative, restoration. Custom acceptance must
+fail when demanded without runtime; run actual after root build ready. No
+mock-only feature claim. Self-review and task-owned commit/report task-9-report.md;
+no subagents, no broad suites.
+
+## Task 10: Reproducible sync deployment and container acceptance
+
+User has no hosting account/domain; complete local deploy/operations assets
+without purchasing/publishing or inventing a public endpoint. Existing
+services/sync Node24 service/CLI/Dockerfile already implement real auth, TLS,
+SQLite encrypted persistence/externalkey, backup/restore/deletion-ledger/key
+rotation and health/ready. Preserve their security boundaries and account model.
+
+Own services/sync/deploy (or equivalent focused directory), deploy docs, focused
+container acceptance script/test and .github/workflows sync-container job as
+separate workflow. Root owns native runtime workflow and all native app files.
+Provide concrete HTTPS deployment with durable SQLite data, separate masterkey,
+restart/health/monitoring and backup/restore operational commands. A proxy must
+share loopback network namespace; current service rejects nonloopback plainHTTP.
+Never relax service network validation merely to accommodate Docker networking.
+Use mandatory operator-owned domain and external secrets; do not generate
+production keys inrepo or emit key/tokens/log payloads. No telemetry destination.
+Graceful stop and singleton lock remain reliable across container restart.
+
+Container acceptance must build actual Dockerfile/image and use disposable
+volumes/keys/accounts only. Test health/readiness, signup/auth/sync roundtrip,
+restart persistent state, wrongkey/absentkey failure, backup/restore behavior and
+HTTPS path where feasible using fixture-only certificates. No real accounts or
+public endpoint. Cleanup only testnamed containers/volumes; keep diagnostics
+with no secretbody/token output. Add reproducible CI LinuxDocker job for this
+acceptance; actual Windows/mac builds remain separate.
+
+Root installed colima0.10.3/lima2.2.1/docker29.9.2/compose5.6.1. Dedicated VM is
+starting exec63184: COLIMA_HOME=/Volumes/ZacroElectronBuild/colima, profile
+zacro-sync-test, activate=false, sshconfig=false, sshagent=false, mountnone,
+disk12GiB/root10GiB/cpu2/memory2, VZ. Logs container-setup.log. It is downloading
+diskimage. Do not change global Docker context; set DOCKER_HOST to this VM socket
+whenready (discover exact path via colima status/config). Docker Compose is
+standalone docker-compose because global plugin config was not modified.
+Root is also syncing Chromium externally; avoid memorypressure during compile,
+coordinate stop of VM once container acceptance finishes.
+
+Use official docs/currentpinned images where needed. TDD behavior for new
+helpers, realDocker acceptance, self-review/task-ownedcommit and report
+task-10-report.md. No subagents; no deployments/pushes/accountcreation.
+
+## Task 11: Pinned native build and artifact integrity tooling (root)
+
+Provide explicit resumable source/toolchain/patch/build/native-test phases for
+the three supported targets, exact source/depot pins and ordered patch hashes.
+Never reset existing source changes. Build locally on the dedicated APFS volume
+authorized by the user. Prepare manual self-hosted CI; do not claim unprovisioned
+Windows/Intel runners ran. Keep source checks, compilation, native tests and
+signed release gates distinct.
+
+Record every regular file/relative internal symlink in a target/source/patch
+receipt. Reject tampered files, extra files, wrong target/source and escaping
+links. Stage/verify installs, preserve previous npm runtime backup, and recheck
+receipt at packaging. Receipt is local integrity, not publisher authentication
+or compilation proof. Use targeted adversarial tests and actual pinned-source
+build/native/package acceptance once available. Root self-review followed by
+fresh scoped review of task-owned scripts/docs/workflow.
