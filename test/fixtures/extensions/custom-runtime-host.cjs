@@ -22,6 +22,10 @@ app.whenReady().then(async () => {
     const manifest = {
       manifest_version: 3,
       name: 'Custom runtime acceptance',
+      key: require('node:crypto')
+        .generateKeyPairSync('rsa', { modulusLength: 2048 })
+        .publicKey.export({ format: 'der', type: 'spki' })
+        .toString('base64'),
       version: '1',
       permissions: ['activeTab', 'scripting', 'storage', 'userScripts'],
       optional_host_permissions: ['http://localhost/*'],
@@ -184,7 +188,26 @@ app.whenReady().then(async () => {
     } catch (error) {
       afterDisable = { error: error.message };
     }
+    await manager.remove('p', record.id);
+    const reinstalled = await manager.installLocal('p', source);
+    if (reinstalled.id !== record.id) throw new Error('Reinstall changed verified identity');
+    await manager.changePermissions('p', record.id, {
+      permissions: manifest.permissions,
+      origins: ['http://localhost/*'],
+    });
+    await manager.setUserScriptsEnabled('p', record.id, true);
+    if (!view.isDestroyed()) view.destroy();
+    view = window();
+    await view.loadURL(`chrome-extension://${record.id}/page.html`);
+    const cleanReinstall =
+      (await view.webContents.executeJavaScript('chrome.userScripts.getScripts()')).length === 0;
+    await target.loadURL(otherURL);
+    const noResurrectedScript = await target.webContents.executeJavaScript(
+      '!document.documentElement.hasAttribute("data-world-a")',
+    );
     globalThis.contextResult = {
+      cleanReinstall,
+      noResurrectedScript,
       capabilities,
       before,
       active,

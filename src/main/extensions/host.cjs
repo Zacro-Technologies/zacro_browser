@@ -151,6 +151,7 @@ class ExtensionHost {
         this.guards.get(this.key(profile, id)) || this.guards.get(this.key(profile, '*')) || (() => {}),
       confirmPermissions: (context) => this.confirm(context),
       onDeactivated: (context) => this.deactivated(context),
+      onPermissionsChanged: (...args) => this.permissionsChanged(...args),
       onNativeLoaded: (profile) => this.fontSettings?.reconcile(profile),
       onChange: (profile) => {
         publish();
@@ -573,6 +574,10 @@ class ExtensionHost {
       cancelId: 0,
     });
     return response === 1 && !context.signal.aborted && this.activeProfile()?.id === context.profileId;
+  }
+  permissionsChanged(profileId, extensionId, { before, after }) {
+    if (before.permissions.includes('nativeMessaging') && !after.permissions.includes('nativeMessaging'))
+      this.nativeMessaging.revoke({ profileId, extensionId });
   }
   async approveNativeHost(review) {
     const current = () => {

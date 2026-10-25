@@ -60,6 +60,8 @@ test(
     assert.deepEqual(result.restartWorlds, result.worlds);
     assert.equal(result.consentAfterRestart, true);
     assert.equal(result.afterUserScriptsOff, null);
+    assert.equal(result.cleanReinstall, true);
+    assert.equal(result.noResurrectedScript, true);
     assert.match(result.afterDisable.error, /permission|access|invalid|context|extension|destroy/i);
   },
 );

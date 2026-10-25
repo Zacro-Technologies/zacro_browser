@@ -270,6 +270,7 @@
       return api;
     }
     host.onEvent?.((name, args) => {
+      if (name === 'permissions.onAdded' || name === 'permissions.onRemoved') refreshNativeServices();
       if (name === 'contextMenus.onClicked') {
         const saved = menuCallbacks.get(args[0]?.menuItemId);
         if (saved?.token === args[2]) {
@@ -330,19 +331,24 @@
     }
     function invoke(name, args) {
       const callback = typeof args.at(-1) === 'function' ? args.pop() : null;
-      const promise = Promise.resolve().then(() => {
-        if (
-          (name === 'action.setIcon' || name === 'browserAction.setIcon') &&
-          args[0]?.imageData !== undefined
-        )
-          args[0] = { ...args[0], imageData: serializeImageData(args[0].imageData) };
-        if (
-          name === 'storage.sync.set' ||
-          (name === 'storage.sync.get' && args[0] && typeof args[0] === 'object')
-        )
-          validate(args[0]);
-        return host.invoke(name, args);
-      });
+      const promise = Promise.resolve()
+        .then(() => {
+          if (
+            (name === 'action.setIcon' || name === 'browserAction.setIcon') &&
+            args[0]?.imageData !== undefined
+          )
+            args[0] = { ...args[0], imageData: serializeImageData(args[0].imageData) };
+          if (
+            name === 'storage.sync.set' ||
+            (name === 'storage.sync.get' && args[0] && typeof args[0] === 'object')
+          )
+            validate(args[0]);
+          return host.invoke(name, args);
+        })
+        .then((result) => {
+          if (name === 'permissions.request' || name === 'permissions.remove') refreshNativeServices();
+          return result;
+        });
       return complete(promise, callback);
     }
     function complete(promise, callback) {
@@ -387,42 +393,47 @@
     // Native setters become durable at their Promise/callback boundary. Reads
     // also wait for host restoration, so a waking worker never sees empty state
     // and overwrites a user's saved rules. Session rules remain session-local.
-    for (const [group, reads, mutations] of [
-      [
-        'declarativeNetRequest',
-        // Session mutation waits for restore but intentionally stays volatile.
+    const nativeWrappers = new WeakSet();
+    function refreshNativeServices() {
+      for (const [group, reads, mutations] of [
         [
-          'getDynamicRules',
-          'getEnabledRulesets',
-          'getDisabledRuleIds',
-          'getSessionRules',
-          'updateSessionRules',
-          'getAvailableStaticRuleCount',
+          'declarativeNetRequest',
+          // Session mutation waits for restore but intentionally stays volatile.
+          [
+            'getDynamicRules',
+            'getEnabledRulesets',
+            'getDisabledRuleIds',
+            'getSessionRules',
+            'updateSessionRules',
+            'getAvailableStaticRuleCount',
+          ],
+          ['updateDynamicRules', 'updateEnabledRulesets', 'updateStaticRules'],
         ],
-        ['updateDynamicRules', 'updateEnabledRulesets', 'updateStaticRules'],
-      ],
-      ['alarms', ['get', 'getAll'], ['create', 'clear', 'clearAll']],
-      ['offscreen', ['createDocument', 'hasDocument', 'closeDocument'], []],
-    ]) {
-      const native = chrome[group];
-      if (!native) continue;
-      for (const name of [...reads, ...mutations]) {
-        if (typeof native[name] !== 'function') continue;
-        const original = native[name].bind(native);
-        native[name] = (...args) => {
-          const callback = typeof args.at(-1) === 'function' ? args.pop() : null;
-          const promise = host
-            .invoke('zacro.nativeServices.ready', [])
-            .then(() => original(...args))
-            .then(async (result) => {
-              if (mutations.includes(name)) await host.invoke('zacro.nativeServices.checkpoint', []);
-              return result;
-            });
-          return complete(promise, callback);
-        };
+        ['alarms', ['get', 'getAll'], ['create', 'clear', 'clearAll']],
+        ['offscreen', ['createDocument', 'hasDocument', 'closeDocument'], []],
+      ]) {
+        const native = chrome[group];
+        if (!native) continue;
+        for (const name of [...reads, ...mutations]) {
+          if (typeof native[name] !== 'function' || nativeWrappers.has(native[name])) continue;
+          const original = native[name].bind(native);
+          native[name] = (...args) => {
+            const callback = typeof args.at(-1) === 'function' ? args.pop() : null;
+            const promise = host
+              .invoke('zacro.nativeServices.ready', [group])
+              .then(() => original(...args))
+              .then(async (result) => {
+                if (mutations.includes(name)) await host.invoke('zacro.nativeServices.checkpoint', [group]);
+                return result;
+              });
+            return complete(promise, callback);
+          };
+          nativeWrappers.add(native[name]);
+        }
+        if (group === 'alarms') native.onAlarm = event('alarms.onAlarm');
       }
-      if (group === 'alarms') native.onAlarm = event('alarms.onAlarm');
     }
+    refreshNativeServices();
     function methods(group, names) {
       chrome[group] ||= {};
       for (const name of names) chrome[group][name] = (...args) => invoke(group + '.' + name, args);

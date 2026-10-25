@@ -561,7 +561,12 @@ class ExtensionAPI {
       const nativeContext = Object.freeze({
         ...context,
         permissions: metadata.grants.permissions,
-        guard: () => this.guard(context),
+        guard: () => {
+          const current = this.guard(context);
+          if (!current.grants.permissions.includes('nativeMessaging'))
+            throw new Error('Missing nativeMessaging permission');
+          return current;
+        },
       });
       if (name === 'connectNative') return this.nativeMessaging.connect(nativeContext, args[0], args[1]);
       if (name === 'postNativeMessage') return this.nativeMessaging.post(nativeContext, args[0], args[1]);

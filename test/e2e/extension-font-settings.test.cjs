@@ -51,6 +51,9 @@ test(
     assert.equal(result.foreignUnchanged, true);
     assert.equal(result.restored, true);
     assert.equal(result.eventReceived, true);
+    assert.equal(result.mixedFontEvents, true);
+    assert.equal(result.backgroundStopped, true);
+    assert.equal(result.backgroundWakeDelivered, true);
     assert.equal(result.disabledRestored, true);
     assert.equal(result.permissionDenied, true);
   },

@@ -32,9 +32,18 @@ app.whenReady().then(async () => {
       two: session.fromPartition('persist:font-two'),
     };
     let manager, api, fonts;
+    const backgroundEvents = [];
     const bridge = new ExtensionBridge({
       resolveExtension: (p, id) => manager.resolveExtension(p, id),
-      dispatch: (context, method, args) => api.call(context, method, args),
+      dispatch: (context, method, args) =>
+        method === 'fixture.backgroundEvent'
+          ? backgroundEvents.push(args[0])
+          : api.call(context, method, args),
+    });
+    const { SyncStorage } = require(path.join(root, 'src/main/sync/storage.cjs'));
+    const store = new SyncStorage({
+      directory: path.join(directory, 'sync'),
+      onChanged: (id, changes) => bridge.emit('one', id, 'storage.onChanged', [changes, 'sync']),
     });
     manager = new ExtensionManager({
       root: path.join(directory, 'managed'),
@@ -75,9 +84,17 @@ app.whenReady().then(async () => {
         manifest_version: 3,
         name: 'Native fonts fixture',
         version: '1',
-        permissions: ['fontSettings'],
+        permissions: ['fontSettings', 'storage'],
+        background: { service_worker: 'worker.js' },
         options_ui: { page: 'page.html' },
       }),
+    );
+    await fs.writeFile(
+      path.join(source, 'worker.js'),
+      `
+      for(const event of ['onFontChanged','onDefaultFontSizeChanged','onDefaultFixedFontSizeChanged','onMinimumFontSizeChanged']) chrome.fontSettings[event].addListener(()=>zacroExtension.invoke('fixture.backgroundEvent',[event]));
+      chrome.storage.sync.onChanged.addListener(()=>zacroExtension.invoke('fixture.backgroundEvent',['storage']));
+    `,
     );
     await fs.writeFile(path.join(source, 'page.html'), '<!doctype html><script src="page.js"></script>');
     await fs.writeFile(
@@ -176,6 +193,31 @@ app.whenReady().then(async () => {
       foreignUnchanged: Math.abs((await measure(foreign)) - foreignOriginal) < 0.05,
       eventReceived,
     };
+    const waitFor = async (predicate) => {
+      const deadline = Date.now() + 5000;
+      while (!predicate() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
+      return predicate();
+    };
+    await waitFor(() => backgroundEvents.length >= 4);
+    result.mixedFontEvents = [
+      'onFontChanged',
+      'onDefaultFontSizeChanged',
+      'onDefaultFixedFontSizeChanged',
+      'onMinimumFontSizeChanged',
+    ].every((name) => backgroundEvents.includes(name));
+    extension.webContents.debugger.attach('1.3');
+    await extension.webContents.debugger.sendCommand('ServiceWorker.enable');
+    await extension.webContents.debugger.sendCommand('ServiceWorker.stopAllWorkers');
+    result.backgroundStopped = await waitFor(
+      () => Object.keys(sessions.one.serviceWorkers.getAllRunning()).length === 0,
+    );
+    backgroundEvents.length = 0;
+    await call('setDefaultFontSize', { pixelSize: 32 });
+    store.call(record.id, 'set', [{ mixedWake: true }], { trusted: true });
+    result.backgroundWakeDelivered = await waitFor(
+      () => backgroundEvents.includes('onDefaultFontSizeChanged') && backgroundEvents.includes('storage'),
+    );
+    extension.webContents.debugger.detach();
     await call('clearFont', { genericFamily: 'serif' });
     await call('clearDefaultFontSize');
     await call('clearDefaultFixedFontSize');

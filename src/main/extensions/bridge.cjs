@@ -48,7 +48,15 @@ class ExtensionBridge {
       backgrounds: new Map(),
     };
     this.sessions.set(session, entry);
-    registerNativeEventDelivery(session, (id, event, args) => this.emit(profileId, id, event, args));
+    registerNativeEventDelivery(session, (id, event, args) => {
+      const revision = this.resolveExtension(profileId, id)?.nativeAlarmRevision;
+      this.emit(profileId, id, event, args, {
+        filter: (context) =>
+          context.kind !== 'content-script' &&
+          context.metadata.grants.permissions.includes('alarms') &&
+          context.metadata.nativeAlarmRevision === revision,
+      });
+    });
     entry.unloaded = (_event, extension) => {
       entry.revoked.add(extension.id);
       // Electron removes the extension from its registry but retains open
@@ -419,6 +427,7 @@ class ExtensionBridge {
       if (!services) throw new Error('Native extension services unavailable');
       await services.ready;
       assertCurrent();
+      services.assertPermission(request.args[0]);
       if (request.method.endsWith('.checkpoint')) await services.checkpoint();
       assertCurrent();
       return;
@@ -439,7 +448,7 @@ class ExtensionBridge {
         names.some(
           (name) =>
             typeof name !== 'string' ||
-            !/^(tabs\.(onCreated|onUpdated|onRemoved|onActivated|onMoved)|windows\.onFocusChanged|permissions\.(onAdded|onRemoved)|commands\.onCommand|action\.onClicked|contextMenus\.onClicked|storage\.onChanged|alarms\.onAlarm)$/.test(
+            !/^(tabs\.(onCreated|onUpdated|onRemoved|onActivated|onMoved)|windows\.onFocusChanged|permissions\.(onAdded|onRemoved)|commands\.onCommand|action\.onClicked|contextMenus\.onClicked|storage\.onChanged|alarms\.onAlarm|fontSettings\.(onFontChanged|onDefaultFontSizeChanged|onDefaultFixedFontSizeChanged|onMinimumFontSizeChanged))$/.test(
               name,
             ),
         )

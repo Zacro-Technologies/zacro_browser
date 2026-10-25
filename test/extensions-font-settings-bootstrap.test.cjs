@@ -60,3 +60,103 @@ test('font facade exposes Promise/callback methods, lastError and four independe
   ]);
   assert.equal(calls.filter((c) => c[0].startsWith('fontSettings.')).length, 2);
 });
+
+test('authenticated background accepts mixed font/storage snapshot and replays it after worker wake', async () => {
+  const module = { exports: {} };
+  vm.runInNewContext(fs.readFileSync(path.join(__dirname, '../src/main/extensions/bridge.cjs'), 'utf8'), {
+    module,
+    exports: module.exports,
+    __dirname: path.resolve(__dirname, '../src/main/extensions'),
+    require: (name) =>
+      name === 'electron'
+        ? { ipcMain: { handle() {} } }
+        : name.startsWith('./')
+          ? require(path.resolve(__dirname, '../src/main/extensions', name))
+          : require(name),
+    Buffer,
+    structuredClone,
+    setTimeout,
+    clearTimeout,
+    console,
+  });
+  const { ExtensionBridge } = module.exports;
+  const id = 'a'.repeat(32),
+    metadata = { enabled: true, generation: 'g', grants: { permissions: ['fontSettings', 'storage'] } };
+  const delivered = [];
+  let wakes = 0,
+    dead = false;
+  const session = {
+    extensions: {
+      getExtension: () => ({
+        manifest: { manifest_version: 3, background: { service_worker: 'worker.js' } },
+      }),
+    },
+    serviceWorkers: {
+      startWorkerForScope: async () => {
+        wakes++;
+      },
+    },
+  };
+  const bridge = new ExtensionBridge({ resolveExtension: () => metadata, dispatch() {} });
+  bridge.sessions.set(session, {
+    profileId: 'p',
+    epochs: new Map(),
+    revoked: new Set(),
+    backgrounds: new Map(),
+  });
+  let context = {
+    session,
+    profileId: 'p',
+    extensionId: id,
+    generation: 'g',
+    epoch: 0,
+    kind: 'service-worker',
+    url: `chrome-extension://${id}/worker.js`,
+    sender: { isDestroyed: () => dead, send: (_channel, value) => delivered.push(value.event) },
+  };
+  bridge.authenticate = () => context;
+  const events = [
+    'storage.onChanged',
+    'fontSettings.onFontChanged',
+    'fontSettings.onDefaultFontSizeChanged',
+    'fontSettings.onDefaultFixedFontSizeChanged',
+    'fontSettings.onMinimumFontSizeChanged',
+  ];
+  const subscribe = async () => {
+    const token = await bridge.handle({}, { operation: 'connect' });
+    await bridge.handle({}, { operation: 'invoke', token, method: 'zacro.events.subscribe', args: [events] });
+    return token;
+  };
+  let token = await subscribe();
+  const filter = (c) => c.metadata.grants.permissions.includes('fontSettings');
+  for (const event of events) bridge.emit('p', id, event, [{}], { filter });
+  assert.deepEqual(delivered, events);
+  dead = true;
+  bridge.releaseLease(token);
+  bridge.emit('p', id, events[1], [{}], { filter });
+  bridge.emit('p', id, events[0], [{}]);
+  await new Promise(setImmediate);
+  assert.equal(wakes, 1);
+  dead = false;
+  context = {
+    ...context,
+    sender: { isDestroyed: () => dead, send: (_channel, value) => delivered.push(value.event) },
+  };
+  token = await subscribe();
+  assert.deepEqual(delivered.slice(-2), [events[1], events[0]]);
+  metadata.grants.permissions = ['storage'];
+  bridge.emit('p', id, events[1], [{}], { filter });
+  assert.equal(delivered.length, 7);
+  await assert.rejects(
+    bridge.handle(
+      {},
+      {
+        operation: 'invoke',
+        token,
+        method: 'zacro.events.subscribe',
+        args: [['fontSettings.onUnknownChanged']],
+      },
+    ),
+    /Invalid event subscriptions/,
+  );
+});

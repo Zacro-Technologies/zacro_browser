@@ -1151,6 +1151,7 @@ const nativeEngine = () => ({
   async grantZacroActiveTab() {},
   async setZacroReviewedPermissions() {},
   setZacroUserScriptsEnabled() {},
+  async resetZacroExtensionState() {},
   setZacroFontPreferences() {},
   getZacroFontPreferences() {
     return {};
@@ -1598,4 +1599,95 @@ test('lifecycle cancellation followed by a failed queued update still records th
   assert.equal(h.manager.list('p1')[0].enabled, false);
   assert.equal(h.manager.resolveExtension('p1', record.id), null);
   assert.deepEqual(h.manager.list('p1')[0].grants, record.grants);
+});
+
+test('permanent native cleanup fences rapid reinstall and survives restart after reset failure', async (t) => {
+  const engine = nativeEngine(),
+    entered = deferred(),
+    release = deferred();
+  let resets = 0;
+  engine.resetZacroExtensionState = async () => {
+    resets++;
+    entered.resolve();
+    await release.promise;
+  };
+  const h = await setup(t, { engine });
+  const first = await h.manager.installStore('p1', fixture().id);
+  const removed = h.manager.remove('p1', first.id);
+  removed.catch(() => {});
+  const reinstalled = h.manager.installStore('p1', first.id);
+  reinstalled.catch(() => {});
+  await new Promise(setImmediate);
+  assert.equal(resets, 1, 'permanent removal must begin native cleanup before queued teardown');
+  await entered.promise;
+  const loadsBefore = h.events.filter((e) => e[0] === 'load').length;
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(h.events.filter((e) => e[0] === 'load').length, loadsBefore);
+  release.resolve();
+  await Promise.allSettled([removed]);
+  const next = await reinstalled;
+  assert.equal(next.enabled, true);
+  assert.equal(resets, 1);
+  await h.manager.disable('p1', next.id);
+  await h.manager.enable('p1', next.id);
+  assert.equal(resets, 1, 'ordinary disable/enable preserves registrations');
+  h.sessions.get('p1').extensions.resetZacroExtensionState = async () => {
+    throw Error('disk unavailable');
+  };
+  await assert.rejects(h.manager.remove('p1', next.id), /disk unavailable/);
+  const state = JSON.parse(await fs.readFile(path.join(h.manager.profilePath('p1'), 'state.json')));
+  assert.deepEqual(state.pendingNativeRemovals, [next.id]);
+  h.sessions.get('p1').extensions.resetZacroExtensionState = async () => {
+    resets++;
+  };
+  await h.manager.close();
+  const restarted = new ExtensionManager(h.options);
+  h.setManager(restarted);
+  t.after(() => restarted.close());
+  await restarted.restore('p1');
+  assert.equal(resets, 2, 'restart completes persisted cleanup even without an installed record');
+  assert.equal((await restarted.installStore('p1', next.id)).enabled, true);
+});
+
+test('native optional nativeMessaging removal publishes revocation before same-generation regrant', async (t) => {
+  const notifications = [];
+  const h = await setup(t, {
+    engine: nativeEngine(),
+    fetchPackage: async () => fixture('1', ['storage'], ['nativeMessaging']),
+    onPermissionsChanged: (profileId, extensionId, change) =>
+      notifications.push({ profileId, extensionId, change }),
+  });
+  const installed = await h.manager.installStore('p1', fixture().id);
+  await h.manager.changePermissionDelta('p1', installed.id, { permissions: ['nativeMessaging'] }, false);
+  const generation = h.manager.resolveExtension('p1', installed.id).generation;
+  await h.manager.changePermissionDelta('p1', installed.id, { permissions: ['nativeMessaging'] }, true);
+  await h.manager.changePermissionDelta('p1', installed.id, { permissions: ['nativeMessaging'] }, false);
+  assert.equal(h.manager.resolveExtension('p1', installed.id).generation, generation);
+  assert.equal(notifications.length, 3);
+  assert.deepEqual(notifications[1], {
+    profileId: 'p1',
+    extensionId: installed.id,
+    change: {
+      before: { permissions: ['nativeMessaging', 'storage'], origins: [] },
+      after: { permissions: ['storage'], origins: [] },
+    },
+  });
+});
+
+test('removal after runtime downgrade retains a permanent native cleanup tombstone', async (t) => {
+  const h = await setup(t, { engine: nativeEngine() });
+  const installed = await h.manager.installStore('p1', fixture().id);
+  await h.manager.disable('p1', installed.id);
+  h.sessions.get('p1').extensions.resetZacroExtensionState = undefined;
+  await h.manager.enable('p1', installed.id);
+  assert.equal(h.manager.list('p1')[0].current.nativeReviewedPermissions, false);
+  await h.manager.disable('p1', installed.id);
+  await assert.rejects(h.manager.remove('p1', installed.id), /complete custom runtime/);
+  const state = JSON.parse(await fs.readFile(path.join(h.manager.profilePath('p1'), 'state.json')));
+  assert.deepEqual(state.pendingNativeRemovals, [installed.id]);
+  assert.equal(state.extensions.length, 0);
+  Object.assign(h.sessions.get('p1').extensions, nativeEngine());
+  assert.equal((await h.manager.installStore('p1', installed.id)).enabled, true);
+  const cleaned = JSON.parse(await fs.readFile(path.join(h.manager.profilePath('p1'), 'state.json')));
+  assert.deepEqual(cleaned.pendingNativeRemovals, []);
 });

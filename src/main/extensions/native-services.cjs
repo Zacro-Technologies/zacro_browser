@@ -17,17 +17,19 @@ function reconcileRulesets(resources, state) {
     )
     .map((resource) => resource.id);
 }
-function required(manifest) {
-  return (manifest.permissions || []).some((permission) =>
+function required(manifest, grants = manifest) {
+  return (grants.permissions || []).some((permission) =>
     ['declarativeNetRequest', 'declarativeNetRequestWithHostAccess', 'alarms', 'offscreen'].includes(
       permission,
     ),
   );
 }
 class NativeServices {
-  constructor({ session, id, manifest, filename, persist, guard }) {
+  constructor({ session, id, manifest, permissions = manifest.permissions || [], filename, persist, guard }) {
     Object.assign(this, { session, id, manifest, filename, persist, guard });
+    this.permissions = [...permissions];
     this.closed = false;
+    this.authorityRevision = 0;
     this.queue = Promise.resolve();
     this.ready = new Promise((resolve, reject) => {
       this.resolveReady = resolve;
@@ -53,8 +55,7 @@ class NativeServices {
         if (!owner || event.senderFrame.url !== `chrome-extension://${owner.id}/${PAGE}`)
           throw new Error('Not the owned native alarm receiver');
         owner.guard();
-        if (!(owner.manifest.permissions || []).includes('alarms'))
-          throw new Error('Native alarm permission unavailable');
+        if (!owner.permissions.includes('alarms')) throw new Error('Native alarm permission unavailable');
         if (
           !value ||
           typeof value.name !== 'string' ||
@@ -65,6 +66,7 @@ class NativeServices {
             (!Number.isFinite(value.periodInMinutes) || value.periodInMinutes <= 0))
         )
           throw new Error('Invalid native alarm event');
+        const revision = owner.authorityRevision;
         const alarm = {
           name: value.name,
           scheduledTime: value.scheduledTime,
@@ -75,6 +77,8 @@ class NativeServices {
         };
         await owner.ready;
         owner.guard();
+        owner.assertPermission('alarms');
+        if (revision !== owner.authorityRevision) throw new Error('Native alarm authority changed');
         const deliver = deliveries.get(owner.session);
         if (!deliver) throw new Error('Native alarm delivery unavailable');
         deliver(owner.id, 'alarms.onAlarm', [alarm]);
@@ -83,7 +87,87 @@ class NativeServices {
       receiverInstalled = true;
     }
   }
-  async initialize() {
+  assertPermission(group) {
+    this.guard();
+    if (
+      this.closed ||
+      !(group === 'declarativeNetRequest'
+        ? this.permissions.some((permission) =>
+            ['declarativeNetRequest', 'declarativeNetRequestWithHostAccess'].includes(permission),
+          )
+        : ['alarms', 'offscreen'].includes(group) && this.permissions.includes(group))
+    )
+      throw new Error('Native service permission unavailable');
+  }
+  async reconfigure(permissions, apply) {
+    const servicePermissions = (values) =>
+      values
+        .filter((value) =>
+          ['alarms', 'offscreen', 'declarativeNetRequest', 'declarativeNetRequestWithHostAccess'].includes(
+            value,
+          ),
+        )
+        .sort();
+    if (
+      JSON.stringify(servicePermissions(this.permissions)) === JSON.stringify(servicePermissions(permissions))
+    )
+      return apply();
+    const previous = [...this.permissions],
+      oldReady = this.ready,
+      oldQueue = this.queue;
+    this.ready = new Promise((resolve, reject) => {
+      this.resolveReady = resolve;
+      this.rejectReady = reject;
+    });
+    this.ready.catch(() => {});
+    // New requests wait at the barrier, and queued native alarm events lose
+    // authority immediately. The original extension caller stays alive.
+    if (previous.includes('alarms') && !permissions.includes('alarms')) this.authorityRevision++;
+    this.permissions = previous.filter((permission) => permissions.includes(permission));
+    try {
+      await oldReady;
+      await oldQueue;
+      this.guard();
+      await this.execute(
+        async ({ previous, next }) => {
+          if (previous.includes('alarms') && !next.includes('alarms')) await chrome.alarms.clearAll();
+          if (
+            previous.includes('offscreen') &&
+            !next.includes('offscreen') &&
+            (await chrome.offscreen.hasDocument())
+          )
+            await chrome.offscreen.closeDocument();
+          const hasDnr = (values) =>
+            values.some((value) =>
+              ['declarativeNetRequest', 'declarativeNetRequestWithHostAccess'].includes(value),
+            );
+          if (hasDnr(previous) && !hasDnr(next)) {
+            const dnr = chrome.declarativeNetRequest;
+            await dnr.updateDynamicRules({
+              removeRuleIds: (await dnr.getDynamicRules()).map((rule) => rule.id),
+            });
+            await dnr.updateSessionRules({
+              removeRuleIds: (await dnr.getSessionRules()).map((rule) => rule.id),
+            });
+            await dnr.updateEnabledRulesets({ disableRulesetIds: await dnr.getEnabledRulesets() });
+          }
+        },
+        { previous, next: permissions },
+      );
+      await this.snapshot(previous);
+      if (this.window && !this.window.isDestroyed()) this.window.destroy();
+      const result = await apply();
+      this.permissions = [...permissions];
+      this.guard();
+      await this.initialize({ added: permissions.filter((permission) => !previous.includes(permission)) });
+      return result;
+    } catch (error) {
+      this.rejectReady(error);
+      this.close();
+      throw error;
+    }
+  }
+  async initialize({ added = null } = {}) {
     try {
       const { BrowserWindow } = require('electron');
       let state = null;
@@ -123,8 +207,12 @@ class NativeServices {
       this.guard();
       const resources = this.manifest.declarative_net_request?.rule_resources || [];
       await this.execute(
-        async ({ resources, state, enabled, permissions }) => {
-          const dnr = chrome.declarativeNetRequest;
+        async ({ resources, state, enabled, permissions, added }) => {
+          const dnr = permissions.some((permission) =>
+            ['declarativeNetRequest', 'declarativeNetRequestWithHostAccess'].includes(permission),
+          )
+            ? chrome.declarativeNetRequest
+            : null;
           if (
             permissions.some(
               (permission) =>
@@ -138,7 +226,7 @@ class NativeServices {
             throw new Error('Native alarms unavailable in this runtime');
           if (permissions.includes('offscreen') && !chrome.offscreen?.createDocument)
             throw new Error('Native offscreen documents unavailable in this runtime');
-          if (dnr) {
+          if (dnr && (!added || added.some((permission) => permission.startsWith('declarativeNetRequest')))) {
             const sessions = await dnr.getSessionRules();
             if (sessions.length)
               await dnr.updateSessionRules({ removeRuleIds: sessions.map((rule) => rule.id) });
@@ -165,9 +253,19 @@ class NativeServices {
               });
             }
           }
-          if (chrome.offscreen && (await chrome.offscreen.hasDocument()))
+          if (
+            (!added || added.includes('offscreen')) &&
+            permissions.includes('offscreen') &&
+            chrome.offscreen &&
+            (await chrome.offscreen.hasDocument())
+          )
             await chrome.offscreen.closeDocument();
-          if (chrome.alarms && state) {
+          if (
+            (!added || added.includes('alarms')) &&
+            permissions.includes('alarms') &&
+            chrome.alarms &&
+            state
+          ) {
             await chrome.alarms.clearAll();
             for (const alarm of state.alarms) {
               // Do not replay already elapsed one-shots after restart. Recurring
@@ -185,7 +283,8 @@ class NativeServices {
           resources,
           state,
           enabled: reconcileRulesets(resources, state),
-          permissions: this.manifest.permissions || [],
+          permissions: this.permissions,
+          added,
         },
       );
       await this.snapshot();
@@ -201,44 +300,49 @@ class NativeServices {
       return Promise.reject(new Error('Native extension lifecycle closed'));
     return this.window.webContents.executeJavaScript(`(${fn.toString()})(${JSON.stringify(args)})`);
   }
-  async snapshot() {
+  async snapshot(permissions = this.permissions) {
     this.guard();
     const state = await this.execute(
-      async ({ resources }) => ({
+      async ({ resources, permissions }) => ({
         schema: 1,
-        enabledRulesets: chrome.declarativeNetRequest
-          ? await chrome.declarativeNetRequest.getEnabledRulesets()
-          : [],
-        dynamicRules: chrome.declarativeNetRequest
-          ? await chrome.declarativeNetRequest.getDynamicRules()
-          : [],
-        alarms: chrome.alarms
-          ? (await chrome.alarms.getAll()).filter((alarm) => alarm.persistAcrossSessions !== false)
-          : [],
-        disabledStaticRules: chrome.declarativeNetRequest
-          ? Object.fromEntries(
-              await Promise.all(
-                resources.map(async (resource) => [
-                  resource.id,
-                  await chrome.declarativeNetRequest.getDisabledRuleIds({ rulesetId: resource.id }),
-                ]),
-              ),
-            )
-          : {},
+        enabledRulesets:
+          permissions.some((p) => p.startsWith('declarativeNetRequest')) && chrome.declarativeNetRequest
+            ? await chrome.declarativeNetRequest.getEnabledRulesets()
+            : [],
+        dynamicRules:
+          permissions.some((p) => p.startsWith('declarativeNetRequest')) && chrome.declarativeNetRequest
+            ? await chrome.declarativeNetRequest.getDynamicRules()
+            : [],
+        alarms:
+          permissions.includes('alarms') && chrome.alarms
+            ? (await chrome.alarms.getAll()).filter((alarm) => alarm.persistAcrossSessions !== false)
+            : [],
+        disabledStaticRules:
+          permissions.some((p) => p.startsWith('declarativeNetRequest')) && chrome.declarativeNetRequest
+            ? Object.fromEntries(
+                await Promise.all(
+                  resources.map(async (resource) => [
+                    resource.id,
+                    await chrome.declarativeNetRequest.getDisabledRuleIds({ rulesetId: resource.id }),
+                  ]),
+                ),
+              )
+            : {},
       }),
-      { resources: this.manifest.declarative_net_request?.rule_resources || [] },
+      { resources: this.manifest.declarative_net_request?.rule_resources || [], permissions },
     );
     this.guard();
-    state.knownRulesets = (this.manifest.declarative_net_request?.rule_resources || []).map(
-      (resource) => resource.id,
-    );
+    state.knownRulesets = permissions.some((permission) => permission.startsWith('declarativeNetRequest'))
+      ? (this.manifest.declarative_net_request?.rule_resources || []).map((resource) => resource.id)
+      : [];
     this.persist(this.filename, state);
   }
   checkpoint() {
+    const ready = this.ready;
     const next = this.queue
       .catch(() => {})
       .then(async () => {
-        await this.ready;
+        await ready;
         await this.snapshot();
       });
     this.queue = next;

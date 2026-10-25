@@ -48,6 +48,7 @@ function fixture(t) {
             setZacroReviewedPermissions() {},
             grantZacroActiveTab() {},
             setZacroUserScriptsEnabled() {},
+            async resetZacroExtensionState() {},
             getZacroFontPreferences: () => structuredClone(native.get(p)),
             setZacroFontPreferences: (value) => {
               const fonts = new Map(defaults.fonts.map((f) => [f.script + ':' + f.genericFamily, f]));

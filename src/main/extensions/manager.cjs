@@ -6,7 +6,7 @@ const crypto = require('node:crypto');
 const { parseStoreId, fetchStorePackage, extractArchive, idFromKey, LIMITS } = require('./packages.cjs');
 const { inspectManifest, compareVersions, requiresReview } = require('./catalog.cjs');
 const { adaptExtension } = require('./adapt.cjs');
-const { NativeServices, needsNativeServices } = require('./native-services.cjs');
+const { NativeServices, needsNativeServices, getNativeServices } = require('./native-services.cjs');
 const { negotiateEngineCapabilities } = require('./engine-capabilities.cjs');
 const SIX_HOURS = 6 * 60 * 60 * 1000;
 const hash = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex');
@@ -124,6 +124,7 @@ class ExtensionManager {
     captureOperationGuard = () => () => {},
     onDeactivated = async () => ({ requiresPageReload: true }),
     onNativeLoaded = async () => {},
+    onPermissionsChanged = () => {},
   }) {
     if (
       !root ||
@@ -148,6 +149,7 @@ class ExtensionManager {
       captureOperationGuard,
       onDeactivated,
       onNativeLoaded,
+      onPermissionsChanged,
     });
     this.states = new Map();
     this.preparedSessions = new WeakMap();
@@ -160,6 +162,7 @@ class ExtensionManager {
     this.scheduleRuns = new Map();
     this.restored = new Set();
     this.localEpochs = new Map();
+    this.nativeResets = new Map();
     this.closed = false;
   }
   async whenReady(profileId, id) {
@@ -308,6 +311,22 @@ class ExtensionManager {
     return clone(record);
   }
   _save(context, record) {
+    const existing = this.states.get(context.profileId)?.extensions.find((item) => item.id === record.id);
+    // Keep permanent-cleanup ownership across a downgrade that rederives every
+    // current package for stock Electron. A later uninstall still owes cleanup.
+    if (
+      record.nativeStateOwned ||
+      existing?.nativeStateOwned ||
+      [
+        record.current,
+        record.pending,
+        record.previous,
+        existing?.current,
+        existing?.pending,
+        existing?.previous,
+      ].some((version) => version?.nativeReviewedPermissions)
+    )
+      record = { ...record, nativeStateOwned: true };
     this._persist(
       context.profileId,
       (state) => {
@@ -379,6 +398,11 @@ class ExtensionManager {
     guard();
     await this._prepareSession(profileId);
     guard();
+    for (const id of state.pendingNativeRemovals || []) {
+      if (!/^[a-p]{32}$/.test(id)) throw new Error('Invalid pending native removal');
+      await this._resetRemovedState(profileId, id);
+      guard();
+    }
     for (const record of this.list(profileId))
       if (record.enabled && record.current) {
         try {
@@ -672,6 +696,7 @@ class ExtensionManager {
             .join('; '),
       );
     const session = await this._prepareSession(context.profileId);
+    await this._resetRemovedState(context.profileId, record.id);
     this._guard(context);
     const metadata = {
       enabled: true,
@@ -683,12 +708,17 @@ class ExtensionManager {
       adapted: !version.legacyPath,
       capabilities,
       activeTabRevision: 0,
+      nativeAlarmRevision: 0,
       userScriptsEnabled: grants.permissions.includes('userScripts') && record.userScriptsEnabled === true,
     };
     this.runtime.set(context.key, metadata);
     let services;
     try {
-      if (needsNativeServices(metadata.manifest)) {
+      if (
+        needsNativeServices(metadata.manifest, {
+          permissions: [...grants.permissions, ...(metadata.originalManifest.optional_permissions || [])],
+        })
+      ) {
         const directory = path.join(this.profilePath(context.profileId), 'native-services');
         await fs.mkdir(directory, { recursive: true });
         this._guard(context);
@@ -696,6 +726,7 @@ class ExtensionManager {
           session,
           id: record.id,
           manifest: metadata.manifest,
+          permissions: grants.permissions,
           filename: path.join(directory, record.id + '.json'),
           persist: atomicJson,
           guard: () => {
@@ -1123,12 +1154,37 @@ class ExtensionManager {
       },
     );
   }
+  _resetRemovedState(profileId, id) {
+    const key = this._key(profileId, id);
+    if (this.nativeResets.has(key)) return this.nativeResets.get(key);
+    if (!this.states.get(profileId)?.pendingNativeRemovals?.includes(id)) return Promise.resolve();
+    const epoch = this.epochs.get(profileId);
+    const reset = Promise.resolve().then(async () => {
+      if (!this.capabilities(profileId).reviewedPermissions)
+        throw new Error('Native state cleanup requires the complete custom runtime');
+      await this.getSession(profileId).extensions.resetZacroExtensionState(id);
+      this._profile(profileId);
+      if (this.epochs.get(profileId) !== epoch) throw new Error('Stale native state cleanup');
+      this._persist(profileId, (state) => {
+        state.pendingNativeRemovals = (state.pendingNativeRemovals || []).filter((value) => value !== id);
+      });
+    });
+    this.nativeResets.set(key, reset);
+    reset
+      .finally(() => {
+        if (this.nativeResets.get(key) === reset) this.nativeResets.delete(key);
+      })
+      .catch(() => {});
+    return reset;
+  }
   remove(profileId, id) {
-    let record;
+    let record, cleanup;
     return this._run(
       profileId,
       id,
       async (context) => {
+        await cleanup;
+        this._guard(context);
         const requiresPageReload = await this._unload(context, 'remove');
         for (const version of [record?.current, record?.pending, record?.previous])
           await this._discard(context, version);
@@ -1142,9 +1198,20 @@ class ExtensionManager {
           profileId,
           (state) => {
             state.extensions = state.extensions.filter((item) => item.id !== id);
+            if (
+              record &&
+              (record.nativeStateOwned ||
+                this.capabilities(profileId).reviewedPermissions ||
+                [record.current, record.pending, record.previous].some(
+                  (version) => version?.nativeReviewedPermissions,
+                ))
+            )
+              state.pendingNativeRemovals = [...new Set([...(state.pendingNativeRemovals || []), id])];
           },
           context,
         );
+        cleanup = this._resetRemovedState(profileId, id);
+        cleanup.catch(() => {});
         // A successor may cancel queued teardown; discard removed native state
         // synchronously so a reinstall cannot inherit obsolete rules or alarms.
         if (record)
@@ -1312,21 +1379,28 @@ class ExtensionManager {
         const live = this.runtime.get(context.key);
         if (!live || live.generation !== record.generation) throw new Error('Stale native caller');
         try {
-          await this.getSession(profileId).extensions.setZacroReviewedPermissions(id, clone(grants));
-          this._guard(context);
-          if (this.runtime.get(context.key) !== live) throw new Error('Stale native caller');
-          const saved = this._save(context, {
-            ...record,
-            grants,
-            userScriptsEnabled:
-              grants.permissions.includes('userScripts') && record.userScriptsEnabled === true,
-          });
-          if (reducedGrants(record.grants, grants)) live.activeTabRevision++;
-          live.grants = clone(grants);
-          live.userScriptsEnabled = saved.userScriptsEnabled;
-          if (this.capabilities(profileId).userScripts)
-            this.getSession(profileId).extensions.setZacroUserScriptsEnabled(id, saved.userScriptsEnabled);
-          return { ...saved, permissionChange };
+          const apply = async () => {
+            await this.getSession(profileId).extensions.setZacroReviewedPermissions(id, clone(grants));
+            this._guard(context);
+            if (this.runtime.get(context.key) !== live) throw new Error('Stale native caller');
+            const saved = this._save(context, {
+              ...record,
+              grants,
+              userScriptsEnabled:
+                grants.permissions.includes('userScripts') && record.userScriptsEnabled === true,
+            });
+            if (reducedGrants(record.grants, grants)) live.activeTabRevision++;
+            if (record.grants.permissions.includes('alarms') && !grants.permissions.includes('alarms'))
+              live.nativeAlarmRevision++;
+            live.grants = clone(grants);
+            this.onPermissionsChanged(profileId, id, permissionChange);
+            live.userScriptsEnabled = saved.userScriptsEnabled;
+            if (this.capabilities(profileId).userScripts)
+              this.getSession(profileId).extensions.setZacroUserScriptsEnabled(id, saved.userScriptsEnabled);
+            return { ...saved, permissionChange };
+          };
+          const services = getNativeServices(this.getSession(profileId), id);
+          return services ? await services.reconfigure(grants.permissions, apply) : await apply();
         } catch (error) {
           if (this.runtime.get(context.key) === live) {
             this.runtime.delete(context.key);

@@ -241,3 +241,195 @@ test('production local review shows exact canonical identity and rejects stale p
   };
   assert.equal(await host.approveNativeHost(review), false);
 });
+
+for (const pending of [false, true])
+  test(`living native broker checks current permission during ${pending ? 'held approval' : 'inbound host event'}`, async (t) => {
+    const { EventEmitter } = require('node:events');
+    const { PassThrough } = require('node:stream');
+    let approve, entered;
+    const waiting = new Promise((resolve) => {
+      entered = resolve;
+    });
+    const approval = new Promise((resolve) => {
+      approve = resolve;
+    });
+    const child = new EventEmitter();
+    Object.assign(child, {
+      stdin: new PassThrough(),
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+      exitCode: null,
+      signalCode: null,
+      kill() {
+        this.signalCode = 'SIGTERM';
+      },
+    });
+    const events = [];
+    const metadata = {
+      enabled: true,
+      generation: 'stable',
+      manifest: {},
+      grants: { permissions: ['nativeMessaging'], origins: [] },
+    };
+    let spawned = 0;
+    const broker = new NativeMessagingBroker({
+      resolveHost: async () => ({
+        identity: 'test',
+        origin: `chrome-extension://${ID}/`,
+        executablePath: '/never-executed',
+      }),
+      approveHost: async () => {
+        entered();
+        return pending ? approval : true;
+      },
+      spawnHost: () => {
+        spawned++;
+        return child;
+      },
+      emit: (_ctx, event) => events.push(event),
+    });
+    t.after(() => {
+      approve(true);
+      broker.dispose();
+    });
+    const api = new ExtensionAPI({ resolveExtension: () => metadata, nativeMessaging: broker });
+    const ctx = {
+      profileId: 'p1',
+      extensionId: ID,
+      generation: 'stable',
+      contextId: 'page',
+      kind: 'extension-frame',
+    };
+    const connect = api.call(ctx, 'runtime.connectNative', ['com.zacro.test', 'port']);
+    connect.catch(() => {});
+    await waiting;
+    if (!pending) await connect;
+    metadata.grants = { permissions: [], origins: [] };
+    if (pending) {
+      approve(true);
+      await assert.rejects(connect, /revoked/);
+      assert.equal(spawned, 0);
+    } else {
+      const body = Buffer.from('{"afterRemoval":true}'),
+        header = Buffer.alloc(4);
+      header.writeUInt32LE(body.length);
+      child.stdout.write(Buffer.concat([header, body]));
+      assert.equal(
+        events.some((event) => event.type === 'message'),
+        false,
+      );
+      assert.equal(child.signalCode, 'SIGTERM');
+    }
+    assert.equal(broker.ports.size, 0);
+  });
+
+for (const pending of ['active', 'resolve', 'approval', 'cached'])
+  test(`host removal immediately revokes ${pending} native connections across same-generation regrant`, async (t) => {
+    const { EventEmitter } = require('node:events');
+    const { PassThrough } = require('node:stream');
+    const { ExtensionHost } = require('../src/main/extensions/host.cjs');
+    let release, entered;
+    const gate = new Promise((resolve) => {
+      release = resolve;
+    });
+    const waiting = new Promise((resolve) => {
+      entered = resolve;
+    });
+    let hold = false;
+    const children = [],
+      events = [];
+    const review = (ctx) => ({
+      identity: 'registered-test',
+      origin: `chrome-extension://${ctx.extensionId}/`,
+      executablePath: '/never-executed',
+    });
+    const broker = new NativeMessagingBroker({
+      resolveHost: async (_name, ctx) => {
+        if (
+          hold &&
+          ctx.profileId === 'p1' &&
+          ctx.extensionId === ID &&
+          ['resolve', 'cached'].includes(pending)
+        ) {
+          entered();
+          await gate;
+        }
+        return review(ctx);
+      },
+      approveHost: async (info) => {
+        if (hold && info.profileId === 'p1' && info.extensionId === ID && pending === 'approval') {
+          entered();
+          await gate;
+        }
+        return true;
+      },
+      spawnHost: () => {
+        const child = new EventEmitter();
+        Object.assign(child, {
+          stdin: new PassThrough(),
+          stdout: new PassThrough(),
+          exitCode: null,
+          signalCode: null,
+          kill() {
+            this.signalCode = 'SIGTERM';
+          },
+        });
+        children.push(child);
+        return child;
+      },
+      emit: (ctx, event) => events.push({ profileId: ctx.profileId, extensionId: ctx.extensionId, ...event }),
+    });
+    t.after(() => {
+      release();
+      broker.dispose();
+    });
+    const metadata = {
+      enabled: true,
+      generation: 'stable',
+      manifest: {},
+      grants: { permissions: ['nativeMessaging'], origins: [] },
+    };
+    const api = new ExtensionAPI({ resolveExtension: () => metadata, nativeMessaging: broker });
+    const context = {
+      profileId: 'p1',
+      extensionId: ID,
+      generation: 'stable',
+      contextId: 'caller',
+      kind: 'extension-frame',
+    };
+    await api.call({ ...context, profileId: 'p2' }, 'runtime.connectNative', [
+      'com.zacro.test',
+      'foreign-profile',
+    ]);
+    await api.call({ ...context, extensionId: 'b'.repeat(32) }, 'runtime.connectNative', [
+      'com.zacro.test',
+      'foreign-extension',
+    ]);
+    if (pending === 'cached') {
+      await api.call(context, 'runtime.connectNative', ['com.zacro.test', 'old']);
+      await api.call(context, 'runtime.disconnectNative', ['old']);
+    }
+    hold = true;
+    const connect = api.call(context, 'runtime.connectNative', ['com.zacro.test', 'removed']);
+    connect.catch(() => {});
+    if (pending === 'active') await connect;
+    else await waiting;
+    const host = Object.assign(Object.create(ExtensionHost.prototype), { nativeMessaging: broker });
+    metadata.grants = { permissions: [], origins: [] };
+    host.permissionsChanged('p1', ID, {
+      before: { permissions: ['nativeMessaging'] },
+      after: metadata.grants,
+    });
+    metadata.grants = { permissions: ['nativeMessaging'], origins: [] };
+    assert.equal(broker.ports.size, 2, 'revocation must precede another native event or resolver completion');
+    assert.equal(children[0].signalCode, null);
+    assert.equal(children[1].signalCode, null);
+    const spawnedBefore = children.length;
+    release();
+    if (pending !== 'active') await assert.rejects(connect, /revoked/);
+    assert.equal(children.length, spawnedBefore);
+    assert.equal(
+      events.filter((event) => event.portId === 'removed' && event.type === 'disconnect').length,
+      1,
+    );
+  });
