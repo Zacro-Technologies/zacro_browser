@@ -427,3 +427,93 @@ receipt at packaging. Receipt is local integrity, not publisher authentication
 or compilation proof. Use targeted adversarial tests and actual pinned-source
 build/native/package acceptance once available. Root self-review followed by
 fresh scoped review of task-owned scripts/docs/workflow.
+
+## Task 12: Native ruleset resource paths found in verified packages
+
+Production verification of uBlock Origin Lite2026.1021.1354 (ID
+ddkjiahejlhfcafbddmgiahcphecmpfh, CRX SHA256
+0887559eb9e6864e91b52e4a0c660995ade47c084dcc7150ed9ae743c9475a76)
+found valid ruleset paths such as `/rulesets/main/easylist.json` rejected by
+catalog validation. Pinned Chromium156 `Extension::GetResource(string_view)`
+removes exactly one leading slash; DNR manifest handling uses this method.
+
+Own the DNR path check in catalog.cjs, focused native-services unit/native
+fixtures and relevant compatibility documentation. Accept a single
+extension-root slash while retaining rejection of traversal, double-leading
+slashes, empty path components, foreign URLs, encoded/control characters and
+backslashes. Preserve original package bytes and the native resource path;
+never interpret it as a host filesystem absolute path. Existing acquisition
+and copied-package symlink boundaries remain unchanged.
+
+Add a failing catalog case and a real managed native ruleset fixture using the
+root-relative path. Prove actual blocking and cleanup, not catalog success
+alone. Update the previously overbroad negative `/rules.json` expectation while
+retaining its meaningful adversarial cases. No new permissions or native API
+facades. Run focused tests, record RED/GREEN and exact behavior, commit owned
+files and request fresh review. Do not run foreground tests while root's full
+stock verification owns that lane. No subagents.
+
+## Task 13: Native paint assertion precision (root inline)
+
+Current stock verification passes106/107 native cases; the native startup paint
+case fails on background channel30 versus expected31. A separate unmodified
+Electron45 BrowserWindow, loading none of Zacro, reproduces background BGRA
+`[93,121,30,255]` and marker `[88,56,222,255]` on three captures while DOM CSS
+remains `rgb(31,121,93)` and `rgb(222,55,88)`. This is a one-channel-level native
+capture conversion difference, not a hidden or unpainted page.
+
+Keep all visibility, animation-frame, actual capture, marker placement, draft
+retention and nine-transition assertions. Compare each sorted color channel
+within one integer level, with useful per-transition diagnostics; do not force
+rendering/color switches or replace image evidence with DOM-only checks. The
+existing real startup test supplies RED/GREEN. This low-impact test assertion
+change needs no new implementation-mirroring unit suite. Record the minimal
+baseline and focused actual result, commit this test only, and obtain a fresh
+scoped review.
+
+## Task 14: Version-pinned representative provider acceptance
+
+Own a separate opt-in test/provider representative acceptance fixture and
+compatibility evidence documentation. Keep normal unit/E2E suites offline and
+all user profiles/accounts untouched. Existing JSON Formatter acceptance stays.
+Use production HTTPS acquisition and CRX developer/publisher verification,
+original hashes and real managed installation. Fail closed if the provider
+changes the explicitly pinned version/hash. Locally cached task-owned original
+CRXs are available for investigation only; do not substitute unverified bytes
+or a mocked compatibility capability for final provider acceptance.
+
+Verified current samples:
+- Dark Reader4.9.133, eimadpbcbfnmbkopoojfekhnkhdbieeh,
+  ee38f20d1d50789f4b482c9a1a5dadab599b8682fd2a7dfb7de21fae8561b918.
+- React Developer Tools8.0.0, fmkadmapgofadopljbjfkapdkoienihi,
+  d92e1122a16362cc5510927068a5b1a8d50b43e1f3be25c3117f7c005807b302.
+- uBlock Origin Lite2026.1021.1354, ddkjiahejlhfcafbddmgiahcphecmpfh,
+  0887559eb9e6864e91b52e4a0c660995ade47c084dcc7150ed9ae743c9475a76.
+- Bitwarden2026.10.0, nngceckbapebfimnlniiiahkandclblb,
+  f2feb7fc46d2550bef9b69af1cc358aea26b90a947645f9de16ec14d9296ef69.
+
+Exercise actual core behavior on disposable local pages: Dark Reader changes
+page appearance; React DevTools creates real component tools for a genuine
+React page; uBOL's original enabled rules block a local fixture request and
+disable removes the block. Select a real original ruleset condition that can
+match loopback fixture traffic, or a test-process-only hostname map to loopback;
+do not contact ad endpoints or replace the extension's rules. React18.3.1 and
+ReactDOM18.3.1 official npm archives are in the task-owned react-fixture cache;
+use bounded integrity-pinned acquisition for any reusable fixture dependency,
+not an invented React hook. Do not add production dependencies.
+
+On stock runtime, assert the actual documented engine-required denial for
+Dark Reader/fontSettings and uBOL/activeTab/userScripts. On negotiated custom
+runtime, execute their real positive core behavior; demanded custom acceptance
+must fail if native hooks are absent. Bitwarden currently has other required
+unsupported APIs/file access/sandbox; prove visible incompatible state and no
+native activation, and document it as unsupported, never a positive password
+manager result. React's optional clipboardWrite is a visible partial boundary.
+Do not broaden the approved API scope merely to make these samples install.
+
+Coordinate the single native foreground lane. Root's stock suite has finished;
+Task12 owns its focused run until released. Root will supply the actual custom
+runtime when compiled; custom positive checks remain unrun until then. Record
+exact versions, behaviors, negative limits, commands/results and source/runtime
+identity in task-14-report.md. Fresh task review follows the narrow commit.
+No subagents, personal account login, source package modification or publication.
