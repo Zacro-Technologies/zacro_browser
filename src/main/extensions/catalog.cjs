@@ -13,6 +13,8 @@ const API_PERMISSIONS = new Set([
   'declarativeNetRequestFeedback',
   'offscreen',
   'alarms',
+  'identity',
+  'identity.email',
   'nativeMessaging',
   'sidePanel',
 ]);
@@ -168,6 +170,13 @@ function inspectManifest(manifest) {
     )
       throw new Error('Invalid declarative_net_request rule_resources');
   }
+  if (manifest.oauth2 !== undefined)
+    unsupported.push({
+      capability: 'identity.getAuthToken',
+      required: true,
+      reason:
+        'Google account and token services require provider support unavailable in this Electron runtime.',
+    });
   for (const key of ['chrome_url_overrides', 'sandbox'])
     if (manifest[key])
       unsupported.push({

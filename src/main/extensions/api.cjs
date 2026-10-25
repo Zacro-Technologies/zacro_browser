@@ -382,6 +382,13 @@ class ExtensionAPI {
     if (!trusted(context)) throw new Error('Trusted extension contexts only');
     if (method.split('.').length !== 2) throw new Error(`Unsupported API: ${method}`);
     const [group, name] = method.split('.');
+    if (group === 'identity') {
+      if (!metadata.grants.permissions.includes('identity')) throw new Error('Missing identity permission');
+      if (!this.identity) throw new Error('Identity unavailable');
+      const result = await this.identity.call(context, name, args);
+      this.guard(context);
+      return result;
+    }
     if (group === 'sidePanel') {
       if (!metadata.grants.permissions.includes('sidePanel')) throw new Error('Missing sidePanel permission');
       if (!this.sidePanel) throw new Error('Side panel unavailable');

@@ -195,11 +195,13 @@
           }
           return connection.request(
             { method, args },
-            method === 'runtime.connectNative'
-              ? 300000
-              : method === 'runtime.sendNativeMessage'
-                ? 31000
-                : 10000,
+            method === 'identity.launchWebAuthFlow'
+              ? 601000
+              : method === 'runtime.connectNative'
+                ? 300000
+                : method === 'runtime.sendNativeMessage'
+                  ? 31000
+                  : 10000,
           );
         },
       }),
@@ -439,6 +441,30 @@
     methods('windows', ['get', 'getCurrent', 'getAll', 'update', 'create', 'remove']);
     methods('permissions', ['contains', 'getAll', 'request', 'remove']);
     methods('commands', ['getAll']);
+    methods('identity', [
+      'launchWebAuthFlow',
+      'getProfileUserInfo',
+      'getAuthToken',
+      'getAccounts',
+      'removeCachedAuthToken',
+      'clearAllCachedAuthTokens',
+    ]);
+    // Synchronous Chrome helper derives only the authenticated native runtime ID.
+    chrome.identity.getRedirectURL = (path = '') => {
+      if (
+        typeof path !== 'string' ||
+        path.length > 2048 ||
+        /[\\\x00-\x20\x7f]/.test(path) ||
+        path.startsWith('//') ||
+        /^[a-z][a-z0-9+.-]*:/i.test(path) ||
+        path.split(/[/?#]/).some((part) => part === '.' || part === '..')
+      )
+        throw new Error('Invalid redirect path');
+      const base = `https://${runtime.id}.chromiumapp.org/`;
+      const result = new URL(path.replace(/^\//, ''), base);
+      if (result.origin !== new URL(base).origin) throw new Error('Invalid redirect path');
+      return result.href;
+    };
     methods('sidePanel', [
       'getOptions',
       'setOptions',

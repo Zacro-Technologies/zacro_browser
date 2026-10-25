@@ -6,6 +6,7 @@ const { ExtensionManager } = require('./manager.cjs');
 const { ExtensionAPI } = require('./api.cjs');
 const { ExtensionBridge } = require('./bridge.cjs');
 const { SidePanelController } = require('./side-panel.cjs');
+const { IdentityController } = require('./identity.cjs');
 const { NativeMessagingBroker } = require('./native-messaging.cjs');
 const { parseStoreId } = require('./packages.cjs');
 const { matches, covers } = require('./permissions.cjs');
@@ -128,7 +129,10 @@ class ExtensionHost {
     this.bridge = new ExtensionBridge({
       resolveExtension,
       dispatch: (context, method, args) => this.api.call(context, method, args),
-      onContextRevoked: (context) => this.nativeMessaging?.revoke(context),
+      onContextRevoked: (context) => {
+        this.nativeMessaging?.revoke(context);
+        this.identity?.revoke(context);
+      },
       onError: (_error, { profileId, extensionId }) => {
         this.notificationErrors.set(this.key(profileId, extensionId), true);
         publish();
@@ -149,6 +153,7 @@ class ExtensionHost {
       approveHost: (review) => this.approveNativeHost(review),
       emit: (context, event) => this.bridge.emitNative(context, event),
     });
+    this.identity = new IdentityController({ native, getSession, getProfile, resolveExtension });
     this.sidePanel = new SidePanelController({
       native,
       resolveExtension,
@@ -162,6 +167,7 @@ class ExtensionHost {
       changed: panelChanged,
     });
     this.api = new ExtensionAPI({
+      identity: this.identity,
       sidePanel: this.sidePanel,
       nativeMessaging: this.nativeMessaging,
       resolveExtension,
@@ -596,6 +602,7 @@ class ExtensionHost {
   }
   async deactivated({ profileId, extensionId, reason }) {
     this.nativeMessaging?.revoke({ profileId, extensionId });
+    this.identity?.revoke({ profileId, extensionId });
     this.sidePanel?.revoke(profileId, extensionId, reason === 'remove');
     this.closeViews(profileId, extensionId);
     const key = this.key(profileId, extensionId);
@@ -973,6 +980,7 @@ class ExtensionHost {
   async removeProfile(profile) {
     this.sidePanel?.revokeProfile(profile);
     this.nativeMessaging?.revoke({ profileId: profile });
+    this.identity?.revoke({ profileId: profile });
     this.closeViews(profile);
     await this.manager.invalidateProfile(profile);
     this.restores.delete(profile);
@@ -982,6 +990,7 @@ class ExtensionHost {
   async close() {
     this.closed = true;
     this.nativeMessaging?.dispose();
+    this.identity?.dispose();
     this.sidePanel?.close();
     this.closeViews();
     this.bridge.close();
