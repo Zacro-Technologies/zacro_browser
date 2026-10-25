@@ -44,21 +44,36 @@ test(
   async (t) => {
     const id = `zacro-sync-test-${randomUUID()}`;
     const temporary = await fs.mkdtemp(path.join(os.tmpdir(), 'zacro-sync-container-'));
-    const volumes = ['data', 'keys', 'backups', 'restored', 'certs'].map((name) => `${id}-${name}`);
-    const [data, keys, backups, restored, certs] = volumes;
+    const volumes = ['data', 'keys', 'backups', 'restored', 'certs', 'second-recovery'].map(
+      (name) => `${id}-${name}`,
+    );
+    const [data, keys, backups, restored, certs, secondRecovery] = volumes;
     const images = [`${id}-service`, `${id}-proxy`];
-    const env = {
-      ...process.env,
+    const configuration = {
+      ZACRO_SYNC_ACTIVE_VOLUME: data,
+      ZACRO_SYNC_ACTIVE_DATA_DIR: '/data',
+      ZACRO_SYNC_BACKUPS_VOLUME: backups,
       ZACRO_SYNC_DOMAIN: 'sync.test',
       ZACRO_SYNC_IMAGE: images[0],
       ZACRO_SYNC_PROXY_IMAGE: images[1],
-      ZACRO_SYNC_DATA_VOLUME: data,
       ZACRO_SYNC_KEYS_VOLUME: keys,
       ZACRO_SYNC_CADDY_DATA_VOLUME: `${id}-caddy-data`,
       ZACRO_SYNC_CADDY_CONFIG_VOLUME: `${id}-caddy-config`,
       ZACRO_SYNC_HTTP_BIND: '127.0.0.1::80',
       ZACRO_SYNC_HTTPS_BIND: '127.0.0.1::443',
     };
+    const env = Object.fromEntries(
+      Object.entries(process.env).filter(([key]) => !key.startsWith('ZACRO_SYNC_')),
+    );
+    const operatorFile = path.join(temporary, 'operator.env');
+    const saveConfiguration = () =>
+      fs.writeFile(
+        operatorFile,
+        Object.entries(configuration)
+          .map(([key, value]) => `${key}=${value}`)
+          .join('\n') + '\n',
+      );
+    await saveConfiguration();
     let composeProgram = 'docker',
       composePrefix = ['compose'];
     if ((await execute('docker', ['compose', 'version'], { allowFailure: true })).code !== 0) {
@@ -67,31 +82,44 @@ test(
     }
     const override = path.join(temporary, 'fixture.yaml');
     const compose = (args, options = {}) =>
-      execute(composeProgram, [...composePrefix, '-p', id, '-f', composeFile, '-f', override, ...args], {
-        env,
-        ...options,
-      });
-    const docker = (args, options) => execute('docker', args, options);
-    const serviceRun = (args, { volume = data, key = '/keys/master.key', allowFailure = false } = {}) =>
-      docker(
-        [
-          'run',
-          '--rm',
-          '--network',
-          'none',
-          '-v',
-          `${volume}:/data`,
-          '-v',
-          `${keys}:/keys:ro`,
-          '-v',
-          `${backups}:/backups`,
-          images[0],
-          ...args,
-          '--key-file',
-          key,
-        ],
-        { allowFailure },
+      execute(
+        composeProgram,
+        [...composePrefix, '--env-file', operatorFile, '-p', id, '-f', composeFile, '-f', override, ...args],
+        {
+          env,
+          ...options,
+        },
       );
+    const docker = (args, options) => execute('docker', args, options);
+    const serviceRun = (args, { key = '/keys/master.key', allowFailure = false } = {}) =>
+      compose(['run', '--rm', '--no-deps', '-T', 'maintenance', ...args, '--key-file', key], {
+        allowFailure,
+      });
+    const restoreInto = (volume, backup) =>
+      compose([
+        'run',
+        '--rm',
+        '--no-deps',
+        '-T',
+        '--volume',
+        `${volume}:/restore`,
+        '--entrypoint',
+        'sh',
+        'maintenance',
+        '-ec',
+        'exec node /app/cli.cjs restore --data /restore/recovered --key-file "$ZACRO_SYNC_MASTER_KEY_FILE" --backup "$1" --ledger "$ZACRO_SYNC_DATA/deletions.jsonl"',
+        'restore',
+        backup,
+      ]);
+    const cutover = async (volume) => {
+      configuration.ZACRO_SYNC_ROLLBACK_VOLUME = configuration.ZACRO_SYNC_ACTIVE_VOLUME;
+      configuration.ZACRO_SYNC_ROLLBACK_DATA_DIR = configuration.ZACRO_SYNC_ACTIVE_DATA_DIR;
+      configuration.ZACRO_SYNC_ACTIVE_VOLUME = volume;
+      configuration.ZACRO_SYNC_ACTIVE_DATA_DIR = '/data/recovered';
+      await saveConfiguration();
+      await compose(['up', '-d', '--wait', '--wait-timeout', '90', 'sync']);
+      await ready();
+    };
     t.after(async () => {
       await compose(['down', '--volumes', '--remove-orphans'], { allowFailure: true }).catch(() => {});
       for (const name of volumes) await docker(['volume', 'rm', name], { allowFailure: true });
@@ -290,7 +318,7 @@ test(
     await compose(['restart', 'sync']);
     await ready();
     await verifySnapshot(token);
-    const lock = await serviceRun(['migrate', '--data', '/data'], { allowFailure: true });
+    const lock = await serviceRun(['migrate'], { allowFailure: true });
     assert.notEqual(lock.code, 0, 'maintenance cannot share a live dataset');
     assert.ok(/already in use|locked/i.test(lock.stderr), 'live singleton refusal is explicit');
     await compose(['stop', 'sync']);
@@ -308,14 +336,14 @@ test(
       `const fs=require('node:fs');if(fs.existsSync('/data/.service.lock'))process.exit(1);const b=fs.readFileSync('/data/sync.sqlite');for(const s of ['Synthetic encrypted dataset','synthetic-value-encrypted-at-rest'])if(b.includes(Buffer.from(s)))process.exit(2)`,
     ]);
     assert.equal(diskCheck.code, 0);
-    const backupResult = await serviceRun(['backup', '--data', '/data', '--backup-dir', '/backups']);
+    const backupResult = await serviceRun(['backup', '--backup-dir', '/backups']);
     const backupPath = JSON.parse(backupResult.stdout.trim()).path;
     assert.ok(backupPath.startsWith('/backups/zacro-sync-'));
     for (const [key, reason] of [
       ['/keys/wrong.key', /decrypt|authenticat|master key/i],
       ['/keys/absent.key', /ENOENT/],
     ]) {
-      const failure = await serviceRun(['serve', '--data', '/data', '--dev-loopback'], {
+      const failure = await serviceRun(['serve', '--dev-loopback'], {
         key,
         allowFailure: true,
       });
@@ -360,58 +388,8 @@ test(
       200,
     );
     await compose(['stop', 'sync']);
-    await docker([
-      'run',
-      '--rm',
-      '--network',
-      'none',
-      '-v',
-      `${data}:/live:ro`,
-      '-v',
-      `${keys}:/keys:ro`,
-      '-v',
-      `${backups}:/backups:ro`,
-      '-v',
-      `${restored}:/restore`,
-      images[0],
-      'restore',
-      '--data',
-      '/restore/recovered',
-      '--key-file',
-      '/keys/master.key',
-      '--backup',
-      backupPath,
-      '--ledger',
-      '/live/deletions.jsonl',
-    ]);
-    // Replace only the test service's mount; the authoritative live ledger is retained separately.
-    const restoreOverride = path.join(temporary, 'restore.yaml');
-    await fs.writeFile(
-      restoreOverride,
-      `services:\n  sync:\n    environment:\n      ZACRO_SYNC_DATA: /data/recovered\n    volumes:\n      - recovery:/data\nvolumes:\n  recovery:\n    external: true\n    name: ${restored}\n`,
-    );
-    await execute(
-      composeProgram,
-      [
-        ...composePrefix,
-        '-p',
-        id,
-        '-f',
-        composeFile,
-        '-f',
-        override,
-        '-f',
-        restoreOverride,
-        'up',
-        '-d',
-        '--wait',
-        '--wait-timeout',
-        '90',
-        'sync',
-      ],
-      { env },
-    );
-    await ready();
+    await restoreInto(restored, backupPath);
+    await cutover(restored);
     assert.equal((await request('/v1/account', { token })).status, 401, 'restore revokes sessions');
     const restoredLogin = await request('/v1/sessions', { body: credentials });
     assert.equal(restoredLogin.status, 200);
@@ -426,6 +404,97 @@ test(
       (await request('/v1/sessions', { body: { ...credentials, username: 'delete.acceptance' } })).status,
       401,
       'current ledger preserves account deletion',
+    );
+    // Regression: maintenance must follow the recovered store after cutover.
+    const cutoverMutation = await request(`/v1/datasets/${dataset.id}/operations`, {
+      token: restoredToken,
+      body: {
+        epoch: dataset.epoch,
+        operations: [
+          {
+            id: randomUUID(),
+            kind: 'settings',
+            extensionId,
+            generation: 'container-generation',
+            baseRevision: 2,
+            payload: { set: { cutoverMarker: 'acknowledged-after-cutover' } },
+          },
+        ],
+      },
+    });
+    assert.equal(cutoverMutation.status, 200);
+    assert.equal(cutoverMutation.data.results[0].status, 'applied');
+    const retainedAfterCutover = await request('/v1/datasets', {
+      token: restoredToken,
+      body: { name: 'Retain after cutover' },
+    });
+    const removedAfterCutover = await request('/v1/datasets', {
+      token: restoredToken,
+      body: { name: 'Delete after second snapshot' },
+    });
+    assert.equal(retainedAfterCutover.status, 201);
+    assert.equal(removedAfterCutover.status, 201);
+    await compose(['stop', 'sync']);
+    const secondBackup = JSON.parse(
+      (await serviceRun(['backup', '--backup-dir', '/backups'])).stdout.trim(),
+    ).path;
+    await compose(['start', 'sync']);
+    await ready();
+    assert.equal(
+      (
+        await request(`/v1/datasets/${removedAfterCutover.data.id}`, {
+          token: restoredToken,
+          method: 'DELETE',
+          body: { password, confirm: true },
+        })
+      ).status,
+      200,
+    );
+    await compose(['stop', 'sync']);
+    await docker([
+      'run',
+      '--rm',
+      '--network',
+      'none',
+      '--user',
+      '0',
+      '--entrypoint',
+      'node',
+      '-v',
+      `${secondRecovery}:/restore`,
+      images[0],
+      '-e',
+      `const fs=require('node:fs');fs.chownSync('/restore',1000,1000);fs.chmodSync('/restore',0o700)`,
+    ]);
+    await restoreInto(secondRecovery, secondBackup);
+    await cutover(secondRecovery);
+    const secondLogin = await request('/v1/sessions', { body: credentials });
+    assert.equal(secondLogin.status, 200);
+    const secondRecoveryToken = secondLogin.data.accessToken;
+    assert.equal(
+      (
+        await request(`/v1/datasets/${retainedAfterCutover.data.id}/snapshot`, {
+          token: secondRecoveryToken,
+        })
+      ).status,
+      200,
+      'second backup retains acknowledged post-cutover data',
+    );
+    const afterSecondRestore = await request(`/v1/datasets/${dataset.id}/snapshot`, {
+      token: secondRecoveryToken,
+    });
+    assert.ok(
+      afterSecondRestore.data.settings[0].values.cutoverMarker === 'acknowledged-after-cutover',
+      'second backup retains acknowledged post-cutover settings',
+    );
+    assert.equal(
+      (
+        await request(`/v1/datasets/${removedAfterCutover.data.id}/snapshot`, {
+          token: secondRecoveryToken,
+        })
+      ).status,
+      404,
+      'second restore uses the current post-cutover deletion ledger',
     );
     const logs = (await compose(['logs', '--no-color'])).stdout;
     for (const secret of [

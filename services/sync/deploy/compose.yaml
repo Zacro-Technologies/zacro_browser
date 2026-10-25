@@ -1,4 +1,7 @@
 # One instance. External key/data volumes survive even `down --volumes`.
+x-store-environment: &store-environment
+  ZACRO_SYNC_DATA: ${ZACRO_SYNC_ACTIVE_DATA_DIR:?Set the active data directory under /data}
+  ZACRO_SYNC_MASTER_KEY_FILE: /keys/master.key
 services:
   proxy:
     image: ${ZACRO_SYNC_PROXY_IMAGE:-zacro-sync-proxy:local}
@@ -47,8 +50,7 @@ services:
     pids_limit: 128
     mem_limit: 1g
     environment:
-      ZACRO_SYNC_DATA: /data
-      ZACRO_SYNC_MASTER_KEY_FILE: /keys/master.key
+      <<: *store-environment
       ZACRO_SYNC_HOST: 127.0.0.1
       ZACRO_SYNC_PORT: '4040'
       ZACRO_SYNC_TRUSTED_PROXY: '1'
@@ -69,13 +71,32 @@ services:
       options:
         max-size: 10m
         max-file: '3'
+  # Explicit one-shot CLI only; shares the exact active volume/path with sync.
+  maintenance:
+    profiles: [maintenance]
+    image: ${ZACRO_SYNC_IMAGE:-zacro-sync:local}
+    network_mode: none
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    environment: *store-environment
+    volumes:
+      - data:/data
+      - keys:/keys:ro
+      - backups:/backups
+    tmpfs:
+      - /tmp:size=16m,mode=1777
 volumes:
   data:
     external: true
-    name: ${ZACRO_SYNC_DATA_VOLUME:?Set the durable SQLite volume name}
+    name: ${ZACRO_SYNC_ACTIVE_VOLUME:?Set the active durable SQLite volume name}
   keys:
     external: true
     name: ${ZACRO_SYNC_KEYS_VOLUME:?Set a separate external private-key volume name}
+  backups:
+    external: true
+    name: ${ZACRO_SYNC_BACKUPS_VOLUME:?Set the separate backup volume name}
   caddy-data:
     name: ${ZACRO_SYNC_CADDY_DATA_VOLUME:-zacro-sync-caddy-data}
   caddy-config:

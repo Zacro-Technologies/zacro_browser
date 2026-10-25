@@ -33,22 +33,31 @@ verify every published address and allow inbound TCP 80/443.
 
 Copy [operator.env.example](operator.env.example) to an operator-only location
 outside the checkout, fill `ZACRO_SYNC_DOMAIN` with an owned DNS hostname (no
-scheme/path), then explicitly export it in the operator shell:
+scheme/path). This persistent file is the active store configuration. Service
+startup and every maintenance command read it again with `--env-file`; do not
+rely on exported active-volume/path values or a temporary Compose override:
 
 ```sh
 install -m 600 services/sync/deploy/operator.env.example /etc/zacro-sync/operator.env
 # Edit /etc/zacro-sync/operator.env, particularly the mandatory hostname.
-# Source only this trusted, operator-owned shell configuration.
-set -a
-. /etc/zacro-sync/operator.env
-set +a
+ZACRO_SYNC_CONFIG=/etc/zacro-sync/operator.env
+# Only initial volume/key provisioning reads these trusted values in the shell.
+# Do not export them; runtime and maintenance read the persistent file below.
+. "$ZACRO_SYNC_CONFIG"
 : "${ZACRO_SYNC_DOMAIN:?Configure an operator-owned DNS hostname first}"
 
-sync_compose() { docker compose -f services/sync/deploy/compose.yaml "$@"; }
+sync_compose() {
+  (
+    # Prevent stale active-store exports from overriding the persistent file.
+    unset ZACRO_SYNC_ACTIVE_VOLUME ZACRO_SYNC_ACTIVE_DATA_DIR
+    docker compose --env-file "$ZACRO_SYNC_CONFIG" \
+      -f services/sync/deploy/compose.yaml "$@"
+  )
+}
 sync_compose config --quiet
 sync_compose build
 
-docker volume create "$ZACRO_SYNC_DATA_VOLUME"
+docker volume create "$ZACRO_SYNC_ACTIVE_VOLUME"
 docker volume create "$ZACRO_SYNC_KEYS_VOLUME"
 docker volume create "$ZACRO_SYNC_BACKUPS_VOLUME"
 # Set ownership of the NEW, EMPTY key and backup volumes once.
@@ -103,9 +112,9 @@ or notification destination is provisioned by these assets.
 sync_compose ps
 sync_compose logs --tail 100 sync proxy
 docker stats --no-stream
-# Inspect disk use inside the live volume without exposing stored values:
-docker run --rm --network none --entrypoint du \
-  -v "$ZACRO_SYNC_DATA_VOLUME:/data:ro" "$ZACRO_SYNC_IMAGE" -sh /data
+# Inspect the active store without exposing stored values:
+sync_compose run --rm --no-deps -T --entrypoint sh maintenance \
+  -ec 'du -sh "$ZACRO_SYNC_DATA"'
 sync_compose restart sync
 ```
 
@@ -141,15 +150,18 @@ runs; that does not replace external expiry enforcement.
 sync_compose stop sync
 (
   trap 'sync_compose start sync' EXIT
-  docker run --rm --init --network none \
-    -v "$ZACRO_SYNC_DATA_VOLUME:/data" -v "$ZACRO_SYNC_KEYS_VOLUME:/keys:ro" \
-    -v "$ZACRO_SYNC_BACKUPS_VOLUME:/backups" "$ZACRO_SYNC_IMAGE" \
-    backup --data /data --key-file /keys/master.key --backup-dir /backups
+  sync_compose run --rm --no-deps -T maintenance backup --backup-dir /backups
 )
 ```
 
-Schedule this command with the host's service manager at the operator's chosen
-interval; check successful completion and the returned creation time. Never
+The `maintenance` service shares the service's active data volume and data/key
+environment through the same Compose configuration. It has no network and runs
+only when explicitly requested. The backup command intentionally omits `--data`
+and takes `ZACRO_SYNC_DATA` from that shared configuration. Schedule this command
+with the host's service manager, defining the same `sync_compose` function and
+absolute config/repository paths in the job. Read the persistent file on each
+run; do not cache active fields in a scheduler environment. Check successful
+completion and the returned creation time. Never
 restore an entire old live-volume snapshot. **The current `deletions.jsonl` is
 authoritative and must survive outside the backup rollback domain.** It also
 holds encrypted password/recovery continuity and dataset deletion records.
@@ -178,42 +190,59 @@ docker volume create "$ZACRO_SYNC_RECOVERY_VOLUME"
 docker run --rm --network none --user 0 --entrypoint node \
   -v "$ZACRO_SYNC_RECOVERY_VOLUME:/restore" "$ZACRO_SYNC_IMAGE" \
   -e 'const fs=require("node:fs");fs.chownSync("/restore",1000,1000);fs.chmodSync("/restore",0o700)'
-docker run --rm --init --network none \
-  -v "$ZACRO_SYNC_DATA_VOLUME:/live:ro" -v "$ZACRO_SYNC_KEYS_VOLUME:/keys:ro" \
-  -v "$ZACRO_SYNC_BACKUPS_VOLUME:/backups:ro" -v "$ZACRO_SYNC_RECOVERY_VOLUME:/restore" \
-  "$ZACRO_SYNC_IMAGE" restore --data /restore/recovered \
-  --key-file /keys/master.key --backup "$ZACRO_SYNC_SELECTED_BACKUP" \
-  --ledger /live/deletions.jsonl
+sync_compose run --rm --no-deps -T \
+  --volume "$ZACRO_SYNC_RECOVERY_VOLUME:/restore" --entrypoint sh maintenance -ec \
+  'exec node /app/cli.cjs restore --data /restore/recovered \
+    --key-file "$ZACRO_SYNC_MASTER_KEY_FILE" --backup "$1" \
+    --ledger "$ZACRO_SYNC_DATA/deletions.jsonl"' restore "$ZACRO_SYNC_SELECTED_BACKUP"
 ```
 
 Restore authenticates/checks the snapshot and applies the current ledger before
-validation. It refuses an existing destination and expired snapshots. Device
-sessions are revoked; users must log in again. For a production cutover, create
-an operator-owned Compose override:
+validation. Its source volume is the configured **active** data volume, and the
+ledger path is derived **inside the maintenance container** from its shared
+`ZACRO_SYNC_DATA` value. It refuses an existing destination and expired snapshots.
+Device sessions are revoked; users must log in again.
 
-```yaml
-services:
-  sync:
-    environment:
-      ZACRO_SYNC_DATA: /data/recovered
-    volumes:
-      - recovery:/data
-volumes:
-  recovery:
-    external: true
-    name: ${ZACRO_SYNC_RECOVERY_VOLUME:?Set the verified new volume}
+For a cutover, keep the service stopped. Archive the current operator file in a
+protected recovery log, then edit that same persistent file; no service-only
+Compose override is needed. For the first recovery, these four lines become:
+
+```dotenv
+# Retain the previous store separately; these rollback fields are documentary.
+ZACRO_SYNC_ROLLBACK_VOLUME=zacro-sync-live
+ZACRO_SYNC_ROLLBACK_DATA_DIR=/data
+# Use the exact NEW volume selected above, including the actual date/name.
+ZACRO_SYNC_ACTIVE_VOLUME=zacro-sync-recovery-YYYYMMDD
+ZACRO_SYNC_ACTIVE_DATA_DIR=/data/recovered
 ```
 
-Save that override outside the checkout and include it on **every subsequent**
-Compose command, including backups and maintenance with the matching
-`/data/recovered` path. Define `sync_compose()` accordingly. Start the recovered
-service using `up -d --wait`; verify external HTTPS readiness, fresh login,
-retained settings and absence of deleted datasets/accounts. Do not run the old
-and recovered stores concurrently. Keep the previous live volume protected
-until cutover verification and ledger continuity are established. Thereafter
-the recovered service's ledger is authoritative: rolling back to the old live
-volume without its newer ledger can resurrect deleted data. Stop and transfer
-the current complete ledger before any rollback; revalidate before readiness.
+Set the rollback pair to the previous active pair, and the active pair to the
+new volume and its actual directory. Keep every previous config/recovery log
+and protected rollback volume until verified retention decisions. Persist the
+file with mode 0600. Start using the existing function:
+
+```sh
+sync_compose config --quiet
+sync_compose up -d --wait --wait-timeout 90 sync
+```
+
+The file now controls **both** the running store and subsequent scheduled
+backups/restores. Do not run the old and recovered stores concurrently. Verify
+external HTTPS readiness, fresh login, retained settings and absence of deleted
+datasets/accounts. Then make a synthetic post-cutover update, create datasets
+for retention/deletion, run the **same** backup command above, delete the chosen
+dataset, and drill the **same** restore command into another new volume. Verify
+that post-cutover values survive and the newly deleted dataset stays absent.
+The acceptance test exercises this second backup/restore transition.
+
+For the next restore, repeat the procedure without substituting an old volume
+or hard-coding `/data/deletions.jsonl`: the maintenance container automatically
+reads the active `/data/recovered/deletions.jsonl` in this example. Each cutover
+records the previous active pair as its rollback pair. Thereafter the new
+service's ledger is authoritative: switching to an old rollback volume without
+its newer ledger can resurrect deleted data. Stop and transfer the complete
+current ledger into the retained rollback store before any rollback; validate
+it with the CLI and preserve credential/deletion continuity before readiness.
 
 Old backups need the key that authenticated them. For rotation, generate
 `/keys/next.key` with the same CLI, stop the service, run `rotate-key` with
@@ -238,7 +267,10 @@ it never requests a public certificate. Tests cover health/readiness, rejected
 unauthenticated access, two authenticated clients, library/settings roundtrip,
 encrypted persisted values, graceful restart, singleton refusal, wrong/absent
 key failure, offline backup/restore, revoked sessions and post-backup account
-and dataset deletion. Test output omits credentials and bodies. Cleanup removes
+and dataset deletion. It then persists a recovery cutover in its operator file,
+acknowledges new settings/datasets, creates a second backup, acknowledges a
+further deletion, and verifies another restore against that current active
+ledger. Test output omits credentials and bodies. Cleanup removes
 only its uniquely named containers/volumes/images; failure diagnostics contain
 fixed steps/status rather than raw response bodies. No VM or global Docker
 context is created or changed. Set `DOCKER_HOST` explicitly for a remote engine;
