@@ -3,6 +3,15 @@
 (() => {
   const runtime = globalThis.chrome?.runtime;
   if (!runtime?.id || globalThis.__zacroFacadeInstalled) return;
+  // Native offscreen documents deliberately expose runtime only. This heuristic
+  // suppresses facade creation; the main process independently verifies native
+  // OFFSCREEN_DOCUMENT identity before accepting any privileged invocation.
+  if (
+    typeof document !== 'undefined' &&
+    location.protocol === 'chrome-extension:' &&
+    (location.pathname === '/zacro-native-services.html' || (!chrome.storage && !chrome.tabs))
+  )
+    return;
   Object.defineProperty(globalThis, '__zacroFacadeInstalled', { value: true });
   const namespace = 'zacro.extension.transport.v1';
   let resubscribe = () => {};
@@ -194,6 +203,7 @@
       get: () => callbackError || nativeError?.get?.call(runtime),
     });
     const events = new Map();
+    const menuCallbacks = new Map();
     let subscriptionTimer;
     resubscribe = () => {
       if (subscriptionTimer) return;
@@ -213,6 +223,7 @@
         const names = [...events]
           .filter(([, item]) => item.listeners.size)
           .map(([name]) => (name === 'storage.sync.onChanged' ? 'storage.onChanged' : name));
+        if (menuCallbacks.size) names.push('contextMenus.onClicked');
         host.invoke('zacro.events.subscribe', [[...new Set(names)]]).catch(() => {});
       }, 0);
     };
@@ -244,6 +255,17 @@
       return api;
     }
     host.onEvent?.((name, args) => {
+      if (name === 'contextMenus.onClicked') {
+        const saved = menuCallbacks.get(args[0]?.menuItemId);
+        if (saved?.token === args[2]) {
+          try {
+            saved.callback(args[0], args[1]);
+          } catch (error) {
+            console.error(error);
+          }
+        }
+        args = args.slice(0, 2);
+      }
       for (const listener of events.get(name)?.listeners || []) {
         try {
           listener(...args);
@@ -295,12 +317,20 @@
       const callback = typeof args.at(-1) === 'function' ? args.pop() : null;
       const promise = Promise.resolve().then(() => {
         if (
+          (name === 'action.setIcon' || name === 'browserAction.setIcon') &&
+          args[0]?.imageData !== undefined
+        )
+          args[0] = { ...args[0], imageData: serializeImageData(args[0].imageData) };
+        if (
           name === 'storage.sync.set' ||
           (name === 'storage.sync.get' && args[0] && typeof args[0] === 'object')
         )
           validate(args[0]);
         return host.invoke(name, args);
       });
+      return complete(promise, callback);
+    }
+    function complete(promise, callback) {
       if (!callback) return promise;
       promise.then(
         (value) => callback(value),
@@ -314,6 +344,68 @@
         },
       );
       return undefined;
+    }
+    function serializeImageData(value) {
+      let remaining = 1024 * 1024;
+      const one = (image) => {
+        const { width, height, data } = image || {};
+        if (
+          !Number.isInteger(width) ||
+          !Number.isInteger(height) ||
+          width < 1 ||
+          height < 1 ||
+          width > 256 ||
+          height > 256 ||
+          data?.length !== width * height * 4 ||
+          data.length > remaining
+        )
+          throw new Error('Invalid or oversized icon ImageData');
+        remaining -= data.length;
+        return { width, height, data: Array.from(data) };
+      };
+      if (!value || typeof value !== 'object') throw new Error('Invalid icon ImageData');
+      if ('width' in value) return one(value);
+      const entries = Object.entries(value);
+      if (!entries.length || entries.length > 16) throw new Error('Invalid icon ImageData sizes');
+      return Object.fromEntries(entries.map(([size, image]) => [size, one(image)]));
+    }
+    // Native setters become durable at their Promise/callback boundary. Reads
+    // also wait for host restoration, so a waking worker never sees empty state
+    // and overwrites a user's saved rules. Session rules remain session-local.
+    for (const [group, reads, mutations] of [
+      [
+        'declarativeNetRequest',
+        // Session mutation waits for restore but intentionally stays volatile.
+        [
+          'getDynamicRules',
+          'getEnabledRulesets',
+          'getDisabledRuleIds',
+          'getSessionRules',
+          'updateSessionRules',
+          'getAvailableStaticRuleCount',
+        ],
+        ['updateDynamicRules', 'updateEnabledRulesets', 'updateStaticRules'],
+      ],
+      ['alarms', ['get', 'getAll'], ['create', 'clear', 'clearAll']],
+    ]) {
+      const native = chrome[group];
+      if (!native) continue;
+      for (const name of [...reads, ...mutations]) {
+        if (typeof native[name] !== 'function') continue;
+        const original = native[name].bind(native);
+        native[name] = (...args) => {
+          const callback = typeof args.at(-1) === 'function' ? args.pop() : null;
+          const promise = host
+            .invoke('zacro.nativeServices.ready', [])
+            .then(() => original(...args))
+            .then(async (result) => {
+              if (mutations.includes(name)) await host.invoke('zacro.nativeServices.checkpoint', []);
+              return result;
+            });
+          return complete(promise, callback);
+        };
+      }
+      if (group === 'alarms') native.onAlarm = event('alarms.onAlarm');
     }
     function methods(group, names) {
       chrome[group] ||= {};
@@ -350,16 +442,55 @@
         'disable',
         'openPopup',
       ]);
-    methods('contextMenus', ['update', 'remove', 'removeAll']);
+    chrome.contextMenus ||= {};
     let menuId = 0;
+    function menuProperties(properties) {
+      const props = { ...properties };
+      const callback = props.onclick;
+      delete props.onclick;
+      if (callback !== undefined && (typeof callback !== 'function' || typeof document === 'undefined'))
+        throw new Error(
+          'Inline menu callbacks require an extension document; use contextMenus.onClicked in workers',
+        );
+      return { props, saved: callback ? { token: crypto.randomUUID(), callback } : null };
+    }
     chrome.contextMenus.create = (properties, callback) => {
       const id = properties.id ?? 'zacro-generated-' + ++menuId;
-      const props = { ...properties, id };
-      if (props.onclick) throw new Error('Use contextMenus.onClicked');
-      const promise = invoke('contextMenus.create', [props, ...(callback ? [callback] : [])]);
-      promise?.catch(console.error);
+      const { props, saved } = menuProperties({ ...properties, id });
+      const promise = invoke('contextMenus.create', [props, { callbackId: saved?.token || null }]).then(
+        () => {
+          if (saved) menuCallbacks.set(id, saved);
+          resubscribe();
+        },
+      );
+      if (callback) complete(promise, callback);
+      else promise.catch(console.error);
       return id;
     };
+    chrome.contextMenus.update = (id, properties, callback) => {
+      const { props, saved } = menuProperties(properties);
+      const promise = invoke('contextMenus.update', [
+        id,
+        props,
+        saved ? { callbackId: saved.token } : {},
+      ]).then(() => {
+        if (saved) menuCallbacks.set(id, saved);
+        resubscribe();
+      });
+      return complete(promise, callback);
+    };
+    for (const name of ['remove', 'removeAll'])
+      chrome.contextMenus[name] = (...args) => {
+        const callback = typeof args.at(-1) === 'function' ? args.pop() : null;
+        return complete(
+          invoke('contextMenus.' + name, args).then(() => {
+            if (name === 'removeAll') menuCallbacks.clear();
+            else menuCallbacks.delete(args[0]);
+            resubscribe();
+          }),
+          callback,
+        );
+      };
     runtime.openOptionsPage = (...args) => invoke('runtime.openOptionsPage', args);
     for (const [group, names] of Object.entries({
       tabs: ['onCreated', 'onUpdated', 'onActivated', 'onRemoved'],

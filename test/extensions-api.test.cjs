@@ -121,6 +121,55 @@ test('actions and options resolve only same-extension resources and lifecycle ch
   metadata.enabled = false;
   await assert.rejects(api.call(context, 'tabs.query', [{}]), /disabled|Expired/i);
 });
+test('extension openPopup opens the active tab popup without granting a user gesture', async () => {
+  const { api, context, effects } = setup();
+  await api.call(context, 'action.openPopup', [{ windowId: 1 }]);
+  assert.equal(effects[0].url, `chrome-extension://${id}/popup.html`);
+  assert.equal(effects[0].tabId, 10);
+  assert.equal(api.state(context).gesture, 0);
+  assert.equal(api.state(context).active.size, 0);
+  await assert.rejects(api.call(context, 'action.openPopup', [{ windowId: 999 }]), /window/i);
+  await api.call(context, 'action.disable', [10]);
+  await assert.rejects(api.call(context, 'action.openPopup', []), /disabled/i);
+  await api.call(context, 'action.enable', [10]);
+  await api.call(context, 'action.setPopup', [{ popup: '' }]);
+  await assert.rejects(api.call(context, 'action.openPopup', []), /popup/i);
+});
+test('pixel icons encode exact RGBA values into real PNG and reject malformed bytes', async () => {
+  const { api, context } = setup();
+  const rgba = [255, 0, 0, 255, 0, 255, 0, 128];
+  await api.call(context, 'action.setIcon', [{ imageData: { width: 2, height: 1, data: rgba } }]);
+  const url = api.actionState('p1', id, 10).icon;
+  assert.match(url, /^data:image\/png;base64,/);
+  const png = Buffer.from(url.split(',')[1], 'base64');
+  assert.deepEqual([...png.subarray(0, 8)], [137, 80, 78, 71, 13, 10, 26, 10]);
+  assert.equal(png.readUInt32BE(16), 2);
+  assert.equal(png.readUInt32BE(20), 1);
+  const compressed = [];
+  for (let offset = 8; offset < png.length;) {
+    const length = png.readUInt32BE(offset);
+    if (png.toString('ascii', offset + 4, offset + 8) === 'IDAT')
+      compressed.push(png.subarray(offset + 8, offset + 8 + length));
+    offset += length + 12;
+  }
+  assert.deepEqual([...require('node:zlib').inflateSync(Buffer.concat(compressed))], [0, ...rgba]);
+  await api.call(context, 'action.setIcon', [
+    { imageData: { 16: { width: 1, height: 1, data: [0, 0, 255, 255] } } },
+  ]);
+  assert.match(api.actionState('p1', id, 10).icon['16'], /^data:image\/png;base64,/);
+  for (const imageData of [
+    { width: 10000, height: 1, data: [] },
+    { width: 1, height: 1, data: [1, 2, 3] },
+    { width: 1, height: 1, data: [0, -1, 0, 255] },
+  ])
+    await assert.rejects(api.call(context, 'action.setIcon', [{ imageData }]), /image|icon|pixel/i);
+  await assert.rejects(
+    api.call(context, 'action.setIcon', [
+      { path: 'ok.png', imageData: { width: 1, height: 1, data: [0, 0, 0, 0] } },
+    ]),
+    /image|icon|path/i,
+  );
+});
 test('tab events redact and menu and command dispatch are bound to host generation', async () => {
   const { api, context, events, metadata } = setup();
   const menu = await api.call(context, 'contextMenus.create', [
@@ -138,6 +187,28 @@ test('tab events redact and menu and command dispatch are bound to host generati
   metadata.generation = 'g2';
   assert.deepEqual(api.menuItems('p1', id), []);
   await assert.rejects(api.call(context, 'contextMenus.update', ['read', { title: 'stale' }]), /Expired/);
+});
+test('inline menu callback routing follows the current registration and cannot survive ID reuse', async () => {
+  const { api, context, events } = setup();
+  await api.call(context, 'contextMenus.create', [
+    { id: 'callback', title: 'Callback' },
+    { callbackId: 'first-owner' },
+  ]);
+  await api.call(context, 'contextMenus.update', [
+    'callback',
+    { title: 'New owner' },
+    { callbackId: 'next-owner' },
+  ]);
+  await api.clickMenu('p1', id, 'callback', {}, 10);
+  assert.equal(events.at(-1)[3][2], 'next-owner');
+  await api.call(context, 'contextMenus.remove', ['callback']);
+  await api.call(context, 'contextMenus.create', [{ id: 'callback', title: 'No callback' }]);
+  await api.clickMenu('p1', id, 'callback', {}, 10);
+  assert.equal(events.at(-1)[3][2], null);
+  await assert.rejects(
+    api.call(context, 'contextMenus.update', ['callback', {}, { callbackId: {} }]),
+    /callback/,
+  );
 });
 test('permission requests require host-issued gesture and cannot grant undeclared rights', async () => {
   const changes = [];
@@ -288,11 +359,11 @@ test('reduced optional grants cannot remove required rights or authorize undecla
     /declared/,
   );
 });
-test('setIcon rejects unsupported imageData rather than silently discarding icon', async () => {
+test('setIcon rejects malformed ImageData rather than silently discarding icon', async () => {
   const { api, context } = setup();
   await assert.rejects(
-    api.call(context, 'action.setIcon', [{ imageData: { width: 1, height: 1, data: [0, 0, 0, 255] } }]),
-    /imageData|Unsupported/,
+    api.call(context, 'action.setIcon', [{ imageData: { width: 1, height: 1, data: [0, 0, 255] } }]),
+    /ImageData|icon/,
   );
 });
 test('browser callbacks retain tab CRUD IDs and sanitize event details per receiver', async () => {

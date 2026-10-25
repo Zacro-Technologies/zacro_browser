@@ -336,6 +336,10 @@ class ExtensionHost {
         (a, b) => Math.abs(Number(a[0]) - 32) - Math.abs(Number(b[0]) - 32),
       )[0]?.[1];
     if (typeof source !== 'string' || !version) return null;
+    if (source.startsWith('data:image/png;base64,') && source.length < 2 * 1024 * 1024) {
+      const image = this.native.nativeImage.createFromDataURL(source);
+      return image.isEmpty() ? null : image.resize({ width: 32, height: 32 }).toDataURL();
+    }
     const key = JSON.stringify([record.id, version.token, source]);
     if (this.icons.has(key)) return this.icons.get(key);
     let value = null;
@@ -579,6 +583,10 @@ class ExtensionHost {
       url.pathname === '/zacro-compat-transport.html'
     )
       throw new Error('Invalid extension page.');
+    if (details.kind === 'action')
+      for (const item of this.windows)
+        if (item.profileId === profileId && item.kind === 'action' && !item.window.isDestroyed())
+          item.window.destroy();
     const { BrowserWindow } = this.native;
     const view = new BrowserWindow({
       parent: this.getWindow(),
@@ -595,7 +603,7 @@ class ExtensionHost {
         webSecurity: true,
       },
     });
-    const entry = { window: view, profileId, id, generation: details.generation };
+    const entry = { window: view, profileId, id, kind: details.kind, generation: details.generation };
     this.windows.add(entry);
     view.on('closed', () => this.windows.delete(entry));
     const validURL = (value) => {

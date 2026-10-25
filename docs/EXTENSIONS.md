@@ -59,9 +59,9 @@ The adapter surface is deliberately bounded:
 | `storage.sync` | `get`, `getKeys`, `getBytesInUse`, `set`, `remove`, `clear`, `setAccessLevel`, change listeners | Strict JSON values and documented quotas; consent controls network synchronization. |
 | `tabs` | `get`, `getCurrent`, `query`, `create`, `update`, `reload`, `duplicate`, `remove`, `move`; created/updated/activated/removed events | Current extension profile only; browser guest IDs exclude shell, broker and separate options/action windows. |
 | `windows` | `get`, `getCurrent`, `getAll`, `update`, focus-change event | Existing single browser window; no window creation/removal API. |
-| `action` / `browserAction` | Title, popup, badge text/colors, packaged icon, enable/disable, click listener | Browser controls open the popup; ImageData and extension-invoked `openPopup` reject. |
+| `action` / `browserAction` | Title, popup, badge text/colors, packaged or ImageData icon, enable/disable, click listener, `openPopup` | Existing active profile/window; opening programmatically grants no temporary page access. Pixel images are bounded to 256×256 and 1 MiB total RGBA. |
 | `runtime` | `openOptionsPage` | Declared own-extension page only; other runtime messaging stays native. |
-| `contextMenus` | `create`, `update`, `remove`, `removeAll`, click event | Supported contexts/patterns and checkbox/radio groups; use `onClicked`, not an inline `onclick` function. |
+| `contextMenus` | `create`, `update`, `remove`, `removeAll`, click event and document `onclick` callbacks | Supported contexts/patterns and checkbox/radio groups; service workers use `onClicked`. Inline callbacks stay in their owning document. |
 | `commands` | `getAll`, command event, declared shortcut dispatch | Browser/system shortcuts keep priority; conflicts and unassigned commands are visible. |
 | `permissions` | `getAll`, `contains`, `request`, `remove`, added/removed events | Reviewed optional supported rights only; native manifest rebuild can disconnect the original caller. |
 
@@ -80,8 +80,9 @@ the host's extension action. Required `activeTab` is rejected before activation;
 optional `activeTab` cannot be granted. Zacro does not replace it with broad host
 permissions. MV2 native `scripting` is also unavailable. Native messaging,
 identity services, DNR/offscreen/userScripts and other absent engine features
-remain unsupported. `action.setIcon` currently accepts packaged image paths,
-not ImageData; extension-invoked `action.openPopup` is not implemented.
+remain unsupported. `action.setIcon` accepts both packaged image paths and
+bounded ImageData, including size dictionaries. Extension-invoked `openPopup`
+opens the active tab's configured popup and replaces any existing action popup.
 
 Persistent MV2 script/HTML backgrounds, MV2 lazy event pages, and MV3
 classic/module workers pass real API tests. Tests stop genuine native workers

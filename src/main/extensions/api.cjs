@@ -1,5 +1,6 @@
 'use strict';
 const { matches, covers, permissionDetails, optionalGrants } = require('./permissions.cjs');
+const { imageDataIcons } = require('./icons.cjs');
 const clone = (value) => structuredClone(value);
 const trusted = (context) => context.kind !== 'content-script';
 const reserved = new Set([
@@ -314,7 +315,11 @@ class ExtensionAPI {
       await this.host(context, 'menus', 'changed', [id, this.menuItems(profileId, id)]);
     }
     this.guard(context);
-    this.emit?.(profileId, id, 'contextMenus.onClicked', [details, this.sanitize(context, tab)]);
+    this.emit?.(profileId, id, 'contextMenus.onClicked', [
+      details,
+      this.sanitize(context, tab),
+      item.callbackId || null,
+    ]);
   }
   publish(profileId, event, args) {
     if (
@@ -498,6 +503,28 @@ class ExtensionAPI {
     if (group === 'action' || group === 'browserAction') {
       if (!metadata.manifest.action && !metadata.manifest.browser_action)
         throw new Error('No action declared');
+      if (name === 'openPopup') {
+        const props = keys(args[0] || {}, ['windowId']);
+        const window = await this.host(context, 'windows', 'getCurrent', [{}]);
+        if (props.windowId !== undefined && props.windowId !== window.id)
+          throw new Error('Unknown profile window');
+        const tabs = await this.host(context, 'tabs', 'query', [{}]);
+        const tab = tabs.find((item) => item.active && item.windowId === window.id);
+        if (!tab) throw new Error('No active profile tab');
+        const action = this.actionState(context.profileId, context.extensionId, tab.id);
+        if (!action.enabled) throw new Error('Extension action is disabled');
+        if (!action.popup) throw new Error('No action popup configured');
+        await this.host(context, 'dialogs', 'openView', [
+          context.extensionId,
+          {
+            kind: 'action',
+            url: resource(context, action.popup),
+            tabId: tab.id,
+            generation: context.generation,
+          },
+        ]);
+        return;
+      }
       const props = ['enable', 'disable'].includes(name) ? {} : object(args[0] || {}),
         tabId = ['enable', 'disable'].includes(name) ? (args[0] ?? -1) : (props.tabId ?? -1);
       if (tabId !== -1) await this.tab(context, tabId);
@@ -541,9 +568,11 @@ class ExtensionAPI {
         }
         if (field === 'popup' && value) resource(context, value);
         if (field === 'icon') {
-          if (props.imageData !== undefined || value === undefined)
-            throw new Error('Unsupported imageData icon; use a packaged icon path');
-          if (typeof value === 'string') resource(context, value);
+          if (props.imageData !== undefined) {
+            if (value !== undefined) throw new Error('Choose icon path or ImageData, not both');
+            value = imageDataIcons(props.imageData);
+          } else if (value === undefined) throw new Error('Icon path or ImageData is required');
+          else if (typeof value === 'string') resource(context, value);
           else {
             object(value);
             for (const file of Object.values(value)) resource(context, file);
@@ -593,6 +622,15 @@ class ExtensionAPI {
         if (props.checked !== undefined && typeof props.checked !== 'boolean')
           throw new Error('Invalid menu checked state');
         const item = { ...state.menus.get(id), ...props, id };
+        const callback = keys(args[name === 'create' ? 1 : 2] || {}, ['callbackId']);
+        if (callback.callbackId !== undefined) {
+          if (
+            callback.callbackId !== null &&
+            (typeof callback.callbackId !== 'string' || !/^[a-zA-Z0-9-]{1,128}$/.test(callback.callbackId))
+          )
+            throw new Error('Invalid menu callback identifier');
+          item.callbackId = callback.callbackId;
+        }
         state.menus.set(id, item);
         if (item.type === 'radio' && item.checked === true)
           for (const sibling of this.radioGroup(state, item)) sibling.checked = sibling.id === id;

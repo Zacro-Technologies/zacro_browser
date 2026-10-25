@@ -287,8 +287,35 @@ test(
     assert.equal(moved.index, 0);
     await native('options', `chrome.tabs.remove(${created.id})`);
     await native('options', 'chrome.storage.sync.set({throughOptions:42})');
-    await b.invoke('extension:action', { id: extension.id });
+    await native('options', 'chrome.action.openPopup()');
     await expect.poll(() => native('popup', 'typeof chrome.storage.sync?.get')).toBe('function');
+    await native(
+      'options',
+      'new Promise((resolve,reject)=>chrome.action.openPopup(()=>chrome.runtime.lastError?reject(Error(chrome.runtime.lastError.message)):resolve(true)))',
+    );
+    assert.equal(
+      await b.app.evaluate(
+        ({ BrowserWindow }, id) =>
+          BrowserWindow.getAllWindows().filter(
+            (w) => w.webContents.getURL() === `chrome-extension://${id}/popup.html`,
+          ).length,
+        extension.id,
+      ),
+      1,
+    );
+    await native(
+      'options',
+      'chrome.action.setIcon({imageData:new ImageData(new Uint8ClampedArray([12,34,56,255]),1,1)})',
+    );
+    const icon = (await b.invoke('state:get')).extensions[0].iconData;
+    assert.match(icon, /^data:image\/png;base64,/);
+    assert.deepEqual(
+      await native(
+        'options',
+        `(async()=>{const image=new Image();image.src=${JSON.stringify(icon)};await image.decode();const canvas=document.createElement('canvas');canvas.width=32;canvas.height=32;const ctx=canvas.getContext('2d');ctx.drawImage(image,0,0);return [...ctx.getImageData(0,0,1,1).data]})()`,
+      ),
+      [12, 34, 56, 255],
+    );
     assert.deepEqual(await native('popup', 'chrome.storage.sync.get("throughOptions")'), {
       throughOptions: 42,
     });
@@ -313,7 +340,7 @@ test(
     await expect.poll(async () => (await b.invoke('state:get')).extensions[0]?.action.badgeText).toBe('7');
     await native(
       'options',
-      'chrome.commands.onCommand.addListener(command=>chrome.storage.sync.set({command})); globalThis.menuClicks=0; chrome.contextMenus.onClicked.addListener(info=>chrome.storage.sync.set({clickedMenu:info.menuItemId,menuClicks:++globalThis.menuClicks,menuInfo:JSON.parse(JSON.stringify(info))})); chrome.contextMenus.create({id:"fixture-menu",title:"Fixture menu",contexts:["page"]}); chrome.contextMenus.create({id:"fixture-check",title:"Fixture checkbox",type:"checkbox",contexts:["page"]});',
+      'chrome.commands.onCommand.addListener(command=>chrome.storage.sync.set({command})); globalThis.menuClicks=0; chrome.contextMenus.onClicked.addListener(info=>chrome.storage.sync.set({clickedMenu:info.menuItemId,menuClicks:++globalThis.menuClicks,menuInfo:JSON.parse(JSON.stringify(info))})); chrome.contextMenus.create({id:"fixture-menu",title:"Fixture menu",contexts:["page"],onclick:info=>chrome.storage.sync.set({inlineMenu:info.menuItemId})}); chrome.contextMenus.create({id:"fixture-check",title:"Fixture checkbox",type:"checkbox",contexts:["page"]});',
     );
     await b.app.evaluate(({ BrowserWindow }) => {
       const shell = BrowserWindow.getAllWindows().find((window) =>
@@ -390,6 +417,18 @@ test(
     menuInfo = (await native('options', 'chrome.storage.sync.get("menuInfo")')).menuInfo;
     assert.equal(menuInfo.wasChecked, true);
     assert.equal(menuInfo.checked, false);
+    assert.equal(
+      (await native('options', 'chrome.storage.sync.get("inlineMenu")')).inlineMenu,
+      'fixture-menu',
+    );
+    await native(
+      'options',
+      'chrome.contextMenus.update("fixture-menu",{onclick:()=>chrome.storage.sync.set({inlineMenu:"replacement"})})',
+    );
+    await clickMenu('Fixture menu');
+    await expect
+      .poll(async () => (await native('options', 'chrome.storage.sync.get("inlineMenu")')).inlineMenu)
+      .toBe('replacement');
     const ownTab = await native('options', `chrome.tabs.create({url:'onboarding.html',active:false})`);
     assert.equal(typeof ownTab.id, 'number');
     assert.equal(ownTab.url, `chrome-extension://${extension.id}/onboarding.html`);
