@@ -1,13 +1,40 @@
 # Extensions and sync validation
 
-This is the development record for `extensions-and-sync`, based on the
-[approved design](superpowers/specs/2026-10-25-extensions-and-sync-design.md).
-Production implementation is committed through `cae78db`. After the Mac was
-unlocked, the final full verification passed all 240 Node and 96 native checks.
-The final arm64 development package also passed its complete acceptance test
-after the user handled the OS Keychain confirmation. Local Apple silicon
-acceptance is complete. Windows/Intel Mac CI, the service container build and
-signed/notarized release acceptance remain unverified.
+This record preserves the original accepted implementation and its historical
+validation. The sections below describe the baseline that preceded the
+[remaining capability work](superpowers/specs/2026-10-25-remaining-extensions-sync-design.md);
+they do not certify the current branch or the custom runtime.
+
+The original [approved design](superpowers/specs/2026-10-25-extensions-and-sync-design.md)
+was implemented through `cae78db`. Its full verification passed 240 Node and
+96 native checks after the Mac was unlocked. Its arm64 development package
+passed acceptance after the user handled the OS Keychain confirmation.
+
+## Current follow-up status, 2026-10-26
+
+- Independent library/settings sync, device activity times and the remaining
+  extension API slices now have implementation and focused validation. The
+  current full-product verification and integration review are in progress.
+- Real representative provider results are recorded separately in
+  [Provider acceptance](EXTENSION-PROVIDER-VALIDATION.md). React Developer Tools
+  now displays its genuine panels and component tree on stock Electron.
+  Dark Reader and uBOL still require positive acceptance on the custom binary.
+- The custom Electron source is building on the external APFS volume. Passing
+  patch application or individual compiler checks is not a completed build,
+  native capability acceptance, or a newly validated package. See the
+  [runtime instructions](../runtime/electron/README.md).
+- The actual Linux arm64 service container and HTTPS proxy acceptance passed,
+  including a second backup and restore after a recovery cutover (`ad47ee7`).
+  No public domain or service has been provisioned.
+- Windows backup and CLI portability fixes are committed at `b6662e4`, with
+  15 focused local checks passing and an independent review. Native Windows
+  execution of this revision remains pending. Earlier Windows/Intel/arm64 CI
+  failures at `1da83e3` are historical evidence, not current revision results.
+- Custom runtime acceptance on all three targets, a new packaged acceptance,
+  Google provider account/token access and signed/notarized distribution remain
+  open. These gates must pass before the whole follow-up is called complete.
+
+## Original accepted baseline record
 
 ## Environment and baseline
 

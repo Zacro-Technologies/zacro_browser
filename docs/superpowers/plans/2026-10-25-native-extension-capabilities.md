@@ -517,3 +517,51 @@ runtime when compiled; custom positive checks remain unrun until then. Record
 exact versions, behaviors, negative limits, commands/results and source/runtime
 identity in task-14-report.md. Fresh task review follows the narrow commit.
 No subagents, personal account login, source package modification or publication.
+
+Task14 implementation ruling: the verified uBOL archive also uses native-valid
+`background.service_worker: "/js/background.js"`. The adapter previously rejected
+this before presenting incompatibility. The Task14 implementer owns the minimal
+worker-path fix in adapt.cjs and focused classic/module native fixtures: remove
+one root slash for filesystem/bootstrap-relative calculations only, retain the
+original native manifest path/bytes, and reject traversal, double slash, encoded,
+control, foreign and backslash paths. Genuine imported worker code and relative
+dependencies must run after adaptation. This does not expand API permissions.
+
+## Task 15: Windows sync backup and CLI acceptance portability
+
+Read-only inspection of the existing baseline CI run40206850043 (head1da83e3,
+not the current branch revision) found Windows backup fsync failures and a
+CLI shutdown assertion failure. Job121209518324 shows EPERM at maintenance.cjs
+backup fsync and null exitCode vs0 after child.kill('SIGTERM'). These paths are
+unchanged in current source. Windows FlushFileBuffers requires GENERIC_WRITE;
+the backup snapshot is currently reopened read-only. Node24 documents that
+Windows child.kill SIGTERM terminates the process rather than delivering POSIX
+signal handlers. Actual Windows re-verification remains pending current CI.
+
+Own services/sync/maintenance.cjs and focused sync operations tests/fixtures.
+Open the freshly-created snapshot with the access required for a real durable
+flush, without truncating it or swallowing flush failures. Reproduce the
+read-only regular-file fsync failure through a narrow platform-contract seam
+over real filesystem/SQLite backup and restore; retain mandatory failure on
+genuine write/flush errors and existing authenticated metadata/deletion rules.
+
+Test the real CLI's registered graceful handler portably. On POSIX preserve real
+signal coverage. A test-only preload over the child's authenticated parent IPC
+may emit the handler event on Windows; exercise that transport locally too.
+Keep it outside all production/package files and never add a product shutdown
+network endpoint. Require a clean exit, stopped event, released ownership and
+successful offline backup/restore; never accept forced termination as graceful
+success. Bound test cleanup and keep passwords/keys out of logs.
+
+Use the existing failing CI as platform evidence, add covering focused
+regressions before the production change, and run only the affected Node tests.
+No native foreground test, live runtime source edits or public CI rerun/push.
+Document the precise remaining Windows execution gate. Report exact commands,
+RED/GREEN and self-review in task-15-report.md and commit only owned files;
+fresh review required. No subagents.
+
+Primary references:
+- https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-flushfilebuffers
+- pinned Node24.22.0 doc/api/child_process.md in the source checkout, or
+  https://github.com/nodejs/node/blob/v24.22.0/doc/api/child_process.md
+- https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40206850043

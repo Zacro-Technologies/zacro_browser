@@ -20,6 +20,12 @@ project allocation, not a measured guarantee for every configuration. The
 source, tools and build outputs are much larger than a prebuilt Electron app.
 The scripts use four compile jobs and disable remote execution.
 
+Xcode may provide Metal as a separate component. Verify `xcrun metal --version`
+before the first build. If it reports a missing Metal Toolchain, install Apple's
+component with `xcodebuild -downloadComponent MetalToolchain`, then repeat the
+version check and resume the build. The current local build required this step
+for ANGLE's native Metal shaders; completed build outputs were retained.
+
 The current local build uses `/Volumes/ZacroElectronBuild`, an APFS sparse disk
 image stored at `/Volumes/EVA SSD/ZacroElectronBuild.sparsebundle`. The existing
 SSD is exFAT; it was not reformatted. Keep the SSD connected until builds stop
