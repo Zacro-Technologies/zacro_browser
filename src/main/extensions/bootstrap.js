@@ -439,6 +439,15 @@
     methods('windows', ['get', 'getCurrent', 'getAll', 'update', 'create', 'remove']);
     methods('permissions', ['contains', 'getAll', 'request', 'remove']);
     methods('commands', ['getAll']);
+    methods('sidePanel', [
+      'getOptions',
+      'setOptions',
+      'getPanelBehavior',
+      'setPanelBehavior',
+      'open',
+      'close',
+      'getLayout',
+    ]);
     for (const group of ['action', 'browserAction'])
       methods(group, [
         'getTitle',

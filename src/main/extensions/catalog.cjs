@@ -14,6 +14,7 @@ const API_PERMISSIONS = new Set([
   'offscreen',
   'alarms',
   'nativeMessaging',
+  'sidePanel',
 ]);
 function list(value, name) {
   if (value === undefined) return [];
@@ -61,6 +62,11 @@ function inspectManifest(manifest) {
   )
     throw new Error('Invalid extension manifest');
   versionParts(manifest.version);
+  if (manifest.side_panel !== undefined) {
+    if (!manifest.side_panel || typeof manifest.side_panel !== 'object' || Array.isArray(manifest.side_panel))
+      throw new Error('Invalid side panel resource');
+    require('./side-panel.cjs').sidePanelResource(manifest.side_panel.default_path);
+  }
   if (
     manifest.devtools_page !== undefined &&
     (typeof manifest.devtools_page !== 'string' ||

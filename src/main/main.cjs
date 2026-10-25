@@ -219,6 +219,7 @@ function snapshot() {
   const preview = peek && !peek.entry.contents.isDestroyed() ? peek : null;
   result.runtime = {
     page: pageState(activeEntry()),
+    extensionPanel: extensionHost?.sidePanel?.snapshot() || null,
     pages: Object.fromEntries([...views].map(([id, entry]) => [id, pageState(entry)])),
     splitTabId,
     peek: preview
@@ -780,6 +781,7 @@ function reconcile() {
   // Allocate stable native tab identities without starting renderers or
   // network navigation for restored/background pages.
   for (const tab of store.state.tabs) reserveView(tab);
+  extensionHost?.sidePanel?.reconcile();
   publishExtensionTabChanges();
   const split = resolveSplit(splitPair, store.state.tabs, store.state.activeTabId, store.state.activeSpaceId);
   splitTabId = split?.otherId || null;
@@ -868,6 +870,7 @@ function arrangeViews() {
         win.contentView,
       );
   }
+  extensionHost?.sidePanel?.arrange(layout);
 }
 async function openPeek(url, source = activeTab()) {
   url = webURL(url);
@@ -1633,6 +1636,7 @@ async function invoke(action, payload = {}) {
       else if (previousSidebarWidth === 0)
         layout.contentTop = process.platform === 'darwin' || win.isFullScreen() ? 8 : 36;
       if (typeof payload.overlay === 'boolean') layout.overlay = payload.overlay;
+      if (typeof payload.extensionPanel === 'boolean') layout.extensionPanel = payload.extensionPanel;
       if (layout.overlay && !previousOverlay) void captureBackdrop();
       else if (!layout.overlay && previousOverlay) clearBackdrop();
       arrangeViews();
@@ -2358,6 +2362,10 @@ if (singleInstance)
         getSession: profileSession,
         getWindow: () => win,
         browser: extensionBrowser,
+        panelChanged: () => {
+          arrangeViews();
+          publish();
+        },
         syncClient: () => syncAccount.client,
         publish,
         report,

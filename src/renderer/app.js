@@ -441,7 +441,18 @@ function applyState(next) {
   const previousProfile = activeProfile()?.id;
   const previousSpace = state?.activeSpaceId;
   const previousTab = state?.activeTabId;
+  const previousExtensionPanel = state?.runtime?.extensionPanel;
   state = next;
+  if (
+    state.runtime?.extensionPanel &&
+    state.runtime.extensionPanel.openId !== previousExtensionPanel?.openId
+  ) {
+    ui.panel = 'extension';
+    ui.panelSignature = '';
+  } else if (!state.runtime?.extensionPanel && ui.panel === 'extension') {
+    ui.panel = null;
+    ui.panelSignature = '';
+  }
   document.documentElement.dataset.fullscreen = String(Boolean(state.runtime?.fullScreen));
   document.documentElement.dataset.focused = String(state.runtime?.focused !== false);
   setTheme();
@@ -741,6 +752,7 @@ function syncLayout() {
   const layout = {
     sidebarWidth: width,
     panelWidth: panel,
+    extensionPanel: ui.panel === 'extension',
     contentTop,
     overlay: Boolean(ui.dialog),
     peek: Boolean(state.runtime?.peek),
@@ -761,10 +773,12 @@ const panelNames = {
   archive: ['archive', 'Archived tabs'],
   settings: ['settings', 'Settings'],
   extensions: ['extension', 'Extensions'],
+  extension: ['extension', 'Extension panel'],
   ai: ['sparkle', 'Ask Zacro'],
 };
 function panelHeader() {
-  const [symbol, title] = panelNames[ui.panel] || ['info', 'Library'];
+  const [symbol, label] = panelNames[ui.panel] || ['info', 'Library'];
+  const title = ui.panel === 'extension' ? esc(state.runtime?.extensionPanel?.title || label) : label;
   const library = ['bookmarks', 'history', 'downloads', 'archive'].includes(ui.panel);
   return `<header class="panel-header">${icon(symbol)}<h2 id="panel-title" tabindex="-1">${title}</h2>${ui.panel === 'ai' ? button('ui:ai-reset', 'New conversation', 'plus') : ''}${button('ui:panel-close', 'Close panel', 'close', 'data-key="panel-close"')}</header>${library ? `<nav class="panel-tabs" aria-label="Library sections">${['bookmarks', 'history', 'downloads', 'archive'].map((panel) => button('ui:panel', panelNames[panel][1], panelNames[panel][0], `data-panel="${panel}" data-key="panel-${panel}" aria-pressed="${ui.panel === panel}"`)).join('')}</nav>` : ''}`;
 }
@@ -854,7 +868,10 @@ function renderPanel(force = false) {
   const focusedId = element.contains(focused) ? focused.id : null;
   const selection =
     focusedId && 'selectionStart' in focused ? [focused.selectionStart, focused.selectionEnd] : null;
-  if (ui.panel === 'settings') {
+  if (ui.panel === 'extension') {
+    element.innerHTML =
+      panelHeader() + '<div class="extension-panel-surface" aria-label="Extension content"></div>';
+  } else if (ui.panel === 'settings') {
     element.innerHTML = panelHeader() + `<div class="panel-body">${renderSettings()}</div>`;
   } else if (ui.panel === 'extensions') {
     element.innerHTML = panelHeader() + `<div class="panel-body">${renderExtensions()}</div>`;
@@ -1059,7 +1076,7 @@ function renderExtensions() {
   };
   const control = (ext, action, label, danger = false) =>
     `<button type="button" class="text-button ${danger ? 'danger' : ''}" data-action="${action}" data-id="${esc(ext.id)}" data-generation="${esc(ext.generation || '')}" data-profile-id="${esc(ext.profileId)}" ${action === 'extension:action' && ext.action?.enabled === false ? 'disabled' : ''}>${esc(label)}</button>`;
-  return `<p class="panel-intro">Extensions belong to <strong>${esc(activeProfile()?.name)}</strong>. Review requested access before allowing an extension to run.</p><div class="setting-actions">${primary('ui:extension-store', 'Install from Chrome Web Store', 'plus')}${secondary('extension:install', 'Load unpacked extension', 'folder')}${secondary('extension:check-updates', 'Check for updates', 'reload')}</div><p class="provider-note">Compatibility depends on the APIs each extension uses. Local folders stay on this device. Settings sync requires a linked account and separate consent.</p>${warnings}${extensions.length ? extensions.map((ext) => `<article class="extension-card"><div class="row"><div class="extension-icon">${ext.iconData ? `<img src="${esc(ext.iconData)}" alt="">` : icon('extension')}</div><div class="grow"><h3>${esc(ext.name || ext.id)}</h3><span class="small muted">${esc(ext.version || '')} · ${esc(labels[ext.status] || ext.status)}</span></div>${ext.action?.badgeText ? `<span class="extension-badge" data-badge-background="${esc(badgeColor(ext.action.badgeBackgroundColor, '#000000'))}" data-badge-foreground="${esc(badgeColor(ext.action.badgeTextColor, '#ffffff'))}">${esc(ext.action.badgeText)}</span>` : ''}</div><p class="small muted">${ext.source === 'chrome-web-store' ? 'Chrome Web Store' : 'Local folder · only on this device'}${ext.publisherVerified ? ' · Publisher proof verified' : ''}</p>${ext.description ? `<p>${esc(ext.description)}</p>` : ''}${ext.error || ext.syncError || ext.notificationError ? `<p class="danger">${esc(ext.error || ext.syncError || ext.notificationError)}</p>` : ''}${ext.requiresPageReload ? '<p class="provider-note">Open pages may still contain scripts from the previous version. Reload them to finish changing access.</p>' : ''}${ext.unsupported?.length ? `<ul class="extension-access">${ext.unsupported.map((item) => `<li>${esc(item.capability)}: ${esc(item.reason)}</li>`).join('')}</ul>` : ''}<div class="setting-actions">${ext.syncError ? control(ext, 'extension:retry-sync', 'Retry library change') : ''}${ext.status === 'remote-pending' ? control(ext, 'extension:review-remote', 'Review installation') : `${ext.pendingVersion && ext.compatible ? control(ext, 'extension:approve', 'Review permissions') : ''}${ext.status !== 'incompatible' && ext.status !== 'pending-approval' ? control(ext, 'extension:toggle', ext.enabled ? 'Disable' : 'Enable') : ''}${ext.enabled && ext.hasAction ? control(ext, 'extension:action', ext.action?.title || 'Open extension') : ''}${ext.enabled && ext.hasOptions ? control(ext, 'extension:options', 'Options') : ''}${ext.source === 'chrome-web-store' ? control(ext, 'extension:update', 'Check update') : ''}${ext.canRollback ? control(ext, 'extension:rollback', 'Roll back') : ''}${control(ext, 'ui:extension-remove', 'Remove', true)}`}</div>${ext.status !== 'remote-pending' ? `<details><summary>Permissions and compatibility</summary><p class="small muted">${ext.adapted ? 'Runs a managed compatibility copy. The verified original is retained.' : 'Legacy local installation; reinstall to receive the compatibility adapter.'}</p><h4>Granted access</h4><ul class="extension-access">${[...(ext.grants?.permissions || []), ...(ext.grants?.origins || [])].map((value) => `<li>${esc(value)}</li>`).join('') || '<li>No permissions granted</li>'}</ul>${['permissions', 'origins'].flatMap((kind) => (ext.revocable?.[kind] || []).map((value) => `<button type="button" class="text-button" data-action="extension:revoke-permission" data-id="${esc(ext.id)}" data-profile-id="${esc(ext.profileId)}" data-generation="${esc(ext.generation)}" data-permission-kind="${kind}" data-permission="${esc(value)}">Revoke ${esc(value)}</button>`)).join('')}${ext.pendingVersion ? `<h4>Requested access · ${esc(ext.pendingVersion)}</h4><ul class="extension-access">${[...(ext.requested?.permissions || []), ...(ext.requested?.origins || [])].map((value) => `<li>${esc(value)}</li>`).join('')}</ul>` : ''}${ext.commands?.length ? `<h4>Keyboard shortcuts</h4><ul class="extension-access">${ext.commands.map((command) => `<li>${esc(command.description || command.name)}: ${esc(command.shortcut || command.status === 'conflict' ? command.shortcut || 'Conflicts with another shortcut' : 'Unassigned')}</li>`).join('')}</ul>` : ''}<p class="small muted">${ext.syncState === 'local-only' ? 'Only on this device' : ext.syncState === 'not-linked' ? 'Not linked to a sync profile' : `Library sync: ${esc(ext.syncState)}. Permission approval is local to this device.`}</p></details>` : ''}</article>`).join('') : empty('extension', 'No extensions', 'Installed extensions and requests from your other devices appear here.')}`;
+  return `<p class="panel-intro">Extensions belong to <strong>${esc(activeProfile()?.name)}</strong>. Review requested access before allowing an extension to run.</p><div class="setting-actions">${primary('ui:extension-store', 'Install from Chrome Web Store', 'plus')}${secondary('extension:install', 'Load unpacked extension', 'folder')}${secondary('extension:check-updates', 'Check for updates', 'reload')}</div><p class="provider-note">Compatibility depends on the APIs each extension uses. Local folders stay on this device. Settings sync requires a linked account and separate consent.</p>${warnings}${extensions.length ? extensions.map((ext) => `<article class="extension-card"><div class="row"><div class="extension-icon">${ext.iconData ? `<img src="${esc(ext.iconData)}" alt="">` : icon('extension')}</div><div class="grow"><h3>${esc(ext.name || ext.id)}</h3><span class="small muted">${esc(ext.version || '')} · ${esc(labels[ext.status] || ext.status)}</span></div>${ext.action?.badgeText ? `<span class="extension-badge" data-badge-background="${esc(badgeColor(ext.action.badgeBackgroundColor, '#000000'))}" data-badge-foreground="${esc(badgeColor(ext.action.badgeTextColor, '#ffffff'))}">${esc(ext.action.badgeText)}</span>` : ''}</div><p class="small muted">${ext.source === 'chrome-web-store' ? 'Chrome Web Store' : 'Local folder · only on this device'}${ext.publisherVerified ? ' · Publisher proof verified' : ''}</p>${ext.description ? `<p>${esc(ext.description)}</p>` : ''}${ext.error || ext.syncError || ext.notificationError ? `<p class="danger">${esc(ext.error || ext.syncError || ext.notificationError)}</p>` : ''}${ext.requiresPageReload ? '<p class="provider-note">Open pages may still contain scripts from the previous version. Reload them to finish changing access.</p>' : ''}${ext.unsupported?.length ? `<ul class="extension-access">${ext.unsupported.map((item) => `<li>${esc(item.capability)}: ${esc(item.reason)}</li>`).join('')}</ul>` : ''}<div class="setting-actions">${ext.syncError ? control(ext, 'extension:retry-sync', 'Retry library change') : ''}${ext.status === 'remote-pending' ? control(ext, 'extension:review-remote', 'Review installation') : `${ext.pendingVersion && ext.compatible ? control(ext, 'extension:approve', 'Review permissions') : ''}${ext.status !== 'incompatible' && ext.status !== 'pending-approval' ? control(ext, 'extension:toggle', ext.enabled ? 'Disable' : 'Enable') : ''}${ext.enabled && ext.hasAction ? control(ext, 'extension:action', ext.action?.title || 'Open extension') : ''}${ext.enabled && ext.hasSidePanel ? control(ext, 'extension:panel-open', 'Open side panel') : ''}${ext.enabled && ext.hasOptions ? control(ext, 'extension:options', 'Options') : ''}${ext.source === 'chrome-web-store' ? control(ext, 'extension:update', 'Check update') : ''}${ext.canRollback ? control(ext, 'extension:rollback', 'Roll back') : ''}${control(ext, 'ui:extension-remove', 'Remove', true)}`}</div>${ext.status !== 'remote-pending' ? `<details><summary>Permissions and compatibility</summary><p class="small muted">${ext.adapted ? 'Runs a managed compatibility copy. The verified original is retained.' : 'Legacy local installation; reinstall to receive the compatibility adapter.'}</p><h4>Granted access</h4><ul class="extension-access">${[...(ext.grants?.permissions || []), ...(ext.grants?.origins || [])].map((value) => `<li>${esc(value)}</li>`).join('') || '<li>No permissions granted</li>'}</ul>${['permissions', 'origins'].flatMap((kind) => (ext.revocable?.[kind] || []).map((value) => `<button type="button" class="text-button" data-action="extension:revoke-permission" data-id="${esc(ext.id)}" data-profile-id="${esc(ext.profileId)}" data-generation="${esc(ext.generation)}" data-permission-kind="${kind}" data-permission="${esc(value)}">Revoke ${esc(value)}</button>`)).join('')}${ext.pendingVersion ? `<h4>Requested access · ${esc(ext.pendingVersion)}</h4><ul class="extension-access">${[...(ext.requested?.permissions || []), ...(ext.requested?.origins || [])].map((value) => `<li>${esc(value)}</li>`).join('')}</ul>` : ''}${ext.commands?.length ? `<h4>Keyboard shortcuts</h4><ul class="extension-access">${ext.commands.map((command) => `<li>${esc(command.description || command.name)}: ${esc(command.shortcut || command.status === 'conflict' ? command.shortcut || 'Conflicts with another shortcut' : 'Unassigned')}</li>`).join('')}</ul>` : ''}<p class="small muted">${ext.syncState === 'local-only' ? 'Only on this device' : ext.syncState === 'not-linked' ? 'Not linked to a sync profile' : `Library sync: ${esc(ext.syncState)}. Permission approval is local to this device.`}</p></details>` : ''}</article>`).join('') : empty('extension', 'No extensions', 'Installed extensions and requests from your other devices appear here.')}`;
 }
 function renderAnswer(message) {
   const text = String(message.text || '');
@@ -1149,6 +1166,7 @@ function renderAI() {
 function openPanel(panel, { refreshStatus = true } = {}) {
   if (!panelNames[panel]) return;
   const changed = ui.panel !== panel;
+  if (ui.panel === 'extension' && panel !== 'extension') safely(invoke('extension:panel-close'));
   if (!ui.panel || !$('#side-panel').contains(document.activeElement)) ui.panelReturn = focusDescriptor();
   ui.panelMotion = (ui.panelMotion || 0) + 1;
   $('#side-panel')
@@ -1183,6 +1201,7 @@ function openPanel(panel, { refreshStatus = true } = {}) {
 }
 function closePanel() {
   if (!ui.panel) return;
+  if (ui.panel === 'extension') safely(invoke('extension:panel-close'));
   ui.panelMotion = (ui.panelMotion || 0) + 1;
   $('#side-panel')
     .getAnimations()

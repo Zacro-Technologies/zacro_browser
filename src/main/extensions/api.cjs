@@ -2,6 +2,7 @@
 const { matches, covers, permissionDetails, optionalGrants } = require('./permissions.cjs');
 const { imageDataIcons } = require('./icons.cjs');
 const clone = (value) => structuredClone(value);
+const metadataSidePanel = (context) => context.metadata.grants.permissions.includes('sidePanel');
 const trusted = (context) => context.kind !== 'content-script';
 const reserved = new Set([
   'F5',
@@ -252,6 +253,7 @@ class ExtensionAPI {
       tab = await this.tab(context, tabId);
     this.guard(context);
     state.gesture = Date.now() + 5000;
+    if (metadataSidePanel(context)) this.sidePanel?.recordGesture(context);
     if (context.metadata.grants.permissions.includes('activeTab')) state.active.set(tabId, { url: tab.url });
     return tab;
   }
@@ -260,7 +262,13 @@ class ExtensionAPI {
       tab = await this.gesture(context, tabId),
       action = this.actionState(profileId, id, tabId);
     if (!action.enabled) return false;
-    if (action.popup)
+    if (
+      this.sidePanel &&
+      metadataSidePanel(context) &&
+      (await this.sidePanel.call(context, 'getPanelBehavior', [])).openPanelOnActionClick
+    ) {
+      await this.sidePanel.call(context, 'open', [{ tabId }]);
+    } else if (action.popup)
       await this.host(context, 'dialogs', 'openView', [
         id,
         { kind: 'action', url: resource(context, action.popup), tabId, generation: context.generation },
@@ -374,6 +382,13 @@ class ExtensionAPI {
     if (!trusted(context)) throw new Error('Trusted extension contexts only');
     if (method.split('.').length !== 2) throw new Error(`Unsupported API: ${method}`);
     const [group, name] = method.split('.');
+    if (group === 'sidePanel') {
+      if (!metadata.grants.permissions.includes('sidePanel')) throw new Error('Missing sidePanel permission');
+      if (!this.sidePanel) throw new Error('Side panel unavailable');
+      const result = await this.sidePanel.call(context, name, args);
+      this.guard(context);
+      return result;
+    }
     if (group === 'tabs') {
       if (name === 'get') return this.sanitize(context, await this.tab(context, args[0]));
       if (name === 'getCurrent') {

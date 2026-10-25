@@ -5,6 +5,7 @@ const files = require('node:fs');
 const { ExtensionManager } = require('./manager.cjs');
 const { ExtensionAPI } = require('./api.cjs');
 const { ExtensionBridge } = require('./bridge.cjs');
+const { SidePanelController } = require('./side-panel.cjs');
 const { NativeMessagingBroker } = require('./native-messaging.cjs');
 const { parseStoreId } = require('./packages.cjs');
 const { matches, covers } = require('./permissions.cjs');
@@ -58,6 +59,7 @@ function publicRecord(record) {
     canRollback: !!record.previous,
     hasOptions: !!(manifest.options_ui?.page || manifest.options_page),
     hasAction: !!(manifest.action || manifest.browser_action),
+    hasSidePanel: !!manifest.side_panel || record.grants?.permissions?.includes('sidePanel'),
   };
 }
 function inputShortcut(input) {
@@ -89,6 +91,7 @@ class ExtensionHost {
     syncClient,
     publish,
     report,
+    panelChanged = publish,
     native = require('electron'),
   }) {
     Object.assign(this, {
@@ -146,7 +149,20 @@ class ExtensionHost {
       approveHost: (review) => this.approveNativeHost(review),
       emit: (context, event) => this.bridge.emitNative(context, event),
     });
+    this.sidePanel = new SidePanelController({
+      native,
+      resolveExtension,
+      getProfile,
+      activeProfile,
+      getSession,
+      getWindow,
+      getTab: (profile, id) => browser.tabs.get(profile, id, () => {}),
+      activeTabId: (profile) => browser.activeTabId(profile),
+      profilePath: (profile) => this.manager.profilePath(profile),
+      changed: panelChanged,
+    });
     this.api = new ExtensionAPI({
+      sidePanel: this.sidePanel,
       nativeMessaging: this.nativeMessaging,
       resolveExtension,
       listExtensions: (profile) => this.manager.list(profile),
@@ -580,6 +596,7 @@ class ExtensionHost {
   }
   async deactivated({ profileId, extensionId, reason }) {
     this.nativeMessaging?.revoke({ profileId, extensionId });
+    this.sidePanel?.revoke(profileId, extensionId, reason === 'remove');
     this.closeViews(profileId, extensionId);
     const key = this.key(profileId, extensionId);
     this.notificationErrors.delete(key);
@@ -659,6 +676,8 @@ class ExtensionHost {
         return false;
       }
     };
+    if (this.manager.resolveExtension(profileId, id)?.grants.permissions.includes('sidePanel'))
+      this.sidePanel.trackInput(view.webContents, this.api.context(profileId, id));
     view.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
     view.webContents.on('will-navigate', (event, target) => {
       if (!validURL(target)) event.preventDefault();
@@ -682,6 +701,8 @@ class ExtensionHost {
         if (!item.window.isDestroyed()) item.window.destroy();
   }
   profileChanged() {
+    this.sidePanel?.destroy();
+    this.sidePanel?.gestures.clear();
     this.closeViews();
   }
   async handle(action, payload) {
@@ -714,6 +735,10 @@ class ExtensionHost {
     guard();
     await this.restore(profile.id);
     guard();
+    if (action === 'extension:panel-close') {
+      this.sidePanel.destroy();
+      return null;
+    }
     if (action === 'extension:reload-pages') return this.reloadPendingPages(profile.id, payload, guard);
     if (action === 'extension:check-updates') {
       await this.manager.checkUpdates(profile.id, { force: true });
@@ -793,6 +818,12 @@ class ExtensionHost {
               (value) => value !== payload.permission,
             );
             return this.manager.changePermissions(profile.id, id, grants);
+          }
+          case 'extension:panel-open': {
+            const context = this.api.context(profile.id, id);
+            this.sidePanel.recordGesture(context);
+            const tabId = this.browser.activeTabId(profile.id);
+            return this.sidePanel.call(context, 'open', [{ tabId }]);
           }
           case 'extension:action':
             return this.api.activateAction(profile.id, id, this.browser.activeTabId(profile.id));
@@ -940,6 +971,7 @@ class ExtensionHost {
     return result;
   }
   async removeProfile(profile) {
+    this.sidePanel?.revokeProfile(profile);
     this.nativeMessaging?.revoke({ profileId: profile });
     this.closeViews(profile);
     await this.manager.invalidateProfile(profile);
@@ -950,6 +982,7 @@ class ExtensionHost {
   async close() {
     this.closed = true;
     this.nativeMessaging?.dispose();
+    this.sidePanel?.close();
     this.closeViews();
     this.bridge.close();
     await this.manager.close();
