@@ -21,13 +21,13 @@
       "file": "0001-chromium-zacro-native-permissions.patch",
       "target": "chromium",
       "strip": 1,
-      "sha256": "f9536c7eb01327c56593bb45cbbab4a786712a103959875f758c610785e31ab3"
+      "sha256": "5ea0510619525ee16de46d93ae00287592f7fd4d0f6cc4a9a7786f23be64cff0"
     },
     {
       "file": "0002-electron-zacro-native-hooks.patch",
       "target": "electron",
       "strip": 1,
-      "sha256": "1681920408af98358fed68f581e446be72b1c285b14e8d64720feda5c632c7cc"
+      "sha256": "4ca0a7072c2d0feb90807f3cfcdb2f1f30554a53c181d8d7001d7022e2f297a7"
     }
   ]
 }

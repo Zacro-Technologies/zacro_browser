@@ -482,7 +482,7 @@ index 64f4c28..46572e3 100644
  };
  
 diff --git a/shell/browser/extensions/electron_extension_loader.cc b/shell/browser/extensions/electron_extension_loader.cc
-index 6d687b5..2c2cd8a 100644
+index 6d687b5..d840bb5 100644
 --- a/shell/browser/extensions/electron_extension_loader.cc
 +++ b/shell/browser/extensions/electron_extension_loader.cc
 @@ -24,12 +24,19 @@
@@ -505,7 +505,7 @@ index 6d687b5..2c2cd8a 100644
  
  namespace extensions {
  
-@@ -97,6 +104,74 @@ std::pair<scoped_refptr<const Extension>, std::string> LoadUnpacked(
+@@ -97,6 +104,75 @@ std::pair<scoped_refptr<const Extension>, std::string> LoadUnpacked(
  
  }  // namespace
  
@@ -574,13 +574,14 @@ index 6d687b5..2c2cd8a 100644
 +  prefs->AddGrantedPermissions(extension.id(), permissions);
 +  prefs->AddRuntimeGrantedPermissions(extension.id(), permissions);
 +  // Initialize before AddExtension can start a worker or inject a script.
-+  PermissionsUpdater(context).InitializePermissions(&extension);
++  PermissionsUpdater(context).InitializePermissionsWithoutManagement(
++      &extension);
 +}
 +
  ElectronExtensionLoader::ElectronExtensionLoader(
      content::BrowserContext* browser_context)
      : browser_context_(browser_context),
-@@ -112,11 +187,15 @@ ElectronExtensionLoader::~ElectronExtensionLoader() = default;
+@@ -112,11 +188,15 @@ ElectronExtensionLoader::~ElectronExtensionLoader() = default;
  void ElectronExtensionLoader::LoadExtension(
      const base::FilePath& extension_dir,
      int load_flags,
@@ -597,7 +598,7 @@ index 6d687b5..2c2cd8a 100644
  }
  
  void ElectronExtensionLoader::ReloadExtension(const ExtensionId& extension_id) {
-@@ -142,10 +221,46 @@ void ElectronExtensionLoader::UnloadExtension(
+@@ -142,10 +222,46 @@ void ElectronExtensionLoader::UnloadExtension(
  }
  
  void ElectronExtensionLoader::FinishExtensionLoad(
@@ -625,7 +626,7 @@ index 6d687b5..2c2cd8a 100644
 +      SeedZacroReviewedPermissions(browser_context_, *extension, *permissions);
 +    } else {
 +      PermissionsUpdater(browser_context_)
-+          .InitializePermissions(extension.get());
++          .InitializePermissionsWithoutManagement(extension.get());
 +    }
 +    if (initial_user_scripts_enabled) {
 +      if (ExtensionRegistry::Get(browser_context_)
@@ -644,11 +645,12 @@ index 6d687b5..2c2cd8a 100644
      ExtensionPrefs* extension_prefs = ExtensionPrefs::Get(browser_context_);
  
      if (BackgroundInfo::IsServiceWorkerBased(extension.get())) {
-@@ -187,6 +302,7 @@ void ElectronExtensionLoader::FinishExtensionReload(
+@@ -187,6 +303,8 @@ void ElectronExtensionLoader::FinishExtensionReload(
      std::pair<scoped_refptr<const Extension>, std::string> result) {
    scoped_refptr<const Extension> extension = result.first;
    if (extension) {
-+    PermissionsUpdater(browser_context_).InitializePermissions(extension.get());
++    PermissionsUpdater(browser_context_)
++        .InitializePermissionsWithoutManagement(extension.get());
      extension_registrar_->AddExtension(extension);
    }
  }
@@ -782,18 +784,21 @@ index 6e8b569..028ac8c 100644
    std::unique_ptr<AppSorting> app_sorting_;
    std::unique_ptr<ManagementPolicy> management_policy_;
 diff --git a/shell/browser/extensions/electron_extensions_browser_api_provider.cc b/shell/browser/extensions/electron_extensions_browser_api_provider.cc
-index 70b8fe5..932ff1a 100644
+index 70b8fe5..ec4f8ec 100644
 --- a/shell/browser/extensions/electron_extensions_browser_api_provider.cc
 +++ b/shell/browser/extensions/electron_extensions_browser_api_provider.cc
-@@ -64,6 +64,11 @@ constexpr const char* kUnsupportedWebstorePrivateFunctions[] = {
+@@ -64,6 +64,14 @@ constexpr const char* kUnsupportedWebstorePrivateFunctions[] = {
  };
  
  void OverrideUnsupportedFunctions(ExtensionFunctionRegistry* registry) {
 +  // Zacro review is host-only. Retaining optional declarations must not create
-+  // an unreviewed native request path, including direct extension IPC dispatch.
-+  registry->Register(ExtensionFunctionRegistry::FactoryEntry(
-+      &NewExtensionFunction<UnsupportedFunction>, "permissions.request",
-+      functions::UNKNOWN));
++  // an unreviewed native mutation path, including direct extension IPC
++  // dispatch. Removal must also use the authenticated host path so temporary
++  // grants, userScripts consent and exact update sequencing cannot be bypassed.
++  for (const char* name : {"permissions.request", "permissions.remove"}) {
++    registry->Register(ExtensionFunctionRegistry::FactoryEntry(
++        &NewExtensionFunction<UnsupportedFunction>, name, functions::UNKNOWN));
++  }
    for (const char* name : kUnsupportedWebstorePrivateFunctions) {
      registry->Register(ExtensionFunctionRegistry::FactoryEntry(
          &NewExtensionFunction<UnsupportedFunction>, name, functions::UNKNOWN));
@@ -901,10 +906,10 @@ index 0000000..a878327
 +}).catch(error => { console.error(error); app.exit(1); });
 diff --git a/spec/zacro-native-capabilities.spec.ts b/spec/zacro-native-capabilities.spec.ts
 new file mode 100644
-index 0000000..93e5469
+index 0000000..f6bb2a2
 --- /dev/null
 +++ b/spec/zacro-native-capabilities.spec.ts
-@@ -0,0 +1,257 @@
+@@ -0,0 +1,314 @@
 +// These acceptance tests require the patched binary. Stock Electron must fail.
 +import { BrowserWindow, session, type Session } from 'electron/main';
 +import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
@@ -960,12 +965,12 @@ index 0000000..93e5469
 +    await fs.rm(directory, { recursive: true, force: true });
 +  });
 +
-+  async function extension(permissions = ['activeTab', 'scripting'], origins: string[] = []) {
++  async function extension(permissions = ['activeTab', 'scripting'], origins: string[] = [], optionalPermissions = ['storage']) {
 +    const extensionPath = path.join(directory, `extension-${sequence++}`);
 +    await fs.mkdir(extensionPath);
 +    await fs.writeFile(path.join(extensionPath, 'manifest.json'), JSON.stringify({
 +      manifest_version: 3, name: 'Native capability acceptance', version: '1.0',
-+      permissions, host_permissions: origins, optional_permissions: ['storage'],
++      permissions, host_permissions: origins, optional_permissions: optionalPermissions,
 +      optional_host_permissions: ['http://*/*']
 +    }));
 +    await fs.writeFile(path.join(extensionPath, 'page.html'), '<!doctype html><body>Native caller</body>');
@@ -986,6 +991,23 @@ index 0000000..93e5469
 +  function inject(caller: BrowserWindow, id: number) {
 +    return caller.webContents.executeJavaScript(`chrome.scripting.executeScript({target:{tabId:${id}},func:()=>location.href})`);
 +  }
++
++  it('initializes managed, ordinary and runtime-reloaded extensions before activation', async () => {
++    const { ext, caller, extensionPath } = await extension();
++    expect(await caller.webContents.executeJavaScript('chrome.permissions.contains({permissions:["activeTab","scripting"]})')).toBe(true);
++    await native(profile).setZacroReviewedPermissions(ext.id, { permissions: ['activeTab', 'scripting', 'storage'], origins: [] });
++    profile.extensions.removeExtension(ext.id);
++    const ordinaryReady = once(profile.extensions, 'extension-ready');
++    await profile.extensions.loadExtension(extensionPath);
++    await ordinaryReady;
++    const ordinaryCaller = await tab(profile, `chrome-extension://${ext.id}/page.html`);
++    expect(await ordinaryCaller.webContents.executeJavaScript('chrome.permissions.contains({permissions:["storage"]})')).toBe(true);
++    const runtimeReady = once(profile.extensions, 'extension-ready');
++    await ordinaryCaller.webContents.executeJavaScript('setTimeout(() => chrome.runtime.reload(), 0); true');
++    await runtimeReady;
++    const reloadedCaller = await tab(profile, `chrome-extension://${ext.id}/page.html`);
++    expect(await reloadedCaller.webContents.executeJavaScript('chrome.permissions.contains({permissions:["activeTab","scripting","storage"]})')).toBe(true);
++  });
 +
 +  it('grants only the invoked native tab and rejects cross-profile/private targets', async () => {
 +    const { ext, caller } = await extension();
@@ -1032,6 +1054,27 @@ index 0000000..93e5469
 +    await expect(granting).rejects.toThrow(/cancelled/);
 +  });
 +
++  it('keeps A pending grants alive when unrelated B unloads or loses rights', async () => {
++    const { ext: a, caller: callerA } = await extension();
++    const { ext: b } = await extension();
++    const first = await tab();
++    const pendingA = native(profile).grantZacroActiveTab(a.id, first.webContents.id);
++    profile.extensions.removeExtension(b.id);
++    await pendingA;
++    expect((await inject(callerA, first.webContents.id))[0].result).toBe(url);
++
++    const { ext: c, caller: callerC } = await extension();
++    await native(profile).setZacroReviewedPermissions(c.id, { permissions: ['activeTab', 'scripting', 'storage'], origins: [] });
++    const second = await tab();
++    await native(profile).grantZacroActiveTab(c.id, second.webContents.id);
++    const nextA = native(profile).grantZacroActiveTab(a.id, second.webContents.id);
++    const revokingC = native(profile).setZacroReviewedPermissions(c.id, { permissions: ['activeTab', 'scripting'], origins: [] });
++    await nextA;
++    await revokingC;
++    expect((await inject(callerA, second.webContents.id))[0].result).toBe(url);
++    await expect(inject(callerC, second.webContents.id)).rejects.toThrow();
++  });
++
 +  it('rejects an extension that did not declare activeTab and internal pages', async () => {
 +    const { ext } = await extension(['scripting']);
 +    const first = await tab();
@@ -1060,6 +1103,25 @@ index 0000000..93e5469
 +    await expect(inject(caller, first.webContents.id)).rejects.toThrow();
 +    expect(await caller.webContents.executeJavaScript('chrome.permissions.contains({permissions:["storage"]})')).toBe(false);
 +    await expect(native(profile).setZacroReviewedPermissions(ext.id, { permissions: ['debugger'], origins: [] })).rejects.toThrow();
++  });
++
++  it('denies native optional permission removal and routes cleanup through the host', async () => {
++    const { ext, caller } = await extension(['scripting'], ['http://127.0.0.1/*'], ['activeTab', 'userScripts']);
++    await native(profile).setZacroReviewedPermissions(ext.id, { permissions: ['scripting', 'activeTab', 'userScripts'], origins: ['http://127.0.0.1/*'] });
++    native(profile).setZacroUserScriptsEnabled(ext.id, true);
++    await caller.webContents.executeJavaScript(`chrome.userScripts.register([{id:'native-removal',matches:['http://127.0.0.1/*'],js:[{code:"document.documentElement.dataset.nativeRemoval = 'ran'"}],runAt:'document_end',world:'USER_SCRIPT'}])`);
++    const first = await tab();
++    await native(profile).grantZacroActiveTab(ext.id, first.webContents.id);
++    expect(await first.webContents.executeJavaScript('document.documentElement.dataset.nativeRemoval')).toBe('ran');
++    await expect(caller.webContents.executeJavaScript('chrome.permissions.remove({permissions:["activeTab","userScripts"]})')).rejects.toThrow(/not supported/);
++    expect(await caller.webContents.executeJavaScript('chrome.permissions.contains({permissions:["activeTab","userScripts"]})')).toBe(true);
++    await native(profile).setZacroReviewedPermissions(ext.id, { permissions: ['scripting'], origins: ['http://127.0.0.1/*'] });
++    expect(await caller.webContents.executeJavaScript('chrome.permissions.contains({permissions:["activeTab","userScripts"]})')).toBe(false);
++    const reloaded = once(first.webContents, 'did-finish-load');
++    first.reload();
++    await reloaded;
++    expect(await first.webContents.executeJavaScript('document.documentElement.dataset.nativeRemoval')).toBeUndefined();
++    await expect(native(profile).grantZacroActiveTab(ext.id, first.webContents.id)).rejects.toThrow();
 +  });
 +
 +  it('retains required hosts when revoking a broader optional origin', async () => {

@@ -70,9 +70,10 @@ session/extension/tab identity and reject invalid input.
   asynchronous operating-system font enumeration.
 
 Original optional declarations remain metadata; they are never moved into
-required permissions. Native `permissions.request` is disabled at browser
+required permissions. Native `permissions.request` and `permissions.remove` are disabled at browser
 function registration, so retaining these declarations cannot bypass the
-application's reviewed request path. Native APIs are not exposed to USER_SCRIPT
+application's reviewed mutation path. Removal must use the authenticated host
+facade so userScripts, temporary grants and serialization stay consistent. Native APIs are not exposed to USER_SCRIPT
 worlds, and no manifest-wide activeTab host grant or CSS font shim is used.
 
 ## Acceptance evidence required
@@ -86,3 +87,18 @@ profile isolation, new contents, getter values and default restoration.
 
 Additional packaged Windows/x64/arm64 runs, artifact hashes/signing and real
 application identity/consent integration remain mandatory release gates.
+
+## Review corrections, round 1
+
+Electron has no ExtensionManagementClient. Its managed, ordinary and reload
+paths explicitly use `InitializePermissionsWithoutManagement`, which asserts the
+service is absent and performs normal bounded/effective permission, context ID,
+pref and native default-host-policy initialization before activation. It does
+not dereference a null delegate or fabricate enterprise policy decisions.
+Normal Chromium callers retain their existing managed initialization behavior.
+
+Grant cancellation now tracks per-extension operation-generation tokens. An
+unload or reviewed revocation for B invalidates only B; navigation/destruction
+still invalidates all pending callbacks for the tab. Native cases cover managed,
+ordinary and runtime reload startup, A pending while B unloads or loses rights,
+and direct native optional-permission removal denial and host cleanup.
