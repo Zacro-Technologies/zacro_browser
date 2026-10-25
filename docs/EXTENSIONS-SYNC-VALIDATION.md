@@ -2,9 +2,11 @@
 
 This is the development record for `extensions-and-sync`, based on the
 [approved design](superpowers/specs/2026-10-25-extensions-and-sync-design.md).
-Implementation is committed through `cae78db`; local acceptance remains incomplete
-because the Mac is locked and the rebuilt development app needs an OS Keychain
-confirmation. The record below separates passing checks from these open gates.
+Production implementation is committed through `cae78db`. After the Mac was
+unlocked, the final full verification passed all 240 Node and 96 native checks.
+Final packaged acceptance remains
+incomplete because the rebuilt development app still waits for an OS Keychain
+confirmation. The record below separates passing checks from open gates.
 
 ## Environment and baseline
 
@@ -154,8 +156,25 @@ profile or real external account is used.
   compact-layout (1), Mac keyboard (2), polish startup focus (20), and startup
   paint (1). Native diagnostics showed invisible-to-the-desktop page visibility
   and no focused window. Computer-use tooling then positively confirmed that
-  the Mac was locked. The user has been asked to unlock it; these failures are
-  not suppressed or reported as passed.
+  the Mac was locked. The user subsequently unlocked it; see the later full-run
+  results below. The original failed run is retained as historical evidence.
+- The first unlocked `npm run verify` passed formatting/syntax and **240/240**
+  Node checks, with **94/96** native checks passing. The old focus/paint failures
+  passed. Two stale test expectations failed: Settings still expected four
+  disclosures after Account & sync added a fifth, and one notification test
+  still counted only worker filtering after live-frame delivery was added.
+  The tests now assert all five named sections and keyboard operation, and the
+  exact permission-check context/timing for the live frame and queued worker.
+  The focused rerun passed **2/2**. Independent review found no actionable
+  findings and confirmed the behavior/security assertions remain intact.
+- The final unlocked `npm run verify` exited **0** after those test corrections:
+  formatting/syntax passed, **240/240** Node checks passed, and **96/96** native
+  checks passed, with no failures, cancellations or skipped tests. The native
+  suite completed in 235.36 seconds. It includes all five complete two-browser
+  variants, the corrected assertions, native focus and startup painting. No
+  production source changed after the reviewed `cae78db` implementation, so
+  the existing final-source build and soak results still apply. Reviewed test
+  corrections and bounded package-process cleanup are committed at `fbb705a`.
 - Following the final bridge fix, focused native **8/8** passed: genuine stopped
   classic/module worker wake, MV2 lazy wake, MV2 idle-retirement race, immediate
   and gated first-listener notifications in both extension pages and isolated
@@ -176,9 +195,14 @@ profile or real external account is used.
   before the first local page loaded. Narrow macOS `securityd` diagnostics
   explicitly show a pending “Zacro Safe Storage” access confirmation for the
   rebuilt app. Its ad-hoc CDHash differs from the existing Keychain ACL's
-  requirement. The Mac is locked, so the confirmation cannot be handled.
+  requirement. After the user unlocked the Mac, an explicit interactive rerun
+  still timed out at the same first-navigation assertion after 305 seconds;
+  **0/1** passed. The user has been asked to handle the OS confirmation manually.
+  This run did not establish packaged browsing or the later executable checks.
   No Keychain item, credential or OS protection was changed. A disposable
   browser profile does not isolate the app-scoped Keychain encryption key.
+  Test cleanup now waits for its own disposable process to exit before deleting
+  the temporary profile; the blocked run ended without leaving that process.
 - The final full-product native file passed **9/9**, including all five
   two-Electron variants, against the actual service and OS-protected credentials.
   The review-fix native group passed **6/6**; the final active-profile deletion
@@ -201,15 +225,13 @@ was performed.
 
 Implementation choices and their costs are recorded in [the decision record](EXTENSIONS-SYNC-DECISIONS.md).
 
-## Resume the remaining local gates
+## Resume packaged acceptance
 
-Unlock the Mac manually first. Run `npm run verify` with the normal native
-focus/paint assertions intact. The previously failing files are
-`compact-layout.test.cjs`, `mac.test.cjs`, `polish.test.cjs`, and
-`startup.test.cjs` under `test/e2e/`.
-
-For the final packaged executable, review and handle the genuine macOS
-“Zacro Safe Storage” confirmation if it appears, then rerun
-`npm run test:package`. Rebuilding an ad-hoc app can change its signature again;
+For the final packaged executable, keep the Mac unlocked and run
+`ZACRO_INTERACTIVE_KEYCHAIN=1 npm run test:package`. This explicit local mode
+allows five extra minutes for the user to review and handle the genuine macOS
+“Zacro Safe Storage” confirmation. It does not approve the dialog or skip any
+assertion. The ordinary `npm run test:package` keeps its original deadlines.
+Rebuilding an ad-hoc app can change its signature again;
 never delete the Keychain entry or disable encryption/fuses just to bypass this
 gate. The final local artifact is `dist/mac-arm64/Zacro.app`.

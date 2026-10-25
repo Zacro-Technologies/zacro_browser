@@ -59,11 +59,17 @@
 
 Implementation and review fixes are committed through `cae78db` on the requested
 branch. Independent whole-branch/scoped review has no remaining code findings.
-Final Node240/240, full-product native9/9, focused native lifecycle/permissions,
-soak40cycles, arm64 build and packaged-source/fuse checks pass. The local full
-UI gate still needs an unlocked Mac; the final actual packaged run also needs
-the genuine macOS Keychain confirmation after the ad-hoc signature changed.
+After user-confirmed unlock, final `npm run verify` exits0: formatting/syntax,
+Node240/240 and native96/96 pass, including all five two-browser variants and
+native focus/paint. Two stale test expectations were corrected with exact
+section/keyboard and permission-check timing assertions; narrow independent
+review approved those test-only changes. Production remains at `cae78db`.
+Soak40cycles, arm64 build and packaged-source/fuse checks also pass. The final
+actual packaged run still needs the genuine macOS Keychain confirmation after
+the ad-hoc signature changed; the explicit interactive rerun timed out0/1 at
+first navigation. No protection or behavior assertion was weakened.
 Windows/Intel Mac CI and the Docker image have not been run for this branch.
-The unchecked verification items remain open; see
+The combined verification items remain open because packaged acceptance is
+pending; the completed local UI gate does not imply package acceptance. See
 [the validation record](../../EXTENSIONS-SYNC-VALIDATION.md). No merge or
 publication was performed. Keep the checkout and validation evidence for resume.

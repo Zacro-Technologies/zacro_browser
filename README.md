@@ -12,7 +12,7 @@ Zacro is an independent project, not an official continuation of Arc or an affil
 
 **Desktop development build.** This repository contains a runnable Chromium browser built with Electron, with Windows 11 x64 and native macOS integration for Apple silicon and Intel. It includes real page rendering, sandboxed tabs, Spaces, separate profiles, Peek, split view, local session recovery, library panels, managed compatible extensions, and optional AI through your Codex subscription. Windows has passed local and CI checks; native macOS 15 CI has passed on both architectures, including packaged-application acceptance and development DMG/ZIP builds. Physical Mac review and signed/notarized release acceptance remain open. See [macOS setup and validation](docs/MACOS.md) for the exact support boundary.
 
-The `extensions-and-sync` branch adds verified Web Store installation, action/options controls, a distinct `chrome.storage.sync` adapter, and an independently runnable account/sync service with explicit profile links and device management. See [extension support](docs/EXTENSIONS.md), [how to try synchronization](docs/SYNC.md), and [feature validation](docs/EXTENSIONS-SYNC-VALIDATION.md). Feature acceptance and review are still in progress; earlier platform CI results do not validate this branch.
+The `extensions-and-sync` branch adds verified Web Store installation, action/options controls, a distinct `chrome.storage.sync` adapter, and an independently runnable account/sync service with explicit profile links and device management. See [extension support](docs/EXTENSIONS.md), [how to try synchronization](docs/SYNC.md), and [feature validation](docs/EXTENSIONS-SYNC-VALIDATION.md). Independent code review is complete; final packaged and cross-platform acceptance remain open. Earlier platform CI results do not validate this branch.
 
 This is **not yet a complete implementation of the vision or a commercial release**. Full Chrome extension compatibility, a publicly operated sync service, consequential browser agents, signed automatic updates, and operational/security release gates remain open. Subscription sign-in is implemented; live account and inference acceptance still requires a user to finish ChatGPT sign-in. The [implementation roadmap](docs/ROADMAP.md) separates working features from required release work; [AI documentation](docs/AI.md) describes the connection and data boundaries.
 
@@ -225,11 +225,12 @@ The initial integration uses Electron 45, a sandboxed HTML/CSS/JavaScript interf
 - [x] Build downloads, history, bookmarks, and settings interfaces.
 - [x] Manage compatible unpacked extensions with profile isolation and enable/disable/remove controls.
 - [x] Add verified Web Store acquisition and action/options browser integration.
-- [ ] Complete broader extension compatibility and background-lifecycle acceptance.
+- [x] Validate the supported MV2/MV3 background contexts, including native suspend/wake.
+- [ ] Expand compatibility beyond the documented Electron API boundary.
 - [x] Design and implement Zacro accounts, device management, and explicit profile-scoped sync.
-- [ ] Sync extension installation and removal across compatible desktop devices.
+- [x] Synchronize extension installation and removal between explicitly linked profiles.
 - [x] Integrate distinct extension settings through `chrome.storage.sync` with separate consent.
-- [ ] Validate sync permissions, offline conflicts, device revocation, and cloud-data deletion.
+- [x] Validate sync permissions, offline conflicts, device revocation, and cloud-data deletion with isolated desktop clients and the real service.
 - [x] Import/export Zacro data and standard bookmark HTML, including supported bookmark exports from other browsers.
 - [ ] Add and validate native Arc sidebar migration.
 - [x] Add local keyboard, contrast, reduced-motion, lifecycle and recovery regressions.

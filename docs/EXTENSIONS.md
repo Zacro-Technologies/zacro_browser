@@ -3,7 +3,7 @@
 The `extensions-and-sync` branch adds verified Chrome Web Store acquisition,
 profile-scoped extension controls, and a Zacro compatibility adapter. Development
 acceptance is still in progress; the [validation record](EXTENSIONS-SYNC-VALIDATION.md)
-distinguishes working checks from open lifecycle and platform gates. This is a
+distinguishes passing lifecycle checks from open packaged and platform gates. This is a
 bounded compatibility layer, not Chrome-wide extension support.
 
 ## Install and manage
