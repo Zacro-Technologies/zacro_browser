@@ -284,10 +284,10 @@ for (const cancellation of ['filter', 'disable', 'profile', 'trusted', 'expiry']
           return original(event, request);
         };
         f.events.length = 0;
-        let checks = 0;
+        const checks = [];
         f.bridge.emit('p1', f.record.id, 'commands.onCommand', ['pending'], {
-          filter: () => {
-            checks++;
+          filter: (context) => {
+            checks.push({ kind: context.kind, allowed, waiting });
             return allowed;
           },
         });
@@ -339,7 +339,14 @@ for (const cancellation of ['filter', 'disable', 'profile', 'trusted', 'expiry']
       if (cancellation === 'expiry') assert.match(result.errors[0]?.message, /deadline/);
       assert.equal(result.queues, 0);
       if (cancellation === 'filter') {
-        assert.equal(result.checks, 1, 'filter runs only at delivery');
+        assert.deepEqual(
+          result.checks,
+          [
+            { kind: 'extension-frame', allowed: true, waiting: false },
+            { kind: 'service-worker', allowed: false, waiting: true },
+          ],
+          'live frames are checked immediately; the queued worker rechecks policy only at delivery',
+        );
         assert.equal(result.errors.length, 3, '128-event queue reports overflow without unbounded retention');
         assert.ok(result.errors.every((error) => /queue limit/.test(error.message)));
       }

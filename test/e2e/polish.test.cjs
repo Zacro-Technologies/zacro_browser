@@ -334,8 +334,15 @@ test(
     await openLibrarySection(shell, 'settings');
     await expect(shell.locator('select[data-setting="theme"]')).toBeVisible();
     const disclosures = shell.locator('#side-panel details');
-    await expect(disclosures).toHaveCount(4);
+    await expect(disclosures.locator('summary')).toHaveText([
+      'Account & sync',
+      'Codex subscription',
+      'Your data',
+      'Extensions',
+      'About Zacro',
+    ]);
     assert.deepEqual(await disclosures.evaluateAll((items) => items.map((item) => item.open)), [
+      false,
       false,
       false,
       false,
@@ -352,7 +359,7 @@ test(
     await expect(connection).toHaveAttribute('open', '');
     await expect(shell.getByLabel('Model', { exact: true })).toHaveValue('fixture-two');
     await expect(shell.getByLabel('Model', { exact: true })).toBeFocused();
-    for (const heading of ['Your data', 'Extensions', 'About Zacro']) {
+    for (const heading of ['Account & sync', 'Your data', 'Extensions', 'About Zacro']) {
       const summary = shell.locator('#side-panel summary').filter({ hasText: heading });
       await summary.focus();
       await shell.keyboard.press('Enter');

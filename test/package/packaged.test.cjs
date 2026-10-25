@@ -13,10 +13,14 @@ const { getCurrentFuseWire, FuseV1Options } = require('@electron/fuses');
 const { makePDF } = require('../fixtures/pdf.cjs');
 const { packagedPaths } = require('../../scripts/platform-build.cjs');
 const execFileAsync = promisify(execFile);
+// An ad-hoc macOS rebuild changes its code hash, so an existing Keychain
+// entry may need the user's approval. Only an explicit interactive run waits
+// for that OS dialog; ordinary CI keeps its existing navigation deadline.
+const keychainApprovalWait = process.env.ZACRO_INTERACTIVE_KEYCHAIN === '1' ? 300000 : 0;
 
 test(
   'native package has hardened fuses, browses, parses PDFs and starts its isolated Codex runtime',
-  { timeout: 90000, skip: !['win32', 'darwin'].includes(process.platform) },
+  { timeout: 90000 + keychainApprovalWait, skip: !['win32', 'darwin'].includes(process.platform) },
   async (t) => {
     const root = path.resolve(__dirname, '../..');
     const captureMacDesktop = async (name) => {
@@ -51,7 +55,16 @@ test(
     t.after(async () => {
       if (harness) await harness.close().catch(() => harness.process().kill());
       if (browser) await browser.close().catch(() => {});
-      if (child && child.exitCode === null) child.kill();
+      if (child && child.exitCode === null && child.signalCode === null) {
+        const exited = once(child, 'exit');
+        const timer = setTimeout(() => child.kill('SIGKILL'), 2000);
+        child.kill();
+        try {
+          await exited;
+        } finally {
+          clearTimeout(timer);
+        }
+      }
       server.closeAllConnections();
       await new Promise((resolve) => server.close(resolve));
       await fs.rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
@@ -122,10 +135,13 @@ test(
     const url = `http://127.0.0.1:${server.address().port}/`;
     await shell.evaluate((url) => window.zacro.invoke('navigate', { url }), url);
     await expect
-      .poll(async () => {
-        const state = await shell.evaluate(() => window.zacro.invoke('state:get'));
-        return state.tabs.find((tab) => tab.id === state.activeTabId)?.title;
-      })
+      .poll(
+        async () => {
+          const state = await shell.evaluate(() => window.zacro.invoke('state:get'));
+          return state.tabs.find((tab) => tab.id === state.activeTabId)?.title;
+        },
+        { timeout: 5000 + keychainApprovalWait },
+      )
       .toBe('Packaged browser acceptance');
     await fs.mkdir(path.join(root, 'test-results'), { recursive: true });
     await shell.screenshot({ path: path.join(root, 'test-results/packaged-browser.png') });
