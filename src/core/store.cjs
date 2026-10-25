@@ -3,6 +3,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const { EventEmitter } = require('node:events');
+const { sanitizeOverrides } = require('./shortcuts.cjs');
 
 const MAX_TABS = 1000;
 const MAX_HISTORY = 20000;
@@ -78,26 +79,13 @@ function webUrl(value) {
 }
 
 function createInitialState() {
-  const now = Date.now();
   return {
     version: 1,
     profiles: [{ id: 'default', name: 'Personal', private: false }],
     spaces: [{ id: 'home', profileId: 'default', name: 'Personal', color: '#9d4460', icon: 'P' }],
     activeSpaceId: 'home',
-    activeTabId: 'welcome',
-    tabs: [
-      {
-        id: 'welcome',
-        spaceId: 'home',
-        profileId: 'default',
-        title: 'New tab',
-        url: 'zacro://newtab',
-        pinned: false,
-        folderId: null,
-        createdAt: now,
-        lastActiveAt: now,
-      },
-    ],
+    activeTabId: null,
+    tabs: [],
     folders: [],
     history: [],
     bookmarks: [],
@@ -115,6 +103,7 @@ function createInitialState() {
       aiProvider: 'codex',
       aiModel: '',
       sharePageContext: false,
+      shortcutOverrides: {},
     },
     windowBounds: { width: 1440, height: 940 },
   };
@@ -133,9 +122,15 @@ function validateSettings(values, base = createInitialState().settings) {
     next.openSourcesLimit = Math.min(10, Math.max(1, values.openSourcesLimit));
   for (const key of ['restoreSession', 'sharePageContext'])
     if (typeof values[key] === 'boolean') next[key] = values[key];
-  next.aiProvider = 'codex';
-  if (values.aiProvider === 'codex' && typeof values.aiModel === 'string')
-    next.aiModel = str(values.aiModel, 100);
+  if (['codex', 'claude-code', 'openai', 'anthropic', 'compatible', 'openrouter'].includes(values.aiProvider))
+    next.aiProvider = values.aiProvider;
+  if (
+    typeof values.aiModel === 'string' &&
+    (!values.aiModel || /^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,159}$/.test(values.aiModel))
+  )
+    next.aiModel = values.aiModel;
+  if (Object.hasOwn(values, 'shortcutOverrides'))
+    next.shortcutOverrides = sanitizeOverrides(values.shortcutOverrides);
   return next;
 }
 
@@ -184,6 +179,7 @@ function hydrate(raw) {
     title: str(t.customTitle, 500) || str(t.title, 500) || 'New tab',
     ...(str(t.customTitle, 500) ? { customTitle: str(t.customTitle, 500) } : {}),
     url: webUrl(t.url) || 'zacro://newtab',
+    ...(t.homePage === true && !webUrl(t.url) ? { homePage: true } : {}),
     pinned: Boolean(t.pinned),
     folderId: folders.get(t.folderId)?.spaceId === t.spaceId ? t.folderId : null,
     createdAt: time(t.createdAt),
@@ -433,6 +429,7 @@ class BrowserStore extends EventEmitter {
           profileId: space.profileId,
           url,
           title: url === 'zacro://newtab' ? 'New tab' : new URL(url).hostname,
+          ...(p.homePage === true && (!p.url || p.url === 'zacro://newtab') ? { homePage: true } : {}),
           pinned: false,
           folderId: null,
           createdAt: now,
@@ -459,6 +456,7 @@ class BrowserStore extends EventEmitter {
       case 'tab:update': {
         const tab = this.require('tabs', p.id, 'Tab');
         if (p.url !== undefined) tab.url = normalizeAddress(p.url, s.settings.searchEngine);
+        if (tab.url !== 'zacro://newtab') delete tab.homePage;
         if (p.title !== undefined && !tab.customTitle) tab.title = str(p.title, 500) || tab.url;
         result = tab;
         break;
@@ -496,6 +494,10 @@ class BrowserStore extends EventEmitter {
         const oldSpace = tab.spaceId;
         tab.spaceId = space.id;
         if (p.folderId !== undefined || oldSpace !== space.id) tab.folderId = p.folderId || null;
+        if (typeof p.pinned === 'boolean') {
+          tab.pinned = p.pinned;
+          if (p.pinned) tab.folderId = null;
+        }
         if (tab.folderId) tab.pinned = false;
         if (Number.isInteger(p.index)) {
           s.tabs.splice(s.tabs.indexOf(tab), 1);

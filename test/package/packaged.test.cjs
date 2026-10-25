@@ -117,7 +117,7 @@ test(
     await fs.mkdir(path.join(root, 'test-results'), { recursive: true });
     await shell.screenshot({ path: path.join(root, 'test-results/packaged-browser.png') });
     await captureMacDesktop('packaged-mac-browser-desktop.png');
-    await shell.evaluate(() => window.zacro.invoke('navigate', { url: 'zacro://newtab' }));
+    await shell.evaluate(() => window.zacro.invoke('tab:create', { homePage: true }));
     await expect(shell.locator('#home-query')).toBeVisible();
     for (const theme of ['light', 'dark']) {
       await shell.evaluate((theme) => window.zacro.invoke('settings:update', { values: { theme } }), theme);

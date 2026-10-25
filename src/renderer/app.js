@@ -1,3 +1,5 @@
+import { createSpaceGesture } from './space-gesture.js';
+
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 const esc = (value = '') =>
@@ -17,7 +19,7 @@ const icons = {
   forward: 'm10 5 7 7-7 7',
   down: 'm7 10 5 5 5-5',
   up: 'm7 14 5-5 5 5',
-  reload: 'M20 7v5h-5M4 17v-5h5M6.1 7a7 7 0 0 1 11.6-2L20 8M4 16l2.3 3A7 7 0 0 0 18 17',
+  reload: 'M20 4v6h-6M19.1 9a7.5 7.5 0 1 0 .4 5',
   search: 'M21 21l-5-5M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0',
   star: 'm12 3 2.8 5.7 6.3.9-4.6 4.5 1.1 6.3L12 17.4l-5.6 3 1.1-6.3L3 9.6l6.2-.9z',
   split: 'M3 4h18v16H3zM12 4v16',
@@ -119,6 +121,12 @@ const ui = {
   commandIndex: 0,
   commandMode: 'navigate',
   commandItems: [],
+  commandAuto: false,
+  commandBusy: false,
+  blankPaletteContext: null,
+  shortcutQuery: '',
+  recordingShortcut: null,
+  shortcutError: '',
   closedFolders: new Set(),
   dragTab: null,
   aiMessages: [],
@@ -143,66 +151,109 @@ const activeProfile = () => state?.profiles.find((p) => p.id === activeSpace()?.
 const activeTab = () => state?.tabs.find((t) => t.id === state.activeTabId);
 const currentTabs = () => state?.tabs.filter((t) => t.spaceId === state.activeSpaceId) || [];
 const profileItems = (key) => (state?.[key] || []).filter((item) => item.profileId === activeProfile()?.id);
+const shortcutFor = (id, fallback = '') => {
+  const entry = state?.runtime?.shortcuts?.find((item) => item.id === id);
+  return shortcut(entry ? entry.accelerator : fallback);
+};
+const shortcutLabel = (label, id, fallback = '') => {
+  const key = shortcutFor(id, fallback);
+  return `${label}${key ? ` (${key})` : ''}`;
+};
+const blankContext = () => `${state?.activeSpaceId || ''}:${state?.activeTabId || 'empty'}`;
+const isBlankPage = () => !activeTab() || (activeTab().url === 'zacro://newtab' && !activeTab().homePage);
+function maybeOpenBlankPalette() {
+  if (!state || ui.commandBusy || !isBlankPage() || ui.dialog || ui.panel || ui.dragTab) return;
+  const context = blankContext();
+  if (ui.blankPaletteContext === context) return;
+  ui.blankPaletteContext = context;
+  requestAnimationFrame(() => {
+    if (!ui.dialog && !ui.panel && !ui.commandBusy && isBlankPage() && blankContext() === context)
+      openCommand('newtab', '', { automatic: true });
+  });
+}
 const sidebarScroll = new Map();
-const spaceScroll = { lastEvent: -Infinity, distance: 0, consumed: false, pending: false };
+const spaceGesture = createSpaceGesture();
+let spaceGestureTimer;
+let spaceGesturePending = false;
+function resetSpaceFeedback() {
+  const list = $('.tabs-scroll');
+  if (list) {
+    list.style.removeProperty('transform');
+    list.style.removeProperty('opacity');
+    list.classList.remove('gesture-tracking');
+  }
+  const preview = $('#space-gesture-preview');
+  if (preview) preview.hidden = true;
+}
 function interruptSpaceScroll() {
-  spaceScroll.distance = 0;
-  spaceScroll.consumed = true;
-  spaceScroll.lastEvent = performance.now();
+  clearTimeout(spaceGestureTimer);
+  spaceGesture.interrupt(performance.now());
+  resetSpaceFeedback();
+}
+function settleSpaceGesture() {
+  const result = spaceGesture.settle(performance.now());
+  if (result.idleDelay) spaceGestureTimer = setTimeout(settleSpaceGesture, result.idleDelay);
+  else resetSpaceFeedback();
 }
 function onSpaceScroll(event) {
-  const now = performance.now();
-  // Wheel events have no portable gesture-end event. Rearm only after the
-  // stream (including its inertial tail) stops, so a flick moves one Space.
-  if (now - spaceScroll.lastEvent > 220) {
-    spaceScroll.distance = 0;
-    spaceScroll.consumed = false;
-  }
-  spaceScroll.lastEvent = now;
   const sidebar = $('#sidebar');
-  if (
-    !state ||
-    ui.sidebarHidden ||
-    sidebar.inert ||
-    ui.dialog ||
-    ui.dragTab ||
-    event.buttons ||
-    event.defaultPrevented ||
-    event.ctrlKey ||
-    event.metaKey ||
-    event.altKey ||
-    event.target.closest('#toolbar, input, textarea, select, [contenteditable="true"]')
-  ) {
-    interruptSpaceScroll();
-    return;
+  const spaces = state?.spaces.filter((space) => space.profileId === activeProfile()?.id) || [];
+  const result = spaceGesture.update({
+    deltaX: event.deltaX,
+    deltaY: event.deltaY,
+    deltaMode: event.deltaMode,
+    shiftKey: event.shiftKey,
+    ctrlKey: event.ctrlKey,
+    metaKey: event.metaKey,
+    altKey: event.altKey,
+    buttons: event.buttons,
+    defaultPrevented: event.defaultPrevented,
+    momentum: typeof event.momentum === 'boolean' ? event.momentum : undefined,
+    time: performance.now(),
+    width: sidebar.clientWidth,
+    index: spaces.findIndex((space) => space.id === state?.activeSpaceId),
+    count: spaces.length,
+    contextKey: activeProfile()?.id,
+    blocked:
+      !state ||
+      ui.sidebarHidden ||
+      sidebar.inert ||
+      (ui.dialog && ui.dialog !== 'command') ||
+      ui.dragTab ||
+      spaceGesturePending ||
+      Boolean(
+        event.target.closest('#toolbar, .space-dots, input, textarea, select, [contenteditable="true"]'),
+      ),
+  });
+  if (result.preventDefault) event.preventDefault();
+  clearTimeout(spaceGestureTimer);
+  if (result.idleDelay) spaceGestureTimer = setTimeout(settleSpaceGesture, result.idleDelay);
+  if (['tracking', 'edge'].includes(result.phase)) {
+    const list = $('.tabs-scroll');
+    list?.classList.add('gesture-tracking');
+    if (list) {
+      list.style.transform = `translateX(${result.offset}px)`;
+      list.style.opacity = String(1 - result.progress * 0.15);
+    }
+    const preview = $('#space-gesture-preview');
+    const next = spaces[result.targetIndex];
+    if (preview) {
+      preview.hidden = !next;
+      if (next)
+        preview.innerHTML = `${icon(result.direction > 0 ? 'forward' : 'back')}<span>${esc(next.name)}</span>`;
+    }
+  } else if (result.phase !== 'committed') resetSpaceFeedback();
+  if (result.commit && spaces[result.targetIndex]) {
+    spaceGesturePending = true;
+    const next = spaces[result.targetIndex];
+    $('#live-region').textContent = `Switching to ${next.name}`;
+    safely(
+      invoke('space:activate', { id: next.id }).finally(() => {
+        spaceGesturePending = false;
+        resetSpaceFeedback();
+      }),
+    );
   }
-  const scale = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? sidebar.clientWidth : 1;
-  const shifted = event.shiftKey && event.deltaX === 0;
-  const dx = (shifted ? event.deltaY : event.deltaX) * scale;
-  const dy = shifted ? 0 : event.deltaY * scale;
-  if (!dx || Math.abs(dx) < Math.abs(dy) * 1.5) {
-    // Once a gesture is vertical, leave it to the tab list even if its tail
-    // drifts sideways. Do not cancel normal scrolling or pinch-to-zoom.
-    if (dx || dy) interruptSpaceScroll();
-    return;
-  }
-  const spaces = state.spaces.filter((space) => space.profileId === activeProfile()?.id);
-  if (spaces.length < 2) return;
-  event.preventDefault();
-  if (spaceScroll.consumed || spaceScroll.pending) return;
-  if (Math.sign(dx) !== Math.sign(spaceScroll.distance)) spaceScroll.distance = 0;
-  spaceScroll.distance += dx;
-  if (Math.abs(spaceScroll.distance) < 64) return;
-  spaceScroll.consumed = true;
-  const index = spaces.findIndex((space) => space.id === state.activeSpaceId);
-  const next = spaces[index + Math.sign(spaceScroll.distance)];
-  if (index < 0 || !next) return; // Stop at the ends; never cross profiles.
-  spaceScroll.pending = true;
-  safely(
-    invoke('space:activate', { id: next.id }).finally(() => {
-      spaceScroll.pending = false;
-    }),
-  );
 }
 function hostname(url) {
   try {
@@ -381,8 +432,11 @@ function restoreFocus(descriptor) {
   element?.focus({ preventScroll: true });
 }
 function isolateDialog(active) {
-  for (const selector of ['#sidebar', '#toolbar', '#captionbar', '#workspace', '#side-panel', '#findbar'])
-    $(selector).inert = active;
+  for (const selector of ['#sidebar', '#toolbar', '#captionbar', '#workspace', '#side-panel', '#findbar']) {
+    const element = $(selector);
+    const commandSidebar = ui.dialog === 'command' && element.closest('#sidebar');
+    element.inert = active && !commandSidebar;
+  }
 }
 function restoreFocusAround(callback) {
   const focused = document.activeElement;
@@ -426,11 +480,18 @@ function applyState(next) {
   const previousSpace = state?.activeSpaceId;
   const previousTab = state?.activeTabId;
   state = next;
+  if (ui.commandAuto && ui.dialog === 'command' && !isBlankPage()) closeDialog({ restore: false });
+  if (!isBlankPage()) ui.blankPaletteContext = null;
   document.documentElement.dataset.fullscreen = String(Boolean(state.runtime?.fullScreen));
   document.documentElement.dataset.focused = String(state.runtime?.focused !== false);
   setTheme();
   if (previousSpace !== state.activeSpaceId || previousTab !== state.activeTabId) clearPageBackdrop();
   if (previousProfile && previousProfile !== activeProfile()?.id) {
+    if (ui.dialog === 'command') {
+      ui.commandQuery = '';
+      ui.commandIndex = 0;
+      $('#command-input').value = '';
+    }
     invalidateAIRequest();
     ui.aiMessages = [];
     ui.aiSources = [];
@@ -438,11 +499,30 @@ function applyState(next) {
     ui.aiBusy = false;
     ui.aiProgress = '';
     ui.aiContext = 'research';
+    ui.aiStatus = null;
+    ui.renderedAIProvider = null;
+    ui.aiProviderSerial = (ui.aiProviderSerial || 0) + 1;
+    ui.aiConnectionError = '';
+    ui.aiConnectionMessage = '';
+    ui.aiConfiguring = false;
+    ui.aiSigningIn = false;
     ui.aiProfileId = activeProfile()?.id;
     ui.panelSignature = '';
     safely(invoke('ai:reset'));
+    if (ui.panel === 'ai' || ui.panel === 'settings') {
+      const profileId = activeProfile()?.id;
+      const serial = ui.aiProviderSerial;
+      safely(
+        invoke('ai:status').then((status) => {
+          if (profileId !== activeProfile()?.id || serial !== ui.aiProviderSerial) return;
+          ui.aiStatus = status;
+          renderPanel(true);
+        }),
+      );
+    }
   }
   render();
+  maybeOpenBlankPalette();
   if (previousSpace && previousSpace !== state.activeSpaceId) {
     interruptSpaceScroll();
     const spaces = state.spaces.filter((space) => space.profileId === activeProfile()?.id);
@@ -483,6 +563,8 @@ function render() {
     renderWorkspace();
     renderPanel();
     renderPageMenu();
+    if (ui.dialog === 'command') renderCommands({ preserve: true });
+    if (ui.dialog === 'shortcuts') renderShortcutRows();
   });
   syncLayout();
 }
@@ -491,7 +573,7 @@ function renderSidebar() {
   const profile = activeProfile();
   const tabs = currentTabs();
   const pins = tabs.filter((t) => t.pinned);
-  const loose = tabs.filter((t) => !t.pinned && !t.folderId);
+  const loose = tabs.filter((t) => !t.pinned && !t.folderId && (t.url !== 'zacro://newtab' || t.homePage));
   const folders = state.folders.filter((f) => f.spaceId === space?.id);
   const spaces = state.spaces.filter((s) => s.profileId === profile?.id);
   const signature = JSON.stringify([
@@ -527,8 +609,8 @@ function renderSidebar() {
     const page = state.runtime?.pages?.[tab.id];
     return `<div class="tab-row ${tab.id === state.activeTabId ? 'active' : ''}" draggable="true" data-tab-id="${esc(tab.id)}" data-drop-tab="${esc(tab.id)}"><button type="button" class="tab-main" data-action="tab:activate" data-id="${esc(tab.id)}" data-key="tab-${esc(tab.id)}" ${tab.id === state.activeTabId ? 'aria-current="page"' : ''} title="${esc(tab.title)} — ${esc(tab.url)}">${page?.loading ? '<span class="spinner"></span>' : favicon(tab.url)}<span class="title">${esc(tab.title || 'New tab')}</span>${state.runtime?.splitTabId === tab.id ? icon('split') : ''}</button>${page?.audible || page?.muted ? button('tab:mute', page.muted ? 'Unmute tab' : 'Mute tab', page.muted ? 'muted' : 'volume', `data-id="${esc(tab.id)}"`, 'tab-audio') : ''}${button('tab:close', `Close ${tab.title || 'tab'}`, 'close', `data-id="${esc(tab.id)}" data-key="close-${esc(tab.id)}"`, 'tab-close')}</div>`;
   };
-  $('#sidebar-content').innerHTML = `<div class="tabs-scroll">
-    ${pins.length ? `<div class="favorites" aria-label="Pinned tabs">${pins.map((tab) => `<button type="button" class="favorite ${tab.id === state.activeTabId ? 'active' : ''}" draggable="true" data-tab-id="${esc(tab.id)}" data-action="tab:activate" data-id="${esc(tab.id)}" data-key="pin-${esc(tab.id)}" ${tab.id === state.activeTabId ? 'aria-current="page"' : ''} aria-label="${esc(tab.title || hostname(tab.url))}" title="${esc(tab.title)} — ${esc(tab.url)}">${favicon(tab.url, tab.id)}</button>`).join('')}</div>` : ''}
+  $('#sidebar-content').innerHTML =
+    `${pins.length ? `<div class="favorites" aria-label="Pinned tabs" data-drop-pinned>${pins.map((tab) => `<button type="button" class="favorite ${tab.id === state.activeTabId ? 'active' : ''}" draggable="true" data-tab-id="${esc(tab.id)}" data-drop-tab="${esc(tab.id)}" data-action="tab:activate" data-id="${esc(tab.id)}" data-key="pin-${esc(tab.id)}" ${tab.id === state.activeTabId ? 'aria-current="page"' : ''} aria-label="${esc(tab.title || hostname(tab.url))}" title="${esc(tab.title)} — ${esc(tab.url)}">${favicon(tab.url, tab.id)}</button>`).join('')}</div>` : '<div class="favorites favorites-empty" aria-label="Pinned tabs" data-drop-pinned><span class="pin-drop-hint">Drop to pin</span></div>'}<div class="tabs-scroll">
     <div class="space-header"><button type="button" class="space-picker" data-action="ui:spaces" data-key="space-picker" aria-label="Switch Space or profile" title="${esc(space?.name)} · ${esc(profile?.name)}${profile?.private ? ' · Private session' : ''}">${profile?.private ? icon('shield') : '<span class="space-color" aria-hidden="true"></span>'}<span class="space-title">${esc(space?.name || 'My Space')}</span>${profile?.private ? '<span class="private-indicator">Private</span>' : ''}${icon('down')}</button></div>
     ${folders
       .map(
@@ -545,7 +627,6 @@ function renderSidebar() {
           }</div>`,
       )
       .join('')}
-    <div class="tabs-section-header"><button type="button" class="new-tab" data-action="ui:new-tab" data-key="new-tab">${icon('plus')}<span>New tab</span><kbd>${shortcut('Mod+T')}</kbd></button></div>
     <div class="loose-tabs" data-drop-folder="">${loose.map(tabRow).join('')}</div></div>
     <footer class="sidebar-footer">${button('ui:library', 'Library', 'library', 'data-key="library" aria-haspopup="dialog"')}<div class="space-dots" aria-label="Your Spaces">${spaces.map((s) => `<button type="button" class="space-dot ${s.id === space?.id ? 'active' : ''}" data-action="space:activate" data-id="${esc(s.id)}" title="${esc(s.name)}" aria-label="Switch to ${esc(s.name)}" ${s.id === space?.id ? 'aria-current="true"' : ''}><span aria-hidden="true"></span></button>`).join('')}</div>${button('ui:add-menu', 'New tab, folder or Space', 'plus', 'data-key="add-menu" aria-haspopup="dialog"')}</footer>`;
   for (const dot of $$('.space-dot')) {
@@ -596,6 +677,7 @@ function renderToolbar() {
     state.runtime?.fullScreen,
     ui.panel,
     ui.sidebarHidden,
+    state.runtime?.shortcuts,
   ]);
   if (signature === ui.toolbarSignature) return;
   ui.toolbarSignature = signature;
@@ -609,13 +691,13 @@ function renderToolbar() {
   $('#captionbar').innerHTML = ui.sidebarHidden ? '' : controls;
   $('#captionbar').hidden = ui.sidebarHidden || !controls;
   $('#toolbar').innerHTML =
-    `<div class="navigation">${!isMac ? `<button type="button" class="brand-button" data-action="ui:menu" data-key="browser-menu" aria-label="Browser menu" title="Zacro menu">${mark}</button>` : ''}${button('ui:sidebar-toggle', `${ui.sidebarHidden ? 'Show' : 'Hide'} sidebar (${shortcut('Mod+Shift+B')})`, 'sidebar', `data-key="sidebar-toggle" aria-pressed="${!ui.sidebarHidden}"`)}<span class="navigation-spacer"></span>${button('back', `Back (${shortcut(isMac ? 'Mod+[' : 'Alt+Left')})`, 'back', `data-key="back" ${page.canGoBack ? '' : 'disabled'}`)}${button('forward', `Forward (${shortcut(isMac ? 'Mod+]' : 'Alt+Right')})`, 'forward', `data-key="forward" ${page.canGoForward ? '' : 'disabled'}`)}${button(page.loading ? 'stop' : 'reload', page.loading ? 'Stop loading' : `Reload (${shortcut('Mod+R')})`, page.loading ? 'close' : 'reload', `data-key="reload" ${blank ? 'disabled' : ''}`)}</div><div class="address-row"><button type="button" class="address-button" data-action="ui:address" data-key="address" title="${esc(tab?.url || 'Search or enter a URL')}" aria-label="Address bar: ${esc(tab?.url || 'New tab')}">${icon(blank ? 'search' : secure ? 'lock' : 'globe')}<span class="address-text">${esc(blank ? 'Search or enter URL' : ui.sidebarHidden ? displayURL(tab.url) : hostname(tab.url))}</span></button>${button('ui:page-menu', 'Page actions', 'more', 'data-key="page-menu" aria-haspopup="dialog"')}</div>${ui.sidebarHidden ? controls : ''}`;
+    `<div class="navigation">${!isMac ? `<button type="button" class="brand-button" data-action="ui:menu" data-key="browser-menu" aria-label="Browser menu" title="Zacro menu">${mark}</button>` : ''}${button('ui:sidebar-toggle', shortcutLabel(`${ui.sidebarHidden ? 'Show' : 'Hide'} sidebar`, 'sidebar-toggle', 'Mod+S'), 'sidebar', `data-key="sidebar-toggle" aria-pressed="${!ui.sidebarHidden}"`)}<span class="navigation-spacer"></span>${button('back', shortcutLabel('Back', 'history-back', isMac ? 'Mod+[' : 'Alt+Left'), 'back', `data-key="back" ${page.canGoBack ? '' : 'disabled'}`)}${button('forward', shortcutLabel('Forward', 'history-forward', isMac ? 'Mod+]' : 'Alt+Right'), 'forward', `data-key="forward" ${page.canGoForward ? '' : 'disabled'}`)}${button(page.loading ? 'stop' : 'reload', page.loading ? 'Stop loading' : shortcutLabel('Reload', 'reload', 'Mod+R'), page.loading ? 'close' : 'reload', `data-key="reload" ${blank ? 'disabled' : ''}`)}</div><div class="address-row"><button type="button" class="address-button" data-action="ui:address" data-key="address" title="${esc(tab?.url || 'Search or enter a URL')}" aria-label="Address bar: ${esc(tab?.url || 'New tab')}">${icon(blank ? 'search' : secure ? 'lock' : 'globe')}<span class="address-text">${esc(blank ? 'Search or enter URL' : ui.sidebarHidden ? displayURL(tab.url) : hostname(tab.url))}</span></button>${button('ui:page-menu', 'Page actions', 'more', 'data-key="page-menu" aria-haspopup="dialog"')}</div>${ui.sidebarHidden ? controls : ''}`;
 }
 function renderWorkspace() {
   const tab = activeTab();
   const blank = !tab || tab.url === 'zacro://newtab';
   const page = state.runtime?.page || {};
-  $('#newtab').hidden = !blank;
+  $('#newtab').hidden = !(blank && tab?.homePage);
   const signature = JSON.stringify([
     state.activeTabId,
     state.activeSpaceId,
@@ -629,7 +711,7 @@ function renderWorkspace() {
     activeProfile()?.private,
     ui.sidebarHidden,
   ]);
-  if (blank && signature !== ui.homeSignature) {
+  if (tab?.homePage && signature !== ui.homeSignature) {
     ui.homeSignature = signature;
     renderHome();
   }
@@ -707,7 +789,7 @@ function syncLayout() {
     ui.sidebarHidden || !$('#findbar').hidden ? 40 : isMac || state.runtime?.fullScreen ? 8 : 36;
   $('#app').dataset.panelOpen = String(Boolean(ui.panel));
   $('#app').dataset.sidebarHidden = String(ui.sidebarHidden);
-  $('#sidebar').inert = ui.sidebarHidden || Boolean(ui.dialog);
+  $('#sidebar').inert = ui.sidebarHidden || Boolean(ui.dialog && ui.dialog !== 'command');
   $('#sidebar').setAttribute('aria-hidden', String(ui.sidebarHidden));
   document.documentElement.style.setProperty('--sidebar', `${width}px`);
   document.documentElement.style.setProperty('--panel', `${panel}px`);
@@ -817,9 +899,17 @@ function renderPanel(force = false) {
       details.open,
     ]),
   );
-  const providerDraft = Object.fromEntries(
-    $$('#provider-form input,#provider-form select', element).map((el) => [el.id, el.value]),
-  );
+  const provider = ui.aiStatus?.provider || 'codex';
+  const providerDraft =
+    ui.renderedAIProvider === provider
+      ? Object.fromEntries(
+          $$(
+            '#provider-form input,#provider-form select,#api-provider-form input,#api-provider-form select',
+            element,
+          ).map((el) => [el.id, el.value]),
+        )
+      : {};
+  ui.renderedAIProvider = provider;
   const focused = document.activeElement;
   const focusedId = element.contains(focused) ? focused.id : null;
   const selection =
@@ -924,22 +1014,108 @@ function selectOptions(values, current) {
 function settingSelect(key, label, values) {
   return `<div class="setting-field"><label for="setting-${key}">${label}</label><select id="setting-${key}" data-setting="${key}">${selectOptions(values, state.settings[key])}</select></div>`;
 }
+function aiProviderName() {
+  const provider = ui.aiStatus?.provider || 'codex';
+  return (
+    ui.aiStatus?.providers?.find((item) => item.id === provider)?.name ||
+    {
+      codex: 'Codex',
+      'claude-code': 'Claude Code',
+      openai: 'OpenAI',
+      anthropic: 'Anthropic',
+      compatible: 'Custom API',
+      openrouter: 'OpenRouter',
+    }[provider] ||
+    'AI provider'
+  );
+}
+function isLocalAPIEndpoint(value) {
+  try {
+    const url = new URL(value);
+    return (
+      ['http:', 'https:'].includes(url.protocol) &&
+      !url.username &&
+      !url.password &&
+      !url.search &&
+      !url.hash &&
+      (url.hostname === 'localhost' ||
+        url.hostname === '[::1]' ||
+        /^127\.(?:\d{1,3}\.){2}\d{1,3}$/.test(url.hostname))
+    );
+  } catch {
+    return false;
+  }
+}
 function renderAIConnection() {
   const status = ui.aiStatus || {};
+  if (activeProfile()?.private) return '<p class="provider-note">AI is unavailable in private browsing.</p>';
+  const provider = status.provider || 'codex';
+  const providers = status.providers?.length
+    ? status.providers
+    : [{ id: 'codex', name: 'Codex · ChatGPT subscription', kind: 'subscription', available: true }];
+  const selected = providers.find((item) => item.id === provider) || providers[0];
+  const api = selected.kind === 'api';
   const connected = Boolean(status.configured ?? state.runtime?.aiConfigured);
   const pending = Boolean(status.loginPending || ui.aiSigningIn);
-  const account = status.account || {};
-  if (activeProfile()?.private) return '<p class="provider-note">AI is unavailable in private browsing.</p>';
-  const identity = account.email || 'ChatGPT account';
   const models = Array.isArray(status.models) ? status.models : [];
-  return `<div id="ai-connection-status" class="connection-status" role="status"><span class="status-dot ${connected ? 'connected' : ''}"></span>${connected ? esc(identity) : pending ? 'Waiting for sign-in…' : 'Not connected'}</div>${connected && account.planType ? `<p class="provider-note">${esc(account.planType)} · Codex subscription</p>` : ''}${status.error ? `<p class="provider-note danger" role="alert">${esc(status.error)}</p>` : ''}<div class="setting-actions">${connected ? secondary('ui:ai-disconnect', 'Sign out', '', 'id="ai-account-action"') : pending ? secondary('ui:ai-login-cancel', 'Cancel sign-in', '', 'id="ai-account-action"') : primary('ui:ai-login', 'Sign in with ChatGPT', 'user', 'id="ai-account-action"')}</div><p class="provider-note">Uses your Codex subscription and its usage limits. No API key required.</p>${
+  const error = ui.aiConnectionError || status.error;
+  const local = provider === 'compatible' && isLocalAPIEndpoint(status.baseUrl);
+  const keyless = local && connected && status.credentialStorage === 'none';
+  const common = `<div class="setting-field"><label for="ai-provider">Provider</label><select id="ai-provider" ${ui.aiConfiguring ? 'disabled' : ''}>${selectOptions(
+    providers.map((item) => [item.id, item.name]),
+    provider,
+  )}</select></div><div id="ai-connection-status" class="connection-status" role="status"><span class="status-dot ${connected ? 'connected' : ''}"></span>${connected ? esc(api ? (keyless ? 'Local API ready' : 'Key saved') : status.account?.email || 'Signed in') : pending ? 'Waiting for sign-in…' : 'Not connected'}</div>${error ? `<p class="provider-note danger" role="alert">${esc(error)}</p>` : ''}${ui.aiConnectionMessage ? `<p class="provider-note" role="status">${esc(ui.aiConnectionMessage)}</p>` : ''}`;
+  if (api)
+    return `${common}<form id="api-provider-form" data-provider="${esc(provider)}" autocomplete="off"><label class="ai-credential-field" for="ai-api-key">API key<input id="ai-api-key" name="apiKey" type="password" autocomplete="off" spellcheck="false" placeholder="${local ? 'Optional for localhost' : connected ? 'Leave blank to keep saved key' : 'Paste an API key'}" ${connected || local ? '' : 'required'}></label>${provider === 'compatible' ? `<label class="ai-credential-field" for="ai-base-url">Base URL<input id="ai-base-url" name="baseUrl" type="url" value="${esc(status.baseUrl || '')}" placeholder="https://example.com/v1" autocomplete="off" spellcheck="false" required></label>` : ''}<label class="ai-credential-field" for="ai-api-model">Model<input id="ai-api-model" name="model" value="${esc(status.model || '')}" list="ai-model-list" placeholder="Model ID" autocomplete="off" spellcheck="false" required></label><datalist id="ai-model-list">${models.map((model) => `<option value="${esc(model.id)}">${esc(model.name || model.id)}</option>`).join('')}</datalist><div class="setting-field"><label for="ai-key-storage">Keep key</label><select id="ai-key-storage" name="storage">${selectOptions([...(status.storageAvailable ? [['encrypted', 'Encrypted on this device']] : []), ['session', 'This session only']], status.credentialStorage === 'session' || !status.storageAvailable ? 'session' : 'encrypted')}</select></div><div class="setting-actions"><button type="submit" class="primary" ${ui.aiConfiguring ? 'disabled' : ''}>Save connection</button>${connected ? secondary('ui:ai-test', 'Test connection', '', 'id="ai-test-connection"') : ''}${connected && !keyless ? secondary('ui:ai-disconnect', 'Remove key', '', 'id="ai-account-action"') : ''}</div></form><p class="provider-note">Uses your provider’s API billing.${status.credentialStorage === 'session' ? ' This key is cleared when Zacro quits.' : ''}</p>${status.storageNotice ? `<p class="provider-note">${esc(status.storageNotice)}</p>` : ''}${provider === 'compatible' ? '<p class="provider-note">Keys stay with their endpoint. Localhost can run without a key.</p>' : ''}`;
+  return `${common}${connected && status.account?.planType ? `<p class="provider-note">${esc(status.account.planType)} · ${esc(aiProviderName())}</p>` : ''}${
+    provider === 'codex'
+      ? `<div class="setting-field"><label for="ai-auth-storage">Keep sign-in</label><select id="ai-auth-storage" ${pending || ui.aiConfiguring || status.busy ? 'disabled' : ''}>${selectOptions(
+          [
+            ['keyring', 'Operating system keychain'],
+            ['session', 'This session only'],
+          ],
+          status.credentialStorage === 'session' ? 'session' : 'keyring',
+        )}</select></div><p class="provider-note">Changing storage ends the current sign-in.</p>`
+      : ''
+  }${provider === 'claude-code' ? `<p class="provider-note">${esc(status.storageNotice || 'Claude Code manages sign-in using the macOS Keychain or its local credentials file on other systems.')}</p>` : ''}<div class="setting-actions">${connected ? secondary('ui:ai-disconnect', 'Sign out', '', 'id="ai-account-action"') : pending ? secondary('ui:ai-login-cancel', 'Cancel sign-in', '', 'id="ai-account-action"') : selected.available === false ? (provider === 'claude-code' ? primary('ai:install', 'Install Claude Code', 'external') : '<p class="provider-note">Reinstall Zacro to restore its bundled Codex runtime.</p>') : primary('ui:ai-login', provider === 'codex' ? 'Sign in with ChatGPT' : 'Sign in with Claude', 'user', 'id="ai-account-action"')}${connected ? secondary('ui:ai-test', 'Test connection', '', 'id="ai-test-connection"') : ''}</div>${provider === 'codex' && selected.available !== false && status.credentialStorage !== 'session' && !connected && !pending ? `<button type="button" class="text-button" data-action="ui:ai-session-login">Use only for this session</button>` : ''}<p class="provider-note">${provider === 'codex' ? 'Uses your Codex subscription and its usage limits. No API key required.' : 'Uses your Claude subscription through Claude Code.'}${status.credentialStorage === 'session' ? ' Sign-in is cleared when Zacro quits.' : ''}</p>${provider === 'codex' && status.storageNotice ? `<p class="provider-note">${esc(status.storageNotice)}</p>` : ''}${
     connected && models.length
-      ? `<form id="provider-form"><div class="setting-field"><label for="ai-model">Model</label><select id="ai-model" name="model">${selectOptions(
-          models.map((m) => [m.id, m.name || m.id]),
+      ? `<form id="provider-form" data-provider="${esc(provider)}"><div class="setting-field"><label for="ai-model">Model</label><select id="ai-model" name="model">${selectOptions(
+          models.map((model) => [model.id, model.name || model.id]),
           status.model,
         )}</select></div><button type="submit" class="secondary">Use model</button></form>`
       : ''
   }`;
+}
+async function configureAIConnection(payload, message = 'Connection saved.') {
+  const serial = (ui.aiProviderSerial = (ui.aiProviderSerial || 0) + 1);
+  const profile = activeProfile()?.id;
+  ui.aiConfiguring = true;
+  ui.aiConnectionError = '';
+  ui.aiConnectionMessage = '';
+  if (payload.provider !== (ui.aiStatus?.provider || 'codex')) {
+    invalidateAIRequest();
+    ui.aiMessages = [];
+    ui.aiSources = [];
+    ui.aiBusy = false;
+    ui.aiSigningIn = false;
+  }
+  try {
+    const status = await invoke('ai:configure', payload);
+    if (serial !== ui.aiProviderSerial || profile !== activeProfile()?.id) return;
+    ui.aiStatus = status;
+    const key = $('#ai-api-key');
+    if (key) key.value = '';
+    ui.aiConnectionMessage = message;
+    if (state.runtime) state.runtime.aiConfigured = Boolean(status.configured);
+  } catch (error) {
+    if (serial === ui.aiProviderSerial && profile === activeProfile()?.id)
+      ui.aiConnectionError = error.message;
+  } finally {
+    if (serial === ui.aiProviderSerial && profile === activeProfile()?.id) {
+      ui.aiConfiguring = false;
+      renderPanel(true);
+    }
+  }
 }
 function renderSettings() {
   const settings = state.settings;
@@ -979,7 +1155,7 @@ function renderSettings() {
         ? [[settings.sidebarWidth, `${settings.sidebarWidth}px`]]
         : []),
     ],
-  )}<label class="setting-toggle"><span>Restore session</span><input type="checkbox" data-setting="restoreSession" ${settings.restoreSession ? 'checked' : ''}></label><div class="setting-actions">${secondary('ui:edit-space', 'Customize Space', 'edit')}${secondary('ui:profiles', 'Profiles', 'user')}</div></section><details class="setting-section" id="ai-settings"><summary>Codex subscription</summary>${renderAIConnection()}${settingSelect(
+  )}<label class="setting-toggle"><span>Restore session</span><input type="checkbox" data-setting="restoreSession" ${settings.restoreSession ? 'checked' : ''}></label><div class="setting-actions">${secondary('ui:edit-space', 'Customize Space', 'edit')}${secondary('ui:profiles', 'Profiles', 'user')}${secondary('ui:shortcuts', 'Shortcuts', 'keyboard')}</div></section><details class="setting-section" id="ai-settings"><summary>AI providers</summary>${renderAIConnection()}${settingSelect(
     'openSourcesLimit',
     'Pages to open from each answer',
     [
@@ -1044,7 +1220,7 @@ function renderAI() {
   const messages = ui.aiMessages;
   let body;
   if (!messages.length) {
-    body = `<div class="ai-welcome">${icon('sparkle')}<h3>${privateSession ? 'Private session' : configured ? 'Ask Zacro' : 'Your Codex, here'}</h3><p>${privateSession ? 'AI is unavailable in private browsing.' : configured ? 'Research the web or ask about a page.' : 'Use your subscription to research the web and ask about your tabs.'}</p>${configured ? `<button type="button" class="prompt-suggestion" data-action="ui:ai-page">Ask about this page${icon('arrow')}</button><button type="button" class="prompt-suggestion" data-action="ui:ai-select-tabs">Compare tabs${icon('arrow')}</button>` : privateSession ? primary('ui:spaces', 'Switch profile', 'user') : primary('ui:ai-connect', 'Connect Codex', 'user')}</div>`;
+    body = `<div class="ai-welcome">${icon('sparkle')}<h3>${privateSession ? 'Private session' : configured ? 'Ask Zacro' : 'AI, your way'}</h3><p>${privateSession ? 'AI is unavailable in private browsing.' : configured ? 'Ask a question or bring in a page.' : 'Connect a subscription or API provider in Settings.'}</p>${configured ? `<button type="button" class="prompt-suggestion" data-action="ui:ai-page">Ask about this page${icon('arrow')}</button><button type="button" class="prompt-suggestion" data-action="ui:ai-select-tabs">Compare tabs${icon('arrow')}</button>` : privateSession ? primary('ui:spaces', 'Switch profile', 'user') : primary('ui:ai-connect', 'Connect AI', 'user')}</div>`;
   } else {
     body = messages
       .map(
@@ -1057,14 +1233,19 @@ function renderAI() {
     configured
       ? `<div class="ai-footer" id="ai-footer">${ui.aiSources.length && !ui.aiBusy ? `<button type="button" class="secondary ai-source-action" id="ai-open-sources" data-action="ai:open-sources">${icon('external')}Open sources <kbd>${shortcut('Mod+Enter')}</kbd></button>` : ''}<div class="ai-context" id="ai-context-controls">${icon('shield')}<label for="ai-context" class="sr-only">Content to share</label><select id="ai-context" ${activeProfile()?.private ? 'disabled' : ''}>${selectOptions(
           [
-            ['research', 'Web research · no page sharing'],
+            [
+              'research',
+              ui.aiStatus?.researchSupported === false
+                ? 'Chat · no page sharing'
+                : 'Web research · no page sharing',
+            ],
             ['page', 'Current page'],
             ['tabs', `Selected tabs${ui.aiTabs.length ? ' (' + ui.aiTabs.length + ')' : ''}`],
           ],
           ui.aiContext,
         )}</select>${ui.aiContext === 'tabs' ? button('ui:ai-select-tabs', 'Choose tabs', 'plus', '', 'small-button') : ''}</div>${
           ui.aiContext !== 'research'
-            ? `<p class="provider-note" id="ai-sharing">Sharing with Codex: ${esc(
+            ? `<p class="provider-note" id="ai-sharing">Sharing with ${esc(aiProviderName())}: ${esc(
                 ui.aiContext === 'page'
                   ? activeTab()?.title || 'Current page'
                   : state.tabs
@@ -1073,14 +1254,15 @@ function renderAI() {
                       .join(', ') || 'No tabs selected',
               )}</p>`
             : ''
-        }<form id="ai-form" class="ai-composer"><textarea id="ai-question" name="question" rows="2" placeholder="${configured ? 'Ask anything…' : 'Sign in with ChatGPT in Settings'}" aria-label="Ask Zacro" ${configured ? '' : 'disabled'}></textarea>${ui.aiBusy ? button('ai:cancel', 'Stop response', 'stop', 'id="ai-submit"') : '<button type="submit" class="primary" id="ai-submit" aria-label="Send question" ' + (configured && !ui.aiSubmitting ? '' : 'disabled') + '>' + icon('arrow') + '</button>'}</form><p class="ai-help" id="ai-help">${activeProfile()?.private ? 'AI is unavailable in private sessions.' : 'Check sources. Shift + Enter for a new line.'}</p></div>`
+        }<form id="ai-form" class="ai-composer"><textarea id="ai-question" name="question" rows="2" placeholder="${configured ? 'Ask anything…' : 'Connect a provider in Settings'}" aria-label="Ask Zacro" ${configured ? '' : 'disabled'}></textarea>${ui.aiBusy ? button('ai:cancel', 'Stop response', 'stop', 'id="ai-submit"') : '<button type="submit" class="primary" id="ai-submit" aria-label="Send question" ' + (configured && !ui.aiSubmitting ? '' : 'disabled') + '>' + icon('arrow') + '</button>'}</form><p class="ai-help" id="ai-help">${activeProfile()?.private ? 'AI is unavailable in private sessions.' : 'Check sources. Shift + Enter for a new line.'}</p></div>`
       : !privateSession && messages.length
-        ? `<div class="ai-footer" id="ai-footer">${primary('ui:ai-connect', ui.aiStatus?.loginPending || ui.aiSigningIn ? 'Continue sign-in' : 'Connect Codex', 'user', 'id="ai-reconnect"')}</div>`
+        ? `<div class="ai-footer" id="ai-footer">${primary('ui:ai-connect', ui.aiStatus?.loginPending || ui.aiSigningIn ? 'Continue sign-in' : 'Connect AI', 'user', 'id="ai-reconnect"')}</div>`
         : ''
   }`;
 }
 function openPanel(panel, { refreshStatus = true } = {}) {
   if (!panelNames[panel]) return;
+  if (ui.dialog) closeDialog();
   const changed = ui.panel !== panel;
   if (!ui.panel || !$('#side-panel').contains(document.activeElement)) ui.panelReturn = focusDescriptor();
   ui.panelMotion = (ui.panelMotion || 0) + 1;
@@ -1100,9 +1282,12 @@ function openPanel(panel, { refreshStatus = true } = {}) {
       ],
       140,
     );
+  const profileId = activeProfile()?.id;
+  const providerSerial = ui.aiProviderSerial;
   if (refreshStatus && (panel === 'ai' || panel === 'settings'))
     safely(
       invoke('ai:status').then((status) => {
+        if (profileId !== activeProfile()?.id || providerSerial !== ui.aiProviderSerial) return;
         ui.aiStatus = status;
         renderPanel(true);
       }),
@@ -1126,19 +1311,22 @@ function closePanel() {
   ui.panelReturn = null;
   render();
   restoreFocus(focus);
+  maybeOpenBlankPalette();
 }
 function openDialog(kind, html, { title, focus } = {}) {
-  interruptSpaceScroll();
+  stopShortcutRecording();
+  if (kind !== 'command') interruptSpaceScroll();
   if (ui.authRequest) {
     const id = ui.authRequest;
     ui.authRequest = null;
     safely(invoke('auth:cancel', { id }));
   }
-  ui.dialogReturn = ui.dialog ? ui.dialogReturn : focusDescriptor();
+  ui.dialogReturn =
+    ui.dialog && $('#dialog-root').contains(document.activeElement) ? ui.dialogReturn : focusDescriptor();
   ui.dialogToken = (ui.dialogToken || 0) + 1;
   ui.dialog = kind;
   $('#dialog-root').innerHTML =
-    `<div class="dialog-backdrop" data-action="ui:backdrop"><section class="dialog ${kind === 'command' ? 'command-dialog' : kind === 'menu' ? 'context-menu' : kind === 'library' ? 'library-dialog' : ''}" role="dialog" aria-modal="true" aria-label="${esc(title || kind)}" tabindex="-1">${html}</section></div>`;
+    `<div class="dialog-backdrop ${kind === 'command' ? 'command-backdrop' : ''}" data-action="ui:backdrop"><section class="dialog ${kind === 'command' ? 'command-dialog' : kind === 'menu' ? 'context-menu' : kind === 'library' ? 'library-dialog' : ''}" role="dialog" aria-modal="${kind !== 'command'}" aria-label="${esc(title || kind)}" tabindex="-1">${html}</section></div>`;
   isolateDialog(true);
   syncLayout();
   const focusToken = ui.dialogToken;
@@ -1157,6 +1345,7 @@ function openDialog(kind, html, { title, focus } = {}) {
   });
 }
 function closeDialog({ restore = true } = {}) {
+  stopShortcutRecording();
   if (ui.authRequest) {
     const id = ui.authRequest;
     ui.authRequest = null;
@@ -1164,6 +1353,7 @@ function closeDialog({ restore = true } = {}) {
   }
   const focus = ui.dialogReturn;
   ui.dialog = null;
+  ui.commandAuto = false;
   ui.modalSubmit = null;
   ui.dialogToken = (ui.dialogToken || 0) + 1;
   $('#dialog-root').replaceChildren();
@@ -1172,6 +1362,7 @@ function closeDialog({ restore = true } = {}) {
   syncLayout();
   if (restore) restoreFocus(focus);
   ui.dialogReturn = null;
+  maybeOpenBlankPalette();
 }
 function openPopover(kind, html, { title, anchor } = {}) {
   const rect = (anchor || document.activeElement)?.getBoundingClientRect?.();
@@ -1290,7 +1481,7 @@ function showMenu() {
     `<button type="button" class="context-action" data-action="${name}">${icon(symbol)}${label}${key ? `<kbd>${key}</kbd>` : ''}</button>`;
   openPopover(
     'menu',
-    `<div class="dialog-body">${action('ui:new-tab', 'New tab', 'plus', shortcut('Mod+T'))}${action('ui:new-private', 'New private session', 'shield')}${action('ui:spaces', 'Spaces & profiles', 'user')}<hr class="context-separator">${action('ui:find', 'Find on page', 'search', shortcut('Mod+F'))}${action('ui:zoom-in', 'Zoom in', 'plus', shortcut('Mod+='))}${action('ui:zoom-out', 'Zoom out', 'minimize', shortcut('Mod+−'))}${action('ui:zoom-reset', 'Reset zoom', 'monitor', shortcut('Mod+0'))}${action('ui:print', 'Print page', 'print', shortcut('Mod+P'))}${action('ui:devtools', 'Developer tools', 'terminal')}<hr class="context-separator">${action('ui:extensions', 'Extensions', 'extension')}${action('ui:settings', 'Settings', 'settings')}${action('ui:shortcuts', 'Keyboard shortcuts', 'keyboard')}${action('ui:about', 'About Zacro', 'info')}</div>`,
+    `<div class="dialog-body">${action('ui:new-tab', 'New tab', 'plus', shortcutFor('command-palette', 'Mod+T'))}${action('ui:new-private', 'New private session', 'shield')}${action('ui:spaces', 'Spaces & profiles', 'user')}<hr class="context-separator">${action('ui:find', 'Find on page', 'search', shortcutFor('find', 'Mod+F'))}${action('ui:zoom-in', 'Zoom in', 'plus', shortcut('Mod+='))}${action('ui:zoom-out', 'Zoom out', 'minimize', shortcut('Mod+−'))}${action('ui:zoom-reset', 'Reset zoom', 'monitor', shortcut('Mod+0'))}${action('ui:print', 'Print page', 'print', shortcutFor('print', 'Mod+P'))}${action('ui:devtools', 'Developer tools', 'terminal')}<hr class="context-separator">${action('ui:extensions', 'Extensions', 'extension')}${action('ui:settings', 'Settings', 'settings')}${action('ui:shortcuts', 'Keyboard shortcuts', 'keyboard')}${action('ui:home-page', 'Home page', 'monitor')}${action('ui:about', 'About Zacro', 'info')}</div>`,
     { title: 'Browser menu', anchor: $('[data-key="browser-menu"]') },
   );
 }
@@ -1299,7 +1490,7 @@ function showAddMenu() {
     `<button type="button" class="context-action" data-action="${name}">${icon(symbol)}<span>${label}</span>${key ? `<kbd>${key}</kbd>` : ''}</button>`;
   openPopover(
     'menu',
-    `<div class="dialog-body">${action('ui:new-tab', 'New tab', 'plus', shortcut('Mod+T'))}${action('ui:new-folder', 'New folder', 'folderPlus')}${action('ui:new-space', 'New Space', 'layers')}<hr class="context-separator">${action('ui:new-private', 'Private session', 'shield')}</div>`,
+    `<div class="dialog-body">${action('ui:new-tab', 'New tab', 'plus', shortcutFor('command-palette', 'Mod+T'))}${action('ui:new-folder', 'New folder', 'folderPlus')}${action('ui:new-space', 'New Space', 'layers')}<hr class="context-separator">${action('ui:new-private', 'Private session', 'shield')}</div>`,
     { title: 'Add', anchor: $('[data-key="add-menu"]') },
   );
 }
@@ -1311,7 +1502,7 @@ function showPageMenu() {
     `<button type="button" class="context-action" data-action="${name}" ${attrs}>${icon(symbol)}<span>${label}</span>${key ? `<kbd>${key}</kbd>` : ''}</button>`;
   openPopover(
     'page-actions',
-    `<div class="dialog-body">${action('ui:bookmark', saved ? 'Remove bookmark' : 'Bookmark this page', 'star', `data-key="bookmark" aria-pressed="${saved}" ${blank ? 'disabled' : ''}`, shortcut('Mod+D'))}${action('ui:split', state.runtime?.splitTabId ? 'Close split view' : 'Split view', 'split', 'data-key="split"')}${action('ui:find', 'Find on page', 'search', blank ? 'disabled' : '', shortcut('Mod+F'))}${action('ui:print', 'Print page', 'print', blank ? 'disabled' : '', shortcut('Mod+P'))}<hr class="context-separator"><div class="menu-zoom" aria-label="Page zoom">${button('ui:zoom-out', 'Zoom out', 'minimize')}${action('ui:zoom-reset', `${Math.round((state.runtime?.page?.zoom || 1) * 100)}%`, 'monitor')}${button('ui:zoom-in', 'Zoom in', 'plus')}</div></div>`,
+    `<div class="dialog-body">${action('ui:bookmark', saved ? 'Remove bookmark' : 'Bookmark this page', 'star', `data-key="bookmark" aria-pressed="${saved}" ${blank ? 'disabled' : ''}`, shortcutFor('bookmark', 'Mod+D'))}${action('ui:split', state.runtime?.splitTabId ? 'Close split view' : 'Split view', 'split', 'data-key="split"')}${action('ui:find', 'Find on page', 'search', blank ? 'disabled' : '', shortcutFor('find', 'Mod+F'))}${action('ui:print', 'Print page', 'print', blank ? 'disabled' : '', shortcutFor('print', 'Mod+P'))}<hr class="context-separator"><div class="menu-zoom" aria-label="Page zoom">${button('ui:zoom-out', 'Zoom out', 'minimize')}${action('ui:zoom-reset', `${Math.round((state.runtime?.page?.zoom || 1) * 100)}%`, 'monitor')}${button('ui:zoom-in', 'Zoom in', 'plus')}</div></div>`,
     { title: 'Page actions', anchor: $('[data-key="page-menu"]') },
   );
 }
@@ -1336,7 +1527,7 @@ function renderPageMenu() {
 function showLibrary() {
   openPopover(
     'library',
-    `<div class="dialog-body">${['bookmarks', 'history', 'downloads', 'archive'].map((panel) => `<button type="button" class="context-action" data-action="ui:panel" data-panel="${panel}" data-key="panel-${panel}">${icon(panelNames[panel][0])}<span>${panelNames[panel][1]}</span>${panel === 'history' ? `<kbd>${shortcut(isMac ? 'Mod+Y' : 'Mod+H')}</kbd>` : panel === 'downloads' ? `<kbd>${shortcut(isMac ? 'Mod+Shift+J' : 'Mod+J')}</kbd>` : ''}</button>`).join('')}<hr class="context-separator">${['ai', 'settings'].map((panel) => `<button type="button" class="context-action" data-action="ui:panel" data-panel="${panel}" data-key="panel-${panel}">${icon(panelNames[panel][0])}<span>${panelNames[panel][1]}</span>${panel === 'settings' ? `<kbd>${shortcut('Mod+,')}</kbd>` : ''}</button>`).join('')}</div>`,
+    `<div class="dialog-body">${['bookmarks', 'history', 'downloads', 'archive'].map((panel) => `<button type="button" class="context-action" data-action="ui:panel" data-panel="${panel}" data-key="panel-${panel}">${icon(panelNames[panel][0])}<span>${panelNames[panel][1]}</span>${panel === 'history' ? `<kbd>${shortcutFor('history', isMac ? 'Mod+Y' : 'Mod+H')}</kbd>` : panel === 'downloads' ? `<kbd>${shortcutFor('downloads', isMac ? 'Mod+Shift+J' : 'Mod+J')}</kbd>` : ''}</button>`).join('')}<hr class="context-separator">${['ai', 'settings'].map((panel) => `<button type="button" class="context-action" data-action="ui:panel" data-panel="${panel}" data-key="panel-${panel}">${icon(panelNames[panel][0])}<span>${panelNames[panel][1]}</span>${panel === 'settings' ? `<kbd>${shortcutFor('preferences', 'Mod+,')}</kbd>` : ''}</button>`).join('')}<hr class="context-separator"><button type="button" class="context-action" data-action="ui:home-page">${icon('monitor')}<span>Home page</span></button></div>`,
     { title: 'Library', anchor: $('[data-key="library"]') },
   );
 }
@@ -1429,7 +1620,7 @@ function showTabSelection() {
   }
   formDialog(
     'Ask selected tabs',
-    'Choose up to six pages. Only the checked pages will be shared with Codex for your next question.',
+    `Choose up to six pages. Only the checked pages will be shared with ${aiProviderName()} for your next question.`,
     `<div class="tab-selector">${tabs.map((tab) => `<label class="tab-select-row"><input type="checkbox" name="tabId" value="${esc(tab.id)}" ${ui.aiTabs.includes(tab.id) ? 'checked' : ''}>${favicon(tab.url)}<span class="grow truncate" title="${esc(tab.url)}">${esc(tab.title || hostname(tab.url))}</span></label>`).join('') || '<p class="dialog-description">Open some pages first, then select the ones you want to share.</p>'}</div>`,
     'Use selected tabs',
     async (data, context) => {
@@ -1458,181 +1649,389 @@ function showPermissions() {
     { title: 'Site permissions' },
   );
 }
+function stopShortcutRecording() {
+  if (!ui.recordingShortcut) return;
+  ui.recordingShortcut = null;
+  safely(invoke('shortcut:record', { active: false }));
+}
 function showShortcuts() {
-  const shortcuts = [
-    ['Search or enter an address', shortcut('Mod+L')],
-    ['New tab', shortcut('Mod+T')],
-    ['Toggle sidebar', shortcut('Mod+Shift+B')],
-    ['Close current tab', shortcut('Mod+W')],
-    ['Restore closed tab', shortcut('Mod+Shift+T')],
-    ['Ask AI / open sources', shortcut('Mod+Enter')],
-    ['Find in page', shortcut('Mod+F')],
-    ['Reload', shortcut('Mod+R')],
-    ['History', shortcut(isMac ? 'Mod+Y' : 'Mod+H')],
-    ['Downloads', shortcut(isMac ? 'Mod+Shift+J' : 'Mod+J')],
-    ['Bookmark page', shortcut('Mod+D')],
-    ['Next tab', shortcut('Ctrl+Tab')],
-    ['Previous tab', shortcut('Ctrl+Shift+Tab')],
-    ['Settings', shortcut('Mod+,')],
-    [
-      'Back / Forward',
-      `${shortcut(isMac ? 'Mod+[' : 'Alt+Left')} / ${shortcut(isMac ? 'Mod+]' : 'Alt+Right')}`,
-    ],
-    ...(isMac
-      ? [
-          ['Close window', shortcut('Mod+Shift+W')],
-          ['Full screen', shortcut('Ctrl+Mod+F')],
-        ]
-      : []),
-    ['Peek link', isMac ? '⌥ click' : 'Alt + click'],
-    ['Dismiss Peek / dialog', 'Esc'],
-  ];
+  ui.shortcutQuery = '';
+  ui.shortcutError = '';
   openDialog(
     'shortcuts',
-    `<div class="dialog-header"><h2>Keyboard shortcuts</h2>${button('ui:dialog-close', 'Close', 'close')}</div><div class="dialog-body"><div class="shortcut-grid">${shortcuts.map(([label, key]) => `<span>${label}</span><kbd>${key}</kbd>`).join('')}</div></div>`,
-    { title: 'Keyboard shortcuts' },
+    `<div class="dialog-header"><h2>Keyboard shortcuts</h2>${button('ui:dialog-close', 'Close', 'close')}</div><div class="shortcut-search-wrap">${icon('search')}<input id="shortcut-search" type="search" aria-label="Search shortcuts" placeholder="Find a shortcut" autocomplete="off"></div><div id="shortcut-rows" class="shortcut-rows"></div><div id="shortcut-status" class="shortcut-status" role="status" aria-live="polite"></div><footer class="shortcut-footer"><span>Click a shortcut to change it</span><button type="button" class="text-button" data-action="ui:shortcut-reset-all">Reset all</button></footer>`,
+    { title: 'Keyboard shortcuts', focus: '#shortcut-search' },
   );
+  $('.dialog').classList.add('shortcut-dialog');
+  renderShortcutRows();
+}
+function renderShortcutRows() {
+  const root = $('#shortcut-rows');
+  if (!root) return;
+  const selected = document.activeElement?.dataset?.shortcutRecord;
+  const q = ui.shortcutQuery.trim().toLowerCase();
+  let category = '';
+  root.innerHTML =
+    (state.runtime?.shortcuts || [])
+      .filter((entry) => `${entry.label} ${entry.category} ${entry.accelerator}`.toLowerCase().includes(q))
+      .map((entry) => {
+        const heading =
+          entry.category !== category ? `<div class="shortcut-category">${esc(entry.category)}</div>` : '';
+        category = entry.category;
+        const recording = ui.recordingShortcut === entry.id;
+        return `${heading}<div class="shortcut-row" data-shortcut-id="${esc(entry.id)}"><span class="grow">${esc(entry.label)}</span><button type="button" class="shortcut-key ${recording ? 'recording' : ''}" data-action="ui:shortcut-record" data-id="${esc(entry.id)}" data-shortcut-record="${esc(entry.id)}" aria-label="${esc(`Change shortcut for ${entry.label}`)}" title="${esc(entry.defaultAccelerator ? `Default: ${shortcut(entry.defaultAccelerator)}` : 'No default shortcut')}" ${entry.editable === false ? 'disabled' : ''}><kbd>${recording ? 'Press keys…' : esc(entry.accelerator ? shortcut(entry.accelerator) : 'Unassigned')}</kbd></button>${button('ui:shortcut-reset', `Reset ${entry.label}`, 'undo', `data-id="${esc(entry.id)}" data-shortcut-reset="${esc(entry.id)}" ${entry.customized ? '' : 'disabled'}`)}</div>`;
+      })
+      .join('') || '<div class="command-empty">No shortcuts found</div>';
+  const status = $('#shortcut-status');
+  status.textContent =
+    ui.shortcutError || (ui.recordingShortcut ? 'Press a combination. Esc cancels; Delete removes it.' : '');
+  status.classList.toggle('danger', Boolean(ui.shortcutError));
+  if (selected) $(`[data-shortcut-record="${CSS.escape(selected)}"]`, root)?.focus({ preventScroll: true });
+}
+async function recordShortcut(id) {
+  stopShortcutRecording();
+  ui.recordingShortcut = id;
+  ui.shortcutError = '';
+  renderShortcutRows();
+  $(`[data-shortcut-record="${CSS.escape(id)}"]`)?.focus();
+  try {
+    await invoke('shortcut:record', { active: true });
+    if (ui.recordingShortcut !== id || ui.dialog !== 'shortcuts')
+      await invoke('shortcut:record', { active: false });
+  } catch (error) {
+    stopShortcutRecording();
+    ui.shortcutError = error.message;
+    renderShortcutRows();
+  }
+}
+function recordedAccelerator(event) {
+  const keys = [];
+  if (isMac ? event.metaKey : event.ctrlKey) keys.push('Mod');
+  if (isMac && event.ctrlKey) keys.push('Ctrl');
+  if (!isMac && event.metaKey) keys.push('Meta');
+  if (event.altKey) keys.push('Alt');
+  if (event.shiftKey) keys.push('Shift');
+  const physical = /^Key[A-Z]$/.test(event.code)
+    ? event.code.slice(3)
+    : /^Digit\d$/.test(event.code)
+      ? event.code.slice(5)
+      : {
+          Equal: '=',
+          Minus: '-',
+          BracketLeft: '[',
+          BracketRight: ']',
+          Comma: ',',
+          Period: '.',
+          Slash: '/',
+          Backslash: '\\',
+          Semicolon: ';',
+          Quote: "'",
+          Backquote: '`',
+        }[event.code];
+  const key =
+    physical ||
+    { ArrowLeft: 'Left', ArrowRight: 'Right', ArrowUp: 'Up', ArrowDown: 'Down', ' ': 'Space', '+': '=' }[
+      event.key
+    ] ||
+    event.key;
+  if (
+    !isMac &&
+    event.ctrlKey &&
+    event.altKey &&
+    (event.getModifierState('AltGraph') ||
+      (event.key.length === 1 && physical && event.key.toUpperCase() !== physical.toUpperCase()))
+  )
+    return null;
+  if (['Control', 'Meta', 'Alt', 'Shift', 'Dead', 'Unidentified'].includes(key)) return null;
+  return [...keys, key.length === 1 && /[a-z]/i.test(key) ? key.toUpperCase() : key].join('+');
+}
+async function saveShortcut(id, accelerator) {
+  stopShortcutRecording();
+  try {
+    await invoke('shortcut:set', { id, accelerator });
+    const next = await invoke('state:get');
+    applyState(next);
+    ui.shortcutError = '';
+  } catch (error) {
+    ui.shortcutError = error.message || 'That shortcut cannot be used.';
+  }
+  if (ui.dialog === 'shortcuts') {
+    renderShortcutRows();
+    $(`[data-shortcut-record="${CSS.escape(id)}"]`)?.focus({ preventScroll: true });
+  }
+}
+const commandSymbols = {
+  'command-palette': 'plus',
+  'open-location': 'search',
+  'sidebar-toggle': 'sidebar',
+  'save-page': 'download',
+  'reopen-tab': 'undo',
+  'next-tab': 'forward',
+  'previous-tab': 'back',
+  'next-space': 'layers',
+  'previous-space': 'layers',
+  bookmark: 'bookmark',
+  'pin-tab': 'pin',
+  'duplicate-tab': 'copy',
+  'rename-tab': 'edit',
+  'move-tab': 'folder',
+  'mute-tab': 'volume',
+  'new-folder': 'folderPlus',
+  'new-space': 'layers',
+  'new-private-space': 'shield',
+  preferences: 'settings',
+  shortcuts: 'keyboard',
+  history: 'history',
+  downloads: 'download',
+  bookmarks: 'bookmark',
+  archive: 'archive',
+  extensions: 'extension',
+  ai: 'sparkle',
+  find: 'search',
+  'find-next': 'down',
+  'find-previous': 'up',
+  reload: 'reload',
+  'force-reload': 'reload',
+  stop: 'stop',
+  'history-back': 'back',
+  'history-forward': 'forward',
+  'zoom-in': 'plus',
+  'zoom-out': 'minimize',
+  'zoom-reset': 'monitor',
+  split: 'split',
+  'peek-close': 'close',
+  'peek-promote': 'external',
+  'copy-url': 'copy',
+  print: 'print',
+  fullscreen: 'maximize',
+  'developer-tools': 'terminal',
+};
+const commandAliases = {
+  preferences: 'settings appearance theme search engine sidebar width',
+  'command-palette': 'new tab search open',
+  'new-space': 'create workspace',
+  'new-private-space': 'incognito private browsing',
+  shortcuts: 'keyboard keybindings hotkeys edit',
+  ai: 'ask zacro assistant codex chatgpt',
+  split: 'split view compare side by side',
+  bookmarks: 'saved favorites library',
+  archive: 'closed tabs restore',
+  'save-page': 'save as html download page',
+  'copy-url': 'copy link address',
+};
+function commandActionOptions() {
+  const tab = activeTab();
+  const real = tab && tab.url !== 'zacro://newtab';
+  const needsPage = new Set([
+    'save-page',
+    'bookmark',
+    'pin-tab',
+    'duplicate-tab',
+    'rename-tab',
+    'move-tab',
+    'mute-tab',
+    'find',
+    'find-next',
+    'find-previous',
+    'reload',
+    'force-reload',
+    'copy-url',
+    'print',
+  ]);
+  const catalog = state.runtime?.shortcuts || [];
+  return catalog
+    .filter((entry) => commandSymbols[entry.id])
+    .filter((entry) => !needsPage.has(entry.id) || real)
+    .filter((entry) => !entry.id.startsWith('peek-') || state.runtime?.peek)
+    .filter((entry) => entry.id !== 'stop' || state.runtime?.page?.loading)
+    .filter((entry) => entry.id !== 'history-back' || state.runtime?.page?.canGoBack)
+    .filter((entry) => entry.id !== 'history-forward' || state.runtime?.page?.canGoForward)
+    .map((entry) => ({
+      id: `action:${entry.id}`,
+      kind: 'action',
+      label: entry.id === 'command-palette' ? 'New tab' : entry.label,
+      description: '',
+      symbol: commandSymbols[entry.id],
+      type: entry.accelerator ? shortcut(entry.accelerator) : 'Action',
+      keywords: `${entry.category} ${entry.id.replaceAll('-', ' ')} ${commandAliases[entry.id] || ''}`,
+      priority: 4,
+      run: () => {
+        closeDialog({ restore: false });
+        return invoke('shortcut:run', { id: entry.id });
+      },
+    }));
+}
+function fuzzyScore(query, value) {
+  const normalize = (text) =>
+    String(text || '')
+      .normalize('NFKD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase();
+  const q = normalize(query),
+    text = normalize(value);
+  if (!q) return 0;
+  if (text === q) return 160;
+  if (text.startsWith(q)) return 125 - Math.min(15, (text.length - q.length) / 8);
+  const at = text.indexOf(q);
+  if (at >= 0) return (at === 0 || /[\s./:_-]/.test(text[at - 1]) ? 105 : 82) - Math.min(20, at / 3);
+  const words = q.split(/\s+/).filter(Boolean);
+  let total = 0;
+  for (const word of words) {
+    let cursor = 0,
+      previous = -2,
+      score = 0;
+    for (const char of word) {
+      const found = text.indexOf(char, cursor);
+      if (found < 0) return -1;
+      score += found === previous + 1 ? 9 : found === 0 || /[\s./:_-]/.test(text[found - 1]) ? 8 : 2;
+      score -= Math.min(5, (found - cursor) / 5);
+      previous = found;
+      cursor = found + 1;
+    }
+    total += Math.min(70, 35 + score - (text.length - word.length) / 12);
+  }
+  return total / words.length;
 }
 function commandOptions(query) {
-  const q = query.trim().toLowerCase();
+  const raw = query.trim();
+  const actionsOnly = raw.startsWith('>') || raw.startsWith('/');
+  const q = (actionsOnly ? raw.slice(1) : raw).trim();
   const options = [];
-  if (query.trim()) {
-    options.push({
-      label: query.trim(),
-      description: '',
-      symbol: 'search',
-      type: 'Go',
-      run: () => commitNavigation(query),
-    });
-    if (!activeProfile()?.private && (ui.aiStatus?.configured ?? state.runtime?.aiConfigured))
-      options.push({
-        label: `Ask Zacro: ${query.trim()}`,
-        description: '',
-        symbol: 'sparkle',
-        type: shortcut('Mod+Enter'),
+  const add = (item) => {
+    const score = q
+      ? Math.max(
+          fuzzyScore(q, item.label),
+          fuzzyScore(q, item.description) * 0.75,
+          fuzzyScore(q, item.keywords) * 0.7,
+        )
+      : 0;
+    if (q && score < 20) return;
+    options.push({ ...item, score: score + (item.priority || 0) });
+  };
+  if (!actionsOnly) {
+    const tabs = state.tabs.filter(
+      (tab) => tab.profileId === activeProfile()?.id && (tab.url !== 'zacro://newtab' || tab.homePage),
+    );
+    tabs.sort((a, b) => (b.lastActiveAt || 0) - (a.lastActiveAt || 0));
+    for (const [index, tab] of tabs.entries()) {
+      if (!q && (tab.id === state.activeTabId || index > 5)) continue;
+      add({
+        id: `tab:${tab.id}`,
+        kind: 'tab',
+        label: tab.title || hostname(tab.url),
+        description:
+          tab.spaceId === state.activeSpaceId
+            ? hostname(tab.url)
+            : state.spaces.find((space) => space.id === tab.spaceId)?.name,
+        keywords: tab.url,
+        url: tab.url,
+        symbol: 'globe',
+        type: 'Switch to tab',
+        priority: q ? 14 : 100 - index,
         run: () => {
-          closeDialog();
-          askAI(query);
+          closeDialog({ restore: false });
+          return invoke('tab:activate', { id: tab.id });
+        },
+      });
+    }
+    const seen = new Set(options.filter((item) => item.kind === 'tab').map((item) => item.url));
+    for (const [kind, items] of [
+      ['bookmark', profileItems('bookmarks')],
+      ['history', profileItems('history')],
+    ]) {
+      for (const [index, item] of items.entries()) {
+        if (seen.has(item.url) || item.url === 'zacro://newtab') continue;
+        if (!q && index > 2) continue;
+        const before = options.length;
+        add({
+          id: `${kind}:${item.url}`,
+          kind,
+          label: item.title || hostname(item.url),
+          description: displayURL(item.url),
+          url: item.url,
+          symbol: kind === 'bookmark' ? 'bookmark' : 'history',
+          type: kind === 'bookmark' ? 'Bookmark' : 'History',
+          priority: q ? (kind === 'bookmark' ? 8 : 0) : 60 - index,
+          run: () => {
+            const existing = tabs.find((tab) => tab.url === item.url);
+            if (existing) {
+              closeDialog({ restore: false });
+              return invoke('tab:activate', { id: existing.id });
+            }
+            return commitNavigation(item.url);
+          },
+        });
+        if (options.length > before) seen.add(item.url);
+      }
+    }
+    for (const space of state.spaces.filter(
+      (item) => item.profileId === activeProfile()?.id && item.id !== state.activeSpaceId,
+    ))
+      add({
+        id: `space:${space.id}`,
+        kind: 'space',
+        label: space.name,
+        description: '',
+        keywords: 'switch space workspace',
+        symbol: 'layers',
+        type: 'Space',
+        priority: q ? 9 : 30,
+        run: () => {
+          closeDialog({ restore: false });
+          return invoke('space:activate', { id: space.id });
         },
       });
   }
-  const tabs = state.tabs
-    .filter(
-      (t) => t.profileId === activeProfile()?.id && (!q || `${t.title} ${t.url}`.toLowerCase().includes(q)),
+  for (const option of commandActionOptions()) {
+    if (
+      !q &&
+      !actionsOnly &&
+      !['action:new-folder', 'action:new-space', 'action:preferences', 'action:shortcuts'].includes(option.id)
     )
-    .slice(0, q ? 7 : 5);
-  options.push(
-    ...tabs.map((tab) => ({
-      label: tab.title || 'New tab',
-      description:
-        tab.spaceId !== state.activeSpaceId
-          ? state.spaces.find((s) => s.id === tab.spaceId)?.name
-          : tab.url === 'zacro://newtab'
-            ? ''
-            : hostname(tab.url),
-      symbol: 'globe',
-      type: 'Tab',
-      run: () => {
-        closeDialog();
-        safely(invoke('tab:activate', { id: tab.id }));
-      },
-    })),
-  );
-  if (q) {
-    options.push(
-      ...profileItems('bookmarks')
-        .filter((b) => `${b.title} ${b.url}`.toLowerCase().includes(q))
-        .slice(0, 4)
-        .map((b) => ({
-          label: b.title || hostname(b.url),
-          description: b.url,
-          symbol: 'bookmark',
-          type: 'Saved',
-          run: () => commitNavigation(b.url),
-        })),
-    );
+      continue;
+    add({ ...option, priority: q ? option.priority : 20 });
   }
-  const actions = [
-    ['New tab', 'plus', () => newTab()],
-    ['New folder', 'folderPlus', () => handleAction('ui:new-folder')],
-    ['New Space', 'folderPlus', () => showSpaceForm()],
-    [ui.sidebarHidden ? 'Show sidebar' : 'Hide sidebar', 'sidebar', () => toggleSidebar()],
-    [
-      'History',
-      'history',
-      () => {
-        closeDialog();
-        openPanel('history');
-      },
-    ],
-    [
-      'Downloads',
-      'download',
-      () => {
-        closeDialog();
-        openPanel('downloads');
-      },
-    ],
-    [
-      'Bookmarks',
-      'bookmark',
-      () => {
-        closeDialog();
-        openPanel('bookmarks');
-      },
-    ],
-    [
-      'Archived tabs',
-      'archive',
-      () => {
-        closeDialog();
-        openPanel('archive');
-      },
-    ],
-    [
-      'Ask Zacro',
-      'sparkle',
-      () => {
-        closeDialog();
-        openPanel('ai');
-      },
-    ],
-    [
-      'Settings',
-      'settings',
-      () => {
-        closeDialog();
-        openPanel('settings');
-      },
-    ],
-    [
-      'Extensions',
-      'extension',
-      () => {
-        closeDialog();
-        openPanel('extensions');
-      },
-    ],
-    [
-      'Split view',
-      'split',
-      () => {
-        closeDialog();
-        showSplitPicker();
-      },
-    ],
-    ['Private session', 'shield', () => newPrivate()],
-    ['Keyboard shortcuts', 'keyboard', () => showShortcuts()],
-  ];
-  options.push(
-    ...actions
-      .filter(([label]) => !q || label.toLowerCase().includes(q))
-      .map(([label, symbol, run]) => ({ label, description: '', symbol, type: '', run })),
-  );
-  return options.slice(0, q ? 12 : 8);
+  if (q && !actionsOnly) {
+    const address =
+      /^(?:[a-z][a-z\d+.-]*:\/\/|localhost(?::\d+)?(?:[/?#]|$)|(?:[\w-]+\.)+[a-z]{2,}(?:[:/?#]|$)|(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?(?:[/?#]|$))/i.test(
+        q,
+      );
+    options.push({
+      id: 'navigation',
+      kind: 'navigation',
+      label: q,
+      description: '',
+      symbol: address ? 'globe' : 'search',
+      type: address
+        ? ui.commandMode === 'address'
+          ? 'Go to address'
+          : 'Open page'
+        : `Search ${{ duckduckgo: 'DuckDuckGo', google: 'Google', bing: 'Bing', brave: 'Brave' }[state.settings.searchEngine] || 'the web'}`,
+      score: address ? 220 : 45,
+      url: q,
+      run: () => commitNavigation(q),
+    });
+    if (!activeProfile()?.private && (ui.aiStatus?.configured ?? state.runtime?.aiConfigured))
+      options.push({
+        id: 'ask',
+        kind: 'action',
+        label: `Ask Zacro: ${q}`,
+        description: '',
+        symbol: 'sparkle',
+        type: shortcutFor('ai', 'Mod+Enter'),
+        score: 10,
+        run: () => {
+          closeDialog();
+          return askAI(q);
+        },
+      });
+  }
+  return options.sort((a, b) => b.score - a.score).slice(0, actionsOnly ? 80 : q ? 16 : 8);
 }
-function openCommand(mode = 'navigate', query) {
-  ui.commandMode = mode;
+function openCommand(mode = 'newtab', query, { automatic = false } = {}) {
+  ui.commandMode = mode === 'address' || mode === 'navigate' ? 'address' : 'newtab';
+  ui.commandAuto = automatic;
+  if (isBlankPage()) ui.blankPaletteContext = blankContext();
   ui.commandQuery =
     query ??
     (mode === 'address' && (state.runtime?.peek?.url || activeTab()?.url) !== 'zacro://newtab'
@@ -1641,37 +2040,76 @@ function openCommand(mode = 'navigate', query) {
   ui.commandIndex = 0;
   openDialog(
     'command',
-    `<div class="command-input-wrap">${icon('search')}<input id="command-input" type="text" role="combobox" aria-autocomplete="list" aria-expanded="true" aria-controls="command-results" aria-label="Search tabs, enter a URL, or ask a question" placeholder="Search tabs or enter a URL" value="${esc(ui.commandQuery)}" autocomplete="off" spellcheck="false"><kbd>Esc</kbd></div><div id="command-results" class="command-results" role="listbox" aria-label="Suggestions"></div><footer class="command-footer"><span class="row"><kbd>↑↓</kbd> Navigate</span><span class="row"><kbd>↵</kbd> Open</span></footer>`,
+    `<div class="command-input-wrap">${icon('search')}<input id="command-input" type="text" role="combobox" aria-autocomplete="list" aria-expanded="true" aria-controls="command-results" aria-label="Search tabs, history, Spaces and actions, or enter a URL" placeholder="Search or enter a URL" value="${esc(ui.commandQuery)}" autocomplete="off" spellcheck="false"><button type="button" class="command-mode" data-action="ui:command-mode" aria-label="Change navigation destination"></button></div><div id="command-results" class="command-results" role="listbox" aria-label="Suggestions"></div><footer class="command-footer"><span><kbd>↑↓</kbd> Select <kbd>↵</kbd> Open</span><span><kbd>Alt ↵</kbd> New tab <kbd>/</kbd> Actions</span></footer>`,
     { title: 'Command bar', focus: '#command-input' },
   );
   renderCommands();
-  requestAnimationFrame(() => $('#command-input')?.select());
+  const token = ui.dialogToken;
+  requestAnimationFrame(() => {
+    if (ui.dialog === 'command' && ui.dialogToken === token) $('#command-input')?.select();
+  });
 }
-function renderCommands() {
+function renderCommands({ preserve = false } = {}) {
+  const root = $('#command-results');
+  if (!root) return;
+  const selected = preserve ? ui.commandItems[ui.commandIndex]?.id : null;
   ui.commandItems = commandOptions(ui.commandQuery);
+  if (selected && ui.commandItems.some((item) => item.id === selected))
+    ui.commandIndex = ui.commandItems.findIndex((item) => item.id === selected);
   ui.commandIndex = Math.max(0, Math.min(ui.commandIndex, ui.commandItems.length - 1));
-  $('#command-results').innerHTML = ui.commandItems
-    .map(
-      (item, i) =>
-        `<button type="button" class="command-result ${i === ui.commandIndex ? 'selected' : ''}" data-action="ui:command-select" data-index="${i}" role="option" tabindex="-1" aria-selected="${i === ui.commandIndex}" id="command-option-${i}"><span class="command-result-icon">${icon(item.symbol)}</span><span class="grow command-result-copy"><span class="command-result-label truncate">${esc(item.label)}</span>${item.description ? `<span class="command-result-description">${esc(item.description)}</span>` : ''}</span><span class="command-result-type">${esc(item.type)}</span></button>`,
-    )
-    .join('');
-  $('#command-input')?.setAttribute('aria-activedescendant', `command-option-${ui.commandIndex}`);
+  root.innerHTML =
+    ui.commandItems
+      .map(
+        (item, index) =>
+          `<button type="button" class="command-result ${index === ui.commandIndex ? 'selected' : ''}" data-action="ui:command-select" data-index="${index}" data-command-id="${esc(item.id)}" data-command-kind="${item.kind}" role="option" tabindex="-1" aria-selected="${index === ui.commandIndex}" id="command-option-${index}"><span class="command-result-icon">${item.url && item.kind !== 'navigation' ? favicon(item.url) : icon(item.symbol)}</span><span class="grow command-result-copy"><span class="command-result-label truncate">${esc(item.label)}</span>${item.description ? `<span class="command-result-description">${esc(item.description)}</span>` : ''}</span><span class="command-result-type">${esc(item.type)}</span></button>`,
+      )
+      .join('') || '<div class="command-empty" role="presentation">No matching actions</div>';
+  const input = $('#command-input');
+  if (ui.commandItems.length)
+    input?.setAttribute('aria-activedescendant', `command-option-${ui.commandIndex}`);
+  else input?.removeAttribute('aria-activedescendant');
+  const mode = $('.command-mode');
+  mode.textContent = ui.commandMode === 'address' ? 'This tab' : 'New tab';
+  mode.setAttribute(
+    'aria-label',
+    `Destination: ${ui.commandMode === 'address' ? 'current tab' : 'new tab'}. Change destination`,
+  );
 }
-async function commitNavigation(url) {
+function selectCommand(index, { separate = false } = {}) {
+  const item = ui.commandItems[index];
+  if (!item || ui.commandBusy) return;
+  if (separate && item.url && item.url !== 'zacro://newtab') return safely(commitNavigation(item.url, true));
+  safely(Promise.resolve().then(() => item.run()));
+}
+async function commitNavigation(url, separate = false) {
+  if (ui.commandBusy || !String(url || '').trim()) return;
   const mode = ui.commandMode;
+  ui.commandBusy = true;
+  ui.commandAuto = false;
   closeDialog({ restore: false });
-  await invoke(mode === 'newtab' ? 'tab:create' : 'navigate', { url });
+  try {
+    const reuse = !separate && (!activeTab() || activeTab().url === 'zacro://newtab');
+    await invoke((mode === 'newtab' || separate) && !reuse ? 'tab:create' : 'navigate', { url });
+    applyState(await invoke('state:get'));
+  } catch (error) {
+    openCommand(mode, url);
+    throw error;
+  } finally {
+    ui.commandBusy = false;
+  }
 }
-async function newTab(command = false) {
+function newTab() {
+  openCommand('newtab', '');
+}
+async function showHomePage() {
+  ui.commandBusy = true;
   closeDialog({ restore: false });
-  const created = await invoke('tab:create', { url: 'zacro://newtab' });
-  if (created === null) return;
-  if (command) openCommand('navigate');
-  else
-    setTimeout(() => {
-      if (!ui.dialog) $('#home-query')?.focus();
-    }, 40);
+  try {
+    await invoke('tab:create', { url: 'zacro://newtab', homePage: true });
+    applyState(await invoke('state:get'));
+  } finally {
+    ui.commandBusy = false;
+  }
 }
 async function newPrivate() {
   closeDialog();
@@ -1751,7 +2189,7 @@ async function askAI(question) {
       toast(
         activeProfile()?.private
           ? 'AI is unavailable in private browsing.'
-          : 'Sign in with ChatGPT in Settings to ask Zacro.',
+          : 'Connect an AI provider in Settings to ask Zacro.',
       );
       return false;
     }
@@ -1795,6 +2233,28 @@ async function askAI(question) {
 
 function handleEvent(event) {
   switch (event.type) {
+    case 'newtab:show':
+      closeDialog({ restore: false });
+      safely(invoke('state:get').then(applyState));
+      break;
+    case 'shortcut': {
+      const action = {
+        shortcuts: 'ui:shortcuts',
+        split: 'ui:split',
+        'rename-tab': 'ui:tab-rename',
+        'move-tab': 'ui:tab-move',
+        'new-space': 'ui:new-space',
+        'new-folder': 'ui:new-folder',
+        'find-next': 'ui:find-next',
+        'find-previous': 'ui:find-prev',
+      }[event.id];
+      if (action) {
+        if (ui.dialog) closeDialog();
+        if (['find-next', 'find-previous'].includes(event.id) && $('#findbar').hidden) openFind();
+        else safely(handleAction(action, { id: state.activeTabId }));
+      }
+      break;
+    }
     case 'sidebar:toggle':
       toggleSidebar(event.fromPage === true);
       break;
@@ -1918,6 +2378,7 @@ function handleEvent(event) {
       toast('Response stopped.');
       break;
     case 'ai:status':
+      if (event.profileId && event.profileId !== activeProfile()?.id) break;
       ui.aiStatus = event;
       if (state.runtime) state.runtime.aiConfigured = Boolean(event.configured);
       ui.aiBusy = Boolean(event.busy);
@@ -1933,7 +2394,12 @@ function handleEvent(event) {
       renderPanel(true);
       break;
     case 'ai:shortcut':
-      if (ui.aiSources.length && !ui.aiBusy) safely(invoke('ai:open-sources'));
+      if (ui.dialog === 'command' && ui.commandQuery.trim()) safely(askAI(ui.commandQuery));
+      else if (document.activeElement?.id === 'ai-question' && $('#ai-question').value.trim())
+        safely(askAI($('#ai-question').value));
+      else if (document.activeElement?.id === 'home-query' && $('#home-query').value.trim())
+        safely(askAI($('#home-query').value));
+      else if (ui.aiSources.length && !ui.aiBusy) safely(invoke('ai:open-sources'));
       else openPanel('ai');
       break;
     case 'ai:open-sources':
@@ -1946,11 +2412,61 @@ document.addEventListener('click', (event) => {
   if (!target || target.disabled) return;
   if (target.dataset.action === 'ui:backdrop' && event.target !== target) return;
   event.preventDefault();
+  if (target.dataset.action === 'ui:command-select') {
+    selectCommand(Number(target.dataset.index), { separate: event.altKey });
+    return;
+  }
   safely(handleAction(target.dataset.action, target.dataset, target));
 });
 async function handleAction(action, data = {}, target) {
   const id = data.id;
+  if (ui.dialog === 'command' && action === 'tab:activate') closeDialog({ restore: false });
   switch (action) {
+    case 'ui:ai-test': {
+      const profileId = activeProfile()?.id;
+      const provider = ui.aiStatus?.provider;
+      target.disabled = true;
+      ui.aiConnectionError = '';
+      ui.aiConnectionMessage = '';
+      try {
+        const result = await invoke('ai:test-connection');
+        if (profileId !== activeProfile()?.id || provider !== ui.aiStatus?.provider) return;
+        if (Array.isArray(result.models)) ui.aiStatus.models = result.models;
+        const message = [result.message, result.warning].filter(Boolean).join(' ');
+        if (result.ok) ui.aiConnectionMessage = message || 'Connection verified.';
+        else ui.aiConnectionError = message || 'The connection could not be verified.';
+      } catch (error) {
+        if (profileId === activeProfile()?.id && provider === ui.aiStatus?.provider)
+          ui.aiConnectionError = error.message;
+      } finally {
+        if (target.isConnected) target.disabled = false;
+        renderPanel(true);
+      }
+      return;
+    }
+    case 'ui:ai-session-login':
+      await configureAIConnection(
+        { provider: 'codex', authStorage: 'session' },
+        'Sign-in will last for this session only.',
+      );
+      if (!ui.aiConnectionError) return handleAction('ui:ai-login', {}, target);
+      return;
+    case 'ui:home-page':
+      return showHomePage();
+    case 'ui:command-mode':
+      ui.commandMode = ui.commandMode === 'address' ? 'newtab' : 'address';
+      renderCommands({ preserve: true });
+      $('#command-input')?.focus();
+      return;
+    case 'ui:shortcut-record':
+      return recordShortcut(id);
+    case 'ui:shortcut-reset':
+    case 'ui:shortcut-reset-all':
+      stopShortcutRecording();
+      await invoke('shortcut:reset', action === 'ui:shortcut-reset' ? { id } : {});
+      ui.shortcutError = '';
+      applyState(await invoke('state:get'));
+      return;
     case 'ui:default-browser': {
       target.disabled = true;
       try {
@@ -2182,7 +2698,7 @@ async function handleAction(action, data = {}, target) {
       closeDialog();
       return invoke('split:toggle', { id });
     case 'ui:command-select':
-      ui.commandItems[Number(data.index)]?.run();
+      selectCommand(Number(data.index));
       return;
     case 'ui:open-url':
       return invoke('tab:create', { url: data.url });
@@ -2293,7 +2809,7 @@ async function handleAction(action, data = {}, target) {
       const profileId = activeProfile()?.id;
       let result = ui.downloadSuggestions.get(id);
       if (!result) {
-        toast('Asking Codex for a filename suggestion…');
+        toast(`Asking ${aiProviderName()} for a filename suggestion…`);
         result = await invoke('ai:suggest-name', {
           id,
           name: file.name || file.filename,
@@ -2356,11 +2872,26 @@ async function handleAction(action, data = {}, target) {
       if (ui.aiSigningIn || ui.aiStatus?.loginPending) return;
       ui.aiSigningIn = true;
       renderPanel(true);
-      try {
-        ui.aiStatus = await invoke('ai:login');
-      } finally {
-        ui.aiSigningIn = false;
-        renderPanel(true);
+      {
+        const profileId = activeProfile()?.id;
+        const serial = ui.aiProviderSerial;
+        try {
+          const status = await invoke('ai:login');
+          if (profileId !== activeProfile()?.id || serial !== ui.aiProviderSerial) return;
+          ui.aiStatus = status;
+          ui.aiConnectionError = '';
+        } catch (error) {
+          if (profileId !== activeProfile()?.id || serial !== ui.aiProviderSerial) return;
+          const status = await invoke('ai:status').catch(() => ui.aiStatus);
+          if (profileId !== activeProfile()?.id || serial !== ui.aiProviderSerial) return;
+          ui.aiStatus = status;
+          ui.aiConnectionError = error.message;
+        } finally {
+          if (profileId === activeProfile()?.id && serial === ui.aiProviderSerial) {
+            ui.aiSigningIn = false;
+            renderPanel(true);
+          }
+        }
       }
       return;
     case 'ui:ai-login-cancel':
@@ -2378,7 +2909,7 @@ async function handleAction(action, data = {}, target) {
       if (state.runtime) state.runtime.aiConfigured = false;
       ui.panelSignature = '';
       renderPanel(true);
-      toast('Signed out of Codex.');
+      toast('Disconnected AI provider.');
       return;
     case 'ai:cancel':
       invalidateAIRequest();
@@ -2406,19 +2937,26 @@ document.addEventListener('submit', (event) => {
   } else if (form.id === 'ai-form') {
     const question = data.get('question');
     safely(askAI(question));
-  } else if (form.id === 'provider-form') {
+  } else if (form.id === 'provider-form' || form.id === 'api-provider-form') {
     const submit = $('button[type=submit]', form);
     submit.disabled = true;
+    const payload = {
+      provider: form.dataset.provider || ui.aiStatus?.provider || 'codex',
+      model: String(data.get('model') || '').trim(),
+    };
+    if (form.id === 'api-provider-form') {
+      const key = String(data.get('apiKey') || '').trim();
+      if (key) payload.apiKey = key;
+      if (data.has('baseUrl')) payload.baseUrl = String(data.get('baseUrl') || '').trim();
+      payload.storage = data.get('storage');
+    }
     safely(
-      invoke('ai:configure', { model: data.get('model') })
-        .then((status) => {
-          ui.aiStatus = status;
-          renderPanel(true);
-          toast('Model updated.');
-        })
-        .finally(() => {
-          submit.disabled = false;
-        }),
+      configureAIConnection(
+        payload,
+        form.id === 'provider-form' ? 'Model updated.' : 'Connection saved.',
+      ).finally(() => {
+        if (submit.isConnected) submit.disabled = false;
+      }),
     );
   } else if (form.id === 'modal-form' && ui.modalSubmit) {
     const submit = $('button[type=submit]', form);
@@ -2442,6 +2980,23 @@ document.addEventListener('input', (event) => {
     ui.commandQuery = target.value;
     ui.commandIndex = 0;
     renderCommands();
+  } else if (target.id === 'shortcut-search') {
+    ui.shortcutQuery = target.value;
+    renderShortcutRows();
+  } else if (target.id === 'ai-base-url') {
+    const key = $('#ai-api-key');
+    const changed = target.value.trim() !== (ui.aiStatus?.baseUrl || '');
+    if (key) {
+      const local = isLocalAPIEndpoint(target.value.trim());
+      key.required = !local && (changed || !ui.aiStatus?.configured);
+      key.placeholder = local
+        ? 'Optional for localhost'
+        : changed
+          ? 'New key required for this endpoint'
+          : ui.aiStatus?.configured
+            ? 'Leave blank to keep saved key'
+            : 'Paste an API key';
+    }
   } else if (target.id === 'panel-search') {
     ui.panelQuery = target.value;
     renderPanel();
@@ -2465,6 +3020,23 @@ document.addEventListener('change', (event) => {
     if (['archiveAfterHours', 'openSourcesLimit', 'sidebarWidth'].includes(target.dataset.setting))
       value = Number(value);
     safely(invoke('settings:update', { values: { [target.dataset.setting]: value } }));
+  } else if (target.id === 'ai-auth-storage') {
+    target.disabled = true;
+    safely(
+      configureAIConnection(
+        { provider: 'codex', authStorage: target.value },
+        target.value === 'session'
+          ? 'Sign in again for this session only.'
+          : 'Sign in again using the operating system keychain.',
+      ),
+    );
+  } else if (target.id === 'ai-provider') {
+    target.disabled = true;
+    safely(
+      configureAIConnection({ provider: target.value }, '').finally(() => {
+        if (target.isConnected) target.disabled = false;
+      }),
+    );
   } else if (target.id === 'ai-context') {
     const next = target.value;
     if (next === 'tabs') {
@@ -2481,16 +3053,51 @@ document.addEventListener('change', (event) => {
     }
   }
 });
+document.addEventListener(
+  'keydown',
+  (event) => {
+    if (!ui.recordingShortcut || event.isComposing) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    if (event.repeat) return;
+    if (event.key === 'Escape') {
+      stopShortcutRecording();
+      renderShortcutRows();
+      return;
+    }
+    const id = ui.recordingShortcut;
+    if (
+      ['Backspace', 'Delete'].includes(event.key) &&
+      !event.ctrlKey &&
+      !event.metaKey &&
+      !event.altKey &&
+      !event.shiftKey
+    ) {
+      safely(saveShortcut(id, ''));
+      return;
+    }
+    const accelerator = recordedAccelerator(event);
+    if (accelerator) safely(saveShortcut(id, accelerator));
+  },
+  true,
+);
 document.addEventListener('keydown', (event) => {
   if (event.isComposing || event.keyCode === 229) return;
   const cmd = primaryModifier(event);
   if (ui.dialog === 'command' && event.target.id === 'command-input') {
+    if (event.key === 'Tab' && !event.shiftKey && ['', '/', '>'].includes(ui.commandQuery.trim())) {
+      event.preventDefault();
+      ui.commandQuery = ui.commandQuery.trim() ? '' : '/';
+      $('#command-input').value = ui.commandQuery;
+      ui.commandIndex = 0;
+      renderCommands();
+      return;
+    }
     if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
       event.preventDefault();
-      ui.commandIndex = Math.max(
-        0,
-        Math.min(ui.commandItems.length - 1, ui.commandIndex + (event.key === 'ArrowDown' ? 1 : -1)),
-      );
+      ui.commandIndex =
+        (ui.commandIndex + (event.key === 'ArrowDown' ? 1 : -1) + ui.commandItems.length) %
+        Math.max(1, ui.commandItems.length);
       renderCommands();
       $(`#command-option-${ui.commandIndex}`)?.scrollIntoView({ block: 'nearest' });
       return;
@@ -2501,7 +3108,7 @@ document.addEventListener('keydown', (event) => {
         const question = ui.commandQuery;
         closeDialog();
         safely(askAI(question));
-      } else ui.commandItems[ui.commandIndex]?.run();
+      } else selectCommand(ui.commandIndex, { separate: event.altKey });
       return;
     }
   }
@@ -2562,24 +3169,6 @@ document.addEventListener('keydown', (event) => {
     safely(invoke('find', { text: ui.findText, forward: !event.shiftKey, findNext: true }));
     return;
   }
-  if (cmd && event.key === 'Enter') {
-    event.preventDefault();
-    if (ui.panel === 'ai' && ui.aiSources.length && !ui.aiBusy) safely(invoke('ai:open-sources'));
-    else if (event.target.id === 'home-query') safely(askAI(event.target.value));
-    else if (event.target.id === 'ai-question') safely(askAI(event.target.value));
-    else openPanel('ai');
-    return;
-  }
-  if (cmd && event.key.toLowerCase() === 'l') {
-    event.preventDefault();
-    openCommand('address');
-  } else if (cmd && event.key.toLowerCase() === 't' && !event.shiftKey) {
-    event.preventDefault();
-    safely(newTab(true));
-  } else if (cmd && event.key.toLowerCase() === 'f') {
-    event.preventDefault();
-    openFind();
-  }
 });
 document.addEventListener('contextmenu', (event) => {
   const tab = event.target.closest('[data-tab-id]');
@@ -2592,49 +3181,86 @@ document.addEventListener('contextmenu', (event) => {
     showFolderMenu(folder.dataset.folderId);
   } else event.preventDefault();
 });
+function clearDragFeedback() {
+  $$('.drag-over,.drop-before,.drop-after').forEach((element) =>
+    element.classList.remove('drag-over', 'drop-before', 'drop-after'),
+  );
+}
+function dragDestination(event) {
+  const drop = event.target.closest('[data-drop-tab],[data-drop-pinned],[data-drop-folder]');
+  const source = state?.tabs.find((tab) => tab.id === ui.dragTab);
+  if (!drop || !source || source.profileId !== activeProfile()?.id) return null;
+  const target = drop.dataset.dropTab ? state.tabs.find((tab) => tab.id === drop.dataset.dropTab) : null;
+  if (target?.id === source.id) return null;
+  const pinned = Boolean(drop.closest('[data-drop-pinned]'));
+  const rectangle = drop.getBoundingClientRect();
+  const after =
+    target &&
+    (pinned
+      ? event.clientX > rectangle.left + rectangle.width / 2
+      : event.clientY > rectangle.top + rectangle.height / 2);
+  const remaining = state.tabs.filter((tab) => tab.id !== source.id);
+  let index;
+  if (target) index = remaining.findIndex((tab) => tab.id === target.id) + (after ? 1 : 0);
+  else {
+    const siblings = remaining.filter(
+      (tab) =>
+        tab.spaceId === state.activeSpaceId &&
+        (pinned ? tab.pinned : !tab.pinned && (tab.folderId || '') === (drop.dataset.dropFolder || '')),
+    );
+    index = siblings.length ? remaining.indexOf(siblings.at(-1)) + 1 : remaining.length;
+  }
+  return {
+    drop,
+    after,
+    payload: {
+      id: source.id,
+      spaceId: target?.spaceId || state.activeSpaceId,
+      pinned,
+      folderId: pinned ? null : target ? target.folderId : drop.dataset.dropFolder || null,
+      index,
+    },
+  };
+}
 document.addEventListener('dragstart', (event) => {
   const tab = event.target.closest('[data-tab-id]');
-  if (!tab) return;
+  if (!tab || !event.dataTransfer) return;
   interruptSpaceScroll();
   ui.dragTab = tab.dataset.tabId;
+  $('#app').dataset.dragging = 'true';
   event.dataTransfer.effectAllowed = 'move';
   event.dataTransfer.setData('text/plain', ui.dragTab);
 });
 document.addEventListener('dragover', (event) => {
-  const drop = event.target.closest('[data-drop-tab],[data-drop-folder]');
-  if (!drop || !ui.dragTab) return;
+  const destination = dragDestination(event);
+  if (!destination) return;
   event.preventDefault();
   event.dataTransfer.dropEffect = 'move';
-  drop.classList.add('drag-over');
+  clearDragFeedback();
+  destination.drop.classList.add(
+    destination.drop.dataset.dropTab ? (destination.after ? 'drop-after' : 'drop-before') : 'drag-over',
+  );
 });
 document.addEventListener('dragleave', (event) => {
-  event.target.closest('[data-drop-tab],[data-drop-folder]')?.classList.remove('drag-over');
+  const drop = event.target.closest('[data-drop-tab],[data-drop-pinned],[data-drop-folder]');
+  if (drop && !drop.contains(event.relatedTarget))
+    drop.classList.remove('drag-over', 'drop-before', 'drop-after');
 });
-document.addEventListener('dragend', () => {
+function endTabDrag() {
   ui.dragTab = null;
-  $$('.drag-over').forEach((el) => el.classList.remove('drag-over'));
-});
+  delete $('#app').dataset.dragging;
+  clearDragFeedback();
+}
+document.addEventListener('dragend', endTabDrag);
 document.addEventListener('drop', (event) => {
-  const drop = event.target.closest('[data-drop-tab],[data-drop-folder]');
-  if (!drop || !ui.dragTab) return;
+  const destination = dragDestination(event);
+  if (!destination) {
+    endTabDrag();
+    return;
+  }
   event.preventDefault();
-  const id = ui.dragTab;
-  ui.dragTab = null;
-  $$('.drag-over').forEach((el) => el.classList.remove('drag-over'));
-  if (drop.dataset.dropTab) {
-    const target = state.tabs.find((t) => t.id === drop.dataset.dropTab);
-    safely(
-      invoke('tab:move', {
-        id,
-        spaceId: target.spaceId,
-        folderId: target.folderId,
-        index: state.tabs.findIndex((t) => t.id === target.id),
-      }),
-    );
-  } else
-    safely(
-      invoke('tab:move', { id, spaceId: state.activeSpaceId, folderId: drop.dataset.dropFolder || null }),
-    );
+  endTabDrag();
+  safely(invoke('tab:move', destination.payload));
 });
 function showAuth(event) {
   if (event.profileId && event.profileId !== activeProfile()?.id) {
@@ -2674,60 +3300,7 @@ async function showAbout() {
     { title: 'About Zacro' },
   );
 }
-document.addEventListener('keydown', (event) => {
-  if (event.isComposing || event.keyCode === 229) return;
-  if (event.defaultPrevented || !state || ui.dialog) return;
-  const cmd = primaryModifier(event);
-  const key = event.key.toLowerCase();
-  let action = null,
-    payload = {};
-  if (cmd && key === 't' && event.shiftKey) action = 'tab:restore';
-  else if (cmd && key === 'w') {
-    action = state.runtime?.peek ? 'peek:close' : 'tab:close';
-    payload = { id: state.activeTabId };
-  } else if (cmd && key === 'd') action = 'bookmark:toggle';
-  else if (cmd && key === (isMac ? 'y' : 'h')) {
-    event.preventDefault();
-    openPanel('history');
-    return;
-  } else if (cmd && key === 'j') {
-    event.preventDefault();
-    openPanel('downloads');
-    return;
-  } else if (cmd && key === ',') {
-    event.preventDefault();
-    openPanel('settings');
-    return;
-  } else if (cmd && key === 'p') action = 'print';
-  else if (cmd && key === 'r') action = 'reload';
-  else if (cmd && key === 'k') {
-    event.preventDefault();
-    openCommand('address');
-    return;
-  } else if (cmd && key === 'i' && event.shiftKey) action = 'devtools';
-  else if ((isMac ? event.ctrlKey && !event.metaKey : cmd) && key === 'tab') {
-    event.preventDefault();
-    const tabs = currentTabs();
-    const current = tabs.findIndex((t) => t.id === state.activeTabId);
-    const tab = tabs[(current + (event.shiftKey ? -1 : 1) + tabs.length) % tabs.length];
-    if (tab) safely(invoke('tab:activate', { id: tab.id }));
-    return;
-  } else if (cmd && /^[1-9]$/.test(key)) {
-    event.preventDefault();
-    const tabs = currentTabs();
-    const tab = tabs[key === '9' ? tabs.length - 1 : Number(key) - 1];
-    if (tab) safely(invoke('tab:activate', { id: tab.id }));
-    return;
-  } else if (cmd && ['+', '=', '-', '0'].includes(key)) {
-    action = 'zoom';
-    payload = key === '0' ? { reset: true } : { delta: key === '-' ? -0.1 : 0.1 };
-  } else if (!isMac && event.altKey && key === 'arrowleft') action = 'back';
-  else if (!isMac && event.altKey && key === 'arrowright') action = 'forward';
-  if (action) {
-    event.preventDefault();
-    safely(invoke(action, payload));
-  }
-});
+
 document.addEventListener(
   'error',
   (event) => {
@@ -2741,7 +3314,11 @@ document.addEventListener(
 );
 $('#sidebar').addEventListener('wheel', onSpaceScroll, { passive: false });
 $('#sidebar').addEventListener('pointerleave', interruptSpaceScroll);
-window.addEventListener('blur', interruptSpaceScroll);
+window.addEventListener('blur', () => {
+  interruptSpaceScroll();
+  stopShortcutRecording();
+  if (ui.dialog === 'shortcuts') renderShortcutRows();
+});
 window.addEventListener('resize', () => {
   interruptSpaceScroll();
   syncLayout();

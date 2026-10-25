@@ -1,35 +1,46 @@
 # Zacro on macOS
 
-The Mac implementation targets **macOS 13 or later**, on **Apple silicon (`arm64`) and Intel (`x64`)**. It includes native window chrome and menus, Mac keyboard conventions, Dock reopening, safe web-link delivery, and architecture-matched application packaging. Native CI has passed on macOS 15 for both architectures. macOS 13 is the declared minimum, not a completed physical-device test result; physical Mac review and signed/notarized release acceptance remain open.
+The Mac implementation targets **macOS 13 or later**, on **Apple silicon (`arm64`) and Intel (`x64`)**. It includes native window chrome and menus, Mac keyboard conventions, Dock reopening, safe web-link delivery, and architecture-matched application packaging. Native CI passed the previous 0.4 revision on macOS 15 for both architectures; the current command, shortcut and gesture revision is still undergoing validation. macOS 13 is the declared minimum, not a completed physical-device test result; physical Mac review and signed/notarized release acceptance remain open.
 
 ## Everyday use
 
 ![Packaged Zacro in dark appearance on macOS, with native traffic lights, menu bar and Dock icon](screenshots/macos-dark.png)
 
-This is an unedited native desktop capture of the Apple silicon development package on macOS 15.7.9, using a disposable CI profile. The [README](../README.md#screenshots) also shows light appearance.
+This is a historical, unedited native desktop capture of the previous 0.4 Apple silicon development package on macOS 15.7.9, using a disposable CI profile. It predates the current empty-Space palette and shortcut changes. The [README](../README.md#screenshots) also shows light appearance; refreshed captures are pending.
 
 The red, yellow and green window controls are native macOS controls. Their reserved area remains clear when the sidebar is hidden. Full screen uses the operating system's transition and screen arrangement; returning to a window restores the controls' layout. The interface follows system light/dark appearance, reduced motion, reduced transparency and increased contrast, uses the system font, and dims chrome when inactive.
 
 Zacro's menu bar exposes browser actions without adding another menu row inside the window. The application menu contains Settings, Services, Hide and Quit. Window actions use native Minimize, Zoom and Bring All to Front. Edit actions target the focused page or browser field, including Undo, Redo, Select All, and Paste and Match Style. Downloads offer **Show in Finder**. These choices follow [Apple's Mac design guidance](https://developer.apple.com/design/human-interface-guidelines/designing-for-macos) and [Electron's native menu behavior](https://www.electronjs.org/docs/latest/api/menu-item).
 
-Page context menus include spelling suggestions and macOS Look Up for selected text. Native pages use macOS scroll bounce. The Dock menu offers the browser window, a new tab and a new private Space without requiring an existing window.
+Page context menus include spelling suggestions and macOS Look Up for selected text. Native pages use macOS scroll bounce. The Dock menu offers the browser window, command palette and a new private Space without requiring an existing window.
 
-| Action                               | Mac shortcut               |
-| ------------------------------------ | -------------------------- |
-| Address / command bar                | ⌘L or ⌘K                   |
-| New tab / reopen closed tab          | ⌘T / ⇧⌘T                   |
-| Close tab / close window             | ⌘W / ⇧⌘W                   |
-| Open or bring forward browser window | ⌘N                         |
-| New private Space                    | ⇧⌘N                        |
-| Previous / next tab                  | ⌃⇧Tab / ⌃Tab, or ⌥⌘← / ⌥⌘→ |
-| Back / forward                       | ⌘[ / ⌘]                    |
-| Settings / History / Downloads       | ⌘, / ⌘Y / ⇧⌘J              |
-| Toggle sidebar / full screen         | ⇧⌘B / ⌃⌘F                  |
-| Find / print / reload                | ⌘F / ⌘P / ⌘R               |
-| Reload without cache                 | ⇧⌘R                        |
-| Quit                                 | ⌘Q                         |
+| Action                               | Mac shortcut |
+| ------------------------------------ | ------------ |
+| Command palette / edit current address | ⌘T or ⌘K / ⌘L |
+| Reopen closed tab | ⇧⌘T |
+| Close tab / close window | ⌘W / ⇧⌘W |
+| Open or bring forward browser window | ⌘N |
+| New private Space | ⇧⌘N |
+| Recent tabs / reverse recent tabs | ⌃Tab / ⌃⇧Tab |
+| Previous / next tab in sidebar order | ⌥⌘↑ / ⌥⌘↓ |
+| Previous / next Space | ⌥⌘← / ⌥⌘→ |
+| Space by position | ⌃1–9 |
+| Tab by position / last tab | ⌘1–8 / ⌘9 |
+| Pin or unpin / bookmark | ⌘D / ⌥⌘D |
+| Split view | ⌃⇧= |
+| Back / forward | ⌘[ / ⌘] |
+| Settings / History / Downloads | ⌘, / ⌘Y / ⌘J |
+| Toggle sidebar / full screen | ⌘S / ⌃⌘F |
+| Save page / keyboard shortcuts | ⇧⌘S / ⌥⌘K |
+| Find / print / reload | ⌘F / ⌘P / ⌘R |
+| Reload without cache | ⇧⌘R |
+| Quit | ⌘Q |
 
-⌘Tab remains the system application switcher, and ⌘H hides the application. Horizontal scrolling over the sidebar switches Spaces within the current profile; ordinary webpage scrolling remains with the page. Each gesture moves one Space, respects the endpoints and restores that Space's tab-list position. Reduced-motion users get the same immediate state changes without the decorative transition.
+⌘T opens the command palette without creating a tab. An empty Space opens it automatically; submitting an address or search creates the page, and cancelling keeps the Space empty. Choose New Tab Page explicitly to open the home page. The sidebar stays interactive beside the palette. ⌘L edits the current destination, while `/` in the palette searches browser actions.
+
+⌃Tab returns to the most recent tab in the current profile. Keep Control held and press Tab again to move farther back; Shift reverses the direction. The Option-Command-Up/Down commands follow sidebar order instead: pins, folders, then ordinary tabs. Open Keyboard Shortcuts to search, record, disable and reset bindings. Defaults and aliases come from the shared catalog, and overrides are stored separately for macOS. These conventions follow Arc's [command and recent-tab workflow](https://start.arc.net/master-multitasking), [pinning](https://resources.arc.net/hc/en-us/articles/19231060187159-Pinned-Tabs-Tabs-you-want-to-stick-around), and [Space navigation](https://resources.arc.net/hc/en-us/articles/19228064149143-Spaces-Distinct-Browsing-Areas).
+
+⌘Tab remains the system application switcher, and ⌘H hides the application. Horizontal scrolling over the sidebar switches Spaces within the current profile; ordinary webpage scrolling remains with the page. Finger movement previews the neighbor, a short flick or deliberate drag commits one switch, and the momentum tail cannot advance repeatedly. Reversing before commitment cancels the preview; the endpoints resist without wrapping. Each Space retains its tab-list position. Forms, text fields, dragging and pinch/zoom keep their input. Reduced-motion users get the same state changes without the decorative transition. Real trackpad acceptance remains part of the physical-Mac checklist below.
 
 Zacro currently uses one browser window. ⌘N opens that window if closed or brings it forward; it does not create an independent second browsing window. Closing the window keeps the application available in the Dock. Reopening restores tabs and the active Space from the session; pages reload after an approved window close. Beforeunload decisions still protect pages that report unsaved work. Quit exits the application, and cancelling a close warning cancels the pending quit.
 
@@ -68,6 +79,8 @@ Passing a build is only one release gate. A Mac release still needs clean-machin
 ## Native verification
 
 The GitHub Actions workflow has separate `macos-15` Apple silicon and `macos-15-intel` jobs. Both passed the 0.4 revision on macOS **15.7.9 (24G830)** in [run 40099796398](https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40099796398) at commit `f3101841f04cda2e9441734c0b711f6e63c697e2`: **99 unit/security tests, 32 desktop integration tests and one packaged-application test per architecture**, plus source formatting/syntax and native DMG/ZIP builds. The development artifacts are retained for seven days with explicit architecture labels; they are CI outputs, not a public signed/notarized release.
+
+Those results and the screenshots refer to that exact commit. They do not yet establish native Mac acceptance of the command, shortcut and trackpad changes described above; record the new run separately when it completes.
 
 The Darwin-only suite covers native traffic-light position and layout, menu conventions, Cmd-based shortcuts, Ctrl-Tab, native full screen, guest-page editing, window close/Dock reopen, validated web links, pre-ready link delivery, cancellation of Quit with unsaved work, and private-session cleanup after the last window closes. It is skipped on non-Mac hosts. The Mac command also runs shared browser, renderer contract, motion, Space-scroll, security and startup native-paint tests. The packaged suite checks actual browsing, security fuses, PDF parsing and an isolated signed-out Codex handshake; it does not make authenticated model requests.
 

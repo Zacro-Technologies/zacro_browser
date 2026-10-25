@@ -87,15 +87,17 @@ test(
 
     // Focus chosen before the entrance frame must survive deferred autofocus.
     // Otherwise a fast Enter on Rename can activate the first menu item instead.
-    const earlyFocus = await shell.evaluate(async () => {
+    const fixtureTab = await invoke('tab:create', { homePage: true });
+    await expect(shell.locator(`[data-key="tab-${fixtureTab.id}"]`)).toBeVisible();
+    const earlyFocus = await shell.evaluate(async (id) => {
       document
-        .querySelector('[data-key="tab-welcome"]')
+        .querySelector(`[data-key="tab-${id}"]`)
         .dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true }));
       const rename = document.querySelector('[data-action="ui:tab-rename"]');
       rename.focus();
       await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
       return document.activeElement === rename;
-    });
+    }, fixtureTab.id);
     assert.equal(earlyFocus, true, 'A menu entrance must preserve the user-selected control');
     await shell.keyboard.press('Escape');
 

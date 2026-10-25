@@ -1,63 +1,29 @@
 'use strict';
+const { matchShortcut, shortcutCatalog, menuAccelerator } = require('../core/shortcuts.cjs');
 
 // Kept independent of Electron so platform conventions can be verified on all
 // development hosts. Native integration is exercised separately on macOS.
 function windowChrome(platform) {
   return platform === 'darwin'
-    ? { frame: true, titleBarStyle: 'hiddenInset', trafficLightPosition: { x: 16, y: 16 } }
+    ? { frame: true, titleBarStyle: 'hiddenInset', trafficLightPosition: { x: 16, y: 12 } }
     : { frame: false };
 }
 
-function macShortcut(input) {
-  if (input.type !== 'keyDown' || input.isComposing) return null;
-  const key = input.key?.toLowerCase();
-  if (input.control && !input.meta && !input.alt && key === 'tab')
-    return input.shift ? 'previous-tab' : 'next-tab';
-  if (!input.meta) return null;
-  if (input.control) return !input.alt && !input.shift && key === 'f' ? 'fullscreen' : null;
-  if (input.alt) {
-    if (input.shift) return null;
-    return { arrowleft: 'previous-tab', arrowright: 'next-tab', i: 'developer-tools' }[key] || null;
-  }
-  if (input.shift)
-    return (
-      {
-        t: 'reopen-tab',
-        n: 'new-private-space',
-        w: 'close-window',
-        r: 'force-reload',
-        b: 'sidebar-toggle',
-        j: 'downloads',
-        '+': 'zoom-in',
-        '=': 'zoom-in',
-      }[key] || null
-    );
-  return (
-    {
-      n: 'open-browser',
-      t: 'new-tab',
-      w: 'close-tab',
-      l: 'open-location',
-      k: 'open-location',
-      ',': 'preferences',
-      f: 'find',
-      p: 'print',
-      r: 'reload',
-      d: 'bookmark',
-      y: 'history',
-      j: 'downloads',
-      '[': 'history-back',
-      ']': 'history-forward',
-      '+': 'zoom-in',
-      '=': 'zoom-in',
-      '-': 'zoom-out',
-      0: 'zoom-reset',
-    }[key] || null
-  );
+function macShortcut(input, overrides = {}) {
+  return matchShortcut(input, 'darwin', overrides);
 }
 
-function macMenuTemplate(run, edit) {
-  const action = (id, label, accelerator) => ({ id, label, accelerator, click: () => run(id) });
+function macMenuTemplate(run, edit, overrides = {}) {
+  const catalog = shortcutCatalog('darwin', overrides);
+  const action = (id, label) => ({
+    id,
+    label,
+    accelerator: menuAccelerator(catalog.find((entry) => entry.id === id)?.accelerator)?.replace(
+      'CommandOrControl',
+      'Command',
+    ),
+    click: () => run(id),
+  });
   const separator = { type: 'separator' };
   const editing = (id, label, accelerator) => ({
     id: `edit-${id === 'selectAll' ? 'select-all' : id === 'pasteAndMatchStyle' ? 'paste-match-style' : id}`,
@@ -72,6 +38,7 @@ function macMenuTemplate(run, edit) {
         { role: 'about' },
         separator,
         action('preferences', 'Settings…', 'Command+,'),
+        action('shortcuts', 'Keyboard Shortcuts…'),
         separator,
         { role: 'services' },
         separator,
@@ -85,7 +52,8 @@ function macMenuTemplate(run, edit) {
     {
       label: 'File',
       submenu: [
-        action('new-tab', 'New Tab', 'Command+T'),
+        action('command-palette', 'Command Palette…'),
+        action('new-tab', 'New Tab Page'),
         action('open-browser', 'Open Browser Window', 'Command+N'),
         action('new-private-space', 'New Private Space', 'Command+Shift+N'),
         action('open-location', 'Open Location…', 'Command+L'),
@@ -97,6 +65,7 @@ function macMenuTemplate(run, edit) {
         action('import', 'Import Browser Data…'),
         action('export', 'Export Browser Data…'),
         separator,
+        action('save-page', 'Save Page As…'),
         action('print', 'Print…', 'Command+P'),
       ],
     },
@@ -146,6 +115,18 @@ function macMenuTemplate(run, edit) {
       submenu: [
         action('previous-tab', 'Previous Tab', 'Control+Shift+Tab'),
         action('next-tab', 'Next Tab', 'Control+Tab'),
+        separator,
+        action('pin-tab', 'Pin / Unpin Tab'),
+        action('duplicate-tab', 'Duplicate Tab'),
+        action('rename-tab', 'Rename Tab…'),
+        action('move-tab', 'Move Tab…'),
+        action('mute-tab', 'Mute / Unmute Tab'),
+        action('split', 'Split View…'),
+        separator,
+        action('previous-space', 'Previous Space'),
+        action('next-space', 'Next Space'),
+        action('new-space', 'New Space…'),
+        action('new-folder', 'New Folder…'),
         separator,
         action('bookmark', 'Bookmark This Page', 'Command+D'),
       ],

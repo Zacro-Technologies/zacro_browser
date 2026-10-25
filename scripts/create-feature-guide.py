@@ -1,4 +1,4 @@
-"""Build the screenshot guide after final application captures are approved.
+"""Build the five-page 0.5 guide after final application captures are approved.
 
 Requires ReportLab and Pillow; both are included in the Codex workspace runtime.
 Run from any directory: python scripts/create-feature-guide.py
@@ -21,67 +21,42 @@ PAGES = [
     (
         "workspace.jpg",
         "01 / THE WORKSPACE",
-        "Room for the web.",
-        "Navigation and the address field live in the sidebar. Icon favorites, folders and "
-        "single-line tabs stay close; Library, Spaces and creation share a quiet footer.",
+        "Compact by design.",
+        "Navigation, address, favorites and folders share a 224px sidebar with 32px tab rows. "
+        "Drag a tab into favorites to pin it, or back into the list to unpin. "
+        "The page keeps its space and live state.",
     ),
     (
-        "home-dark.jpg",
-        "02 / A QUIET START",
-        "Start with one thought.",
-        "Search, saved destinations and recent pages. The new-tab page keeps familiar places "
-        "nearby without repeating favorites already visible in the sidebar.",
+        "palette.jpg",
+        "02 / COMMAND PALETTE",
+        "One palette. Clear intent.",
+        "Ctrl/Command + T prepares a new destination; Ctrl/Command + L edits the current address. "
+        "Type / to find browser actions. The sidebar stays usable beside the palette. "
+        "Opening or cancelling it never adds a disposable tab.",
     ),
     (
-        "focus-mode.jpg",
-        "03 / FOCUS",
-        "Give the page more room.",
-        "Ctrl/Command + Shift + B hides the sidebar without reloading the page. A compact "
-        "navigation row keeps the address and sidebar toggle available.",
+        "shortcuts.jpg",
+        "03 / KEYBOARD SHORTCUTS",
+        "Familiar keys. Your choices.",
+        "Arc-style defaults: Ctrl/Command + S toggles the sidebar, Ctrl/Command + D pins a tab, "
+        "and Ctrl + Tab visits recent tabs. Search the catalog to record, disable or reset a binding. "
+        "Conflicts are checked before saving.",
     ),
     (
-        "command-palette.jpg",
-        "04 / COMMAND BAR",
-        "Move at the speed of a shortcut.",
-        "Ctrl/Command + L opens the command bar. Find a tab, enter an address, search the web "
-        "or choose a browser action. Escape returns to the page.",
+        "ai-connections.jpg",
+        "04 / OPTIONAL AI",
+        "Six explicit connections.",
+        "ChatGPT subscription, Claude subscription, OpenAI API, Claude API, OpenRouter, "
+        "or an OpenAI-compatible server. Subscription usage and API billing stay separate; "
+        "page sharing is explicit. Live sign-in and inference acceptance remain pending.",
     ),
     (
-        "peek.jpg",
-        "05 / PEEK",
-        "Follow a link. Keep your place.",
-        "Alt + click or the link menu opens a live preview. Escape dismisses it. Promote it "
-        "to a tab while preserving its draft, scroll position and navigation history.",
-    ),
-    (
-        "split-view.jpg",
-        "06 / SPLIT VIEW",
-        "Two pages, one workspace.",
-        "Compare or reference pages side by side. The address and navigation follow the "
-        "focused pane while both pages keep their position and live state.",
-    ),
-    (
-        "bookmarks.jpg",
-        "07 / LIBRARY",
-        "Find what you left behind.",
-        "Bookmarks, history, downloads and archived tabs share one Library entry. Search "
-        "within a section, switch sections, or return directly to your browsing.",
-    ),
-    (
-        "appearance-light.jpg",
-        "08 / MAKE IT YOURS",
-        "Small controls. Useful choices.",
-        "Choose appearance, sidebar width and everyday behavior in Settings. Expand details "
-        "when needed. Saved custom sidebar widths survive the compact layout update.",
-    ),
-    (
-        "optional-ai.jpg",
-        "09 / OPTIONAL AI",
-        "Your Codex subscription, in reach.",
-        "Connect Codex opens Settings, where Sign in with ChatGPT connects your subscription; "
-        "no API-key or separate API billing. This capture is unconnected. Page sharing is explicit. Live account "
-        "and inference acceptance remain open. This is a development build: sync, signed "
-        "updates and commercial release gates remain unfinished. See README and docs/VALIDATION.md.",
+        "blank-space.jpg",
+        "05 / AN EMPTY SPACE",
+        "Start without tab clutter.",
+        "An empty Space opens the command palette automatically. Submit an address or search "
+        "to create a page; Escape leaves the Space empty. New Tab Page remains an explicit action. "
+        "This is a development build; see the README for release limits.",
     ),
 ]
 
@@ -95,16 +70,16 @@ def build(screenshots, output):
     width, height = 792, 612  # US Letter, landscape; one intact screenshot per page.
     margin = 32
     doc = canvas.Canvas(str(output), pagesize=(width, height), pageCompression=1)
-    doc.setTitle("Zacro 0.4 - Design and Feature Guide")
+    doc.setTitle("Zacro 0.5 - Design and Feature Guide")
     doc.setAuthor("Zacro Technologies")
-    doc.setSubject("Windows development interface, features and release boundaries")
+    doc.setSubject("Zacro 0.5 Windows development interface, commands, shortcuts and optional AI connections")
     body = ParagraphStyle(
         "caption", fontName="Helvetica", fontSize=9, leading=12,
-        textColor=HexColor("#4f5c59"), spaceAfter=0,
+        textColor=HexColor("#5f5661"), spaceAfter=0,
     )
-    background = HexColor("#f7f7f3")
-    ink = HexColor("#233a32")
-    muted = HexColor("#68766f")
+    background = HexColor("#f7f4f3")
+    ink = HexColor("#342c35")
+    muted = HexColor("#766b77")
 
     for index, (filename, label, title, caption) in enumerate(PAGES, start=1):
         doc.setFillColor(background)
@@ -112,7 +87,7 @@ def build(screenshots, output):
 
         doc.setFont("Helvetica-Bold", 8)
         doc.setFillColor(muted)
-        doc.drawString(margin, height - 27, "ZACRO / INTERFACE 0.4")
+        doc.drawString(margin, height - 27, "ZACRO / INTERFACE 0.5")
         doc.drawRightString(width - margin, height - 27, label)
         doc.setFont("Helvetica", 23)
         doc.setFillColor(ink)
@@ -132,12 +107,12 @@ def build(screenshots, output):
         draw_width, draw_height = image_width * scale, image_height * scale
         x = (width - draw_width) / 2
         y = screenshot_top - draw_height
-        doc.setFillColor(HexColor("#e0e5df"))
+        doc.setFillColor(HexColor("#e2dbe1"))
         doc.roundRect(x - 1, y - 1, draw_width + 2, draw_height + 2, 5, fill=1, stroke=0)
         doc.drawImage(str(path), x, y, width=draw_width, height=draw_height, mask="auto")
         paragraph.drawOn(doc, margin, caption_bottom)
 
-        doc.setStrokeColor(HexColor("#dce3dc"))
+        doc.setStrokeColor(HexColor("#ded5dd"))
         doc.setLineWidth(0.4)
         doc.line(margin, 26, width - margin, 26)
         doc.setFillColor(muted)
@@ -152,10 +127,10 @@ def build(screenshots, output):
 
 if __name__ == "__main__":
     parser = ArgumentParser(description=__doc__)
-    parser.add_argument("--screenshots", type=Path, default=ROOT / "docs/screenshots")
+    parser.add_argument("--screenshots", type=Path, default=ROOT / "docs/screenshots/0.5")
     parser.add_argument(
         "--output", type=Path,
-        default=ROOT / "output/pdf/Zacro-0.4-Design-and-Feature-Guide.pdf",
+        default=ROOT / "output/pdf/Zacro-0.5-Design-and-Feature-Guide.pdf",
     )
     args = parser.parse_args()
     build(args.screenshots.resolve(), args.output.resolve())

@@ -73,6 +73,8 @@ async function launch(t, directory) {
   const page = await app.firstWindow();
   page.on('pageerror', (error) => errors.push(error.message));
   await page.waitForFunction(() => Boolean(window.zacro));
+  await expect(page.locator('[data-key="address"]')).toBeVisible();
+  if (await page.locator('#command-input').count()) await page.keyboard.press('Escape');
   const downloadDirectory = path.join(dir, 'downloads');
   await fsp.mkdir(downloadDirectory, { recursive: true });
   await app.evaluate(({ app }, directory) => app.setPath('downloads', directory), downloadDirectory);
@@ -112,7 +114,8 @@ test(
   async (t) => {
     const b = await launch(t);
     await expect(b.page.locator('#sidebar')).toBeVisible();
-    await expect(b.page.locator('#newtab')).toBeVisible();
+    await expect(b.page.locator('#newtab')).toBeHidden();
+    assert.equal((await b.state()).tabs.length, 0);
     await expect(b.page.locator('[data-key="space-picker"]')).toBeVisible();
     await expect(b.page.getByRole('button', { name: /New tab/, exact: false }).first()).toBeVisible();
     await b.navigate(`${base}/a`);
@@ -350,8 +353,9 @@ test(
     await createFolder.getByLabel('Folder name', { exact: true }).fill('Evidence');
     await createFolder.getByRole('button', { name: 'Create folder', exact: true }).click();
     await expect.poll(async () => (await b.state()).folders[0]?.name).toBe('Evidence');
-    await b.page.locator('#home-query').fill(`${base}/a`);
-    await b.page.locator('#home-query').press('Enter');
+    await b.page.locator('[data-key="address"]').click();
+    await b.page.locator('#command-input').fill(`${base}/a`);
+    await b.page.locator('#command-input').press('Enter');
     await expect.poll(async () => (await b.state()).runtime.page.url).toBe(`${base}/a`);
     await expect
       .poll(async () => {
@@ -473,9 +477,12 @@ test(
 
     menu = await menuAtControl(b.page.locator('[data-key="add-menu"]'), 'Add', 'above');
     await menu.getByRole('button', { name: /^New tab(?:\s|$)/ }).click();
-    await expect(b.page.getByRole('dialog')).toHaveCount(0);
+    await expect(b.page.locator('#command-input')).toBeFocused();
+    assert.equal((await b.state()).activeTabId, first, 'Opening the palette does not create a tab');
+    await b.page.locator('#command-input').fill(`${base}/b`);
+    await b.page.locator('#command-input').press('Enter');
     await expect.poll(async () => (await b.state()).activeTabId).not.toBe(first);
-    await b.navigate(`${base}/b`);
+    await expect.poll(async () => (await b.state()).runtime.page.url).toBe(`${base}/b`);
     menu = await menuAtControl(pageActions, 'Page actions', 'below');
     await menu.getByRole('button', { name: 'Split view', exact: true }).click();
     await b.page

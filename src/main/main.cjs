@@ -14,6 +14,7 @@ const {
   nativeTheme,
   screen,
   webContents,
+  safeStorage,
 } = require('electron');
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
@@ -24,7 +25,8 @@ const { BrowserStore, normalizeAddress } = require('../core/store.cjs');
 const { webURL, safeFilename, unusedPath, renameWithoutOverwrite } = require('./security.cjs');
 const { browserLayout, presentView, resolveSplit, restoreWindowPlacement } = require('./layout.cjs');
 const { FaviconLoader } = require('./favicon.cjs');
-const { windowChrome, macShortcut, macMenuTemplate } = require('./mac.cjs');
+const { windowChrome, macMenuTemplate } = require('./mac.cjs');
+const { shortcutCatalog, matchShortcut, updateShortcut, sidebarTabs } = require('../core/shortcuts.cjs');
 const faviconLoader = new FaviconLoader();
 
 app.setName('Zacro');
@@ -66,6 +68,9 @@ let windowReady = null;
 let startupReady = false;
 let quitRequested = false;
 let drainingExternalURLs = false;
+let recordingShortcut = false;
+let recentTabCycle = null;
+let recentTabModifiers = null;
 const externalURLs = [];
 let defaultBrowser = { supported: process.platform === 'darwin' && app.isPackaged, configured: false };
 
@@ -219,6 +224,7 @@ function snapshot() {
         }
       : null,
     platform: process.platform,
+    shortcuts: shortcutCatalog(process.platform, store.state.settings.shortcutOverrides),
     version: app.getVersion(),
     chromium: process.versions.chrome,
     aiConfigured: Boolean(status.configured),
@@ -905,104 +911,138 @@ function showPageMenu(entry, params) {
   Menu.buildFromTemplate(items).popup({ window: win });
 }
 
+function setShortcutRecording(active) {
+  recordingShortcut = Boolean(active && validWindow());
+  if (validWindow()) win.webContents.setIgnoreMenuShortcuts(recordingShortcut);
+}
 function handleShortcut(event, input, contents) {
-  if (input.type !== 'keyDown' || input.isComposing || !validWindow()) return;
-  const mod = process.platform === 'darwin' ? input.meta : input.control;
-  const key = input.key.toLowerCase();
-  const run = (callback) => {
-    event.preventDefault();
-    try {
-      const value = callback();
-      if (value?.catch) value.catch(report);
-    } catch (error) {
-      report(error);
+  if (input.type === 'keyUp') {
+    if (
+      recentTabModifiers &&
+      (!recentTabModifiers.length ||
+        recentTabModifiers.includes(input.key) ||
+        recentTabModifiers.some((name) => !input[{ Control: 'control', Meta: 'meta', Alt: 'alt' }[name]]))
+    ) {
+      recentTabCycle = null;
+      recentTabModifiers = null;
     }
-  };
-  if (process.platform === 'darwin') {
-    const action = macShortcut(input);
-    if (action) return run(() => runMacAction(action, contents !== win.webContents));
-    // These belong to Cocoa: Command-H hides the app and Command-Tab is the
-    // system application switcher. They must never become browser actions.
-    // Unrecognized modified Command combinations also remain native. Falling
-    // through would turn, for example, Command-Option-T into a new tab.
-    if (input.meta && (input.control || input.alt || input.shift || ['h', 'q', 'tab'].includes(key))) return;
+    return;
   }
-  if (key === 'f6') {
-    return run(() => {
-      const target = activeContents();
-      if (contents === win.webContents && !layout.overlay && target) target.focus();
-      else {
-        win.webContents.focus();
-        emit({ type: 'focus:chrome' });
-      }
-    });
+  if (input.type !== 'keyDown' || input.isComposing || !validWindow()) return;
+  if (recordingShortcut && contents === win.webContents) return;
+  const action = matchShortcut(input, process.platform, store.state.settings.shortcutOverrides);
+  if (action) {
+    event.preventDefault();
+    if (['recent-tab', 'previous-recent-tab'].includes(action))
+      recentTabModifiers ||= [input.control && 'Control', input.meta && 'Meta', input.alt && 'Alt'].filter(
+        Boolean,
+      );
+    else {
+      recentTabCycle = null;
+      recentTabModifiers = null;
+    }
+    if (
+      input.isAutoRepeat &&
+      ![
+        'zoom-in',
+        'zoom-out',
+        'next-tab',
+        'previous-tab',
+        'recent-tab',
+        'previous-recent-tab',
+        'find-next',
+        'find-previous',
+      ].includes(action)
+    )
+      return;
+    // Command+Enter inside the palette submits the current query; dialog key
+    // handling stays in the renderer while the shared catalog owns the binding.
+    runMacAction(action, contents !== win.webContents).catch(report);
+    return;
   }
-  if (mod && input.shift && key === 'b')
-    return run(() => emit({ type: 'sidebar:toggle', fromPage: contents !== win.webContents }));
-  // The shell owns focused fields and command-panel shortcuts itself.
-  if (contents === win.webContents && !['f5', 'f11', 'f12'].includes(key)) return;
-  if (contents === win.webContents && ['f5', 'f12'].includes(key)) {
-    const target = activeContents();
-    return run(() => {
-      if (!target) return;
-      if (key === 'f12') target.openDevTools({ mode: 'detach' });
-      else if (input.shift) target.reloadIgnoringCache();
-      else target.reload();
-    });
+  if (
+    input.key?.toLowerCase() === 'escape' &&
+    !input.control &&
+    !input.meta &&
+    !input.alt &&
+    !input.shift &&
+    contents !== win.webContents
+  ) {
+    if (peek) {
+      event.preventDefault();
+      requestClosePeek().catch(report);
+    } else if (contents.isLoading()) {
+      event.preventDefault();
+      contents.stop();
+    }
   }
-  if (key === 'escape' && peek) return run(() => requestClosePeek());
-  if (mod && key === 't' && input.shift) return run(() => invoke('tab:restore', {}));
-  if (mod && ['l', 'k', 't'].includes(key))
-    return run(async () => {
-      if (key === 't' && !(await invoke('tab:create', {}))) return;
-      emit({ type: 'command', mode: key === 't' ? 'navigate' : 'address' });
-      win.webContents.focus();
-    });
-  if (mod && key === 'w')
-    return run(() => (peek ? requestClosePeek() : requestCloseTab(store.state.activeTabId)));
-  if (mod && key === 'f')
-    return run(() => {
-      emit({ type: 'find' });
-      win.webContents.focus();
-    });
-  if (mod && key === 'd') return run(() => store.dispatch('bookmark:toggle', {}));
-  if (mod && key === 'enter')
-    return run(() => {
-      emit({ type: 'ai:shortcut' });
-      win.webContents.focus();
-    });
-  if (mod && ['h', 'j', ','].includes(key))
-    return run(() => {
-      emit({ type: 'panel', panel: { h: 'history', j: 'downloads', ',': 'settings' }[key] });
-      win.webContents.focus();
-    });
-  if (mod && key === 'p') return run(() => contents.print({}));
-  if ((mod && key === 'r') || key === 'f5')
-    return run(() => (input.shift ? contents.reloadIgnoringCache() : contents.reload()));
-  if (process.platform !== 'darwin' && mod && key === 'tab') return run(() => cycleTab(input.shift ? -1 : 1));
-  if (mod && /^[1-9]$/.test(key))
-    return run(() => {
-      const tabs = store.state.tabs.filter((tab) => tab.spaceId === store.state.activeSpaceId);
-      const tab = tabs[key === '9' ? tabs.length - 1 : Number(key) - 1];
-      if (tab) return invoke('tab:activate', { id: tab.id });
-    });
-  if (process.platform !== 'darwin' && input.alt && key === 'arrowleft')
-    return run(() => contents.navigationHistory.canGoBack() && contents.navigationHistory.goBack());
-  if (process.platform !== 'darwin' && input.alt && key === 'arrowright')
-    return run(() => contents.navigationHistory.canGoForward() && contents.navigationHistory.goForward());
-  if (mod && ['+', '=', '-', '0'].includes(key))
-    return run(() => zoom(contents, key === '0' ? { reset: true } : { delta: key === '-' ? -0.1 : 0.1 }));
-  if (key === 'f11') return run(() => win.setFullScreen(!win.isFullScreen()));
-  if (key === 'f12' || (mod && input.shift && key === 'i'))
-    return run(() => contents.openDevTools({ mode: 'detach' }));
+}
+async function savePage() {
+  const contents = activeContents();
+  if (!contents || contents.isDestroyed() || !webURL(contents.getURL())) return null;
+  const originalURL = contents.getURL();
+  let filename = String(contents.getTitle() || 'Page')
+    .normalize('NFKC')
+    .replace(/[<>:"/\\|?*\x00-\x1f\x7f\u202a-\u202e\u2066-\u2069]/g, '_')
+    .replace(/^[. ]+|[. ]+$/g, '')
+    .slice(0, 150);
+  try {
+    filename = safeFilename((filename || 'Page') + '.html');
+  } catch {
+    filename = 'Page.html';
+  }
+  const result = await dialog.showSaveDialog(win, {
+    title: 'Save page as',
+    defaultPath: path.join(app.getPath('downloads'), filename),
+    filters: [{ name: 'Web page, complete', extensions: ['html', 'htm'] }],
+  });
+  if (result.canceled || !result.filePath) return null;
+  if (contents.isDestroyed() || contents.getURL() !== originalURL)
+    throw new Error('The page changed while choosing a location. Save it again.');
+  await contents.savePage(result.filePath, 'HTMLComplete');
+  toast('Page saved.');
+  return { saved: true };
 }
 async function cycleTab(direction) {
-  const tabs = store.state.tabs.filter((tab) => tab.spaceId === store.state.activeSpaceId);
+  const tabs = sidebarTabs(store.state);
   if (!tabs.length) return;
   const index = tabs.findIndex((tab) => tab.id === store.state.activeTabId);
   const id = tabs[(index + direction + tabs.length) % tabs.length].id;
   const result = await invoke('tab:activate', { id });
   if (result && store.state.activeTabId === id) focusContentOrChrome();
+  return result;
+}
+async function cycleRecentTab(direction) {
+  const profileId = activeSpace()?.profileId;
+  if (
+    !recentTabCycle ||
+    recentTabCycle.profileId !== profileId ||
+    recentTabCycle.selected !== store.state.activeTabId
+  ) {
+    const active = activeTab();
+    const others = store.state.tabs
+      .filter(
+        (tab) =>
+          tab.profileId === profileId &&
+          tab.id !== active?.id &&
+          (tab.url !== NEW_TAB || tab.homePage || tab.pinned || tab.folderId),
+      )
+      .reverse()
+      .sort((a, b) => b.lastActiveAt - a.lastActiveAt);
+    recentTabCycle = {
+      profileId,
+      ids: [...(active ? [active.id] : []), ...others.map((tab) => tab.id)],
+      index: 0,
+      selected: active?.id,
+    };
+  }
+  const cycle = recentTabCycle;
+  cycle.ids = cycle.ids.filter((id) => store.state.tabs.some((tab) => tab.id === id));
+  if (!cycle.ids.length) return;
+  cycle.index = (cycle.index + direction + cycle.ids.length) % cycle.ids.length;
+  cycle.selected = cycle.ids[cycle.index];
+  const result = await invoke('tab:activate', { id: cycle.selected });
+  if (result) focusContentOrChrome();
   return result;
 }
 function zoom(contents, payload) {
@@ -1516,6 +1556,7 @@ async function invoke(action, payload = {}) {
         cancelId: 0,
       });
       if (answer.response !== 1) return null;
+      await ai?.forgetProfile(profile.id);
       if (peek?.profileId === profile.id) closePeek(false);
       if (activeSpace()?.profileId === profile.id) await ai?.handle('ai:reset', {});
       for (const record of store.state.downloads.filter((item) => item.profileId === profile.id))
@@ -1540,10 +1581,48 @@ async function invoke(action, payload = {}) {
     const result = store.dispatch(action, payload);
     if (action === 'settings:update' && payload.values?.sidebarWidth && layout.sidebarWidth !== 0)
       layout.sidebarWidth = store.state.settings.sidebarWidth;
+    if (action === 'settings:update' && payload.values?.shortcutOverrides) buildMenu();
     return result;
   }
   const contents = activeContents();
   switch (action) {
+    case 'shortcut:set': {
+      const overrides = updateShortcut(
+        store.state.settings.shortcutOverrides,
+        process.platform,
+        payload.id,
+        payload.accelerator,
+      );
+      store.dispatch('settings:update', { values: { shortcutOverrides: overrides } });
+      buildMenu();
+      return shortcutCatalog(process.platform, store.state.settings.shortcutOverrides);
+    }
+    case 'shortcut:reset': {
+      const current = store.state.settings.shortcutOverrides || {};
+      let overrides;
+      if (payload.id) {
+        const entry = shortcutCatalog(process.platform, current).find((item) => item.id === payload.id);
+        if (!entry) throw new Error('Unknown browser shortcut.');
+        overrides = updateShortcut(current, process.platform, payload.id, entry.defaultAccelerator);
+      } else overrides = { ...current, [process.platform]: {} };
+      store.dispatch('settings:update', { values: { shortcutOverrides: overrides } });
+      buildMenu();
+      return shortcutCatalog(process.platform, store.state.settings.shortcutOverrides);
+    }
+    case 'shortcut:record':
+      setShortcutRecording(payload.active === true);
+      return null;
+    case 'shortcut:run':
+      if (
+        payload.id !== 'new-tab' &&
+        !shortcutCatalog(process.platform, store.state.settings.shortcutOverrides).some(
+          (entry) => entry.id === payload.id,
+        )
+      )
+        throw new Error('Unknown browser shortcut.');
+      return runMacAction(payload.id);
+    case 'save-page':
+      return savePage();
     case 'app:quit':
       // Let the IPC reply settle before a successful quit destroys its sender.
       setImmediate(() => app.quit());
@@ -1853,13 +1932,14 @@ function buildMenu() {
             const contents = webContents.getFocusedWebContents();
             if (contents && !contents.isDestroyed()) contents[action]();
           },
+          store.state.settings.shortcutOverrides,
         ),
       ),
     );
     app.dock?.setMenu(
       Menu.buildFromTemplate([
         { label: 'Open Browser Window', click: () => ensureWindow().catch(report) },
-        { label: 'New Tab', click: () => runMacAction('new-tab').catch(report) },
+        { label: 'Command Palette', click: () => runMacAction('command-palette').catch(report) },
         { label: 'New Private Space', click: () => runMacAction('new-private-space').catch(report) },
       ]),
     );
@@ -1871,16 +1951,11 @@ function buildMenu() {
       label: 'File',
       submenu: [
         {
-          label: 'New tab',
-          click: () =>
-            invoke('tab:create', {})
-              .then((tab) => {
-                if (!tab) return;
-                emit({ type: 'command', mode: 'navigate' });
-                win.webContents.focus();
-              })
-              .catch(report),
+          label: 'Command palette',
+          click: () => runMacAction('command-palette').catch(report),
         },
+        { label: 'New tab page', click: () => runMacAction('new-tab').catch(report) },
+        { label: 'Save page as…', click: () => savePage().catch(report) },
         {
           label: 'New private Space',
           click: () => invoke('profile:create', { name: 'Private', private: true }).catch(report),
@@ -1956,6 +2031,7 @@ function updateMacMenu() {
     enable(id, available);
   for (const id of [
     'print',
+    'save-page',
     'reload',
     'force-reload',
     'find',
@@ -1986,9 +2062,13 @@ async function runMacAction(action, fromPage = false) {
   switch (action) {
     case 'open-browser':
       return;
-    case 'new-tab':
-      if (!(await invoke('tab:create', {}))) return;
-      return showChrome({ type: 'command', mode: 'navigate' });
+    case 'new-tab': {
+      const tab = await invoke('tab:create', { homePage: true });
+      if (tab) return showChrome({ type: 'newtab:show', id: tab.id });
+      return;
+    }
+    case 'command-palette':
+      return showChrome({ type: 'command', mode: 'newtab' });
     case 'new-private-space':
       await invoke('profile:create', { name: 'Private', private: true });
       return;
@@ -2004,7 +2084,27 @@ async function runMacAction(action, fromPage = false) {
     case 'preferences':
     case 'history':
     case 'downloads':
+    case 'bookmarks':
+    case 'archive':
+    case 'extensions':
       return showChrome({ type: 'panel', panel: action === 'preferences' ? 'settings' : action });
+    case 'save-page':
+      return savePage();
+    case 'focus-chrome':
+      if (!fromPage && !layout.overlay && contents) contents.focus();
+      else showChrome({ type: 'focus:chrome' });
+      return;
+    case 'ai':
+      return showChrome({ type: 'ai:shortcut' });
+    case 'shortcuts':
+    case 'split':
+    case 'rename-tab':
+    case 'move-tab':
+    case 'new-space':
+    case 'new-folder':
+    case 'find-next':
+    case 'find-previous':
+      return showChrome({ type: 'shortcut', id: action });
     case 'find':
       return showChrome({ type: 'find' });
     case 'print':
@@ -2013,6 +2113,32 @@ async function runMacAction(action, fromPage = false) {
       return contents?.reload();
     case 'force-reload':
       return contents?.reloadIgnoringCache();
+    case 'stop':
+      return contents?.stop();
+    case 'copy-url':
+      if (contents && webURL(contents.getURL())) {
+        clipboard.writeText(contents.getURL());
+        toast('Address copied.');
+      }
+      return;
+    case 'peek-close':
+      return requestClosePeek();
+    case 'peek-promote':
+      return peek && promotePeek();
+    case 'pin-tab':
+      return activeTab() && invoke('tab:pin', {});
+    case 'duplicate-tab':
+      return activeTab() && invoke('tab:create', { url: activeTab().url, homePage: activeTab().homePage });
+    case 'mute-tab':
+      return contents && invoke('tab:mute', {});
+    case 'next-space':
+    case 'previous-space': {
+      const spaces = store.state.spaces.filter((space) => space.profileId === activeSpace()?.profileId);
+      const index = spaces.findIndex((space) => space.id === store.state.activeSpaceId);
+      const next = spaces[index + (action === 'next-space' ? 1 : -1)];
+      if (next) return invoke('space:activate', { id: next.id });
+      return;
+    }
     case 'sidebar-toggle':
       return emit({ type: 'sidebar:toggle', fromPage });
     case 'zoom-in':
@@ -2036,12 +2162,27 @@ async function runMacAction(action, fromPage = false) {
     case 'previous-tab':
     case 'next-tab':
       return cycleTab(action === 'previous-tab' ? -1 : 1);
+    case 'recent-tab':
+    case 'previous-recent-tab':
+      return cycleRecentTab(action === 'recent-tab' ? 1 : -1);
     case 'bookmark':
       return invoke('bookmark:toggle', {});
     case 'import':
       return importData();
     case 'export':
       return exportData();
+    default:
+      if (/^tab-[1-9]$/.test(action)) {
+        const tabs = sidebarTabs(store.state);
+        const number = Number(action.slice(4));
+        const selected = tabs[number === 9 ? tabs.length - 1 : number - 1];
+        if (selected) return invoke('tab:activate', { id: selected.id });
+      }
+      if (/^space-[1-9]$/.test(action)) {
+        const spaces = store.state.spaces.filter((space) => space.profileId === activeSpace()?.profileId);
+        const selected = spaces[Number(action.slice(6)) - 1];
+        if (selected) return invoke('space:activate', { id: selected.id });
+      }
   }
 }
 async function ensureWindow() {
@@ -2082,6 +2223,7 @@ async function endPrivateSessions() {
   // The Mac process survives closing its last window; private browsing must
   // not. Run only after every page has accepted the close, never on Cancel.
   for (const profile of store.state.profiles.filter((item) => item.private)) {
+    await ai?.forgetProfile(profile.id);
     for (const record of store.state.downloads.filter((item) => item.profileId === profile.id))
       liveDownloads.get(record.id)?.cancel();
     const ses = sessions.get(profile.id);
@@ -2177,6 +2319,7 @@ async function createWindow() {
   win.webContents.on('will-attach-webview', (event) => event.preventDefault());
   win.webContents.on('before-input-event', (event, input) => handleShortcut(event, input, win.webContents));
   win.webContents.on('render-process-gone', () => {
+    setShortcutRecording(false);
     if (validWindow()) win.webContents.reload();
   });
   win.webContents.on('did-finish-load', () => {
@@ -2206,7 +2349,12 @@ async function createWindow() {
     refreshDefaultBrowser();
     publish();
   });
-  win.on('blur', publish);
+  win.on('blur', () => {
+    recentTabCycle = null;
+    recentTabModifiers = null;
+    setShortcutRecording(false);
+    publish();
+  });
   const fullscreenChanged = () => {
     // Native full-screen transitions can arrive before the renderer publishes
     // its matching layout. Preserve the 40px toolbar/Find reservation; otherwise
@@ -2263,6 +2411,7 @@ async function createWindow() {
     }
   });
   win.on('closed', () => {
+    recordingShortcut = false;
     clearTimeout(publishTimer);
     publishTimer = null;
     finishAuth();
@@ -2354,6 +2503,7 @@ if (singleInstance)
           },
           userDataPath: app.getPath('userData'),
           openExternal: (url) => shell.openExternal(url),
+          safeStorage,
         });
         await ai.ready;
       } catch (error) {

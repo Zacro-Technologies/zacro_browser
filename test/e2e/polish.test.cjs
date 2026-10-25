@@ -93,6 +93,7 @@ async function launch(t, existingDirectory) {
   shell.on('pageerror', (error) => errors.push(error.message));
   await shell.waitForFunction(() => Boolean(window.zacro));
   await expect(shell.locator('[data-key="address"]')).toBeVisible();
+  if (await shell.locator('#command-input').count()) await shell.keyboard.press('Escape');
   const invoke = (action, payload = {}) =>
     shell.evaluate(([action, payload]) => window.zacro.invoke(action, payload), [action, payload]);
   const state = () => invoke('state:get');
@@ -142,7 +143,7 @@ test(
       if (index < 2) await browser.invoke('tab:move', { id: tab.id, folderId: folder.id });
     }
     await expect(shell.locator('.favorite')).toHaveCount(4);
-    await expect(shell.locator('.tab-row')).toHaveCount(9);
+    await expect(shell.locator('.tab-row')).toHaveCount(8);
     const geometry = await shell.evaluate(() => {
       const rows = [...document.querySelectorAll('.tab-row')].map((row) => {
         const box = row.getBoundingClientRect();
@@ -174,9 +175,9 @@ test(
       assert.equal(favorite.labels, 0);
     }
     await shell.locator(`[data-key="folder-${folder.id}"]`).click();
-    await expect(shell.locator('.tab-row')).toHaveCount(7);
+    await expect(shell.locator('.tab-row')).toHaveCount(6);
     await shell.locator(`[data-key="folder-${folder.id}"]`).click();
-    await expect(shell.locator('.tab-row')).toHaveCount(9);
+    await expect(shell.locator('.tab-row')).toHaveCount(8);
   },
 );
 
@@ -208,11 +209,11 @@ test(
     await browser.app.evaluate(({ webContents }, url) => {
       const contents = webContents.getAllWebContents().find((item) => item.getURL() === url);
       contents.focus();
-      contents.sendInputEvent({ type: 'keyDown', keyCode: 'B', modifiers: ['control', 'shift'] });
-      contents.sendInputEvent({ type: 'keyUp', keyCode: 'B', modifiers: ['control', 'shift'] });
+      contents.sendInputEvent({ type: 'keyDown', keyCode: 'S', modifiers: ['control'] });
+      contents.sendInputEvent({ type: 'keyUp', keyCode: 'S', modifiers: ['control'] });
     }, url);
     await expect(shell.locator('#sidebar')).toBeHidden();
-    const restore = shell.getByRole('button', { name: 'Show sidebar (Ctrl + Shift + B)', exact: true });
+    const restore = shell.getByRole('button', { name: 'Show sidebar (Ctrl + S)', exact: true });
     await expect(restore).toBeVisible();
     await expect.poll(async () => (await surface())?.x).toBe(8);
     const expanded = await surface();
@@ -240,7 +241,7 @@ test(
     const library = shell.getByRole('button', { name: 'Library', exact: true });
     await library.click();
     const menu = shell.getByRole('dialog', { name: 'Library', exact: true });
-    await expect(menu.getByRole('button')).toHaveCount(6);
+    await expect(menu.getByRole('button')).toHaveCount(7);
     await menu.getByRole('button', { name: 'Bookmarks', exact: true }).click();
     const navigation = shell.getByRole('navigation', { name: 'Library sections' });
     await expect(navigation.getByRole('button')).toHaveCount(4);
@@ -271,16 +272,17 @@ test(
     await browser.invoke('tab:pin', { id: tab.id });
     await browser.invoke('bookmark:toggle', { url, title: 'Saved favorite' });
     await browser.invoke('bookmark:toggle', { url: `${base}/saved-page`, title: 'Saved page' });
+    await browser.invoke('tab:create', { homePage: true });
     const home = shell.locator('#newtab');
     await expect(home).toBeVisible();
     await expect(home.locator(`.home-link[data-url="${url}"]`)).toHaveCount(0);
     await expect(home.locator('.home-link')).toHaveCount(1);
     await shell.locator('#home-query').fill('Keep this search draft');
-    await shell.getByRole('button', { name: 'Hide sidebar (Ctrl + Shift + B)', exact: true }).click();
+    await shell.getByRole('button', { name: 'Hide sidebar (Ctrl + S)', exact: true }).click();
     await expect(home.locator(`.home-link[data-url="${url}"]`)).toHaveCount(1);
     await expect(home.locator('.home-link')).toHaveCount(2);
     await expect(shell.locator('#home-query')).toHaveValue('Keep this search draft');
-    await shell.getByRole('button', { name: 'Show sidebar (Ctrl + Shift + B)', exact: true }).click();
+    await shell.getByRole('button', { name: 'Show sidebar (Ctrl + S)', exact: true }).click();
     await expect(home.locator(`.home-link[data-url="${url}"]`)).toHaveCount(0);
     await expect(shell.locator('#home-query')).toHaveValue('Keep this search draft');
   },
@@ -358,7 +360,7 @@ test(
 );
 
 test(
-  'command bar supports composition, selection, modal focus containment and return after state updates',
+  'command bar supports composition, action filtering, interactive sidebar and focus return after updates',
   { timeout: 45000 },
   async (t) => {
     const browser = await launch(t);
@@ -394,16 +396,26 @@ test(
     await expect(input).toBeFocused();
     await shell.keyboard.press('Tab');
     await expect(input).toBeFocused();
+    await expect(input).toHaveValue('/');
     await shell.keyboard.press('Shift+Tab');
+    await expect(shell.locator('.command-mode')).toBeFocused();
+    await shell.keyboard.press('Tab');
     await expect(input).toBeFocused();
     await address.evaluate((element) => element.focus());
-    await expect(input).toBeFocused();
-    const current = (await browser.state()).activeTabId;
-    await browser.invoke('tab:update', { id: current, title: 'Background title update' });
+    await expect(address).toBeFocused();
+    await input.focus();
+    const metadataTab = await browser.invoke('tab:create', { url: `${base}/metadata`, active: false });
+    await browser.invoke('tab:update', { id: metadataTab.id, title: 'Background title update' });
     await shell.keyboard.press('Escape');
     await expect(shell.getByRole('dialog')).toHaveCount(0);
     await expect(address).toBeFocused();
-    await shell.keyboard.press('Control+l');
+    await browser.app.evaluate(({ BrowserWindow }) => {
+      const contents = BrowserWindow.getAllWindows()[0].webContents;
+      contents.focus();
+      const modifiers = [process.platform === 'darwin' ? 'meta' : 'control'];
+      contents.sendInputEvent({ type: 'keyDown', keyCode: 'L', modifiers });
+      contents.sendInputEvent({ type: 'keyUp', keyCode: 'L', modifiers });
+    });
     await expect(input).toBeFocused();
     await input.fill(`${base}/composition`);
     await shell.keyboard.press('Enter');
@@ -595,8 +607,9 @@ test(
     const search = shell.locator('#panel-search');
     await expect(search).toBeFocused();
     await search.fill('unmatched search');
+    const metadataTab = await browser.invoke('tab:create', { url: `${base}/metadata`, active: false });
     await browser.invoke('tab:update', {
-      id: (await browser.state()).activeTabId,
+      id: metadataTab.id,
       title: 'Async page metadata',
     });
     await expect(search).toHaveValue('unmatched search');
@@ -683,7 +696,7 @@ test(
           }
           return candidates;
         };
-        return ['.space-title', '.new-tab', '.provider-note', '.setting-section h3'].map((selector) => {
+        return ['.space-title', '.address-text', '.provider-note', '.setting-section h3'].map((selector) => {
           const element = document.querySelector(selector);
           const values = backgrounds(element).map((behind) => {
             context.fillStyle = `rgb(${behind.join(',')})`;
@@ -1067,6 +1080,7 @@ test(
     const browser = await launch(t);
     const { shell } = browser;
     await shell.emulateMedia({ forcedColors: 'active', reducedMotion: 'reduce' });
+    await browser.invoke('tab:create', { homePage: true });
     assert.equal(await shell.evaluate(() => matchMedia('(forced-colors: active)').matches), true);
     const visibleOutline = (locator) =>
       locator.evaluate((element) => {
@@ -1307,8 +1321,8 @@ test(
       };
     });
     await openLibrarySection(shell, 'ai');
-    await expect(shell.getByRole('button', { name: 'Connect Codex', exact: true })).toBeVisible();
-    await shell.getByRole('button', { name: 'Connect Codex', exact: true }).click();
+    await expect(shell.getByRole('button', { name: 'Connect AI', exact: true })).toBeVisible();
+    await shell.getByRole('button', { name: 'Connect AI', exact: true }).click();
     await expect(shell.getByRole('button', { name: 'Sign in with ChatGPT', exact: true })).toBeVisible();
     assert.equal(await shell.locator('input[type=password], #api-key, #provider').count(), 0);
     await shell.getByRole('button', { name: 'Sign in with ChatGPT', exact: true }).click();
@@ -1369,8 +1383,8 @@ test(
     await shell.locator('#ai-submit').focus();
     await emit({ type: 'ai:progress', message: 'Writing…' });
     await emit({ type: 'ai:delta', delta: ' More detail.' });
-    const active = (await browser.state()).activeTabId;
-    await browser.invoke('tab:update', { id: active, title: 'A title update during a stream' });
+    const metadataTab = await browser.invoke('tab:create', { url: `${base}/metadata`, active: false });
+    await browser.invoke('tab:update', { id: metadataTab.id, title: 'A title update during a stream' });
     await expect(shell.locator('#ai-submit')).toBeFocused();
     await expect(shell.locator('#ai-submit')).toHaveAttribute('aria-label', 'Stop response');
     await shell.locator('#ai-context').focus();
@@ -1403,7 +1417,7 @@ test(
     await expect(shell.locator('.message.assistant').first()).toHaveText(`Zacro${longAnswer}`);
     await expect(shell.locator('.message.assistant').last()).toContainText('Sign in with ChatGPT again.');
     await expect(shell.locator('#ai-form')).toHaveCount(0);
-    await expect(shell.getByRole('button', { name: 'Connect Codex', exact: true })).toBeVisible();
+    await expect(shell.getByRole('button', { name: 'Connect AI', exact: true })).toBeVisible();
     await emit({ type: 'ai:status', configured: false, busy: false, loginPending: true, models: [] });
     await expect(shell.getByRole('button', { name: 'Continue sign-in', exact: true })).toBeVisible();
     await emit({ type: 'ai:status', configured: true, busy: false, loginPending: false, models: [] });
@@ -1486,9 +1500,11 @@ test(
     await expect.poll(() => browser.app.evaluate(() => globalThis.__subscriptionStatusQueue.length)).toBe(1);
     await browser.invoke('profile:create', { name: 'Other test profile' });
     await expect(shell.locator('.space-title')).toHaveText('Other test profile');
+    await expect.poll(() => browser.app.evaluate(() => globalThis.__subscriptionStatusQueue.length)).toBe(2);
     await browser.app.evaluate(() => {
       globalThis.__deferSubscriptionStatus = false;
-      globalThis.__subscriptionStatusQueue.shift()(globalThis.__subscriptionFixture);
+      for (const resolve of globalThis.__subscriptionStatusQueue.splice(0))
+        resolve(globalThis.__subscriptionFixture);
     });
     await expect(shell.locator('#ai-question')).toHaveValue('');
     assert.equal(

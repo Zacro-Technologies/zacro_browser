@@ -1,5 +1,7 @@
 # Screenshot assets
 
+These images and the linked 0.4 feature PDF are historical captures, made before the current empty-Space command palette, shortcut editor and trackpad feedback changes. Fresh captures are pending; use the current README and interaction guide for usage.
+
 The nine JPEG images were captured from the packaged Zacro 0.4 Windows development application on October 24, 2026 using the Computer plugin for both the final interactions and native window captures. They show the implemented compact sidebar interface with a prepared demo profile and locally served journal pages. The Mail, Calendar, Notes and Studio favorites are local demo destinations with original PNG icons. The captures contain no real account credentials, private browsing history, or simulated AI answers.
 
 The captures are JPEG images, preserved without recompression. The blue pointer highlight belongs to the Computer capture tool and is preserved in the images. The filenames describe the visible feature:

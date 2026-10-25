@@ -2,9 +2,20 @@
 
 Validated locally on Windows 11 x64 (OS build 26200), Node.js 24.19.0, Electron 45.0.0 and Chromium 156.0.8078.48. This record describes engineering verification of the development build, not commercial certification or a security audit.
 
+## 0.5 commands, gestures and AI connections
+
+Local evidence recorded October 25, 2026 covers the tabless command workflow, editable Arc-style shortcuts, recent-tab navigation, proportional Space gestures and six explicit AI connections. The results below are Windows development checks. Final cross-platform CI and the packaged Computer review are still pending.
+
+- **Source and unit checks:** formatting and JavaScript syntax checks pass, along with **144 unit/security tests**. Coverage includes visible sidebar ordering, shortcut conflicts and aliases, exact modifiers, gesture intent and momentum, provider isolation, credential storage, cancellation and response bounds.
+- **Desktop integration:** **53 Windows desktop checks pass** across the full 51-check run, two additional AI cases and targeted regression reruns. Six Darwin-only checks skip on Windows. Tests exercise actual Chromium pages, command creation/current-address intent, empty Spaces, persistent shortcut edits, recent-tab switching, drag pinning, native page geometry and preserved page state. Gesture checks cover finger-proportional feedback, reversal, endpoint resistance, momentum suppression and the usable sidebar beside the command palette.
+- **AI transport evidence:** the added API workflows use a real loopback HTTP fixture with a fake key. They verify the application-to-provider request path and settings behavior without a live provider account, paid inference or completed subscription sign-in. Controlled runtime transports cover the Claude connection; the bundled Codex runtime is checked while signed out. These checks do not establish live model, search, billing or account acceptance; see [AI verification limits](AI.md#validation-and-remaining-acceptance).
+- **Lifecycle soak:** **40 tab/Peek/split cycles pass**, retaining the original page's draft and reading position and releasing closed native pages. The local observation in `test-results/soak.json` reports **359ms median and 376ms p95 per cycle**. These are deterministic fixture lifecycle timings, not general browsing-speed or long-running memory guarantees.
+- **Packaged Windows application:** the 0.5 folder build passes acceptance for Electron security fuses, real navigation, local PDF extraction and the isolated signed-out Codex handshake. This verifies the packaged executable; it does not certify installer deployment or a signed release.
+- **Still pending:** current macOS CI on Apple silicon and Intel, packaged Computer review, refreshed screenshots/PDF verification, and final cross-platform CI status. Physical-Mac, assistive-technology, real-account and signed/notarized release acceptance remain open. The completed 0.4 checks and captures below are historical evidence, not substitutes for those 0.5 gates.
+
 ## 0.4 interface revision
 
-The current redesign moves navigation and the address field into the sidebar and follows the hierarchy recorded in the [0.4 design study](DESIGN-REVIEW-0.4.md): favorites, Space identity, folders/tabs, and a compact Library/Space/creation footer. It replaces permanent action strips with menus while retaining keyboard access and visible focus. The default sidebar is 224px wide; saved custom widths are preserved. Tab rows and the footer are 32px high.
+That revision moved navigation and the address field into the sidebar and followed the hierarchy recorded in the [0.4 design study](DESIGN-REVIEW-0.4.md): favorites, Space identity, folders/tabs, and a compact Library/Space/creation footer. It replaced permanent action strips with menus while retaining keyboard access and visible focus. The default sidebar is 224px wide; saved custom widths are preserved. Tab rows and the footer are 32px high.
 
 The layout contract places the native page at an 8px top inset on macOS with the sidebar visible, or 36px on Windows to preserve window controls. Full screen uses the 8px inset. Page content begins at 40px when the sidebar is hidden or Find is open, keeping those controls outside the website. Tests compare exact native Chromium bounds with the shell in normal, hidden-sidebar, Find, panel, split-view and Peek states, including a saved 380px sidebar at the minimum window size.
 
@@ -68,7 +79,7 @@ The baseline pass used UIA clicks/edits and F6/Escape. Control-key delivery was 
 
 ## Distribution
 
-`dist/win-unpacked/Zacro.exe` is the directly runnable build. The 0.4 CI workflow generates `Zacro-0.4.0-x64-Setup.exe`, a per-user Windows NSIS installer, and architecture-specific Mac DMG/ZIP files. These are **development artifacts**: Windows release signing and Mac Developer ID signing/notarization have not been completed. Windows Authenticode inspection of the earlier 0.3 executable and installer returned `NotSigned`; current packaged-application acceptance is recorded above. Installation/uninstallation on a clean disposable Windows machine has not been certified. Generated binaries are ignored by Git; the curated README screenshots are tracked under `docs/screenshots/`.
+`dist/win-unpacked/Zacro.exe` is the directly runnable Windows build. The CI workflow runs `npm run pack` and packaged acceptance on that application folder; it does **not** generate or upload a Windows NSIS installer. `npm run dist` is the separate local command that creates `Zacro-<version>-x64-Setup.exe`. The Mac CI jobs run `npm run dist:mac` and upload architecture-specific development DMG/ZIP files. These are **development artifacts**: Windows release signing and Mac Developer ID signing/notarization have not been completed. Windows Authenticode inspection of the earlier 0.3 executable and installer returned `NotSigned`; packaged-application acceptance is recorded above. Installation/uninstallation on a clean disposable Windows machine has not been certified. Generated binaries are ignored by Git; the curated README screenshots are tracked under `docs/screenshots/`.
 
 ## Required further acceptance
 

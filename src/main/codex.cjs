@@ -109,12 +109,12 @@ function isolatedEnvironment(home, cwd, input = process.env) {
   return env;
 }
 
-function lockedConfig() {
+function lockedConfig(authStorage = 'keyring') {
   return {
     model_provider: 'openai',
     forced_login_method: 'chatgpt',
     // A separate keyring entry is derived from CODEX_HOME; do not fall back to plaintext.
-    cli_auth_credentials_store: 'keyring',
+    cli_auth_credentials_store: authStorage === 'session' ? 'ephemeral' : 'keyring',
     approval_policy: 'never',
     sandbox_mode: 'read-only',
     project_doc_max_bytes: 0,
@@ -161,6 +161,11 @@ function loginUrl(value) {
 
 function safeError(error) {
   const detail = JSON.stringify(error || {}).toLowerCase();
+  if (/persist_failed|keyring|keychain|credential.{0,40}(store|persist|write)/.test(detail))
+    return new CodexError(
+      'The operating system keychain could not save your ChatGPT sign-in. Unlock or create your default login keychain, or choose “This session only” and sign in again. Zacro has not saved a plaintext token file.',
+      'AUTH_STORAGE',
+    );
   if (/eaddrinuse|address already in use/.test(detail))
     return new CodexError(
       'Another Codex sign-in is using the local callback. Finish or close it and try again.',
@@ -185,6 +190,7 @@ class CodexClient extends EventEmitter {
     spawn: spawnImpl = spawn,
     executable = executablePath(),
     rpcTimeoutMs = 20000,
+    authStorage = 'keyring',
   } = {}) {
     super();
     this.home = path.join(userDataPath, 'codex');
@@ -192,6 +198,7 @@ class CodexClient extends EventEmitter {
     this.spawn = spawnImpl;
     this.executable = executable;
     this.rpcTimeoutMs = rpcTimeoutMs;
+    this.authStorage = authStorage === 'session' ? 'session' : 'keyring';
     this.available = Boolean(executable);
     this.account = null;
     this.models = [];
@@ -202,6 +209,7 @@ class CodexClient extends EventEmitter {
     this.accountReadId = 0;
     this.loggingOut = false;
     this.error = null;
+    this.errorCode = null;
     this.pending = new Map();
     this.nextId = 1;
     this.child = null;
@@ -217,12 +225,35 @@ class CodexClient extends EventEmitter {
       account: this.account,
       models: this.models,
       loginPending: Boolean(this.loginId || this.loginStarting),
+      credentialStorage: this.authStorage,
+      ...(this.authStorage === 'session'
+        ? {
+            storageNotice:
+              'ChatGPT sign-in lasts only while this Codex connection is running. Closing Zacro or restarting the connection signs you out. An earlier saved keychain sign-in may remain if the keychain was unavailable; reconnect with keychain storage and sign out to remove it.',
+          }
+        : {}),
       ...(this.error ? { error: this.error } : {}),
+      ...(this.errorCode ? { errorCode: this.errorCode } : {}),
     };
   }
 
   changed() {
     this.emit('status', this.status());
+  }
+
+  async setAuthStorage(value) {
+    if (!['keyring', 'session'].includes(value))
+      throw new CodexError('Choose the operating system keychain or this session only.', 'INPUT');
+    if (value === this.authStorage) return;
+    if (this.turn) throw new CodexError('Stop the current answer before changing sign-in storage.', 'BUSY');
+    // Remove reachable durable auth through the official runtime. Failed keychain
+    // writes may already have stopped it; that must not block ephemeral recovery.
+    if (this.authStorage === 'keyring' && this.child) await this.logout();
+    this.stopProcess();
+    this.authStorage = value;
+    this.error = null;
+    this.errorCode = null;
+    this.changed();
   }
 
   async start() {
@@ -236,6 +267,7 @@ class CodexClient extends EventEmitter {
       await this.starting;
     } catch (error) {
       this.error = error instanceof CodexError ? error.message : 'Unable to start the bundled Codex runtime.';
+      this.errorCode = error.code || 'UNAVAILABLE';
       this.stopProcess();
       this.changed();
       throw new CodexError(this.error, error.code || 'UNAVAILABLE');
@@ -249,7 +281,13 @@ class CodexClient extends EventEmitter {
     if (this.closed) throw new CodexError('The Codex connection has closed.', 'CLOSED');
     const child = this.spawn(
       this.executable,
-      ['app-server', '--strict-config', '--listen', 'stdio://', ...configArgs(lockedConfig())],
+      [
+        'app-server',
+        '--strict-config',
+        '--listen',
+        'stdio://',
+        ...configArgs(lockedConfig(this.authStorage)),
+      ],
       {
         cwd: this.cwd,
         env: isolatedEnvironment(this.home, this.cwd),
@@ -282,7 +320,7 @@ class CodexClient extends EventEmitter {
     child.on('error', () => this.processEnded(child));
     child.on('exit', () => this.processEnded(child));
     await this.rpc('initialize', {
-      clientInfo: { name: 'zacro_browser', title: 'Zacro', version: '0.3.0' },
+      clientInfo: { name: 'zacro_browser', title: 'Zacro', version: require('../../package.json').version },
       capabilities: { experimentalApi: true },
     });
     this.notify('initialized', {});
@@ -319,6 +357,7 @@ class CodexClient extends EventEmitter {
     this.rejectPending(error);
     this.turn?.reject(error);
     this.error = error.message;
+    this.errorCode = error.code;
     child.kill();
     this.changed();
   }
@@ -342,6 +381,7 @@ class CodexClient extends EventEmitter {
     const error = new CodexError('Codex requested a tool that Zacro does not permit.', 'TOOL_POLICY');
     this.turn?.reject(error);
     this.error = error.message;
+    this.errorCode = error.code;
     // Stop our own child, including when the server has not returned a turn ID.
     this.stopProcess();
   }
@@ -409,8 +449,22 @@ class CodexClient extends EventEmitter {
     if (message.method === 'account/login/completed') {
       if (p.loginId !== this.loginId) return;
       this.loginId = null;
-      if (!p.success) this.error = 'ChatGPT sign-in did not complete. Please try again.';
-      this.readAccount(p.success).catch(() => {
+      if (!p.success) {
+        const failure = safeError(p.error || p);
+        // A runtime can briefly expose an in-memory account after OAuth succeeds but
+        // persistence fails. Never present that account as a completed sign-in.
+        this.stopProcess();
+        this.error =
+          failure.code === 'AUTH_STORAGE'
+            ? failure.message
+            : 'ChatGPT sign-in did not complete. Please try again.';
+        this.errorCode = failure.code;
+        this.changed();
+        return;
+      }
+      this.error = null;
+      this.errorCode = null;
+      this.readAccount(true).catch(() => {
         this.error = 'Unable to read the ChatGPT connection.';
         this.changed();
       });
@@ -518,6 +572,7 @@ class CodexClient extends EventEmitter {
       }
       this.loginId = result.loginId;
       this.error = null;
+      this.errorCode = null;
       return authUrl;
     } finally {
       if (generation === this.loginGeneration) this.loginStarting = false;
@@ -544,6 +599,7 @@ class CodexClient extends EventEmitter {
       await this.cancelLogin();
       await this.rpc('account/logout');
       this.error = null;
+      this.errorCode = null;
       return this.status();
     } finally {
       this.loggingOut = false;
@@ -578,7 +634,7 @@ class CodexClient extends EventEmitter {
         baseInstructions: instructions,
         environments: [],
         allowProviderModelFallback: false,
-        config: { ...lockedConfig(), web_search: research ? 'live' : 'disabled' },
+        config: { ...lockedConfig(this.authStorage), web_search: research ? 'live' : 'disabled' },
       });
     } catch (error) {
       if (signal?.aborted) throw signal.reason;
@@ -681,4 +737,5 @@ module.exports = {
   isolatedEnvironment,
   lockedConfig,
   loginUrl,
+  safeError,
 };

@@ -55,6 +55,7 @@ load('electron').app.emit('open-url', { preventDefault() {} }, ${JSON.stringify(
     BrowserWindow.getAllWindows()[0].focus();
   });
   await expect(shell.locator('[data-key="space-picker"]')).toBeVisible();
+  if (await shell.locator('#command-input').count()) await shell.keyboard.press('Escape');
   const invoke = (action, payload = {}) =>
     shell.evaluate(([action, payload]) => window.zacro.invoke(action, payload), [action, payload]);
   const state = () => invoke('state:get');
@@ -109,7 +110,7 @@ test('macOS uses native window chrome, menu conventions and keyboard navigation'
       globalThis.macShortcutTrace.push({ source: 'host', ...input, prevented: event.defaultPrevented });
       if (globalThis.macShortcutTrace.length > 80) globalThis.macShortcutTrace.shift();
     });
-    for (const id of ['new-tab', 'next-tab', 'previous-tab', 'close-tab', 'reopen-tab']) {
+    for (const id of ['command-palette', 'next-tab', 'previous-tab', 'close-tab', 'reopen-tab']) {
       const item = Menu.getApplicationMenu().getMenuItemById(id);
       const click = item.click;
       item.click = (...args) => {
@@ -198,7 +199,7 @@ test('macOS uses native window chrome, menu conventions and keyboard navigation'
         menu: flatten(Menu.getApplicationMenu()),
       };
     });
-    assert.deepEqual(native.buttons, { x: 16, y: 16 });
+    assert.deepEqual(native.buttons, { x: 16, y: 12 });
     assert.equal(native.fullscreen, false);
     for (const role of ['services', 'hide', 'hideothers', 'quit', 'minimize', 'zoom', 'front'])
       assert(
@@ -234,12 +235,19 @@ test('macOS uses native window chrome, menu conventions and keyboard navigation'
     await expect(b.shell.locator('#command-input')).toBeFocused();
     await b.shell.keyboard.press('Escape');
 
+    await b.navigate(`${b.base}/initial`);
     const initial = (await b.state()).activeTabId;
     await active(initial);
     await focusChrome();
     await nativeShortcut('T', ['meta']);
     await expect(b.shell.locator('#command-input')).toBeFocused();
     await b.shell.keyboard.press('Escape');
+    assert.equal((await b.state()).activeTabId, initial);
+    assert.equal((await b.state()).tabs.length, 1);
+    await focusChrome();
+    await nativeShortcut('T', ['meta']);
+    await b.shell.locator('#command-input').fill(`${b.base}/second`);
+    await b.shell.locator('#command-input').press('Enter');
     await expect.poll(async () => (await b.state()).activeTabId).not.toBe(initial);
     const second = (await b.state()).activeTabId;
     assert.notEqual(initial, second);
