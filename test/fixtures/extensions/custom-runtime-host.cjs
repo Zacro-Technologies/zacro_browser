@@ -89,6 +89,10 @@ app.whenReady().then(async () => {
         guard();
         return manager.changePermissions(p, id, grants);
       },
+      changePermissionDelta: (p, id, details, remove, guard) => {
+        guard();
+        return manager.changePermissionDelta(p, id, details, remove);
+      },
       emit: (...args) => bridge.emit(...args),
     });
     let view = window();

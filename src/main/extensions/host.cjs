@@ -229,6 +229,18 @@ class ExtensionHost {
           this.manager.changePermissions(profile, id, grants),
         );
       },
+      changePermissionDelta: (profile, id, details, remove, guard) => {
+        guard();
+        const epoch = this.syncClient().epoch;
+        const ownership = () => {
+          guard();
+          if (this.activeProfile()?.id !== profile) throw new Error('The active profile changed.');
+          this.syncClient().guard(epoch);
+        };
+        return this.operation(profile, id, ownership, () =>
+          this.manager.changePermissionDelta(profile, id, details, remove),
+        );
+      },
       emit: (profile, id, event, args) => {
         this.bridge.emit(profile, id, event, args);
         publish();

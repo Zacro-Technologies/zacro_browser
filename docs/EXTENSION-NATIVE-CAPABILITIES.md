@@ -21,7 +21,10 @@ through `zacroReviewedPermissions` before native registration. The initial
 On ABI v1, optional permission requests and removals call the native exact-set
 setter. They await native network/renderer dispatch and persistence before
 updating adapter metadata, durable grants and events. The extension generation,
-worker and original document remain alive. Required permissions and undeclared
+worker and original document remain alive. Approval authorizes only the requested
+delta; it is applied to the latest grants inside the native mutation queue.
+Concurrent ordinary changes do not cancel each other or replay stale full sets.
+Required permissions and undeclared
 or unsupported optional rights cannot be removed/granted. Stock Electron keeps
 its existing reduced-manifest/reload behavior.
 

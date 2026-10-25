@@ -21,13 +21,14 @@ const deferred = () => {
   return { promise, resolve, reject };
 };
 const keys = [keyPair()];
-function fixture(version = '1', permissions = ['storage'], optionalPermissions = []) {
+function fixture(version = '1', permissions = ['storage'], optionalPermissions = [], optionalOrigins = []) {
   const manifest = {
     manifest_version: 3,
     name: 'Synthetic',
     version,
     permissions,
     optional_permissions: optionalPermissions,
+    optional_host_permissions: optionalOrigins,
     background: { service_worker: 'worker.js' },
   };
   const signed = crx(
@@ -1404,4 +1405,197 @@ test('native callers can await committed manager readiness before reading startu
   await pending;
   await readiness;
   assert.equal(h.manager.list('p1')[0].enabled, true);
+});
+
+for (const kind of ['permissions', 'origins'])
+  test(`native approval rebases only its reviewed ${kind} delta after an unrelated completed removal`, async (t) => {
+    const dialog = deferred(),
+      entered = deferred();
+    t.after(() => dialog.resolve(true));
+    const engine = nativeEngine(),
+      nativeSets = [];
+    engine.setZacroReviewedPermissions = async (_id, grants) => nativeSets.push(structuredClone(grants));
+    const h = await setup(t, {
+      engine,
+      fetchPackage: async () =>
+        fixture('1', ['storage'], ['tabs', 'contextMenus'], ['https://a.example/*', 'https://b.example/*']),
+    });
+    const record = await h.manager.installStore('p1', fixture().id);
+    await h.manager.changePermissions('p1', record.id, {
+      permissions: ['storage', 'tabs'],
+      origins: ['https://a.example/*'],
+    });
+    const { ExtensionAPI } = require('../src/main/extensions/api.cjs'),
+      events = [];
+    const api = new ExtensionAPI({
+      resolveExtension: (p, id) => h.manager.resolveExtension(p, id),
+      tabs: { get: async () => ({ id: 10, url: 'https://target.example/' }) },
+      dialogs: {
+        requestPermissions: async () => {
+          entered.resolve();
+          return dialog.promise;
+        },
+      },
+      changePermissions: (p, id, grants) => h.manager.changePermissions(p, id, grants),
+      changePermissionDelta: (p, id, details, remove) =>
+        h.manager.changePermissionDelta(p, id, details, remove),
+      emit: (...args) => events.push(args),
+    });
+    const context = api.context('p1', record.id);
+    await api.activateAction('p1', record.id, 10);
+    const requested =
+      kind === 'permissions' ? { permissions: ['contextMenus'] } : { origins: ['https://b.example/*'] };
+    const removed = kind === 'permissions' ? { permissions: ['tabs'] } : { origins: ['https://a.example/*'] };
+    const pending = api.call(context, 'permissions.request', [requested]);
+    await entered.promise;
+    await api.call(context, 'permissions.remove', [removed]);
+    assert.equal(h.manager.resolveExtension('p1', record.id).generation, record.generation);
+    dialog.resolve(true);
+    assert.equal(await pending, true);
+    const saved = h.manager.list('p1')[0],
+      revoked = removed[kind][0],
+      approved = requested[kind][0];
+    assert.equal(saved.grants[kind].includes(revoked), false);
+    assert.equal(saved.grants[kind].includes(approved), true);
+    assert.deepEqual(nativeSets.at(-1), saved.grants);
+    const durable = JSON.parse(await fs.readFile(path.join(h.manager.profilePath('p1'), 'state.json')));
+    assert.deepEqual(durable.extensions[0].grants, saved.grants);
+    assert.equal(durable.extensions[0].grants[kind].includes(revoked), false);
+    assert.deepEqual(events.filter((event) => event[2] === 'permissions.onAdded').at(-1)[3], [
+      {
+        permissions: kind === 'permissions' ? [approved] : [],
+        origins: kind === 'origins' ? [approved] : [],
+      },
+    ]);
+  });
+test('overlapping native permission reductions serialize without unloading or reviving either removed grant after restore', async (t) => {
+  const gate = deferred(),
+    entered = deferred();
+  t.after(() => gate.resolve());
+  let deferredUpdate = false;
+  const nativeSets = [],
+    engine = nativeEngine();
+  engine.setZacroReviewedPermissions = async (_id, grants) => {
+    nativeSets.push(structuredClone(grants));
+    if (deferredUpdate) {
+      deferredUpdate = false;
+      entered.resolve();
+      await gate.promise;
+    }
+  };
+  const h = await setup(t, {
+    engine,
+    fetchPackage: async () => fixture('1', ['storage'], ['tabs', 'contextMenus']),
+  });
+  const record = await h.manager.installStore('p1', fixture().id);
+  await h.manager.changePermissions('p1', record.id, {
+    permissions: ['storage', 'tabs', 'contextMenus'],
+    origins: [],
+  });
+  const unloads = h.events.filter((event) => event[0] === 'unload').length;
+  deferredUpdate = true;
+  const first = h.manager.changePermissions('p1', record.id, {
+    permissions: ['storage', 'contextMenus'],
+    origins: [],
+  });
+  const results = Promise.allSettled([first]);
+  await entered.promise;
+  const second = h.manager.changePermissions('p1', record.id, {
+    permissions: ['storage', 'tabs'],
+    origins: [],
+  });
+  const secondResult = Promise.allSettled([second]);
+  gate.resolve();
+  const settled = [...(await results), ...(await secondResult)];
+  assert.deepEqual(
+    settled.map((value) => value.status),
+    ['fulfilled', 'fulfilled'],
+  );
+  const saved = h.manager.list('p1')[0];
+  assert.equal(saved.enabled, true);
+  assert.equal(saved.generation, record.generation);
+  assert.deepEqual(saved.grants, { permissions: ['storage'], origins: [] });
+  assert.deepEqual(h.manager.resolveExtension('p1', record.id).grants, saved.grants);
+  assert.equal(h.events.filter((event) => event[0] === 'unload').length, unloads);
+  assert.deepEqual(nativeSets.at(-1), saved.grants);
+  await h.manager.invalidateProfile('p1');
+  await h.manager.restore('p1');
+  assert.equal(h.manager.list('p1')[0].enabled, true);
+  assert.deepEqual(h.manager.resolveExtension('p1', record.id).grants, saved.grants);
+});
+
+test('native setter failure with another queued mutation durably disables the original record and cannot revive on restore', async (t) => {
+  const gate = deferred(),
+    entered = deferred();
+  t.after(() => gate.resolve());
+  let fail = false;
+  const engine = nativeEngine();
+  engine.setZacroReviewedPermissions = async () => {
+    if (fail) {
+      entered.resolve();
+      await gate.promise;
+      throw Error('Native dispatch failed');
+    }
+  };
+  const h = await setup(t, {
+    engine,
+    fetchPackage: async () => fixture('1', ['storage'], ['tabs', 'contextMenus']),
+  });
+  const record = await h.manager.installStore('p1', fixture().id);
+  await h.manager.changePermissions('p1', record.id, {
+    permissions: ['storage', 'tabs', 'contextMenus'],
+    origins: [],
+  });
+  fail = true;
+  const first = h.manager.changePermissionDelta('p1', record.id, { permissions: ['tabs'] }, true);
+  const caughtFirst = first.catch((error) => error);
+  await entered.promise;
+  const second = h.manager.changePermissionDelta('p1', record.id, { permissions: ['contextMenus'] }, true);
+  const caughtSecond = second.catch((error) => error);
+  gate.resolve();
+  assert.match((await caughtFirst).message, /Native dispatch failed/);
+  assert.match((await caughtSecond).message, /enabled adapted/);
+  assert.equal(h.manager.list('p1')[0].enabled, false);
+  assert.equal(h.manager.resolveExtension('p1', record.id), null);
+  const disk = JSON.parse(await fs.readFile(path.join(h.manager.profilePath('p1'), 'state.json')));
+  assert.equal(disk.extensions[0].enabled, false);
+  await h.manager.invalidateProfile('p1');
+  await h.manager.restore('p1');
+  assert.equal(h.manager.list('p1')[0].enabled, false);
+  assert.equal(h.manager.resolveExtension('p1', record.id), null);
+});
+test('lifecycle cancellation followed by a failed queued update still records the exact original native generation as disabled', async (t) => {
+  const gate = deferred(),
+    entered = deferred();
+  t.after(() => gate.resolve());
+  let hold = false,
+    offline = false;
+  const engine = nativeEngine();
+  engine.setZacroReviewedPermissions = async () => {
+    if (hold) {
+      entered.resolve();
+      await gate.promise;
+    }
+  };
+  const h = await setup(t, {
+    engine,
+    fetchPackage: async () => {
+      if (offline) throw Error('Offline update');
+      return fixture('1', ['storage'], ['tabs']);
+    },
+  });
+  const record = await h.manager.installStore('p1', fixture().id);
+  hold = true;
+  const mutation = h.manager.changePermissionDelta('p1', record.id, { permissions: ['tabs'] });
+  const caught = mutation.catch((error) => error);
+  await entered.promise;
+  offline = true;
+  const update = h.manager.update('p1', record.id);
+  const caughtUpdate = update.catch((error) => error);
+  gate.resolve();
+  assert.match((await caught).message, /cancel|Stale/);
+  assert.match((await caughtUpdate).message, /Offline/);
+  assert.equal(h.manager.list('p1')[0].enabled, false);
+  assert.equal(h.manager.resolveExtension('p1', record.id), null);
+  assert.deepEqual(h.manager.list('p1')[0].grants, record.grants);
 });

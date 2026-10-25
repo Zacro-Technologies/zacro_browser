@@ -743,7 +743,7 @@ class ExtensionAPI {
           details[key].every((value) => covers(grants[key], value, key)),
         );
       if (name === 'request' || name === 'remove') {
-        const next = optionalGrants(
+        optionalGrants(
           metadata.originalManifest || metadata.manifest,
           grants,
           details,
@@ -759,19 +759,40 @@ class ExtensionAPI {
           )
             return false;
         }
-        if (typeof this.changePermissions !== 'function')
+        if (typeof this.changePermissions !== 'function' && typeof this.changePermissionDelta !== 'function')
           throw new Error('Native permission rebuild unavailable');
-        this.guard(context);
-        const result = await this.changePermissions(context.profileId, context.extensionId, next, () =>
-          this.guard(context),
+        const current = this.guard(context);
+        const before = clone(current.grants);
+        const next = optionalGrants(
+          current.originalManifest || current.manifest,
+          before,
+          details,
+          name === 'remove',
+          current.capabilities,
         );
+        // The approved details are the authority. The manager applies that delta
+        // against its latest grants while holding native mutation serialization.
+        const result =
+          typeof this.changePermissionDelta === 'function'
+            ? await this.changePermissionDelta(
+                context.profileId,
+                context.extensionId,
+                details,
+                name === 'remove',
+                () => this.guard(context),
+              )
+            : await this.changePermissions(context.profileId, context.extensionId, next, () =>
+                this.guard(context),
+              );
         if (metadata.capabilities?.reviewedPermissions) this.guard(context);
+        const actualBefore = result?.permissionChange?.before || before;
+        const actualAfter = result?.permissionChange?.after || next;
         const changed = Object.fromEntries(
           ['permissions', 'origins'].map((key) => [
             key,
             name === 'remove'
-              ? grants[key].filter((value) => !next[key].includes(value))
-              : next[key].filter((value) => !grants[key].includes(value)),
+              ? actualBefore[key].filter((value) => !actualAfter[key].includes(value))
+              : actualAfter[key].filter((value) => !actualBefore[key].includes(value)),
           ]),
         );
         if (changed.permissions.length || changed.origins.length)

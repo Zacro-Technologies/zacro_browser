@@ -153,6 +153,7 @@ class ExtensionManager {
     this.preparedSessions = new WeakMap();
     this.epochs = new Map();
     this.operations = new Map();
+    this.lifecycleIntents = new Map();
     this.queues = new Map();
     this.runtime = new Map();
     this.timers = new Map();
@@ -196,10 +197,11 @@ class ExtensionManager {
   _key(profileId, id) {
     return JSON.stringify([profileId, id]);
   }
-  _context(profileId, id) {
+  _context(profileId, id, { mutation = false } = {}) {
     this._profile(profileId);
     if (!this.states.has(profileId)) throw new Error('Restore the profile before extension operations');
     const key = this._key(profileId, id);
+    if (!mutation) this.lifecycleIntents.set(key, Symbol('lifecycle intent'));
     this.operations.get(key)?.controller.abort(new Error('Stale extension operation cancelled'));
     const context = {
       profileId,
@@ -245,6 +247,47 @@ class ExtensionManager {
     return promise.finally(() => {
       if (this.queues.get(context.key) === promise) this.queues.delete(context.key);
       if (this.operations.get(context.key) === context) this.operations.delete(context.key);
+    });
+  }
+  _runMutation(profileId, id, work) {
+    let ticket;
+    const key = this._key(profileId, id);
+    try {
+      this._profile(profileId);
+      ticket = {
+        epoch: this.epochs.get(profileId),
+        intent: this.lifecycleIntents.get(key),
+        generation: this._record(profileId, id).generation,
+        externalGuard: this.captureOperationGuard(profileId, id),
+      };
+      ticket.externalGuard();
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    let context;
+    const previous = this.queues.get(key) || Promise.resolve();
+    const promise = previous
+      .catch(() => {})
+      .then(() => {
+        ticket.externalGuard();
+        this._profile(profileId);
+        if (
+          this.epochs.get(profileId) !== ticket.epoch ||
+          this.lifecycleIntents.get(key) !== ticket.intent ||
+          this._record(profileId, id).generation !== ticket.generation
+        )
+          throw new Error('Stale queued extension mutation');
+        // An ordinary queued permission/consent mutation does not supersede the
+        // current living caller. Lifecycle intents still cancel it immediately.
+        context = this._context(profileId, id, { mutation: true });
+        context.externalGuard = ticket.externalGuard;
+        this._guard(context);
+        return work(context);
+      });
+    this.queues.set(key, promise);
+    return promise.finally(() => {
+      if (this.queues.get(key) === promise) this.queues.delete(key);
+      if (context && this.operations.get(key) === context) this.operations.delete(key);
     });
   }
   _persist(profileId, change, context) {
@@ -1192,13 +1235,64 @@ class ExtensionManager {
     }
   }
   changePermissions(profileId, id, requested) {
-    return this._run(profileId, id, async (context) => {
+    let desired, before;
+    try {
+      const { permissionDetails } = require('./permissions.cjs');
+      desired = permissionDetails(requested);
+      before = this._record(profileId, id).grants;
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    const native = this.capabilities(profileId).reviewedPermissions;
+    const added = {},
+      removed = {};
+    for (const key of ['permissions', 'origins']) {
+      added[key] = desired[key].filter((value) => !before[key].includes(value));
+      removed[key] = before[key].filter((value) => !desired[key].includes(value));
+    }
+    return this._changePermissions(profileId, id, (record) =>
+      native
+        ? Object.fromEntries(
+            ['permissions', 'origins'].map((key) => [
+              key,
+              [
+                ...new Set([
+                  ...record.grants[key].filter((value) => !removed[key].includes(value)),
+                  ...added[key],
+                ]),
+              ].sort(),
+            ]),
+          )
+        : desired,
+    );
+  }
+  changePermissionDelta(profileId, id, requested, remove = false) {
+    let details;
+    try {
+      details = require('./permissions.cjs').permissionDetails(requested);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    return this._changePermissions(profileId, id, (record) =>
+      require('./permissions.cjs').optionalGrants(
+        record.current.manifest,
+        record.grants,
+        details,
+        remove,
+        this.capabilities(profileId),
+      ),
+    );
+  }
+  _changePermissions(profileId, id, resolveGrants) {
+    const run = this.capabilities(profileId).reviewedPermissions ? this._runMutation : this._run;
+    return run.call(this, profileId, id, async (context) => {
       const record = this.list(profileId).find((item) => item.id === id);
       if (!record?.enabled || record.current.legacyPath)
         throw new Error('Native permission rebuild requires an enabled adapted extension');
       const { permissionDetails, covers } = require('./permissions.cjs');
-      const grants = permissionDetails(requested),
+      const grants = permissionDetails(resolveGrants(record)),
         inspection = record.current.inspection;
+      const permissionChange = { before: clone(record.grants), after: clone(grants) };
       for (const key of ['permissions', 'origins']) {
         if (inspection.required[key].some((value) => !covers(grants[key], value, key)))
           throw new Error('Required permissions cannot be removed');
@@ -1211,7 +1305,7 @@ class ExtensionManager {
         )
           throw new Error('Unsupported or undeclared permission');
       }
-      if (JSON.stringify(grants) === JSON.stringify(record.grants)) return record;
+      if (JSON.stringify(grants) === JSON.stringify(record.grants)) return { ...record, permissionChange };
       if (this.capabilities(profileId).reviewedPermissions) {
         if (!record.current.nativeReviewedPermissions)
           throw new Error('Enable extension after runtime migration');
@@ -1232,17 +1326,16 @@ class ExtensionManager {
           live.userScriptsEnabled = saved.userScriptsEnabled;
           if (this.capabilities(profileId).userScripts)
             this.getSession(profileId).extensions.setZacroUserScriptsEnabled(id, saved.userScriptsEnabled);
-          return saved;
+          return { ...saved, permissionChange };
         } catch (error) {
           if (this.runtime.get(context.key) === live) {
             this.runtime.delete(context.key);
             this.getSession(profileId).extensions.removeExtension(id);
             // The original document guard may have expired. Persist revocation
-            // only while this exact manager operation still owns the record;
-            // never overwrite a successor's disable, removal or reinstall.
+            // only while the exact original durable generation remains; never
+            // overwrite a successor's published disable, removal or reinstall.
             if (
               !this.closed &&
-              this.operations.get(context.key) === context &&
               this.epochs.get(profileId) === context.epoch &&
               this.states
                 .get(profileId)
@@ -1265,7 +1358,7 @@ class ExtensionManager {
       let version;
       try {
         version = await this._deriveGrants(context, record, record.current, grants);
-        return await this._activate(context, record, version, { grants });
+        return { ...(await this._activate(context, record, version, { grants })), permissionChange };
       } catch (error) {
         await this._discard(context, version);
         throw error;
@@ -1273,7 +1366,7 @@ class ExtensionManager {
     });
   }
   setUserScriptsEnabled(profileId, id, enabled) {
-    return this._run(profileId, id, async (context) => {
+    return this._runMutation(profileId, id, async (context) => {
       if (typeof enabled !== 'boolean') throw new Error('Invalid user scripts consent');
       const record = this._record(profileId, id);
       if (!this.capabilities(profileId).userScripts || !record.grants.permissions.includes('userScripts'))
