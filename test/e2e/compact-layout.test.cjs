@@ -281,32 +281,38 @@ test(
             ?.executeJavaScript(expression) ?? null,
         { url, expression },
       );
-    const instrument = (url) =>
-      app.evaluate(({ webContents }, url) => {
-        const contents = webContents.getAllWebContents().find((contents) => contents.getURL() === url);
-        const capture = contents.capturePage.bind(contents);
-        globalThis.popoverCaptureCount = 0;
-        globalThis.popoverCaptures = [];
-        contents.capturePage = (...args) => {
-          globalThis.popoverCaptureCount++;
-          const record = { startedAt: Date.now(), visibility: contents.mainFrame.visibilityState };
-          globalThis.popoverCaptures.push(record);
-          return capture(...args).then(
-            (image) => {
-              Object.assign(record, {
-                duration: Date.now() - record.startedAt,
-                empty: image.isEmpty(),
-                size: image.getSize(),
-              });
-              return image;
-            },
-            (error) => {
-              Object.assign(record, { duration: Date.now() - record.startedAt, error: error.message });
-              throw error;
-            },
-          );
-        };
-      }, url);
+    const instrument = (url, firstDelayMs = 0) =>
+      app.evaluate(
+        ({ webContents }, { url, firstDelayMs }) => {
+          const contents = webContents.getAllWebContents().find((contents) => contents.getURL() === url);
+          const capture = contents.capturePage.bind(contents);
+          globalThis.popoverCaptureCount = 0;
+          globalThis.popoverCaptures = [];
+          contents.capturePage = (...args) => {
+            globalThis.popoverCaptureCount++;
+            const record = { startedAt: Date.now(), visibility: contents.mainFrame.visibilityState };
+            globalThis.popoverCaptures.push(record);
+            return capture(...args).then(
+              async (image) => {
+                const delay = firstDelayMs;
+                firstDelayMs = 0;
+                if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+                Object.assign(record, {
+                  duration: Date.now() - record.startedAt,
+                  empty: image.isEmpty(),
+                  size: image.getSize(),
+                });
+                return image;
+              },
+              (error) => {
+                Object.assign(record, { duration: Date.now() - record.startedAt, error: error.message });
+                throw error;
+              },
+            );
+          };
+        },
+        { url, firstDelayMs },
+      );
     const expectBackdrop = async (label) => {
       try {
         await expect(shell.locator('#page-backdrop img')).toHaveCount(1);
@@ -341,7 +347,9 @@ test(
       url,
       'document.querySelector("textarea").value="A draft retained through menus";new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))',
     );
-    await instrument(url);
+    // Exercise the cold-compositor path observed in native Mac CI: a successful
+    // capture after 200ms must still arrive without delaying dialog interaction.
+    await instrument(url, 250);
     let expectedCaptures = 0;
     for (const [key, title] of [
       ['library', 'Library'],

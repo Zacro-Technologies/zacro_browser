@@ -127,7 +127,10 @@ async function captureBackdrop() {
         const capture = await Promise.race([
           entry.contents.capturePage(undefined, { stayHidden: true }),
           new Promise((resolve) => {
-            timer = setTimeout(() => resolve(null), 200);
+            // A cold macOS compositor can finish a valid copy just after 200ms.
+            // The overlay and input focus update immediately; only the optional
+            // image waits, with a hard bound before its hidden view detaches.
+            timer = setTimeout(() => resolve(null), 750);
           }),
         ]);
         if (!capture || capture.isEmpty()) return null;

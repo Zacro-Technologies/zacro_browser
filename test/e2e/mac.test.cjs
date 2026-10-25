@@ -148,28 +148,42 @@ test('macOS uses native window chrome, menu conventions and keyboard navigation'
     await b.shell.locator('[data-key="address"]').focus();
     await expect(b.shell.locator('[data-key="address"]')).toBeFocused();
   };
-  const nativeShortcut = async (keyCode, modifiers) => {
+  const nativeShortcut = async (keyCode, modifiers, target = 'host') => {
     // CDP keyboard events reach the DOM but bypass Electron's before-input-event.
     // Exercise the native shortcut owner without changing first-responder focus.
     const offset = await b.app.evaluate(
-      ({ BrowserWindow }, { keyCode, modifiers }) => {
+      ({ BrowserWindow, webContents }, { keyCode, modifiers, target }) => {
         const offset = globalThis.macShortcutTrace.length;
-        const contents = BrowserWindow.getAllWindows()[0].webContents;
+        const contents =
+          target === 'focused'
+            ? webContents.getFocusedWebContents()
+            : BrowserWindow.getAllWindows()[0].webContents;
+        if (!contents) throw new Error('The native shortcut has no focused target');
+        if (target === 'focused') {
+          contents.once('before-input-event', (event, input) => {
+            globalThis.macShortcutTrace.push({
+              source: 'focused',
+              contentsId: contents.id,
+              ...input,
+              prevented: event.defaultPrevented,
+            });
+          });
+        }
         contents.sendInputEvent({ type: 'keyDown', keyCode, modifiers });
         contents.sendInputEvent({ type: 'keyUp', keyCode, modifiers });
         return offset;
       },
-      { keyCode, modifiers },
+      { keyCode, modifiers, target },
     );
     await expect
       .poll(() =>
         b.app.evaluate(
-          (_electron, { offset, keyCode, modifiers }) =>
+          (_electron, { offset, keyCode, modifiers, target }) =>
             globalThis.macShortcutTrace
               .slice(offset)
               .some(
                 (input) =>
-                  input.source === 'host' &&
+                  input.source === target &&
                   input.type === 'keyDown' &&
                   input.key.toLowerCase() === keyCode.toLowerCase() &&
                   input.meta === modifiers.includes('meta') &&
@@ -177,7 +191,7 @@ test('macOS uses native window chrome, menu conventions and keyboard navigation'
                   input.shift === modifiers.includes('shift') &&
                   input.prevented,
               ),
-          { offset, keyCode, modifiers },
+          { offset, keyCode, modifiers, target },
         ),
       )
       .toBe(true);
@@ -267,17 +281,18 @@ test('macOS uses native window chrome, menu conventions and keyboard navigation'
     }, `${b.base}/restore`);
     await expect.poll(async () => (await b.state()).tabs.some((tab) => tab.id === second)).toBe(false);
     await active(initial);
-    // Closing the native guest must restore the shell as first responder without
-    // a test click/focus override. Otherwise the physical reopen shortcut is lost.
+    // Closing the active guest transfers input to the surviving page. Verify the
+    // actual first responder and exercise reopen there without a test focus/click
+    // override, so both page typing and the native browser shortcut stay usable.
     await expect
       .poll(() =>
         b.app.evaluate(
-          ({ BrowserWindow, webContents }) =>
-            webContents.getFocusedWebContents()?.id === BrowserWindow.getAllWindows()[0].webContents.id,
+          ({ webContents }, url) => webContents.getFocusedWebContents()?.getURL() === url,
+          `${b.base}/initial`,
         ),
       )
       .toBe(true);
-    await nativeShortcut('T', ['meta', 'shift']);
+    await nativeShortcut('T', ['meta', 'shift'], 'focused');
     await expect.poll(async () => (await b.state()).tabs.some((tab) => tab.id === second)).toBe(true);
 
     await b.invoke('window:fullscreen');

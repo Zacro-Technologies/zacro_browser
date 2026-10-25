@@ -148,27 +148,102 @@ test(
 );
 
 test(
-  'dragging a tab into empty favorites pins the same tab and survives restart',
-  { timeout: 45000 },
+  'mouse drags pin into empty and occupied favorites, reorder pins and unpin back into the tab list across restarts',
+  { timeout: 60000 },
   async (t) => {
     const b = await fixture(t);
+    const row = (id) => b.shell.locator(`.tab-row[data-tab-id="${id}"]`);
+    const pin = (id) => b.shell.locator(`.favorite[data-tab-id="${id}"]`);
+    const pinnedOrder = () =>
+      b.shell
+        .locator('.favorite[data-tab-id]')
+        .evaluateAll((elements) => elements.map((element) => element.dataset.tabId));
+    const mouseDrag = async (source, target, { x = 0.5, y = 0.5, feedback = 'drag-over' } = {}) => {
+      // Hover waits for a stable, attached row and retries if page metadata
+      // replaces the sidebar while a newly restored tab finishes loading.
+      await source.hover();
+      const start = await source.boundingBox();
+      assert(start, 'The dragged tab must be visible');
+      const startX = start.x + start.width * 0.4;
+      const startY = start.y + start.height / 2;
+      await b.shell.mouse.move(startX, startY);
+      await b.shell.mouse.down();
+      try {
+        await b.shell.mouse.move(startX + 10, startY + 2, { steps: 3 });
+        await expect(b.shell.locator('#app')).toHaveAttribute('data-dragging', 'true');
+        // The empty pinned area grows after dragstart. Measure the destination
+        // afterwards, just as a pointer follows the visible drop target.
+        const end = await target.boundingBox();
+        assert(end, 'The drop destination must be visible');
+        const endX = end.x + end.width * x;
+        const endY = end.y + end.height * y;
+        await b.shell.mouse.move(endX, endY, { steps: 12 });
+        await b.shell.mouse.move(endX + 1, endY, { steps: 2 });
+        await expect(target).toHaveClass(new RegExp(`\\b${feedback}\\b`));
+      } finally {
+        await b.shell.mouse.up();
+      }
+      await expect(b.shell.locator('#app')).not.toHaveAttribute('data-dragging', 'true');
+    };
     await b.submit(`${b.base}/drag-pin`);
     const id = (await b.state()).activeTabId;
     await b.guest(`${b.base}/drag-pin`, 'document.querySelector("textarea").value="Pinned draft"');
-    await b.shell
-      .locator(`.tab-row[data-tab-id="${id}"]`)
-      .dragTo(b.shell.locator('.favorites[data-drop-pinned]'));
+    await mouseDrag(row(id), b.shell.locator('.favorites[data-drop-pinned]'));
     await expect.poll(async () => (await b.state()).tabs.find((tab) => tab.id === id)?.pinned).toBe(true);
-    await expect(b.shell.locator(`.favorite[data-tab-id="${id}"]`)).toBeVisible();
+    await expect(pin(id)).toBeVisible();
     assert.equal((await b.state()).tabs.length, 1);
     assert.equal(
       await b.guest(`${b.base}/drag-pin`, 'document.querySelector("textarea").value'),
       'Pinned draft',
     );
+    const second = await b.invoke('tab:create', { url: `${b.base}/second-pin` });
+    await expect.poll(() => b.guest(`${b.base}/second-pin`, 'document.readyState')).toBe('complete');
+    await b.guest(`${b.base}/second-pin`, 'document.querySelector("textarea").value="Second retained draft"');
+    await expect(row(second.id)).toBeVisible();
+    await mouseDrag(row(second.id), pin(id), { x: 0.75, feedback: 'drop-after' });
+    await expect
+      .poll(async () => (await b.state()).tabs.find((tab) => tab.id === second.id)?.pinned)
+      .toBe(true);
+    await expect.poll(pinnedOrder).toEqual([id, second.id]);
+    assert.equal((await b.state()).tabs.find((tab) => tab.id === second.id).folderId, null);
+
+    await mouseDrag(pin(second.id), pin(id), { x: 0.25, feedback: 'drop-before' });
+    await expect.poll(pinnedOrder).toEqual([second.id, id]);
+    assert.deepEqual(
+      (await b.state()).tabs.filter((tab) => tab.pinned).map((tab) => tab.id),
+      [second.id, id],
+    );
+    assert.equal(
+      await b.guest(`${b.base}/second-pin`, 'document.querySelector("textarea").value'),
+      'Second retained draft',
+      'Dragging preserves the existing live page and its draft',
+    );
+    const loose = await b.invoke('tab:create', { url: `${b.base}/loose-anchor` });
     await b.close();
     await b.launch();
-    await expect(b.shell.locator(`.favorite[data-tab-id="${id}"]`)).toBeVisible();
+    await expect.poll(pinnedOrder).toEqual([second.id, id]);
+    await expect(row(loose.id)).toBeVisible();
+    await mouseDrag(pin(second.id), row(loose.id), { y: 0.75, feedback: 'drop-after' });
+    await expect
+      .poll(async () => (await b.state()).tabs.find((tab) => tab.id === second.id)?.pinned)
+      .toBe(false);
+    await expect(pin(second.id)).toHaveCount(0);
+    await expect(row(second.id)).toBeVisible();
+    await expect
+      .poll(() =>
+        b.shell
+          .locator('.loose-tabs .tab-row')
+          .evaluateAll((elements) => elements.map((element) => element.dataset.tabId)),
+      )
+      .toEqual([loose.id, second.id]);
+    assert.equal((await b.state()).tabs.length, 3, 'Moving a tab never duplicates or closes it');
+    await b.close();
+    await b.launch();
+    await expect.poll(pinnedOrder).toEqual([id]);
+    await expect(row(second.id)).toBeVisible();
     assert.equal((await b.state()).tabs.find((tab) => tab.id === id).pinned, true);
+    assert.equal((await b.state()).tabs.find((tab) => tab.id === second.id).pinned, false);
+    assert.equal((await b.state()).tabs.find((tab) => tab.id === second.id).folderId, null);
   },
 );
 
@@ -252,6 +327,94 @@ test(
     );
     await b.invoke('shortcut:run', { id: 'shortcuts' });
     await expect(b.shell.getByRole('dialog', { name: 'Keyboard shortcuts' })).toBeVisible();
+    for (const [width, height] of [
+      [1440, 900],
+      [960, 640],
+    ]) {
+      await b.app.evaluate(
+        ({ BrowserWindow }, { width, height }) => {
+          BrowserWindow.getAllWindows()[0].setContentSize(width, height);
+        },
+        { width, height },
+      );
+      await expect
+        .poll(() =>
+          b.shell.evaluate(
+            ({ width, height }) => Math.abs(innerWidth - width) <= 2 && Math.abs(innerHeight - height) <= 2,
+            { width, height },
+          ),
+        )
+        .toBe(true);
+      await expect
+        .poll(() =>
+          b.shell
+            .locator('.shortcut-dialog')
+            .evaluate((element) =>
+              element.getAnimations().every((animation) => animation.playState !== 'running'),
+            ),
+        )
+        .toBe(true);
+      const geometry = () =>
+        b.shell.evaluate(() => {
+          const rect = (selector) => {
+            const { top, bottom, left, right, height } = document
+              .querySelector(selector)
+              .getBoundingClientRect();
+            return { top, bottom, left, right, height };
+          };
+          const rows = document.querySelector('#shortcut-rows');
+          const reset = document.querySelector('[data-action="ui:shortcut-reset-all"]');
+          const resetBox = reset.getBoundingClientRect();
+          return {
+            viewport: { width: innerWidth, height: innerHeight },
+            dialog: rect('.shortcut-dialog'),
+            header: rect('.shortcut-dialog .dialog-header'),
+            search: rect('.shortcut-search-wrap'),
+            rows: rect('#shortcut-rows'),
+            footer: rect('.shortcut-footer'),
+            scrollHeight: rows.scrollHeight,
+            clientHeight: rows.clientHeight,
+            scrollTop: rows.scrollTop,
+            dialogScrollTop: document.querySelector('.shortcut-dialog').scrollTop,
+            resetVisible:
+              document
+                .elementFromPoint(resetBox.left + resetBox.width / 2, resetBox.top + resetBox.height / 2)
+                ?.closest('[data-action="ui:shortcut-reset-all"]') === reset,
+          };
+        });
+      await expect
+        .poll(
+          async () => {
+            const view = await geometry();
+            return (
+              view.dialog.bottom <= view.viewport.height - 23 &&
+              view.dialog.left >= 0 &&
+              view.dialog.right <= view.viewport.width &&
+              view.resetVisible
+            );
+          },
+          { message: `The entire editor and Reset all remain reachable at ${width}×${height}` },
+        )
+        .toBe(true);
+      const before = await geometry();
+      assert(before.dialog.height <= 681, 'The editor stays compact on larger windows');
+      assert(before.header.top >= before.dialog.top && before.footer.bottom <= before.dialog.bottom);
+      assert(before.rows.top >= before.search.bottom && before.rows.bottom <= before.footer.top);
+      assert(before.scrollHeight > before.clientHeight, 'The catalog scrolls within its own list');
+      await b.shell.locator('#shortcut-rows').evaluate((element) => {
+        element.scrollTop = element.scrollHeight;
+      });
+      const after = await geometry();
+      assert(after.scrollTop > 0, 'The last shortcuts are reachable by scrolling the catalog');
+      assert.equal(after.dialogScrollTop, 0, 'The outer dialog never scrolls its controls out of view');
+      assert.deepEqual(after.header, before.header);
+      assert.deepEqual(after.search, before.search);
+      assert.deepEqual(after.footer, before.footer);
+      assert(after.resetVisible, 'Reset all remains hit-testable after scrolling to the end');
+      await b.shell.locator('#shortcut-rows').evaluate((element) => {
+        element.scrollTop = 0;
+      });
+    }
     await b.shell.locator(`[data-shortcut-record="${sidebar.id}"]`).click();
     await b.key('9', [b.mod, 'alt']);
     await expect

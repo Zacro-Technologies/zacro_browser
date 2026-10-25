@@ -2442,13 +2442,14 @@ details.setting-section[open] > :not(summary) {
 
 /* Commands and menus share the same compact row rhythm. */
 .dialog-backdrop {
+  --dialog-top: clamp(75px, 15vh, 150px);
   position: fixed;
   inset: 0;
   z-index: 100;
   display: flex;
   align-items: flex-start;
   justify-content: center;
-  padding: clamp(75px, 15vh, 150px) 24px 24px;
+  padding: var(--dialog-top) 24px 24px;
   background: #1c1a1733;
   backdrop-filter: blur(6px);
   animation: backdrop-in var(--motion-fast) ease-out;
@@ -2646,9 +2647,13 @@ details.setting-section[open] > :not(summary) {
 }
 .shortcut-dialog {
   width: 580px;
+  max-height: min(680px, calc(100vh - var(--dialog-top) - 24px));
   display: flex;
   flex-direction: column;
   overflow: hidden;
+}
+.shortcut-dialog > :not(.shortcut-rows) {
+  flex: none;
 }
 .shortcut-search-wrap {
   display: flex;
@@ -2670,6 +2675,7 @@ details.setting-section[open] > :not(summary) {
   font-size: 12px;
 }
 .shortcut-rows {
+  flex: 1 1 auto;
   min-height: 0;
   overflow: auto;
   padding: 0 10px 10px;
