@@ -67,8 +67,19 @@ test(
     for (const record of result.records) {
       assert.equal(record.visibility, 'visible', record.label);
       if (record.background) {
-        assert.deepEqual(record.background, [31, 93, 121], `${record.label}: actual page background`);
-        assert.deepEqual(record.marker, [55, 88, 222], `${record.label}: painted marker`);
+        // Native capture color conversion can round a channel by one level,
+        // including in an unmodified Electron window on this display.
+        for (const [kind, expected] of [
+          ['background', [31, 93, 121]],
+          ['marker', [55, 88, 222]],
+        ]) {
+          const actual = record[kind];
+          assert.ok(
+            actual.length === expected.length &&
+              actual.every((channel, index) => Math.abs(channel - expected[index]) <= 1),
+            `${record.label}: ${kind} expected ${expected} within one level; captured ${actual}`,
+          );
+        }
       }
     }
     assert.equal(result.records.find((record) => record.label === 'new-tab').heading, 'Second page');
