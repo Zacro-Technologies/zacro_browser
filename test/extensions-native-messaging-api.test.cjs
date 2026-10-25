@@ -4,9 +4,134 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const os = require('node:os');
+const vm = require('node:vm');
 const { ExtensionAPI } = require('../src/main/extensions/api.cjs');
 const { NativeMessagingBroker, createHostResolver } = require('../src/main/extensions/native-messaging.cjs');
 const ID = 'a'.repeat(32);
+async function nativeFacade(t, { delayConnect = false } = {}) {
+  let enter,
+    release,
+    deliver,
+    spawned = 0;
+  const reviewing = new Promise((resolve) => (enter = resolve));
+  const approval = new Promise((resolve) => (release = resolve));
+  const listeners = new Set();
+  const nativeMessaging = new NativeMessagingBroker({
+    resolveHost: async () => ({
+      identity: 'synthetic',
+      origin: `chrome-extension://${ID}/`,
+      executablePath: '/synthetic/never-spawned',
+    }),
+    approveHost: () => {
+      enter();
+      return approval;
+    },
+    spawnHost: () => {
+      spawned++;
+      throw new Error('Synthetic spawn must never be reached');
+    },
+    emit: (_context, event) => {
+      for (const listener of listeners) listener('runtime.nativePort', [event]);
+    },
+  });
+  t.after(() => nativeMessaging.dispose());
+  const api = new ExtensionAPI({
+    resolveExtension: () => ({
+      enabled: true,
+      generation: 'g1',
+      manifest: {},
+      grants: { permissions: ['nativeMessaging'], origins: [] },
+    }),
+    nativeMessaging,
+  });
+  const context = {
+    profileId: 'p1',
+    extensionId: ID,
+    generation: 'g1',
+    contextId: 'lease:authenticated',
+    kind: 'extension-frame',
+  };
+  const calls = [];
+  const event = () => {
+    const handlers = new Set();
+    return {
+      addListener: (fn) => handlers.add(fn),
+      removeListener: (fn) => handlers.delete(fn),
+      hasListener: (fn) => handlers.has(fn),
+    };
+  };
+  const chrome = { runtime: { id: ID, onMessage: event(), onConnect: event() }, tabs: {}, storage: {} };
+  vm.runInNewContext(await fs.readFile(path.join(__dirname, '../src/main/extensions/bootstrap.js'), 'utf8'), {
+    chrome,
+    document: { readyState: 'complete' },
+    location: { protocol: 'chrome-extension:', pathname: '/page.html' },
+    crypto: require('node:crypto').webcrypto,
+    setTimeout,
+    clearTimeout,
+    console,
+    zacroExtension: {
+      onEvent: (listener) => listeners.add(listener),
+      invoke(method, args) {
+        const call = () => api.call(context, method, args);
+        const result =
+          delayConnect && method === 'runtime.connectNative'
+            ? new Promise((resolve, reject) => {
+                deliver = () => call().then(resolve, reject);
+              })
+            : call();
+        calls.push(result);
+        return result;
+      },
+    },
+  });
+  return {
+    runtime: chrome.runtime,
+    broker: nativeMessaging,
+    reviewing,
+    release,
+    deliver: () => deliver(),
+    calls,
+    spawned: () => spawned,
+  };
+}
+test('facade disconnect revokes held approval before a later approval can spawn a host', async (t) => {
+  const f = await nativeFacade(t);
+  const port = f.runtime.connectNative('com.zacro.test');
+  let disconnected = 0;
+  let settled = false;
+  f.calls[0].then(
+    () => (settled = true),
+    () => (settled = true),
+  );
+  port.onDisconnect.addListener(() => disconnected++);
+  await f.reviewing;
+  try {
+    assert.equal(f.broker.ports.size, 1);
+    port.disconnect();
+    await new Promise(setImmediate);
+    assert.equal(f.broker.ports.size, 0, 'local disconnect must immediately revoke pending broker work');
+    assert.equal(settled, true, 'pending connect must settle without waiting for approval');
+  } finally {
+    f.release(true);
+    await Promise.allSettled(f.calls);
+  }
+  assert.equal(f.spawned(), 0);
+  assert.equal(f.broker.ports.size, 0);
+  assert.equal(f.broker.approvals.size, 0);
+  assert.equal(disconnected, 0);
+  assert.throws(() => port.postMessage({}), /disconnected/);
+});
+test('facade cancellation arriving before connect cannot be lost or launch a host', async (t) => {
+  const f = await nativeFacade(t, { delayConnect: true });
+  const port = f.runtime.connectNative('com.zacro.test');
+  port.disconnect();
+  await new Promise(setImmediate);
+  f.release(true);
+  f.deliver();
+  await Promise.allSettled(f.calls);
+  assert.equal(f.spawned(), 0);
+  assert.equal(f.broker.ports.size, 0);
+});
 test('native API sends through the verified broker and rejects content and undeclared permissions', async (t) => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'zacro-native-api-'));
   t.after(() => fs.rm(dir, { recursive: true, force: true }));

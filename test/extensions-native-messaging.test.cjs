@@ -314,3 +314,37 @@ test('authenticated manager generation tokens may be strings', async (t) => {
   const ctx = context({ generation: 'g-authenticated-uuid' });
   assert.deepEqual(await b.send(ctx, 'com.zacro.test', { ok: true }), { ok: true });
 });
+test('early cancellation is authenticated, scoped and consumed without resolving or spawning a host', async (t) => {
+  let resolved = 0;
+  const { broker: b } = broker(t, async () => {
+    resolved++;
+    throw new Error('Synthetic host must not be resolved');
+  });
+  const ctx = context();
+  assert.throws(() => b.disconnect(context({ permissions: [] }), 'port'), /permission/);
+  b.disconnect(ctx, 'port');
+  for (const other of [
+    context({ profileId: 'p2' }),
+    context({ generation: 2 }),
+    context({ contextId: 'other' }),
+  ])
+    await assert.rejects(b.connect(other, 'com.zacro.test', 'port'), /connection failed/);
+  assert.equal(resolved, 3);
+  await assert.rejects(b.connect(ctx, 'com.zacro.test', 'port'), /disconnected/);
+  assert.equal(resolved, 3);
+  assert.equal(b.ports.size, 0);
+});
+test('early cancellation bounds fail closed until the authenticated context is revoked', async (t) => {
+  const { broker: b } = broker(t, async () => ({ identity: 'synthetic' }), {
+    approveHost: async () => false,
+  });
+  const ctx = context();
+  for (let i = 0; i < 257; i++) b.disconnect(ctx, `port-${i}`);
+  await assert.rejects(b.connect(ctx, 'com.zacro.test', 'fresh'), /cancellation limit/);
+  await assert.rejects(b.connect(context({ contextId: 'other' }), 'com.zacro.test', 'fresh'), /approval/);
+  b.revoke(ctx);
+  await assert.rejects(b.connect(ctx, 'com.zacro.test', 'fresh'), /approval/);
+  b.disconnect(ctx, 'after-revoke');
+  b.dispose();
+  assert.equal(b.cancellations.size, 0);
+});

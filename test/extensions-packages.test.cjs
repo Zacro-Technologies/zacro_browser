@@ -253,7 +253,7 @@ test('manifest inspection lists required and optional access and blocks missing 
     manifest_version: 3,
     name: 'Blocked',
     version: '1',
-    permissions: ['nativeMessaging', 'identity', 'declarativeNetRequest'],
+    permissions: ['enterprise.platformKeys', 'enterprise.networkingAttributes', 'declarativeNetRequest'],
   });
   assert.equal(blocked.compatible, false);
   assert.equal(blocked.unsupported.length, 2);

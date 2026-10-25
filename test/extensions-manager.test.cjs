@@ -401,7 +401,7 @@ test('legacy keyless imports preserve the historical path and native ID without 
   assert.equal(h.manager.list('old')[0].id, legacyId);
 });
 test('unsupported requirements and declined consent remain disabled pending review', async (t) => {
-  const h = await setup(t, { fetchPackage: async () => fixture('1', ['nativeMessaging']) });
+  const h = await setup(t, { fetchPackage: async () => fixture('1', ['enterprise.platformKeys']) });
   const id = fixture().id;
   let record = await h.manager.installStore('p1', id);
   assert.equal(record.enabled, false);
@@ -665,7 +665,10 @@ test('each native session is prepared exactly once before any load, including pr
   assert.equal(h.manager.list('p1')[0].enabled, true);
 });
 
-for (const declaration of [{ optional_permissions: ['tabs'] }, { permissions: ['nativeMessaging'] }]) {
+for (const declaration of [
+  { optional_permissions: ['tabs'] },
+  { permissions: ['enterprise.platformKeys'] },
+]) {
   test(`incompatible legacy rights cannot activate through enable: ${JSON.stringify(declaration)}`, async (t) => {
     const legacyId = 'abcdefghijklmnopabcdefghijklmnop',
       h = await setup(t, { legacyId });

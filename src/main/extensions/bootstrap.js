@@ -599,7 +599,7 @@
         disconnect() {
           if (saved.closed) return;
           nativeDisconnected(saved, undefined, false);
-          saved.ready.then(() => host.invoke('runtime.disconnectNative', [id])).catch(() => {});
+          host.invoke('runtime.disconnectNative', [id]).catch(() => {});
         },
       });
       nativePorts.set(id, saved);

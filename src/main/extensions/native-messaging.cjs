@@ -195,6 +195,7 @@ class NativeMessagingBroker {
       platform,
     });
     this.ports = new Map();
+    this.cancellations = new Map();
     this.approvals = new Set();
     this.closed = false;
   }
@@ -225,15 +226,12 @@ class NativeMessagingBroker {
       throw fail('context is revoked');
     }
   }
+  scope(context) {
+    return [context.profileId, context.extensionId, context.generation, context.contextId];
+  }
   key(context, portId) {
     if (typeof portId !== 'string' || !portId || portId.length > 256) throw fail('port ID is invalid');
-    return JSON.stringify([
-      context.profileId,
-      context.extensionId,
-      context.generation,
-      context.contextId,
-      portId,
-    ]);
+    return JSON.stringify([...this.scope(context), portId]);
   }
   get(context, portId) {
     this.check(context);
@@ -245,6 +243,13 @@ class NativeMessagingBroker {
     this.check(context);
     validateName(name);
     const key = this.key(context, portId);
+    const scopeKey = JSON.stringify(this.scope(context));
+    const cancellation = this.cancellations.get(scopeKey);
+    if (cancellation?.blocked) throw fail('context cancellation limit reached');
+    if (cancellation?.portIds.delete(portId)) {
+      if (!cancellation.portIds.size) this.cancellations.delete(scopeKey);
+      throw fail('port is disconnected');
+    }
     if (this.ports.has(key)) throw fail('port already exists');
     if (
       this.ports.size >= this.maxPorts ||
@@ -454,8 +459,22 @@ class NativeMessagingBroker {
     }
   }
   disconnect(context, portId) {
-    const record = this.get(context, portId);
-    this.close(record);
+    this.check(context);
+    const record = this.ports.get(this.key(context, portId));
+    if (record) return this.close(record);
+    // Cancellation may beat connect through the transport. Keep it until that
+    // request arrives or its authenticated context dies; expiry could revive it.
+    const scopeKey = JSON.stringify(this.scope(context));
+    let cancellation = this.cancellations.get(scopeKey);
+    if (!cancellation) {
+      cancellation = { context, portIds: new Set(), blocked: false };
+      this.cancellations.set(scopeKey, cancellation);
+    }
+    if (cancellation.blocked || cancellation.portIds.has(portId)) return;
+    if (cancellation.portIds.size >= 256) {
+      cancellation.blocked = true;
+      cancellation.portIds.clear();
+    } else cancellation.portIds.add(portId);
   }
   close(record, error) {
     if (record.closed) return;
@@ -486,6 +505,13 @@ class NativeMessagingBroker {
       this.emit(record.context, { type: 'disconnect', portId: record.portId, ...(error ? { error } : {}) });
   }
   revoke(selector = {}) {
+    for (const [key, cancellation] of this.cancellations)
+      if (
+        ['profileId', 'extensionId', 'generation', 'contextId'].every(
+          (key) => selector[key] === undefined || selector[key] === cancellation.context[key],
+        )
+      )
+        this.cancellations.delete(key);
     for (const record of this.ports.values())
       if (
         ['profileId', 'extensionId', 'generation', 'contextId'].every(
