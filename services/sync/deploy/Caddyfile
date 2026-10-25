@@ -1,0 +1,11 @@
+{
+	admin off
+}
+
+{$ZACRO_SYNC_DOMAIN} {
+	# Empty in production: Caddy obtains/renews publicly trusted certificates.
+	# The local acceptance test supplies an isolated fixture-only TLS directive.
+	{$ZACRO_SYNC_TLS_DIRECTIVE}
+	reverse_proxy 127.0.0.1:4040
+	# Do not enable request/access logging or request body logging here.
+}

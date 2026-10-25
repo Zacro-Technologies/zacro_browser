@@ -212,9 +212,21 @@ ownership, convergence, quotas, paging, encrypted persistence, tampering,
 deletion-aware restore and key rotation. They do not establish deployed-service
 availability or the final two-Electron-client acceptance by themselves.
 
-The [Dockerfile](Dockerfile) is provided for an operator build. Container builds
-and public TLS deployment must be validated in the target environment; they
-are not implied by Node test success. Mount persistent data and an external
-private master-key file readable by the unprivileged `node` user. Use direct TLS
-for a published container port, or a loopback listener with a TLS proxy sharing
-its network namespace. Do not publish plaintext on all interfaces.
+The [deployment guide](deploy/README.md) provides a concrete single-host Compose
+stack, mandatory operator-owned domain, Caddy HTTPS proxy sharing the service's
+loopback namespace, separate external key/data volumes, monitoring commands and
+offline backup/restore procedures. No hosting account or public endpoint is
+created. Keep the private master-key file readable by the unprivileged `node`
+user and outside the database volume. Do not publish plaintext on all interfaces.
+
+```sh
+node --test test/container/sync-container.test.cjs
+```
+
+This explicit Docker acceptance builds the actual [Dockerfile](Dockerfile),
+exercises the checked-in proxy topology with a trusted fixture certificate,
+and checks real authentication/sync, graceful restart, key failures and
+current-ledger restore. It requires Docker/Compose and OpenSSL, and creates only
+disposable synthetic accounts/volumes. The separate Linux CI workflow runs the
+same command. Production DNS, public certificate issuance, storage durability
+and monitoring delivery still require validation in the intended environment.
