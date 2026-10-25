@@ -27,7 +27,7 @@
       "file": "0002-electron-zacro-native-hooks.patch",
       "target": "electron",
       "strip": 1,
-      "sha256": "4ca0a7072c2d0feb90807f3cfcdb2f1f30554a53c181d8d7001d7022e2f297a7"
+      "sha256": "b93eb94c03b0f1fff641895263fcffbc617d7514c94da69cd3b567ae16d55ef3"
     }
   ]
 }
