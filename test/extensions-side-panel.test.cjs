@@ -239,3 +239,72 @@ test('profile removal immediately destroys its panel before profile teardown awa
   assert.equal(c.states.size, 0);
   assert.equal(c.gestures.size, 0);
 });
+test('self replacement retains the new generation-owned panel after its original document is destroyed', async (t) => {
+  const f = fixture(t),
+    c = f.controller;
+  c.recordGesture(f.context);
+  await c.call(f.context, 'open', [{ windowId: 1 }]);
+  const old = f.created[0];
+  const origin = {
+    ...f.context,
+    sourceContents: old.webContents,
+    assertCurrent: () => {
+      if (old.dead) throw Error('Expired extension context');
+    },
+  };
+  await c.call(origin, 'setOptions', [{ path: 'replacement.html' }]);
+  assert.equal(old.dead, true);
+  assert.equal(f.created[1].dead, undefined);
+  assert.ok(c.snapshot());
+  await assert.rejects(c.call(origin, 'setOptions', [{ path: 'forged.html' }]), /Expired/);
+  assert.equal((await c.call(f.context, 'getOptions', [{}])).path, 'replacement.html');
+});
+test('normal extension-tab input is document-bound and is rebound only after another genuine event', async (t) => {
+  const f = fixture(t),
+    c = f.controller;
+  const contents = {
+    id: 10,
+    session: 'owned-session',
+    isDestroyed: () => false,
+    getURL: () => `chrome-extension://${f.context.extensionId}/tab.html`,
+  };
+  const entry = { contents, profileId: 'one', documentEpoch: 1, disposing: false };
+  c.recordTabInput(entry, { type: 'mouseDown' });
+  entry.documentEpoch++;
+  await assert.rejects(c.call(f.context, 'open', [{ windowId: 1 }]), /document/);
+  c.recordTabInput(entry, { type: 'mouseDown' });
+  await c.call(f.context, 'open', [{ windowId: 1 }]);
+  assert.ok(c.snapshot());
+  c.destroy();
+  contents.getURL = () => 'https://ordinary.example/';
+  c.recordTabInput(entry, { type: 'mouseDown' });
+  await assert.rejects(c.call(f.context, 'open', [{ windowId: 1 }]), /gesture/);
+});
+test('self replacement still destroys its new view if the extension generation changes during load', async (t) => {
+  const f = fixture(t),
+    View = f.options.native.WebContentsView;
+  f.options.native.WebContentsView = class extends View {
+    constructor(options) {
+      super(options);
+      const load = this.webContents.loadURL;
+      this.webContents.loadURL = async (url) => {
+        await load(url);
+        if (f.created.length === 2) f.metadata.generation = 'g2';
+      };
+    }
+  };
+  const c = f.controller;
+  c.recordGesture(f.context);
+  await c.call(f.context, 'open', [{ windowId: 1 }]);
+  const old = f.created[0],
+    origin = {
+      ...f.context,
+      sourceContents: old.webContents,
+      assertCurrent: () => {
+        if (old.dead) throw Error('Expired source');
+      },
+    };
+  await assert.rejects(c.call(origin, 'setOptions', [{ path: 'replacement.html' }]), /Expired/);
+  assert.equal(c.snapshot(), null);
+  assert.equal(f.created[1].dead, true);
+});

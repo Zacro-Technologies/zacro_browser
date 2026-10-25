@@ -37,6 +37,10 @@ test(
           data: '<!doctype html><title>Native side panel</title><input id="panelDraft"><button id="close">Close</button><script src="panel.js"></script>',
         },
         {
+          name: 'replacement.html',
+          data: '<!doctype html><title>Replacement side panel</title><input id="panelDraft">',
+        },
+        {
           name: 'panel.js',
           data: "document.querySelector('#close').addEventListener('click',()=>chrome.sidePanel.close({windowId:1}));",
         },
@@ -121,11 +125,32 @@ test(
     await optionsPage.getByRole('button', { name: 'Open using API' }).click();
     await expect.poll(() => execute(optionsId, 'document.body.dataset.opened')).toBe('yes');
     await expect.poll(async () => !!(await state()).runtime.extensionPanel).toBe(true);
+    const normalTab = await execute(
+      optionsId,
+      'chrome.tabs.create({url:chrome.runtime.getURL("options.html")})',
+    );
     await optionsPage.close();
     assert.ok((await state()).runtime.extensionPanel, 'panel outlives its opening extension page');
     await shell.getByRole('button', { name: 'Close panel', exact: true }).click();
     await expect.poll(async () => (await state()).runtime.extensionPanel).toBe(null);
     const baselineWindows = await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().length);
+    await expect.poll(() => execute(normalTab.id, 'typeof chrome.sidePanel?.open')).toBe('function');
+    assert.equal(
+      await execute(
+        normalTab.id,
+        'chrome.sidePanel.open({windowId:1}).then(()=>false,e=>/gesture/.test(e.message))',
+      ),
+      true,
+    );
+    await app.evaluate(({ webContents }, id) => {
+      const wc = webContents.fromId(id);
+      wc.sendInputEvent({ type: 'mouseDown', x: 40, y: 17, button: 'left', clickCount: 1 });
+      wc.sendInputEvent({ type: 'mouseUp', x: 40, y: 17, button: 'left', clickCount: 1 });
+    }, normalTab.id);
+    await expect.poll(() => execute(normalTab.id, 'document.body.dataset.opened')).toBe('yes');
+    await shell.getByRole('button', { name: 'Close panel', exact: true }).click();
+    await expect.poll(async () => (await state()).runtime.extensionPanel).toBe(null);
+    await invoke('tab:close', { id: (await state()).activeTabId });
     // Open the visible manage control through the actual shell event path.
     await shell.keyboard.press(process.platform === 'darwin' ? 'Meta+,' : 'Control+,');
     await shell
@@ -137,7 +162,7 @@ test(
     await shell.getByRole('button', { name: 'Open side panel', exact: true }).click();
     await expect(shell.getByRole('heading', { name: 'Side panel fixture', exact: true })).toBeVisible();
     await expect.poll(async () => (await state()).runtime.extensionPanel?.extensionId).toBe(signed.id);
-    const panelId = await app.evaluate(
+    let panelId = await app.evaluate(
       ({ webContents }, id) =>
         webContents.getAllWebContents().find((w) => w.getURL() === `chrome-extension://${id}/panel.html`)?.id,
       signed.id,
@@ -180,6 +205,25 @@ test(
     await expect.poll(async () => (await native()).attached).toBe(true);
     assert.equal(await execute(panelId, 'document.querySelector("#panelDraft").value'), 'keep panel');
     assert.equal(await execute(pageId, 'document.querySelector("#draft").value'), 'keep unsaved page');
+    const replacedId = panelId;
+    await execute(panelId, 'chrome.sidePanel.setOptions({path:"replacement.html"})').catch((error) => {
+      assert.match(error.message, /destroyed|disposed|frame|context/i);
+    });
+    await expect
+      .poll(
+        async () =>
+          (panelId = await app.evaluate(
+            ({ webContents }, id) =>
+              webContents
+                .getAllWebContents()
+                .find((w) => w.getURL() === `chrome-extension://${id}/replacement.html`)?.id,
+            signed.id,
+          )),
+      )
+      .toBeTruthy();
+    await expect.poll(async () => (await state()).runtime.extensionPanel?.extensionId).toBe(signed.id);
+    assert.equal(await app.evaluate(({ webContents }, id) => !!webContents.fromId(id), replacedId), false);
+    assert.equal(await execute(panelId, 'typeof chrome.sidePanel.getOptions'), 'function');
     await invoke('tab:create', { url: base + 'second' });
     assert.equal(
       (await state()).runtime.extensionPanel?.extensionId,

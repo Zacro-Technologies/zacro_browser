@@ -591,7 +591,11 @@ function createEntry(profileId, tabId = null, suppliedOptions = {}) {
   wc.on('media-started-playing', publish);
   wc.on('media-paused', publish);
   wc.on('found-in-page', (_event, result) => emit({ type: 'find:result', ...result }));
-  wc.on('before-input-event', (event, input) => handleShortcut(event, input, wc));
+  wc.on('before-input-event', (event, input) => {
+    extensionHost?.sidePanel?.recordTabInput(entry, input);
+    handleShortcut(event, input, wc);
+  });
+  wc.on('before-mouse-event', (_event, input) => extensionHost?.sidePanel?.recordTabInput(entry, input));
   wc.on('context-menu', (_event, params) => showPageMenu(entry, params));
   wc.on('focus', () => {
     if (!peek && splitPair?.includes(entry.tabId) && store.state.activeTabId !== entry.tabId) {

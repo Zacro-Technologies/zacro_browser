@@ -105,7 +105,49 @@ class SidePanelController {
   }
   recordGesture(context) {
     this.guard(context);
-    this.gestures.set(this.key(context), { generation: context.generation, expires: Date.now() + 1000 });
+    this.gestures.set(this.key(context), {
+      generation: context.generation,
+      expires: Date.now() + 1000,
+      assertCurrent: context.assertCurrent,
+    });
+  }
+  recordTabInput(entry, input) {
+    if (!['keyDown', 'mouseDown'].includes(input?.type)) return;
+    const contents = entry.contents;
+    try {
+      if (
+        entry.disposing ||
+        contents.isDestroyed() ||
+        this.activeProfile()?.id !== entry.profileId ||
+        this.activeTabId(entry.profileId) !== contents.id ||
+        contents.session !== this.getSession(entry.profileId)
+      )
+        return;
+      const url = contents.getURL(),
+        parsed = new URL(url),
+        epoch = entry.documentEpoch;
+      if (parsed.protocol !== 'chrome-extension:' || parsed.pathname.startsWith('/zacro-')) return;
+      const metadata = this.resolveExtension(entry.profileId, parsed.hostname);
+      if (!metadata?.enabled || !metadata.grants.permissions.includes('sidePanel')) return;
+      this.recordGesture({
+        profileId: entry.profileId,
+        extensionId: parsed.hostname,
+        generation: metadata.generation,
+        assertCurrent: () => {
+          if (
+            entry.disposing ||
+            contents.isDestroyed() ||
+            entry.documentEpoch !== epoch ||
+            contents.getURL() !== url ||
+            this.activeProfile()?.id !== entry.profileId ||
+            this.activeTabId(entry.profileId) !== contents.id
+          )
+            throw Error('Side panel gesture document expired');
+        },
+      });
+    } catch {
+      /* Ordinary pages and revoked documents issue no extension gesture. */
+    }
   }
   trackInput(contents, context) {
     const record = (_event, input) => {
@@ -197,6 +239,7 @@ class SidePanelController {
     this.gestures.delete(this.key(context));
     if (!gesture || gesture.generation !== context.generation || gesture.expires < Date.now())
       throw Error('Opening a side panel requires a user gesture');
+    gesture.assertCurrent?.();
     const requestedTabId = props.tabId;
     if (requestedTabId !== undefined && this.activeTabId(context.profileId) !== requestedTabId)
       throw Error('Activate the requested tab first');
@@ -207,6 +250,12 @@ class SidePanelController {
   }
   async show(context, tabId, options) {
     this.guard(context);
+    // Replacing our own caller deliberately destroys its document lease. The
+    // accepted view replacement remains owned by the live extension generation.
+    const retainedOwner =
+      this.current && context.sourceContents === this.current.view.webContents
+        ? this.current.context
+        : context;
     if (
       this.current &&
       this.key(this.current.context) === this.key(context) &&
@@ -267,7 +316,7 @@ class SidePanelController {
     this.trackInput(view.webContents, entry.context);
     try {
       await view.webContents.loadURL(`chrome-extension://${context.extensionId}/${options.path}`);
-      this.guard(context);
+      this.guard(retainedOwner);
       if (this.current !== entry || this.activeProfile()?.id !== context.profileId)
         throw Error('Side panel lifecycle changed');
       this.changed?.();
