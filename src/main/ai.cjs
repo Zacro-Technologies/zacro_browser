@@ -269,9 +269,10 @@ class AIService {
       loginPending: false,
       researchSupported: API_PROVIDERS[provider].research,
       storageNotice:
-        status.credentialStorage === 'session'
+        status.storageNotice ||
+        (status.credentialStorage === 'session'
           ? 'This API key is kept in memory only and is removed when Zacro closes.'
-          : 'Saved API keys are encrypted with your operating system credential store and scoped to this browser profile and endpoint.',
+          : 'Saved API keys are encrypted with your operating system credential store and scoped to this browser profile and endpoint.'),
     };
   }
 

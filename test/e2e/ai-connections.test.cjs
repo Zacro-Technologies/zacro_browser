@@ -13,6 +13,20 @@ const UNSAVED_KEY = 'zacro-e2e-unsaved-key-that-must-not-follow-profiles';
 const MODEL = 'fixture-chat-model';
 const ANSWER = 'The local fixture answered through the real provider transport.';
 
+async function deadline(work, milliseconds, label) {
+  let timer;
+  try {
+    return await Promise.race([
+      work,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} exceeded ${milliseconds}ms`)), milliseconds);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function fixture(t) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'zacro-ai-connections-'));
   const requests = [];
@@ -52,24 +66,52 @@ async function fixture(t) {
   const baseUrl = `http://127.0.0.1:${server.address().port}/v1`;
   const env = { ...process.env, ZACRO_USER_DATA: directory };
   delete env.ELECTRON_RUN_AS_NODE;
-  let app;
+  let app, shell;
+  const close = async () => {
+    if (!app) return;
+    const previous = app;
+    app = null;
+    shell = null;
+    const child = previous.process();
+    try {
+      await deadline(previous.close(), 8000, 'AI fixture application shutdown');
+    } catch (error) {
+      if (child.exitCode === null && child.signalCode === null) {
+        const exited = new Promise((resolve) => child.once('exit', resolve));
+        child.kill();
+        await deadline(exited, 5000, 'AI fixture process termination');
+      }
+      throw error;
+    }
+  };
   t.after(async () => {
-    if (app) await app.close().catch(() => app.process().kill());
+    let closeError;
+    await close().catch((error) => {
+      closeError = error;
+    });
     server.closeAllConnections();
-    await new Promise((resolve) => server.close(resolve));
+    await deadline(new Promise((resolve) => server.close(resolve)), 5000, 'AI fixture server shutdown');
     assert.equal(path.dirname(path.resolve(directory)), path.resolve(os.tmpdir()));
     assert(path.basename(directory).startsWith('zacro-ai-connections-'));
     await fs.rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     assert.deepEqual(errors, [], 'Provider settings and conversations must not throw renderer errors');
+    if (closeError) throw closeError;
   });
-  app = await electron.launch({ args: [path.resolve(__dirname, '../..')], env, timeout: 30000 });
-  const shell = await app.firstWindow();
-  shell.on('pageerror', (error) => errors.push(error.message));
-  await shell.waitForFunction(() => Boolean(window.zacro));
-  await expect(shell.locator('#command-input')).toBeFocused();
-  await shell.locator('#command-input').press('Escape');
+  const launch = async () => {
+    app = await electron.launch({ args: [path.resolve(__dirname, '../..')], env, timeout: 30000 });
+    shell = await app.firstWindow({ timeout: 15000 });
+    shell.setDefaultTimeout(10000);
+    shell.on('pageerror', (error) => errors.push(error.message));
+    await shell.waitForFunction(() => Boolean(window.zacro));
+    await expect(shell.locator('#command-input')).toBeFocused();
+    await shell.locator('#command-input').press('Escape');
+  };
   const invoke = (action, payload = {}) =>
-    shell.evaluate(([action, payload]) => window.zacro.invoke(action, payload), [action, payload]);
+    deadline(
+      shell.evaluate(([action, payload]) => window.zacro.invoke(action, payload), [action, payload]),
+      10000,
+      `AI fixture IPC ${action}`,
+    );
   const openSection = async (section) => {
     await shell.getByRole('button', { name: 'Library', exact: true }).click();
     const menu = shell.getByRole('dialog', { name: 'Library', exact: true });
@@ -89,7 +131,26 @@ async function fixture(t) {
     await expect(shell.locator('#ai-provider')).toBeEnabled();
     await expect(shell.locator('#ai-provider')).toHaveValue(provider);
   };
-  return { app, shell, invoke, openSection, openConnections, chooseProvider, directory, baseUrl, requests };
+  await launch();
+  return {
+    get app() {
+      return app;
+    },
+    get shell() {
+      return shell;
+    },
+    async restart() {
+      await close();
+      await launch();
+    },
+    invoke,
+    openSection,
+    openConnections,
+    chooseProvider,
+    directory,
+    baseUrl,
+    requests,
+  };
 }
 
 test(
@@ -218,6 +279,123 @@ test(
     assert.equal(b.requests.length, 4);
     assert.equal(b.requests[3].url, '/local/v1/models');
     assert.equal(b.requests[3].authorization, '');
+  },
+);
+
+test(
+  'Windows OS-encrypted API credentials survive a real app restart without entering exports or public state',
+  { timeout: 90000, skip: process.platform !== 'win32' },
+  async (t) => {
+    const b = await fixture(t);
+    // Exercise Electron's actual asynchronous safeStorage implementation and
+    // Windows DPAPI. No vault, crypto or provider transport is substituted.
+    assert.deepEqual(
+      await deadline(
+        b.app.evaluate(({ safeStorage }) => ({
+          encrypt: typeof safeStorage.encryptStringAsync,
+          decrypt: typeof safeStorage.decryptStringAsync,
+        })),
+        5000,
+        'Native safeStorage API discovery',
+      ),
+      { encrypt: 'function', decrypt: 'function' },
+    );
+    await b.openConnections();
+    await b.chooseProvider('compatible');
+    assert.equal(
+      (await b.invoke('ai:status')).storageAvailable,
+      null,
+      'Reading status must not probe the OS key store',
+    );
+    await expect(b.shell.locator('#ai-key-storage')).toHaveValue('encrypted');
+    await b.shell.locator('#ai-base-url').fill(b.baseUrl);
+    await b.shell.locator('#ai-api-model').fill(MODEL);
+    await b.shell.locator('#ai-api-key').fill(DUMMY_KEY);
+    await b.shell.locator('#ai-key-storage').selectOption('encrypted');
+    await b.shell.getByRole('button', { name: 'Save connection', exact: true }).click();
+    await expect(b.shell.locator('#ai-connection-status')).toHaveText('Key saved');
+    await expect(b.shell.locator('#ai-api-key')).toHaveValue('');
+    const saved = await b.invoke('ai:status');
+    assert.equal(saved.credentialStorage, 'encrypted');
+    assert.equal(saved.storageAvailable, true);
+    assert.equal(b.requests.length, 0, 'Saving an encrypted key makes no provider request');
+
+    const credentialPath = path.join(b.directory, 'ai-provider-credentials.enc.json');
+    const credentialFile = await fs.readFile(credentialPath, 'utf8');
+    const vault = JSON.parse(credentialFile);
+    assert.equal(vault.version, 1);
+    const records = Object.entries(vault.records);
+    assert.equal(records.length, 1, 'The selected profile and endpoint have one encrypted record');
+    const [id, encoded] = records[0];
+    assert.match(id, /^[a-f0-9]{64}:[a-f0-9]{64}$/);
+    assert.match(encoded, /^[A-Za-z0-9+/]+={0,2}$/);
+    const encrypted = Buffer.from(encoded, 'base64');
+    assert(encrypted.length > DUMMY_KEY.length, 'Native storage must contain an encrypted payload');
+    assert(!credentialFile.includes(DUMMY_KEY), 'The credential file must not contain a plaintext key');
+    assert(!encrypted.includes(Buffer.from(DUMMY_KEY, 'utf8')), 'Base64 must not disguise a plaintext key');
+    assert(
+      !encrypted.includes(Buffer.from(DUMMY_KEY, 'utf16le')),
+      'The native payload must not expose UTF-16 plaintext',
+    );
+
+    const firstProcess = b.app.process().pid;
+    await b.restart();
+    assert.notEqual(b.app.process().pid, firstProcess, 'Restart must replace the entire Electron process');
+    await b.openConnections();
+    await expect(b.shell.locator('#ai-provider')).toHaveValue('compatible');
+    await expect(b.shell.locator('#ai-base-url')).toHaveValue(b.baseUrl);
+    await expect(b.shell.locator('#ai-api-model')).toHaveValue(MODEL);
+    await expect(b.shell.locator('#ai-api-key')).toHaveValue('');
+    await expect(b.shell.locator('#ai-key-storage')).toHaveValue('encrypted');
+    await expect(b.shell.locator('#ai-connection-status')).toHaveText('Key saved');
+    const restored = await b.invoke('ai:status');
+    assert.equal(restored.provider, 'compatible');
+    assert.equal(restored.configured, true);
+    assert.equal(restored.credentialStorage, 'encrypted');
+    assert.equal(b.requests.length, 0, 'Startup must not silently verify a saved key or request inference');
+
+    // Metadata verification must decrypt the persisted credential in the new
+    // process and send it only to the saved loopback endpoint, without inference.
+    await b.shell.getByRole('button', { name: 'Test connection', exact: true }).click();
+    await expect(b.shell.locator('#ai-settings')).toContainText('Connected. No inference request was made.');
+    assert.deepEqual(b.requests, [
+      { method: 'GET', url: '/v1/models', authorization: `Bearer ${DUMMY_KEY}`, body: null },
+    ]);
+    assert.equal((await b.invoke('ai:status')).storageAvailable, true);
+
+    const exportPath = path.join(b.directory, 'encrypted-browser-export.json');
+    await deadline(
+      b.app.evaluate(({ dialog }, exportPath) => {
+        dialog.showSaveDialog = async () => ({ canceled: false, filePath: exportPath });
+      }, exportPath),
+      5000,
+      'Export destination setup',
+    );
+    await b.shell
+      .locator('details.setting-section')
+      .filter({ has: b.shell.locator('summary', { hasText: 'Your data' }) })
+      .locator('summary')
+      .click();
+    await b.shell.getByRole('button', { name: 'Export data', exact: true }).click();
+    await expect.poll(() => fs.readFile(exportPath, 'utf8').catch(() => '')).toContain('zacro-export');
+    const contents = await Promise.all([
+      fs.readFile(exportPath, 'utf8'),
+      fs.readFile(path.join(b.directory, 'ai-providers.json'), 'utf8'),
+      fs.readFile(path.join(b.directory, 'browser-state.json'), 'utf8'),
+      b.invoke('state:get').then(JSON.stringify),
+      b.invoke('ai:status').then(JSON.stringify),
+    ]);
+    for (const content of contents) {
+      assert(
+        !content.includes(DUMMY_KEY),
+        'Decrypted keys must not enter exports, preferences or public state',
+      );
+      assert(
+        !content.includes(encoded),
+        'The encrypted vault record must stay outside browser exports and state',
+      );
+    }
+    assert.equal(b.requests.length, 1, 'Exporting browser data must not contact the AI provider');
   },
 );
 

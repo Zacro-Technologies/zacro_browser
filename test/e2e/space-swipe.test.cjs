@@ -196,11 +196,48 @@ test(
         }, url),
       )
       .toBe(true);
-    await guest('scrollTo(200, 400); undefined');
+    await guest(`
+      window.nativeInput = { moves: [], wheels: [] };
+      addEventListener('mousemove', (event) => {
+        window.nativeInput.moves.push({ x: event.clientX, y: event.clientY, trusted: event.isTrusted });
+      }, { passive: true });
+      addEventListener('wheel', (event) => {
+        window.nativeInput.wheels.push({
+          x: event.clientX, y: event.clientY, deltaX: event.deltaX, deltaY: event.deltaY,
+          trusted: event.isTrusted, prevented: event.defaultPrevented,
+        });
+      }, { passive: true });
+      scrollTo(200, 400);
+      new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    `);
     await expect.poll(() => guest('scrollX')).toBe(200);
+    await b.app.evaluate(({ BrowserWindow, webContents }, url) => {
+      const contents = webContents.getAllWebContents().find((item) => item.getURL() === url);
+      BrowserWindow.getAllWindows()[0].focus();
+      contents.focus();
+    }, url);
+    await expect
+      .poll(() =>
+        b.app.evaluate(({ BrowserWindow, webContents }, url) => {
+          const contents = webContents.getAllWebContents().find((item) => item.getURL() === url);
+          return (
+            BrowserWindow.getAllWindows()[0].isFocused() && webContents.getFocusedWebContents() === contents
+          );
+        }, url),
+      )
+      .toBe(true);
+    // The previous native pointer target was the sidebar. Confirm that the
+    // reattached guest has processed a real move before issuing one wheel;
+    // visibility/focus alone does not acknowledge Chromium's input target.
     await b.app.evaluate(({ webContents }, url) => {
       const contents = webContents.getAllWebContents().find((item) => item.getURL() === url);
-      contents.focus();
+      contents.sendInputEvent({ type: 'mouseMove', x: 120, y: 120 });
+    }, url);
+    await expect
+      .poll(() => guest('window.nativeInput.moves.at(-1)'))
+      .toEqual({ x: 120, y: 120, trusted: true });
+    await b.app.evaluate(({ webContents }, url) => {
+      const contents = webContents.getAllWebContents().find((item) => item.getURL() === url);
       contents.sendInputEvent({
         type: 'mouseWheel',
         x: 120,
@@ -210,28 +247,40 @@ test(
         canScroll: true,
       });
     }, url);
-    await expect
-      .poll(() => guest('scrollX'))
-      .not.toBe(200)
-      .catch(async (error) => {
-        t.diagnostic(
-          JSON.stringify({
-            shell: await b.shell.evaluate(() => ({
-              focused: document.hasFocus(),
-              dialog: document.querySelector('[role="dialog"]')?.getAttribute('aria-label'),
-            })),
-            page: await guest(
-              '({ focused: document.hasFocus(), visibility: document.visibilityState, width: innerWidth, scrollWidth: document.documentElement.scrollWidth })',
-            ),
-            native: await b.app.evaluate(({ BrowserWindow }, url) => {
-              const win = BrowserWindow.getAllWindows()[0];
-              const view = win.contentView.children.find((child) => child.webContents?.getURL() === url);
-              return { focused: win.isFocused(), visible: view?.getVisible(), bounds: view?.getBounds() };
-            }, url),
-          }),
-        );
-        throw error;
-      });
+    try {
+      await expect.poll(() => guest('window.nativeInput.wheels.length')).toBe(1);
+      const [wheel] = await guest('window.nativeInput.wheels');
+      assert.deepEqual(
+        { ...wheel, deltaX: Math.abs(wheel.deltaX), deltaY: Math.abs(wheel.deltaY) },
+        { x: 120, y: 120, deltaX: 140, deltaY: 0, trusted: true, prevented: false },
+        'One uncancelled native horizontal wheel must reach the page',
+      );
+      await expect.poll(() => guest('scrollX')).not.toBe(200);
+    } catch (error) {
+      t.diagnostic(
+        JSON.stringify({
+          shell: await b.shell.evaluate(() => ({
+            focused: document.hasFocus(),
+            dialog: document.querySelector('[role="dialog"]')?.getAttribute('aria-label'),
+          })),
+          page: await guest(
+            '({ focused: document.hasFocus(), visibility: document.visibilityState, width: innerWidth, scrollWidth: document.documentElement.scrollWidth, scrollX, input: window.nativeInput })',
+          ),
+          native: await b.app.evaluate(({ BrowserWindow, webContents }, url) => {
+            const win = BrowserWindow.getAllWindows()[0];
+            const view = win.contentView.children.find((child) => child.webContents?.getURL() === url);
+            return {
+              focused: win.isFocused(),
+              focusedContentsId: webContents.getFocusedWebContents()?.id,
+              pageContentsId: view?.webContents.id,
+              visible: view?.getVisible(),
+              bounds: view?.getBounds(),
+            };
+          }, url),
+        }),
+      );
+      throw error;
+    }
     assert.equal(await b.current(), b.first);
 
     await b.idle();
