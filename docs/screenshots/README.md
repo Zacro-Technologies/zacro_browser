@@ -1,6 +1,21 @@
 # Screenshot assets
 
-## Current 0.5 captures
+## Current 0.6 captures
+
+The following four JPEGs were captured through native Computer interactions and window capture from the packaged Windows 0.6 development build at commit `1f130cb9719976e54981a63450263af33cbf3862` on October 26, 2026 (JST). They use an isolated showcase profile and locally served journal/demo pages. The images are unretouched originals, preserved without recompression; the blue pointer highlight belongs to the capture tool.
+
+- `0.6/workspace.jpg`: compact navigation, icon favorites, folders and tabs beside a live journal page.
+- `0.6/palette.jpg`: scoped command results over the page-only blurred backdrop, with the sidebar available.
+- `0.6/space-theme.jpg`: Space icon, color and material controls with a live preview.
+- `0.6/customization.jpg`: layout, motion and idle-favorite preferences.
+
+The fifth image, `0.6/ai-workflow.jpg`, was captured through Computer from the rebuilt package at **`9bfcd1c104c5d9a7f9725fce93e32ac5fcd3ce17`** on the same date. It shows an unsent summary question, the explicitly selected local journal page, and the disconnected ChatGPT subscription choice. The question is fully visible after the composer-sizing correction.
+
+All five images were visually reviewed. They contain no personal browsing data, account credentials, authenticated provider session or AI answers. The [five-page 0.6 feature guide](../Zacro-0.6-Design-and-Feature-Guide.pdf) preserves one intact image per page, with concise captions and embedded text. Every page was rendered with Poppler and visually inspected; page count and image presence were also checked. The PDF SHA-256 is `5C6717BA6D2BEB79F1FB400CF92F1385426E0B3B5497151F7A17C7127D2ED19F`.
+
+`0.6/macos-light.png` and `0.6/macos-dark.png` are unedited native desktop captures from the final **`9bfcd1c104c5d9a7f9725fce93e32ac5fcd3ce17`** Apple silicon package on macOS 15.7.9 build 24G830, retrieved from successful [CI run 40222980054](https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40222980054), artifact `12610675900` (`macos-arm64-validation`). Both were visually reviewed. They show the complete native window, traffic lights, application menu and Dock icon. The optional New Tab Page was opened explicitly for package acceptance; an empty Space normally opens the command palette. They supplement automated checks and do not establish physical-device acceptance. The 0.5 Mac captures below retain their historical provenance. See [the validation record](../VALIDATION.md#06-space-materials-motion-favorites-and-ai-workflows) for the tested revisions and remaining acceptance work.
+
+## Historical 0.5 captures
 
 The five JPEGs in `0.5/` were captured from the packaged Zacro 0.5 Windows development application on October 25, 2026 using the Computer plugin for native interactions and window capture. They show an isolated local demo workspace, with locally served journal pages and demo favorites. They are unretouched native captures, preserved without recompression; any blue pointer highlight belongs to the capture tool.
 

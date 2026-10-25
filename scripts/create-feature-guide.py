@@ -1,4 +1,4 @@
-"""Build the five-page 0.5 guide after final application captures are approved.
+"""Build the five-page 0.6 guide after final application captures are approved.
 
 Requires ReportLab and Pillow; both are included in the Codex workspace runtime.
 Run from any directory: python scripts/create-feature-guide.py
@@ -21,42 +21,42 @@ PAGES = [
     (
         "workspace.jpg",
         "01 / THE WORKSPACE",
-        "Compact by design.",
-        "Navigation, address, favorites and folders share a 224px sidebar with 32px tab rows. "
-        "Drag a tab into favorites to pin it, or back into the list to unpin. "
-        "The page keeps its space and live state.",
+        "Room for the page.",
+        "A compact sidebar, equal page gutters and individual Space icons keep the workspace legible. "
+        "Favorites show whether their pages are loaded, sleeping or closed. Closing a favorite keeps its pin; "
+        "inactive favorites can sleep without disturbing active pages, drafts, media or downloads.",
     ),
     (
         "palette.jpg",
         "02 / COMMAND PALETTE",
-        "One palette. Clear intent.",
-        "Ctrl/Command + T prepares a new destination; Ctrl/Command + L edits the current address. "
-        "Type / to find browser actions. The sidebar stays usable beside the palette. "
-        "Opening or cancelling it never adds a disposable tab.",
+        "Find it. Do it.",
+        "Filter tabs, Spaces, bookmarks, history and actions in one palette. Use @ for tabs, # for Spaces, "
+        "or / for commands. Only the page blurs, inside its existing rounded frame; "
+        "the sidebar remains usable. Opening the palette never creates a disposable tab.",
     ),
     (
-        "shortcuts.jpg",
-        "03 / KEYBOARD SHORTCUTS",
-        "Familiar keys. Your choices.",
-        "Arc-style defaults: Ctrl/Command + S toggles the sidebar, Ctrl/Command + D pins a tab, "
-        "and Ctrl + Tab visits recent tabs. Search the catalog to record, disable or reset a binding. "
-        "Conflicts are checked before saving.",
+        "space-theme.jpg",
+        "03 / SPACE MATERIALS",
+        "Make a Space your own.",
+        "Choose an icon, two custom colors, gradient balance, grain, opacity and blur. "
+        "Preview changes live, then save or cancel. Glass blends the Space colors within the window. "
+        "The interface preserves readable contrast and follows reduced-transparency preferences.",
     ),
     (
-        "ai-connections.jpg",
+        "ai-workflow.jpg",
         "04 / OPTIONAL AI",
-        "Six explicit connections.",
-        "ChatGPT subscription, Claude subscription, OpenAI API, Claude API, OpenRouter, "
-        "or an OpenAI-compatible server. Subscription usage and API billing stay separate; "
-        "page sharing is explicit. Live sign-in and inference acceptance remain pending.",
+        "A clear question. Chosen pages.",
+        "Summarize, explain, compare or research from the palette. Review the page context and edit "
+        "the prepared question before sending. Remove shared pages, edit or retry questions, "
+        "and copy answers with sources. Live provider-account acceptance remains pending.",
     ),
     (
-        "blank-space.jpg",
-        "05 / AN EMPTY SPACE",
-        "Start without tab clutter.",
-        "An empty Space opens the command palette automatically. Submit an address or search "
-        "to create a page; Escape leaves the Space empty. New Tab Page remains an explicit action. "
-        "This is a development build; see the README for release limits.",
+        "customization.jpg",
+        "05 / PERSONAL PREFERENCES",
+        "Comfort, down to the details.",
+        "Adjust tab density, page inset, corner radius, animation speed and the idle-favorite timer. "
+        "Space swipes follow displacement until release; sidebar motion supports quick reversals. "
+        "Keyboard shortcuts remain editable. This is a development build with open release gates.",
     ),
 ]
 
@@ -70,9 +70,9 @@ def build(screenshots, output):
     width, height = 792, 612  # US Letter, landscape; one intact screenshot per page.
     margin = 32
     doc = canvas.Canvas(str(output), pagesize=(width, height), pageCompression=1)
-    doc.setTitle("Zacro 0.5 - Design and Feature Guide")
+    doc.setTitle("Zacro 0.6 - Design and Feature Guide")
     doc.setAuthor("Zacro Technologies")
-    doc.setSubject("Zacro 0.5 Windows development interface, commands, shortcuts and optional AI connections")
+    doc.setSubject("Zacro 0.6 Windows development interface, Space materials, favorite lifecycle and reviewed AI context")
     body = ParagraphStyle(
         "caption", fontName="Helvetica", fontSize=9, leading=12,
         textColor=HexColor("#5f5661"), spaceAfter=0,
@@ -87,7 +87,7 @@ def build(screenshots, output):
 
         doc.setFont("Helvetica-Bold", 8)
         doc.setFillColor(muted)
-        doc.drawString(margin, height - 27, "ZACRO / INTERFACE 0.5")
+        doc.drawString(margin, height - 27, "ZACRO / INTERFACE 0.6")
         doc.drawRightString(width - margin, height - 27, label)
         doc.setFont("Helvetica", 23)
         doc.setFillColor(ink)
@@ -127,10 +127,10 @@ def build(screenshots, output):
 
 if __name__ == "__main__":
     parser = ArgumentParser(description=__doc__)
-    parser.add_argument("--screenshots", type=Path, default=ROOT / "docs/screenshots/0.5")
+    parser.add_argument("--screenshots", type=Path, default=ROOT / "docs/screenshots/0.6")
     parser.add_argument(
         "--output", type=Path,
-        default=ROOT / "output/pdf/Zacro-0.5-Design-and-Feature-Guide.pdf",
+        default=ROOT / "output/pdf/Zacro-0.6-Design-and-Feature-Guide.pdf",
     )
     args = parser.parse_args()
     build(args.screenshots.resolve(), args.output.resolve())

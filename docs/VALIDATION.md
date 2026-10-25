@@ -2,6 +2,36 @@
 
 Validated locally on Windows 11 x64 (OS build 26200), Node.js 24.19.0, Electron 45.0.0 and Chromium 156.0.8078.48. This record describes engineering verification of the development build, not commercial certification or a security audit.
 
+## 0.6 Space materials, motion, favorites and AI workflows
+
+Version 0.6 adds Space icons and live material previews; adjustable colors, gradient, grain, opacity and blur; matching page gutters and configurable corners; page-only palette blur; release-based Space gestures; reversible sidebar motion; retained closed favorites and protected idle sleeping; filtered command results; and AI questions with explicit, reviewed document context. Evidence below is recorded on October 26, 2026 (JST), with runtime verification and capture revisions identified separately.
+
+- **Source and unit checks:** formatting, syntax and **173 unit/security tests** pass locally. New coverage includes theme contrast across saturated colors and material combinations, Space gesture release/reversal, layout gutters, retained pins, document-scoped AI history and seven deterministic pin lifecycle races. Pending sleep rechecks document/activity identity and the current timeout, so changing to Never or revisiting/navigating a page cancels stale eligibility. Explicit Close takes precedence over an in-flight sleep.
+- **Native lifecycle design:** idle-pin acceptance uses an ordinary Electron process without a debugging connection. A DevTools protocol attachment makes Chromium report a page as being captured; testing only through Playwright would incorrectly exercise the capture protection instead of actual sleep. The plain fixture verifies unloading, wake, beforeunload decisions and exclusions for active/split pages, media, downloads and edited forms, including shadow inputs.
+- **Additional review fixes:** keyboard traversal reaches theme disclosures; valid imported layout values display correctly; expanded theme forms preserve their footer at short heights; an outside click over an open panel dismisses the palette; Space/profile switches discard unfinished theme previews; and Windows forced-color tokens take precedence over custom colors.
+- **Favorite icons:** the plain native lifecycle suite passes all five cases, including real PNG retrieval, retention after Close/sleep, exact tab/profile/URL isolation and removal when browsing data is cleared. Retention is memory-only, capped at 128 tabs / a 4 MiB string budget; it adds no retrieval or persistence path.
+- **AI acceptance scope:** document-context, draft, cancellation, retry and provider tests use controlled responses or real loopback HTTP with fake keys. Windows credential restart acceptance uses actual OS encryption. No live subscription sign-in, paid inference, account entitlement or provider billing/limit acceptance is claimed.
+
+The final runtime passed [CI run 40222980054](https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40222980054) at commit **`9bfcd1c104c5d9a7f9725fce93e32ac5fcd3ce17`**:
+
+| Platform | Confirmed checks | Job status |
+| --- | --- | --- |
+| Windows x64 | 173 unit/security, 67 desktop, one 40-cycle soak, one packaged-application test; six Mac-only skips | Passed |
+| macOS 15.7.9 Apple silicon | 173 unit/security, 52 desktop, one packaged-application test; one Windows-only skip; development DMG/ZIP generation | Passed |
+| macOS 15.7.9 Intel | 173 unit/security, 52 desktop, one packaged-application test; one Windows-only skip; development DMG/ZIP generation | Passed |
+
+All three jobs completed successfully with zero failures, including formatting and syntax. Both Mac runners report macOS 15.7.9 build 24G830. Package acceptance covers the hardened executable, real navigation, PDF extraction and the isolated signed-out Codex runtime. Development packages do not establish signed release or clean-machine installer acceptance.
+
+The final composer patch, **`9bfcd1c104c5d9a7f9725fce93e32ac5fcd3ce17`**, makes the question field grow with its contents between 53px and 160px. Its targeted local workflow assertions pass for a visible prepared question, shrinking short text and bounded long text. The final Windows `npm run dist` produced the unsigned development installer, and the rebuilt package passed **one packaged-application acceptance test**. Installer generation does not establish installation/uninstallation or signed distribution acceptance.
+
+Native Computer review produced five unretouched, visually reviewed Windows captures. Workspace, scoped commands, Space materials and layout preferences show the packaged `1f130cb` baseline; the AI workflow capture shows the final `9bfcd1c` package with its prepared question fully visible and selected page context. It remains disconnected and shows no provider answer. The [five-page 0.6 feature guide](Zacro-0.6-Design-and-Feature-Guide.pdf) uses one intact capture per page. All five pages were rendered with Poppler and visually inspected; page count, image presence and embedded text were checked.
+
+The final Windows CI run's fresh **40-cycle** soak retained **two WebContents at every sample**, with **366ms median and 420ms p95** per lifecycle cycle. These are bounded fixture observations, not general browsing-speed or long-running memory guarantees.
+
+Final `9bfcd1c` Apple silicon light/dark screenshots were retrieved from the same run's artifact `12610675900` and visually reviewed. The unedited desktop images include the native traffic lights, application menu and Dock icon, with the optional New Tab Page explicitly opened for acceptance. They are tracked under `docs/screenshots/0.6/`; physical-Mac and assistive-technology acceptance remain separate.
+
+The [capture record](screenshots/README.md) identifies image revisions and dates. The 0.5/0.4 evidence below is historical. Physical Mac trackpad feel, live provider-account acceptance, assistive technology and signed commercial distribution remain separate acceptance gates.
+
 ## 0.5 commands, gestures and AI connections
 
 Evidence recorded October 25, 2026 covers the tabless command workflow, editable Arc-style shortcuts, recent-tab navigation, proportional Space gestures and six explicit AI connections. Local Windows checks and final cross-platform CI are complete; physical-device, live-account and release acceptance remain separate gates.
@@ -67,9 +97,9 @@ The initial 0.3 `npm run test:soak` run completed 40 repeated real tab/Peek/spli
 
 The real bundled Codex runtime passed an isolated signed-out account handshake and an authentication-start/cancel smoke check. The latter validated the official authorization URL without opening a browser, using credentials, completing sign-in or submitting a model request. Protocol tests use controlled transport responses. Live subscription entitlement and inference remain unverified until the user completes authentication.
 
-## Native Computer acceptance
+## Historical native Computer acceptance
 
-The packaged Apple silicon app was initially captured through macOS's native screen capture in disposable GitHub CI on commit `62c34cdc103b8f58d047c01ce987d60bbfdd6a85`. The actual website pixels, light/dark appearance, native traffic lights, Zacro menu-bar name and Dock icon were visually reviewed. The two unedited Mac README screenshots now come from the 0.4 package at `f3101841f04cda2e9441734c0b711f6e63c697e2` and were reviewed again. These captures supplement the automated native tests; they are not a physical-device or assistive-technology review.
+The packaged Apple silicon app was initially captured through macOS's native screen capture in disposable GitHub CI on commit `62c34cdc103b8f58d047c01ce987d60bbfdd6a85`. The actual website pixels, light/dark appearance, native traffic lights, Zacro menu-bar name and Dock icon were visually reviewed. Subsequent 0.4 captures at `f3101841f04cda2e9441734c0b711f6e63c697e2` and 0.5 captures at `4913177dfe5998608bdc2f1ab1d5f02115986167` were separately reviewed and retain their historical provenance. The 0.6 review status is recorded at the top of this document. These captures supplement automated tests; they are not a physical-device or assistive-technology review.
 
 The final 0.3 packaged application was exercised through actual Computer input and native window capture in a disposable showcase profile. The pass covered sidebar hide/show, light/dark appearance through the native combobox, New tab, a link's context-menu Peek and Escape dismissal, split selection and closing, command-palette search and dismissal, Library bookmarks, and Ask Zacro's Connect Codex route to Settings. Settings displayed ChatGPT sign-in with no API-key fields. All nine README screenshots were refreshed for that build and visually reviewed; the Computer pointer highlight remains visible in the original captures. No browser-protocol input driver was used for that manual pass.
 
