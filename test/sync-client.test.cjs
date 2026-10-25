@@ -556,6 +556,44 @@ test('paused library still processes tombstones without installing/removing loca
   assert.deepEqual(await f.a.callStorage(f.ctx(), 'get', []), {});
   assert.equal(f.b.status().profiles[0].librarySync, false);
 });
+for (const replace of [false, true])
+  test(`paused cloud ${replace ? 'generation replacement' : 'removal'} retains local settings and trusted-only access`, async (t) => {
+    const f = await linkedPair(t);
+    await f.b.callStorage(f.ctx(), 'set', [{ secret: 'local installation survives' }]);
+    await f.b.callStorage(f.ctx(), 'setAccessLevel', [{ accessLevel: 'TRUSTED_CONTEXTS' }]);
+    await f.b.syncNow();
+    await f.b.setLibrarySync('normal', false);
+    await f.a.queueExtension({ profileId: 'normal', ...portable('removed') });
+    await f.a.syncNow();
+    if (replace) {
+      await f.a.queueExtension({ profileId: 'normal', ...portable() });
+      await f.a.syncNow();
+    }
+    await f.b.syncNow();
+    assert.deepEqual(await f.b.callStorage(f.ctx(), 'get', []), { secret: 'local installation survives' });
+    assert.equal(f.b.canAccessStorage({ ...f.ctx(), trusted: false }), false);
+    await f.b.callStorage(f.ctx(), 'set', [{ secret: 'new local secret' }]);
+    await assert.rejects(f.b.callStorage({ ...f.ctx(), trusted: false }, 'get', []), /access/i);
+    await f.b.syncNow();
+    await f.a.syncNow();
+    assert.deepEqual(await f.a.callStorage(f.ctx(), 'get', []), {});
+  });
+test('resuming a cancelled reinstall preserves independent settings instead of tombstone emptiness', async (t) => {
+  const f = await linkedPair(t);
+  await f.a.queueExtension({ profileId: 'normal', ...portable('removed') });
+  await f.a.syncNow();
+  await f.a.queueExtension({ profileId: 'normal', ...portable() });
+  await f.a.callStorage(f.ctx(), 'set', [{ reinstallSettings: 'must survive' }]);
+  await f.a.callStorage(f.ctx(), 'setAccessLevel', [{ accessLevel: 'TRUSTED_CONTEXTS' }]);
+  await f.a.setLibrarySync('normal', false);
+  assert.deepEqual(await f.a.callStorage(f.ctx(), 'get', []), { reinstallSettings: 'must survive' });
+  await f.a.setLibrarySync('normal', true, { libraryChoice: 'merge-local', localLibrary: [portable()] });
+  assert.deepEqual(await f.a.callStorage(f.ctx(), 'get', []), { reinstallSettings: 'must survive' });
+  assert.equal(f.a.canAccessStorage({ ...f.ctx(), trusted: false }), false);
+  await f.a.syncNow();
+  await f.b.syncNow();
+  assert.deepEqual(await f.b.callStorage(f.ctx(), 'get', []), { reinstallSettings: 'must survive' });
+});
 test('legacy links default library on without rewriting unrelated profile state', async (t) => {
   const f = await linkedPair(t);
   f.a.store.transaction((s) => {

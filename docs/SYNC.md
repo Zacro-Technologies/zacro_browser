@@ -102,6 +102,10 @@ profile; their cloud identity metadata is read to prevent writes to removed
 installations. New local extensions stay local until library sharing is enabled.
 Re-enabling library sync reviews whether to use the cloud library or also share
 local portable extensions, while retaining pending settings and their consent.
+If another device removes or reinstalls an extension while this device's library
+is paused, its existing settings and access restrictions stay local. They are
+not uploaded into the replacement cloud installation. Re-enabling library or
+settings sync explicitly reviews the current cloud state.
 
 Turning settings synchronization off keeps a local copy and stops setting
 uploads/downloads. The library synchronization choice is unchanged. Cloud deletion is a

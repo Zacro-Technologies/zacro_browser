@@ -47,7 +47,7 @@ function library(link) {
 }
 function visible(link, extensionId) {
   const entry = library(link)[extensionId];
-  if (!entry || entry.state === 'removed') return {};
+  if (!entry || entry.state === 'removed' || link.detachedSettings?.[extensionId]) return {};
   const base = link.base[areaKey(extensionId, entry.generation)] || { values: {}, revisions: {} };
   let values = clone(base.values);
   for (const operation of [...link.rejected.map((r) => r.operation), ...link.outbox]) {
@@ -62,6 +62,19 @@ function visible(link, extensionId) {
 }
 function allVisible(link) {
   return Object.fromEntries(Object.keys(library(link)).map((id) => [id, visible(link, id)]));
+}
+function syncedVisible(link) {
+  return Object.fromEntries(
+    Object.values(library(link))
+      .filter((e) => e.state !== 'removed' && !link.detachedSettings?.[e.extensionId])
+      .map((e) => [e.extensionId, visible(link, e.extensionId)]),
+  );
+}
+function observedValues(link, areas, profileId) {
+  const values = allVisible(link);
+  for (const id of Object.keys(link.detachedSettings || {}))
+    values[id] = clone(areas[localKey(profileId, id)]?.values || {});
+  return values;
 }
 function independentArea(link, extensionId, values, localArea) {
   const entry = library(link)[extensionId];
@@ -364,7 +377,7 @@ class SyncClient {
     this.store.transaction((s) => {
       for (const [profile, link] of Object.entries(s.links)) {
         if (link.settingsSync)
-          for (const [ext, values] of Object.entries(allVisible(link)))
+          for (const [ext, values] of Object.entries(syncedVisible(link)))
             s.areas[localKey(profile, ext)] = independentArea(
               link,
               ext,
@@ -524,7 +537,7 @@ class SyncClient {
     this.store.transaction((s) => {
       const previous = s.links[profileId];
       if (previous?.settingsSync)
-        for (const [ext, values] of Object.entries(allVisible(previous)))
+        for (const [ext, values] of Object.entries(syncedVisible(previous)))
           s.areas[localKey(profileId, ext)] = independentArea(
             previous,
             ext,
@@ -567,9 +580,12 @@ class SyncClient {
     if (settingsSync)
       for (const [ext, values] of Object.entries(allVisible(link))) {
         const previous = before.links[profileId];
-        const old = previous?.settingsSync
-          ? visible(previous, ext)
-          : before.areas[localKey(profileId, ext)]?.values || {};
+        const old =
+          previous?.settingsSync &&
+          !previous.detachedSettings?.[ext] &&
+          library(previous)[ext]?.state !== 'removed'
+            ? visible(previous, ext)
+            : before.areas[localKey(profileId, ext)]?.values || {};
         const changes = difference(old, values);
         this.emitStorage(profileId, link, ext, changes);
       }
@@ -585,7 +601,7 @@ class SyncClient {
       const link = s.links[profileId];
       if (!link) return;
       if (link.settingsSync)
-        for (const [ext, values] of Object.entries(allVisible(link)))
+        for (const [ext, values] of Object.entries(syncedVisible(link)))
           s.areas[localKey(profileId, ext)] = independentArea(
             link,
             ext,
@@ -650,7 +666,7 @@ class SyncClient {
     this.store.transaction((s) => {
       const current = s.links[profileId];
       if (current.settingsSync)
-        for (const [ext, values] of Object.entries(allVisible(current)))
+        for (const [ext, values] of Object.entries(syncedVisible(current)))
           s.areas[localKey(profileId, ext)] = independentArea(
             current,
             ext,
@@ -796,7 +812,8 @@ class SyncClient {
     const result = this.store.transaction((s) => {
       const link = s.links[context.profileId];
       const ext = link && library(link)[context.extensionId];
-      const linked = link?.settingsSync && ext && ext.state !== 'removed';
+      const linked =
+        link?.settingsSync && ext && ext.state !== 'removed' && !link.detachedSettings?.[context.extensionId];
       const key = linked
         ? areaKey(context.extensionId, ext.generation)
         : localKey(context.profileId, context.extensionId);
@@ -839,7 +856,7 @@ class SyncClient {
         link = s.links[context.profileId],
         ext = link && library(link)[context.extensionId];
       const area =
-        link?.settingsSync && ext && ext.state !== 'removed'
+        link?.settingsSync && ext && ext.state !== 'removed' && !link.detachedSettings?.[context.extensionId]
           ? link.areas[areaKey(context.extensionId, ext.generation)] ||
             s.areas[localKey(context.profileId, context.extensionId)]
           : s.areas[localKey(context.profileId, context.extensionId)];
@@ -888,9 +905,36 @@ class SyncClient {
     this.linkGuard(identity, epoch);
     const events = this.store.transaction((s) => {
       const link = s.links[profileId],
-        old = allVisible(link),
+        old = observedValues(link, s.areas, profileId),
         oldLibrary = library(link);
-      for (const change of incoming.changes) applyChange(link, change);
+      for (const change of incoming.changes) {
+        const id = change.extensionId,
+          previous = library(link)[id];
+        if (
+          link.librarySync === false &&
+          link.settingsSync &&
+          change.kind === 'extension' &&
+          previous &&
+          previous.state !== 'removed' &&
+          !link.detachedSettings?.[id] &&
+          (change.payload.state === 'removed' || change.generation !== previous.generation)
+        ) {
+          // A paused library leaves the actual extension installed. Retire its
+          // cloud generation, retaining both values and the local access policy.
+          s.areas[localKey(profileId, id)] = independentArea(
+            link,
+            id,
+            visible(link, id),
+            s.areas[localKey(profileId, id)],
+          );
+          (link.detachedSettings ||= {})[id] = true;
+          link.outbox = link.outbox.filter((op) => op.kind !== 'settings' || op.extensionId !== id);
+          link.rejected = link.rejected.filter(
+            (r) => r.operation.kind !== 'settings' || r.operation.extensionId !== id,
+          );
+        }
+        applyChange(link, change);
+      }
       link.cursor = incoming.cursor;
       for (const result of results) {
         const operation = link.outbox.find((o) => o.id === result.id);
@@ -899,7 +943,7 @@ class SyncClient {
         if (!['applied', 'duplicate'].includes(result.status))
           link.rejected.push({ operation, code: result.code || result.status });
       }
-      const next = allVisible(link),
+      const next = observedValues(link, s.areas, profileId),
         nextLibrary = library(link);
       return {
         link,
