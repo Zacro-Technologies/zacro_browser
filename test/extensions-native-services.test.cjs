@@ -26,6 +26,24 @@ test('native static ruleset reconciliation retains choices and applies defaults 
   );
   assert.deepEqual(reconcileRulesets(resources, null), ['kept', 'disabled', 'new']);
 });
+test('native ruleset resources accept one extension-root slash without changing the path', () => {
+  for (const path of [
+    'rules.json',
+    'rulesets/main/easylist.json',
+    '/rules.json',
+    '/rulesets/main/easylist.json',
+  ]) {
+    const manifest = {
+      manifest_version: 3,
+      name: 'Native',
+      version: '1',
+      permissions: ['declarativeNetRequest'],
+      declarative_net_request: { rule_resources: [{ id: 'rules', enabled: true, path }] },
+    };
+    assert.equal(inspectManifest(manifest).compatible, true, path);
+    assert.equal(manifest.declarative_net_request.rule_resources[0].path, path);
+  }
+});
 test('native ruleset resources reject ambiguous IDs and paths before installation', () => {
   const manifest = {
     manifest_version: 3,
@@ -35,10 +53,27 @@ test('native ruleset resources reject ambiguous IDs and paths before installatio
   };
   for (const path of [
     '../rules.json',
-    '/rules.json',
+    '/../rules.json',
+    '/rules/../rules.json',
+    '/rules/./rules.json',
+    '//rules.json',
+    '//foreign/rules.json',
+    '/',
+    '',
+    '/rules//rules.json',
+    '/rules/',
     'https://foreign/rules.json',
+    'chrome-extension://foreign/rules.json',
     'rules.json?x',
+    '/rules.json#fragment',
+    '/rules/%2e%2e/rules.json',
+    '/rules%2frules.json',
+    '/rules\u0000.json',
+    '/rules\n.json',
+    '/rules .json',
+    '/rules\u007f.json',
     'rules\\evil.json',
+    '/rules\\evil.json',
   ])
     assert.throws(
       () =>
@@ -47,6 +82,7 @@ test('native ruleset resources reject ambiguous IDs and paths before installatio
           declarative_net_request: { rule_resources: [{ id: 'rules', enabled: true, path }] },
         }),
       /Invalid declarative_net_request/,
+      JSON.stringify(path),
     );
   assert.throws(
     () =>

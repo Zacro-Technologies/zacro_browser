@@ -7,6 +7,40 @@ const path = require('node:path');
 const { _electron: electron, expect } = require('@playwright/test');
 
 test(
+  'managed native root-relative ruleset blocks requests and unloads on disable and removal',
+  { timeout: 30000 },
+  async (t) => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'zacro-native-root-relative-'));
+    const env = { ...process.env, ZACRO_NATIVE_DIRECTORY: directory, ZACRO_NATIVE_PHASE: 'root-relative' };
+    delete env.ELECTRON_RUN_AS_NODE;
+    const app = await electron.launch({
+      args: [path.resolve(__dirname, '../fixtures/extensions/native-services-host.cjs')],
+      env,
+    });
+    t.after(async () => {
+      await app.close();
+      await fs.rm(directory, { recursive: true, force: true });
+    });
+    await expect
+      .poll(() => app.evaluate(() => globalThis.nativeServicesResult), { timeout: 20000 })
+      .toBeTruthy();
+    const result = await app.evaluate(() => globalThis.nativeServicesResult);
+    t.diagnostic(JSON.stringify(result));
+    assert.equal(result.error, undefined);
+    assert.equal(result.beforeAllowed, true);
+    assert.equal(result.nativePath, '/rulesets/main/static.json');
+    assert.equal(result.sourceUnchanged, true);
+    assert.deepEqual(result.enabledRulesets, ['static']);
+    assert.equal(result.staticBlocked, true);
+    assert.equal(result.unmatchedAllowed, true);
+    assert.equal(result.otherProfileAllowed, true);
+    assert.equal(result.disabledAllowed, true);
+    assert.equal(result.reenabledBlocked, true);
+    assert.equal(result.removedAllowed, true);
+  },
+);
+
+test(
   'startup offscreen creation waits for initialization and survives activation',
   { timeout: 30000 },
   async (t) => {

@@ -21,7 +21,18 @@ enabled/disabled choices; new ruleset IDs use their new manifest defaults and
 removed IDs are discarded. Per-static-rule disabled IDs are retained too.
 Native dynamic rules are durably snapshotted after successful native mutation;
 native session rules are explicitly cleared on every load and never persisted.
-Unload immediately removes effective native rules. Removal deletes the snapshot.
+Unload removes effective rules after native network-service propagation. Removal
+deletes the snapshot.
+
+Ruleset resources accept package-relative paths such as `rulesets/main/static.json`
+and a single extension-root slash such as `/rulesets/main/static.json`. Pinned
+Chromium's `Extension::GetResource(string_view)` removes exactly one leading
+slash for native lookup. Catalog validation permits that spelling while keeping
+the manifest and original package bytes unchanged; it never resolves the path
+as an absolute host filesystem path. Traversal/dot components, double leading
+slashes, empty components, foreign URLs, encoded or control characters, and
+backslashes remain rejected. Package acquisition and copied-resource symlink
+checks still apply.
 
 Snapshots live under the managed profile's `native-services/<extension-id>.json`.
 Native setters complete only after a serialized atomic snapshot succeeds.
@@ -78,5 +89,14 @@ It checks actual static/dynamic/session request blocking, redirect and response
 header changes, an unaffected profile, disable/re-enable cleanup, discarded
 unverified native cache, offscreen runtime/DOM and host denial, genuine lazy
 background suspension and alarm wake, and restart persistence. Unit tests cover
-ruleset reconciliation and resource validation. These results do not establish
+ruleset reconciliation and resource validation. The focused
+`--test-name-pattern='managed native root-relative ruleset'` case uses the same
+manager fixture to preserve the root-relative native manifest path, block a real
+HTTP request, keep a second profile unaffected, allow requests after native
+disable cleanup, block again after enable, and allow requests after removal.
+Cleanup checks wait for asynchronous native network-service propagation.
+This resource-path correction was prompted by the verified uBlock Origin Lite
+2026.1021.1354 package. Fixture success does not establish that third-party
+package's activation or compatibility; its acceptance remains a separate runtime
+check. These results do not establish
 Windows, Intel Mac, every DNR action/quota, audio inactivity, or crash timing.

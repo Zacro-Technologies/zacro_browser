@@ -63,6 +63,75 @@ app.whenReady().then(async () => {
         `fetch(${JSON.stringify(base + endpoint)}).then(async r=>({body:await r.text(),header:r.headers.get('x-native')}),e=>({error:e.message}))`,
       );
     const blocked = async (endpoint) => !!(await request(endpoint)).error;
+    if (process.env.ZACRO_NATIVE_PHASE === 'root-relative') {
+      const source = path.join(directory, 'root-relative-source');
+      await fs.mkdir(path.join(source, 'rulesets', 'main'), { recursive: true });
+      const manifest = JSON.stringify({
+        manifest_version: 3,
+        name: 'Root-relative native ruleset',
+        version: '1',
+        permissions: ['declarativeNetRequest'],
+        host_permissions: ['http://127.0.0.1/*'],
+        declarative_net_request: {
+          rule_resources: [{ id: 'static', enabled: true, path: '/rulesets/main/static.json' }],
+        },
+      });
+      const rules = JSON.stringify([
+        {
+          id: 1,
+          action: { type: 'block' },
+          condition: { urlFilter: '/root-relative-static', resourceTypes: ['xmlhttprequest'] },
+        },
+      ]);
+      await fs.writeFile(path.join(source, 'manifest.json'), manifest);
+      await fs.writeFile(path.join(source, 'rulesets', 'main', 'static.json'), rules);
+      await fs.writeFile(path.join(source, 'page.html'), '<!doctype html>');
+      const beforeAllowed = !(await blocked('/root-relative-static'));
+      const installed = await manager.installLocal('one', source);
+      if (!installed.enabled) throw new Error('Root-relative ruleset did not enable: ' + installed.status);
+      const page = await view(sessions.one, `chrome-extension://${installed.id}/page.html`);
+      const nativeManifest = await page.webContents.executeJavaScript('chrome.runtime.getManifest()');
+      const enabledRulesets = await page.webContents.executeJavaScript(
+        'chrome.declarativeNetRequest.getEnabledRulesets()',
+      );
+      const staticBlocked = await blocked('/root-relative-static');
+      const unmatchedAllowed = !(await blocked('/allowed'));
+      const otherProfileAllowed = !(await request('/root-relative-static', foreign)).error;
+      page.destroy();
+      await manager.disable('one', installed.id);
+      // Native unload propagates to the network service asynchronously.
+      // Observe real successful fetches rather than assuming the first post-unload fetch wins.
+      const allowedAfterUnload = async () => {
+        const deadline = Date.now() + 3000;
+        do {
+          if (!(await blocked('/root-relative-static'))) return true;
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        } while (Date.now() < deadline);
+        return false;
+      };
+      const disabledAllowed = await allowedAfterUnload();
+      await manager.enable('one', installed.id);
+      const reenabledBlocked = await blocked('/root-relative-static');
+      await manager.remove('one', installed.id);
+      const removedAllowed = await allowedAfterUnload();
+      globalThis.nativeServicesResult = {
+        beforeAllowed,
+        nativePath: nativeManifest.declarative_net_request.rule_resources[0].path,
+        sourceUnchanged:
+          (await fs.readFile(path.join(source, 'manifest.json'), 'utf8')) === manifest &&
+          (await fs.readFile(path.join(source, 'rulesets', 'main', 'static.json'), 'utf8')) === rules,
+        enabledRulesets,
+        staticBlocked,
+        unmatchedAllowed,
+        otherProfileAllowed,
+        disabledAllowed,
+        reenabledBlocked,
+        removedAllowed,
+      };
+      await manager.close();
+      bridge.close();
+      return;
+    }
     if (process.env.ZACRO_NATIVE_PHASE === 'update') {
       const { zip, crx, keyPair } = require('./packages/builders.cjs');
       const { verifyCrx } = require(path.join(root, 'src/main/extensions/packages.cjs'));

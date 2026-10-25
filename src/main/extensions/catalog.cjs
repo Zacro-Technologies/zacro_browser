@@ -177,7 +177,12 @@ function inspectManifest(manifest, capabilities = {}) {
           typeof resource.path !== 'string' ||
           !resource.path ||
           /[\\\x00-\x20\x7f:%?#]/.test(resource.path) ||
-          resource.path.split('/').some((part) => !part || part === '.' || part === '..'),
+          // Native Extension::GetResource strips one extension-root slash.
+          // Validate that spelling without rewriting the manifest or joining a host path.
+          resource.path
+            .replace(/^\//, '')
+            .split('/')
+            .some((part) => !part || part === '.' || part === '..'),
       ) ||
       new Set(resources.map((resource) => resource.id)).size !== resources.length
     )
