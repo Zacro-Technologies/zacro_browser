@@ -22,7 +22,7 @@ async function bounded(promise, label) {
   }
 }
 
-async function fixture(t) {
+async function fixture(t, { configured = true } = {}) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'zacro-ai-workflow-'));
   const requests = [],
     errors = [];
@@ -113,7 +113,8 @@ async function fixture(t) {
     .toBe('page-one');
   const first = (await invoke('state:get')).activeTabId;
   const second = await invoke('tab:create', { url: `${base}/page-two`, active: false });
-  await invoke('ai:configure', { provider: 'compatible', baseUrl: `${base}/v1`, model: 'fixture' });
+  if (configured)
+    await invoke('ai:configure', { provider: 'compatible', baseUrl: `${base}/v1`, model: 'fixture' });
   const open = async (section) => {
     await shell.getByRole('button', { name: 'Library', exact: true }).click();
     await shell
@@ -132,6 +133,106 @@ async function fixture(t) {
   });
   return { app, shell, invoke, open, base, requests, first, second: second.id };
 }
+
+test(
+  'Unconnected AI starters and palette questions retain editable drafts through connection settings without reading or sending',
+  { timeout: 45000 },
+  async (t) => {
+    const b = await fixture(t, { configured: false }),
+      { shell } = b;
+    await b.app.evaluate(({ webContents }, url) => {
+      const guest = webContents.getAllWebContents().find((contents) => contents.getURL() === url);
+      if (!guest) throw new Error('Fixture page is missing');
+      global.aiWorkflowContextReads = 0;
+      const original = guest.executeJavaScriptInIsolatedWorld.bind(guest);
+      guest.executeJavaScriptInIsolatedWorld = (worldId, ...args) => {
+        if (worldId === 1001) global.aiWorkflowContextReads++;
+        return original(worldId, ...args);
+      };
+    }, `${b.base}/page-one`);
+    const prepareFromPalette = async (question, { keptInPalette = false } = {}) => {
+      await b.invoke('shortcut:run', { id: 'command-palette' });
+      await shell.locator('#command-input').fill(question);
+      await b.app.evaluate(({ BrowserWindow }) => {
+        const contents = BrowserWindow.getAllWindows()[0].webContents;
+        contents.focus();
+        const modifiers = [process.platform === 'darwin' ? 'meta' : 'control'];
+        contents.sendInputEvent({ type: 'keyDown', keyCode: 'Enter', modifiers });
+        contents.sendInputEvent({ type: 'keyUp', keyCode: 'Enter', modifiers });
+      });
+      await expect(shell.locator('#panel-title')).toHaveText('Ask Zacro');
+      if (keptInPalette) await expect(shell.locator('#command-input')).toHaveValue(question);
+      else await expect(shell.locator('#command-input')).toHaveCount(0);
+    };
+    await shell.getByRole('button', { name: 'Close panel', exact: true }).click();
+    const firstQuestion = 'Explain how this browser keeps my tabs separate';
+    await prepareFromPalette(firstQuestion);
+    await expect(shell.locator('#ai-question')).toHaveValue(firstQuestion);
+    await expect(shell.locator('#ai-submit')).toBeDisabled();
+    const otherQuestion = 'Compare the two approaches to organizing research';
+    await prepareFromPalette(otherQuestion);
+    await expect(shell.locator('#ai-question')).toHaveValue(firstQuestion);
+    await expect(shell.locator('.ai-saved-questions summary')).toHaveText('Saved questions (1)');
+    const newestQuestion = 'Retain this third question without replacing either existing draft';
+    await prepareFromPalette(newestQuestion, { keptInPalette: true });
+    await expect(shell.locator('#ai-question')).toHaveValue(firstQuestion);
+    await expect(shell.locator('.ai-saved-question')).toHaveCount(1);
+    await shell.locator('#command-input').press('Escape');
+    await shell.locator('.ai-saved-questions summary').click();
+    await expect(shell.locator('.ai-saved-question .message-content')).toHaveText(otherQuestion);
+    await shell.getByRole('button', { name: 'Review saved question', exact: true }).click();
+    await expect(shell.locator('#ai-question')).toHaveValue(otherQuestion);
+    await expect(shell.locator('.ai-saved-question .message-content')).toHaveText(firstQuestion);
+    await shell.getByRole('button', { name: 'Review saved question', exact: true }).click();
+    await expect(shell.locator('#ai-question')).toHaveValue(firstQuestion);
+    await shell.getByRole('button', { name: 'Discard saved question', exact: true }).click();
+    await expect(shell.locator('.ai-saved-questions')).toHaveCount(0);
+    await shell.locator('#ai-question').fill('');
+    await shell.getByRole('button', { name: 'Close panel', exact: true }).click();
+    await b.invoke('shortcut:run', { id: 'command-palette' });
+    await shell.locator('#command-input').fill('/summarize');
+    await shell.getByRole('option').filter({ hasText: 'Summarize this page' }).click();
+    await expect(shell.locator('#ai-question')).toBeVisible();
+    await expect(shell.locator('#ai-question')).toBeEditable();
+    await expect(shell.locator('#ai-question')).toHaveValue(/Summarize this page/);
+    await expect(shell.locator('.ai-context-chip')).toContainText('page-one');
+    await expect(shell.locator('.ai-context-chip')).toHaveAttribute('title', `${b.base}/page-one`);
+    await expect(shell.locator('#ai-submit')).toBeDisabled();
+    const draft = 'Keep my prepared question before connecting';
+    await shell.locator('#ai-question').fill(draft);
+    await shell.locator('#ai-question').press('Enter');
+    await expect(shell.locator('#ai-question')).toHaveValue(draft);
+    await expect(shell.locator('.message')).toHaveCount(0);
+    await shell.getByRole('button', { name: 'Connect AI', exact: true }).click();
+    await expect(shell.locator('#panel-title')).toHaveText('Settings');
+    await expect(shell.locator('#ai-settings')).toHaveAttribute('open', '');
+    await b.open('ai');
+    await expect(shell.locator('#ai-question')).toHaveValue(draft);
+    await expect(shell.locator('.ai-context-chip')).toHaveAttribute('title', `${b.base}/page-one`);
+    await expect(shell.locator('#ai-submit')).toBeDisabled();
+    await shell.getByRole('button', { name: 'Connect AI', exact: true }).click();
+    await shell.locator('#ai-provider').selectOption('compatible');
+    await expect(shell.locator('#api-provider-form')).toHaveAttribute('data-provider', 'compatible');
+    await shell.locator('#ai-base-url').fill(`${b.base}/v1`);
+    await shell.locator('#ai-api-model').fill('fixture');
+    await shell.locator('#api-provider-form button[type="submit"]').click();
+    await expect(shell.locator('#ai-connection-status')).toContainText('Local API ready');
+    await b.open('ai');
+    await expect(shell.locator('#ai-question')).toHaveValue(draft);
+    await expect(shell.locator('.ai-context-chip')).toHaveAttribute('title', `${b.base}/page-one`);
+    await expect(shell.locator('#ai-submit')).toBeEnabled();
+    assert.equal(b.requests.length, 0, 'Preparation and connection must not send an AI request');
+    assert.equal(
+      await b.app.evaluate(() => global.aiWorkflowContextReads),
+      0,
+      'Preparation and connection must not extract page text',
+    );
+    await shell.locator('#ai-submit').click();
+    await expect(shell.locator('.message.assistant .message-content')).toContainText('twenty dollars');
+    assert.equal(b.requests.length, 1);
+    assert.equal(await b.app.evaluate(() => global.aiWorkflowContextReads), 1);
+  },
+);
 
 test(
   'AI starters prepare explicit context, preserve drafts and never silently share a newly active page',

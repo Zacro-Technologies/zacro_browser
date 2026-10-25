@@ -41,6 +41,13 @@ const UI_FILE = path.join(__dirname, '../renderer/index.html');
 const UI_URL = pathToFileURL(UI_FILE).href;
 const NEW_TAB = 'zacro://newtab';
 const views = new Map();
+// Retain only validated raster data for this process, never in browser exports
+// or on disk. Keys are tab identities; each record is also bound to its exact
+// profile and page URL. Approximate UTF-16 storage is capped at 4 MiB / 128 tabs.
+const retainedFavicons = new Map();
+const MAX_RETAINED_FAVICONS = 128;
+const MAX_RETAINED_FAVICON_BYTES = 4 * 1024 * 1024;
+let retainedFaviconBytes = 0;
 const sessions = new Map();
 const liveDownloads = new Map();
 const downloadReservations = new Set();
@@ -195,6 +202,55 @@ function requestAuthentication(event, contents, details, authInfo, callback) {
   });
   win.webContents.focus();
 }
+function forgetRetainedFavicon(id) {
+  const record = retainedFavicons.get(id);
+  if (!record) return;
+  retainedFaviconBytes -= record.bytes;
+  retainedFavicons.delete(id);
+}
+function forgetProfileFavicons(profileId) {
+  for (const [id, record] of retainedFavicons) if (record.profileId === profileId) forgetRetainedFavicon(id);
+}
+function retainedFavicon(tab) {
+  if (!tab) return null;
+  const record = retainedFavicons.get(tab.id);
+  if (!record) return null;
+  if (record.profileId !== tab.profileId || record.url !== tab.url) {
+    forgetRetainedFavicon(tab.id);
+    return null;
+  }
+  return record.dataUrl;
+}
+function rememberFavicon(entry, pageURL, favicon) {
+  if (!favicon || entry.disposing || !entry.tabId) return;
+  const tab = store.state.tabs.find((item) => item.id === entry.tabId);
+  if (!tab || tab.profileId !== entry.profileId || tab.url !== pageURL) return;
+  if (!store.state.profiles.some((profile) => profile.id === tab.profileId)) return;
+  const bytes = 2 * (favicon.length + pageURL.length + tab.id.length + tab.profileId.length);
+  if (bytes > MAX_RETAINED_FAVICON_BYTES) return;
+  forgetRetainedFavicon(tab.id);
+  while (
+    retainedFavicons.size >= MAX_RETAINED_FAVICONS ||
+    retainedFaviconBytes + bytes > MAX_RETAINED_FAVICON_BYTES
+  )
+    forgetRetainedFavicon(retainedFavicons.keys().next().value);
+  retainedFavicons.set(tab.id, { profileId: tab.profileId, url: pageURL, dataUrl: favicon, bytes });
+  retainedFaviconBytes += bytes;
+}
+function pruneRetainedFavicons() {
+  const tabs = new Map(store.state.tabs.map((tab) => [tab.id, tab]));
+  const profiles = new Set(store.state.profiles.map((profile) => profile.id));
+  for (const [id, record] of retainedFavicons) {
+    const tab = tabs.get(id);
+    if (
+      !tab ||
+      !profiles.has(record.profileId) ||
+      tab.profileId !== record.profileId ||
+      tab.url !== record.url
+    )
+      forgetRetainedFavicon(id);
+  }
+}
 function pageState(entry, tab = null) {
   if (!entry || entry.contents.isDestroyed())
     return {
@@ -205,8 +261,14 @@ function pageState(entry, tab = null) {
       loaded: false,
       sleeping: Boolean(tab?.pinned),
       closed: Boolean(tab?.closed),
+      favicon: retainedFavicon(tab),
     };
   const wc = entry.contents;
+  const boundTab = entry.tabId === tab?.id ? tab : null;
+  const currentFavicon =
+    entry.faviconURL === wc.getURL() && (!boundTab || boundTab.url === entry.faviconURL)
+      ? entry.favicon
+      : null;
   return {
     loading: wc.isLoading(),
     canGoBack: wc.navigationHistory.canGoBack(),
@@ -215,7 +277,7 @@ function pageState(entry, tab = null) {
     error: entry.error || null,
     audible: wc.isCurrentlyAudible(),
     muted: wc.isAudioMuted(),
-    favicon: entry.favicon || null,
+    favicon: currentFavicon || retainedFavicon(boundTab),
     url: wc.getURL(),
     loaded: true,
     sleeping: false,
@@ -529,9 +591,11 @@ function createEntry(profileId, tabId = null, suppliedOptions = {}) {
   });
   wc.on('did-start-navigation', (_event, url, _isInPlace, isMainFrame) => {
     if (isMainFrame) entry.navigationVersion++;
+    if (isMainFrame && retainedFavicons.get(entry.tabId)?.url !== url) forgetRetainedFavicon(entry.tabId);
     if (isMainFrame && !_isInPlace) {
       entry.faviconRequest?.abort();
       entry.favicon = null;
+      entry.faviconURL = null;
       publish();
     }
     if (isMainFrame && backdropContext?.contentIds.has(wc.id)) clearBackdrop();
@@ -564,12 +628,17 @@ function createEntry(profileId, tabId = null, suppliedOptions = {}) {
       .then((favicon) => {
         if (
           request.signal.aborted ||
+          entry.disposing ||
           wc.isDestroyed() ||
           wc.getURL() !== pageURL ||
           entry.faviconRequest !== request
         )
           return;
         entry.favicon = favicon;
+        entry.faviconURL = pageURL;
+        // FaviconLoader is the only source of retained bytes. A null response
+        // cannot replace a previously validated icon for the same exact page.
+        rememberFavicon(entry, pageURL, favicon);
         publish();
       })
       .catch(() => {});
@@ -891,6 +960,7 @@ function ensureView(tabId) {
   return views.get(tabId);
 }
 function reconcile() {
+  pruneRetainedFavicons();
   if (!validWindow() || quitting || closingWindow) return;
   const profileId = activeSpace()?.profileId;
   if (
@@ -1012,6 +1082,7 @@ function promotePeek() {
   if (redundant) destroyEntry(redundant);
   current.entry.tabId = tab.id;
   views.set(tab.id, current.entry);
+  if (current.entry.faviconURL === url) rememberFavicon(current.entry, url, current.entry.favicon);
   const title = current.entry.contents.getTitle() || tab.title;
   store.dispatch('tab:update', { id: tab.id, title });
   // A transient preview is not a visit until it becomes a tab. Record its
@@ -1553,6 +1624,7 @@ async function clearProfileData(profileId) {
       views.delete(id);
     }
   const ses = profileSession(profileId);
+  forgetProfileFavicons(profileId);
   faviconLoader.clear(ses);
   await ses.clearStorageData();
   await ses.clearCache();
@@ -1758,6 +1830,7 @@ async function invoke(action, payload = {}) {
           views.delete(id);
         }
       const ses = profileSession(profile.id);
+      forgetProfileFavicons(profile.id);
       faviconLoader.clear(ses);
       for (const ext of store.state.extensions.filter((item) => item.profileId === profile.id)) {
         if (ext.enabled) ses.extensions.removeExtension(ext.extensionId);
@@ -2439,6 +2512,7 @@ async function endPrivateSessions() {
   // not. Run only after every page has accepted the close, never on Cancel.
   for (const profile of store.state.profiles.filter((item) => item.private)) {
     await ai?.forgetProfile(profile.id);
+    forgetProfileFavicons(profile.id);
     for (const record of store.state.downloads.filter((item) => item.profileId === profile.id))
       liveDownloads.get(record.id)?.cancel();
     const ses = sessions.get(profile.id);

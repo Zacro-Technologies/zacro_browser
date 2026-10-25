@@ -1420,7 +1420,9 @@ test(
       shell.locator('.message.assistant').first().getByRole('button', { name: 'Copy answer' }),
     ).toBeVisible();
     await expect(shell.locator('.message.assistant').last()).toContainText('Sign in with ChatGPT again.');
-    await expect(shell.locator('#ai-form')).toHaveCount(0);
+    await expect(shell.locator('#ai-form')).toBeVisible();
+    await expect(shell.locator('#ai-question')).toHaveValue('Keep this follow-up draft');
+    await expect(shell.locator('#ai-submit')).toBeDisabled();
     await expect(shell.getByRole('button', { name: 'Connect AI', exact: true })).toBeVisible();
     await emit({ type: 'ai:status', configured: false, busy: false, loginPending: true, models: [] });
     await expect(shell.getByRole('button', { name: 'Continue sign-in', exact: true })).toBeVisible();
@@ -1526,7 +1528,9 @@ test(
     await expect(shell.getByRole('button', { name: 'Sign in with ChatGPT', exact: true })).toBeVisible();
     await openLibrarySection(shell, 'ai');
     await expect(shell.locator('.message')).toHaveCount(0);
-    await expect(shell.locator('#ai-form')).toHaveCount(0);
+    await expect(shell.locator('#ai-form')).toBeVisible();
+    await expect(shell.locator('#ai-question')).toHaveValue('');
+    await expect(shell.locator('#ai-submit')).toBeDisabled();
     const calls = await browser.app.evaluate(() => globalThis.__subscriptionActions);
     assert.equal(
       calls.some((c) => c.payload?.apiKey),

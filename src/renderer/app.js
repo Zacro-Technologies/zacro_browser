@@ -168,6 +168,7 @@ const ui = {
   aiTabs: [],
   aiGrantedPages: [],
   aiDraft: '',
+  aiSavedQuestions: [],
   aiRequestId: null,
   aiContextSerial: 0,
   downloadSuggestions: new Map(),
@@ -702,6 +703,7 @@ function applyState(next) {
     ui.aiTabs = [];
     ui.aiGrantedPages = [];
     ui.aiDraft = '';
+    ui.aiSavedQuestions = [];
     ui.aiContextSerial++;
     ui.aiContextChanging = false;
     ui.aiBusy = false;
@@ -1489,6 +1491,34 @@ function rememberAIDraft(value) {
   ui.aiDraft = String(value || '').slice(0, 8000);
   if (sameProfile && composer && composer.value !== ui.aiDraft) composer.value = ui.aiDraft;
 }
+function prepareDisconnectedQuestion(question) {
+  rememberAIDraft();
+  const differentDraft = ui.aiDraft.trim() && ui.aiDraft.trim() !== question;
+  if (
+    question.length > 8000 ||
+    (differentDraft && ui.aiSavedQuestions.length && ui.aiSavedQuestions[0] !== question)
+  ) {
+    openPanel('ai');
+    openCommand('newtab', question);
+    toast(
+      question.length > 8000
+        ? 'Shorten your question to 8,000 characters. It is still in the command bar.'
+        : 'Review or discard the saved question first. Your new question is still in the command bar.',
+    );
+    return;
+  }
+  if (differentDraft) {
+    if (!ui.aiSavedQuestions.includes(question)) ui.aiSavedQuestions.push(question);
+  } else if (!ui.aiDraft.trim()) rememberAIDraft(question);
+  openPanel('ai');
+  renderAIUpdate(false);
+  $('#ai-question')?.focus();
+  toast(
+    differentDraft
+      ? 'Your unfinished draft was kept. The new question is saved above for review.'
+      : 'Your question is ready. Connect an AI provider in Settings to send it.',
+  );
+}
 async function setAIContext(kind, pages = [], { force = false } = {}) {
   const profile = activeProfile()?.id;
   if (activeProfile()?.private) {
@@ -1619,8 +1649,8 @@ function renderAI() {
   const stale = aiContextStale();
   let body;
   if (!messages.length) {
-    body = `<div class="ai-welcome">${icon('sparkle')}<h3>${privateSession ? 'Private session' : configured ? 'Understand what you’re browsing' : 'AI, your way'}</h3><p>${privateSession ? 'AI is unavailable in private browsing.' : configured ? 'Choose a starting point, review the context, then send your question.' : 'Connect a subscription or API provider in Settings.'}</p>${
-      configured
+    body = `<div class="ai-welcome">${icon('sparkle')}<h3>${privateSession ? 'Private session' : 'Understand what you’re browsing'}</h3><p>${privateSession ? 'AI is unavailable in private browsing.' : 'Choose a starting point and review your question and context before sending.'}</p>${
+      !privateSession
         ? `<div class="ai-intents">${[
             ['summarize', 'Summarize page', 'file'],
             ['explain', 'Explain page', 'sparkle'],
@@ -1638,9 +1668,7 @@ function renderAI() {
             .join(
               '',
             )}</div><p class="ai-empty-note">These actions prepare a question. Nothing is shared until you send.</p>`
-        : privateSession
-          ? primary('ui:spaces', 'Switch profile', 'user')
-          : primary('ui:ai-connect', 'Connect AI', 'user')
+        : primary('ui:spaces', 'Switch profile', 'user')
     }</div>`;
   } else {
     body = messages
@@ -1674,9 +1702,13 @@ function renderAI() {
       })
       .join('');
   }
-  return `<div class="panel-body conversation" id="conversation">${body}${ui.aiBusy ? `<div class="ai-progress" role="status"><span class="spinner"></span>${esc(ui.aiProgress || 'Looking into it…')}</div>` : ''}</div>${
-    configured
-      ? `<div class="ai-footer" id="ai-footer">${ui.aiSources.length && !ui.aiBusy ? `<button type="button" class="secondary ai-source-action" id="ai-open-sources" data-action="ai:open-sources">${icon('external')}Open sources <kbd>${shortcut('Mod+Enter')}</kbd></button>` : ''}<div class="ai-context" id="ai-context-controls">${icon('shield')}<label for="ai-context" class="sr-only">Content to share</label><select id="ai-context" ${ui.aiContextChanging || ui.aiSubmitting ? 'disabled' : ''}>${selectOptions(
+  const savedQuestions =
+    !privateSession && ui.aiSavedQuestions.length
+      ? `<details class="ai-saved-questions"><summary>Saved questions (${ui.aiSavedQuestions.length})</summary><p class="provider-note">Review a saved question in the composer. Your current draft will be kept here.</p>${ui.aiSavedQuestions.map((question, index) => `<div class="ai-saved-question"><p class="message-content">${esc(question)}</p><div class="ai-message-actions">${secondary('ui:ai-review-saved', 'Review saved question', 'edit', `data-index="${index}" ${locked ? 'disabled' : ''}`)}${secondary('ui:ai-discard-saved', 'Discard saved question', 'trash', `data-index="${index}"`)}</div></div>`).join('')}</details>`
+      : '';
+  return `<div class="panel-body conversation" id="conversation">${savedQuestions}${body}${ui.aiBusy ? `<div class="ai-progress" role="status"><span class="spinner"></span>${esc(ui.aiProgress || 'Looking into it…')}</div>` : ''}</div>${
+    !privateSession
+      ? `<div class="ai-footer" id="ai-footer">${!configured ? `<div class="row between"><span class="small muted">Connect to send your question.</span>${secondary('ui:ai-connect', ui.aiStatus?.loginPending || ui.aiSigningIn ? 'Continue sign-in' : 'Connect AI', 'user', 'id="ai-reconnect"')}</div>` : ''}${ui.aiSources.length && !ui.aiBusy ? `<button type="button" class="secondary ai-source-action" id="ai-open-sources" data-action="ai:open-sources">${icon('external')}Open sources <kbd>${shortcut('Mod+Enter')}</kbd></button>` : ''}<div class="ai-context" id="ai-context-controls">${icon('shield')}<label for="ai-context" class="sr-only">Content to share</label><select id="ai-context" ${ui.aiContextChanging || ui.aiSubmitting ? 'disabled' : ''}>${selectOptions(
           [
             [
               'research',
@@ -1691,11 +1723,9 @@ function renderAI() {
         )}</select>${ui.aiContext === 'tabs' ? button('ui:ai-select-tabs', 'Choose tabs', 'plus', locked ? 'disabled' : '', 'small-button') : ''}${ui.aiContext !== 'research' ? button('ui:ai-clear-context', 'Clear shared context and conversation', 'close', locked ? 'disabled' : '', 'small-button') : ''}</div>${
           ui.aiContext !== 'research'
             ? `<div class="ai-context-chips" aria-label="Pages selected for sharing">${ui.aiGrantedPages.map((page) => `<div class="ai-context-chip ${aiContextStale([page]) ? 'stale' : ''}" data-context-id="${esc(page.id)}" title="${esc(page.url)}"><span class="grow truncate"><strong>${esc(page.title)}</strong><small>${esc(hostname(page.url))}${aiContextStale([page]) ? ' · page changed' : ''}</small></span>${button('ui:ai-remove-context', `Remove ${page.title} from context`, 'close', `data-id="${esc(page.id)}" ${locked ? 'disabled' : ''}`, 'small-button')}</div>`).join('')}</div><p class="provider-note" id="ai-sharing">On send, readable page or PDF text goes to ${esc(aiProviderName())}. Forms and passwords are excluded.</p>${stale ? `<p class="provider-note danger" role="status">A selected page changed or closed. ${secondary('ui:ai-refresh-context', 'Review pages again', '', locked ? 'disabled' : '')}</p>` : ''}`
-            : `<p class="provider-note" id="ai-sharing">${ui.aiStatus?.researchSupported === false ? 'No web search on this connection.' : 'Searches the web for supporting sources.'} No open-page text is shared.</p>`
-        }<form id="ai-form" class="ai-composer"><textarea id="ai-question" name="question" rows="2" maxlength="8000" placeholder="${messages.length ? 'Ask a follow-up…' : 'Ask a question…'}" aria-label="Ask Zacro" aria-describedby="ai-sharing ai-help">${esc(ui.aiDraft)}</textarea>${ui.aiBusy ? button('ai:cancel', 'Stop response', 'stop', 'id="ai-submit"') : '<button type="submit" class="primary" id="ai-submit" aria-label="Send question" ' + (!locked && !stale ? '' : 'disabled') + '>' + icon('arrow') + '</button>'}</form><p class="ai-help" id="ai-help">Enter to send · Shift + Enter for a new line. Check sources.</p></div>`
-      : !privateSession && messages.length
-        ? `<div class="ai-footer" id="ai-footer">${primary('ui:ai-connect', ui.aiStatus?.loginPending || ui.aiSigningIn ? 'Continue sign-in' : 'Connect AI', 'user', 'id="ai-reconnect"')}</div>`
-        : ''
+            : `<p class="provider-note" id="ai-sharing">${!configured ? 'Web research depends on your connection.' : ui.aiStatus?.researchSupported === false ? 'No web search on this connection.' : 'Searches the web for supporting sources.'} No open-page text is shared.</p>`
+        }<form id="ai-form" class="ai-composer"><textarea id="ai-question" name="question" rows="2" maxlength="8000" placeholder="${messages.length ? 'Ask a follow-up…' : 'Ask a question…'}" aria-label="Ask Zacro" aria-describedby="ai-sharing ai-help">${esc(ui.aiDraft)}</textarea>${ui.aiBusy ? button('ai:cancel', 'Stop response', 'stop', 'id="ai-submit"') : '<button type="submit" class="primary" id="ai-submit" aria-label="Send question" ' + (configured && !locked && !stale ? '' : 'disabled') + '>' + icon('arrow') + '</button>'}</form><p class="ai-help" id="ai-help">${configured ? 'Enter to send' : 'Connect AI to send'} · Shift + Enter for a new line. Check sources.</p></div>`
+      : ''
   }`;
 }
 function openPanel(panel, { refreshStatus = true } = {}) {
@@ -2753,6 +2783,14 @@ function renderAIUpdate(follow = shouldFollowAI()) {
 async function askAI(question) {
   question = String(question || '').trim();
   if (!question || ui.aiBusy || ui.aiSubmitting || ui.aiContextChanging) return false;
+  if (activeProfile()?.private) {
+    toast('AI is unavailable in private browsing.');
+    return false;
+  }
+  if (!(ui.aiStatus?.configured ?? state.runtime?.aiConfigured)) {
+    prepareDisconnectedQuestion(question);
+    return false;
+  }
   const serial = ++ui.aiSubmissionSerial;
   const context = {
     profileId: activeProfile()?.id,
@@ -2780,11 +2818,8 @@ async function askAI(question) {
       return false;
     }
     if (!status?.configured || activeProfile()?.private) {
-      toast(
-        activeProfile()?.private
-          ? 'AI is unavailable in private browsing.'
-          : 'Connect an AI provider in Settings to ask Zacro.',
-      );
+      if (activeProfile()?.private) toast('AI is unavailable in private browsing.');
+      else prepareDisconnectedQuestion(question);
       return false;
     }
     if (context.kind === 'tabs' && !context.pages.length) {
@@ -3504,6 +3539,25 @@ async function handleAction(action, data = {}, target) {
         );
       return;
     }
+    case 'ui:ai-review-saved': {
+      if (ui.aiBusy || ui.aiSubmitting || ui.aiContextChanging) return;
+      const index = Number(data.index);
+      const question = ui.aiSavedQuestions[index];
+      if (typeof question !== 'string') return;
+      rememberAIDraft();
+      const previous = ui.aiDraft;
+      ui.aiSavedQuestions.splice(index, 1);
+      if (previous.trim() && previous.trim() !== question && !ui.aiSavedQuestions.includes(previous))
+        ui.aiSavedQuestions.push(previous);
+      rememberAIDraft(question);
+      renderAIUpdate(false);
+      $('#ai-question')?.focus();
+      return;
+    }
+    case 'ui:ai-discard-saved':
+      if (Number(data.index) === 0) ui.aiSavedQuestions.splice(0, 1);
+      renderAIUpdate(false);
+      return;
     case 'ui:ai-prompt':
       openPanel('ai');
       if (!ui.aiDraft.trim()) rememberAIDraft(data.prompt || '');

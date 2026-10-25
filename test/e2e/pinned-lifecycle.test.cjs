@@ -9,7 +9,18 @@ const { spawn } = require('node:child_process');
 
 let server, base;
 before(async () => {
+  const favicon = await fs.readFile(path.resolve(__dirname, '../../assets/icon-256.png'));
   server = http.createServer((req, res) => {
+    if (req.url === '/favicon.png') {
+      res.writeHead(200, { 'Content-Type': 'image/png', 'Cache-Control': 'no-store' });
+      res.end(favicon);
+      return;
+    }
+    if (req.url === '/favicon.ico') {
+      res.writeHead(404);
+      res.end();
+      return;
+    }
     if (req.url === '/download') {
       res.writeHead(200, {
         'Content-Type': 'application/octet-stream',
@@ -23,7 +34,7 @@ before(async () => {
     }
     res.writeHead(200, { 'Content-Type': 'text/html', 'Cache-Control': 'no-store' });
     res.end(
-      '<!doctype html><title>Favorite fixture</title><button id="activate">Activate</button><input id="draft"><a id="download" href="/download">Download</a><h1>Retained favorite</h1>',
+      `<!doctype html><title>Favorite fixture</title>${req.url.startsWith('/no-icon') ? '' : '<link rel="icon" href="/favicon.png" type="image/png">'}<button id="activate">Activate</button><input id="draft"><a id="download" href="/download">Download</a><h1>Retained favorite</h1>`,
     );
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -39,6 +50,7 @@ const names = [
   'idle sleeping obeys Never/timeout and preserves active and dirty pages',
   'split/media/download protection and silent beforeunload veto keep pages alive',
   'trusted shadow-root editing protects the pin without sharing form values',
+  'retained favorite icons stay bound to their tab/profile/URL and clear with browsing data',
 ];
 for (const [index, name] of names.entries())
   test(name, { timeout: 30000 }, async (t) => {

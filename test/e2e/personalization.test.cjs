@@ -190,9 +190,59 @@ test(
       };
     });
     assert.deepEqual(pageBounds, geometry);
+    // Native geometry can settle before a newly resized Mac compositor has
+    // produced its first page frame. Wait for actual guest rendering before
+    // opening the overlay, then observe the real capture without replacing it.
+    const painted = await b.guest(`new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('The resized page did not paint')), 3000);
+      requestAnimationFrame(() => requestAnimationFrame(() => {
+        clearTimeout(timer);
+        resolve({ visibility: document.visibilityState, width: innerWidth, height: innerHeight });
+      }));
+    })`);
+    assert.equal(painted.visibility, 'visible');
+    assert.equal(painted.width, pageBounds.width);
+    assert.equal(painted.height, pageBounds.height);
+    await b.app.evaluate(({ webContents }, url) => {
+      const contents = webContents.getAllWebContents().find((item) => item.getURL() === url);
+      const capture = contents.capturePage.bind(contents);
+      globalThis.personalizationCaptures = [];
+      contents.capturePage = (...args) => {
+        const record = { visibility: contents.mainFrame.visibilityState, startedAt: Date.now() };
+        globalThis.personalizationCaptures.push(record);
+        return capture(...args).then(
+          (image) => {
+            record.elapsed = Date.now() - record.startedAt;
+            record.empty = image.isEmpty();
+            record.size = image.getSize();
+            return image;
+          },
+          (error) => {
+            record.error = error.message;
+            throw error;
+          },
+        );
+      };
+    }, b.url);
     await b.invoke('bookmark:toggle');
     await b.emit({ type: 'command', mode: 'newtab', query: 'alpha' });
-    await expect(b.shell.locator('.page-backdrop-frame')).toHaveCount(1);
+    try {
+      await expect(b.shell.locator('.page-backdrop-frame')).toHaveCount(1);
+    } catch (error) {
+      t.diagnostic(
+        JSON.stringify(
+          await b.app.evaluate(({ BrowserWindow }) => ({
+            captures: globalThis.personalizationCaptures,
+            windowVisible: BrowserWindow.getAllWindows()[0].isVisible(),
+            windowFocused: BrowserWindow.getAllWindows()[0].isFocused(),
+          })),
+        ),
+      );
+      throw error;
+    }
+    const captured = await b.app.evaluate(() => globalThis.personalizationCaptures);
+    assert.equal(captured.length, 1);
+    assert.equal(captured[0].empty, false, 'The backdrop must come from a real nonempty page capture');
     const backdrop = await b.shell.evaluate(() => {
       const clip = document.querySelector('.page-backdrop-frame');
       const rect = clip.getBoundingClientRect();
@@ -216,6 +266,19 @@ test(
     assert.equal(backdrop.background, 'rgba(0, 0, 0, 0)');
     assert.equal(backdrop.imageFilter, 'blur(6px)');
     assert.deepEqual(backdrop.bounds, pageBounds);
+    const media = await b.shell.context().newCDPSession(b.shell);
+    try {
+      await media.send('Emulation.setEmulatedMedia', {
+        features: [{ name: 'prefers-reduced-transparency', value: 'reduce' }],
+      });
+      const reduced = await b.shell.evaluate(() => ({
+        clickSurface: getComputedStyle(document.querySelector('.command-backdrop')).backgroundColor,
+        pageSnapshot: getComputedStyle(document.querySelector('#page-backdrop')).visibility,
+      }));
+      assert.deepEqual(reduced, { clickSurface: 'rgba(0, 0, 0, 0)', pageSnapshot: 'hidden' });
+    } finally {
+      await media.detach();
+    }
     await b.shell.getByRole('button', { name: 'Bookmarks', exact: true }).click();
     await expect(b.shell.locator('.command-result')).toHaveCount(1);
     await expect(b.shell.locator('.command-result')).toHaveAttribute('data-command-kind', 'bookmark');
@@ -310,14 +373,19 @@ test(
     await b.shell.locator('summary').filter({ hasText: 'Gradient & texture' }).click();
     await b.shell.locator('summary').filter({ hasText: 'Glass & transparency' }).click();
     for (const height of [640, 780, 795]) {
-      await b.app.evaluate(
-        ({ BrowserWindow }, height) => BrowserWindow.getAllWindows()[0].setContentSize(960, height),
-        height,
-      );
-      // Windows may round a requested DIP height by one pixel at fractional
-      // desktop scaling. The actual dialog/footer bounds are checked below.
+      const accepted = await b.app.evaluate(({ BrowserWindow }, height) => {
+        const window = BrowserWindow.getAllWindows()[0];
+        window.setContentSize(960, height);
+        return window.getContentSize();
+      }, height);
+      // macOS constrains a window to the runner's available display height;
+      // Windows may round a DIP by one pixel at fractional desktop scaling.
+      // Verify the size the OS accepted, without claiming the request was met.
+      assert.ok(accepted[0] > 0 && accepted[1] > 0);
+      if (Math.abs(accepted[1] - height) > 1)
+        t.diagnostic(`Requested ${height}px content height; the OS accepted ${accepted[1]}px.`);
       await expect
-        .poll(async () => Math.abs((await b.shell.evaluate(() => innerHeight)) - height))
+        .poll(async () => Math.abs((await b.shell.evaluate(() => innerHeight)) - accepted[1]))
         .toBeLessThanOrEqual(1);
       const bounds = await b.shell.locator('.space-theme-dialog').evaluate((dialog) => {
         dialog.scrollTop = 0;
@@ -334,12 +402,12 @@ test(
       });
       assert(
         bounds.top >= 0 && bounds.bottom <= bounds.height - 23,
-        `Theme dialog must preserve its bottom margin at ${height}px`,
+        `Theme dialog must preserve its bottom margin at the accepted ${bounds.height}px height`,
       );
       for (const action of bounds.actions)
         assert(
           action.top >= bounds.top && action.bottom <= bounds.bottom,
-          `${action.label} must remain fully visible at ${height}px`,
+          `${action.label} must remain fully visible at the accepted ${bounds.height}px height`,
         );
     }
     await b.shell.getByRole('button', { name: 'Cancel', exact: true }).click();

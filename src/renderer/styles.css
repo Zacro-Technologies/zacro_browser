@@ -2559,7 +2559,7 @@ details.setting-section[open] > :not(summary) {
   overflow: hidden;
   background: var(--surface);
 }
-.command-backdrop {
+.app .command-backdrop {
   left: calc(var(--sidebar) + var(--page-gutter));
   right: 0;
   padding-right: calc(var(--canvas-right, 8px) + 24px);
@@ -3198,7 +3198,7 @@ details.setting-section[open] > :not(summary) {
 }
 .space-theme-dialog {
   width: 460px;
-  max-height: min(680px, calc(100vh - var(--dialog-top) - 24px));
+  max-height: min(760px, calc(100vh - var(--dialog-top) - 24px));
 }
 .space-theme-dialog .dialog-header {
   position: sticky;

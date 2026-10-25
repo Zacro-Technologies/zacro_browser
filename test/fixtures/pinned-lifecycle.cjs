@@ -89,6 +89,11 @@ test(
   async (t) => {
     const b = await launch(t);
     const favorite = await b.open('close', true);
+    const favicon = await until(
+      async () => (await b.state()).runtime.pages[favorite.id].favicon,
+      'validated favorite icon',
+    );
+    assert.match(favicon, /^data:image\/png;base64,/);
     await b.invoke('tab:update', { id: favorite.id, title: 'Daily favorite' });
     await b.invoke('bookmark:toggle', { url: favorite.url, title: 'Daily favorite' });
     const original = await b.pageId(favorite.url);
@@ -119,6 +124,11 @@ test(
     const closed = await b.state();
     assert.equal(closed.tabs.find((tab) => tab.id === favorite.id).closed, true);
     assert.equal(closed.tabs.find((tab) => tab.id === favorite.id).customTitle, 'Daily favorite');
+    assert.equal(
+      closed.runtime.pages[favorite.id].favicon,
+      favicon,
+      'Closing a page must retain its favorite icon',
+    );
     assert.deepEqual(
       [closed.runtime.pages[favorite.id].loaded, closed.runtime.pages[favorite.id].sleeping],
       [false, true],
@@ -157,6 +167,10 @@ test(
   async (t) => {
     const b = await launch(t);
     const clean = await b.open('clean', true);
+    const favicon = await until(
+      async () => (await b.state()).runtime.pages[clean.id].favicon,
+      'validated clean favorite icon',
+    );
     const dirty = await b.open('dirty', true);
     await b.guest(dirty.url, 'document.querySelector("#draft").value="An unsaved form"; undefined');
     const active = await b.open('active', true);
@@ -170,6 +184,11 @@ test(
     await b.invoke('settings:update', { values: { pinnedSleepMinutes: 20 } });
     await expect.poll(async () => (await b.state()).runtime.pages[clean.id].sleeping).toBe(true);
     const slept = await b.state();
+    assert.equal(
+      slept.runtime.pages[clean.id].favicon,
+      favicon,
+      'Sleeping must retain the validated icon without a live page',
+    );
     assert.equal(slept.runtime.pages[dirty.id].loaded, true);
     assert.equal(slept.runtime.pages[active.id].loaded, true);
     assert.equal(
@@ -260,6 +279,82 @@ test(
     await b.open('shadow-other');
     assert.equal((await b.invoke('tab:sleep', { id: favorite.id })).slept, false);
     assert.ok(!JSON.stringify(await b.state()).includes('private-shadow-draft'));
+  },
+);
+
+test(
+  'retained icons are exact-tab/profile/URL scoped and erased by profile data clearing',
+  { timeout: 30000 },
+  async (t) => {
+    const b = await launch(t);
+    const favorite = await b.open('icon-retention', true);
+    const initial = await b.state();
+    const spaceId = initial.activeSpaceId;
+    const profileId = initial.spaces.find((space) => space.id === spaceId).profileId;
+    const favicon = await until(
+      async () => (await b.state()).runtime.pages[favorite.id].favicon,
+      'validated retained icon',
+    );
+    await b.invoke('tab:close', { id: favorite.id });
+    assert.equal((await b.state()).runtime.pages[favorite.id].favicon, favicon);
+
+    // A matching URL in another profile must not inherit a retained raster,
+    // including an unloaded favorite which has never contacted the fixture.
+    await b.invoke('profile:create', { name: 'Isolated favorite icons' });
+    const other = await b.invoke('tab:create', { url: favorite.url, active: false });
+    await b.invoke('tab:pin', { id: other.id });
+    const isolated = (await b.state()).runtime.pages[other.id];
+    assert.equal(isolated.loaded, false);
+    assert.equal(isolated.favicon, null);
+    await b.invoke('space:activate', { id: spaceId });
+    assert.equal((await b.state()).runtime.pages[favorite.id].favicon, favicon);
+
+    await b.activate(favorite);
+    await until(async () => (await b.state()).runtime.pages[favorite.id].favicon, 'restored favorite icon');
+    const noIconURL = base + '/no-icon';
+    await b.invoke('navigate', { url: noIconURL });
+    await expect.poll(() => b.guest(noIconURL, 'document.readyState')).toBe('complete');
+    assert.equal(
+      (await b.state()).runtime.pages[favorite.id].favicon,
+      null,
+      'A different URL must not reuse the previous page icon',
+    );
+    await b.invoke('tab:close', { id: favorite.id });
+    assert.equal(
+      (await b.state()).runtime.pages[favorite.id].favicon,
+      null,
+      'Closing the newly navigated page must not retain its previous URL icon',
+    );
+    const unvisited = await b.invoke('tab:create', { url: favorite.url, active: false });
+    assert.equal(
+      (await b.state()).runtime.pages[unvisited.id].favicon,
+      null,
+      'Another tab in the same profile must not inherit a retained icon by URL',
+    );
+
+    // The public tab:update action only renames a tab. Return through the real
+    // navigation action so the new document must obtain its own validated icon.
+    await b.invoke('tab:activate', { id: favorite.id });
+    await expect.poll(() => b.guest(noIconURL, 'document.readyState')).toBe('complete');
+    await b.invoke('navigate', { url: favorite.url });
+    await expect.poll(() => b.guest(favorite.url, 'document.readyState')).toBe('complete');
+    await until(
+      async () => (await b.state()).runtime.pages[favorite.id].favicon,
+      'freshly loaded favorite icon',
+    );
+    await b.invoke('tab:close', { id: favorite.id });
+    assert.equal((await b.state()).runtime.pages[favorite.id].favicon, favicon);
+    await b.app.evaluate(({ dialog }) => {
+      dialog.showMessageBox = async () => ({ response: 1 });
+    });
+    await b.invoke('data:clear', { profileId });
+    const cleared = (await b.state()).runtime.pages[favorite.id];
+    assert.equal(cleared.loaded, false);
+    assert.equal(
+      cleared.favicon,
+      null,
+      'Clearing profile data must remove icons even for already-closed pages',
+    );
   },
 );
 
