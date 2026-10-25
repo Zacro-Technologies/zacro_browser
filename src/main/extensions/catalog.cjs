@@ -55,6 +55,15 @@ function inspectManifest(manifest) {
   )
     throw new Error('Invalid extension manifest');
   versionParts(manifest.version);
+  if (
+    manifest.devtools_page !== undefined &&
+    (typeof manifest.devtools_page !== 'string' ||
+      !manifest.devtools_page ||
+      manifest.devtools_page.length > 2048 ||
+      /[\\\x00-\x20\x7f:%?#]/.test(manifest.devtools_page) ||
+      manifest.devtools_page.split('/').some((part) => !part || part === '.' || part === '..'))
+  )
+    throw new Error('Invalid devtools_page');
   const requiredPermissions = list(manifest.permissions, 'permissions'),
     optionalPermissions = list(manifest.optional_permissions, 'optional_permissions');
   const contentScripts = manifest.content_scripts || [];
@@ -115,7 +124,7 @@ function inspectManifest(manifest) {
         required: false,
         reason: 'This optional origin cannot be granted.',
       });
-  for (const key of ['devtools_page', 'chrome_url_overrides', 'sandbox', 'declarative_net_request'])
+  for (const key of ['chrome_url_overrides', 'sandbox', 'declarative_net_request'])
     if (manifest[key])
       unsupported.push({
         capability: key,

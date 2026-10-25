@@ -4,6 +4,7 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { parse } = require('parse5');
+const { inspectManifest } = require('./catalog.cjs');
 const TRANSFORM_VERSION = 3;
 const BOOTSTRAP = 'zacro-compat-bootstrap.js';
 
@@ -13,6 +14,14 @@ async function adaptExtension(source, destination, { publicKey } = {}) {
   if (destination === source || destination.startsWith(source + path.sep))
     throw new Error('Derived copy must be outside the source');
   const manifest = JSON.parse(await fs.readFile(path.join(source, 'manifest.json'), 'utf8'));
+  inspectManifest(manifest);
+  if (manifest.devtools_page) {
+    const resource = path.join(source, manifest.devtools_page);
+    const stat = await fs.lstat(resource).catch(() => null);
+    const real = await fs.realpath(resource).catch(() => null);
+    if (!stat?.isFile() || !real?.startsWith((await fs.realpath(source)) + path.sep))
+      throw new Error('Invalid devtools_page resource');
+  }
   for (const reserved of [BOOTSTRAP, 'zacro-compat-transport.html'])
     if (
       await fs.access(path.join(source, reserved)).then(

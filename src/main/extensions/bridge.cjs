@@ -44,6 +44,13 @@ class ExtensionBridge {
     this.sessions.set(session, entry);
     entry.unloaded = (_event, extension) => {
       entry.revoked.add(extension.id);
+      // Electron removes the extension from its registry but retains open
+      // DevTools frames and their native inspectedWindow authority. Destroy
+      // those contexts on unload; keep inspected documents and other sessions.
+      if (extension.manifest?.devtools_page)
+        for (const contents of webContents.getAllWebContents())
+          if (!contents.isDestroyed() && contents.session === session && contents.isDevToolsOpened())
+            contents.closeDevTools();
       this.clearBackground(entry, extension.id);
       entry.epochs.set(extension.id, (entry.epochs.get(extension.id) || 0) + 1);
       for (const [key, lease] of this.leases)
