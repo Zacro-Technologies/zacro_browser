@@ -10,7 +10,7 @@ Zacro is an independent project, not an official continuation of Arc or an affil
 
 ## Project status
 
-**Desktop development build · 0.5.** This repository contains a runnable Chromium browser built with Electron, with Windows 11 x64 and native macOS integration for Apple silicon and Intel. It includes real page rendering, sandboxed tabs, Spaces, separate profiles, Peek, split view, local session recovery, library panels, compatible unpacked extensions, and six optional AI connections: ChatGPT subscription, Claude subscription, OpenAI API, Claude API, OpenRouter, and OpenAI-compatible servers. The previous 0.4 revision passed Windows and native macOS 15 CI on both Mac architectures, including packaged-application acceptance and development DMG/ZIP builds. The current command, shortcut, gesture and provider changes are undergoing validation; those earlier results do not certify this revision. Physical Mac review and signed/notarized release acceptance remain open. See [macOS setup and validation](docs/MACOS.md) for the exact support boundary.
+**Desktop development build · 0.5.** This repository contains a runnable Chromium browser built with Electron, with Windows 11 x64 and native macOS integration for Apple silicon and Intel. It includes real page rendering, sandboxed tabs, Spaces, separate profiles, Peek, split view, local session recovery, library panels, compatible unpacked extensions, and six optional AI connections: ChatGPT subscription, Claude subscription, OpenAI API, Claude API, OpenRouter, and OpenAI-compatible servers. The current command, shortcut, gesture and provider revision passed [Windows and native macOS 15 CI](https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40190619770) on both Mac architectures, including packaged-application acceptance and development DMG/ZIP builds. Physical Mac review and signed/notarized release acceptance remain open. See [macOS setup and validation](docs/MACOS.md) for the exact support boundary.
 
 This is **not yet a complete implementation of the vision or a commercial release**. Zacro account sync, full Chrome extension compatibility and `chrome.storage.sync`, consequential browser agents, signed automatic updates, and operational/security release gates remain open. AI connection code and controlled-transport tests are implemented; live subscription sign-in, API model access, billing/limits and inference acceptance remain pending with user-authorized accounts. The [implementation roadmap](docs/ROADMAP.md) separates working features from required release work; [AI documentation](docs/AI.md) describes the connection and data boundaries.
 
@@ -37,6 +37,17 @@ A 224px sidebar keeps navigation, Spaces and tabs within reach. Drag tabs into f
 | --- | --- |
 | ![Zacro 0.5 Settings with the OpenAI API connection form](docs/screenshots/0.5/ai-connections.jpg) | ![Zacro 0.5 opening the command palette in a Space without creating a blank tab](docs/screenshots/0.5/blank-space.jpg) |
 | Six explicit providers. Subscription usage and API billing stay separate; this capture does not demonstrate live sign-in or answers. | Start with the palette. A tab is created only when you submit a destination. |
+
+<details>
+<summary>Native macOS 0.5 · light and dark</summary>
+
+| Light | Dark |
+| --- | --- |
+| ![Packaged Zacro 0.5 on macOS in light appearance with native traffic lights, menu bar and Dock](docs/screenshots/0.5/macos-light.png) | ![Packaged Zacro 0.5 on macOS in dark appearance with native traffic lights, menu bar and Dock](docs/screenshots/0.5/macos-dark.png) |
+
+Unedited desktop captures from the packaged Apple silicon build on macOS 15.7.9. These show the optional New Tab Page opened explicitly during package acceptance; empty Spaces normally open the command palette. See [capture provenance](docs/screenshots/README.md).
+
+</details>
 
 <details>
 <summary>Historical 0.4 · Windows and native macOS</summary>

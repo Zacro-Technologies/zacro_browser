@@ -1,12 +1,12 @@
 # Zacro on macOS
 
-The Mac implementation targets **macOS 13 or later**, on **Apple silicon (`arm64`) and Intel (`x64`)**. It includes native window chrome and menus, Mac keyboard conventions, Dock reopening, safe web-link delivery, and architecture-matched application packaging. Native CI passed the previous 0.4 revision on macOS 15 for both architectures; the current command, shortcut and gesture revision is still undergoing validation. macOS 13 is the declared minimum, not a completed physical-device test result; physical Mac review and signed/notarized release acceptance remain open.
+The Mac implementation targets **macOS 13 or later**, on **Apple silicon (`arm64`) and Intel (`x64`)**. It includes native window chrome and menus, Mac keyboard conventions, Dock reopening, safe web-link delivery, and architecture-matched application packaging. The current 0.5 revision passed [native CI on macOS 15.7.9](https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40190619770) for both architectures: 154 unit/security checks, 39 desktop checks, packaged-application acceptance and development DMG/ZIP generation on each. macOS 13 is the declared minimum, not a completed physical-device test result; physical Mac review and signed/notarized release acceptance remain open.
 
 ## Everyday use
 
-![Packaged Zacro in dark appearance on macOS, with native traffic lights, menu bar and Dock icon](screenshots/macos-dark.png)
+![Packaged Zacro 0.5 in dark appearance on macOS, with native traffic lights, menu bar and Dock icon](screenshots/0.5/macos-dark.png)
 
-This is a historical, unedited native desktop capture of the previous 0.4 Apple silicon development package on macOS 15.7.9, using a disposable CI profile. It predates the current empty-Space palette and shortcut changes. The [README](../README.md#screenshots) also shows light appearance; refreshed captures are pending.
+This unedited native desktop capture shows the 0.5 Apple silicon development package on macOS 15.7.9, using a disposable profile in [CI run 40190619770](https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40190619770). The optional New Tab Page was opened explicitly during acceptance; an empty Space normally opens the command palette. The [README](../README.md#screenshots) also shows light appearance.
 
 The red, yellow and green window controls are native macOS controls. Their reserved area remains clear when the sidebar is hidden. Full screen uses the operating system's transition and screen arrangement; returning to a window restores the controls' layout. The interface follows system light/dark appearance, reduced motion, reduced transparency and increased contrast, uses the system font, and dims chrome when inactive.
 

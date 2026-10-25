@@ -12,6 +12,8 @@ The five JPEGs in `0.5/` were captured from the packaged Zacro 0.5 Windows devel
 
 The captures contain no real account credentials, private browsing history, live subscription sign-in, or AI answers. The AI connection image shows configuration choices; it does not establish authentication or inference acceptance. The [0.5 design and feature guide](../Zacro-0.5-Design-and-Feature-Guide.pdf) uses these five images; every page was rendered with Poppler and visually inspected. See the [validation record](../VALIDATION.md) for the separate test and review status.
 
+`0.5/macos-light.png` and `0.5/macos-dark.png` are unedited native desktop captures from the packaged Apple silicon build on macOS 15.7.9 in [CI run 40190619770](https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40190619770), commit `4913177dfe5998608bdc2f1ab1d5f02115986167`. Both were visually reviewed. They show native traffic lights, the application menu, Dock icon and the optional New Tab Page opened explicitly during acceptance. Empty Spaces normally open the command palette. These disposable-profile captures supplement automated Mac checks and do not establish physical-device acceptance.
+
 ## Historical 0.4 captures
 
 The images below and the [0.4 feature guide](../Zacro-0.4-Design-and-Feature-Guide.pdf) predate the current empty-Space command palette, shortcut editor, provider selection and trackpad feedback. Use the current README and interaction guide for usage.
