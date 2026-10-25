@@ -227,7 +227,7 @@ async function main(phase, options) {
     await fs.mkdir(output, { recursive: true });
     await fs.writeFile(
       path.join(output, 'args.gn'),
-      `import("//electron/build/args/testing.gn")\ntarget_cpu = "${arch === 'x64' ? 'x64' : 'arm64'}"\nsymbol_level = 0\nblink_symbol_level = 0\nv8_symbol_level = 0\nuse_remoteexec = false\nuse_siso = false\n`,
+      `import("//electron/build/args/testing.gn")\ntarget_cpu = "${arch === 'x64' ? 'x64' : 'arm64'}"\noverride_electron_version = "${config.electronVersion}"\nsymbol_level = 0\nblink_symbol_level = 0\nv8_symbol_level = 0\nuse_remoteexec = false\nuse_siso = false\n`,
     );
     await run(path.join(depot, 'gn' + suffix), ['gen', `out/${out}`], source, env);
     await run(
