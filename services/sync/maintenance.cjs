@@ -55,7 +55,8 @@ function backup(store, directory) {
     filename = path.join(target, `zacro-sync-${createdAt}-${randomUUID()}.sqlite`);
   store.db.prepare('VACUUM INTO ?').run(filename);
   fs.chmodSync(filename, 0o600);
-  const fd = fs.openSync(filename, 'r');
+  // Windows FlushFileBuffers requires write access; r+ preserves the snapshot.
+  const fd = fs.openSync(filename, 'r+');
   try {
     fs.fsyncSync(fd);
   } finally {

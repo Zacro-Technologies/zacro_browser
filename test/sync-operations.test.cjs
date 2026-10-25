@@ -2,6 +2,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
+const syncFS = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const { randomBytes, randomUUID, createHash } = require('node:crypto');
@@ -84,94 +85,268 @@ test('a failed durable security-ledger open makes readiness fail closed', async 
   assert.equal((await f.request('/account', f.user.accessToken)).status, 503);
 });
 
-test('operator CLI generates protected keys, serves a real database and performs an offline backup and restore', async (t) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'zacro-sync-cli-'));
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
-  const keyFile = path.join(root, 'master.key'),
-    directory = path.join(root, 'data');
-  const generated = await execute(process.execPath, [cli, 'generate-key', '--key-file', keyFile]);
-  assert.equal((await fs.readFile(keyFile)).length, 32);
-  assert.equal(generated.stdout.includes((await fs.readFile(keyFile)).toString('hex')), false);
-  if (process.platform !== 'win32') assert.equal((await fs.stat(keyFile)).mode & 0o077, 0);
-  const child = spawn(
-    process.execPath,
-    [cli, 'serve', '--data', directory, '--key-file', keyFile, '--port', '0', '--dev-loopback'],
-    { stdio: ['ignore', 'pipe', 'pipe'] },
-  );
-  let stderr = '';
-  child.stderr.on('data', (c) => {
-    stderr = (stderr + c).slice(-8000);
+// Model only the Windows regular-file flush access contract; SQLite, file
+// contents, metadata authentication and restore continue through the real code.
+function snapshotFlushContract(t, directory, failure) {
+  const open = syncFS.openSync,
+    close = syncFS.closeSync,
+    flush = syncFS.fsyncSync;
+  const snapshots = new Map(),
+    flushed = [];
+  t.mock.method(syncFS, 'openSync', (filename, flags, ...args) => {
+    const snapshot =
+      typeof filename === 'string' && path.dirname(filename) === directory && filename.endsWith('.sqlite');
+    const writable =
+      typeof flags === 'number'
+        ? Boolean(flags & (syncFS.constants.O_WRONLY | syncFS.constants.O_RDWR))
+        : /[wa+]/.test(flags);
+    if (snapshot && writable && failure === 'open')
+      throw Object.assign(new Error('Snapshot write access denied'), { code: 'EACCES' });
+    const fd = open(filename, flags, ...args);
+    if (snapshot) snapshots.set(fd, { filename, writable });
+    return fd;
   });
-  t.after(async () => {
-    if (child.exitCode === null && !child.killed) {
-      const exited = new Promise((resolve) => child.once('exit', resolve));
-      child.kill('SIGTERM');
-      await exited;
+  t.mock.method(syncFS, 'closeSync', (fd) => {
+    snapshots.delete(fd);
+    return close(fd);
+  });
+  t.mock.method(syncFS, 'fsyncSync', (fd) => {
+    const snapshot = snapshots.get(fd);
+    if (snapshot) {
+      if (!snapshot.writable || failure === 'EPERM')
+        throw Object.assign(new Error('Snapshot flush requires write access'), { code: 'EPERM' });
+      if (failure === 'EIO') throw Object.assign(new Error('Snapshot flush failed'), { code: 'EIO' });
+      // A successful flush still executes the host's real filesystem operation.
+      flush(fd);
+      flushed.push(snapshot.filename);
+      return;
     }
+    return flush(fd);
   });
-  const lines = createInterface({ input: child.stdout });
-  const url = await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('CLI startup timed out: ' + stderr)), 10000);
-    const fail = () => {
-      clearTimeout(timer);
-      reject(new Error('CLI exited: ' + stderr));
-    };
-    child.once('exit', fail);
-    lines.on('line', (line) => {
-      const record = JSON.parse(line);
-      if (record.event === 'listening') {
-        clearTimeout(timer);
-        child.off('exit', fail);
-        resolve(record.url);
+  return flushed;
+}
+
+test('backup durably flushes a nontruncated SQLite snapshot with Windows write access', async (t) => {
+  const f = await setup(t);
+  const directory = path.join(f.root, 'backups');
+  const flushed = snapshotFlushContract(t, directory);
+  const backup = await f.service.backup(directory);
+  assert.deepEqual(flushed, [backup.path]);
+  assert.equal(
+    createHash('sha256')
+      .update(await fs.readFile(backup.path))
+      .digest('hex'),
+    backup.sha256,
+  );
+  await f.service.close();
+  const restored = path.join(f.root, 'restored-write-access');
+  await restoreSyncBackup({
+    directory: restored,
+    backupPath: backup.path,
+    ledgerPath: path.join(f.options.directory, 'deletions.jsonl'),
+    masterKey: f.options.masterKey,
+  });
+  const db = new DatabaseSync(path.join(restored, 'sync.sqlite'), { readOnly: true });
+  try {
+    assert.equal(db.prepare('PRAGMA integrity_check').get().integrity_check, 'ok');
+    assert.equal(db.prepare('SELECT username FROM accounts').get().username, 'operator.test');
+    assert.equal(db.prepare('SELECT count(*) AS n FROM devices WHERE revoked = 0').get().n, 0);
+  } finally {
+    db.close();
+  }
+});
+
+for (const [failure, code] of [
+  ['open', 'EACCES'],
+  ['EPERM', 'EPERM'],
+  ['EIO', 'EIO'],
+]) {
+  test(`backup rejects a genuine snapshot ${failure} failure without publishing metadata`, async (t) => {
+    const f = await setup(t);
+    const directory = path.join(f.root, 'backups');
+    snapshotFlushContract(t, directory, failure);
+    await assert.rejects(async () => f.service.backup(directory), { code });
+    assert.equal(
+      (await fs.readdir(directory)).some((name) => name.endsWith('.json')),
+      false,
+    );
+  });
+}
+
+async function bounded(promise, label, milliseconds = 10000) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(label + ' timed out')), milliseconds);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Windows child.kill('SIGTERM') forcibly terminates Node rather than delivering
+// its registered signal handler. Keep actual POSIX delivery and run the portable
+// authenticated-parent transport on every platform, including local POSIX runs.
+for (const shutdown of process.platform === 'win32' ? ['parent-ipc'] : ['SIGTERM', 'parent-ipc']) {
+  test(`operator CLI gracefully stops via ${shutdown} before offline backup and restore`, async (t) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'zacro-sync-cli-'));
+    let child, lines, closed;
+    t.after(async () => {
+      try {
+        if (child && child.exitCode === null && child.signalCode === null) {
+          child.kill('SIGKILL');
+          await bounded(closed, 'CLI forced cleanup', 5000);
+        }
+      } finally {
+        lines?.close();
+        await fs.rm(root, { recursive: true, force: true });
       }
     });
+    const run = (args) => execute(process.execPath, [cli, ...args], { timeout: 10000 });
+    const keyFile = path.join(root, 'master.key'),
+      directory = path.join(root, 'data');
+    const generated = await run(['generate-key', '--key-file', keyFile]);
+    const key = await fs.readFile(keyFile);
+    assert.equal(key.length, 32);
+    assert.equal(generated.stdout.includes(key.toString('hex')), false);
+    if (process.platform !== 'win32') assert.equal((await fs.stat(keyFile)).mode & 0o077, 0);
+    const ipc = shutdown === 'parent-ipc';
+    const token = randomBytes(32).toString('hex');
+    const preload = path.join(__dirname, 'fixtures/sync-cli-shutdown.cjs');
+    child = spawn(
+      process.execPath,
+      [
+        ...(ipc ? ['--require', preload] : []),
+        cli,
+        'serve',
+        '--data',
+        directory,
+        '--key-file',
+        keyFile,
+        '--port',
+        '0',
+        '--dev-loopback',
+      ],
+      {
+        stdio: ['ignore', 'pipe', 'pipe', ...(ipc ? ['ipc'] : [])],
+        env: {
+          ...process.env,
+          ...(ipc
+            ? { ZACRO_TEST_SHUTDOWN_TOKEN: token, ZACRO_TEST_SHUTDOWN_PARENT: String(process.pid) }
+            : {}),
+        },
+      },
+    );
+    closed = new Promise((resolve) => child.once('close', (code, signal) => resolve({ code, signal })));
+    let stderr = '';
+    child.stderr.on('data', (c) => {
+      stderr = (stderr + c).slice(-8000);
+    });
+    const records = [];
+    lines = createInterface({ input: child.stdout });
+    const listening = new Promise((resolve, reject) => {
+      const fail = () => reject(new Error('CLI exited before listening: ' + stderr));
+      child.once('error', reject);
+      child.once('close', fail);
+      lines.on('line', (line) => {
+        try {
+          const record = JSON.parse(line);
+          records.push(record);
+          if (record.event === 'listening') {
+            child.off('close', fail);
+            resolve(record.url);
+          }
+        } catch (error) {
+          reject(error);
+        }
+      });
+    });
+    const url = await bounded(listening, 'CLI startup');
+    const ready = () => fetch(url + '/ready', { signal: AbortSignal.timeout(5000) });
+    assert.equal((await ready()).status, 200);
+    await fs.access(path.join(directory, '.service.lock'));
+    const send = (message) =>
+      bounded(
+        new Promise((resolve, reject) => {
+          child.send(message, (error) => (error ? reject(error) : resolve()));
+        }),
+        'CLI parent IPC',
+      );
+    if (ipc) {
+      // An unauthenticated message must leave the service ready and owned.
+      const rejected = new Promise((resolve) => child.once('message', resolve));
+      await send({ type: 'zacro-test-graceful-stop', token: '0'.repeat(64) });
+      assert.deepEqual(await bounded(rejected, 'CLI invalid capability rejection'), {
+        event: 'test-shutdown-rejected',
+      });
+      assert.equal((await ready()).status, 200);
+      await fs.access(path.join(directory, '.service.lock'));
+      assert.equal(
+        records.some((record) => record.event === 'stopped'),
+        false,
+      );
+      await send({ type: 'zacro-test-graceful-stop', token });
+    } else {
+      assert.equal(child.kill('SIGTERM'), true);
+    }
+    assert.deepEqual(await bounded(closed, 'CLI graceful shutdown'), { code: 0, signal: null }, stderr);
+    assert.equal(records.filter((record) => record.event === 'stopped').length, 1);
+    await assert.rejects(fs.access(path.join(directory, '.service.lock')), { code: 'ENOENT' });
+    assert.equal(JSON.stringify(records).includes(key.toString('hex')), false);
+    assert.equal(stderr.includes(token), false);
+    assert.equal(stderr.includes(key.toString('hex')), false);
+    assert.equal(JSON.stringify(records).includes(token), false);
+    const backup = JSON.parse(
+      (
+        await run([
+          'backup',
+          '--data',
+          directory,
+          '--key-file',
+          keyFile,
+          '--backup-dir',
+          path.join(root, 'backups'),
+        ])
+      ).stdout,
+    );
+    assert.equal(backup.event, 'backup-created');
+    const restored = path.join(root, 'restored');
+    const restoration = JSON.parse(
+      (
+        await run([
+          'restore',
+          '--data',
+          restored,
+          '--key-file',
+          keyFile,
+          '--backup',
+          backup.path,
+          '--ledger',
+          path.join(directory, 'deletions.jsonl'),
+        ])
+      ).stdout,
+    );
+    assert.equal(restoration.event, 'restored');
+    const db = new DatabaseSync(path.join(restored, 'sync.sqlite'), { readOnly: true });
+    try {
+      assert.equal(db.prepare('PRAGMA integrity_check').get().integrity_check, 'ok');
+    } finally {
+      db.close();
+    }
+    await assert.rejects(
+      run(['serve', '--data', restored, '--key-file', keyFile, '--host', '0.0.0.0', '--dev-loopback']),
+      (error) => {
+        assert.equal(error.code, 1);
+        assert.equal(error.killed, false);
+        assert.match(error.stderr, /HTTPS|loopback|proxy/i);
+        return true;
+      },
+    );
   });
-  assert.equal((await fetch(url + '/ready')).status, 200);
-  const exited = new Promise((resolve) => child.once('exit', resolve));
-  child.kill('SIGTERM');
-  await exited;
-  lines.close();
-  assert.equal(child.exitCode, 0, stderr);
-  const backed = await execute(process.execPath, [
-    cli,
-    'backup',
-    '--data',
-    directory,
-    '--key-file',
-    keyFile,
-    '--backup-dir',
-    path.join(root, 'backups'),
-  ]);
-  const backup = JSON.parse(backed.stdout);
-  const restored = path.join(root, 'restored');
-  await execute(process.execPath, [
-    cli,
-    'restore',
-    '--data',
-    restored,
-    '--key-file',
-    keyFile,
-    '--backup',
-    backup.path,
-    '--ledger',
-    path.join(directory, 'deletions.jsonl'),
-  ]);
-  await fs.access(path.join(restored, 'sync.sqlite'));
-  await assert.rejects(
-    execute(process.execPath, [
-      cli,
-      'serve',
-      '--data',
-      restored,
-      '--key-file',
-      keyFile,
-      '--host',
-      '0.0.0.0',
-      '--dev-loopback',
-    ]),
-    /HTTPS|loopback|proxy/i,
-  );
-});
+}
 
 test('restoring an old real SQLite backup applies the current deletion ledger before readiness', async (t) => {
   const f = await setup(t);
