@@ -1823,6 +1823,10 @@ async function askAI(question) {
   try {
     const status = await invoke('ai:status');
     if (!current()) return false;
+    // Navigation can finish before its throttled state notification arrives.
+    // Refresh the main-process snapshot before checking the captured context.
+    applyState(await invoke('state:get'));
+    if (!current()) return false;
     if (
       context.kind !== ui.aiContext ||
       (context.kind === 'page' &&

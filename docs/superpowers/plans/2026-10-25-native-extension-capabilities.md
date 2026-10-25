@@ -565,3 +565,31 @@ Primary references:
 - pinned Node24.22.0 doc/api/child_process.md in the source checkout, or
   https://github.com/nodejs/node/blob/v24.22.0/doc/api/child_process.md
 - https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40206850043
+
+## Task 16: Authoritative AI preflight state after asynchronous status
+
+**Execution:** Root inline, separate from the extension integration fix wave.
+**Files:** src/renderer/app.js, test/e2e/polish.test.cjs.
+
+The current full stock verification failed one existing AI context assertion.
+The helper waited for the native page and main state, but the renderer state
+notification is delayed by publish's 25ms timer. Releasing a held ai:status
+reply before that notification allowed askAI to compare its captured page with
+the same stale renderer snapshot and submit the old question for the new page.
+An ignored diagnostic held only zacro:state pushes, kept the genuine native
+navigation and main state, and reproduced accepted second ai:ask plus the
+missing context-change notice. No real provider was contacted.
+
+Make the existing pending-status preflight refresh from the authoritative
+state:get response before using its existing profile/context guard or clearing
+the draft. Preserve serial cancellation and profile reset behavior, and keep
+the existing main page-extraction checks. This is a bounded correction to the
+observed stale-renderer preflight, not a new AI integration or provider flow.
+
+Make the existing native test deterministic by holding the state notification
+while navigating, prove the main page is new and shell state old, then release
+the pending status. Require the unchanged context notice, draft preservation
+and no extra ai:ask. Restore normal publication before the remaining test.
+Run RED before the source change and GREEN after, followed by the affected
+polish file and static checks. Do not add sleeps or increase timeouts. Fresh
+scoped review follows the narrow commit.

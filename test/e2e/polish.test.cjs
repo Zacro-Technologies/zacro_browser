@@ -1466,6 +1466,10 @@ test(
     // A pending status reply must not submit against a newly selected page or
     // carry a question across a profile boundary.
     await browser.navigate(`${base}/ai-page-before`);
+    await expect(shell.locator('[data-key="address"]')).toHaveAttribute(
+      'aria-label',
+      `Address bar: ${base}/ai-page-before`,
+    );
     await shell.locator('#ai-context').selectOption('page');
     await browser.app.evaluate(() => {
       globalThis.__deferSubscriptionStatus = true;
@@ -1473,7 +1477,32 @@ test(
     await shell.locator('#ai-question').fill('Question for the original page');
     await shell.locator('#ai-question').press('Enter');
     await expect.poll(() => browser.app.evaluate(() => globalThis.__subscriptionStatusQueue.length)).toBe(1);
+    // Main state changes before its throttled renderer notification. Hold only
+    // that notification so the preflight cannot trust a stale shell snapshot.
+    await browser.app.evaluate(({ BrowserWindow }) => {
+      const contents = BrowserWindow.getAllWindows()[0].webContents;
+      const send = contents.send.bind(contents);
+      let pending;
+      contents.send = (channel, ...args) => {
+        if (channel === 'zacro:state') pending = args;
+        else send(channel, ...args);
+      };
+      globalThis.__releaseSubscriptionState = () => {
+        contents.send = send;
+        if (pending) send('zacro:state', ...pending);
+        delete globalThis.__releaseSubscriptionState;
+      };
+    });
     await browser.navigate(`${base}/ai-page-after`);
+    const navigatedState = await browser.state();
+    assert.equal(
+      navigatedState.tabs.find((tab) => tab.id === navigatedState.activeTabId).url,
+      `${base}/ai-page-after`,
+    );
+    await expect(shell.locator('[data-key="address"]')).toHaveAttribute(
+      'aria-label',
+      `Address bar: ${base}/ai-page-before`,
+    );
     await browser.app.evaluate(() => {
       globalThis.__deferSubscriptionStatus = false;
       globalThis.__subscriptionStatusQueue.shift()(globalThis.__subscriptionFixture);
@@ -1486,6 +1515,7 @@ test(
       ),
       1,
     );
+    await browser.app.evaluate(() => globalThis.__releaseSubscriptionState());
 
     await shell.locator('#ai-question').press('Enter');
     await expect
