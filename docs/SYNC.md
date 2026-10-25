@@ -68,7 +68,8 @@ password, invalidates old device sessions and replaces all recovery codes.
 Changing a password while signed in revokes the other devices. Regenerating
 recovery codes invalidates the previous set.
 
-**Devices** shows enrolled devices, their names and revocation status. Revoking
+**Devices** shows enrolled devices, their names, registration and last-active
+times, and revocation status. Times use the local date/time format. Revoking
 a device prevents further synchronization and requires it to sign in again.
 It cannot erase files or settings already downloaded to that computer.
 
@@ -80,6 +81,8 @@ profile names do not create a link. Each local profile can have one link; a sync
 profile cannot be attached twice within the same browser installation.
 
 Extension-library and extension-setting synchronization are separate choices.
+The link review starts with library sync on and settings sync off. Either can be
+enabled on its own, and each has an independent control after linking.
 The library contains portable extension source IDs and enabled/disabled/removed
 intent. Local unpacked folders stay local; no local directory is uploaded.
 Versions are observations, not commands to downgrade another device.
@@ -92,8 +95,16 @@ or local paths into synchronization records. The service encrypts stored
 settings, but the running service can read them: this is **not end-to-end
 encryption**.
 
+Turning library synchronization off keeps local installations and stops sharing
+installation, enabled/disabled and removal changes. Pending library changes are
+cancelled locally. Settings can still sync for extensions already in the cloud
+profile; their cloud identity metadata is read to prevent writes to removed
+installations. New local extensions stay local until library sharing is enabled.
+Re-enabling library sync reviews whether to use the cloud library or also share
+local portable extensions, while retaining pending settings and their consent.
+
 Turning settings synchronization off keeps a local copy and stops setting
-uploads/downloads. Library synchronization continues. Cloud deletion is a
+uploads/downloads. The library synchronization choice is unchanged. Cloud deletion is a
 separate action. Requests waiting for token refresh or a retry recheck the
 originating link and consent before sending. Re-enabling presents the
 local/remote choice again.

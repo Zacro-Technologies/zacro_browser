@@ -141,16 +141,34 @@ test(
     await b.page.getByLabel('New sync profile name', { exact: true }).fill('Personal extensions');
     await b.page.getByRole('button', { name: 'Create sync profile', exact: true }).click();
     await expect(b.page.getByRole('dialog', { name: 'Review profile link' })).toBeVisible();
+    await expect(b.page.getByLabel('Sync extension library', { exact: true })).toBeChecked();
     await expect(b.page.getByLabel('Sync extension settings', { exact: true })).not.toBeChecked();
     if (process.env.ZACRO_CAPTURE_UI) {
       await fs.mkdir(process.env.ZACRO_CAPTURE_UI, { recursive: true });
       await expect(b.page.getByRole('dialog')).toHaveCSS('opacity', '1');
       await b.page.screenshot({ path: path.join(process.env.ZACRO_CAPTURE_UI, 'sync-consent.png') });
     }
+    await b.page.getByLabel('Sync extension library', { exact: true }).uncheck();
+    await b.page.getByLabel('Sync extension settings', { exact: true }).check();
     await b.page.getByRole('button', { name: 'Link this profile', exact: true }).click();
+    await expect.poll(async () => (await b.invoke('state:get')).sync.profiles[0]?.settingsSync).toBe(true);
+    assert.equal((await b.invoke('state:get')).sync.profiles[0].librarySync, false);
+    await b.page.getByRole('button', { name: 'Enable library sync', exact: true }).click();
+    await b.page
+      .getByRole('dialog')
+      .getByRole('button', { name: 'Enable library sync', exact: true })
+      .click();
+    await expect.poll(async () => (await b.invoke('state:get')).sync.profiles[0]?.librarySync).toBe(true);
+    assert.equal((await b.invoke('state:get')).sync.profiles[0].settingsSync, true);
+    await b.page.getByRole('button', { name: 'Turn off library sync', exact: true }).click();
+    await expect.poll(async () => (await b.invoke('state:get')).sync.profiles[0]?.librarySync).toBe(false);
+    await b.page.getByRole('button', { name: 'Turn off settings sync', exact: true }).click();
     await expect.poll(async () => (await b.invoke('state:get')).sync.profiles[0]?.settingsSync).toBe(false);
     await b.page.getByRole('button', { name: 'Devices', exact: true }).click();
     await expect(b.page.getByRole('dialog', { name: 'Your devices' })).toContainText('Native fixture');
+    await expect(b.page.getByRole('dialog')).toContainText('Registered');
+    await expect(b.page.getByRole('dialog')).toContainText('Last active');
+    await expect(b.page.locator('.sync-device time')).toHaveCount(2);
     await b.page.getByRole('dialog').getByRole('button', { name: 'Close', exact: true }).click();
     await b.page.getByRole('button', { name: 'Sign out', exact: true }).click();
     await expect.poll(async () => (await b.invoke('state:get')).sync.account).toBe(null);
@@ -619,6 +637,24 @@ for (const backgroundKind of ['module', 'classic', 'mv2-scripts', 'mv2-html', 'm
       await expect
         .poll(() => b.api('remoteEvents.some(e=>e.area==="sync"&&e.changes.fromBackground?.newValue===41)'))
         .toBe(true);
+      if (backgroundKind === 'classic') {
+        await b.invoke('sync:library', { enabled: false });
+        await a.invoke('extension:toggle', { id: signed.id });
+        await a.invoke('sync:now');
+        await b.invoke('sync:now');
+        assert.equal((await b.invoke('state:get')).extensions[0].enabled, true);
+        await b.api('chrome.storage.sync.set({whileLibraryPaused:"settings still shared"})');
+        await b.invoke('sync:now');
+        await a.invoke('extension:toggle', { id: signed.id });
+        await a.invoke('extension:options', { id: signed.id });
+        await a.invoke('sync:now');
+        assert.equal(
+          (await a.api('chrome.storage.sync.get("whileLibraryPaused")')).whileLibraryPaused,
+          'settings still shared',
+        );
+        await b.invoke('sync:library', { enabled: true, libraryChoice: 'remote-only' });
+        assert.equal((await b.invoke('state:get')).sync.profiles[0].settingsSync, true);
+      }
       if (backgroundKind === 'mv2-lazy') {
         await b.api('chrome.runtime.sendMessage({fixture:true})');
         await expect

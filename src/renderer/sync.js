@@ -18,6 +18,8 @@ export function createSyncUI({
   const call = (action, payload = {}, profileId = getProfile()?.id) =>
     invoke('sync:' + action, { ...payload, profileId });
   const options = `<label class="field">Choose settings<select name="settingsChoice"><option value="use-remote">Use settings from the sync profile</option><option value="upload-local">Upload settings from this device</option></select></label>`;
+  const libraryOptions = `<label class="field">Extension library<select name="libraryChoice"><option value="remote-only">Use the sync profile’s library</option><option value="merge-local">Also share this device’s portable extensions</option></select></label>`;
+  const libraryConsent = `<label class="setting-toggle"><span>Sync extension library</span><input type="checkbox" name="librarySync" aria-label="Sync extension library" checked></label><p class="provider-note">Share which portable extensions are installed, enabled or removed. With this off, settings can still sync for extensions already in the sync profile.</p>`;
   const consent = `<label class="setting-toggle"><span>Sync extension settings</span><input type="checkbox" name="settingsSync" aria-label="Sync extension settings"></label><p class="provider-note">Extensions choose what they save. Settings may contain personal information or credentials. The synchronization service can read these values. Enabling this option means you agree to share them with your configured service.</p>${options}`;
   function form(title, description, fields, label, submit, danger = false) {
     const profileId = getProfile()?.id,
@@ -48,23 +50,35 @@ export function createSyncUI({
       `<p>Store these codes somewhere private. Each code can be used once to recover your account. They will disappear when you close this window.</p><div class="recovery-codes">${codes.map((code) => `<code>${esc(code)}</code>`).join('')}</div>${primary('ui:dialog-close', 'I saved my recovery codes')}`,
     );
   }
-  async function review(datasetId, token = serial, profileId = getProfile()?.id) {
+  async function review(datasetId, token = serial, profileId = getProfile()?.id, libraryOnly = false) {
     const preview = await call('link-preview', { datasetId }, profileId);
     if (token !== serial || profileId !== getProfile()?.id) return;
     const local = preview.localExtensions || [],
       remote = preview.extensions.filter((e) => e.state !== 'removed');
     form(
-      'Review profile link',
-      `Link ${getProfile().name} to “${preview.dataset.name}”. New extensions still require permission on this device.`,
-      `<p>${remote.length} extensions in the sync profile; ${local.length} portable extensions on this device.</p>${remote.length ? `<ul>${remote.map((e) => `<li>${esc(e.name || e.extensionId)} · ${esc(e.state)}</li>`).join('')}</ul>` : ''}<label class="field">Extension library<select name="libraryChoice"><option value="remote-only">Use the sync profile’s library</option><option value="merge-local">Also share this device’s portable extensions</option></select></label>${consent}`,
-      'Link this profile',
+      libraryOnly ? 'Enable library synchronization' : 'Review profile link',
+      libraryOnly
+        ? 'Choose how to share your extension library. Your settings synchronization choice stays the same. New extensions require permission on this device.'
+        : `Link ${getProfile().name} to “${preview.dataset.name}”. New extensions still require permission on this device.`,
+      `<p>${remote.length} extensions in the sync profile; ${local.length} portable extensions on this device.</p>${remote.length ? `<ul>${remote.map((e) => `<li>${esc(e.name || e.extensionId)} · ${esc(e.state)}</li>`).join('')}</ul>` : ''}${libraryOnly ? '' : libraryConsent}${libraryOptions}${libraryOnly ? '' : consent}`,
+      libraryOnly ? 'Enable library sync' : 'Link this profile',
       async (data, context) => {
+        if (libraryOnly) {
+          await call(
+            'library',
+            { enabled: true, libraryChoice: data.get('libraryChoice') },
+            context.profileId,
+          );
+          if (context.isCurrent()) context.close();
+          return;
+        }
         const settingsSync = data.get('settingsSync') === 'on';
         await call(
           'link',
           {
             datasetId,
             libraryChoice: data.get('libraryChoice'),
+            librarySync: data.get('librarySync') === 'on',
             settingsSync,
             settingsConsent: settingsSync,
             settingsChoice: data.get('settingsChoice'),
@@ -75,6 +89,12 @@ export function createSyncUI({
       },
     );
   }
+  function deviceTime(value) {
+    const date = new Date(value);
+    return typeof value === 'number' && Number.isFinite(date.getTime())
+      ? `<time datetime="${date.toISOString()}">${esc(date.toLocaleString())}</time>`
+      : 'Unknown';
+  }
   async function devices() {
     const token = serial,
       profileId = getProfile()?.id;
@@ -82,7 +102,7 @@ export function createSyncUI({
     if (token !== serial || profileId !== getProfile()?.id) return;
     display(
       'Your devices',
-      `<p>Revoking a device stops its future synchronization. Files already downloaded remain on that device.</p>${list.map((d) => `<article class="sync-device"><strong>${esc(d.name)}</strong><p class="small muted">${esc(d.platform)}${d.id === status().device?.id ? ' · This device' : ''}${d.revoked ? ' · Revoked' : ''}</p>${!d.revoked ? `<div class="setting-actions">${secondary('ui:sync-rename-device', 'Rename', '', `data-id="${esc(d.id)}" data-name="${esc(d.name)}"`)}${secondary('ui:sync-revoke-device', 'Revoke', '', `data-id="${esc(d.id)}"`)}</div>` : ''}</article>`).join('')}`,
+      `<p>Revoking a device stops its future synchronization. Files already downloaded remain on that device.</p>${list.map((d) => `<article class="sync-device"><strong>${esc(d.name)}</strong><p class="small muted">${esc(d.platform)}${d.id === status().device?.id ? ' · This device' : ''}${d.revoked ? ' · Revoked' : ''}</p><p class="small muted">Registered ${deviceTime(d.createdAt)}<br>Last active ${deviceTime(d.lastSeenAt)}</p>${!d.revoked ? `<div class="setting-actions">${secondary('ui:sync-rename-device', 'Rename', '', `data-id="${esc(d.id)}" data-name="${esc(d.name)}"`)}${secondary('ui:sync-revoke-device', 'Revoke', '', `data-id="${esc(d.id)}"`)}</div>` : ''}</article>`).join('')}`,
     );
   }
   return {
@@ -110,7 +130,7 @@ export function createSyncUI({
       if (s.account) {
         html += `<p>Signed in as <strong>${esc(s.account.username)}</strong></p><div class="setting-actions">${secondary('ui:sync-devices', 'Devices')}${secondary('ui:sync-now', 'Sync now')}${secondary('ui:sync-logout', 'Sign out')}</div>`;
         html += current
-          ? `<p><strong>${esc(current.name)}</strong> is linked to this profile.</p><p class="small muted">${current.pending ? 'Changes are waiting to be accepted by the service.' : current.lastSync ? `Last synchronized ${esc(new Date(current.lastSync).toLocaleString())}` : 'Waiting for the first synchronization.'}</p><div class="setting-actions">${secondary('ui:sync-settings', current.settingsSync ? 'Turn off settings sync' : 'Enable settings sync')}${secondary('ui:sync-unlink', 'Unlink profile')}${secondary('ui:sync-delete-dataset', 'Delete cloud profile')}</div>`
+          ? `<p><strong>${esc(current.name)}</strong> is linked to this profile.</p><p class="small muted">Library sync: ${current.librarySync !== false ? 'On' : 'Off'} · Settings sync: ${current.settingsSync ? 'On' : 'Off'}</p><p class="small muted">${current.pending ? 'Changes are waiting to be accepted by the service.' : current.lastSync ? `Last synchronized ${esc(new Date(current.lastSync).toLocaleString())}` : 'Waiting for the first synchronization.'}</p><div class="setting-actions">${secondary('ui:sync-library', current.librarySync !== false ? 'Turn off library sync' : 'Enable library sync')}${secondary('ui:sync-settings', current.settingsSync ? 'Turn off settings sync' : 'Enable settings sync')}${secondary('ui:sync-unlink', 'Unlink profile')}${secondary('ui:sync-delete-dataset', 'Delete cloud profile')}</div>`
           : `<p>This browser profile is not linked. Local extensions keep working.</p>${primary('ui:sync-link', 'Link profile')}`;
         if (current?.rejected.length)
           html += `<div class="sync-rejections">${current.rejected.map((r) => `<article><p>${r.code === 'storage_quota' ? 'Settings could not fit in cloud storage. Your local values are retained.' : 'A change conflicts with the current sync profile.'}</p><div class="setting-actions">${secondary('ui:sync-retry', 'Retry', '', `data-id="${esc(r.id)}"`)}${secondary('ui:sync-export', 'Export', '', `data-id="${esc(r.id)}"`)}${secondary('ui:sync-discard', 'Discard', '', `data-id="${esc(r.id)}"`)}</div></article>`).join('')}</div>`;
@@ -209,7 +229,11 @@ export function createSyncUI({
           },
         );
       } else if (name === 'join-choice') await review(document.querySelector('#sync-dataset-choice').value);
-      else if (name === 'settings') {
+      else if (name === 'library') {
+        const current = link();
+        if (current?.librarySync !== false) await call('library', { enabled: false });
+        else await review(current.datasetId, serial, getProfile()?.id, true);
+      } else if (name === 'settings') {
         if (link()?.settingsSync) await call('settings', { enabled: false });
         else
           form(

@@ -100,6 +100,10 @@ removed intent. A new device shows **Needs installation on this device** and
 requires its own permission review. Declining does not remove other devices'
 installations. Local execution, cloud intent, and remote approval are separate.
 
+Library and settings synchronization have independent on/off controls. Pausing
+library sync leaves local installations in place; settings can continue for
+extensions already represented in the cloud profile. Resuming library sharing
+asks whether to use the cloud library or merge local portable extensions.
 Settings synchronization starts off and requires separate consent. Extensions
 choose what they write to `chrome.storage.sync`; those values can include
 personal information or credentials. `storage.local` remains local. The service

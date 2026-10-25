@@ -133,6 +133,7 @@ class SyncController {
           profileId: profile.id,
           datasetId: payload.datasetId,
           libraryChoice: payload.libraryChoice,
+          librarySync: payload.librarySync !== false,
           localLibrary: this.getPortableLibrary(profile.id),
           settingsSync: payload.settingsSync === true,
           settingsChoice: payload.settingsChoice,
@@ -141,6 +142,12 @@ class SyncController {
         break;
       case 'sync:unlink':
         result = await this.client.unlinkProfile(profile.id);
+        break;
+      case 'sync:library':
+        result = await this.client.setLibrarySync(profile.id, payload.enabled === true, {
+          libraryChoice: payload.libraryChoice,
+          localLibrary: this.getPortableLibrary(profile.id),
+        });
         break;
       case 'sync:settings':
         result = await this.client.setSettingsSync(profile.id, payload.enabled === true, {
