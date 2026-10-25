@@ -197,7 +197,15 @@ profile or real external account is used.
   rebuilt app. Its ad-hoc CDHash differs from the existing Keychain ACL's
   requirement. After the user unlocked the Mac, an explicit interactive rerun
   still timed out at the same first-navigation assertion after 305 seconds;
-  **0/1** passed. The user has been asked to handle the OS confirmation manually.
+  **0/1** passed. The user subsequently reported that no confirmation dialog
+  was visible. An OS log saying it requested a prompt is not evidence that the
+  user can see or answer that prompt.
+  A fresh retry after that report also failed **0/1** at the unchanged
+  305-second navigation deadline. The exact new process again generated the
+  OS confirmation request; its user ID matched the console login, and normal
+  app activation/tab selection did not unblock navigation. The disposable
+  process was closed by test cleanup. Why no confirmation appeared remains
+  unresolved; no packaged success is claimed.
   This run did not establish packaged browsing or the later executable checks.
   No Keychain item, credential or OS protection was changed. A disposable
   browser profile does not isolate the app-scoped Keychain encryption key.
@@ -226,6 +234,18 @@ was performed.
 Implementation choices and their costs are recorded in [the decision record](EXTENSIONS-SYNC-DECISIONS.md).
 
 ## Resume packaged acceptance
+
+The user reports no visible confirmation dialog. Treat the gap between the
+OS confirmation request and a visible dialog as unresolved, not simply an
+unanswered approval request.
+The current app has an intact ad-hoc signature (`codesign --verify --deep
+--strict` passes), but its CDHash differs from the stored Keychain requirement.
+[Electron's code-signing documentation](https://www.electronjs.org/docs/latest/tutorial/code-signing#macos-apis-that-require-code-signing)
+describes inconsistent Keychain behavior with ad-hoc signatures and recommends
+consistent signing for both safeStorage and cookie encryption. This supports
+the signature diagnosis; it does not establish why this particular dialog is
+absent or prove that a newly signed release fixes it. The repository already
+has a separate Developer ID/notarized release path; it has not been executed.
 
 For the final packaged executable, keep the Mac unlocked and run
 `ZACRO_INTERACTIVE_KEYCHAIN=1 npm run test:package`. This explicit local mode
