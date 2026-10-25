@@ -4,9 +4,10 @@ This is the development record for `extensions-and-sync`, based on the
 [approved design](superpowers/specs/2026-10-25-extensions-and-sync-design.md).
 Production implementation is committed through `cae78db`. After the Mac was
 unlocked, the final full verification passed all 240 Node and 96 native checks.
-Final packaged acceptance remains
-incomplete because the rebuilt development app still waits for an OS Keychain
-confirmation. The record below separates passing checks from open gates.
+The final arm64 development package also passed its complete acceptance test
+after the user handled the OS Keychain confirmation. Local Apple silicon
+acceptance is complete. Windows/Intel Mac CI, the service container build and
+signed/notarized release acceptance remain unverified.
 
 ## Environment and baseline
 
@@ -191,7 +192,7 @@ profile or real external account is used.
   security fuses, normal browsing, AI runtime startup, packaged PDF worker,
   adapter dependencies/bootstrap, SQLite persistence and OS credential
   protection; plaintext sync HTTP rejected; service/test-only provider absent.
-  **The final rebuilt executable has not passed this gate.** Its rerun stalled
+  The final rebuilt executable initially did not pass this gate. Its rerun stalled
   before the first local page loaded. Narrow macOS `securityd` diagnostics
   explicitly show a pending “Zacro Safe Storage” access confirmation for the
   rebuilt app. Its ad-hoc CDHash differs from the existing Keychain ACL's
@@ -219,8 +220,22 @@ profile or real external account is used.
   Interactive mode now permits one extra hour so the live process can survive
   asynchronous manual confirmation. Independent review approved this deadline
   change; formatting and syntax pass. Ordinary deadlines, cleanup, assertions
-  and security settings are unchanged. A new interactive run is awaiting
-  confirmation; its success must be verified before closing this gate.
+  and security settings are unchanged.
+- After the user handled confirmation for the live process,
+  `ZACRO_INTERACTIVE_KEYCHAIN=1 npm run test:package` exited **0**, with **1/1**
+  passed and no failures, cancellations or skips. This closes the final local
+  package gate on the reviewed production source and test commit `58026d1`.
+  The actual built executable passed normal browsing, isolated AI runtime
+  initialization and plaintext sync-endpoint rejection; all six security fuses
+  passed inspection. The same test then loaded the exact shipped ASAR modules
+  in the pinned Electron development harness, verifying PDF parsing, adapter
+  dependencies/bootstrap, SQLite persistence, OS credential protection, and
+  absence of the service and test-only provider from the package.
+  Total elapsed time was 1279.32 seconds, including human confirmation time;
+  this is not a performance measurement. The earlier ordinary five-second
+  deadline failures remain historical failures, not ordinary-mode passes.
+  The app was not rebuilt or restarted between manual confirmation and this
+  successful result. Test cleanup closed the disposable processes.
 - The final full-product native file passed **9/9**, including all five
   two-Electron variants, against the actual service and OS-protected credentials.
   The review-fix native group passed **6/6**; the final active-profile deletion
@@ -250,13 +265,15 @@ was handled. Some decisions arrived after the corresponding disposable app
 had already exited. A new process can request confirmation again; keep the
 interactive test running while handling its current OS dialog. A recorded
 allow decision alone does not establish that the package checks passed.
-The current app has an intact ad-hoc signature (`codesign --verify --deep
---strict` passes), but its CDHash differs from the stored Keychain requirement.
+The accepted app has an intact ad-hoc signature (`codesign --verify --deep
+--strict` passes). Earlier requests showed its CDHash differed from the stored
+Keychain requirement. The final live test passed after manual confirmation;
+this does not establish that permission persists for later launches or rebuilds.
 [Electron's code-signing documentation](https://www.electronjs.org/docs/latest/tutorial/code-signing#macos-apis-that-require-code-signing)
 describes inconsistent Keychain behavior with ad-hoc signatures and recommends
 consistent signing for both safeStorage and cookie encryption. This supports
-the signature diagnosis; it does not establish why this particular dialog is
-absent or prove that a newly signed release fixes it. The repository already
+the signature diagnosis; it does not establish why the earlier dialog was
+not visible or prove that a newly signed release fixes it. The repository already
 has a separate Developer ID/notarized release path; it has not been executed.
 
 For the final packaged executable, keep the Mac unlocked and run

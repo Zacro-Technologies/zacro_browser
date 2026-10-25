@@ -1,9 +1,9 @@
 # Extensions on Electron
 
 The `extensions-and-sync` branch adds verified Chrome Web Store acquisition,
-profile-scoped extension controls, and a Zacro compatibility adapter. Development
-acceptance is still in progress; the [validation record](EXTENSIONS-SYNC-VALIDATION.md)
-distinguishes passing lifecycle checks from open packaged and platform gates. This is a
+profile-scoped extension controls, and a Zacro compatibility adapter. Local Apple
+silicon acceptance passes; the [validation record](EXTENSIONS-SYNC-VALIDATION.md)
+distinguishes passing lifecycle/package checks from open platform/release gates. This is a
 bounded compatibility layer, not Chrome-wide extension support.
 
 ## Install and manage

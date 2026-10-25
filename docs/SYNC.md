@@ -4,8 +4,9 @@ Implementation and independent code review are complete on `extensions-and-sync`
 account service and desktop client have passed real HTTP/SQLite tests, and the
 native account screen and two complete Electron browsers have passed genuine
 extension-API synchronization, offline restart and device-revocation flows.
-Native background suspend/wake also passes. Review findings and fixes,
-packaged acceptance and remaining platform checks are tracked in
+Native background suspend/wake and the final arm64 development package also
+pass. Review findings and fixes, manual package confirmation and remaining
+platform checks are tracked in
 [the validation record](EXTENSIONS-SYNC-VALIDATION.md).
 
 ## Start a development service
