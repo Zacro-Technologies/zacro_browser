@@ -563,7 +563,12 @@ async function invoke(action, payload = {}) {
     if (result?.error) throw new Error(result.error);
     return result;
   } catch (error) {
-    toast(error.message || String(error), true);
+    const original = error?.message || String(error);
+    const message = original.replace(/^Error invoking remote method 'zacro:invoke': Error: /, '');
+    toast(message, true);
+    // Keep validation and provider errors intact; remove only Electron's IPC
+    // transport envelope from the text presented by forms and dialogs.
+    if (message !== original) throw new Error(message, { cause: error });
     throw error;
   }
 }
@@ -2580,10 +2585,16 @@ async function recordShortcut(id) {
   }
 }
 function recordedAccelerator(event) {
+  if (['Control', 'Meta', 'OS', 'Alt', 'AltGraph', 'Shift', 'Dead', 'Unidentified'].includes(event.key))
+    return null;
+  if (!isMac && event.metaKey) {
+    ui.shortcutError = 'Windows-key combinations belong to Windows. Choose Control, Alt or a function key.';
+    refreshShortcutEditor();
+    return null;
+  }
   const keys = [];
   if (isMac ? event.metaKey : event.ctrlKey) keys.push('Mod');
   if (isMac && event.ctrlKey) keys.push('Ctrl');
-  if (!isMac && event.metaKey) keys.push('Meta');
   if (event.altKey) keys.push('Alt');
   if (event.shiftKey) keys.push('Shift');
   const physical = /^Key[A-Z]$/.test(event.code)
@@ -2615,9 +2626,11 @@ function recordedAccelerator(event) {
     event.altKey &&
     (event.getModifierState('AltGraph') ||
       (event.key.length === 1 && physical && event.key.toUpperCase() !== physical.toUpperCase()))
-  )
+  ) {
+    ui.shortcutError = 'That combination types a character on your keyboard. Try another shortcut.';
+    refreshShortcutEditor();
     return null;
-  if (['Control', 'Meta', 'Alt', 'Shift', 'Dead', 'Unidentified'].includes(key)) return null;
+  }
   return [...keys, key.length === 1 && /[a-z]/i.test(key) ? key.toUpperCase() : key].join('+');
 }
 async function saveShortcut(id, accelerator) {

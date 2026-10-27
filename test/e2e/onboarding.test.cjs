@@ -75,7 +75,69 @@ test(
     await sidebarBinding.click();
     await sidebarBinding.press(`${chord}+T`);
     await expect(shell.locator('#onboarding-status')).toContainText('Already used');
+    await expect(shell.locator('#onboarding-status')).not.toContainText('Error invoking remote method');
+    await expect(shell.locator('#onboarding-status')).not.toContainText('zacro:invoke');
+    await expect(shell.locator('#toast-root')).not.toContainText('Error invoking remote method');
     await expect(shell.locator('.onboarding-dialog')).toBeVisible();
+    if (process.platform !== 'darwin') {
+      await sidebarBinding.click();
+      // Synthetic modifier flags exercise the recorder without invoking real
+      // operating-system hotkeys or changing the machine's keyboard layout.
+      await shell.evaluate(() =>
+        document.activeElement.dispatchEvent(
+          new KeyboardEvent('keydown', {
+            key: 'Y',
+            code: 'KeyY',
+            ctrlKey: true,
+            shiftKey: true,
+            metaKey: true,
+            bubbles: true,
+            cancelable: true,
+          }),
+        ),
+      );
+      await expect(shell.locator('#onboarding-status')).toContainText(
+        'Windows-key combinations belong to Windows',
+      );
+      await expect(sidebarBinding).toHaveClass(/recording/);
+      const altGraph = await shell.evaluate(() => {
+        const event = new KeyboardEvent('keydown', {
+          key: 'y',
+          code: 'KeyY',
+          ctrlKey: true,
+          altKey: true,
+          modifierAltGraph: true,
+          bubbles: true,
+          cancelable: true,
+        });
+        document.activeElement.dispatchEvent(event);
+        return event.getModifierState('AltGraph');
+      });
+      assert.equal(altGraph, true);
+      await expect(shell.locator('#onboarding-status')).toContainText('types a character on your keyboard');
+      await expect(sidebarBinding).toHaveClass(/recording/);
+      assert.equal(
+        (await state()).runtime.shortcuts.find((item) => item.id === 'sidebar-toggle').accelerator,
+        'Mod+S',
+        'System and AltGr combinations never replace the current shortcut',
+      );
+      // A normal native Control+Shift+Y has no Meta/AltGr flag and remains valid.
+      await sidebarBinding.press('Control+Shift+Y');
+      await expect
+        .poll(
+          async () =>
+            (await state()).runtime.shortcuts.find((item) => item.id === 'sidebar-toggle').accelerator,
+        )
+        .toBe('Mod+Shift+Y');
+      await expect(shell.locator('#onboarding-status')).toBeEmpty();
+      await shell.locator('[data-action="ui:shortcut-reset"][data-id="sidebar-toggle"]').click();
+      await expect
+        .poll(
+          async () =>
+            (await state()).runtime.shortcuts.find((item) => item.id === 'sidebar-toggle').accelerator,
+        )
+        .toBe('Mod+S');
+    }
     await sidebarBinding.click();
     await sidebarBinding.press(`${chord}+Shift+X`);
     await expect

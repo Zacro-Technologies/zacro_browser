@@ -160,6 +160,7 @@ async function main() {
   await fs.mkdir(scratch, { recursive: true });
   const directory = await fs.mkdtemp(path.join(scratch, 'interactive-qa-'));
   const showcase = process.argv.includes('--showcase');
+  const compact = process.argv.includes('--compact');
   const server = showcase ? createShowcaseSite() : createInteractiveSite();
   await new Promise((resolve, reject) => {
     server.once('error', reject);
@@ -167,9 +168,11 @@ async function main() {
   });
   const url = `http://127.0.0.1:${server.address().port}/`;
   const packaged = process.argv.includes('--packaged');
-  if (showcase) {
+  if (showcase || compact) {
     const store = new BrowserStore(directory);
-    store.state = populateLocalFavorites(createShowcaseState(url), url);
+    if (showcase) store.state = populateLocalFavorites(createShowcaseState(url), url);
+    if (compact)
+      store.state.windowBounds = { width: 560, height: 420, maximized: false, sizeKind: 'content' };
     store.save();
   }
   const executable = packaged ? packagedPaths(root).executable : require('electron');
@@ -181,12 +184,13 @@ async function main() {
   delete env.ELECTRON_RUN_AS_NODE;
   console.log(`Opening ${packaged ? 'packaged' : 'development'} Zacro with an isolated test profile.`);
   console.log(`Local test page: ${url}`);
+  if (compact) console.log('Compact review: 560×420 content window.');
   if (showcase)
     console.log(
       'Showcase: local Mail, Calendar, Notes and Studio favorites. Visit each once to load its icon; the journal opens first.',
     );
   console.log(
-    'Options: --showcase for the demo workspace; --packaged for the built application; --onboarding to show the welcome tour.',
+    'Options: --showcase for the demo workspace; --packaged for the built application; --onboarding to show the welcome tour; --compact for a 560×420 content window.',
   );
   console.log(
     `${process.platform === 'darwin' ? 'Quit Zacro with Command-Q' : 'Close the browser'} when finished. No real browser profile is modified.`,
