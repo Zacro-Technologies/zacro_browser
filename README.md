@@ -10,21 +10,57 @@ Zacro is an independent project, not an official continuation of Arc or an affil
 
 ## Project status
 
-**Desktop development preview · 0.6.** This repository contains a runnable Chromium browser built with Electron, with Windows 11 x64 and native macOS integration for Apple silicon and Intel. It includes real page rendering, sandboxed tabs, Spaces, separate profiles, Peek, split view, local session recovery, library panels, compatible unpacked extensions, and six optional AI connections: ChatGPT subscription, Claude subscription, OpenAI API, Claude API, OpenRouter, and OpenAI-compatible servers. Version 0.6 adds Space customization, release-based gestures, retained favorites, configurable page framing, filtered commands and reviewed AI context. At revision `9bfcd1c`, [Windows and native macOS 15 verification](https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40222980054) passed 173 unit/security tests per platform, 67 Windows desktop tests, 52 desktop tests on each Mac architecture, packaged-application acceptance, and Mac development DMG/ZIP builds. Windows also passed the 40-cycle lifecycle check. See the [validation record](docs/VALIDATION.md) and [Mac support boundary](docs/MACOS.md) for the exact evidence and remaining release checks.
+**Desktop development preview · 0.7.** This repository contains a runnable Chromium browser built with Electron, with Windows 11 x64 and native macOS integration for Apple silicon and Intel. It includes real page rendering, sandboxed tabs, Spaces, separate profiles, Peek, split view, local session recovery, library panels, compatible unpacked extensions, and six optional AI connections: ChatGPT subscription, Claude subscription, OpenAI API, Claude API, OpenRouter, and OpenAI-compatible servers. Version 0.7 adds compact windows, browser-style panels, editable keyboard onboarding, neighboring-Space previews, contextual Space menus and a simpler application icon. See the [validation record](docs/VALIDATION.md) and [Mac support boundary](docs/MACOS.md) for exact test evidence and remaining release checks.
 
 This is **not yet a complete implementation of the vision or a commercial release**. Zacro account sync, full Chrome extension compatibility and `chrome.storage.sync`, consequential browser agents, signed automatic updates, and operational/security release gates remain open. AI connection code and controlled-transport tests are implemented; live subscription sign-in, API model access, billing/limits and inference acceptance remain pending with user-authorized accounts. The [implementation roadmap](docs/ROADMAP.md) separates working features from required release work; [AI documentation](docs/AI.md) describes the connection and data boundaries.
 
-See the [validation record](docs/VALIDATION.md) for tests performed, package checks, and remaining acceptance work.
+The final 0.7 runtime at `7f8aba0` passed [cross-platform CI](https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40581387047): 176 unit/security checks per platform, 74 Windows desktop cases, 59 native cases on each Mac architecture, and packaged-application acceptance on all three. The Windows lifecycle check also passed. See the [validation record](docs/VALIDATION.md) for exact counts, package checks, and remaining acceptance work.
 
 Navigation and the address field live in the sidebar. Icon favorites sit above the Space name, followed by folders and single-line tabs. Library, Space icons and one creation menu share the footer; page actions live in compact menus. The default sidebar is 224px wide, with 32px Comfortable tab rows and footer; existing custom widths are preserved. See the historical [0.4 design study](docs/DESIGN-REVIEW-0.4.md) and current [interaction notes](docs/DESIGN.md).
 
 The command workflow opens a palette in an empty Space instead of creating a blank tab. New Tab and **Ctrl/Command + T** open that palette; submitting an address or search creates the page. The shortcut editor, pinning and Space keys, recent-tab switching, and explicit subscription/API provider selection remain available.
 
-In 0.6, choose a Space icon, two colors, gradient balance, grain and glass settings with a live preview. The tab list follows a sideways gesture until release, while keyboard Space changes use a 220ms transition at the Balanced motion setting. The sidebar opens and closes with a short spring that keeps the live page aligned. Settings also offers tab spacing, page inset and corner controls. Closing a favorite keeps its pin; idle favorites can sleep when their page is safe to unload. AI actions prepare a question and show the exact pages selected for sharing before you send.
+Choose a Space icon, two colors, gradient balance, grain and glass settings with a live preview. Sideways gestures reveal the next Space's actual favorites, folders and tabs until release. Right-click a footer Space icon, or use Shift+F10, for its actions. The sidebar and browser panels share a 220ms ease at Balanced speed, with no spring overshoot. Library keeps the live page at its original rendering scale. Windows as small as **560 × 420** logical pixels are supported; panels temporarily make room by hiding the sidebar while retaining its saved preference.
+
+The welcome tour explains the keyboard workflow, including **Command/Ctrl+S** to toggle the sidebar. Every shortcut it displays can be edited directly on that slide. Focus the sidebar with **Command/Ctrl+Alt+S**, use arrows to navigate tabs and folders, and open row actions with Shift+F10. **F10** opens the browser menu on Windows; macOS has native menu routes. The toolbar no longer includes the sidebar-toggle button or the top-left application mark. Favorites retain accessible state labels without visual status dots.
+
+Closing a favorite keeps its pin; idle favorites can sleep when their page is safe to unload. AI actions prepare a question and show the pages selected for sharing before sending. Website login popups retain their session and callback document, then return to their opener. **Live Google sign-in is unverified**, and Google may reject embedded browsers; a Zacro account with Google is not implemented. See [website sign-in](docs/WEB-SIGN-IN.md) for the supported mechanics and default-browser option.
 
 ## Screenshots
 
-The Windows images below show the packaged **0.6** development application, captured through native Computer interactions on October 26, 2026 (Japan time). They use an isolated demo workspace and local pages, with no retouching or simulated AI answers. Earlier versions remain available below.
+These **0.7** Windows captures show the packaged development application in an isolated local demo workspace. They were captured through native Computer interactions without retouching. See [capture provenance](docs/screenshots/README.md), the [0.7 design decisions](docs/DESIGN-REVIEW-0.7.md), and the [design and feature guide (PDF)](docs/Zacro-0.7-Design-and-Feature-Guide.pdf).
+
+![Zacro 0.7 with quiet sidebar navigation, favorites and tabs beside a live page](docs/screenshots/0.7/workspace.jpg)
+
+| Browser settings | Compact window |
+| --- | --- |
+| ![Settings belongs to the Space-colored browser chrome beside the live page](docs/screenshots/0.7/settings.jpg) | ![Compact Zacro window with a browser panel and adaptive navigation](docs/screenshots/0.7/compact.jpg) |
+| Shared panel and sidebar motion; Library keeps the real page visible. | Layout adapts down to 560 × 420 logical pixels. |
+
+| Editable onboarding | Space actions |
+| --- | --- |
+| ![Welcome tour with directly editable keyboard shortcuts](docs/screenshots/0.7/onboarding.jpg) | ![Context menu for a footer Space, including customization and organization](docs/screenshots/0.7/spaces.jpg) |
+| Change each displayed shortcut on its slide. | Right-click or press Shift+F10 on a Space. |
+
+![Command palette with scoped results over the content-only blurred backdrop](docs/screenshots/0.7/palette.jpg)
+
+Still images document layout; native interaction tests and hands-on review cover motion separately. Physical Mac trackpad and live identity-provider acceptance remain open.
+
+<details>
+<summary>Native macOS 0.7 · light and dark</summary>
+
+| Light | Dark |
+| --- | --- |
+| ![Zacro 0.7 on macOS with native traffic lights, compact controls and the revised Dock icon](docs/screenshots/0.7/macos-light.png) | ![Zacro 0.7 in dark appearance on macOS](docs/screenshots/0.7/macos-dark.png) |
+
+Unedited desktop captures from the Apple silicon package at `7766947`, from successful [Windows and native Mac CI](https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40579207712). The optional New Tab Page was opened explicitly during package acceptance; empty Spaces normally open the command palette. Both Mac architectures passed 176 unit checks, 59 native cases and package acceptance at this revision.
+
+</details>
+
+<details>
+<summary>Historical 0.6 · Windows and native macOS</summary>
+
+The Windows images below show the packaged **0.6** development application, captured through native Computer interactions on October 26, 2026 (Japan time). They use an isolated demo workspace and local pages, with no retouching or simulated AI answers, and predate the 0.7 interface changes.
 
 See [capture provenance](docs/screenshots/README.md) and the [0.6 design and feature guide (PDF)](docs/Zacro-0.6-Design-and-Feature-Guide.pdf).
 
@@ -48,6 +84,8 @@ See [capture provenance](docs/screenshots/README.md) and the [0.6 design and fea
 | ![Packaged Zacro 0.6 on macOS in light appearance with native traffic lights, menu bar and Dock](docs/screenshots/0.6/macos-light.png) | ![Packaged Zacro 0.6 on macOS in dark appearance with native traffic lights, menu bar and Dock](docs/screenshots/0.6/macos-dark.png) |
 
 Unedited desktop captures from the packaged Apple silicon build on macOS 15.7.9, at revision `9bfcd1c`. These show the optional New Tab Page opened explicitly during package acceptance; empty Spaces normally open the command palette. The [capture record](docs/screenshots/README.md) identifies their exact revision and CI provenance. Physical-device acceptance remains separate.
+
+</details>
 
 </details>
 
@@ -109,7 +147,7 @@ Navigation and the address field share the sidebar. A thin page frame leaves roo
 
 ![The same page with the sidebar hidden and more width available for reading](docs/screenshots/focus-mode.jpg)
 
-**Ctrl/Command + S** now hides or shows the sidebar without reloading pages. When hidden, a compact navigation row keeps the address and sidebar toggle available. The older capture predates this shortcut change.
+**Ctrl/Command + S** hides or shows the sidebar without reloading pages. When hidden, a compact navigation row keeps the address available. The older capture predates the shortcut change and removal of the sidebar-toggle button.
 
 ![Unconnected Ask Zacro panel with a Connect Codex button leading to subscription settings](docs/screenshots/optional-ai.jpg)
 
@@ -140,6 +178,8 @@ npm test           # State, import, security and provider protocol tests
 npm run test:e2e   # Real Chromium desktop integration tests
 npm run test:interactive # Disposable browser + local site for hands-on review
 npm run test:interactive -- --showcase # Populated design-review workspace
+npm run test:interactive -- --showcase --compact # Minimum-size workspace
+npm run test:interactive -- --onboarding # First-run tour with editable shortcuts
 npm run test:soak  # Repeated native tab/Peek/split lifecycle checks
 npm run pack       # Runnable application folder under dist/
 npm run test:package # Verify the packaged executable, security fuses and PDF worker
@@ -160,6 +200,9 @@ Use **Ctrl/Command + T** to open the command palette and **Ctrl/Command + L** to
 | --- | --- | --- |
 | Command palette / edit current address | ⌘T / ⌘L | Ctrl+T / Ctrl+L |
 | Toggle sidebar / save page | ⌘S / ⇧⌘S | Ctrl+S / Ctrl+Shift+S |
+| Focus sidebar | ⌥⌘S | Ctrl+Alt+S |
+| Context menu for focused tab or Space | ⇧F10 | Shift+F10 |
+| Browser menu | Native menu bar | F10 |
 | Pin or unpin / bookmark | ⌘D / ⌥⌘D | Ctrl+D / Ctrl+Alt+D |
 | Recent tabs / reverse recent tabs | ⌃Tab / ⌃⇧Tab | Ctrl+Tab / Ctrl+Shift+Tab |
 | Previous / next tab in sidebar order | ⌥⌘↑ / ⌥⌘↓ | Ctrl+Alt+↑ / Ctrl+Alt+↓ |
@@ -173,7 +216,7 @@ Use **Ctrl/Command + T** to open the command palette and **Ctrl/Command + L** to
 
 **Scroll sideways over the sidebar** to switch Spaces within the current profile; **Shift + mouse wheel** works too. The tab list follows the movement. At release, distance and recent speed decide whether it settles into the neighboring Space or returns; crossing a small fixed threshold no longer switches immediately. Reversing unwinds the preview, and the endpoints resist without wrapping. One gesture's momentum cannot advance through several Spaces. The sidebar remains usable beside the command palette. Other dialogs, text fields, dragging and pinch/zoom keep their own input. Webpage scrolling stays with the page, and each Space remembers its tab-list position. Portable wheel events require release/momentum heuristics; physical Mac trackpad acceptance remains open.
 
-**Favorites remain when closed.** Closing a pinned page releases its live page, after any unsaved-work decision, while retaining its name, address and position. Click it to open again, or choose Remove pin to return it to the ordinary tab list. Favorites expose Loaded, Sleeping or Closed status. Idle sleep defaults to 20 minutes and can be changed or disabled in **Settings → Layout & motion**. Active/split pages, media, captures, pending authentication, downloads and detected edits are protected; a page's beforeunload veto keeps it awake without an automatic discard prompt. Sleeping reloads the page when reopened, so it is not a promise to preserve arbitrary in-memory application state.
+**Favorites remain when closed.** Closing a pinned page releases its live page, after any unsaved-work decision, while retaining its name, address and position. Click it to open again, or choose Remove pin to return it to the ordinary tab list. Loaded, Sleeping or Closed states remain in tooltips and accessible labels, without status dots. Idle sleep defaults to 20 minutes and can be changed or disabled in **Settings → Layout & motion**. Active/split pages, media, captures, pending authentication and live popup openers, downloads and detected edits are protected; a page's beforeunload veto keeps it awake without an automatic discard prompt. Sleeping reloads the page when reopened, so it is not a promise to preserve arbitrary in-memory application state.
 
 **Customize the frame and Space.** Edit a Space to choose from twelve icons, primary/secondary colors, gradient balance, grain, glass opacity and blur. Changes preview before Save. Layout & motion offers Compact/Comfortable tab spacing, 4–20px page insets, square through rounded corners, and motion speed. The same frame settings drive shell and native pages; title controls, hidden-sidebar navigation and Find retain their required top space. System reduced-motion and reduced-transparency preferences take precedence.
 

@@ -1,4 +1,4 @@
-"""Build the five-page 0.6 guide after final application captures are approved.
+"""Build the six-page 0.7 guide after final application captures are approved.
 
 Requires ReportLab and Pillow; both are included in the Codex workspace runtime.
 Run from any directory: python scripts/create-feature-guide.py
@@ -22,9 +22,9 @@ PAGES = [
         "workspace.jpg",
         "01 / THE WORKSPACE",
         "Room for the page.",
-        "A compact sidebar, equal page gutters and individual Space icons keep the workspace legible. "
-        "Favorites show whether their pages are loaded, sleeping or closed. Closing a favorite keeps its pin; "
-        "inactive favorites can sleep without disturbing active pages, drafts, media or downloads.",
+        "Navigation stays in the sidebar; the application logo, sidebar-toggle button and favorite status dots "
+        "leave the chrome. Closing a favorite keeps its destination. Inactive favorites can sleep while "
+        "active pages, drafts, media, downloads and live login callbacks remain protected.",
     ),
     (
         "palette.jpg",
@@ -35,28 +35,36 @@ PAGES = [
         "the sidebar remains usable. Opening the palette never creates a disposable tab.",
     ),
     (
-        "space-theme.jpg",
-        "03 / SPACE MATERIALS",
-        "Make a Space your own.",
-        "Choose an icon, two custom colors, gradient balance, grain, opacity and blur. "
-        "Preview changes live, then save or cancel. Glass blends the Space colors within the window. "
-        "The interface preserves readable contrast and follows reduced-transparency preferences.",
+        "onboarding.jpg",
+        "03 / KEYBOARD WORKFLOW",
+        "Learn it. Make it yours.",
+        "The five-step welcome tour introduces the command bar, sidebar, Spaces, favorites and settings. "
+        "Every displayed shortcut is directly editable with conflict checks and a reset control. "
+        "The same bindings drive menus and commands; the tour can be reopened at any time.",
     ),
     (
-        "ai-workflow.jpg",
-        "04 / OPTIONAL AI",
-        "A clear question. Chosen pages.",
-        "Summarize, explain, compare or research from the palette. Review the page context and edit "
-        "the prepared question before sending. Remove shared pages, edit or retry questions, "
-        "and copy answers with sources. Live provider-account acceptance remains pending.",
+        "settings.jpg",
+        "04 / BROWSER PANELS",
+        "Part of the browser.",
+        "Library, Settings and the assistant belong to the Space-colored window, with their own divider "
+        "and compact section navigation. Sidebar and panel widths share a 220 ms ease without spring "
+        "overshoot. Library keeps the real page visible at its original rendering scale.",
     ),
     (
-        "customization.jpg",
-        "05 / PERSONAL PREFERENCES",
-        "Comfort, down to the details.",
-        "Adjust tab density, page inset, corner radius, animation speed and the idle-favorite timer. "
-        "Space swipes follow displacement until release; sidebar motion supports quick reversals. "
-        "Keyboard shortcuts remain editable. This is a development build with open release gates.",
+        "compact.jpg",
+        "05 / COMPACT WINDOWS",
+        "A smaller footprint.",
+        "The window supports sizes down to 560 by 420 logical pixels. Opening a browser panel makes room "
+        "by temporarily hiding the sidebar, while retaining its saved width and visibility preference. "
+        "Short dialogs and command results scroll to keep their controls reachable.",
+    ),
+    (
+        "spaces.jpg",
+        "06 / SPACES",
+        "Everything in its place.",
+        "Right-click a Space or press Shift-F10 for its contextual actions. Sideways gestures reveal the "
+        "neighboring Space's actual favorites, folders and tabs without a redundant name badge. "
+        "Still captures do not establish motion quality; physical Mac and live Google acceptance remain open.",
     ),
 ]
 
@@ -70,9 +78,9 @@ def build(screenshots, output):
     width, height = 792, 612  # US Letter, landscape; one intact screenshot per page.
     margin = 32
     doc = canvas.Canvas(str(output), pagesize=(width, height), pageCompression=1)
-    doc.setTitle("Zacro 0.6 - Design and Feature Guide")
+    doc.setTitle("Zacro 0.7 - Design and Feature Guide")
     doc.setAuthor("Zacro Technologies")
-    doc.setSubject("Zacro 0.6 Windows development interface, Space materials, favorite lifecycle and reviewed AI context")
+    doc.setSubject("Zacro 0.7 compact windows, browser panels, editable keyboard onboarding and Space navigation")
     body = ParagraphStyle(
         "caption", fontName="Helvetica", fontSize=9, leading=12,
         textColor=HexColor("#5f5661"), spaceAfter=0,
@@ -87,7 +95,7 @@ def build(screenshots, output):
 
         doc.setFont("Helvetica-Bold", 8)
         doc.setFillColor(muted)
-        doc.drawString(margin, height - 27, "ZACRO / INTERFACE 0.6")
+        doc.drawString(margin, height - 27, "ZACRO / INTERFACE 0.7")
         doc.drawRightString(width - margin, height - 27, label)
         doc.setFont("Helvetica", 23)
         doc.setFillColor(ink)
@@ -127,10 +135,10 @@ def build(screenshots, output):
 
 if __name__ == "__main__":
     parser = ArgumentParser(description=__doc__)
-    parser.add_argument("--screenshots", type=Path, default=ROOT / "docs/screenshots/0.6")
+    parser.add_argument("--screenshots", type=Path, default=ROOT / "docs/screenshots/0.7")
     parser.add_argument(
         "--output", type=Path,
-        default=ROOT / "output/pdf/Zacro-0.6-Design-and-Feature-Guide.pdf",
+        default=ROOT / "output/pdf/Zacro-0.7-Design-and-Feature-Guide.pdf",
     )
     args = parser.parse_args()
     build(args.screenshots.resolve(), args.output.resolve())

@@ -2,6 +2,31 @@
 
 Validated locally on Windows 11 x64 (OS build 26200), Node.js 24.19.0, Electron 45.0.0 and Chromium 156.0.8078.48. This record describes engineering verification of the development build, not commercial certification or a security audit.
 
+## 0.7 compact windows, browser panels and keyboard onboarding
+
+On October 28, 2026 (JST), final [CI run 40581387047](https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40581387047) passed at runtime commit **`7f8aba038f805a948e06ed6d90fcc846ae977196`**:
+
+| Platform | Unit/security | Native desktop | Packaged app | Additional |
+| --- | --- | --- | --- | --- |
+| Windows x64 | 176 passed | 74 passed; 6 Mac-only skips | 1 passed | 40-cycle lifecycle check passed |
+| macOS 15, Apple silicon | 176 passed | 59 passed; 1 Windows-only skip | 1 passed | Development DMG/ZIP built |
+| macOS 15, Intel | 176 passed | 59 passed; 1 Windows-only skip | 1 passed | Development DMG/ZIP built |
+
+All three jobs completed successfully, including validation artifact uploads. The earlier [CI run 40579207712](https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40579207712) at `77669476468d53bb66f98d37faddae7c10bb99d8` passed the same suites and supplied the Mac documentation captures. The final runtime also includes clearer shortcut-recorder feedback and the compact manual-review launcher.
+
+- **Compact layout:** minimum 560×420 geometry, all six browser panel sections, adaptive sidebar hiding, retained width preference, scrollable short dialogs, theme controls and command results. Native page bounds match the shell at fractional Windows scaling.
+- **Live Library and motion:** opening Library performs zero `capturePage` calls and retains the real page, document identity and device-pixel ratio. Sidebar and panel width changes share a monotonic 220 ms ease, with reversal and reduced-motion handling. Interrupting chrome motion with a dialog captures the settled native bounds. Opening a panel or focusing the sidebar cancels a pending Space swipe.
+- **Keyboard:** first-run/replay tour, editable bindings on every slide, conflict rejection, persistence after restart, focus restoration, roving sidebar arrows, folder expansion/collapse, keyboard context menus and Windows F10. Native Mac menu and shortcut checks pass on both architectures.
+- **Spaces:** neighboring favorites, folders and tabs appear during dragging; previews are inert and have no duplicate IDs or actions. Cancellation, reversal, endpoints, release settling, native page retention, profile boundaries and right-click/keyboard menu targeting pass.
+- **Website login mechanics:** cross-origin popup callback and opener restoration pass in a local Chromium fixture. A separate plain Electron fixture proves favorite protection without debugger capture, background callbacks without focus theft, and sleep eligibility after popup closure. These are not live Google acceptance results; see [website sign-in](WEB-SIGN-IN.md).
+- **Local package and soak:** the unsigned 0.7 Windows installer built, package acceptance passed, and the 40-cycle soak kept two WebContents at every sample. Observed cycle median was 345 ms and p95 364 ms; sampled memory grew from 499,268 to 722,496 KiB. These bounded fixture measurements are not general latency or long-term memory guarantees.
+
+The revised icon contains nine Windows sizes from 16 to 256 pixels, plus the existing seven macOS sizes. Mac validation archives were SHA-256 verified before extraction; packaged light/dark captures were visually inspected. Mac artifacts are ad hoc signed development builds; notarization was explicitly skipped. Physical Mac trackpad review, assistive-technology acceptance, live identity-provider/AI accounts, signed distribution and the other commercial release gates remain separate.
+
+**Computer review:** the packaged Windows application was exercised with disposable profiles at normal and minimum size. Checks covered onboarding F8 recording/reset, direct Library/Settings navigation, panel scrolling and close/restoration, right-click Space targeting, horizontal Space switching, F10 menu navigation and compact command results. This host's injected Control combinations arrived as Windows/Meta combinations, so those manual modifier results are not counted as successful Control/Command verification; native event tests cover the intended bindings. That review prompted clearer recorder notices for Windows-key/AltGr input and removal of Electron's IPC envelope from displayed errors. The updated onboarding native test and rebuilt Windows package passed locally at `7f8aba0`.
+
+Six original Windows screenshots and two native Mac captures were visually reviewed. The six-page PDF was rendered with Poppler; every page was inspected for clipping and overlap, with page count, embedded images and extracted text checked. [Capture provenance](screenshots/README.md) distinguishes the normal-size `7766947` captures from the minimum-size `7f8aba0` captures. The PDF SHA-256 is `9B71D3B0A21BBEE583E74471712782AD9D40AD9EB6B8C5BC577ECE53044E0A55`.
+
 ## 0.6 Space materials, motion, favorites and AI workflows
 
 Version 0.6 adds Space icons and live material previews; adjustable colors, gradient, grain, opacity and blur; matching page gutters and configurable corners; page-only palette blur; release-based Space gestures; reversible sidebar motion; retained closed favorites and protected idle sleeping; filtered command results; and AI questions with explicit, reviewed document context. Evidence below is recorded on October 26, 2026 (JST), with runtime verification and capture revisions identified separately.

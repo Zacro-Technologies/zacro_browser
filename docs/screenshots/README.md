@@ -1,6 +1,16 @@
 # Screenshot assets
 
-## Current 0.6 captures
+## Current 0.7 captures
+
+Eight unretouched captures document the 0.7 interface. The six Windows JPEGs were captured with native Computer interactions on October 28, 2026 (JST), using disposable showcase profiles and local demo pages. Original capture bytes are preserved; the blue pointer highlight comes from the capture tool. No account credentials, personal browsing data or simulated AI answers are present.
+
+- `0.7/workspace.jpg`, `0.7/settings.jpg` and `0.7/onboarding.jpg` come from the packaged **`77669476468d53bb66f98d37faddae7c10bb99d8`** build, at a normal window size. They show the quiet chrome, browser-owned panels and editable tour.
+- `0.7/compact.jpg`, `0.7/palette.jpg` and `0.7/spaces.jpg` come from the rebuilt **`7f8aba038f805a948e06ed6d90fcc846ae977196`** package, started with the minimum-size QA option. Their captured window is 565×424 pixels, including the native boundary and fractional-scale rounding. They show adaptive Settings, a fully reachable command palette and an inactive Space's context menu.
+- `0.7/macos-light.png` and `0.7/macos-dark.png` are whole native desktop captures from the **`7766947`** Apple silicon package in successful [CI run 40579207712](https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40579207712), artifact `12769696376`. Its ZIP was SHA-256 verified before extraction. Native controls, menus and the revised Dock icon are visible. The optional New Tab Page was opened explicitly during package acceptance.
+
+All eight images were visually reviewed. The [six-page 0.7 guide](../Zacro-0.7-Design-and-Feature-Guide.pdf) embeds one intact Windows capture per page with explanatory text. Every page was rendered using Poppler and visually inspected; six pages, one embedded image per page and text extraction were verified. These stills do not prove motion quality, physical trackpad behavior or live Google/AI authentication. See [validation](../VALIDATION.md) for the separate tests and limitations.
+
+## Historical 0.6 captures
 
 The following four JPEGs were captured through native Computer interactions and window capture from the packaged Windows 0.6 development build at commit `1f130cb9719976e54981a63450263af33cbf3862` on October 26, 2026 (JST). They use an isolated showcase profile and locally served journal/demo pages. The images are unretouched originals, preserved without recompression; the blue pointer highlight belongs to the capture tool.
 
