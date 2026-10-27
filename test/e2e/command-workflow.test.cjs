@@ -36,7 +36,7 @@ async function fixture(t) {
     assert.deepEqual(errors, [], 'No renderer errors during the command workflow');
   });
   const launch = async () => {
-    const env = { ...process.env, ZACRO_USER_DATA: directory };
+    const env = { ...process.env, ZACRO_SKIP_ONBOARDING: '1', ZACRO_USER_DATA: directory };
     delete env.ELECTRON_RUN_AS_NODE;
     app = await electron.launch({ args: [path.resolve(__dirname, '../..')], env });
     shell = await app.firstWindow();

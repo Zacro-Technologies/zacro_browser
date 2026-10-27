@@ -10,7 +10,7 @@ const { _electron: electron, expect } = require('@playwright/test');
 
 async function launch(t) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'zacro-space-swipe-'));
-  const env = { ...process.env, ZACRO_USER_DATA: directory };
+  const env = { ...process.env, ZACRO_SKIP_ONBOARDING: '1', ZACRO_USER_DATA: directory };
   delete env.ELECTRON_RUN_AS_NODE;
   const app = await electron.launch({ args: [path.resolve(__dirname, '../..')], env });
   const errors = [];
@@ -53,7 +53,7 @@ async function launch(t) {
   const measuredBurst = (before, after, tails = false) =>
     shell.evaluate(
       async ({ before, after, tails }) => {
-        const list = document.querySelector('.tabs-scroll');
+        const list = document.querySelector('.space-page');
         const dispatch = (events) =>
           events.map((event) => {
             const wheel = new WheelEvent('wheel', { bubbles: true, cancelable: true, ...event });
@@ -110,6 +110,43 @@ async function launch(t) {
 }
 
 test(
+  'opening browser panels or focusing tabs cancels an unsettled Space swipe',
+  { timeout: 30000 },
+  async (t) => {
+    const b = await launch(t);
+    await b.invoke('tab:create', { homePage: true });
+    await b.app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].setContentSize(560, 420));
+    await expect(b.shell.locator('[data-key="library"]')).toBeVisible();
+    if (await b.shell.locator('#command-input').count()) await b.shell.keyboard.press('Escape');
+    for (const action of ['library', 'focus-sidebar']) {
+      await b.idle();
+      const tracking = await b.shell.evaluate(async (action) => {
+        const list = document.querySelector('.space-page');
+        list.dispatchEvent(new WheelEvent('wheel', { deltaX: 100, bubbles: true, cancelable: true }));
+        const wasTracking = list.classList.contains('gesture-tracking');
+        if (action === 'library') document.querySelector('[data-key="library"]').click();
+        else await window.zacro.invoke('shortcut:run', { id: 'focus-sidebar' });
+        // Wait beyond the gesture's quiet release deadline. An uncancelled timer
+        // would commit the pending Space change after the new browser action.
+        await new Promise((resolve) => setTimeout(resolve, 350));
+        return wasTracking;
+      }, action);
+      assert.equal(tracking, true);
+      assert.equal(await b.current(), b.first, `${action} takes precedence over the pending swipe`);
+      await expect(b.shell.locator('#space-gesture-preview')).toBeHidden();
+      await expect(b.shell.locator('.space-transition-snapshot')).toHaveCount(0);
+      if (action === 'library') {
+        await expect(b.shell.locator('#app')).toHaveAttribute('data-sidebar-hidden', 'true');
+        await expect(b.shell.locator('#panel-title')).toHaveText('Bookmarks');
+        await b.shell.locator('[data-key="panel-close"]').click();
+        await expect(b.shell.locator('#app')).toHaveAttribute('data-sidebar-hidden', 'false');
+        await expect(b.shell.locator('#app')).toHaveAttribute('data-sidebar-animating', 'false');
+      }
+    }
+  },
+);
+
+test(
   'native horizontal scrolling switches Spaces and preserves the live page',
   { timeout: 45000 },
   async (t) => {
@@ -164,7 +201,7 @@ test(
       window.spaceMotion = [];
       const animate = Element.prototype.animate;
       Element.prototype.animate = function (frames, options) {
-        if (this.matches('.tabs-scroll')) window.spaceMotion.push({ frames, duration: options.duration });
+        if (this.matches('.space-page')) window.spaceMotion.push({ frames, duration: options.duration });
         return animate.call(this, frames, options);
       };
     });
@@ -449,11 +486,11 @@ test(
     assert.equal(await b.current(), b.first);
     await b.shell.evaluate(() => document.dispatchEvent(new DragEvent('dragend', { bubbles: true })));
 
-    await b.shell.locator('[data-key="sidebar-toggle"]').click();
+    await b.invoke('shortcut:run', { id: 'sidebar-toggle' });
     await b.idle();
     await b.wheel([{ deltaX: 100 }], '#sidebar');
     assert.equal(await b.current(), b.first);
-    await b.shell.locator('[data-key="sidebar-toggle"]').click();
+    await b.invoke('shortcut:run', { id: 'sidebar-toggle' });
     await b.idle();
     await b.wheel([{ deltaX: 100 }]);
     await b.changedTo(b.second);
@@ -472,7 +509,7 @@ test(
     // Observe the individual samples on one renderer clock. An IPC round trip
     // between samples can exceed the fallback contact-release pause on CI.
     const reversal = await b.shell.evaluate(() => {
-      const list = document.querySelector('.tabs-scroll');
+      const list = document.querySelector('.space-page');
       const preview = document.querySelector('#space-gesture-preview');
       const samples = [];
       for (const deltaX of [18, 10, -18, -10]) {
@@ -482,7 +519,7 @@ test(
           prevented: wheel.defaultPrevented,
           offset: new DOMMatrix(list.style.transform).m41,
           tracking: list.classList.contains('gesture-tracking'),
-          preview: preview.hidden ? null : preview.textContent,
+          preview: preview.hidden ? null : preview.querySelector('.space-title').textContent,
           active: document.querySelector('.space-dot[aria-current="true"]').dataset.id,
         });
       }
@@ -496,10 +533,10 @@ test(
     assert.equal(reversal[1].preview, 'Third Space');
     assert.equal(reversal[3].preview, null);
     await b.idle();
-    await expect(b.shell.locator('.tabs-scroll')).not.toHaveClass(/gesture-tracking/);
+    await expect(b.shell.locator('.space-page')).not.toHaveClass(/gesture-tracking/);
 
     const cancelled = await b.shell.evaluate(() => {
-      const list = document.querySelector('.tabs-scroll');
+      const list = document.querySelector('.space-page');
       const wheel = (deltaX) =>
         list.dispatchEvent(new WheelEvent('wheel', { deltaX, bubbles: true, cancelable: true }));
       wheel(24);
@@ -518,7 +555,7 @@ test(
     await b.changedTo(b.first);
     await b.idle();
     const edge = await b.shell.evaluate(() => {
-      const list = document.querySelector('.tabs-scroll');
+      const list = document.querySelector('.space-page');
       list.dispatchEvent(new WheelEvent('wheel', { deltaX: -180, bubbles: true, cancelable: true }));
       return new DOMMatrix(list.style.transform).m41;
     });
@@ -527,11 +564,140 @@ test(
     await expect(b.shell.locator('#space-gesture-preview')).toBeHidden();
     await b.idle();
     assert.equal(
-      await b.shell.locator('.tabs-scroll').evaluate((element) => element.style.transform),
+      await b.shell.locator('.space-page').evaluate((element) => element.style.transform),
       '',
       'Uncommitted feedback settles after the gesture ends',
     );
-    await expect(b.shell.locator('.tabs-scroll')).not.toHaveClass(/gesture-tracking/);
+    await expect(b.shell.locator('.space-page')).not.toHaveClass(/gesture-tracking/);
+  },
+);
+
+test(
+  'neighbor previews show real favorites, folders and tabs without activating pages',
+  { timeout: 45000 },
+  async (t) => {
+    const b = await launch(t);
+    const folder = await b.invoke('folder:create', { spaceId: b.third, name: 'Reading list' });
+    const pin = await b.invoke('tab:create', { spaceId: b.third, homePage: true, active: false });
+    await b.invoke('tab:update', { id: pin.id, title: 'Favorite reference' });
+    await b.invoke('tab:pin', { id: pin.id });
+    const article = await b.invoke('tab:create', { spaceId: b.third, homePage: true, active: false });
+    await b.invoke('tab:update', { id: article.id, title: 'Neighbor article' });
+    await b.invoke('tab:move', { id: article.id, spaceId: b.third, folderId: folder.id });
+    await b.invoke('space:activate', { id: b.second });
+    await b.changedTo(b.second);
+    if (await b.shell.locator('#command-input').count()) await b.shell.keyboard.press('Escape');
+    await b.idle();
+    const before = await b.state();
+    const preview = await b.shell.evaluate(() => {
+      const live = document.querySelector('.space-page');
+      const wheel = (deltaX, phase) => {
+        const event = new WheelEvent('wheel', { deltaX, bubbles: true, cancelable: true });
+        Object.defineProperty(event, 'phase', { value: phase });
+        live.dispatchEvent(event);
+      };
+      wheel(90, 'began');
+      const region = document.querySelector('#space-gesture-preview');
+      const page = region.firstElementChild;
+      const result = {
+        hidden: region.hidden,
+        inert: region.inert && page.inert,
+        accessible: region.getAttribute('aria-hidden'),
+        heading: page.querySelector('.space-title').textContent,
+        tab: page.querySelector('.tab-row .title').textContent,
+        folder: page.querySelector('.folder-heading .truncate').textContent,
+        favorite: page.querySelector('.favorite').getAttribute('aria-label'),
+        interactiveAttributes: page.querySelectorAll(
+          '[id],[data-action],[data-tab-id],[data-key],[draggable]',
+        ).length,
+        favoriteStatusDots: page.querySelectorAll('.favorite-status').length,
+        outgoingOffset: new DOMMatrix(live.style.transform).m41,
+        incomingOffset: new DOMMatrix(page.style.transform).m41,
+        travel: document.querySelector('#sidebar').clientWidth,
+      };
+      wheel(-130, 'changed');
+      result.reversedHeading = region.querySelector('.space-title').textContent;
+      result.reversedOffset = new DOMMatrix(region.firstElementChild.style.transform).m41;
+      wheel(0, 'cancelled');
+      return result;
+    });
+    assert.equal(preview.hidden, false);
+    assert.equal(preview.inert, true);
+    assert.equal(preview.accessible, 'true');
+    assert.equal(preview.heading, 'Third Space');
+    assert.equal(preview.tab, 'Neighbor article');
+    assert.equal(preview.folder, 'Reading list');
+    assert.match(preview.favorite, /^Favorite reference — (Loaded|Sleeping|Closed)$/);
+    assert.equal(preview.interactiveAttributes, 0);
+    assert.equal(preview.favoriteStatusDots, 0);
+    assert.equal(preview.outgoingOffset, -90);
+    assert.equal(preview.incomingOffset, preview.travel - 90);
+    assert.equal(preview.reversedHeading, before.spaces.find((space) => space.id === b.first).name);
+    assert.equal(preview.reversedOffset, -preview.travel + 40);
+    await b.idle();
+    await expect(b.shell.locator('#space-gesture-preview')).toBeHidden();
+    const after = await b.state();
+    assert.equal(after.activeSpaceId, before.activeSpaceId);
+    assert.equal(after.activeTabId, before.activeTabId);
+    assert.deepEqual(
+      after.runtime.pages,
+      before.runtime.pages,
+      'Previewing must not load or wake native pages',
+    );
+  },
+);
+
+test(
+  'Space footer menus target the clicked Space and support keyboard access',
+  { timeout: 45000 },
+  async (t) => {
+    const server = http.createServer((_request, response) => {
+      response.writeHead(200, { 'Content-Type': 'text/html', 'Cache-Control': 'no-store' });
+      response.end('<!doctype html><title>Move me</title><h1>Space menu fixture</h1>');
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    t.after(async () => {
+      server.closeAllConnections();
+      await new Promise((resolve) => server.close(resolve));
+    });
+    const b = await launch(t);
+    const tab = await b.invoke('tab:create', { url: `http://127.0.0.1:${server.address().port}/` });
+    await b.invoke('tab:pin', { id: tab.id });
+    await expect(b.shell.locator(`.favorite[data-tab-id="${tab.id}"]`)).toHaveAttribute(
+      'aria-label',
+      / — (Loaded|Sleeping|Closed)$/,
+    );
+    assert.equal(await b.shell.locator('.favorite-status').count(), 0);
+    const second = b.shell.locator(`.space-dot[data-id="${b.second}"]`);
+    await second.click({ button: 'right' });
+    await expect(b.shell.getByRole('dialog', { name: 'Space actions' })).toBeVisible();
+    await expect(b.shell.locator('[data-action="ui:rename-space"]')).toHaveAttribute('data-id', b.second);
+    await b.shell.locator('[data-action="ui:rename-space"]').click();
+    await b.shell.getByLabel('Space name', { exact: true }).fill('Renamed neighbor');
+    await b.shell.getByRole('button', { name: 'Save', exact: true }).click();
+    await expect
+      .poll(async () => (await b.state()).spaces.find((space) => space.id === b.second).name)
+      .toBe('Renamed neighbor');
+    assert.equal(await b.current(), b.first, 'Editing an inactive Space must not switch the active Space');
+    await expect(second).toBeFocused();
+    await second.press('Shift+F10');
+    await expect(b.shell.getByRole('dialog', { name: 'Space actions' })).toBeVisible();
+    await b.shell.keyboard.press('Escape');
+    await expect(second).toBeFocused();
+    await second.press('ContextMenu');
+    await expect(b.shell.locator('[data-action="ui:space-move-tab"]')).toHaveAttribute(
+      'data-source-tab',
+      tab.id,
+    );
+    await b.shell.locator('[data-action="ui:space-move-tab"]').click();
+    await b.changedTo(b.second);
+    assert.equal((await b.state()).tabs.find((item) => item.id === tab.id).spaceId, b.second);
+    assert.equal((await b.state()).tabs.find((item) => item.id === tab.id).pinned, true);
+    await b.invoke('space:delete', { id: b.third });
+    await b.invoke('space:delete', { id: b.first });
+    await second.click({ button: 'right' });
+    await expect(b.shell.locator('[data-action="ui:delete-space"]')).toBeDisabled();
+    await b.shell.keyboard.press('Escape');
   },
 );
 
@@ -557,21 +723,21 @@ test(
         const wheel = (deltaX, phase) => {
           const event = new WheelEvent('wheel', { deltaX, bubbles: true, cancelable: true });
           Object.defineProperty(event, 'phase', { value: phase });
-          document.querySelector('.tabs-scroll').dispatchEvent(event);
+          document.querySelector('.space-page').dispatchEvent(event);
         };
         const frames = [];
         const animate = Element.prototype.animate;
         Element.prototype.animate = function (keyframes, options) {
-          if (this.matches('.tabs-scroll') || this.parentElement?.matches('.space-transition-snapshot'))
-            frames.push({ incoming: this.matches('.tabs-scroll'), keyframes, duration: options.duration });
+          if (this.matches('.space-page') || this.parentElement?.matches('.space-transition-snapshot'))
+            frames.push({ incoming: this.matches('.space-page'), keyframes, duration: options.duration });
           return animate.call(this, keyframes, options);
         };
         try {
           wheel(80, 'began');
-          const oldList = document.querySelector('.tabs-scroll');
+          const oldList = document.querySelector('.space-page');
           await window.zacro.invoke('tab:update', { id: tabId, title: 'Changed while dragging' });
-          await until(() => document.querySelector('.tabs-scroll') !== oldList);
-          const list = document.querySelector('.tabs-scroll');
+          await until(() => document.querySelector('.space-page') !== oldList);
+          const list = document.querySelector('.space-page');
           const afterRedraw = {
             offset: new DOMMatrix(list.style.transform).m41,
             tracking: list.classList.contains('gesture-tracking'),
@@ -629,7 +795,7 @@ test(
       'The outgoing and incoming lists share one settling clock',
     );
     assert(incoming.duration >= 140 && incoming.duration <= 240);
-    await expect(b.shell.locator('.tabs-scroll')).not.toHaveClass(/gesture-tracking/);
+    await expect(b.shell.locator('.space-page')).not.toHaveClass(/gesture-tracking/);
     await expect(b.shell.locator('.space-transition-snapshot')).toHaveCount(0);
   },
 );

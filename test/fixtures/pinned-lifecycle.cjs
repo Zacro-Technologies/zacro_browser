@@ -358,6 +358,89 @@ test(
   },
 );
 
+test(
+  'login popups protect the original pinned callback document even after switching away',
+  { timeout: 30000 },
+  async (t) => {
+    const b = await launch(t);
+    const favorite = await b.open('popup-opener', true);
+    const openerContentsId = await b.pageId(favorite.url);
+    const other = await b.open('popup-unrelated');
+    await b.activate(favorite);
+    const popupURL = `${base}/popup-identity`;
+    await b.guest(
+      favorite.url,
+      `window.popupMessages = [];
+       window.addEventListener('message', event => {
+         if (event.origin === ${JSON.stringify(base)} && event.source === window.popupReference)
+           window.popupMessages.push(event.data);
+       }); undefined`,
+    );
+    const popup = async () => {
+      await b.guest(
+        favorite.url,
+        `window.popupReference = window.open(${JSON.stringify(popupURL)}, 'pin-login'); undefined`,
+      );
+      await expect.poll(() => b.guest(popupURL, 'document.readyState')).toBe('complete');
+      const tab = await until(
+        async () => (await b.state()).tabs.find((item) => item.url === popupURL),
+        'popup tab',
+      );
+      await expect.poll(async () => (await b.state()).activeTabId).toBe(tab.id);
+      const opener = webContents.fromId(openerContentsId);
+      assert(opener && !opener.isDestroyed());
+      assert.equal(opener.isBeingCaptured(), false, 'No debugger/capture may mask opener sleep eligibility');
+      assert.equal(opener.isLoading(), false, 'The opener must be clean and fully loaded');
+      return tab;
+    };
+    const complete = (message) =>
+      b
+        .guest(
+          popupURL,
+          `window.opener.postMessage(${JSON.stringify(message)}, ${JSON.stringify(base)}); window.close(); undefined`,
+        )
+        .catch(() => {});
+
+    await popup();
+    assert.equal((await b.invoke('tab:sleep', { id: favorite.id })).slept, false);
+    assert.equal(await b.pageId(favorite.url), openerContentsId);
+    await complete('foreground callback');
+    await expect.poll(async () => (await b.state()).activeTabId).toBe(favorite.id);
+    await expect.poll(() => b.guest(favorite.url, 'window.popupMessages[0]')).toBe('foreground callback');
+    await expect.poll(() => webContents.getFocusedWebContents()?.id).toBe(openerContentsId);
+
+    const backgroundPopup = await popup();
+    await b.activate(other);
+    await b.invoke('page:focus');
+    const otherContentsId = await b.pageId(other.url);
+    await expect.poll(() => webContents.getFocusedWebContents()?.id).toBe(otherContentsId);
+    assert.equal(
+      (await b.invoke('tab:sleep', { id: favorite.id })).slept,
+      false,
+      'An open login popup still needs its callback listener while another tab is active',
+    );
+    assert.equal(await b.pageId(favorite.url), openerContentsId);
+    await complete('background callback');
+    await expect
+      .poll(async () => (await b.state()).tabs.some((item) => item.id === backgroundPopup.id))
+      .toBe(false);
+    await expect.poll(() => b.guest(favorite.url, 'window.popupMessages[1]')).toBe('background callback');
+    assert.equal((await b.state()).activeTabId, other.id, 'A closing background popup must not switch tabs');
+    assert.equal(
+      webContents.getFocusedWebContents()?.id,
+      otherContentsId,
+      'A background callback must not steal focus',
+    );
+    assert.equal(
+      (await b.invoke('tab:sleep', { id: favorite.id })).slept,
+      true,
+      'After its last popup closes, the same clean inactive favorite must become eligible for sleep',
+    );
+    assert.equal(await b.pageId(favorite.url), null);
+    assert.equal((await b.state()).runtime.pages[favorite.id].sleeping, true);
+  },
+);
+
 (async () => {
   const selected = cases[Number(process.env.ZACRO_PIN_CASE)];
   try {

@@ -17,10 +17,12 @@ function browserLayout({
   const gutter = Math.round(clamp(finite(pageGutter, 8), 4, 20));
   // Transient widths below 200 animate the sidebar; persisted widths retain
   // their separate 200px minimum. Every canvas edge keeps the same gutter.
-  const sidebar = Math.round(clamp(finite(sidebarWidth, 224), 0, Math.min(380, Math.max(0, width - 400))));
+  const sidebar = Math.round(
+    clamp(finite(sidebarWidth, 224), 0, Math.min(380, Math.max(0, width - 240 - gutter * 2))),
+  );
   const left = sidebar + gutter;
-  const right = Math.round(clamp(finite(panelWidth, 0), 0, Math.max(0, width - sidebar - 316)));
-  const available = Math.max(1, width - left - (right > 0 ? right + gutter * 2 : gutter));
+  const right = Math.round(clamp(finite(panelWidth, 0), 0, Math.max(0, width - sidebar - 240 - gutter * 2)));
+  const available = Math.max(1, width - left - right - gutter);
   // The sidebar owns navigation in the compact layout. Only the Windows
   // caption rail, hidden-sidebar toolbar or an active Find row reserve height.
   const top = Math.min(
@@ -93,8 +95,8 @@ function restoreWindowPlacement(saved = {}, workAreas = []) {
     (area) => Number.isFinite(area.x) && Number.isFinite(area.y) && area.width > 0 && area.height > 0,
   );
   const fallback = { x: 0, y: 0, width: 1920, height: 1080 };
-  const width = clamp(finite(saved.width, 1440), 960, 7680);
-  const height = clamp(finite(saved.height, 940), 640, 4320);
+  const width = clamp(finite(saved.width, 1440), 560, 7680);
+  const height = clamp(finite(saved.height, 940), 420, 4320);
   const intersection = (area) =>
     Math.max(0, Math.min(saved.x + width, area.x + area.width) - Math.max(saved.x, area.x)) *
     Math.max(0, Math.min(saved.y + height, area.y + area.height) - Math.max(saved.y, area.y));

@@ -92,6 +92,8 @@ function macMenuTemplate(run, edit, overrides = {}) {
         action('force-reload', 'Reload Without Cache', 'Command+Shift+R'),
         separator,
         action('sidebar-toggle', 'Toggle Sidebar', 'Command+Shift+B'),
+        action('focus-sidebar', 'Focus Sidebar'),
+        action('reveal-tab', 'Reveal Tab in Sidebar'),
         action('zoom-in', 'Zoom In', 'Command+Plus'),
         action('zoom-out', 'Zoom Out', 'Command+-'),
         action('zoom-reset', 'Actual Size', 'Command+0'),
@@ -137,7 +139,12 @@ function macMenuTemplate(run, edit, overrides = {}) {
     },
     {
       role: 'help',
-      submenu: [action('releases', 'Zacro Releases'), action('issues', 'Report an Issue')],
+      submenu: [
+        action('onboarding', 'Welcome Tour'),
+        separator,
+        action('releases', 'Zacro Releases'),
+        action('issues', 'Report an Issue'),
+      ],
     },
   ];
 }

@@ -78,7 +78,7 @@ const icons = {
 const icon = (name) =>
   `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="${icons[name] || icons.globe}"/></svg>`;
 const mark =
-  '<span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 32 32"><path d="M9 9h14L9 23h14M8 16h16"/></svg></span>';
+  '<span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 32 32"><path d="M10 10h12L10 22h12"/></svg></span>';
 const button = (action, label, symbol, attrs = '', classes = '') =>
   `<button type="button" class="icon-button ${classes}" data-action="${action}" aria-label="${esc(label)}" title="${esc(label)}" ${attrs}>${icon(symbol)}</button>`;
 const primary = (action, label, symbol = '', attrs = '') =>
@@ -156,6 +156,8 @@ const ui = {
   shortcutQuery: '',
   recordingShortcut: null,
   shortcutError: '',
+  onboardingOffered: false,
+  onboardingStep: 0,
   closedFolders: new Set(),
   dragTab: null,
   aiMessages: [],
@@ -206,11 +208,41 @@ function maybeOpenBlankPalette() {
   });
 }
 const sidebarScroll = new Map();
+const favoriteScroll = new Map();
 const spaceGesture = createSpaceGesture();
 let spaceGestureTimer;
 let spaceGesturePending = false;
 let spaceGestureFeedback = null;
 let spaceTransition = null;
+let spacePreview = null;
+const visibleSpacePage = () => $('#sidebar-content > .space-page');
+function clearSpacePreview() {
+  const preview = $('#space-gesture-preview');
+  if (spacePreview?.page) elementMotions.get(spacePreview.page)?.cancel();
+  spacePreview = null;
+  if (preview) {
+    preview.hidden = true;
+    preview.replaceChildren();
+  }
+}
+function inertSpacePage(page) {
+  page.classList.remove('space-page', 'gesture-tracking');
+  page.classList.add('space-preview-page');
+  for (const node of [page, ...page.querySelectorAll('*')]) {
+    for (const attribute of [...node.attributes])
+      if (attribute.name === 'id' || attribute.name.startsWith('data-')) node.removeAttribute(attribute.name);
+    node.removeAttribute('draggable');
+    node.removeAttribute('aria-current');
+    if (node.matches('button, input, select, textarea, a, [tabindex]')) node.tabIndex = -1;
+  }
+  for (const scroll of $$('.tabs-scroll', page)) {
+    scroll.classList.remove('tabs-scroll');
+    scroll.classList.add('space-preview-scroll');
+  }
+  page.inert = true;
+  page.setAttribute('aria-hidden', 'true');
+  return page;
+}
 function clearSpaceTransition() {
   const previous = spaceTransition;
   spaceTransition = null;
@@ -219,8 +251,9 @@ function clearSpaceTransition() {
   previous?.wrapper?.remove();
 }
 function resetSpaceFeedback({ animate = false, preserveTransition = false, duration = 140 } = {}) {
-  const list = $('.tabs-scroll');
-  const offset = spaceGestureFeedback?.offset || 0;
+  const list = visibleSpacePage();
+  const feedback = spaceGestureFeedback;
+  const offset = feedback?.offset || 0;
   spaceGestureFeedback = null;
   if (list) {
     list.style.removeProperty('transform');
@@ -230,8 +263,20 @@ function resetSpaceFeedback({ animate = false, preserveTransition = false, durat
     if (animate && offset)
       motion(list, [{ transform: `translateX(${offset}px)` }, { transform: 'translateX(0)' }], duration);
   }
-  const preview = $('#space-gesture-preview');
-  if (preview) preview.hidden = true;
+  const preview = spacePreview;
+  if (animate && offset && preview && !reducedMotion.matches) {
+    const destination = feedback.direction * feedback.travel;
+    const animation = motion(
+      preview.page,
+      [{ transform: `translateX(${destination + offset}px)` }, { transform: `translateX(${destination}px)` }],
+      duration,
+    );
+    animation?.finished
+      .then(() => {
+        if (spacePreview === preview) clearSpacePreview();
+      })
+      .catch(() => {});
+  } else clearSpacePreview();
   if (!preserveTransition) clearSpaceTransition();
 }
 function interruptSpaceScroll({ preserveTransition = false } = {}) {
@@ -240,28 +285,46 @@ function interruptSpaceScroll({ preserveTransition = false } = {}) {
   resetSpaceFeedback({ preserveTransition });
 }
 function paintSpaceFeedback(result) {
-  const list = $('.tabs-scroll');
+  const list = visibleSpacePage();
   if (!spaceGestureFeedback) {
     clearSpaceTransition();
+    clearSpacePreview();
     elementMotions.get(list)?.cancel();
   }
   spaceGestureFeedback = { ...result, profileId: activeProfile()?.id, spaceId: state.activeSpaceId };
   if (list) {
     list.classList.add('gesture-tracking');
     list.style.transform = `translateX(${result.offset}px)`;
-    list.style.opacity = String(1 - result.progress * 0.1);
   }
   const spaces = state.spaces.filter((space) => space.profileId === activeProfile()?.id);
   const next = spaces[result.targetIndex];
   const preview = $('#space-gesture-preview');
-  if (preview) {
-    preview.hidden = !next;
-    if (next) preview.innerHTML = `${icon(next.icon || 'circle')}<span>${esc(next.name)}</span>`;
+  if (!preview || !list) return;
+  if (!next) return clearSpacePreview();
+  if (spacePreview?.spaceId !== next.id || spacePreview.state !== state) {
+    clearSpacePreview();
+    const page = document.createElement('div');
+    page.innerHTML = renderSpacePage(next);
+    inertSpacePage(page);
+    preview.append(page);
+    spacePreview = { spaceId: next.id, state, page };
   }
+  const bounds = list.getBoundingClientRect();
+  const sidebar = $('#sidebar').getBoundingClientRect();
+  Object.assign(preview.style, {
+    left: `${bounds.left - sidebar.left - result.offset}px`,
+    top: `${bounds.top - sidebar.top}px`,
+    width: `${list.clientWidth}px`,
+    height: `${list.clientHeight}px`,
+  });
+  preview.hidden = false;
+  spacePreview.page.style.transform = `translateX(${result.direction * result.travel + result.offset}px)`;
+  $('.space-preview-scroll', spacePreview.page).scrollTop = sidebarScroll.get(next.id) || 0;
+  $('.favorites', spacePreview.page).scrollTop = favoriteScroll.get(next.id) || 0;
 }
 function prepareSpaceTransition(nextId, result, gesture = false) {
   clearSpaceTransition();
-  const list = $('.tabs-scroll');
+  const list = visibleSpacePage();
   const record = {
     ...result,
     gesture,
@@ -286,13 +349,7 @@ function prepareSpaceTransition(nextId, result, gesture = false) {
     pointerEvents: 'none',
     zIndex: '40',
   });
-  const snapshot = list.cloneNode(true);
-  snapshot.classList.remove('tabs-scroll', 'gesture-tracking');
-  for (const node of [snapshot, ...snapshot.querySelectorAll('*')]) {
-    for (const attribute of [...node.attributes])
-      if (attribute.name === 'id' || attribute.name.startsWith('data-')) node.removeAttribute(attribute.name);
-    node.removeAttribute('draggable');
-  }
+  const snapshot = inertSpacePage(list.cloneNode(true));
   Object.assign(snapshot.style, {
     width: '100%',
     height: '100%',
@@ -304,7 +361,8 @@ function prepareSpaceTransition(nextId, result, gesture = false) {
   });
   wrapper.append(snapshot);
   document.body.append(wrapper);
-  snapshot.scrollTop = list.scrollTop;
+  $('.space-preview-scroll', snapshot).scrollTop = $('.tabs-scroll', list).scrollTop;
+  $('.favorites', snapshot).scrollTop = $('.favorites', list).scrollTop;
   record.wrapper = wrapper;
   record.snapshot = snapshot;
   list.style.visibility = 'hidden';
@@ -318,7 +376,7 @@ function animateSpaceTransition(
   offset = record.direction * record.travel + record.fromOffset,
   duration = record.duration,
 ) {
-  const list = $('.tabs-scroll');
+  const list = visibleSpacePage();
   if (!list || spaceTransition !== record) return;
   list.style.removeProperty('visibility');
   record.incomingDuration = duration;
@@ -342,7 +400,7 @@ function animateSpaceTransition(
 }
 function captureSpacePresentation() {
   const record = spaceTransition;
-  const list = $('.tabs-scroll');
+  const list = visibleSpacePage();
   if (record?.incoming?.playState !== 'running' || !list) return null;
   const timing = record.incoming.effect.getComputedTiming();
   return {
@@ -354,8 +412,8 @@ function captureSpacePresentation() {
   };
 }
 function restoreSpacePresentation(presentation) {
-  if (spaceTransition?.fromSpaceId === state.activeSpaceId && $('.tabs-scroll'))
-    $('.tabs-scroll').style.visibility = 'hidden';
+  if (spaceTransition?.fromSpaceId === state.activeSpaceId && visibleSpacePage())
+    visibleSpacePage().style.visibility = 'hidden';
   else if (
     spaceGestureFeedback?.spaceId === state.activeSpaceId &&
     spaceGestureFeedback.profileId === activeProfile()?.id
@@ -422,7 +480,7 @@ function onSpaceScroll(event) {
     contextKey: activeProfile()?.id,
     blocked:
       !state ||
-      ui.sidebarHidden ||
+      effectiveSidebarHidden() ||
       sidebar.inert ||
       (ui.dialog && ui.dialog !== 'command') ||
       ui.dragTab ||
@@ -564,6 +622,8 @@ reducedMotion.addEventListener('change', (event) => {
   // Finish presentation immediately when the preference changes. UI state and
   // native page geometry never wait for an animation to complete.
   for (const animation of activeMotions) animation.finish();
+  finishChromeMotion();
+  syncLayout();
 });
 function motion(element, frames, duration = 140) {
   elementMotions.get(element)?.cancel();
@@ -732,6 +792,7 @@ function applyState(next) {
     }
   }
   render();
+  maybeOpenOnboarding();
   maybeOpenBlankPalette();
   if (previousSpace && previousSpace !== state.activeSpaceId) {
     const transition = spaceTransition?.toSpaceId === state.activeSpaceId ? spaceTransition : null;
@@ -743,7 +804,7 @@ function applyState(next) {
     if (transition) animateSpaceTransition(transition);
     else
       motion(
-        $('.tabs-scroll'),
+        visibleSpacePage(),
         [
           { opacity: 0.65, transform: `translateX(${direction * $('#sidebar').clientWidth}px)` },
           { opacity: 1, transform: 'translateX(0)' },
@@ -764,21 +825,164 @@ function render() {
   if (!state) return;
   restoreFocusAround(() => {
     renderSidebar();
+    prepareSidebarKeyboard();
     renderToolbar();
     renderWorkspace();
     renderPanel();
     renderPageMenu();
     if (ui.dialog === 'command') renderCommands({ preserve: true });
     if (ui.dialog === 'shortcuts') renderShortcutRows();
+    if (ui.dialog === 'onboarding') renderOnboardingShortcuts();
   });
   syncLayout();
+}
+function sidebarKeyboardItems() {
+  return $$(
+    '#sidebar-content .space-page .favorite, #sidebar-content .space-page .folder-heading, #sidebar-content .space-page .tab-main',
+  ).filter((item) => !item.closest('[inert]') && item.getClientRects().length);
+}
+function prepareSidebarKeyboard() {
+  const items = sidebarKeyboardItems();
+  const selected =
+    items.find((item) => item.dataset.key === ui.sidebarFocusKey) ||
+    items.find((item) => item.getAttribute('aria-current') === 'page') ||
+    items[0];
+  for (const item of items) item.tabIndex = item === selected ? 0 : -1;
+  // Context menus expose row actions; avoid a close/mute stop for every tab.
+  for (const item of $$('#sidebar-content .tab-close, #sidebar-content .tab-audio')) item.tabIndex = -1;
+}
+async function focusSidebar() {
+  interruptSpaceScroll();
+  const token = ui.dialogToken;
+  const next = await invoke('state:get');
+  if (ui.dialog || token !== ui.dialogToken) return;
+  // Native tab creation can precede the batched renderer state publication.
+  // Reveal the current host tab even when this shortcut immediately follows it.
+  applyState(next);
+  const tab = activeTab();
+  if (tab?.folderId) ui.closedFolders.delete(tab.folderId);
+  if (effectiveSidebarHidden()) toggleSidebar();
+  // An explicitly hidden sidebar and a compact panel can both hide it. The
+  // focus command must resolve both causes in the same invocation.
+  if (effectiveSidebarHidden() && ui.panel) closePanel();
+  render();
+  requestAnimationFrame(() => {
+    if (ui.dialog) return;
+    const items = sidebarKeyboardItems();
+    const target =
+      items.find((item) => item.dataset.id === state.activeTabId) ||
+      items[0] ||
+      $('[data-key="space-picker"]');
+    target?.focus({ preventScroll: true });
+    target?.scrollIntoView({ block: 'nearest' });
+  });
+}
+function handleSidebarKeyboard(event) {
+  if (ui.dialog || event.ctrlKey || event.metaKey || event.altKey) return false;
+  const items = sidebarKeyboardItems();
+  const current = items.indexOf(event.target);
+  if (current < 0) return false;
+  if (event.key === 'ContextMenu' || (event.key === 'F10' && event.shiftKey)) {
+    event.preventDefault();
+    const folder = event.target.matches('.folder-heading');
+    if (folder) showFolderMenu(event.target.dataset.id);
+    else showTabMenu(event.target.dataset.id);
+    return true;
+  }
+  if (event.shiftKey) return false;
+  if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
+    event.preventDefault();
+    const next =
+      event.key === 'Home'
+        ? 0
+        : event.key === 'End'
+          ? items.length - 1
+          : Math.max(0, Math.min(items.length - 1, current + (event.key === 'ArrowDown' ? 1 : -1)));
+    items[next]?.focus();
+    items[next]?.scrollIntoView({ block: 'nearest' });
+    return true;
+  }
+  if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+    const heading = event.target.matches('.folder-heading')
+      ? event.target
+      : event.target.closest('.folder')?.querySelector('.folder-heading');
+    if (heading) {
+      event.preventDefault();
+      const id = heading.dataset.id;
+      if (event.key === 'ArrowLeft' && event.target !== heading) heading.focus();
+      else if (event.key === 'ArrowLeft' && !ui.closedFolders.has(id)) {
+        ui.closedFolders.add(id);
+        render();
+      } else if (event.key === 'ArrowRight' && ui.closedFolders.has(id)) {
+        ui.closedFolders.delete(id);
+        render();
+      } else if (event.key === 'ArrowRight') items[current + 1]?.focus();
+      return true;
+    }
+    if (event.target.matches('.favorite')) {
+      const pins = items.filter((item) => item.matches('.favorite'));
+      event.preventDefault();
+      pins[
+        Math.max(
+          0,
+          Math.min(pins.length - 1, pins.indexOf(event.target) + (event.key === 'ArrowRight' ? 1 : -1)),
+        )
+      ]?.focus();
+      return true;
+    }
+  }
+  return false;
+}
+function renderSpacePage(space) {
+  const profile = state.profiles.find((item) => item.id === space?.profileId);
+  const tabs = state.tabs.filter((tab) => tab.spaceId === space?.id);
+  const selectedTabId =
+    space?.id === state.activeSpaceId
+      ? state.activeTabId
+      : tabs.find((tab) => tab.id === space?.lastActiveTabId && !tab.closed)?.id ||
+        tabs.find((tab) => !tab.closed)?.id;
+  const pins = tabs.filter((tab) => tab.pinned);
+  const loose = tabs.filter(
+    (tab) => !tab.pinned && !tab.folderId && (tab.url !== 'zacro://newtab' || tab.homePage),
+  );
+  const folders = state.folders.filter((folder) => folder.spaceId === space?.id);
+  const tabRow = (tab) => {
+    const page = state.runtime?.pages?.[tab.id];
+    return `<div class="tab-row ${tab.id === selectedTabId ? 'active' : ''}" draggable="true" data-tab-id="${esc(tab.id)}" data-drop-tab="${esc(tab.id)}"><button type="button" class="tab-main" data-action="tab:activate" data-id="${esc(tab.id)}" data-key="tab-${esc(tab.id)}" ${tab.id === selectedTabId ? 'aria-current="page"' : ''} title="${esc(tab.title)} — ${esc(tab.url)}">${page?.loading ? '<span class="spinner"></span>' : favicon(tab.url)}<span class="title">${esc(tab.title || 'New tab')}</span>${state.runtime?.splitTabId === tab.id ? icon('split') : ''}</button>${page?.audible || page?.muted ? button('tab:mute', page.muted ? 'Unmute tab' : 'Mute tab', page.muted ? 'muted' : 'volume', `data-id="${esc(tab.id)}"`, 'tab-audio') : ''}${button('tab:close', `Close ${tab.title || 'tab'}`, 'close', `data-id="${esc(tab.id)}" data-key="close-${esc(tab.id)}"`, 'tab-close')}</div>`;
+  };
+  return `${
+    pins.length
+      ? `<div class="favorites" aria-label="Pinned tabs" data-drop-pinned>${pins
+          .map((tab) => {
+            const page = state.runtime?.pages?.[tab.id];
+            const status = page?.closed || tab.closed ? 'Closed' : page?.loaded ? 'Loaded' : 'Sleeping';
+            return `<button type="button" class="favorite ${tab.id === selectedTabId ? 'active' : ''} ${status.toLowerCase()}" draggable="true" data-tab-id="${esc(tab.id)}" data-drop-tab="${esc(tab.id)}" data-action="tab:activate" data-id="${esc(tab.id)}" data-key="pin-${esc(tab.id)}" ${tab.id === selectedTabId ? 'aria-current="page"' : ''} aria-label="${esc(tab.title || hostname(tab.url))} — ${status}" title="${esc(tab.title)} — ${status}${status === 'Loaded' ? '' : ' · Click to open'}\n${esc(tab.url)}">${favicon(tab.url, tab.id)}</button>`;
+          })
+          .join('')}</div>`
+      : '<div class="favorites favorites-empty" aria-label="Pinned tabs" data-drop-pinned><span class="pin-drop-hint">Drop to pin</span></div>'
+  }<div class="tabs-scroll">
+    <div class="space-header"><button type="button" class="space-picker" data-action="ui:spaces" data-key="space-picker" aria-label="Switch Space or profile" title="${esc(space?.name)} · ${esc(profile?.name)}${profile?.private ? ' · Private session' : ''}">${icon(profile?.private ? 'shield' : space?.icon || 'circle')}<span class="space-title">${esc(space?.name || 'My Space')}</span>${profile?.private ? '<span class="private-indicator">Private</span>' : ''}${icon('down')}</button></div>
+    ${folders
+      .map(
+        (folder) =>
+          `<div class="folder" data-folder-id="${esc(folder.id)}" data-drop-folder="${esc(folder.id)}"><button type="button" class="folder-heading" data-action="ui:folder-toggle" data-id="${esc(folder.id)}" data-key="folder-${esc(folder.id)}" aria-expanded="${!ui.closedFolders.has(folder.id)}"><span class="folder-icon">${icon('folder')}${icon('down')}</span><span class="truncate">${esc(folder.name)}</span><span class="folder-count">${tabs.filter((t) => t.folderId === folder.id).length}</span></button>${
+            ui.closedFolders.has(folder.id)
+              ? ''
+              : `<div class="folder-tabs">${
+                  tabs
+                    .filter((t) => t.folderId === folder.id && !t.pinned)
+                    .map(tabRow)
+                    .join('') || '<div class="empty-tabs">Drop tabs here</div>'
+                }</div>`
+          }</div>`,
+      )
+      .join('')}
+    <div class="loose-tabs" data-drop-folder="">${loose.map(tabRow).join('')}</div></div>`;
 }
 function renderSidebar() {
   const space = activeSpace();
   const profile = activeProfile();
   const tabs = currentTabs();
-  const pins = tabs.filter((t) => t.pinned);
-  const loose = tabs.filter((t) => !t.pinned && !t.folderId && (t.url !== 'zacro://newtab' || t.homePage));
   const folders = state.folders.filter((f) => f.spaceId === space?.id);
   const spaces = state.spaces.filter((s) => s.profileId === profile?.id);
   const signature = JSON.stringify([
@@ -804,9 +1008,15 @@ function renderSidebar() {
   ]);
   if (signature === ui.sidebarSignature) return;
   ui.sidebarSignature = signature;
-  if (ui.sidebarSpaceId) sidebarScroll.set(ui.sidebarSpaceId, $('.tabs-scroll')?.scrollTop || 0);
+  if (ui.sidebarSpaceId) {
+    sidebarScroll.set(ui.sidebarSpaceId, $('.tabs-scroll')?.scrollTop || 0);
+    favoriteScroll.set(ui.sidebarSpaceId, $('.favorites')?.scrollTop || 0);
+  }
   for (const id of sidebarScroll.keys())
-    if (!state.spaces.some((item) => item.id === id)) sidebarScroll.delete(id);
+    if (!state.spaces.some((item) => item.id === id)) {
+      sidebarScroll.delete(id);
+      favoriteScroll.delete(id);
+    }
   const scroll = sidebarScroll.get(space?.id) || 0;
   const oldRows = new Map(
     $$('[data-tab-id]', $('#sidebar')).map((row) => [row.dataset.tabId, row.getBoundingClientRect().top]),
@@ -827,44 +1037,14 @@ function renderSidebar() {
       });
     else clearSpaceTransition();
   }
-  const tabRow = (tab) => {
-    const page = state.runtime?.pages?.[tab.id];
-    return `<div class="tab-row ${tab.id === state.activeTabId ? 'active' : ''}" draggable="true" data-tab-id="${esc(tab.id)}" data-drop-tab="${esc(tab.id)}"><button type="button" class="tab-main" data-action="tab:activate" data-id="${esc(tab.id)}" data-key="tab-${esc(tab.id)}" ${tab.id === state.activeTabId ? 'aria-current="page"' : ''} title="${esc(tab.title)} — ${esc(tab.url)}">${page?.loading ? '<span class="spinner"></span>' : favicon(tab.url)}<span class="title">${esc(tab.title || 'New tab')}</span>${state.runtime?.splitTabId === tab.id ? icon('split') : ''}</button>${page?.audible || page?.muted ? button('tab:mute', page.muted ? 'Unmute tab' : 'Mute tab', page.muted ? 'muted' : 'volume', `data-id="${esc(tab.id)}"`, 'tab-audio') : ''}${button('tab:close', `Close ${tab.title || 'tab'}`, 'close', `data-id="${esc(tab.id)}" data-key="close-${esc(tab.id)}"`, 'tab-close')}</div>`;
-  };
-  $('#sidebar-content').innerHTML = `${
-    pins.length
-      ? `<div class="favorites" aria-label="Pinned tabs" data-drop-pinned>${pins
-          .map((tab) => {
-            const page = state.runtime?.pages?.[tab.id];
-            const status = page?.closed || tab.closed ? 'Closed' : page?.loaded ? 'Loaded' : 'Sleeping';
-            return `<button type="button" class="favorite ${tab.id === state.activeTabId ? 'active' : ''} ${status.toLowerCase()}" draggable="true" data-tab-id="${esc(tab.id)}" data-drop-tab="${esc(tab.id)}" data-action="tab:activate" data-id="${esc(tab.id)}" data-key="pin-${esc(tab.id)}" ${tab.id === state.activeTabId ? 'aria-current="page"' : ''} aria-label="${esc(tab.title || hostname(tab.url))} — ${status}" title="${esc(tab.title)} — ${status}${status === 'Loaded' ? '' : ' · Click to open'}\n${esc(tab.url)}">${favicon(tab.url, tab.id)}<span class="favorite-status" aria-hidden="true">${status === 'Sleeping' ? icon('moon') : ''}</span></button>`;
-          })
-          .join('')}</div>`
-      : '<div class="favorites favorites-empty" aria-label="Pinned tabs" data-drop-pinned><span class="pin-drop-hint">Drop to pin</span></div>'
-  }<div class="tabs-scroll">
-    <div class="space-header"><button type="button" class="space-picker" data-action="ui:spaces" data-key="space-picker" aria-label="Switch Space or profile" title="${esc(space?.name)} · ${esc(profile?.name)}${profile?.private ? ' · Private session' : ''}">${icon(profile?.private ? 'shield' : space?.icon || 'circle')}<span class="space-title">${esc(space?.name || 'My Space')}</span>${profile?.private ? '<span class="private-indicator">Private</span>' : ''}${icon('down')}</button></div>
-    ${folders
-      .map(
-        (folder) =>
-          `<div class="folder" data-folder-id="${esc(folder.id)}" data-drop-folder="${esc(folder.id)}"><button type="button" class="folder-heading" data-action="ui:folder-toggle" data-id="${esc(folder.id)}" data-key="folder-${esc(folder.id)}" aria-expanded="${!ui.closedFolders.has(folder.id)}"><span class="folder-icon">${icon('folder')}${icon('down')}</span><span class="truncate">${esc(folder.name)}</span><span class="folder-count">${tabs.filter((t) => t.folderId === folder.id).length}</span></button>${
-            ui.closedFolders.has(folder.id)
-              ? ''
-              : `<div class="folder-tabs">${
-                  tabs
-                    .filter((t) => t.folderId === folder.id && !t.pinned)
-                    .map(tabRow)
-                    .join('') || '<div class="empty-tabs">Drop tabs here</div>'
-                }</div>`
-          }</div>`,
-      )
-      .join('')}
-    <div class="loose-tabs" data-drop-folder="">${loose.map(tabRow).join('')}</div></div>
-    <footer class="sidebar-footer">${button('ui:library', 'Library', 'library', 'data-key="library" aria-haspopup="dialog"')}<div class="space-dots" aria-label="Your Spaces">${spaces.map((s) => `<button type="button" class="space-dot ${s.id === space?.id ? 'active' : ''}" data-action="space:activate" data-id="${esc(s.id)}" title="${esc(s.name)}" aria-label="Switch to ${esc(s.name)}" ${s.id === space?.id ? 'aria-current="true"' : ''}>${icon(s.icon || 'circle')}</button>`).join('')}</div>${button('ui:add-menu', 'New tab, folder or Space', 'plus', 'data-key="add-menu" aria-haspopup="dialog"')}</footer>`;
+  $('#sidebar-content').innerHTML = `<div class="space-page">${renderSpacePage(space)}</div>
+    <footer class="sidebar-footer">${button('ui:library', 'Library', 'library', 'data-key="library" aria-haspopup="dialog"')}<div class="space-dots" aria-label="Your Spaces">${spaces.map((s) => `<button type="button" class="space-dot ${s.id === space?.id ? 'active' : ''}" data-action="space:activate" data-id="${esc(s.id)}" data-key="space-${esc(s.id)}" aria-haspopup="dialog" title="${esc(s.name)}" aria-label="Switch to ${esc(s.name)}" ${s.id === space?.id ? 'aria-current="true"' : ''}>${icon(s.icon || 'circle')}</button>`).join('')}</div>${button('ui:add-menu', 'New tab, folder or Space', 'plus', 'data-key="add-menu" aria-haspopup="dialog"')}</footer>`;
   for (const dot of $$('.space-dot')) {
     const color = spaces.find((item) => item.id === dot.dataset.id)?.color;
     if (/^#[\da-f]{6}$/i.test(color || '')) dot.style.setProperty('--dot-color', color);
   }
   $('.tabs-scroll').scrollTop = scroll;
+  $('.favorites').scrollTop = favoriteScroll.get(space?.id) || 0;
   restoreSpacePresentation(presentation);
   if (!sameSpace) $('.space-dot.active')?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
   if (sameSpace && !spaceGestureFeedback && !spaceTransition)
@@ -890,6 +1070,7 @@ function renderSidebar() {
   ui.sidebarSpaceId = space?.id;
 }
 function renderToolbar() {
+  const sidebarHidden = effectiveSidebarHidden();
   const tab = state.runtime?.peek
     ? { ...activeTab(), url: state.runtime.peek.url, title: state.runtime.peek.title }
     : activeTab();
@@ -908,22 +1089,22 @@ function renderToolbar() {
     state.runtime?.maximized,
     state.runtime?.fullScreen,
     ui.panel,
-    ui.sidebarHidden,
+    sidebarHidden,
     state.runtime?.shortcuts,
   ]);
   if (signature === ui.toolbarSignature) return;
   ui.toolbarSignature = signature;
   const toolbar = $('#toolbar');
-  const parent = ui.sidebarHidden ? $('.main') : $('#sidebar');
+  const parent = sidebarHidden ? $('.main') : $('#sidebar');
   if (toolbar.parentElement !== parent) parent.prepend(toolbar);
   const controls =
     !isMac && !state.runtime?.fullScreen
       ? `<div class="window-controls">${button('window:minimize', 'Minimize', 'minimize')}${button('window:maximize', 'Maximize or restore', state.runtime?.maximized ? 'restore' : 'maximize')}${button('window:close', 'Close window', 'close', '', 'close-window')}</div>`
       : '';
-  $('#captionbar').innerHTML = ui.sidebarHidden ? '' : controls;
-  $('#captionbar').hidden = ui.sidebarHidden || !controls;
+  $('#captionbar').innerHTML = sidebarHidden ? '' : controls;
+  $('#captionbar').hidden = sidebarHidden || !controls;
   $('#toolbar').innerHTML =
-    `<div class="navigation">${!isMac ? `<button type="button" class="brand-button" data-action="ui:menu" data-key="browser-menu" aria-label="Browser menu" title="Zacro menu">${mark}</button>` : ''}${button('ui:sidebar-toggle', shortcutLabel(`${ui.sidebarHidden ? 'Show' : 'Hide'} sidebar`, 'sidebar-toggle', 'Mod+S'), 'sidebar', `data-key="sidebar-toggle" aria-pressed="${!ui.sidebarHidden}"`)}<span class="navigation-spacer"></span>${button('back', shortcutLabel('Back', 'history-back', isMac ? 'Mod+[' : 'Alt+Left'), 'back', `data-key="back" ${page.canGoBack ? '' : 'disabled'}`)}${button('forward', shortcutLabel('Forward', 'history-forward', isMac ? 'Mod+]' : 'Alt+Right'), 'forward', `data-key="forward" ${page.canGoForward ? '' : 'disabled'}`)}${button(page.loading ? 'stop' : 'reload', page.loading ? 'Stop loading' : shortcutLabel('Reload', 'reload', 'Mod+R'), page.loading ? 'close' : 'reload', `data-key="reload" ${blank ? 'disabled' : ''}`)}</div><div class="address-row"><button type="button" class="address-button" data-action="ui:address" data-key="address" title="${esc(tab?.url || 'Search or enter a URL')}" aria-label="Address bar: ${esc(tab?.url || 'New tab')}">${icon(blank ? 'search' : secure ? 'lock' : 'globe')}<span class="address-text">${esc(blank ? 'Search or enter URL' : ui.sidebarHidden ? displayURL(tab.url) : hostname(tab.url))}</span></button>${button('ui:page-menu', 'Page actions', 'more', 'data-key="page-menu" aria-haspopup="dialog"')}</div>${ui.sidebarHidden ? controls : ''}`;
+    `<div class="navigation"><span class="navigation-spacer"></span>${button('back', shortcutLabel('Back', 'history-back', isMac ? 'Mod+[' : 'Alt+Left'), 'back', `data-key="back" ${page.canGoBack ? '' : 'disabled'}`)}${button('forward', shortcutLabel('Forward', 'history-forward', isMac ? 'Mod+]' : 'Alt+Right'), 'forward', `data-key="forward" ${page.canGoForward ? '' : 'disabled'}`)}${button(page.loading ? 'stop' : 'reload', page.loading ? 'Stop loading' : shortcutLabel('Reload', 'reload', 'Mod+R'), page.loading ? 'close' : 'reload', `data-key="reload" ${blank ? 'disabled' : ''}`)}</div><div class="address-row"><button type="button" class="address-button" data-action="ui:address" data-key="address" title="${esc(tab?.url || 'Search or enter a URL')}" aria-label="Address bar: ${esc(tab?.url || 'New tab')}">${icon(blank ? 'search' : secure ? 'lock' : 'globe')}<span class="address-text">${esc(blank ? 'Search or enter URL' : sidebarHidden ? displayURL(tab.url) : hostname(tab.url))}</span></button>${button('ui:page-menu', 'Page actions', 'more', 'data-key="page-menu" aria-haspopup="dialog"')}</div>${sidebarHidden ? controls : ''}`;
 }
 function renderWorkspace() {
   const tab = activeTab();
@@ -941,7 +1122,7 @@ function renderWorkspace() {
     currentTabs().filter((tab) => tab.pinned),
     state.settings.searchEngine,
     activeProfile()?.private,
-    ui.sidebarHidden,
+    effectiveSidebarHidden(),
   ]);
   if (tab?.homePage && signature !== ui.homeSignature) {
     ui.homeSignature = signature;
@@ -980,8 +1161,8 @@ function renderHome() {
   const focused = document.activeElement?.id === 'home-query';
   const profile = activeProfile();
   const pins = currentTabs().filter((tab) => tab.pinned);
-  const seen = new Set(ui.sidebarHidden ? [] : pins.map((tab) => tab.url));
-  const links = [...(ui.sidebarHidden ? pins : []), ...profileItems('bookmarks')]
+  const seen = new Set(effectiveSidebarHidden() ? [] : pins.map((tab) => tab.url));
+  const links = [...(effectiveSidebarHidden() ? pins : []), ...profileItems('bookmarks')]
     .filter((item) => {
       if (seen.has(item.url)) return false;
       seen.add(item.url);
@@ -1006,30 +1187,93 @@ function renderHome() {
 }
 
 let lastLayout = '';
+function expandedSidebarWidth() {
+  const gutter = state?.settings.pageGutter ?? 8;
+  return Math.min(
+    Math.max(200, Math.min(380, Number(state?.settings.sidebarWidth) || 224)),
+    Math.max(0, innerWidth - 240 - gutter * 2),
+  );
+}
+function effectiveSidebarHidden() {
+  const gutter = state?.settings.pageGutter ?? 8;
+  return (
+    ui.sidebarHidden || Boolean(ui.panel && innerWidth < expandedSidebarWidth() + 288 + 240 + gutter * 2)
+  );
+}
+function chromeTargets() {
+  const sidebar = effectiveSidebarHidden() ? 0 : expandedSidebarWidth();
+  const gutter = state?.settings.pageGutter ?? 8;
+  return {
+    sidebar,
+    panel: ui.panel ? Math.min(336, Math.max(0, innerWidth - sidebar - 240 - gutter * 2)) : 0,
+  };
+}
+function currentChromeWidths() {
+  const targets = chromeTargets();
+  return {
+    sidebar: ui.sidebarAnimationWidth ?? targets.sidebar,
+    panel: ui.panelAnimationWidth ?? targets.panel,
+  };
+}
+function finishChromeMotion() {
+  cancelAnimationFrame(ui.chromeAnimationFrame);
+  ui.chromeAnimationFrame = null;
+  ui.sidebarAnimationWidth = null;
+  ui.panelAnimationWidth = null;
+}
+function animateChrome(start) {
+  finishChromeMotion();
+  const target = chromeTargets();
+  if (reducedMotion.matches || (start.sidebar === target.sidebar && start.panel === target.panel)) {
+    render();
+    return;
+  }
+  ui.sidebarAnimationWidth = start.sidebar;
+  ui.panelAnimationWidth = start.panel;
+  const duration = 220 * (state.settings.motionScale || 1);
+  const started = performance.now();
+  render();
+  const tick = (now) => {
+    const progress = Math.min(1, (now - started) / duration);
+    if (progress === 1 || reducedMotion.matches) {
+      finishChromeMotion();
+      syncLayout();
+      return;
+    }
+    // One monotonic ease for both chrome rails. Reversals start at the current
+    // displayed widths and native pages follow each sample without snapshots.
+    const eased = 1 - Math.pow(1 - progress, 3);
+    ui.sidebarAnimationWidth = Math.round(start.sidebar + (target.sidebar - start.sidebar) * eased);
+    ui.panelAnimationWidth = Math.round(start.panel + (target.panel - start.panel) * eased);
+    syncLayout();
+    ui.chromeAnimationFrame = requestAnimationFrame(tick);
+  };
+  ui.chromeAnimationFrame = requestAnimationFrame(tick);
+}
 function syncLayout() {
   if (!state) return;
-  const width =
-    ui.sidebarAnimationWidth ??
-    (ui.sidebarHidden ? 0 : Math.max(200, Math.min(380, Number(state.settings.sidebarWidth) || 224)));
+  const { sidebar: width, panel } = currentChromeWidths();
   const gutter = state.settings.pageGutter ?? 8;
-  const panel = ui.panel
-    ? Math.min(
-        Math.max(0, window.innerWidth - width - 316),
-        Math.max(288, Math.min(336, window.innerWidth - width - 328)),
-      )
-    : 0;
-  const contentTop =
-    ui.sidebarHidden || !$('#findbar').hidden ? 40 : isMac || state.runtime?.fullScreen ? gutter : 36;
+  const hidden = effectiveSidebarHidden();
+  if (ui.panel) ui.panelExpandedWidth = chromeTargets().panel;
+  const contentTop = hidden || !$('#findbar').hidden ? 40 : isMac || state.runtime?.fullScreen ? gutter : 36;
   $('#app').dataset.panelOpen = String(Boolean(ui.panel));
-  $('#app').dataset.sidebarHidden = String(ui.sidebarHidden);
+  $('#app').dataset.sidebarHidden = String(hidden);
   $('#app').dataset.sidebarAnimating = String(ui.sidebarAnimationWidth != null);
+  $('#app').dataset.panelAnimating = String(ui.panelAnimationWidth != null);
+  $('#app').dataset.compactCanvas = String(innerWidth - width - panel - gutter * 2 < 420);
   $('#app').dataset.dialog = ui.dialog || '';
-  $('#sidebar').inert = ui.sidebarHidden || Boolean(ui.dialog && ui.dialog !== 'command');
-  $('#sidebar').setAttribute('aria-hidden', String(ui.sidebarHidden));
+  $('#sidebar').inert = hidden || Boolean(ui.dialog && ui.dialog !== 'command');
+  $('#sidebar').setAttribute('aria-hidden', String(hidden));
+  $('#side-panel').hidden = !ui.panel && panel === 0;
+  $('#side-panel').inert = !ui.panel || Boolean(ui.dialog);
+  $('#side-panel').setAttribute('aria-hidden', String(!ui.panel));
   document.documentElement.style.setProperty('--sidebar', `${width}px`);
+  document.documentElement.style.setProperty('--sidebar-expanded', `${expandedSidebarWidth()}px`);
   document.documentElement.style.setProperty('--panel', `${panel}px`);
+  document.documentElement.style.setProperty('--panel-expanded', `${ui.panelExpandedWidth || 336}px`);
   document.documentElement.style.setProperty('--page-top', `${contentTop}px`);
-  document.documentElement.style.setProperty('--canvas-right', `${panel ? panel + gutter * 2 : gutter}px`);
+  document.documentElement.style.setProperty('--canvas-right', `${panel + gutter}px`);
   const layout = {
     sidebarWidth: width,
     panelWidth: panel,
@@ -1057,8 +1301,7 @@ const panelNames = {
 };
 function panelHeader() {
   const [symbol, title] = panelNames[ui.panel] || ['info', 'Library'];
-  const library = ['bookmarks', 'history', 'downloads', 'archive'].includes(ui.panel);
-  return `<header class="panel-header">${icon(symbol)}<h2 id="panel-title" tabindex="-1">${title}</h2>${ui.panel === 'ai' ? button('ui:ai-reset', 'New conversation', 'plus') : ''}${button('ui:panel-close', 'Close panel', 'close', 'data-key="panel-close"')}</header>${library ? `<nav class="panel-tabs" aria-label="Library sections">${['bookmarks', 'history', 'downloads', 'archive'].map((panel) => button('ui:panel', panelNames[panel][1], panelNames[panel][0], `data-panel="${panel}" data-key="panel-${panel}" aria-pressed="${ui.panel === panel}"`)).join('')}</nav>` : ''}`;
+  return `<header class="panel-header">${icon(symbol)}<h2 id="panel-title" tabindex="-1">${title}</h2><span class="panel-owner" aria-hidden="true">Zacro</span>${ui.panel === 'ai' ? button('ui:ai-reset', 'New conversation', 'plus') : ''}${button('ui:panel-close', 'Close panel', 'close', 'data-key="panel-close"')}</header><nav class="panel-tabs" aria-label="Browser panels">${['bookmarks', 'history', 'downloads', 'archive', 'ai', 'settings'].map((panel) => button('ui:panel', panelNames[panel][1], panelNames[panel][0], `data-panel="${panel}" data-key="panel-${panel}" aria-pressed="${ui.panel === panel}"`)).join('')}</nav>`;
 }
 function patchAIContent(current, incoming) {
   // Keep the composer, native select, focused controls, and unchanged messages
@@ -1104,7 +1347,7 @@ function patchAIContent(current, incoming) {
 }
 function renderPanel(force = false) {
   const element = $('#side-panel');
-  element.hidden = !ui.panel;
+  element.hidden = !ui.panel && !(ui.panelAnimationWidth > 0);
   if (!ui.panel) return;
   element.setAttribute('aria-label', panelNames[ui.panel][1]);
   const data =
@@ -1730,26 +1973,19 @@ function renderAI() {
 }
 function openPanel(panel, { refreshStatus = true } = {}) {
   if (!panelNames[panel]) return;
+  interruptSpaceScroll();
   if (ui.dialog) closeDialog();
-  const changed = ui.panel !== panel;
+  const start = currentChromeWidths();
   if (!ui.panel || !$('#side-panel').contains(document.activeElement)) ui.panelReturn = focusDescriptor();
   ui.panelMotion = (ui.panelMotion || 0) + 1;
   $('#side-panel')
     .getAnimations()
     .forEach((animation) => animation.cancel());
   ui.panel = panel;
+  ui.lastPanel = panel;
   ui.panelQuery = '';
   ui.panelSignature = '';
-  render();
-  if (changed)
-    motion(
-      $('#side-panel'),
-      [
-        { opacity: 0.65, transform: 'translateX(6px)' },
-        { opacity: 1, transform: 'translateX(0)' },
-      ],
-      140,
-    );
+  animateChrome(start);
   const profileId = activeProfile()?.id;
   const providerSerial = ui.aiProviderSerial;
   if (refreshStatus && (panel === 'ai' || panel === 'settings'))
@@ -1769,6 +2005,7 @@ function openPanel(panel, { refreshStatus = true } = {}) {
 }
 function closePanel() {
   if (!ui.panel) return;
+  const start = currentChromeWidths();
   ui.panelMotion = (ui.panelMotion || 0) + 1;
   $('#side-panel')
     .getAnimations()
@@ -1777,11 +2014,14 @@ function closePanel() {
   ui.panel = null;
   ui.panelSignature = '';
   ui.panelReturn = null;
-  render();
+  animateChrome(start);
   restoreFocus(focus);
   maybeOpenBlankPalette();
 }
 function openDialog(kind, html, { title, focus } = {}) {
+  // The native page snapshot and its clipped shell frame must use the same
+  // settled bounds, even when a shortcut interrupts a moving chrome rail.
+  finishChromeMotion();
   stopShortcutRecording();
   if (ui.themePreview) {
     ui.themePreview = null;
@@ -1857,6 +2097,10 @@ function openPopover(kind, html, { title, anchor } = {}) {
 }
 function dismissDialog() {
   if (!ui.dialog) return;
+  if (ui.dialog === 'onboarding') {
+    safely(finishOnboarding());
+    return;
+  }
   // Closing returns the live document and keyboard focus in this turn. An
   // outro would otherwise hold the native page behind its captured backdrop.
   closeDialog();
@@ -2000,8 +2244,8 @@ function showMenu() {
     `<button type="button" class="context-action" data-action="${name}">${icon(symbol)}${label}${key ? `<kbd>${key}</kbd>` : ''}</button>`;
   openPopover(
     'menu',
-    `<div class="dialog-body">${action('ui:new-tab', 'New tab', 'plus', shortcutFor('command-palette', 'Mod+T'))}${action('ui:new-private', 'New private session', 'shield')}${action('ui:spaces', 'Spaces & profiles', 'user')}<hr class="context-separator">${action('ui:find', 'Find on page', 'search', shortcutFor('find', 'Mod+F'))}${action('ui:zoom-in', 'Zoom in', 'plus', shortcut('Mod+='))}${action('ui:zoom-out', 'Zoom out', 'minimize', shortcut('Mod+−'))}${action('ui:zoom-reset', 'Reset zoom', 'monitor', shortcut('Mod+0'))}${action('ui:print', 'Print page', 'print', shortcutFor('print', 'Mod+P'))}${action('ui:devtools', 'Developer tools', 'terminal')}<hr class="context-separator">${action('ui:extensions', 'Extensions', 'extension')}${action('ui:settings', 'Settings', 'settings')}${action('ui:shortcuts', 'Keyboard shortcuts', 'keyboard')}${action('ui:home-page', 'Home page', 'monitor')}${action('ui:about', 'About Zacro', 'info')}</div>`,
-    { title: 'Browser menu', anchor: $('[data-key="browser-menu"]') },
+    `<div class="dialog-body">${action('ui:new-tab', 'New tab', 'plus', shortcutFor('command-palette', 'Mod+T'))}${action('ui:new-private', 'New private session', 'shield')}${action('ui:spaces', 'Spaces & profiles', 'user')}<hr class="context-separator">${action('ui:find', 'Find on page', 'search', shortcutFor('find', 'Mod+F'))}${action('ui:zoom-in', 'Zoom in', 'plus', shortcut('Mod+='))}${action('ui:zoom-out', 'Zoom out', 'minimize', shortcut('Mod+−'))}${action('ui:zoom-reset', 'Reset zoom', 'monitor', shortcut('Mod+0'))}${action('ui:print', 'Print page', 'print', shortcutFor('print', 'Mod+P'))}${action('ui:devtools', 'Developer tools', 'terminal')}<hr class="context-separator">${action('ui:extensions', 'Extensions', 'extension')}${action('ui:settings', 'Settings', 'settings')}${action('ui:shortcuts', 'Keyboard shortcuts', 'keyboard')}${action('ui:onboarding', 'Welcome tour', 'sparkle')}${action('ui:home-page', 'Home page', 'monitor')}${action('ui:about', 'About Zacro', 'info')}</div>`,
+    { title: 'Browser menu', anchor: $('[data-key="page-menu"]') },
   );
 }
 function showAddMenu() {
@@ -2021,7 +2265,7 @@ function showPageMenu() {
     `<button type="button" class="context-action" data-action="${name}" ${attrs}>${icon(symbol)}<span>${label}</span>${key ? `<kbd>${key}</kbd>` : ''}</button>`;
   openPopover(
     'page-actions',
-    `<div class="dialog-body">${action('ui:bookmark', saved ? 'Remove bookmark' : 'Bookmark this page', 'star', `data-key="bookmark" aria-pressed="${saved}" ${blank ? 'disabled' : ''}`, shortcutFor('bookmark', 'Mod+D'))}${action('ui:split', state.runtime?.splitTabId ? 'Close split view' : 'Split view', 'split', 'data-key="split"')}${action('ui:find', 'Find on page', 'search', blank ? 'disabled' : '', shortcutFor('find', 'Mod+F'))}${action('ui:print', 'Print page', 'print', blank ? 'disabled' : '', shortcutFor('print', 'Mod+P'))}<hr class="context-separator"><div class="menu-zoom" aria-label="Page zoom">${button('ui:zoom-out', 'Zoom out', 'minimize')}${action('ui:zoom-reset', `${Math.round((state.runtime?.page?.zoom || 1) * 100)}%`, 'monitor')}${button('ui:zoom-in', 'Zoom in', 'plus')}</div></div>`,
+    `<div class="dialog-body">${action('ui:bookmark', saved ? 'Remove bookmark' : 'Bookmark this page', 'star', `data-key="bookmark" aria-pressed="${saved}" ${blank ? 'disabled' : ''}`, shortcutFor('bookmark', 'Mod+D'))}${action('ui:split', state.runtime?.splitTabId ? 'Close split view' : 'Split view', 'split', 'data-key="split"')}${action('ui:find', 'Find on page', 'search', blank ? 'disabled' : '', shortcutFor('find', 'Mod+F'))}${action('ui:print', 'Print page', 'print', blank ? 'disabled' : '', shortcutFor('print', 'Mod+P'))}<hr class="context-separator"><div class="menu-zoom" aria-label="Page zoom">${button('ui:zoom-out', 'Zoom out', 'minimize')}${action('ui:zoom-reset', `${Math.round((state.runtime?.page?.zoom || 1) * 100)}%`, 'monitor')}${button('ui:zoom-in', 'Zoom in', 'plus')}</div><hr class="context-separator">${action('external:open', 'Open in default browser', 'external', `data-key="external-page" data-url="${esc(blank ? '' : tab.url)}" ${blank ? 'disabled' : ''}`)}${action('ui:menu', 'Browser menu', 'more', '', shortcutFor('browser-menu', 'F10'))}</div>`,
     { title: 'Page actions', anchor: $('[data-key="page-menu"]') },
   );
 }
@@ -2040,47 +2284,57 @@ function renderPageMenu() {
     ? 'Close split view'
     : 'Split view';
   for (const action of ['ui:find', 'ui:print']) $(`[data-action="${action}"]`, root).disabled = blank;
+  const external = $('[data-key="external-page"]', root);
+  external.disabled = blank;
+  external.dataset.url = blank ? '' : tab.url;
   $('[data-action="ui:zoom-reset"] span', root).textContent =
     `${Math.round((state.runtime?.page?.zoom || 1) * 100)}%`;
 }
 function showLibrary() {
-  openPopover(
-    'library',
-    `<div class="dialog-body">${['bookmarks', 'history', 'downloads', 'archive'].map((panel) => `<button type="button" class="context-action" data-action="ui:panel" data-panel="${panel}" data-key="panel-${panel}">${icon(panelNames[panel][0])}<span>${panelNames[panel][1]}</span>${panel === 'history' ? `<kbd>${shortcutFor('history', isMac ? 'Mod+Y' : 'Mod+H')}</kbd>` : panel === 'downloads' ? `<kbd>${shortcutFor('downloads', isMac ? 'Mod+Shift+J' : 'Mod+J')}</kbd>` : ''}</button>`).join('')}<hr class="context-separator">${['ai', 'settings'].map((panel) => `<button type="button" class="context-action" data-action="ui:panel" data-panel="${panel}" data-key="panel-${panel}">${icon(panelNames[panel][0])}<span>${panelNames[panel][1]}</span>${panel === 'settings' ? `<kbd>${shortcutFor('preferences', 'Mod+,')}</kbd>` : ''}</button>`).join('')}<hr class="context-separator"><button type="button" class="context-action" data-action="ui:home-page">${icon('monitor')}<span>Home page</span></button></div>`,
-    { title: 'Library', anchor: $('[data-key="library"]') },
-  );
+  // Library is browser chrome, not an overlay over the page. Keep the native
+  // web surface alive and crisp instead of replacing it with a captured JPEG.
+  openPanel(ui.lastPanel || 'bookmarks');
 }
 function toggleSidebar(fromPage = false) {
   interruptSpaceScroll();
   if (ui.dialog) closeDialog({ restore: false });
-  const start = ui.sidebarAnimationWidth ?? (ui.sidebarHidden ? 0 : state.settings.sidebarWidth || 224);
-  cancelAnimationFrame(ui.sidebarAnimationFrame);
+  if (!ui.sidebarHidden && effectiveSidebarHidden() && ui.panel) {
+    closePanel();
+    if (fromPage) safely(invoke('page:focus'));
+    return;
+  }
+  const start = currentChromeWidths();
   ui.sidebarHidden = !ui.sidebarHidden;
-  const target = ui.sidebarHidden ? 0 : state.settings.sidebarWidth || 224;
-  const duration = 240 * (state.settings.motionScale || 1);
-  const started = performance.now();
-  ui.sidebarAnimationWidth = reducedMotion.matches ? null : start;
-  render();
-  const tick = (now) => {
-    const progress = Math.min(1, (now - started) / duration);
-    if (progress === 1 || reducedMotion.matches) {
-      ui.sidebarAnimationWidth = null;
-      syncLayout();
-      return;
-    }
-    // A critically quick approach with one small rebound; native and shell
-    // geometry follow the same samples, with no screenshots or lost page state.
-    // Ease into the spring so a closing sidebar stays perceptible instead of
-    // collapsing within its first few frames, then retain the small rebound.
-    const springTime = progress * progress;
-    const spring = 1 - Math.exp(-7.5 * springTime) * Math.cos(10 * springTime);
-    ui.sidebarAnimationWidth = Math.round(Math.max(0, Math.min(380, start + (target - start) * spring)));
-    syncLayout();
-    ui.sidebarAnimationFrame = requestAnimationFrame(tick);
-  };
-  if (!reducedMotion.matches) ui.sidebarAnimationFrame = requestAnimationFrame(tick);
+  animateChrome(start);
   if (fromPage) safely(invoke('page:focus'));
-  else $('[data-key="sidebar-toggle"]')?.focus({ preventScroll: true });
+  else $('[data-key="address"]')?.focus({ preventScroll: true });
+}
+function showSpaceMenu(id) {
+  const space = state.spaces.find((item) => item.id === id && item.profileId === activeProfile()?.id);
+  if (!space) return;
+  const anchor = $(`.space-dot[data-id="${CSS.escape(id)}"]`);
+  anchor?.focus({ preventScroll: true });
+  const tab = activeTab();
+  const canMove = tab?.spaceId !== id && tab?.profileId === space.profileId && tab?.url !== 'zacro://newtab';
+  const onlySpace = state.spaces.filter((item) => item.profileId === space.profileId).length === 1;
+  const action = (name, label, symbol, attributes = '') =>
+    `<button type="button" class="context-action" data-action="${name}" data-id="${esc(id)}" ${attributes}>${icon(symbol)}${esc(label)}</button>`;
+  openPopover(
+    'menu',
+    `<div class="dialog-body"><div class="section-label truncate">${esc(space.name)}</div>${
+      id !== state.activeSpaceId ? action('ui:switch-space', 'Switch to Space', 'arrow') : ''
+    }${action('ui:edit-space', 'Customize Space', 'settings')}${action('ui:rename-space', 'Rename Space', 'edit')}${
+      canMove
+        ? action('ui:space-move-tab', 'Move current tab here', 'folder', `data-source-tab="${esc(tab.id)}"`)
+        : ''
+    }<hr class="context-separator">${action('ui:new-space', 'New Space', 'plus')}${action(
+      'ui:delete-space',
+      'Delete Space',
+      'trash',
+      onlySpace ? 'disabled title="Keep at least one Space in this profile"' : '',
+    )}</div>`,
+    { title: 'Space actions', anchor },
+  );
 }
 function showTabMenu(id) {
   const tab = state.tabs.find((t) => t.id === id);
@@ -2190,6 +2444,91 @@ function stopShortcutRecording() {
   ui.recordingShortcut = null;
   safely(invoke('shortcut:record', { active: false }));
 }
+const onboardingSteps = [
+  {
+    title: 'A little space to think.',
+    description: 'One command bar for websites, tabs, Spaces and actions.',
+    symbol: 'search',
+    shortcuts: ['command-palette', 'open-location'],
+  },
+  {
+    title: 'Make room for the page.',
+    description: 'Hide the sidebar whenever you need room. Bring it back just as easily.',
+    symbol: 'sidebar',
+    shortcuts: ['sidebar-toggle', 'focus-sidebar', 'focus-chrome'],
+  },
+  {
+    title: 'Keep your place.',
+    description: 'Jump between recent tabs, or move to a different Space.',
+    symbol: 'layers',
+    shortcuts: ['recent-tab', 'previous-space', 'next-space'],
+  },
+  {
+    title: 'Keep the good ones close.',
+    description: 'Pin a tab to keep it. Closing a pin unloads the page without removing it.',
+    symbol: 'pin',
+    shortcuts: ['pin-tab', 'close-tab', 'reopen-tab'],
+  },
+  {
+    title: 'Make yourself at home.',
+    description: 'Your themes, your shortcuts. You can revisit this tour from the browser menu.',
+    symbol: 'settings',
+    shortcuts: ['preferences', 'shortcuts'],
+  },
+];
+function maybeOpenOnboarding() {
+  if (
+    ui.onboardingOffered ||
+    state.settings.onboardingCompleted ||
+    state.runtime?.onboardingEnabled === false
+  )
+    return;
+  ui.onboardingOffered = true;
+  showOnboarding();
+}
+function showOnboarding(step = 0) {
+  ui.onboardingOffered = true;
+  ui.onboardingStep = Math.max(0, Math.min(onboardingSteps.length - 1, Number(step) || 0));
+  ui.shortcutError = '';
+  const entry = onboardingSteps[ui.onboardingStep];
+  const last = ui.onboardingStep === onboardingSteps.length - 1;
+  openDialog(
+    'onboarding',
+    `<header class="onboarding-top"><span class="onboarding-brand">${mark}<span>Zacro</span></span><button type="button" class="text-button" data-action="ui:onboarding-finish">Skip tour</button></header><div class="onboarding-body"><div class="onboarding-scene" data-scene="${ui.onboardingStep}" aria-hidden="true"><div class="onboarding-mini-sidebar"><span></span><span></span><span></span><i></i></div><div class="onboarding-mini-page">${icon(entry.symbol)}<span></span><span></span></div></div><div class="onboarding-copy"><h2 id="onboarding-title">${esc(entry.title)}</h2><p>${esc(entry.description)}</p></div><div id="onboarding-shortcuts"></div><div class="onboarding-hint">Select any shortcut to make it yours.</div><div id="onboarding-status" class="shortcut-status" role="status" aria-live="polite"></div></div><footer class="onboarding-footer"><button type="button" class="text-button" data-action="ui:onboarding-back" ${ui.onboardingStep ? '' : 'disabled'}>Back</button><nav class="onboarding-progress" aria-label="Tour steps">${onboardingSteps.map((item, index) => `<button type="button" data-action="ui:onboarding-step" data-id="${index}" aria-label="Step ${index + 1}: ${esc(item.title)}" ${index === ui.onboardingStep ? 'aria-current="step"' : ''}></button>`).join('')}</nav><button type="button" class="primary" data-action="${last ? 'ui:onboarding-finish' : 'ui:onboarding-next'}">${last ? 'Start browsing' : 'Continue'}${icon('forward')}</button></footer>`,
+    { title: 'Welcome to Zacro', focus: '[data-shortcut-record]' },
+  );
+  $('.dialog').classList.add('onboarding-dialog');
+  $('.dialog').setAttribute('aria-labelledby', 'onboarding-title');
+  renderOnboardingShortcuts();
+}
+function renderOnboardingShortcuts() {
+  const root = $('#onboarding-shortcuts');
+  if (!root) return;
+  const selected = document.activeElement?.dataset?.shortcutRecord;
+  root.innerHTML = onboardingSteps[ui.onboardingStep].shortcuts
+    .map((id) => state.runtime?.shortcuts?.find((entry) => entry.id === id))
+    .filter(Boolean)
+    .map((entry) => {
+      const recording = ui.recordingShortcut === entry.id;
+      return `<div class="shortcut-row" data-shortcut-id="${esc(entry.id)}"><span class="grow">${esc(entry.label)}</span><button type="button" class="shortcut-key ${recording ? 'recording' : ''}" data-action="ui:shortcut-record" data-id="${esc(entry.id)}" data-shortcut-record="${esc(entry.id)}" aria-label="${esc(`Change shortcut for ${entry.label}`)}"><kbd>${recording ? 'Press keys…' : esc(entry.accelerator ? shortcut(entry.accelerator) : 'Unassigned')}</kbd></button>${button('ui:shortcut-reset', `Reset ${entry.label}`, 'undo', `data-id="${esc(entry.id)}" ${entry.customized ? '' : 'disabled'}`)}</div>`;
+    })
+    .join('');
+  const status = $('#onboarding-status');
+  status.textContent =
+    ui.shortcutError ||
+    (ui.recordingShortcut ? 'Press a combination. Escape cancels; Delete removes it.' : '');
+  status.classList.toggle('danger', Boolean(ui.shortcutError));
+  if (selected) $(`[data-shortcut-record="${CSS.escape(selected)}"]`, root)?.focus({ preventScroll: true });
+}
+async function finishOnboarding() {
+  // Persist before dismissing: a storage failure leaves a visible, retryable tour.
+  await invoke('settings:update', { values: { onboardingCompleted: true } });
+  if (ui.dialog === 'onboarding') closeDialog();
+}
+function refreshShortcutEditor() {
+  if (ui.dialog === 'shortcuts') renderShortcutRows();
+  else if (ui.dialog === 'onboarding') renderOnboardingShortcuts();
+}
 function showShortcuts() {
   ui.shortcutQuery = '';
   ui.shortcutError = '';
@@ -2228,16 +2567,16 @@ async function recordShortcut(id) {
   stopShortcutRecording();
   ui.recordingShortcut = id;
   ui.shortcutError = '';
-  renderShortcutRows();
+  refreshShortcutEditor();
   $(`[data-shortcut-record="${CSS.escape(id)}"]`)?.focus();
   try {
     await invoke('shortcut:record', { active: true });
-    if (ui.recordingShortcut !== id || ui.dialog !== 'shortcuts')
+    if (ui.recordingShortcut !== id || !['shortcuts', 'onboarding'].includes(ui.dialog))
       await invoke('shortcut:record', { active: false });
   } catch (error) {
     stopShortcutRecording();
     ui.shortcutError = error.message;
-    renderShortcutRows();
+    refreshShortcutEditor();
   }
 }
 function recordedAccelerator(event) {
@@ -2291,8 +2630,8 @@ async function saveShortcut(id, accelerator) {
   } catch (error) {
     ui.shortcutError = error.message || 'That shortcut cannot be used.';
   }
-  if (ui.dialog === 'shortcuts') {
-    renderShortcutRows();
+  if (['shortcuts', 'onboarding'].includes(ui.dialog)) {
+    refreshShortcutEditor();
     $(`[data-shortcut-record="${CSS.escape(id)}"]`)?.focus({ preventScroll: true });
   }
 }
@@ -2300,6 +2639,10 @@ const commandSymbols = {
   'command-palette': 'plus',
   'open-location': 'search',
   'sidebar-toggle': 'sidebar',
+  'focus-sidebar': 'sidebar',
+  'reveal-tab': 'eye',
+  'browser-menu': 'more',
+  onboarding: 'sparkle',
   'save-page': 'download',
   'reopen-tab': 'undo',
   'next-tab': 'forward',
@@ -2348,6 +2691,10 @@ const commandAliases = {
   'new-space': 'create workspace',
   'new-private-space': 'incognito private browsing',
   shortcuts: 'keyboard keybindings hotkeys edit',
+  onboarding: 'welcome introduction tour help learn keyboard',
+  'focus-sidebar': 'keyboard focus tabs sidebar navigate',
+  'reveal-tab': 'show active current tab sidebar',
+  'browser-menu': 'menu browser controls options',
   ai: 'ask zacro assistant codex chatgpt',
   split: 'split view compare side by side',
   bookmarks: 'saved favorites library',
@@ -2888,6 +3235,10 @@ function handleEvent(event) {
     case 'shortcut': {
       const action = {
         shortcuts: 'ui:shortcuts',
+        'browser-menu': 'ui:menu',
+        'focus-sidebar': 'ui:focus-sidebar',
+        'reveal-tab': 'ui:focus-sidebar',
+        onboarding: 'ui:onboarding',
         split: 'ui:split',
         'rename-tab': 'ui:tab-rename',
         'move-tab': 'ui:tab-move',
@@ -2910,7 +3261,7 @@ function handleEvent(event) {
       showPageBackdrop(event.frames);
       break;
     case 'focus:chrome':
-      if (ui.dialog) $('#command-input')?.focus();
+      if (ui.dialog) ($('#command-input') || $('#dialog-root button:not(:disabled)'))?.focus();
       else $('[data-key="address"]')?.focus();
       break;
     case 'auth:request':
@@ -3156,6 +3507,22 @@ async function handleAction(action, data = {}, target) {
     case 'ui:sidebar-toggle':
       toggleSidebar();
       return;
+    case 'ui:focus-sidebar':
+      return focusSidebar();
+    case 'ui:onboarding':
+      showOnboarding();
+      return;
+    case 'ui:onboarding-next':
+      showOnboarding(ui.onboardingStep + 1);
+      return;
+    case 'ui:onboarding-back':
+      showOnboarding(ui.onboardingStep - 1);
+      return;
+    case 'ui:onboarding-step':
+      showOnboarding(data.id);
+      return;
+    case 'ui:onboarding-finish':
+      return finishOnboarding();
     case 'ui:library':
       showLibrary();
       return;
@@ -3218,6 +3585,29 @@ async function handleAction(action, data = {}, target) {
     case 'ui:edit-space':
       showSpaceForm(id || state.activeSpaceId);
       return;
+    case 'ui:rename-space': {
+      const space = state.spaces.find((item) => item.id === id && item.profileId === activeProfile()?.id);
+      if (!space) return;
+      formDialog(
+        'Rename Space',
+        '',
+        field('name', 'Space name', space.name, 'text', 'required maxlength="60"'),
+        'Save',
+        async (values, context) => {
+          if (!context.isCurrent()) return;
+          await invoke('space:update', { id, name: values.get('name') });
+          if (context.isCurrent()) context.close();
+        },
+      );
+      return;
+    }
+    case 'ui:space-move-tab': {
+      const space = state.spaces.find((item) => item.id === id && item.profileId === activeProfile()?.id);
+      const tab = state.tabs.find((item) => item.id === data.sourceTab);
+      if (!space || !tab || tab.profileId !== space.profileId || tab.spaceId === id) return;
+      closeDialog();
+      return invoke('tab:move', { id: tab.id, spaceId: id, folderId: null });
+    }
     case 'ui:color':
       ui.selectedColor = data.color;
       $$('.color-option').forEach((b) => {
@@ -3237,6 +3627,7 @@ async function handleAction(action, data = {}, target) {
       return;
     case 'ui:delete-space': {
       const s = state.spaces.find((s) => s.id === id);
+      if (!s || state.spaces.filter((item) => item.profileId === s.profileId).length < 2) return;
       confirmDialog(
         'Delete this Space?',
         `“${s?.name}” will be removed. Its tabs will move to another Space in the same profile.`,
@@ -3867,7 +4258,7 @@ document.addEventListener(
     if (event.repeat) return;
     if (event.key === 'Escape') {
       stopShortcutRecording();
-      renderShortcutRows();
+      refreshShortcutEditor();
       return;
     }
     const id = ui.recordingShortcut;
@@ -3888,6 +4279,7 @@ document.addEventListener(
 );
 document.addEventListener('keydown', (event) => {
   if (event.isComposing || event.keyCode === 229) return;
+  if (handleSidebarKeyboard(event)) return;
   const cmd = primaryModifier(event);
   if (ui.dialog === 'command' && event.target.id === 'command-input') {
     if (event.key === 'Tab' && !event.shiftKey && ['', '/', '>'].includes(ui.commandQuery.trim())) {
@@ -3975,16 +4367,33 @@ document.addEventListener('keydown', (event) => {
     return;
   }
 });
+document.addEventListener('focusin', (event) => {
+  if (!sidebarKeyboardItems().includes(event.target)) return;
+  ui.sidebarFocusKey = event.target.dataset.key;
+  prepareSidebarKeyboard();
+});
 document.addEventListener('contextmenu', (event) => {
+  const space = event.target.closest('.space-dot');
   const tab = event.target.closest('[data-tab-id]');
   const folder = event.target.closest('[data-folder-id]');
-  if (tab) {
+  if (space) {
+    event.preventDefault();
+    showSpaceMenu(space.dataset.id);
+  } else if (tab) {
     event.preventDefault();
     showTabMenu(tab.dataset.tabId);
   } else if (folder) {
     event.preventDefault();
     showFolderMenu(folder.dataset.folderId);
   } else event.preventDefault();
+});
+document.addEventListener('keydown', (event) => {
+  if (event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey) return;
+  if (event.key !== 'ContextMenu' && !(event.shiftKey && event.key === 'F10')) return;
+  const space = event.target.closest('.space-dot');
+  if (!space) return;
+  event.preventDefault();
+  showSpaceMenu(space.dataset.id);
 });
 function clearDragFeedback() {
   $$('.drag-over,.drop-before,.drop-after').forEach((element) =>
@@ -4122,10 +4531,15 @@ $('#sidebar').addEventListener('pointerleave', interruptSpaceScroll);
 window.addEventListener('blur', () => {
   interruptSpaceScroll();
   stopShortcutRecording();
-  if (ui.dialog === 'shortcuts') renderShortcutRows();
+  refreshShortcutEditor();
 });
 window.addEventListener('resize', () => {
   interruptSpaceScroll();
+  finishChromeMotion();
+  if (state) {
+    renderToolbar();
+    renderWorkspace();
+  }
   syncLayout();
   const popover = $('.popover-panel');
   if (popover) {

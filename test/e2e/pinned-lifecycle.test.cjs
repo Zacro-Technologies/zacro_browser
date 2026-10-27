@@ -51,6 +51,7 @@ const names = [
   'split/media/download protection and silent beforeunload veto keep pages alive',
   'trusted shadow-root editing protects the pin without sharing form values',
   'retained favorite icons stay bound to their tab/profile/URL and clear with browsing data',
+  'live login popups protect pinned callback documents without capturing them',
 ];
 for (const [index, name] of names.entries())
   test(name, { timeout: 30000 }, async (t) => {
@@ -66,6 +67,7 @@ for (const [index, name] of names.entries())
     });
     const env = {
       ...process.env,
+      ZACRO_SKIP_ONBOARDING: '1',
       ZACRO_USER_DATA: path.join(directory, 'profile'),
       ZACRO_PIN_BASE: base,
       ZACRO_PIN_RESULT: resultPath,

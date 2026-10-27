@@ -12,6 +12,7 @@ const store = new BrowserStore(process.env.ZACRO_USER_DATA);
 let window;
 const runtime = {
   fullScreen: false,
+  onboardingEnabled: false,
   focused: true,
   pages: {},
   shortcuts: shortcutCatalog('darwin'),

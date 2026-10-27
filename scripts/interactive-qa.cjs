@@ -173,7 +173,11 @@ async function main() {
     store.save();
   }
   const executable = packaged ? packagedPaths(root).executable : require('electron');
-  const env = { ...process.env, ZACRO_USER_DATA: directory };
+  const env = {
+    ...process.env,
+    ZACRO_USER_DATA: directory,
+    ZACRO_SKIP_ONBOARDING: process.argv.includes('--onboarding') ? '0' : '1',
+  };
   delete env.ELECTRON_RUN_AS_NODE;
   console.log(`Opening ${packaged ? 'packaged' : 'development'} Zacro with an isolated test profile.`);
   console.log(`Local test page: ${url}`);
@@ -181,7 +185,9 @@ async function main() {
     console.log(
       'Showcase: local Mail, Calendar, Notes and Studio favorites. Visit each once to load its icon; the journal opens first.',
     );
-  console.log('Options: --showcase for the demo workspace; --packaged for the built application.');
+  console.log(
+    'Options: --showcase for the demo workspace; --packaged for the built application; --onboarding to show the welcome tour.',
+  );
   console.log(
     `${process.platform === 'darwin' ? 'Quit Zacro with Command-Q' : 'Close the browser'} when finished. No real browser profile is modified.`,
   );

@@ -37,7 +37,7 @@ async function fixture(t) {
     assert.deepEqual(errors, []);
   });
   const launch = async () => {
-    const env = { ...process.env, ZACRO_USER_DATA: directory };
+    const env = { ...process.env, ZACRO_SKIP_ONBOARDING: '1', ZACRO_USER_DATA: directory };
     delete env.ELECTRON_RUN_AS_NODE;
     app = await electron.launch({ args: [path.resolve(__dirname, '../..')], env });
     shell = await app.firstWindow();
@@ -288,6 +288,7 @@ test(
     await b.shell.keyboard.press('Escape');
     await b.emit({ type: 'panel', panel: 'settings' });
     await expect(b.shell.locator('#side-panel')).toBeVisible();
+    await expect(b.shell.locator('#app')).toHaveAttribute('data-panel-animating', 'false');
     const closePanel = await b.shell.locator('[data-key="panel-close"]').boundingBox();
     await b.emit({ type: 'command', mode: 'newtab', query: 'alpha' });
     await expect(b.shell.locator('#command-input')).toBeFocused();
@@ -328,6 +329,14 @@ test(
     assert(
       samples.some((width) => width > 0 && width < 220),
       'Closing must have real intermediate geometry',
+    );
+    assert(
+      samples.every((width) => width >= 0 && width <= 224),
+      'Sidebar motion never overshoots',
+    );
+    assert(
+      samples.every((width, index) => !index || width <= samples[index - 1]),
+      'Closing motion is monotonic without spring recoil',
     );
     assert.equal((await native()).x, 12);
     await b.app.evaluate(async ({ BrowserWindow }) => {
@@ -372,12 +381,20 @@ test(
     await b.shell.getByRole('button', { name: 'Customize Space', exact: true }).click();
     await b.shell.locator('summary').filter({ hasText: 'Gradient & texture' }).click();
     await b.shell.locator('summary').filter({ hasText: 'Glass & transparency' }).click();
-    for (const height of [640, 780, 795]) {
-      const accepted = await b.app.evaluate(({ BrowserWindow }, height) => {
-        const window = BrowserWindow.getAllWindows()[0];
-        window.setContentSize(960, height);
-        return window.getContentSize();
-      }, height);
+    for (const [width, height] of [
+      [560, 420],
+      [960, 640],
+      [960, 780],
+      [960, 795],
+    ]) {
+      const accepted = await b.app.evaluate(
+        ({ BrowserWindow }, { width, height }) => {
+          const window = BrowserWindow.getAllWindows()[0];
+          window.setContentSize(width, height);
+          return window.getContentSize();
+        },
+        { width, height },
+      );
       // macOS constrains a window to the runner's available display height;
       // Windows may round a DIP by one pixel at fractional desktop scaling.
       // Verify the size the OS accepted, without claiming the request was met.

@@ -23,7 +23,7 @@ async function launch(t, { earlyLink = false } = {}) {
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
-  const env = { ...process.env, ZACRO_USER_DATA: directory };
+  const env = { ...process.env, ZACRO_SKIP_ONBOARDING: '1', ZACRO_USER_DATA: directory };
   delete env.ELECTRON_RUN_AS_NODE;
   let app;
   t.after(async () => {
@@ -222,7 +222,7 @@ test('macOS uses native window chrome, menu conventions and keyboard navigation'
       );
     assert.equal(native.menu.find((item) => item.id === 'preferences')?.accelerator, 'Command+,');
     assert.equal(native.menu.find((item) => item.id === 'close-window')?.accelerator, 'Command+Shift+W');
-    assert((await b.shell.locator('[data-key="sidebar-toggle"]').boundingBox()).x >= 88);
+    assert((await b.shell.locator('[data-key="back"]').boundingBox()).x >= 88);
     assert((await b.shell.locator('.space-picker').boundingBox()).x < 30);
     await b.shell.screenshot({ path: path.join(results, `mac-${process.arch}-shell.png`) });
     // Only capture the disposable CI desktop; local developers may have personal
@@ -237,10 +237,10 @@ test('macOS uses native window chrome, menu conventions and keyboard navigation'
       ).catch((error) => console.warn(`Optional native desktop capture unavailable: ${error.message}`));
     }
 
-    await b.shell.locator('[data-key="sidebar-toggle"]').click();
-    assert((await b.shell.locator('[data-key="sidebar-toggle"]').boundingBox()).x >= 88);
+    await nativeShortcut('S', ['meta']);
+    assert((await b.shell.locator('[data-key="back"]').boundingBox()).x >= 88);
     await b.shell.screenshot({ path: path.join(results, `mac-${process.arch}-sidebar-hidden.png`) });
-    await b.shell.locator('[data-key="sidebar-toggle"]').click();
+    await nativeShortcut('S', ['meta']);
     await nativeShortcut(',', ['meta']);
     await expect(b.shell.locator('#panel-title')).toHaveText('Settings');
     await b.shell.screenshot({ path: path.join(results, `mac-${process.arch}-settings.png`) });
@@ -303,7 +303,7 @@ test('macOS uses native window chrome, menu conventions and keyboard navigation'
     );
     await b.invoke('window:fullscreen');
     await expect(b.shell.locator('html')).toHaveAttribute('data-fullscreen', 'false', { timeout: 15000 });
-    assert((await b.shell.locator('[data-key="sidebar-toggle"]').boundingBox()).x >= 88);
+    assert((await b.shell.locator('[data-key="back"]').boundingBox()).x >= 88);
   } catch (error) {
     const diagnostics = await b.app
       .evaluate(({ BrowserWindow, webContents }) => ({

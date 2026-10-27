@@ -109,6 +109,43 @@ test('Arc organization keys use pinning, directional Spaces, and numbered Spaces
   assert.equal(matchShortcut(key('3', { alt: true }), 'win32'), 'space-3');
 });
 
+test('keyboard routes replace chrome buttons without conflicting with the Arc-style defaults', () => {
+  for (const platform of ['darwin', 'win32']) {
+    const mod = platform === 'darwin' ? { meta: true } : { control: true };
+    assert.equal(matchShortcut(key('s', { code: 'KeyS', ...mod, alt: true }), platform), 'focus-sidebar');
+    assert.equal(matchShortcut(key('s', mod), platform), 'sidebar-toggle');
+    const catalog = shortcutCatalog(platform);
+    for (const entry of catalog) {
+      for (const accelerator of [entry.accelerator, ...entry.aliases].filter(Boolean)) {
+        // Assigning each unchanged default validates it against every other route.
+        assert.doesNotThrow(
+          () => updateShortcut({}, platform, entry.id, entry.accelerator),
+          `${entry.id}: ${accelerator}`,
+        );
+      }
+    }
+    assert.equal(catalog.find((entry) => entry.id === 'onboarding').editable, true);
+    assert.equal(catalog.find((entry) => entry.id === 'reveal-tab').accelerator, '');
+  }
+  assert.equal(matchShortcut(key('F10'), 'win32'), 'browser-menu');
+  assert.equal(matchShortcut(key('F10', { shift: true }), 'win32'), null);
+  assert.equal(matchShortcut(key('F10'), 'darwin'), null);
+  assert.equal(matchShortcut(key('Escape', { control: true, shift: true }), 'win32'), null);
+  assert.equal(matchShortcut(key('.', { control: true, shift: true }), 'win32'), 'peek-close');
+});
+
+test('welcome completion survives a restart and older profiles receive the tour once', () => {
+  const store = new BrowserStore();
+  assert.equal(store.state.settings.onboardingCompleted, false);
+  store.dispatch('settings:update', { values: { onboardingCompleted: true } });
+  const saved = store.persistedState();
+  assert.equal(hydrate(saved).settings.onboardingCompleted, true);
+  delete saved.settings.onboardingCompleted;
+  assert.equal(hydrate(saved).settings.onboardingCompleted, false);
+  store.dispatch('settings:update', { values: { onboardingCompleted: 'false' } });
+  assert.equal(store.state.settings.onboardingCompleted, true);
+});
+
 test('shortcut rebinding disables old aliases, detects conflicts and protects typing', () => {
   let overrides = updateShortcut({}, 'darwin', 'command-palette', 'Mod+Alt+T');
   assert.equal(matchShortcut(key('t', { meta: true }), 'darwin', overrides), null);

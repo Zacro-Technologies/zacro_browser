@@ -301,6 +301,7 @@ function snapshot() {
         }
       : null,
     platform: process.platform,
+    onboardingEnabled: process.env.ZACRO_SKIP_ONBOARDING !== '1',
     shortcuts: shortcutCatalog(process.platform, store.state.settings.shortcutOverrides),
     version: app.getVersion(),
     chromium: process.versions.chrome,
@@ -565,6 +566,9 @@ function createEntry(profileId, tabId = null, suppliedOptions = {}) {
           active: false,
         });
         const child = createEntry(source.profileId, tab.id, options);
+        // Keep the relationship in memory only. A sign-in window may return a
+        // result through window.opener, then close itself; resume that page.
+        child.openerTabId = source.id;
         child.requestedURL = url || 'about:blank';
         child.blankPopup = blank;
         views.set(tab.id, child);
@@ -746,7 +750,13 @@ function createEntry(profileId, tabId = null, suppliedOptions = {}) {
     }
     if (!closingWindow && !entry.replacing && store.state.tabs.some((tab) => tab.id === entry.tabId)) {
       const wasActive = store.state.activeTabId === entry.tabId;
+      const opener =
+        wasActive &&
+        store.state.tabs.find(
+          (tab) => tab.id === entry.openerTabId && tab.profileId === entry.profileId && !tab.closed,
+        );
       store.dispatch('tab:close', { id: entry.tabId });
+      if (opener) store.dispatch('tab:activate', { id: opener.id });
       // The closing native view may still be Cocoa's first responder. Move
       // keyboard input to the surviving page (or shell for New Tab) only when
       // the active tab closed; background closes must not steal input focus.
@@ -840,6 +850,15 @@ function pinProtected(entry) {
   )
     return true;
   if (pendingAuth?.contentsId === wc.id) return true;
+  // A popup can still need its opener for a login callback, even after a tab
+  // switch. Keep that document until the popup closes; sleeping would discard
+  // its callback listener. This relationship is never persisted across restarts.
+  if (
+    [...views.values()].some(
+      (popup) => popup.openerTabId === tab.id && !popup.disposing && !popup.contents.isDestroyed(),
+    )
+  )
+    return true;
   return store.state.downloads.some(
     (record) =>
       liveDownloads.has(record.id) &&
@@ -2003,7 +2022,13 @@ async function invoke(action, payload = {}) {
       else if (payload.contentTop !== undefined || layout.sidebarWidth === 0) layout.contentTop = 40;
       else if (previousSidebarWidth === 0)
         layout.contentTop = process.platform === 'darwin' || win.isFullScreen() ? 8 : 36;
-      if (typeof payload.overlay === 'boolean') layout.overlay = payload.overlay;
+      const nextOverlay = typeof payload.overlay === 'boolean' ? payload.overlay : previousOverlay;
+      // A dialog may interrupt a width animation. Present the final visible
+      // geometry before capturing it; otherwise both the bitmap and its bounds
+      // describe the previous animation sample. Capture still starts with the
+      // overlay flag set, so its bounded hidden-attachment lifecycle is intact.
+      if (nextOverlay && !previousOverlay) arrangeViews();
+      layout.overlay = nextOverlay;
       if (layout.overlay && !previousOverlay) void captureBackdrop();
       else if (!layout.overlay && previousOverlay) clearBackdrop();
       arrangeViews();
@@ -2385,6 +2410,10 @@ async function runMacAction(action, fromPage = false) {
     case 'ai':
       return showChrome({ type: 'ai:shortcut' });
     case 'shortcuts':
+    case 'browser-menu':
+    case 'focus-sidebar':
+    case 'reveal-tab':
+    case 'onboarding':
     case 'split':
     case 'rename-tab':
     case 'move-tab':
@@ -2555,8 +2584,8 @@ async function createWindow() {
     y: bounds.y,
     width: bounds.width,
     height: bounds.height,
-    minWidth: Math.min(960, bounds.width),
-    minHeight: Math.min(640, bounds.height),
+    minWidth: Math.min(560, bounds.width),
+    minHeight: Math.min(420, bounds.height),
     title: 'Zacro',
     backgroundColor: '#f4f2ef',
     ...windowChrome(process.platform),

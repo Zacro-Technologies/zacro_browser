@@ -76,7 +76,7 @@ async function fixture(t, { configured = true } = {}) {
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
-  const env = { ...process.env, ZACRO_USER_DATA: directory };
+  const env = { ...process.env, ZACRO_SKIP_ONBOARDING: '1', ZACRO_USER_DATA: directory };
   delete env.ELECTRON_RUN_AS_NODE;
   let app;
   t.after(async () => {
@@ -117,10 +117,7 @@ async function fixture(t, { configured = true } = {}) {
     await invoke('ai:configure', { provider: 'compatible', baseUrl: `${base}/v1`, model: 'fixture' });
   const open = async (section) => {
     await shell.getByRole('button', { name: 'Library', exact: true }).click();
-    await shell
-      .getByRole('dialog', { name: 'Library', exact: true })
-      .locator(`[data-key="panel-${section}"]`)
-      .click();
+    await shell.locator(`#side-panel [data-key="panel-${section}"]`).click();
     await expect(shell.locator('#panel-title')).toHaveText(section === 'ai' ? 'Ask Zacro' : 'Settings');
   };
   await open('ai');

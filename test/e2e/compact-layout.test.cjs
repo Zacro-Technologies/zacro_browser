@@ -23,7 +23,7 @@ test(
     });
     await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
     const base = `http://127.0.0.1:${server.address().port}`;
-    const env = { ...process.env, ZACRO_USER_DATA: directory };
+    const env = { ...process.env, ZACRO_SKIP_ONBOARDING: '1', ZACRO_USER_DATA: directory };
     delete env.ELECTRON_RUN_AS_NODE;
     let app;
     t.after(async () => {
@@ -74,6 +74,8 @@ test(
       return Object.fromEntries(['x', 'y', 'width', 'height'].map((key) => [key, Math.round(box[key])]));
     };
     const aligned = async ({ split = false, peek = false } = {}) => {
+      await expect(shell.locator('#app')).toHaveAttribute('data-sidebar-animating', 'false');
+      await expect(shell.locator('#app')).toHaveAttribute('data-panel-animating', 'false');
       let box, lastGeometry;
       try {
         await expect
@@ -125,6 +127,8 @@ test(
     const firstContents = (await native())[0].id;
 
     for (const [width, height] of [
+      [560, 420],
+      [800, 560],
       [960, 640],
       [1001, 701],
       [1440, 900],
@@ -138,12 +142,12 @@ test(
       assert.equal(box.y, baselineTop);
       assert.equal(box.x, 232);
     }
-    await shell.locator('[data-key="sidebar-toggle"]').click();
+    await emit({ type: 'sidebar:toggle' });
     await expect(shell.locator('#sidebar')).toBeHidden();
     const hidden = await aligned();
     assert.equal(hidden.x, 8);
     assert.equal(hidden.y, 40);
-    await shell.locator('[data-key="sidebar-toggle"]').click();
+    await emit({ type: 'sidebar:toggle' });
     await expect(shell.locator('#sidebar')).toBeVisible();
     assert.equal((await aligned()).y, baselineTop);
 
@@ -188,16 +192,72 @@ test(
     await expect(shell.locator('#side-panel')).toBeVisible();
     const narrowPage = await aligned();
     assert.equal(narrowPage.x, 388);
-    assert.equal(narrowPage.width, 292);
+    assert.equal(narrowPage.width, 240);
     await expect
       .poll(() => rectangle('#side-panel'))
       .toEqual({
-        x: 688,
+        x: 636,
         y: baselineTop,
-        width: minimumSize[0] - 696,
-        height: minimumSize[1] - baselineTop - 8,
+        width: minimumSize[0] - 636,
+        height: minimumSize[1] - baselineTop,
       });
     await shell.locator('[data-key="panel-close"]').click();
+
+    // The smallest window temporarily retracts a wide sidebar for its panel,
+    // while retaining both the saved preference and at least 240px of live page.
+    const compactSize = await app.evaluate(({ BrowserWindow }) => {
+      const window = BrowserWindow.getAllWindows()[0];
+      window.setContentSize(560, 420);
+      return window.getContentSize();
+    });
+    await expect.poll(() => shell.evaluate(() => [innerWidth, innerHeight])).toEqual(compactSize);
+    await aligned();
+    await emit({ type: 'panel', panel: 'settings' });
+    await expect(shell.locator('#sidebar')).toBeHidden();
+    const compactPage = await aligned();
+    assert.equal(compactPage.width, 240);
+    assert.equal(compactPage.x, 8);
+    assert.equal(compactPage.y, 40);
+    await expect
+      .poll(() => rectangle('#side-panel'))
+      .toEqual({
+        x: 256,
+        y: 40,
+        width: compactSize[0] - 256,
+        height: compactSize[1] - 40,
+      });
+    assert.equal((await state()).settings.sidebarWidth, 380);
+    for (const panel of ['bookmarks', 'history', 'downloads', 'archive', 'ai', 'settings']) {
+      await shell.locator(`[data-key="panel-${panel}"]`).click();
+      const fits = await shell.locator('#side-panel').evaluate((panel) => ({
+        horizontal: panel.scrollWidth <= panel.clientWidth,
+        bottom: Math.round(panel.getBoundingClientRect().bottom) <= innerHeight,
+        buttons: [...panel.querySelectorAll('.panel-tabs button')].every((button) => {
+          const rect = button.getBoundingClientRect();
+          return rect.left >= 0 && rect.right <= innerWidth;
+        }),
+      }));
+      assert.deepEqual(fits, { horizontal: true, bottom: true, buttons: true });
+    }
+    await emit({ type: 'command', mode: 'newtab', query: '/' });
+    await expect(shell.locator('#command-input')).toBeFocused();
+    const compactCommand = await shell.locator('.command-dialog').evaluate((dialog) => {
+      const rect = dialog.getBoundingClientRect();
+      const footer = dialog.querySelector('.command-footer').getBoundingClientRect();
+      return {
+        readable: rect.width >= 400,
+        footerVisible: Math.round(footer.bottom) <= Math.round(rect.bottom),
+        withinWindow: rect.top >= 0 && Math.round(rect.bottom) <= innerHeight,
+      };
+    });
+    assert.deepEqual(compactCommand, { readable: true, footerVisible: true, withinWindow: true });
+    await shell.keyboard.press('Escape');
+    await shell.locator('[data-key="panel-close"]').click();
+    await expect(shell.locator('#sidebar')).toBeVisible();
+    await expect(shell.locator('#app')).toHaveAttribute('data-sidebar-animating', 'false');
+    const compactRestored = await aligned();
+    assert.equal(compactRestored.width, 240);
+    assert.equal(compactRestored.x, compactSize[0] - 248);
     await invoke('settings:update', { values: { sidebarWidth: 224 } });
     const restoredSize = await app.evaluate(({ BrowserWindow }) => {
       const window = BrowserWindow.getAllWindows()[0];
@@ -256,7 +316,7 @@ test(
     });
     await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
     const base = `http://127.0.0.1:${server.address().port}`;
-    const env = { ...process.env, ZACRO_USER_DATA: directory };
+    const env = { ...process.env, ZACRO_SKIP_ONBOARDING: '1', ZACRO_USER_DATA: directory };
     delete env.ELECTRON_RUN_AS_NODE;
     let app;
     t.after(async () => {
@@ -350,9 +410,33 @@ test(
     // Exercise the cold-compositor path observed in native Mac CI: a successful
     // capture after 200ms must still arrive without delaying dialog interaction.
     await instrument(url, 250);
+    const liveBeforeLibrary = await guest(
+      url,
+      '({ dpr:devicePixelRatio, identity:window.liveIdentity=crypto.randomUUID() })',
+    );
+    await shell.locator('[data-key="library"]').click();
+    await expect(shell.locator('#panel-title')).toHaveText('Bookmarks');
+    await expect(shell.locator('#app')).toHaveAttribute('data-panel-animating', 'false');
+    await expect(shell.locator('#page-backdrop img')).toHaveCount(0);
+    assert.equal(
+      await app.evaluate(() => globalThis.popoverCaptureCount),
+      0,
+      'Library keeps the actual native page rather than a reduced-resolution capture',
+    );
+    assert.deepEqual(
+      await guest(url, '({dpr:devicePixelRatio, identity:window.liveIdentity})'),
+      liveBeforeLibrary,
+    );
+    assert.equal(await guest(url, 'document.visibilityState'), 'visible');
+    await shell.locator('[data-key="panel-settings"]').click();
+    await shell.locator('[data-key="panel-close"]').click();
+    await expect(shell.locator('#side-panel')).toBeHidden();
+    await shell.locator('[data-key="library"]').click();
+    await expect(shell.locator('#panel-title')).toHaveText('Settings');
+    await shell.locator('[data-key="panel-close"]').click();
+    await expect(shell.locator('#side-panel')).toBeHidden();
     let expectedCaptures = 0;
     for (const [key, title] of [
-      ['library', 'Library'],
       ['page-menu', 'Page actions'],
       ['space-picker', 'Your Spaces'],
       ['add-menu', 'Add'],

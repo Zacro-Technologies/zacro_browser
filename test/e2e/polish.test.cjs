@@ -48,7 +48,7 @@ async function bounded(promise, milliseconds) {
 
 async function launch(t, existingDirectory) {
   const directory = existingDirectory || (await fs.mkdtemp(path.join(os.tmpdir(), 'zacro-e2e-polish-')));
-  const env = { ...process.env, ZACRO_USER_DATA: directory };
+  const env = { ...process.env, ZACRO_SKIP_ONBOARDING: '1', ZACRO_USER_DATA: directory };
   delete env.ELECTRON_RUN_AS_NODE;
   const app = await electron.launch({ args: [path.resolve(__dirname, '../..')], env, timeout: 30000 });
   const errors = [];
@@ -115,10 +115,9 @@ async function launch(t, existingDirectory) {
 
 async function openLibrarySection(shell, section) {
   await shell.getByRole('button', { name: 'Library', exact: true }).click();
-  const menu = shell.getByRole('dialog', { name: 'Library', exact: true });
-  await expect(menu).toBeVisible();
-  await menu.locator(`[data-key="panel-${section}"]`).click();
-  await expect(menu).toHaveCount(0);
+  const sectionButton = shell.locator(`#side-panel [data-key="panel-${section}"]`);
+  await sectionButton.click();
+  await expect(sectionButton).toHaveAttribute('aria-pressed', 'true');
 }
 
 test(
@@ -206,15 +205,17 @@ test(
     const loads = requests.get('/sidebar-draft');
     assert.equal(before.y, process.platform === 'darwin' ? 8 : 36);
     assert.equal(before.width, before.viewport[0] - 224 - 16);
-    await browser.app.evaluate(({ webContents }, url) => {
-      const contents = webContents.getAllWebContents().find((item) => item.getURL() === url);
-      contents.focus();
-      contents.sendInputEvent({ type: 'keyDown', keyCode: 'S', modifiers: ['control'] });
-      contents.sendInputEvent({ type: 'keyUp', keyCode: 'S', modifiers: ['control'] });
-    }, url);
+    const toggleFromPage = () =>
+      browser.app.evaluate(({ webContents }, url) => {
+        const contents = webContents.getAllWebContents().find((item) => item.getURL() === url);
+        contents.focus();
+        const modifiers = [process.platform === 'darwin' ? 'meta' : 'control'];
+        contents.sendInputEvent({ type: 'keyDown', keyCode: 'S', modifiers });
+        contents.sendInputEvent({ type: 'keyUp', keyCode: 'S', modifiers });
+      }, url);
+    await toggleFromPage();
     await expect(shell.locator('#sidebar')).toBeHidden();
-    const restore = shell.getByRole('button', { name: 'Show sidebar (Ctrl + S)', exact: true });
-    await expect(restore).toBeVisible();
+    await expect(shell.locator('[data-key="sidebar-toggle"]')).toHaveCount(0);
     await expect.poll(async () => (await surface())?.x).toBe(8);
     const expanded = await surface();
     assert.equal(expanded.y, 40);
@@ -224,7 +225,7 @@ test(
       .poll(() => browser.guest(url, 'document.hasFocus() && document.activeElement.id'))
       .toBe('draft');
     assert.equal(await browser.guest(url, 'document.getElementById("draft").value'), 'A draft worth keeping');
-    await restore.click();
+    await toggleFromPage();
     await expect(shell.locator('#sidebar')).toBeVisible();
     await expect.poll(async () => (await surface())?.x).toBe(232);
     assert.equal((await surface()).width, before.width);
@@ -240,11 +241,10 @@ test(
     const { shell } = await launch(t);
     const library = shell.getByRole('button', { name: 'Library', exact: true });
     await library.click();
-    const menu = shell.getByRole('dialog', { name: 'Library', exact: true });
-    await expect(menu.getByRole('button')).toHaveCount(7);
-    await menu.getByRole('button', { name: 'Bookmarks', exact: true }).click();
-    const navigation = shell.getByRole('navigation', { name: 'Library sections' });
-    await expect(navigation.getByRole('button')).toHaveCount(4);
+    await expect(shell.locator('#panel-title')).toHaveText('Bookmarks');
+    await expect(shell.getByRole('dialog')).toHaveCount(0);
+    const navigation = shell.getByRole('navigation', { name: 'Browser panels' });
+    await expect(navigation.getByRole('button')).toHaveCount(6);
     for (const section of ['History', 'Downloads', 'Archived tabs', 'Bookmarks']) {
       await navigation.getByRole('button', { name: section, exact: true }).click();
       await expect(shell.locator('#panel-title')).toHaveText(section);
@@ -278,11 +278,24 @@ test(
     await expect(home.locator(`.home-link[data-url="${url}"]`)).toHaveCount(0);
     await expect(home.locator('.home-link')).toHaveCount(1);
     await shell.locator('#home-query').fill('Keep this search draft');
-    await shell.getByRole('button', { name: 'Hide sidebar (Ctrl + S)', exact: true }).click();
+    await expect(shell.locator('[data-key="sidebar-toggle"]')).toHaveCount(0);
+    // CDP keyboard events do not reach Electron's native shortcut interceptor
+    // from this shell field. Exercise the real window input path instead.
+    const toggleFromShell = () =>
+      browser.app.evaluate(({ BrowserWindow }) => {
+        const contents = BrowserWindow.getAllWindows()[0].webContents;
+        contents.focus();
+        const modifiers = [process.platform === 'darwin' ? 'meta' : 'control'];
+        contents.sendInputEvent({ type: 'keyDown', keyCode: 'S', modifiers });
+        contents.sendInputEvent({ type: 'keyUp', keyCode: 'S', modifiers });
+      });
+    await toggleFromShell();
+    await expect(shell.locator('#sidebar')).toBeHidden();
     await expect(home.locator(`.home-link[data-url="${url}"]`)).toHaveCount(1);
     await expect(home.locator('.home-link')).toHaveCount(2);
     await expect(shell.locator('#home-query')).toHaveValue('Keep this search draft');
-    await shell.getByRole('button', { name: 'Show sidebar (Ctrl + S)', exact: true }).click();
+    await toggleFromShell();
+    await expect(shell.locator('#sidebar')).toBeVisible();
     await expect(home.locator(`.home-link[data-url="${url}"]`)).toHaveCount(0);
     await expect(shell.locator('#home-query')).toHaveValue('Keep this search draft');
   },
@@ -602,8 +615,8 @@ test(
     const library = shell.getByRole('button', { name: 'Library', exact: true });
     await library.focus();
     await shell.keyboard.press('Enter');
-    const menu = shell.getByRole('dialog', { name: 'Library', exact: true });
-    await menu.getByRole('button', { name: /History/ }).focus();
+    await expect(shell.locator('#panel-search')).toBeFocused();
+    await shell.locator('#side-panel [data-key="panel-history"]').focus();
     await shell.keyboard.press('Enter');
     const search = shell.locator('#panel-search');
     await expect(search).toBeFocused();
@@ -620,9 +633,8 @@ test(
     await expect(library).toBeFocused();
     await library.focus();
     await shell.keyboard.press('Enter');
-    const settings = shell
-      .getByRole('dialog', { name: 'Library', exact: true })
-      .locator('[data-key="panel-settings"]');
+    await expect(shell.locator('#panel-search')).toBeFocused();
+    const settings = shell.locator('#side-panel [data-key="panel-settings"]');
     await settings.focus();
     await shell.keyboard.press('Enter');
     await expect
@@ -1149,20 +1161,23 @@ test(
     await shell.emulateMedia({ forcedColors: 'none', reducedMotion: 'no-preference' });
     await openLibrarySection(shell, 'history');
     await expect(shell.locator('#panel-search')).toBeFocused();
+    await shell.keyboard.press('Escape');
+    await expect(shell.locator('#side-panel')).toBeHidden();
     const opening = await shell.evaluate(() => {
-      const panel = document.querySelector('#side-panel');
-      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
       document.querySelector('[data-key="library"]').focus();
       document.querySelector('[data-key="library"]').click();
       document.querySelector('[data-key="panel-settings"]').click();
-      const animations = panel.getAnimations();
-      // Hold this real transition so the OS preference switches while it runs.
-      for (const animation of animations) animation.effect.updateTiming({ duration: 10000 });
-      return animations.length;
+      return document.querySelector('#app').dataset.panelAnimating;
     });
-    assert(opening > 0, 'A panel opening transition must be in flight before changing the preference');
+    assert.equal(
+      opening,
+      'true',
+      'A panel opening transition must be in flight before changing the preference',
+    );
     await shell.emulateMedia({ reducedMotion: 'reduce' });
     await expect(shell.locator('#side-panel')).toBeVisible();
+    await expect(shell.locator('#app')).toHaveAttribute('data-panel-animating', 'false');
+    await expect(shell.locator('#app')).toHaveAttribute('data-sidebar-animating', 'false');
     await expect
       .poll(() =>
         shell.evaluate(

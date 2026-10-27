@@ -68,7 +68,7 @@ async function bounded(promise, milliseconds) {
 
 async function launch(t) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'zacro-e2e-security-'));
-  const env = { ...process.env, ZACRO_USER_DATA: directory };
+  const env = { ...process.env, ZACRO_SKIP_ONBOARDING: '1', ZACRO_USER_DATA: directory };
   delete env.ELECTRON_RUN_AS_NODE;
   const app = await electron.launch({ args: [path.resolve(__dirname, '../..')], env, timeout: 30000 });
   let stderr = '';
@@ -175,6 +175,62 @@ test(
       await browser.guest('document.getElementById("submitted").textContent', `${base}/posted`),
       'value=retained-body',
     );
+  },
+);
+
+test(
+  'cross-origin login popups keep their pinned opener alive and return focus after a callback',
+  { timeout: 60000 },
+  async (t) => {
+    const identity = http.createServer((_request, response) => {
+      response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      response.end('<!doctype html><title>Local identity fixture</title><button>Continue</button>');
+    });
+    await new Promise((resolve) => identity.listen(0, '127.0.0.1', resolve));
+    t.after(
+      () =>
+        new Promise((resolve) => {
+          identity.closeAllConnections();
+          identity.close(resolve);
+        }),
+    );
+    const identityURL = `http://127.0.0.1:${identity.address().port}/authorize`;
+    const browser = await launch(t);
+    const openerURL = `${base}/login-opener`;
+    await browser.navigate(openerURL);
+    const opener = (await browser.state()).activeTabId;
+    await browser.invoke('tab:pin', { id: opener });
+    // An intervening tab makes the normal adjacent-tab close policy incorrect
+    // for a login popup: success needs to return to the original document.
+    await browser.invoke('tab:create', { url: `${base}/unrelated`, active: false });
+    await browser.guest(
+      `
+      window.loginResult = null;
+      window.addEventListener('message', (event) => {
+        if (event.origin === ${JSON.stringify(new URL(identityURL).origin)}) window.loginResult = event.data;
+      });
+      window.open(${JSON.stringify(identityURL)}, 'identity-login'); undefined;
+    `,
+      openerURL,
+    );
+    await expect.poll(() => browser.guest('document.readyState', identityURL)).toBe('complete');
+    await expect.poll(async () => (await browser.state()).runtime.page.url).toBe(identityURL);
+    assert.equal((await browser.invoke('tab:sleep', { id: opener })).slept, false);
+    assert.equal(await browser.guest('window.loginResult', openerURL), null);
+    const openerAlive = await browser.app.evaluate(
+      ({ webContents }, url) => webContents.getAllWebContents().some((item) => item.getURL() === url),
+      openerURL,
+    );
+    assert(openerAlive, 'the callback listener must survive while its popup is active');
+    await browser
+      .guest(
+        `window.opener.postMessage({ signedIn: true }, ${JSON.stringify(base)}); window.close(); undefined`,
+        identityURL,
+      )
+      .catch(() => {});
+    await expect.poll(async () => (await browser.state()).activeTabId).toBe(opener);
+    await expect.poll(() => browser.guest('window.loginResult', openerURL)).toEqual({ signedIn: true });
+    assert.equal((await browser.state()).tabs.filter((tab) => tab.url === identityURL).length, 0);
   },
 );
 

@@ -143,6 +143,7 @@ function createInitialState() {
       archiveAfterHours: 24,
       sidebarWidth: 224,
       restoreSession: true,
+      onboardingCompleted: false,
       openSourcesLimit: 3,
       aiProvider: 'codex',
       aiModel: '',
@@ -169,7 +170,7 @@ function validateSettings(values, base = createInitialState().settings) {
     next.sidebarWidth = Math.round(Math.min(380, Math.max(200, values.sidebarWidth)));
   if (Number.isInteger(values.openSourcesLimit))
     next.openSourcesLimit = Math.min(10, Math.max(1, values.openSourcesLimit));
-  for (const key of ['restoreSession', 'sharePageContext'])
+  for (const key of ['restoreSession', 'sharePageContext', 'onboardingCompleted'])
     if (typeof values[key] === 'boolean') next[key] = values[key];
   if (['codex', 'claude-code', 'openai', 'anthropic', 'compatible', 'openrouter'].includes(values.aiProvider))
     next.aiProvider = values.aiProvider;
@@ -313,8 +314,8 @@ function hydrate(raw) {
   if (raw.windowBounds && typeof raw.windowBounds === 'object') {
     const { width, height, x, y } = raw.windowBounds;
     result.windowBounds = {
-      width: Math.min(7680, Math.max(900, Number(width) || 1440)),
-      height: Math.min(4320, Math.max(640, Number(height) || 940)),
+      width: Math.min(7680, Math.max(560, Number(width) || 1440)),
+      height: Math.min(4320, Math.max(420, Number(height) || 940)),
       maximized: raw.windowBounds.maximized === true,
       sizeKind: raw.windowBounds.sizeKind === 'window' ? 'window' : 'content',
     };

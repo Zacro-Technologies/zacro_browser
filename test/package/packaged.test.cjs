@@ -120,7 +120,11 @@ test(
       },
       { timeout: 20000 },
     );
-    const env = { ...process.env, ZACRO_USER_DATA: path.join(directory, 'packaged') };
+    const env = {
+      ...process.env,
+      ZACRO_SKIP_ONBOARDING: '1',
+      ZACRO_USER_DATA: path.join(directory, 'packaged'),
+    };
     delete env.ELECTRON_RUN_AS_NODE;
     child = spawn(executable, ['--remote-debugging-address=127.0.0.1', '--remote-debugging-port=0'], {
       env,
@@ -225,7 +229,7 @@ test(
       () =>
         _electron.launch({
           args: [root],
-          env: { ...env, ZACRO_USER_DATA: path.join(directory, 'harness') },
+          env: { ...env, ZACRO_SKIP_ONBOARDING: '1', ZACRO_USER_DATA: path.join(directory, 'harness') },
           timeout: 15000,
         }),
       20000,

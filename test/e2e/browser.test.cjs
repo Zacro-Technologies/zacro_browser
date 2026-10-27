@@ -42,7 +42,7 @@ after(async () => {
 
 async function launch(t, directory) {
   const dir = directory || (await fsp.mkdtemp(path.join(os.tmpdir(), 'zacro-e2e-')));
-  const env = { ...process.env, ZACRO_USER_DATA: dir };
+  const env = { ...process.env, ZACRO_SKIP_ONBOARDING: '1', ZACRO_USER_DATA: dir };
   delete env.ELECTRON_RUN_AS_NODE;
   const app = await electron.launch({ args: [path.resolve(__dirname, '../..')], env, timeout: 30000 });
   const errors = [];
@@ -386,10 +386,7 @@ test(
       .click();
     await expect.poll(async () => (await b.state()).tabs.find((tab) => tab.id === tabId)?.pinned).toBe(true);
     await sidebar.getByRole('button', { name: 'Library', exact: true }).click();
-    await b.page
-      .getByRole('dialog', { name: 'Library', exact: true })
-      .locator('[data-key="panel-settings"]')
-      .click();
+    await b.page.locator('#side-panel [data-key="panel-settings"]').click();
     await b.page.locator('select[data-setting="searchEngine"]').selectOption('brave');
     await expect.poll(async () => (await b.state()).settings.searchEngine).toBe('brave');
     await b.page.locator('#side-panel summary').filter({ hasText: 'About Zacro' }).click();
@@ -443,11 +440,11 @@ test(
     await b.page.keyboard.press('ArrowDown');
     await expect(menu.getByRole('button', { name: 'Split view', exact: true })).toBeFocused();
     await b.page.keyboard.press('End');
-    await expect(menu.getByRole('button', { name: 'Zoom in', exact: true })).toBeFocused();
+    await expect(menu.getByRole('button', { name: /^Browser menu/ })).toBeFocused();
     await b.page.keyboard.press('Home');
     await expect(menu.getByRole('button', { name: 'Split view', exact: true })).toBeFocused();
     await b.page.keyboard.press('ArrowUp');
-    await expect(menu.getByRole('button', { name: 'Zoom in', exact: true })).toBeFocused();
+    await expect(menu.getByRole('button', { name: /^Browser menu/ })).toBeFocused();
     await b.page.keyboard.press('Escape');
     await expect(pageActions).toBeFocused();
 
@@ -501,9 +498,9 @@ test(
     await menu.getByRole('button', { name: 'Close split view', exact: true }).click();
     await expect.poll(async () => (await b.state()).runtime.splitTabId).toBe(null);
 
-    menu = await menuAtControl(b.page.locator('[data-key="library"]'), 'Library', 'above');
-    await menu.getByRole('button', { name: 'Bookmarks', exact: true }).click();
+    await b.page.locator('[data-key="library"]').click();
     await expect(b.page.locator('#panel-title')).toHaveText('Bookmarks');
+    await expect(b.page.getByRole('dialog')).toHaveCount(0);
     await b.page.keyboard.press('Escape');
     await expect(b.page.locator('[data-key="library"]')).toBeFocused();
   },

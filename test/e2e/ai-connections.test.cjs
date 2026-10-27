@@ -64,7 +64,7 @@ async function fixture(t) {
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const baseUrl = `http://127.0.0.1:${server.address().port}/v1`;
-  const env = { ...process.env, ZACRO_USER_DATA: directory };
+  const env = { ...process.env, ZACRO_SKIP_ONBOARDING: '1', ZACRO_USER_DATA: directory };
   delete env.ELECTRON_RUN_AS_NODE;
   let app, shell;
   const close = async () => {
@@ -114,9 +114,9 @@ async function fixture(t) {
     );
   const openSection = async (section) => {
     await shell.getByRole('button', { name: 'Library', exact: true }).click();
-    const menu = shell.getByRole('dialog', { name: 'Library', exact: true });
-    await menu.locator(`[data-key="panel-${section}"]`).click();
-    await expect(menu).toHaveCount(0);
+    const sectionButton = shell.locator(`#side-panel [data-key="panel-${section}"]`);
+    await sectionButton.click();
+    await expect(sectionButton).toHaveAttribute('aria-pressed', 'true');
   };
   const openConnections = async () => {
     await openSection('settings');
