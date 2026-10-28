@@ -8,7 +8,17 @@ Validated locally on Windows 11 x64 (OS build 26200), Node.js 24.19.0, Electron 
 
 The subsequent website-sign-in fix promotes a Peek popup's opener into a tab before the popup is activated. It retains the original Chromium document and avoids a duplicate page request during promotion. Three new native regressions cover a blank popup redirected across origins, a named-target form POST, and callback/focus return to the secondary split pane. Chromium's implicit `noopener` for `_blank` form targets is preserved.
 
-Local Windows verification passed **176 unit/security tests and all 22 browser/security desktop cases**, plus syntax and formatting. The enhanced restart case verifies server-set HttpOnly persistent login cookies and local storage in two separate profiles, expiry of session-only cookies, and private storage remaining in memory. Computer review in an isolated development profile verified link-menu Peek, automatic promotion, popup creation, callback delivery and return to the original page. The local `/popup-check` fixture displayed its passed result; no provider account or credential was used. This does not establish Google/FedCM acceptance; see [website sign-in](WEB-SIGN-IN.md).
+Local Windows verification passed **176 unit/security tests and all 22 browser/security desktop cases**, plus syntax and formatting. The rebuilt unsigned Windows installer and packaged-application acceptance also passed. The enhanced restart case verifies server-set HttpOnly persistent login cookies and local storage in two separate profiles, expiry of session-only cookies, and private storage remaining in memory. Computer review in an isolated development profile verified link-menu Peek, automatic promotion, popup creation, callback delivery and return to the original page. The local `/popup-check` fixture displayed its passed result; no provider account or credential was used. This does not establish Google/FedCM acceptance; see [website sign-in](WEB-SIGN-IN.md).
+
+At runtime commit **`9bf9af76115afffe63d2c75b97868bf5eab6c506`**, [CI run 40680503131](https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40680503131) passed all test and build steps:
+
+| Platform | Unit/security | Native desktop | Packaged app | Additional |
+| --- | --- | --- | --- | --- |
+| Windows x64 | 176 passed | 77 passed; 6 Mac-only skips | 1 passed | Lifecycle check and upload passed |
+| macOS, Apple silicon | 176 passed | 62 passed; 1 Windows-only skip | 1 passed | Development DMG/ZIP and uploads passed |
+| macOS, Intel | 176 passed | 62 passed; 1 Windows-only skip | 1 passed | Development DMG/ZIP built; upload failed |
+
+**The overall CI result is failed, not green.** Intel's validation archive transferred successfully but GitHub returned `Failed to FinalizeArtifact: Unable to make request: ETIMEDOUT`; its subsequent development-package upload was skipped. The validation artifact later appeared in GitHub's listing, but no Intel development package was published. No tests failed. A failed-job retry was attempted through the connected GitHub integration, which returned HTTP 403 because it lacks Actions write permission. A maintainer with that permission must retry the failed job to complete Intel artifact publication. The earlier green interface runs below remain historical evidence.
 
 ### Original interface acceptance
 
