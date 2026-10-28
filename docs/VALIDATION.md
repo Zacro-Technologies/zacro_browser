@@ -4,6 +4,14 @@ Validated locally on Windows 11 x64 (OS build 26200), Node.js 24.19.0, Electron 
 
 ## 0.7 compact windows, browser panels and keyboard onboarding
 
+### Website sign-in follow-up
+
+The subsequent website-sign-in fix promotes a Peek popup's opener into a tab before the popup is activated. It retains the original Chromium document and avoids a duplicate page request during promotion. Three new native regressions cover a blank popup redirected across origins, a named-target form POST, and callback/focus return to the secondary split pane. Chromium's implicit `noopener` for `_blank` form targets is preserved.
+
+Local Windows verification passed **176 unit/security tests and all 22 browser/security desktop cases**, plus syntax and formatting. The enhanced restart case verifies server-set HttpOnly persistent login cookies and local storage in two separate profiles, expiry of session-only cookies, and private storage remaining in memory. Computer review in an isolated development profile verified link-menu Peek, automatic promotion, popup creation, callback delivery and return to the original page. The local `/popup-check` fixture displayed its passed result; no provider account or credential was used. This does not establish Google/FedCM acceptance; see [website sign-in](WEB-SIGN-IN.md).
+
+### Original interface acceptance
+
 On October 28, 2026 (JST), final [CI run 40581387047](https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40581387047) passed at runtime commit **`7f8aba038f805a948e06ed6d90fcc846ae977196`**:
 
 | Platform | Unit/security | Native desktop | Packaged app | Additional |

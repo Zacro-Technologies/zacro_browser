@@ -560,6 +560,10 @@ function createEntry(profileId, tabId = null, suppliedOptions = {}) {
       outlivesOpener: true,
       overrideBrowserWindowOptions: { webPreferences: guestPreferences(source.profileId) },
       createWindow: (options) => {
+        // A preview becomes a durable tab before its popup takes focus. Closing
+        // Peek during activation would destroy the document waiting for a login
+        // callback, even though Chromium correctly retained window.opener.
+        const opener = peek?.entry === entry ? promotePeek() : source;
         const tab = store.dispatch('tab:create', {
           url: url || NEW_TAB,
           spaceId: source.spaceId,
@@ -568,7 +572,7 @@ function createEntry(profileId, tabId = null, suppliedOptions = {}) {
         const child = createEntry(source.profileId, tab.id, options);
         // Keep the relationship in memory only. A sign-in window may return a
         // result through window.opener, then close itself; resume that page.
-        child.openerTabId = source.id;
+        child.openerTabId = opener.id;
         child.requestedURL = url || 'about:blank';
         child.blankPopup = blank;
         views.set(tab.id, child);
@@ -1093,14 +1097,15 @@ function closePeek(focus = true) {
 function promotePeek() {
   if (!peek) return;
   const current = peek;
-  peek = null;
   const url = current.entry.contents.getURL() || current.url;
-  const tab = store.dispatch('tab:create', { url, spaceId: current.spaceId });
+  // Adopt before activation so reconciliation cannot start a duplicate request
+  // for a page whose current document (or POST response) is already alive.
+  const tab = store.dispatch('tab:create', { url, spaceId: current.spaceId, active: false });
+  peek = null;
   // Reuse the living page, including its scroll position and back stack.
-  const redundant = views.get(tab.id);
-  if (redundant) destroyEntry(redundant);
   current.entry.tabId = tab.id;
   views.set(tab.id, current.entry);
+  store.dispatch('tab:activate', { id: tab.id });
   if (current.entry.faviconURL === url) rememberFavicon(current.entry, url, current.entry.favicon);
   const title = current.entry.contents.getTitle() || tab.title;
   store.dispatch('tab:update', { id: tab.id, title });
@@ -1110,6 +1115,7 @@ function promotePeek() {
   arrangeViews();
   publish();
   focusContentOrChrome(current.entry.contents);
+  return tab;
 }
 
 function showPageMenu(entry, params) {

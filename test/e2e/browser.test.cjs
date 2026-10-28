@@ -11,6 +11,26 @@ const { _electron: electron, expect } = require('@playwright/test');
 let server, base;
 before(async () => {
   server = http.createServer((req, res) => {
+    const requestURL = new URL(req.url, 'http://fixture.local');
+    if (requestURL.pathname === '/login-fixture/set') {
+      const identity = requestURL.searchParams.get('identity');
+      if (!['personal', 'work', 'private'].includes(identity)) {
+        res.writeHead(400);
+        res.end('Unknown fixture identity');
+        return;
+      }
+      res.setHeader('Set-Cookie', `siteLogin=${identity}; Max-Age=3600; Path=/; HttpOnly; SameSite=Lax`);
+    }
+    if (requestURL.pathname === '/login-fixture/whoami') {
+      const cookies = new Map(
+        (req.headers.cookie || '').split(';').map((cookie) => cookie.trim().split('=')),
+      );
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+      res.end(
+        JSON.stringify({ login: cookies.get('siteLogin') || null, session: cookies.get('identity') || null }),
+      );
+      return;
+    }
     if (req.url.startsWith('/download')) {
       res.writeHead(200, {
         'Content-Type': 'text/plain',
@@ -264,26 +284,58 @@ test(
 );
 
 test(
-  'profiles isolate real cookies and storage; private activity is absent after restart',
+  'website logins and storage survive restart within their profile; private activity does not',
   { timeout: 60000 },
   async (t) => {
     const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'zacro-isolation-'));
     t.after(() => fsp.rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
     const b = await launch(t, dir);
+    const websiteIdentity = (browser, target) =>
+      browser.guest('fetch("/login-fixture/whoami").then((response) => response.json())', target);
+    await b.navigate(`${base}/login-fixture/set?identity=personal`);
     await b.navigate(`${base}/a`);
     await b.guest(
       'document.cookie = "identity=personal; path=/"; localStorage.setItem("identity", "personal");',
     );
+    assert.deepEqual(await websiteIdentity(b, `${base}/a`), { login: 'personal', session: 'personal' });
+    assert(!/siteLogin=/.test(await b.guest('document.cookie', `${base}/a`)), 'Login cookie stays HttpOnly');
     const work = await b.invoke('profile:create', { name: 'Work' });
+    const workSpaceId = (await b.state()).activeSpaceId;
     await b.navigate(`${base}/b`);
     assert.equal(await b.guest('document.cookie', `${base}/b`), '');
     assert.equal(await b.guest('localStorage.getItem("identity")', `${base}/b`), null);
-    await b.guest('document.cookie = "identity=work; path=/"', `${base}/b`);
+    assert.deepEqual(await websiteIdentity(b, `${base}/b`), { login: null, session: null });
+    await b.navigate(`${base}/login-fixture/set?identity=work`);
+    await b.navigate(`${base}/b`);
+    await b.guest(
+      'document.cookie = "identity=work; path=/"; localStorage.setItem("identity", "work");',
+      `${base}/b`,
+    );
+    assert.deepEqual(await websiteIdentity(b, `${base}/b`), { login: 'work', session: 'work' });
     await b.invoke('space:activate', { id: 'home' });
     assert.match(await b.guest('document.cookie', `${base}/a`), /identity=personal/);
     assert.equal(await b.guest('localStorage.getItem("identity")', `${base}/a`), 'personal');
+    assert.deepEqual(await websiteIdentity(b, `${base}/a`), { login: 'personal', session: 'personal' });
     const privateProfile = await b.invoke('profile:create', { name: 'Private acceptance', private: true });
     await b.navigate(`${base}/private-secret`);
+    assert.deepEqual(await websiteIdentity(b, `${base}/private-secret`), { login: null, session: null });
+    assert.equal(await b.guest('localStorage.getItem("identity")', `${base}/private-secret`), null);
+    await b.navigate(`${base}/login-fixture/set?identity=private`);
+    await b.navigate(`${base}/private-secret`);
+    await b.guest('localStorage.setItem("identity", "private");', `${base}/private-secret`);
+    assert.deepEqual(await websiteIdentity(b, `${base}/private-secret`), { login: 'private', session: null });
+    assert.equal(
+      await b.app.evaluate(
+        ({ webContents }, url) =>
+          webContents
+            .getAllWebContents()
+            .find((contents) => contents.getURL() === url)
+            .session.isPersistent(),
+        `${base}/private-secret`,
+      ),
+      false,
+      'Private login cookies must remain in an in-memory Chromium session',
+    );
     assert.equal(
       (await b.state()).history.some((h) => h.profileId === privateProfile.id),
       false,
@@ -296,6 +348,28 @@ test(
     const restarted = await launch(t, dir);
     assert.equal((await restarted.state()).profiles.length, 2);
     assert((await restarted.state()).tabs.some((tab) => tab.url === `${base}/a`));
+    await restarted.invoke('space:activate', { id: 'home' });
+    await restarted.navigate(`${base}/a`);
+    assert.deepEqual(await websiteIdentity(restarted, `${base}/a`), { login: 'personal', session: null });
+    assert.equal(await restarted.guest('localStorage.getItem("identity")', `${base}/a`), 'personal');
+    assert(
+      !/siteLogin=/.test(await restarted.guest('document.cookie', `${base}/a`)),
+      'Restored login stays HttpOnly',
+    );
+    await restarted.invoke('space:activate', { id: workSpaceId });
+    await restarted.navigate(`${base}/b`);
+    assert.deepEqual(await websiteIdentity(restarted, `${base}/b`), { login: 'work', session: null });
+    assert.equal(await restarted.guest('localStorage.getItem("identity")', `${base}/b`), 'work');
+    await restarted.invoke('profile:create', { name: 'Private acceptance', private: true });
+    await restarted.navigate(`${base}/private-after-restart`);
+    assert.deepEqual(await websiteIdentity(restarted, `${base}/private-after-restart`), {
+      login: null,
+      session: null,
+    });
+    assert.equal(
+      await restarted.guest('localStorage.getItem("identity")', `${base}/private-after-restart`),
+      null,
+    );
     await restarted.close();
   },
 );

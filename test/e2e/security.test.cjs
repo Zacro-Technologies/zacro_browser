@@ -10,8 +10,10 @@ const { _electron: electron, expect } = require('@playwright/test');
 const { makePDF } = require('../fixtures/pdf.cjs');
 
 let server, base;
+const requestCounts = new Map();
 before(async () => {
   server = http.createServer(async (request, response) => {
+    requestCounts.set(request.url, (requestCounts.get(request.url) || 0) + 1);
     if (request.url === '/document.pdf') {
       response.writeHead(200, { 'Content-Type': 'application/pdf', 'Content-Disposition': 'inline' });
       response.end(
@@ -231,6 +233,153 @@ test(
     await expect.poll(async () => (await browser.state()).activeTabId).toBe(opener);
     await expect.poll(() => browser.guest('window.loginResult', openerURL)).toEqual({ signedIn: true });
     assert.equal((await browser.state()).tabs.filter((tab) => tab.url === identityURL).length, 0);
+  },
+);
+
+for (const mode of ['script', 'post'])
+  test(
+    `a ${mode} login popup promotes Peek without replacing its callback document`,
+    { timeout: 60000 },
+    async (t) => {
+      const identity = http.createServer(async (request, response) => {
+        let body = '';
+        for await (const chunk of request) body += chunk;
+        response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        response.end(
+          `<!doctype html><title>Identity callback</title><p id="method">${request.method}</p><p id="body">${body.replace(/[<>&]/g, '')}</p>`,
+        );
+      });
+      await new Promise((resolve) => identity.listen(0, '127.0.0.1', resolve));
+      t.after(
+        () =>
+          new Promise((resolve) => {
+            identity.closeAllConnections();
+            identity.close(resolve);
+          }),
+      );
+      const identityURL = `http://127.0.0.1:${identity.address().port}/authorize`;
+      const browser = await launch(t);
+      await browser.navigate(`${base}/underlying-${mode}`);
+      const underlyingId = (await browser.state()).activeTabId;
+      const previewPath = `/peek-login-${mode}`;
+      const previewURL = `${base}${previewPath}`;
+      await browser.invoke('peek:open', { url: previewURL });
+      await expect.poll(() => browser.guest('document.readyState', previewURL)).toBe('complete');
+      const previewId = await browser.app.evaluate(
+        ({ webContents }, url) => webContents.getAllWebContents().find((item) => item.getURL() === url).id,
+        previewURL,
+      );
+      await browser.guest(
+        `
+        window.previewMarker = 'same-preview-document';
+        window.unloadAttempts = 0;
+        window.addEventListener('beforeunload', () => { window.unloadAttempts++; });
+        document.querySelector('input').value = 'unsaved-preview-draft';
+        window.loginResult = null;
+        window.addEventListener('message', (event) => {
+          if (event.origin === ${JSON.stringify(new URL(identityURL).origin)}) window.loginResult = event.data;
+        });
+        ${
+          mode === 'post'
+            ? `document.getElementById('post').action = ${JSON.stringify(identityURL)}; document.getElementById('post').target = 'identity-login-post'; document.getElementById('post').submit();`
+            : `window.identityPopup = window.open('about:blank', 'identity-login'); setTimeout(() => { window.identityPopup.location.href = ${JSON.stringify(identityURL)}; }, 25);`
+        }
+        undefined;
+      `,
+        previewURL,
+      );
+      await expect.poll(() => browser.guest('document.readyState', identityURL)).toBe('complete');
+      await expect.poll(async () => (await browser.state()).runtime.page.url).toBe(identityURL);
+      const afterOpen = await browser.state();
+      const promoted = afterOpen.tabs.find((tab) => tab.url === previewURL);
+      assert(promoted, 'the preview must become a durable tab');
+      assert.notEqual(promoted.id, underlyingId);
+      assert.equal(afterOpen.runtime.peek, null);
+      assert.equal(afterOpen.history.filter((visit) => visit.url === previewURL).length, 1);
+      assert.equal(requestCounts.get(previewPath), 1, 'promotion must not refetch the preview');
+      assert.deepEqual(
+        await browser.guest(
+          '[window.previewMarker, window.unloadAttempts, document.querySelector("input").value]',
+          previewURL,
+        ),
+        ['same-preview-document', 0, 'unsaved-preview-draft'],
+      );
+      assert.equal(
+        await browser.app.evaluate(
+          ({ webContents }, { previewId, identityURL }) => {
+            const original = webContents.fromId(previewId);
+            const child = webContents.getAllWebContents().find((item) => item.getURL() === identityURL);
+            return Boolean(original && child && original.session === child.session);
+          },
+          { previewId, identityURL },
+        ),
+        true,
+        'the original WebContents and popup must share the same profile session',
+      );
+      assert.equal(
+        await browser.guest('document.getElementById("method").textContent', identityURL),
+        mode === 'post' ? 'POST' : 'GET',
+      );
+      if (mode === 'post')
+        assert.equal(
+          await browser.guest('document.getElementById("body").textContent', identityURL),
+          'value=unsaved-preview-draft',
+        );
+      await browser
+        .guest(
+          `window.opener.postMessage({ signedIn: true }, ${JSON.stringify(base)}); window.close(); undefined`,
+          identityURL,
+        )
+        .catch(() => {});
+      await expect.poll(() => browser.guest('window.loginResult', previewURL)).toEqual({ signedIn: true });
+      await expect.poll(async () => (await browser.state()).activeTabId).toBe(promoted.id);
+      await expect
+        .poll(() => browser.app.evaluate(({ webContents }) => webContents.getFocusedWebContents()?.id))
+        .toBe(previewId);
+      assert.equal((await browser.state()).tabs.filter((tab) => tab.url === identityURL).length, 0);
+      assert.equal(await browser.guest('window.unloadAttempts', previewURL), 0);
+      await browser.invoke('tab:close', { id: promoted.id });
+      assert.equal(
+        await browser.app.evaluate(({ webContents }, id) => Boolean(webContents.fromId(id)), previewId),
+        false,
+      );
+    },
+  );
+
+test(
+  'a popup from the secondary split pane retains its real opener and restores keyboard focus',
+  { timeout: 60000 },
+  async (t) => {
+    const browser = await launch(t);
+    await browser.navigate(`${base}/split-primary`);
+    const primary = (await browser.state()).activeTabId;
+    const secondary = await browser.invoke('tab:create', { url: `${base}/split-secondary` });
+    await expect.poll(() => browser.guest('document.readyState', `${base}/split-secondary`)).toBe('complete');
+    await browser.invoke('tab:activate', { id: primary });
+    await browser.invoke('split:toggle', { id: secondary.id });
+    const sourceId = await browser.app.evaluate(
+      ({ webContents }, url) => webContents.getAllWebContents().find((item) => item.getURL() === url).id,
+      `${base}/split-secondary`,
+    );
+    await browser.guest(
+      `window.splitMarker = 'retained'; window.loginResult = null; window.addEventListener('message', event => { if (event.origin === ${JSON.stringify(base)}) window.loginResult = event.data; }); window.open('/split-identity', 'split-login'); undefined;`,
+      `${base}/split-secondary`,
+    );
+    await expect.poll(() => browser.guest('document.readyState', `${base}/split-identity`)).toBe('complete');
+    await expect.poll(async () => (await browser.state()).runtime.page.url).toBe(`${base}/split-identity`);
+    await browser
+      .guest(
+        `window.opener.postMessage('signed-in', ${JSON.stringify(base)}); window.close(); undefined`,
+        `${base}/split-identity`,
+      )
+      .catch(() => {});
+    await expect.poll(async () => (await browser.state()).activeTabId).toBe(secondary.id);
+    await expect.poll(() => browser.guest('window.loginResult', `${base}/split-secondary`)).toBe('signed-in');
+    assert.equal(await browser.guest('window.splitMarker', `${base}/split-secondary`), 'retained');
+    await expect
+      .poll(() => browser.app.evaluate(({ webContents }) => webContents.getFocusedWebContents()?.id))
+      .toBe(sourceId);
+    assert((await browser.state()).tabs.some((tab) => tab.id === primary));
   },
 );
 

@@ -8,6 +8,8 @@ Build a privileged host, a restricted application UI, and isolated remote page r
 
 Acceptance: real navigation, redirects, popup handling, keyboard actions, session restart, two-profile cookie isolation, malformed state recovery, page crashes, cancelled navigation and invalid TLS; regression tests run in CI. No disabling the OS sandbox or certificate checks to get a test passing.
 
+Website identity acceptance also requires a native FedCM account chooser and permission model, which the current Electron runtime does not provide. Resolve that engine capability and validate real Google account and third-party Google sign-in flows before claiming Google support. Popup callbacks, persistent cookies and profile isolation have local regression coverage; they do not establish provider acceptance. See [website sign-in](WEB-SIGN-IN.md).
+
 ## 2. The complete browsing interface
 
 Implement vertical tabs, favorites, folders, drag and keyboard organization, Space themes, navigation/command bar, split pages and Peek with promotion and focus return. Deliver downloads with pause/cancel/reveal and reversible renaming, history, bookmark imports, archive recovery, printing, find, zoom, developer tools and readable errors. No inert feature buttons.
