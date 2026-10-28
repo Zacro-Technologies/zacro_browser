@@ -14,9 +14,10 @@ const { makePDF } = require('../fixtures/pdf.cjs');
 const { packagedPaths } = require('../../scripts/platform-build.cjs');
 const execFileAsync = promisify(execFile);
 // An ad-hoc macOS rebuild changes its code hash, so an existing Keychain
-// entry may need the user's approval. Only an explicit interactive run waits
-// for that OS dialog. A human may return after the short automated run would
-// have exited, so allow one hour; ordinary CI keeps its existing deadline.
+// entry may need the user's approval on the first profile navigation. Only an
+// explicit interactive run waits for that OS dialog. A human may return after
+// the short automated run would have exited, so allow one hour; ordinary CI
+// keeps its existing deadline.
 const keychainApprovalWait = process.env.ZACRO_INTERACTIVE_KEYCHAIN === '1' ? 3600000 : 0;
 
 async function bounded(promise, milliseconds, label) {
@@ -197,15 +198,22 @@ test(
       30000,
     );
     const url = `http://127.0.0.1:${server.address().port}/`;
-    await stage('Native page navigation', async () => {
-      await shell.evaluate((url) => window.zacro.invoke('navigate', { url }), url);
-      await expect
-        .poll(async () => {
-          const state = await shell.evaluate(() => window.zacro.invoke('state:get'));
-          return state.tabs.find((tab) => tab.id === state.activeTabId)?.title;
-        })
-        .toBe('Packaged browser acceptance');
-    });
+    await stage(
+      'Native page navigation',
+      async () => {
+        await shell.evaluate((url) => window.zacro.invoke('navigate', { url }), url);
+        await expect
+          .poll(
+            async () => {
+              const state = await shell.evaluate(() => window.zacro.invoke('state:get'));
+              return state.tabs.find((tab) => tab.id === state.activeTabId)?.title;
+            },
+            { timeout: 5000 + keychainApprovalWait },
+          )
+          .toBe('Packaged browser acceptance');
+      },
+      15000 + keychainApprovalWait,
+    );
     await fs.mkdir(path.join(root, 'test-results'), { recursive: true });
     await stage('Native browser capture', async () => {
       await shell.screenshot({ path: path.join(root, 'test-results/packaged-browser.png') });
