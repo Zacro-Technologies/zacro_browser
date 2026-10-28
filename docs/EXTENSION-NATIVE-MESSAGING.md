@@ -100,9 +100,17 @@ with a generic `runtime.lastError`; deliberate local disconnect is clean.
 
 ## Verification
 
-`node --test test/extensions-native-messaging.test.cjs` uses executable copies
-of `test/fixtures/native-messaging/host.cjs` and temporary manifests. It never
-starts a personal installed native host. Injected discovery and registry reads
-cover registration boundaries for all supported OSes. Actual child process
-execution is verified on the local OS; Windows and Linux execution require
-platform CI.
+`node --test test/extensions-native-messaging.test.cjs` uses copies of
+`test/fixtures/native-messaging/host.cjs` and temporary manifests. At the
+test-only subprocess launch boundary, the installed Node runtime executes this
+JavaScript fixture explicitly, including on Windows where shebang scripts are
+not native executables. The Electron fixture uses development Electron's Node
+mode. The real broker still verifies the registered script, obtains approval,
+passes origin/parent arguments and exercises framed pipes, failures and child
+termination. These tests never start a personal installed native host.
+
+Injected discovery and registry reads cover registration boundaries for all
+supported OSes. Passing these protocol fixtures does not establish discovery
+and launch of an actual installed Windows host; that remains a native Windows
+acceptance check. Windows and Linux execution results must come from those
+platforms, separately from local macOS results.

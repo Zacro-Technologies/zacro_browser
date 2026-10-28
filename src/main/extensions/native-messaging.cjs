@@ -18,12 +18,12 @@ function hostRegistrationPaths(name, { platform = process.platform, home = os.ho
   validateName(name);
   if (platform === 'darwin')
     return [
-      path.join(home, 'Library/Application Support/Google/Chrome/NativeMessagingHosts', `${name}.json`),
+      path.posix.join(home, 'Library/Application Support/Google/Chrome/NativeMessagingHosts', `${name}.json`),
       `/Library/Google/Chrome/NativeMessagingHosts/${name}.json`,
     ];
   if (platform === 'linux')
     return [
-      path.join(home, '.config/google-chrome/NativeMessagingHosts', `${name}.json`),
+      path.posix.join(home, '.config/google-chrome/NativeMessagingHosts', `${name}.json`),
       `/etc/opt/chrome/native-messaging-hosts/${name}.json`,
     ];
   return [];

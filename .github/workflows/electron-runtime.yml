@@ -23,7 +23,6 @@ jobs:
     runs-on: ${{ matrix.labels }}
     timeout-minutes: 1440
     env:
-      ZACRO_RUNTIME_ROOT: ${{ runner.temp }}/zacro-electron
       ZACRO_RUNTIME_ARCH: ${{ matrix.arch }}
     steps:
       - uses: actions/checkout@v4
@@ -32,6 +31,10 @@ jobs:
           node-version: '24'
           architecture: ${{ matrix.arch }}
           cache: npm
+      - name: Select dedicated runtime directory
+        run: >-
+          node -e "require('node:fs').appendFileSync(process.env.GITHUB_ENV,
+          'ZACRO_RUNTIME_ROOT=' + require('node:path').join(process.env.RUNNER_TEMP, 'zacro-electron') + '\n')"
       - run: npm ci
       - name: Inspect build capacity
         run: node scripts/build-electron-runtime.cjs doctor "${{ env.ZACRO_RUNTIME_ROOT }}" "${{ matrix.arch }}"

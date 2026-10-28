@@ -7,6 +7,7 @@ const os = require('node:os');
 const vm = require('node:vm');
 const { ExtensionAPI } = require('../src/main/extensions/api.cjs');
 const { NativeMessagingBroker, createHostResolver } = require('../src/main/extensions/native-messaging.cjs');
+const { spawnNativeMessagingFixture } = require('./helpers/native-messaging-fixture.cjs');
 const ID = 'a'.repeat(32);
 async function nativeFacade(t, { delayConnect = false } = {}) {
   let enter,
@@ -151,6 +152,7 @@ test('native API sends through the verified broker and rejects content and undec
   );
   const nativeMessaging = new NativeMessagingBroker({
     resolveHost: createHostResolver({ discoverPaths: () => [manifestPath] }),
+    spawnHost: spawnNativeMessagingFixture,
     approveHost: async () => true,
   });
   t.after(() => nativeMessaging.dispose());

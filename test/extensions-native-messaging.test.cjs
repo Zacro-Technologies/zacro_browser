@@ -5,6 +5,8 @@ const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 const { setTimeout: delay } = require('node:timers/promises');
+const vm = require('node:vm');
+const { spawnNativeMessagingFixture } = require('./helpers/native-messaging-fixture.cjs');
 const {
   NativeMessagingBroker,
   createHostResolver,
@@ -46,6 +48,7 @@ function broker(t, resolveHost, options = {}) {
   const events = [];
   const broker = new NativeMessagingBroker({
     resolveHost,
+    spawnHost: spawnNativeMessagingFixture,
     approveHost: async () => true,
     emit: (ctx, event) => events.push({ ctx, ...event }),
     ...options,
@@ -60,17 +63,27 @@ async function until(predicate) {
   }
   assert.fail('Native host event timed out');
 }
-test('synthetic child reconstructs fragmented UTF-8 frames with exact caller origin', async (t) => {
-  const f = await fixture(t);
-  const { broker: b, events } = broker(t, f.resolveHost);
-  const ctx = context();
-  await b.connect(ctx, 'com.zacro.test', 'port');
-  b.post(ctx, 'port', { mode: 'fragmented', text: '日本語' });
-  await until(() => events.some((e) => e.type === 'message'));
-  assert.deepEqual(events[0].message, { echo: '日本語', origin: ORIGIN });
-  b.disconnect(ctx, 'port');
-  assert.equal(events.at(-1).type, 'disconnect');
-});
+for (const platform of ['darwin', 'win32'])
+  test(`synthetic child reconstructs framed UTF-8 with ${platform} caller arguments`, async (t) => {
+    const f = await fixture(t);
+    let launchArgs;
+    const { broker: b, events } = broker(t, f.resolveHost, {
+      platform,
+      spawnHost(executable, args, options) {
+        launchArgs = args;
+        assert.equal(options.shell, false);
+        return spawnNativeMessagingFixture(executable, args, options);
+      },
+    });
+    const ctx = context();
+    await b.connect(ctx, 'com.zacro.test', 'port');
+    b.post(ctx, 'port', { mode: 'fragmented', text: '日本語' });
+    await until(() => events.some((e) => e.type === 'message'));
+    assert.deepEqual(launchArgs, platform === 'win32' ? [ORIGIN, '--parent-window=0'] : [ORIGIN]);
+    assert.deepEqual(events[0].message, { echo: '日本語', origin: ORIGIN });
+    b.disconnect(ctx, 'port');
+    assert.equal(events.at(-1).type, 'disconnect');
+  });
 test('port receives multiple messages and send returns the first response only', async (t) => {
   const f = await fixture(t);
   const { broker: b, events } = broker(t, f.resolveHost);
@@ -185,6 +198,30 @@ test('dead guards and resource limits tear down queued input', async (t) => {
   assert.throws(() => b.post(ctx, 'one', {}), /revoked/);
   assert.equal(events.at(-1).type, 'disconnect');
 });
+test('registration paths follow the requested OS even with Windows path semantics', async () => {
+  const sandboxModule = { exports: {} };
+  vm.runInNewContext(
+    await fs.readFile(path.join(__dirname, '../src/main/extensions/native-messaging.cjs'), 'utf8'),
+    {
+      module: sandboxModule,
+      require: (name) => (name === 'node:path' ? path.win32 : require(name)),
+      process,
+      Buffer,
+      TextDecoder,
+      setTimeout,
+      clearTimeout,
+    },
+  );
+  const lookup = sandboxModule.exports.hostRegistrationPaths;
+  assert.deepEqual(Array.from(lookup('com.zacro.test', { platform: 'darwin', home: '/u' })), [
+    '/u/Library/Application Support/Google/Chrome/NativeMessagingHosts/com.zacro.test.json',
+    '/Library/Google/Chrome/NativeMessagingHosts/com.zacro.test.json',
+  ]);
+  assert.deepEqual(Array.from(lookup('com.zacro.test', { platform: 'linux', home: '/u' })), [
+    '/u/.config/google-chrome/NativeMessagingHosts/com.zacro.test.json',
+    '/etc/opt/chrome/native-messaging-hosts/com.zacro.test.json',
+  ]);
+});
 test('OS lookup uses documented Chrome registration only and Windows 32-bit then 64-bit', async (t) => {
   assert.deepEqual(hostRegistrationPaths('com.zacro.test', { platform: 'darwin', home: '/u' }), [
     '/u/Library/Application Support/Google/Chrome/NativeMessagingHosts/com.zacro.test.json',
@@ -268,9 +305,10 @@ test('Windows lookup stops at the first registered hive and view', async () => {
 });
 test('revocation kills the real child and clears its live port', async (t) => {
   const f = await fixture(t);
-  const { spawn } = require('node:child_process');
   let child;
-  const { broker: b } = broker(t, f.resolveHost, { spawnHost: (...args) => (child = spawn(...args)) });
+  const { broker: b } = broker(t, f.resolveHost, {
+    spawnHost: (...args) => (child = spawnNativeMessagingFixture(...args)),
+  });
   const ctx = context();
   await b.connect(ctx, 'com.zacro.test', 'port');
   b.post(ctx, 'port', { mode: 'hang' });

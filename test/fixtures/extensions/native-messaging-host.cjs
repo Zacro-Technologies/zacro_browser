@@ -2,7 +2,7 @@
 const { app, BrowserWindow, session } = require('electron');
 const fs = require('node:fs/promises');
 const path = require('node:path');
-const { spawn } = require('node:child_process');
+const { spawnNativeMessagingFixture } = require('../../helpers/native-messaging-fixture.cjs');
 const root = path.resolve(__dirname, '../../..');
 const directory = process.env.ZACRO_NATIVE_MESSAGING_ROOT;
 app.setPath('userData', path.join(directory, 'user'));
@@ -52,7 +52,7 @@ app.whenReady().then(async () => {
       },
       emit: (context, event) => bridge.emitNative(context, event),
       spawnHost: (...args) => {
-        const child = spawn(...args);
+        const child = spawnNativeMessagingFixture(...args);
         children.push(child);
         return child;
       },
