@@ -44,7 +44,14 @@ function Get-ZacroVisualStudio([switch]$Qualified) {
   }
   $zacroDiscovery = & $zacroVswhere @zacroDiscoveryArguments
   if ($LASTEXITCODE -ne 0) { throw 'Visual Studio discovery failed; no installer was started.' }
-  return @($zacroDiscovery | ConvertFrom-Json)
+  # Windows PowerShell 5 keeps a JSON array as one pipeline item. Wrapping the
+  # conversion in @() produces a nested array, even for [], and Select-Object
+  # then invents one instance with null fields. Enumerate the parsed value
+  # explicitly so both PowerShell editions emit zero, one or multiple instances.
+  $zacroDiscoveryText = ($zacroDiscovery -join [Environment]::NewLine).Trim()
+  if (-not $zacroDiscoveryText.StartsWith('[')) { throw 'Visual Studio discovery returned an invalid result; no installer was started.' }
+  $zacroInstances = ConvertFrom-Json -InputObject $zacroDiscoveryText
+  foreach ($zacroInstance in $zacroInstances) { $zacroInstance }
 }
 function Select-ZacroQualifiedCompiler($Instances) {
   # The caller supplies the result of vswhere's C++ and ATL/MFC component filter.
@@ -238,7 +245,7 @@ $zacroReceiptPath = Join-Path $zacroReceiptDirectory ('provision-' + [Guid]::New
 $zacroResults = @()
 foreach ($zacroSpecification in $zacroSpecifications) {
   if ($zacroSpecification.File -like 'vs_*' -and $zacroExistingTarget.Count -gt 0) {
-    $zacroMatchingComponents = @(& $zacroVswhere -all -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 Microsoft.VisualStudio.Component.VC.ATLMFC -format json -utf8 | ConvertFrom-Json |
+    $zacroMatchingComponents = @(Get-ZacroVisualStudio -Qualified |
       Where-Object { $_.installationPath -eq $zacroVisualStudioPath })
     if ($zacroMatchingComponents.Count -eq 0) { throw 'The dedicated VS instance lacks required components. Review it manually; no modification was attempted.' }
     continue

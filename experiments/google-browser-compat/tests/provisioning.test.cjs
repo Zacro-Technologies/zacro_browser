@@ -52,7 +52,7 @@ function markHidden(directory) {
   assert.equal(result.status, 0, result.stdout + result.stderr);
 }
 
-function invokeProvisionFunctions(body) {
+function invokeProvisionFunctions(body, environment = {}) {
   // Load only these pure function declarations from the real script's AST.
   // The script body, downloads, privilege handling and installers never run.
   const setup = `
@@ -61,7 +61,7 @@ function invokeProvisionFunctions(body) {
     $parseTokens = $null; $parseErrors = $null
     $ast = [Management.Automation.Language.Parser]::ParseFile($env:ZACRO_TEST_PROVISION_SCRIPT, [ref]$parseTokens, [ref]$parseErrors)
     if ($parseErrors.Count) { throw 'Provisioning script failed syntax validation.' }
-    $names = @('Get-ZacroInstallerSpecifications', 'Select-ZacroQualifiedCompiler', 'Assert-ZacroPreservedInstances')
+    $names = @('Get-ZacroInstallerSpecifications', 'Get-ZacroVisualStudio', 'Select-ZacroQualifiedCompiler', 'Assert-ZacroPreservedInstances')
     $functions = @($ast.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $names -contains $node.Name }, $false))
     if ($functions.Count -ne $names.Count) { throw 'Expected provisioning guards were not found.' }
     foreach ($function in $functions) { Invoke-Expression $function.Extent.Text }
@@ -78,6 +78,7 @@ function invokeProvisionFunctions(body) {
         ...process.env,
         ZACRO_TEST_PROVISION_SCRIPT: script,
         ZACRO_TEST_INSTALLER_MANIFEST: path.join(path.dirname(script), 'windows-installers.lock.json'),
+        ...environment,
       },
     },
   );
@@ -85,6 +86,75 @@ function invokeProvisionFunctions(body) {
   assert.equal(result.status, 0, result.stdout + result.stderr);
   return JSON.parse(result.stdout);
 }
+
+test(
+  'PowerShell discovery emits real instances for empty, single and multiple vswhere results',
+  { skip: !windows },
+  async (t) => {
+    const directory = await scratch(t);
+    const fixture = path.join(directory, 'vswhere-fixture.ps1');
+    await fs.writeFile(
+      fixture,
+      `
+    $global:zacroFixtureArguments = @($args)
+    $global:LASTEXITCODE = [int]$env:ZACRO_TEST_VSWHERE_EXIT
+    $env:ZACRO_TEST_VSWHERE_JSON -split '\\r?\\n'
+  `,
+    );
+    const result = invokeProvisionFunctions(
+      `
+    $zacroVswhere = $env:ZACRO_TEST_VSWHERE_FIXTURE
+    $env:ZACRO_TEST_VSWHERE_EXIT = '0'
+    $env:ZACRO_TEST_VSWHERE_JSON = '[]'
+    $empty = @(Get-ZacroVisualStudio)
+    Assert-ZacroPreservedInstances $empty @()
+    $old = [pscustomobject]@{ instanceId='old'; installationVersion='17.12.0.0'; installationPath='C:\\FixtureVS17' }
+    $current = [pscustomobject]@{ instanceId='current'; installationVersion='18.11.12315.225'; installationPath='C:\\FixtureVS18' }
+    $env:ZACRO_TEST_VSWHERE_JSON = ConvertTo-Json -InputObject @($old)
+    $single = @(Get-ZacroVisualStudio)
+    $env:ZACRO_TEST_VSWHERE_JSON = ConvertTo-Json -InputObject @($old, $current)
+    $multiple = @(Get-ZacroVisualStudio)
+    $projected = @($multiple | Select-Object instanceId, installationPath, installationVersion)
+    Assert-ZacroPreservedInstances $multiple @($old, $current)
+    $qualified = @(Get-ZacroVisualStudio -Qualified)
+    $qualifiedArguments = $global:zacroFixtureArguments
+    $selected = Select-ZacroQualifiedCompiler $qualified
+    $changedRejected = $false
+    try { Assert-ZacroPreservedInstances $multiple @($old) } catch { $changedRejected = $true }
+    $exitRejected = $false
+    $env:ZACRO_TEST_VSWHERE_EXIT = '1'
+    try { Get-ZacroVisualStudio | Out-Null } catch { $exitRejected = $true }
+    $env:ZACRO_TEST_VSWHERE_EXIT = '0'
+    $invalidRejected = 0
+    foreach ($invalid in @('', 'null', '{}', '[invalid]')) {
+      $env:ZACRO_TEST_VSWHERE_JSON = $invalid
+      try { Get-ZacroVisualStudio | Out-Null } catch { $invalidRejected++ }
+    }
+    $zacroVswhere = Join-Path (Split-Path $zacroVswhere -Parent) 'absent.exe'
+    $absent = @(Get-ZacroVisualStudio)
+    [ordered]@{ editionMajor=$PSVersionTable.PSVersion.Major; emptyCount=$empty.Count; singleCount=$single.Count; singleId=$single[0].instanceId; multipleCount=$multiple.Count; projected=$projected; selected=$selected.instanceId; qualifiedArguments=$qualifiedArguments; changedRejected=$changedRejected; exitRejected=$exitRejected; invalidRejected=$invalidRejected; absentCount=$absent.Count } | ConvertTo-Json -Depth 4 -Compress
+  `,
+      { ZACRO_TEST_VSWHERE_FIXTURE: fixture },
+    );
+    assert.equal(result.editionMajor, 5);
+    assert.equal(result.emptyCount, 0);
+    assert.equal(result.singleCount, 1);
+    assert.equal(result.singleId, 'old');
+    assert.equal(result.multipleCount, 2);
+    assert.deepEqual(result.projected, [
+      { instanceId: 'old', installationPath: 'C:\\FixtureVS17', installationVersion: '17.12.0.0' },
+      { instanceId: 'current', installationPath: 'C:\\FixtureVS18', installationVersion: '18.11.12315.225' },
+    ]);
+    assert.equal(result.selected, 'current');
+    assert.ok(result.qualifiedArguments.includes('-requires'));
+    assert.ok(result.qualifiedArguments.includes('Microsoft.VisualStudio.Component.VC.Tools.x86.x64'));
+    assert.ok(result.qualifiedArguments.includes('Microsoft.VisualStudio.Component.VC.ATLMFC'));
+    assert.equal(result.changedRejected, true);
+    assert.equal(result.exitRejected, true);
+    assert.equal(result.invalidRejected, 4);
+    assert.equal(result.absentCount, 0);
+  },
+);
 
 test(
   'SDK-only selection retains the SDK pin and excludes Visual Studio in every mode',
