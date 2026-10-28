@@ -86,9 +86,14 @@ macOS `Zacro Safe Storage` prompt: OS logs show the original five-second poll
 expired before manual approval. The test-only correction at `1ea360a` applies
 the existing explicit interactive allowance to that poll and its enclosing
 stage, preserving normal CI deadlines and every assertion; scoped review passes.
-The interactive run remains at this OS confirmation gate. Complete package
-acceptance, including the later packaged PDF/storage/adapter checks, is therefore
-still pending and is not represented as a successful run.
+After manual OS approval, the instrumented interactive run passes **1/1**,
+including real native browsing, both home themes, packaged PDF extraction,
+SQLite reopen, credential protection, extension adaptation and exclusion of
+server/test entrypoints from the ASAR. Comparison against `1ea360a` confirms
+the accepted diagnostic copy differs only in logging, equivalent fixture paths
+and comments; every assertion and deadline is identical. The original timed-out
+run remains part of the evidence. This is a development-package pass, not
+signed/notarized release acceptance.
 
 The approved provider recheck at `c4c005c` passes **3/3**: real JSON Formatter
 0.10.2 formatting/options, real React Developer Tools 8.0.0 panels/component
