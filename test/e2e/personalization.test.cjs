@@ -359,7 +359,17 @@ test(
     await b.emit({ type: 'panel', panel: 'settings' });
     await expect(b.shell.locator('#side-panel')).toBeVisible();
     await expect(b.shell.locator('#app')).toHaveAttribute('data-panel-animating', 'false');
-    const closePanel = await b.shell.locator('[data-key="panel-close"]').boundingBox();
+    const closeButton = b.shell.locator('[data-key="panel-close"]');
+    await expect(closeButton).toBeVisible();
+    let closePanel;
+    // Settings' asynchronous status refresh can replace its header between
+    // locator resolution and the native box query. Require a real click target.
+    await expect
+      .poll(async () => {
+        closePanel = await closeButton.boundingBox();
+        return Boolean(closePanel && closePanel.width > 0 && closePanel.height > 0);
+      })
+      .toBe(true);
     await b.emit({ type: 'command', mode: 'newtab', query: 'alpha' });
     await expect(b.shell.locator('#command-input')).toBeFocused();
     const commandAlignment = await b.shell.evaluate(() => {
@@ -589,8 +599,12 @@ test(
     assert(rowsByCount.get(5) > rowsByCount.get(4));
     await b.invoke('settings:update', { values: { sidebarWidth: 380 } });
     await expect(b.shell.locator('#sidebar-resizer')).toHaveAttribute('aria-valuenow', '380');
-    const expanded = await b.shell.locator('.space-page .favorite').first().boundingBox();
-    assert(expanded.width > rowsByCount.get(12));
+    await expect
+      .poll(async () => {
+        const expanded = await b.shell.locator('.space-page .favorite').first().boundingBox();
+        return expanded?.width ?? 0;
+      })
+      .toBeGreaterThan(rowsByCount.get(12));
     const other = await b.invoke('space:create', { name: 'Other Space' });
     await expect(b.shell.locator('.space-page .favorite')).toHaveCount(12);
     assert.equal((await b.invoke('state:get')).activeSpaceId, other.id);

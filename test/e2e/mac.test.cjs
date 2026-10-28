@@ -173,6 +173,15 @@ test('macOS uses native window chrome, menu conventions and keyboard navigation'
     await b.shell.locator('[data-key="address"]').focus();
     await expect(b.shell.locator('[data-key="address"]')).toBeFocused();
   };
+  const expectTrafficLightClearance = () =>
+    expect
+      .poll(async () => {
+        // Toolbar updates replace their buttons; a transient detached node is
+        // not a geometry sample of the current native-chrome arrangement.
+        const bounds = await b.shell.locator('[data-key="back"]').boundingBox();
+        return bounds?.x ?? -1;
+      })
+      .toBeGreaterThanOrEqual(88);
   const nativeShortcut = async (keyCode, modifiers, target = 'host') => {
     // CDP keyboard events reach the DOM but bypass Electron's before-input-event.
     // Exercise the native shortcut owner without changing first-responder focus.
@@ -247,8 +256,10 @@ test('macOS uses native window chrome, menu conventions and keyboard navigation'
       );
     assert.equal(native.menu.find((item) => item.id === 'preferences')?.accelerator, 'Command+,');
     assert.equal(native.menu.find((item) => item.id === 'close-window')?.accelerator, 'Command+Shift+W');
-    assert((await b.shell.locator('[data-key="back"]').boundingBox()).x >= 88);
-    assert((await b.shell.locator('.space-picker').boundingBox()).x < 30);
+    await expectTrafficLightClearance();
+    await expect
+      .poll(async () => (await b.shell.locator('.space-picker').boundingBox())?.x ?? Infinity)
+      .toBeLessThan(30);
     await captureShell('shell');
     // Only capture the disposable CI desktop; local developers may have personal
     // windows visible. Native window controls are outside the shell screenshot.
@@ -263,9 +274,15 @@ test('macOS uses native window chrome, menu conventions and keyboard navigation'
     }
 
     await nativeShortcut('S', ['meta']);
-    assert((await b.shell.locator('[data-key="back"]').boundingBox()).x >= 88);
+    await expect(b.shell.locator('#app')).toHaveAttribute('data-sidebar-hidden', 'true');
+    await expect(b.shell.locator('#app')).toHaveAttribute('data-sidebar-animating', 'false');
+    await expect(b.shell.locator('#sidebar')).toBeHidden();
+    await expectTrafficLightClearance();
     await captureShell('sidebar-hidden');
     await nativeShortcut('S', ['meta']);
+    await expect(b.shell.locator('#app')).toHaveAttribute('data-sidebar-hidden', 'false');
+    await expect(b.shell.locator('#app')).toHaveAttribute('data-sidebar-animating', 'false');
+    await expect(b.shell.locator('#sidebar')).toBeVisible();
     await nativeShortcut(',', ['meta']);
     await expect(b.shell.locator('#panel-title')).toHaveText('Settings');
     await captureShell('settings');
@@ -328,7 +345,7 @@ test('macOS uses native window chrome, menu conventions and keyboard navigation'
     );
     await b.invoke('window:fullscreen');
     await expect(b.shell.locator('html')).toHaveAttribute('data-fullscreen', 'false', { timeout: 15000 });
-    assert((await b.shell.locator('[data-key="back"]').boundingBox()).x >= 88);
+    await expectTrafficLightClearance();
   } catch (error) {
     const diagnostics = await b.app
       .evaluate(({ BrowserWindow, webContents }) => ({

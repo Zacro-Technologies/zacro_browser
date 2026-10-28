@@ -446,9 +446,17 @@ test(
       'translation must not scale or resize the document',
     );
     const resting = samples.at(-1);
-    const peekRectangle = await browser.shell.locator('.peek-body').boundingBox();
-    for (const key of ['x', 'y', 'width', 'height'])
-      assert.equal(Math.round(peekRectangle[key]), resting.bounds[key]);
+    // A late title publication can replace the Peek node after the host has
+    // reached its resting frame. Compare the current, attached shell surface.
+    await expect
+      .poll(async () => {
+        const rectangle = await browser.shell.locator('.peek-body').boundingBox();
+        return (
+          rectangle &&
+          Object.fromEntries(['x', 'y', 'width', 'height'].map((key) => [key, Math.round(rectangle[key])]))
+        );
+      })
+      .toEqual(resting.bounds);
     await browser.invoke('peek:promote');
     assert.equal((await browser.state()).runtime.peek, null);
     assert.equal(await browser.guest(previewURL, 'window.peekDraft'), 'retained');
