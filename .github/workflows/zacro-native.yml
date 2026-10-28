@@ -48,10 +48,12 @@ jobs:
         shell: pwsh
     env:
       ZACRO_NATIVE_PLATFORM: ${{ matrix.platform }}
-      ZACRO_NATIVE_ROOT: ${{ runner.temp }}/zacro-native-validation
       ZACRO_REQUEST_COMPILE: ${{ github.event_name == 'workflow_dispatch' && inputs.compile }}
       ZACRO_REQUEST_ROOT: ${{ inputs.root }}
     steps:
+      - name: Initialize external paths after the runner is assigned
+        run: |
+          "ZACRO_NATIVE_ROOT=$(Join-Path $env:RUNNER_TEMP 'zacro-native-validation')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
@@ -141,10 +143,11 @@ jobs:
     env:
       ZACRO_NATIVE_ROOT: ${{ inputs.root }}
       ZACRO_NATIVE_PLATFORM: ${{ inputs.platform }}
-      ZACRO_BUILD_EVIDENCE: ${{ runner.temp }}/zacro-native-evidence-${{ github.run_id }}-${{ github.run_attempt }}
       ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
       PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
     steps:
+      - name: Initialize run-specific external evidence path
+        run: printf '%s\n' "ZACRO_BUILD_EVIDENCE=$RUNNER_TEMP/zacro-native-evidence-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
         with:
           persist-credentials: false

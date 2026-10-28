@@ -35,11 +35,13 @@ jobs:
         shell: pwsh
     env:
       ZACRO_PLATFORM: ${{ matrix.platform }}
-      ZACRO_PROTOTYPE_ROOT: ${{ runner.temp }}/zacro-google-prototype
-      ZACRO_EVIDENCE_ROOT: ${{ runner.temp }}/zacro-google-evidence
       ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
       PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
     steps:
+      - name: Initialize external paths after the runner is assigned
+        run: |
+          "ZACRO_PROTOTYPE_ROOT=$(Join-Path $env:RUNNER_TEMP 'zacro-google-prototype')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "ZACRO_EVIDENCE_ROOT=$(Join-Path $env:RUNNER_TEMP 'zacro-google-evidence')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
