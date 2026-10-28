@@ -240,7 +240,9 @@ test(
           (image) => {
             record.elapsed = Date.now() - record.startedAt;
             record.empty = image.isEmpty();
-            record.size = image.getSize();
+            record.scaleFactor = Math.max(...image.getScaleFactors());
+            const png = image.toPNG({ scaleFactor: record.scaleFactor });
+            record.size = { width: png.readUInt32BE(16), height: png.readUInt32BE(20) };
             return image;
           },
           (error) => {
@@ -269,6 +271,7 @@ test(
     const captured = await b.app.evaluate(() => globalThis.personalizationCaptures);
     assert.equal(captured.length, 1);
     assert.equal(captured[0].empty, false, 'The backdrop must come from a real nonempty page capture');
+    await b.shell.locator('.page-backdrop-frame img').evaluate((image) => image.decode());
     const backdrop = await b.shell.evaluate(() => {
       const clip = document.querySelector('.page-backdrop-frame');
       const rect = clip.getBoundingClientRect();
@@ -278,6 +281,8 @@ test(
         filter: getComputedStyle(document.querySelector('.command-backdrop')).backdropFilter,
         background: getComputedStyle(document.querySelector('.command-backdrop')).backgroundColor,
         imageFilter: getComputedStyle(clip.firstElementChild).filter,
+        imageSource: clip.firstElementChild.src.slice(0, 30),
+        pixels: { width: clip.firstElementChild.naturalWidth, height: clip.firstElementChild.naturalHeight },
         overlay: getComputedStyle(clip, '::after').content,
         shadow: getComputedStyle(document.querySelector('.command-dialog')).boxShadow,
         bounds: {
@@ -293,6 +298,8 @@ test(
     assert.equal(backdrop.filter, 'none');
     assert.equal(backdrop.background, 'rgba(0, 0, 0, 0)');
     assert.equal(backdrop.imageFilter, 'none', 'The palette leaves page pixels sharp');
+    assert.match(backdrop.imageSource, /^data:image\/png;base64,iVBORw0K/);
+    assert.deepEqual(backdrop.pixels, captured[0].size, 'The decoded backdrop retains every native pixel');
     assert.equal(backdrop.overlay, 'none', 'The palette does not tint the page');
     assert.notEqual(backdrop.shadow, 'none', 'A shadow separates the palette from the unchanged page');
     assert.deepEqual(backdrop.bounds, pageBounds);

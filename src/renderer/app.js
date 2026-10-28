@@ -774,8 +774,8 @@ function showPageBackdrop(frames) {
       continue;
     if (
       typeof frame.dataUrl !== 'string' ||
-      frame.dataUrl.length > 2_000_000 ||
-      !/^data:image\/jpeg;base64,[A-Za-z0-9+/=]+$/.test(frame.dataUrl)
+      frame.dataUrl.length > Math.ceil((20 * 1024 * 1024) / 3) * 4 + 22 ||
+      !/^data:image\/png;base64,[A-Za-z0-9+/=]+$/.test(frame.dataUrl)
     )
       continue;
     const picture = document.createElement('img');

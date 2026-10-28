@@ -374,25 +374,41 @@ test(
         }),
       ];
     }, previewURL);
-    await browser.app.evaluate(({ systemPreferences, BrowserWindow }, url) => {
+    await browser.app.evaluate(({ systemPreferences, BrowserWindow, webContents }) => {
       systemPreferences.getAnimationSettings = () => ({
         prefersReducedMotion: false,
         shouldRenderRichAnimation: true,
         scrollAnimationsEnabledBySystem: true,
       });
       globalThis.__peekMotionSamples = [];
-      globalThis.__peekMotionTimer = setInterval(() => {
-        const view = BrowserWindow.getAllWindows()[0]?.contentView.children.find(
-          (item) => item.webContents?.getURL() === url,
-        );
-        if (view)
-          globalThis.__peekMotionSamples.push({
-            id: view.webContents.id,
-            bounds: view.getBounds(),
-            zoom: view.webContents.getZoomFactor(),
-          });
-      }, 8);
-    }, previewURL);
+      const parent = BrowserWindow.getAllWindows()[0].contentView;
+      const knownIds = new Set(webContents.getAllWebContents().map((contents) => contents.id));
+      const originalAdd = parent.addChildView.bind(parent);
+      let restoreBounds;
+      parent.addChildView = (view, ...args) => {
+        if (view.webContents && !knownIds.has(view.webContents.id) && !restoreBounds) {
+          const originalBounds = view.setBounds.bind(view);
+          // The entrance begins before its URL commits. Observe the newly
+          // attached native surface from its very first real bounds change.
+          view.setBounds = (bounds) => {
+            originalBounds(bounds);
+            globalThis.__peekMotionSamples.push({
+              id: view.webContents.id,
+              bounds: view.getBounds(),
+              zoom: view.webContents.getZoomFactor(),
+            });
+          };
+          restoreBounds = () => {
+            view.setBounds = originalBounds;
+          };
+        }
+        return originalAdd(view, ...args);
+      };
+      globalThis.__stopPeekMotionSamples = () => {
+        parent.addChildView = originalAdd;
+        restoreBounds?.();
+      };
+    });
     await browser.invoke('peek:open', { url: previewURL });
     await browser.ready(previewURL);
     await browser.guest(
@@ -401,7 +417,7 @@ test(
     );
     await expect.poll(async () => (await browser.state()).runtime.peek?.phase).toBe('open');
     const samples = await browser.app.evaluate(() => {
-      clearInterval(globalThis.__peekMotionTimer);
+      globalThis.__stopPeekMotionSamples();
       return globalThis.__peekMotionSamples;
     });
     const shellFrames = await browser.shell.evaluate(() => {

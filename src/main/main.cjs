@@ -78,6 +78,8 @@ let popupTimes = [];
 let pendingAuth = null;
 let backdropGeneration = 0;
 let backdropContext = null;
+const MAX_BACKDROP_PIXELS = 16 * 1024 * 1024;
+const MAX_BACKDROP_BYTES = 20 * 1024 * 1024;
 let windowReady = null;
 let startupReady = false;
 let quitRequested = false;
@@ -242,6 +244,14 @@ async function captureBackdrop() {
       const bounds = { ...entry.presentation.bounds };
       let timer;
       try {
+        // Bound ordinary compositor allocation before requesting the copy. A
+        // later check uses the returned representation and PNG's exact pixels.
+        const displayScale = screen.getDisplayMatching(win.getBounds()).scaleFactor;
+        if (
+          Math.ceil(bounds.width * displayScale) * Math.ceil(bounds.height * displayScale) >
+          MAX_BACKDROP_PIXELS
+        )
+          return null;
         const capture = await Promise.race([
           entry.contents.capturePage(undefined, { stayHidden: true }),
           new Promise((resolve) => {
@@ -251,12 +261,34 @@ async function captureBackdrop() {
             timer = setTimeout(() => resolve(null), 750);
           }),
         ]);
-        if (!capture || capture.isEmpty()) return null;
-        const size = capture.getSize();
-        const image = size.width > 1024 ? capture.resize({ width: 1024, quality: 'good' }) : capture;
-        const bytes = image.toJPEG(65);
-        if (!bytes.length || bytes.length > 1024 * 1024) return null;
-        return { bounds, dataUrl: `data:image/jpeg;base64,${bytes.toString('base64')}` };
+        if (!capture || capture.isEmpty() || generation !== backdropGeneration || !layout.overlay)
+          return null;
+        // Encode an existing backing-pixel representation, never the implicit
+        // 1x conversion (which loses detail on Retina/HiDPI displays). The
+        // 16M-pixel / 20 MiB bounds admit full 4K and 5K frames; exceptional
+        // captures are omitted instead of replaced by a visibly degraded copy.
+        const scales = capture.getScaleFactors().filter((value) => Number.isFinite(value) && value > 0);
+        if (!scales.length) return null;
+        const scaleFactor = Math.max(...scales);
+        // getSize(scaleFactor) is measured in logical pixels for scaled
+        // NativeImage representations, even though toPNG preserves the bitmap.
+        const size = capture.getSize(scaleFactor);
+        if (
+          !Number.isSafeInteger(size.width) ||
+          !Number.isSafeInteger(size.height) ||
+          size.width <= 0 ||
+          size.height <= 0 ||
+          Math.ceil(size.width * scaleFactor) * Math.ceil(size.height * scaleFactor) > MAX_BACKDROP_PIXELS
+        )
+          return null;
+        const bytes = capture.toPNG({ scaleFactor });
+        if (bytes.length < 24 || bytes.length > MAX_BACKDROP_BYTES) return null;
+        // IHDR stores the actual backing dimensions. This final guard also
+        // covers fractional-scale rounding in NativeImage's logical size.
+        const pixelWidth = bytes.readUInt32BE(16),
+          pixelHeight = bytes.readUInt32BE(20);
+        if (!pixelWidth || !pixelHeight || pixelWidth * pixelHeight > MAX_BACKDROP_PIXELS) return null;
+        return { bounds, dataUrl: `data:image/png;base64,${bytes.toString('base64')}` };
       } catch {
         return null;
       } finally {

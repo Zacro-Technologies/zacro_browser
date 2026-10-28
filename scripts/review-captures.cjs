@@ -322,6 +322,8 @@ async function main() {
       }
       await settled();
     }
+    await shell.bringToFront();
+    await shell.mouse.move(Math.min(700, contentSize[0] - 180), 18);
     const snapshot = await state();
     const entry = {
       stage: name,

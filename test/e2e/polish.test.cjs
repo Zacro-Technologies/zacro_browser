@@ -2,6 +2,7 @@
 
 const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
+const { createHash } = require('node:crypto');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
@@ -972,9 +973,13 @@ test(
         );
         const submission = { attached: Boolean(view), visible: view?.getVisible() ?? false };
         const result = await original(...args);
+        const scaleFactor = Math.max(...result.getScaleFactors());
+        const png = result.toPNG({ scaleFactor });
         globalThis.__backdropCaptures.push({
           elapsed: Date.now() - start,
           empty: result.isEmpty(),
+          pixels: { width: png.readUInt32BE(16), height: png.readUInt32BE(20) },
+          png: png.toString('base64'),
           ...submission,
         });
         return result;
@@ -998,6 +1003,7 @@ test(
     assert.equal(capture.visible, false, 'The modal must hide the native page immediately');
     assert.equal(capture.empty, false);
     await expect(browser.shell.locator('#page-backdrop img')).toHaveCount(1);
+    await browser.shell.locator('#page-backdrop img').evaluate((image) => image.decode());
     const attachedCount = () =>
       browser.app.evaluate(
         ({ BrowserWindow }, url) =>
@@ -1009,10 +1015,22 @@ test(
     await expect.poll(attachedCount).toBe(0);
     const frame = await browser.shell.evaluate(() => {
       const frame = window.__backdropEvents.at(-1)[0];
-      return { bounds: frame.bounds, prefix: frame.dataUrl.slice(0, 30), size: frame.dataUrl.length };
+      const image = document.querySelector('#page-backdrop img');
+      return {
+        bounds: frame.bounds,
+        dataUrl: frame.dataUrl,
+        pixels: { width: image.naturalWidth, height: image.naturalHeight },
+      };
     });
-    assert.match(frame.prefix, /^data:image\/jpeg;base64,\/9j\//);
-    assert(frame.size < 1.4 * 1024 * 1024);
+    assert.match(frame.dataUrl.slice(0, 30), /^data:image\/png;base64,iVBORw0K/);
+    const png = Buffer.from(frame.dataUrl.slice('data:image/png;base64,'.length), 'base64');
+    assert(png.length <= 20 * 1024 * 1024);
+    assert.deepEqual(frame.pixels, capture.pixels);
+    assert.equal(
+      createHash('sha256').update(png).digest('hex'),
+      createHash('sha256').update(Buffer.from(capture.png, 'base64')).digest('hex'),
+      'The entire capture is encoded losslessly without resizing',
+    );
     assert(frame.bounds.width > 0 && frame.bounds.height > 0);
     await browser.shell.keyboard.press('Escape');
     await expect.poll(() => browser.shell.evaluate(() => window.__backdropEvents.at(-1)?.length)).toBe(0);
@@ -1068,6 +1086,106 @@ test(
     await expect(browser.shell.locator('#command-input')).toBeFocused();
     await expect.poll(() => browser.shell.evaluate(() => window.__backdropEvents.at(-1)?.length)).toBe(0);
     assert.equal(await browser.app.evaluate(() => globalThis.__polishPrivateCaptureCount), 0);
+  },
+);
+
+test(
+  '4K HiDPI backdrop representations retain backing pixels and oversized captures are omitted',
+  { timeout: 45000 },
+  async (t) => {
+    const browser = await launch(t);
+    const url = `${base}/backdrop-quality`;
+    await browser.navigate(url);
+    await browser.guest(url, 'window.backdropDraft="Keep this document"');
+    await browser.shell.evaluate(() => {
+      window.__qualityFrames = [];
+      window.zacro.onEvent((event) => {
+        if (event.type === 'page:backdrop') window.__qualityFrames.push(event.frames);
+      });
+    });
+    const expected = await browser.app.evaluate(({ nativeImage, webContents }, url) => {
+      // A genuine NativeImage with only a 2x representation reproduces Retina
+      // encoding semantics independently of the display attached to the runner.
+      const bitmap = Buffer.alloc(3840 * 2160 * 4, 255);
+      bitmap.fill(0, 0, 3840 * 4);
+      const image = nativeImage.createFromBitmap(bitmap, { width: 3840, height: 2160, scaleFactor: 2 });
+      const bytes = image.toPNG({ scaleFactor: 2 });
+      globalThis.__qualityMode = 'full';
+      globalThis.__qualityEncodes = 0;
+      let roundingBoundary;
+      const contents = webContents.getAllWebContents().find((item) => item.getURL() === url);
+      contents.capturePage = async () => {
+        if (globalThis.__qualityMode === 'rounding' && !roundingBoundary)
+          roundingBoundary = nativeImage.createFromBitmap(Buffer.alloc(4097 * 4096 * 4, 255), {
+            width: 4097,
+            height: 4096,
+            scaleFactor: 2,
+          });
+        const frame = globalThis.__qualityMode === 'rounding' ? roundingBoundary : image;
+        return {
+          isEmpty: () => frame.isEmpty(),
+          getScaleFactors: () => frame.getScaleFactors(),
+          getSize: (scale) =>
+            globalThis.__qualityMode === 'pixels' ? { width: 2048, height: 2049 } : frame.getSize(scale),
+          toPNG: (options) => {
+            globalThis.__qualityEncodes++;
+            return globalThis.__qualityMode === 'bytes'
+              ? Buffer.alloc(20 * 1024 * 1024 + 1)
+              : frame.toPNG(options);
+          },
+        };
+      };
+      return {
+        scales: image.getScaleFactors(),
+        size: image.getSize(2),
+        pngSize: { width: bytes.readUInt32BE(16), height: bytes.readUInt32BE(20) },
+        png: bytes.toString('base64'),
+      };
+    }, url);
+    assert.deepEqual(expected.scales, [2]);
+    assert.deepEqual(expected.size, { width: 1920, height: 1080 });
+    assert.deepEqual(
+      expected.pngSize,
+      { width: 3840, height: 2160 },
+      'PNG retains the actual backing pixels of a 2x representation',
+    );
+    await browser.shell.locator('[data-key="address"]').click();
+    await expect(browser.shell.locator('#page-backdrop img')).toHaveCount(1);
+    await browser.shell.locator('#page-backdrop img').evaluate((image) => image.decode());
+    const rendered = await browser.shell.locator('#page-backdrop img').evaluate((image) => ({
+      width: image.naturalWidth,
+      height: image.naturalHeight,
+      src: image.src,
+    }));
+    assert.deepEqual({ width: rendered.width, height: rendered.height }, expected.pngSize);
+    const bytes = Buffer.from(rendered.src.slice('data:image/png;base64,'.length), 'base64');
+    assert.equal(
+      createHash('sha256').update(bytes).digest('hex'),
+      createHash('sha256').update(Buffer.from(expected.png, 'base64')).digest('hex'),
+    );
+    await browser.shell.keyboard.press('Escape');
+    await expect(browser.shell.locator('#command-input')).toHaveCount(0);
+
+    // The odd-pixel 2x image rounds down to 2048×2048 logical pixels. Only
+    // checking the encoded IHDR catches its one-column-over-16M bitmap.
+    for (const mode of ['pixels', 'rounding', 'bytes']) {
+      await browser.app.evaluate((_electron, mode) => {
+        globalThis.__qualityMode = mode;
+        globalThis.__qualityEncodes = 0;
+      }, mode);
+      await browser.shell.evaluate(() => {
+        window.__qualityFrames = [];
+      });
+      await browser.shell.locator('[data-key="address"]').click();
+      await expect(browser.shell.locator('#command-input')).toBeFocused();
+      await expect.poll(() => browser.shell.evaluate(() => window.__qualityFrames.at(-1)?.length)).toBe(0);
+      assert.equal(await browser.app.evaluate(() => globalThis.__qualityEncodes), mode === 'pixels' ? 0 : 1);
+      await expect(browser.shell.locator('#page-backdrop img')).toHaveCount(0);
+      await browser.shell.locator('#command-input').fill('The palette stays interactive');
+      await browser.shell.keyboard.press('Escape');
+      await expect(browser.shell.locator('#command-input')).toHaveCount(0);
+      assert.equal(await browser.guest(url, 'window.backdropDraft'), 'Keep this document');
+    }
   },
 );
 
