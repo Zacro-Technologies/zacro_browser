@@ -11,11 +11,11 @@ const {
 
 test('native pages align with compact chrome, sidebar, and open panels without fractional seams', () => {
   const layout = browserLayout({ width: 1441, height: 941, sidebarWidth: 260, panelWidth: 400, split: true });
-  assert.deepEqual(layout.primary, { x: 260, y: 36, width: 379, height: 897 });
-  assert.deepEqual(layout.secondary, { x: 645, y: 36, width: 380, height: 897 });
-  assert.equal(layout.secondary.x + layout.secondary.width + 400 + 16, 1441);
+  assert.deepEqual(layout.primary, { x: 268, y: 36, width: 379, height: 897 });
+  assert.deepEqual(layout.secondary, { x: 653, y: 36, width: 380, height: 897 });
+  assert.equal(layout.secondary.x + layout.secondary.width + 400 + 8, 1441);
   assert.equal(layout.secondary.x - layout.primary.x - layout.primary.width, 6);
-  assert.deepEqual(layout.peek, { x: 284, y: 92, width: 717, height: 817 });
+  assert.deepEqual(layout.peek, { x: 292, y: 92, width: 717, height: 817 });
 });
 
 test('hiding the sidebar reclaims its width while keeping the page, panel and split frame aligned', () => {
@@ -32,14 +32,18 @@ test('hiding the sidebar reclaims its width while keeping the page, panel and sp
     panelWidth: 360,
     split: true,
   });
-  assert.deepEqual(split.primary, { x: 8, y: 40, width: 305, height: 652 });
-  assert.deepEqual(split.secondary, { x: 319, y: 40, width: 305, height: 652 });
-  assert.equal(split.secondary.x + split.secondary.width + 360 + 16, 1000);
-  assert.deepEqual(split.peek, { x: 32, y: 96, width: 568, height: 572 });
+  assert.deepEqual(split.primary, { x: 8, y: 40, width: 309, height: 652 });
+  assert.deepEqual(split.secondary, { x: 323, y: 40, width: 309, height: 652 });
+  assert.equal(split.secondary.x + split.secondary.width + 360 + 8, 1000);
+  assert.deepEqual(split.peek, { x: 32, y: 96, width: 576, height: 572 });
 
   const restored = browserLayout({ width: 1000, height: 700, sidebarWidth: 300 });
-  assert.equal(restored.primary.x, 300, 'A custom sidebar width remains available after focus mode');
-  assert.equal(browserLayout({ width: 1000, height: 700 }).primary.x, 224);
+  assert.equal(
+    restored.primary.x,
+    308,
+    'A custom sidebar width retains the same page inset after focus mode',
+  );
+  assert.equal(browserLayout({ width: 1000, height: 700 }).primary.x, 232);
 });
 
 test('sidebar navigation, caption rail and Find reserve only their supported content insets', () => {
@@ -53,19 +57,38 @@ test('sidebar navigation, caption rail and Find reserve only their supported con
   for (const contentTop of [-1, 0, 8.5, 44, 10000, NaN, Infinity])
     assert.equal(browserLayout({ width: 1000, height: 700, contentTop }).primary.y, 36);
   for (const [sidebarWidth, expected] of [
-    [100, 200],
-    [224, 224],
-    [300, 300],
-    [400, 380],
+    [100, 108],
+    [224, 232],
+    [300, 308],
+    [400, 388],
   ])
     assert.equal(browserLayout({ width: 1000, height: 700, sidebarWidth }).primary.x, expected);
 });
 
+test('custom gutters stay equal throughout the sidebar animation and split layouts', () => {
+  for (const pageGutter of [4, 8, 12, 20])
+    for (const sidebarWidth of [0, 7, 80, 160, 224, 236, 380]) {
+      const result = browserLayout({
+        width: 1440,
+        height: 900,
+        sidebarWidth,
+        pageGutter,
+        contentTop: pageGutter,
+        split: true,
+      });
+      assert.equal(result.primary.x - sidebarWidth, pageGutter);
+      assert.equal(result.primary.y, pageGutter);
+      assert.equal(900 - result.primary.y - result.primary.height, pageGutter);
+      assert.equal(1440 - result.secondary.x - result.secondary.width, pageGutter);
+      assert.equal(result.secondary.x - result.primary.x - result.primary.width, 6);
+    }
+});
+
 test('resizing and malformed dimensions keep native bounds finite and positive', () => {
-  for (const width of [960, 1100, 1440, 3840, NaN]) {
+  for (const width of [560, 640, 800, 960, 1100, 1440, 3840, NaN]) {
     const layout = browserLayout({
       width,
-      height: 640,
+      height: 420,
       sidebarWidth: Infinity,
       panelWidth: 10000,
       split: true,
@@ -75,6 +98,19 @@ test('resizing and malformed dimensions keep native bounds finite and positive',
       assert(rectangle.width > 0 && rectangle.height > 0);
     }
   }
+});
+
+test('small windows reserve a usable page and remember their actual size', () => {
+  const expanded = browserLayout({ width: 560, height: 420, sidebarWidth: 380 });
+  assert.deepEqual(expanded.primary, { x: 312, y: 36, width: 240, height: 376 });
+  const panel = browserLayout({ width: 560, height: 420, sidebarWidth: 0, panelWidth: 304, contentTop: 40 });
+  assert.deepEqual(panel.primary, { x: 8, y: 40, width: 240, height: 372 });
+  assert.deepEqual(
+    restoreWindowPlacement({ x: 50, y: 80, width: 560, height: 420 }, [
+      { x: 0, y: 0, width: 1920, height: 1080 },
+    ]),
+    { x: 50, y: 80, width: 560, height: 420, maximized: false },
+  );
 });
 
 test('unchanged native presentation does not toggle visibility or reset bounds', () => {
@@ -145,6 +181,7 @@ test('focus can change split pane without swapping its visual position', () => {
   assert.equal(resolveSplit(['a', 'b'], tabs, 'c', 'home'), null);
   assert.equal(resolveSplit(['a', 'b'], tabs.slice(0, 1), 'a', 'home'), null);
   assert.equal(resolveSplit(['a', 'b'], tabs, 'a', 'work'), null);
+  assert.equal(resolveSplit(['a', 'b'], [tabs[0], { ...tabs[1], closed: true }], 'a', 'home'), null);
 });
 
 test('saved maximized state preserves the normal window on its original monitor', () => {

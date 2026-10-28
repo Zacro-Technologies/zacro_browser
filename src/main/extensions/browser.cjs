@@ -12,7 +12,7 @@ function createBrowserAdapter({
   reloadDocument,
   publish,
 }) {
-  const tabsFor = (profile) => store.state.tabs.filter((tab) => tab.profileId === profile);
+  const tabsFor = (profile) => store.state.tabs.filter((tab) => tab.profileId === profile && !tab.closed);
   const win = () => {
     const value = getWindow();
     if (!value || value.isDestroyed()) throw new Error('Browser window is closed.');
@@ -24,6 +24,7 @@ function createBrowserAdapter({
     return record;
   }
   function tabData(tab) {
+    if (tab.closed) throw new Error('Unknown profile tab.');
     const entry = reserveView(tab),
       wc = entry.contents,
       active = store.state.activeTabId === tab.id;
@@ -69,7 +70,7 @@ function createBrowserAdapter({
     let cursor = 0;
     guard();
     store.state.tabs = store.state.tabs.map((tab) =>
-      tab.profileId === profile ? profileTabs[cursor++] : tab,
+      tab.profileId === profile && !tab.closed ? profileTabs[cursor++] : tab,
     );
     store.changed();
     return items.map(tabData);

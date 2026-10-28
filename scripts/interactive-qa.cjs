@@ -14,6 +14,8 @@ const demoFavorites = [
   { id: 'calendar', title: 'Calendar', color: '#ec6b69', heading: 'Make room for the day ahead.' },
   { id: 'notes', title: 'Notes', color: '#d4a348', heading: 'Keep a thought close by.' },
   { id: 'studio', title: 'Studio', color: '#8870c7', heading: 'A place for work in progress.' },
+  { id: 'music', title: 'Music', color: '#cf6688', heading: 'Find your rhythm.' },
+  { id: 'compass', title: 'Explore', color: '#4d9d8d', heading: 'Follow your curiosity.' },
 ];
 
 // Original fixture icons, rendered from simple vector shapes into bounded PNGs.
@@ -52,6 +54,21 @@ function demoIcon(id) {
   } else if (id === 'notes') {
     shapes.push([rect(7, 5, 18, 23, 2), '#fffbee']);
     for (const y of [12, 17, 22]) shapes.push([line(11, y, 21, y, 1.6), '#b99857']);
+  } else if (id === 'music') {
+    shapes.push(
+      [line(12, 11, 23, 8, 2.4), '#ffffff'],
+      [line(12, 11, 12, 23, 2.4), '#ffffff'],
+      [line(23, 8, 23, 20, 2.4), '#ffffff'],
+      [rect(7, 21, 6, 5, 2.4), '#ffffff'],
+      [rect(18, 18, 6, 5, 2.4), '#ffffff'],
+    );
+  } else if (id === 'compass') {
+    shapes.push(
+      [rect(5, 5, 22, 22, 11), '#ffffff'],
+      [line(12, 20, 20, 12, 3), color],
+      [line(12, 20, 15, 13, 1.5), color],
+      [line(15, 13, 20, 12, 1.5), color],
+    );
   } else
     shapes.push(
       [rect(6, 6, 20, 20, 3), '#ffffff'],
@@ -112,7 +129,7 @@ function createShowcaseSite() {
   server.removeListener('request', original);
   server.on('request', (request, response) => {
     const url = new URL(request.url, 'http://127.0.0.1');
-    const match = /^\/showcase\/(mail|calendar|notes|studio)(\.png)?$/.exec(url.pathname);
+    const match = /^\/showcase\/(mail|calendar|notes|studio|music|compass)(\.png)?$/.exec(url.pathname);
     if (!match) return original(request, response);
     const [, id, image] = match;
     if (image) {
@@ -160,6 +177,9 @@ async function main() {
   await fs.mkdir(scratch, { recursive: true });
   const directory = await fs.mkdtemp(path.join(scratch, 'interactive-qa-'));
   const showcase = process.argv.includes('--showcase');
+  const compact = process.argv.includes('--compact');
+  const dark = process.argv.includes('--dark');
+  const opaque = process.argv.includes('--opaque');
   const server = showcase ? createShowcaseSite() : createInteractiveSite();
   await new Promise((resolve, reject) => {
     server.once('error', reject);
@@ -167,21 +187,32 @@ async function main() {
   });
   const url = `http://127.0.0.1:${server.address().port}/`;
   const packaged = process.argv.includes('--packaged');
-  if (showcase) {
+  if (showcase || compact || dark || opaque) {
     const store = new BrowserStore(directory);
-    store.state = populateLocalFavorites(createShowcaseState(url), url);
+    if (showcase) store.state = populateLocalFavorites(createShowcaseState(url), url);
+    if (dark) store.state.settings.theme = 'dark';
+    if (opaque) for (const space of store.state.spaces) space.theme = { ...space.theme, opacity: 100 };
+    if (compact)
+      store.state.windowBounds = { width: 560, height: 420, maximized: false, sizeKind: 'content' };
     store.save();
   }
   const executable = packaged ? packagedPaths(root).executable : require('electron');
-  const env = { ...process.env, ZACRO_USER_DATA: directory };
+  const env = {
+    ...process.env,
+    ZACRO_USER_DATA: directory,
+    ZACRO_SKIP_ONBOARDING: process.argv.includes('--onboarding') ? '0' : '1',
+  };
   delete env.ELECTRON_RUN_AS_NODE;
   console.log(`Opening ${packaged ? 'packaged' : 'development'} Zacro with an isolated test profile.`);
   console.log(`Local test page: ${url}`);
+  if (compact) console.log('Compact review: 560×420 content window.');
   if (showcase)
     console.log(
       'Showcase: local Mail, Calendar, Notes and Studio favorites. Visit each once to load its icon; the journal opens first.',
     );
-  console.log('Options: --showcase for the demo workspace; --packaged for the built application.');
+  console.log(
+    'Options: --showcase for the demo workspace; --packaged for the built application; --onboarding for the tour; --compact for 560×420; --dark for dark appearance; --opaque for opaque window chrome.',
+  );
   console.log(
     `${process.platform === 'darwin' ? 'Quit Zacro with Command-Q' : 'Close the browser'} when finished. No real browser profile is modified.`,
   );

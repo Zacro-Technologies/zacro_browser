@@ -23,7 +23,7 @@ async function launch(t, { earlyLink = false } = {}) {
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
-  const env = { ...process.env, ZACRO_USER_DATA: directory };
+  const env = { ...process.env, ZACRO_SKIP_ONBOARDING: '1', ZACRO_USER_DATA: directory };
   delete env.ELECTRON_RUN_AS_NODE;
   let app;
   t.after(async () => {
@@ -50,11 +50,20 @@ load('electron').app.emit('open-url', { preventDefault() {} }, ${JSON.stringify(
   }
   app = await electron.launch({ args: [entry], env });
   let shell = await app.firstWindow();
+  // DOM readiness can precede main's loadFile continuation and win.show().
+  // Establish the native display precondition before focusing or capturing.
+  await expect
+    .poll(() => app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].isVisible()))
+    .toBe(true);
   await app.evaluate(({ app, BrowserWindow }) => {
     app.focus({ steal: true });
     BrowserWindow.getAllWindows()[0].focus();
   });
+  await expect
+    .poll(() => app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].isFocused()))
+    .toBe(true);
   await expect(shell.locator('[data-key="space-picker"]')).toBeVisible();
+  if (await shell.locator('#command-input').count()) await shell.keyboard.press('Escape');
   const invoke = (action, payload = {}) =>
     shell.evaluate(([action, payload]) => window.zacro.invoke(action, payload), [action, payload]);
   const state = () => invoke('state:get');
@@ -103,13 +112,30 @@ test('macOS uses native window chrome, menu conventions and keyboard navigation'
   const b = await launch(t);
   const results = path.resolve(__dirname, '../../test-results');
   await fs.mkdir(results, { recursive: true });
+  const captureShell = async (name) => {
+    await expect
+      .poll(() =>
+        b.app.evaluate(({ BrowserWindow }) => {
+          const window = BrowserWindow.getAllWindows()[0];
+          return window.isVisible() && window.isFocused() && !window.isMinimized();
+        }),
+      )
+      .toBe(true);
+    await b.shell.waitForFunction(() => document.visibilityState === 'visible');
+    // Cross two visible compositor opportunities, rather than asking CDP for
+    // the first surface before the native window has presented it.
+    await b.shell.evaluate(
+      () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))),
+    );
+    await b.shell.screenshot({ path: path.join(results, `mac-${process.arch}-${name}.png`) });
+  };
   await b.app.evaluate(({ BrowserWindow, Menu }) => {
     globalThis.macShortcutTrace = [];
     BrowserWindow.getAllWindows()[0].webContents.on('before-input-event', (event, input) => {
       globalThis.macShortcutTrace.push({ source: 'host', ...input, prevented: event.defaultPrevented });
       if (globalThis.macShortcutTrace.length > 80) globalThis.macShortcutTrace.shift();
     });
-    for (const id of ['new-tab', 'next-tab', 'previous-tab', 'close-tab', 'reopen-tab']) {
+    for (const id of ['command-palette', 'next-tab', 'previous-tab', 'close-tab', 'reopen-tab']) {
       const item = Menu.getApplicationMenu().getMenuItemById(id);
       const click = item.click;
       item.click = (...args) => {
@@ -147,28 +173,51 @@ test('macOS uses native window chrome, menu conventions and keyboard navigation'
     await b.shell.locator('[data-key="address"]').focus();
     await expect(b.shell.locator('[data-key="address"]')).toBeFocused();
   };
-  const nativeShortcut = async (keyCode, modifiers) => {
+  const expectTrafficLightClearance = () =>
+    expect
+      .poll(async () => {
+        // Toolbar updates replace their buttons; a transient detached node is
+        // not a geometry sample of the current native-chrome arrangement.
+        const bounds = await b.shell.locator('[data-key="back"]').boundingBox();
+        return bounds?.x ?? -1;
+      })
+      .toBeGreaterThanOrEqual(88);
+  const nativeShortcut = async (keyCode, modifiers, target = 'host') => {
     // CDP keyboard events reach the DOM but bypass Electron's before-input-event.
     // Exercise the native shortcut owner without changing first-responder focus.
     const offset = await b.app.evaluate(
-      ({ BrowserWindow }, { keyCode, modifiers }) => {
+      ({ BrowserWindow, webContents }, { keyCode, modifiers, target }) => {
         const offset = globalThis.macShortcutTrace.length;
-        const contents = BrowserWindow.getAllWindows()[0].webContents;
+        const contents =
+          target === 'focused'
+            ? webContents.getFocusedWebContents()
+            : BrowserWindow.getAllWindows()[0].webContents;
+        if (!contents) throw new Error('The native shortcut has no focused target');
+        if (target === 'focused') {
+          contents.once('before-input-event', (event, input) => {
+            globalThis.macShortcutTrace.push({
+              source: 'focused',
+              contentsId: contents.id,
+              ...input,
+              prevented: event.defaultPrevented,
+            });
+          });
+        }
         contents.sendInputEvent({ type: 'keyDown', keyCode, modifiers });
         contents.sendInputEvent({ type: 'keyUp', keyCode, modifiers });
         return offset;
       },
-      { keyCode, modifiers },
+      { keyCode, modifiers, target },
     );
     await expect
       .poll(() =>
         b.app.evaluate(
-          (_electron, { offset, keyCode, modifiers }) =>
+          (_electron, { offset, keyCode, modifiers, target }) =>
             globalThis.macShortcutTrace
               .slice(offset)
               .some(
                 (input) =>
-                  input.source === 'host' &&
+                  input.source === target &&
                   input.type === 'keyDown' &&
                   input.key.toLowerCase() === keyCode.toLowerCase() &&
                   input.meta === modifiers.includes('meta') &&
@@ -176,7 +225,7 @@ test('macOS uses native window chrome, menu conventions and keyboard navigation'
                   input.shift === modifiers.includes('shift') &&
                   input.prevented,
               ),
-          { offset, keyCode, modifiers },
+          { offset, keyCode, modifiers, target },
         ),
       )
       .toBe(true);
@@ -198,7 +247,7 @@ test('macOS uses native window chrome, menu conventions and keyboard navigation'
         menu: flatten(Menu.getApplicationMenu()),
       };
     });
-    assert.deepEqual(native.buttons, { x: 16, y: 16 });
+    assert.deepEqual(native.buttons, { x: 16, y: 12 });
     assert.equal(native.fullscreen, false);
     for (const role of ['services', 'hide', 'hideothers', 'quit', 'minimize', 'zoom', 'front'])
       assert(
@@ -207,9 +256,11 @@ test('macOS uses native window chrome, menu conventions and keyboard navigation'
       );
     assert.equal(native.menu.find((item) => item.id === 'preferences')?.accelerator, 'Command+,');
     assert.equal(native.menu.find((item) => item.id === 'close-window')?.accelerator, 'Command+Shift+W');
-    assert((await b.shell.locator('[data-key="sidebar-toggle"]').boundingBox()).x >= 88);
-    assert((await b.shell.locator('.space-picker').boundingBox()).x < 30);
-    await b.shell.screenshot({ path: path.join(results, `mac-${process.arch}-shell.png`) });
+    await expectTrafficLightClearance();
+    await expect
+      .poll(async () => (await b.shell.locator('.space-picker').boundingBox())?.x ?? Infinity)
+      .toBeLessThan(30);
+    await captureShell('shell');
     // Only capture the disposable CI desktop; local developers may have personal
     // windows visible. Native window controls are outside the shell screenshot.
     if (process.env.CI === 'true' && process.env.GITHUB_ACTIONS === 'true') {
@@ -222,24 +273,37 @@ test('macOS uses native window chrome, menu conventions and keyboard navigation'
       ).catch((error) => console.warn(`Optional native desktop capture unavailable: ${error.message}`));
     }
 
-    await b.shell.locator('[data-key="sidebar-toggle"]').click();
-    assert((await b.shell.locator('[data-key="sidebar-toggle"]').boundingBox()).x >= 88);
-    await b.shell.screenshot({ path: path.join(results, `mac-${process.arch}-sidebar-hidden.png`) });
-    await b.shell.locator('[data-key="sidebar-toggle"]').click();
+    await nativeShortcut('S', ['meta']);
+    await expect(b.shell.locator('#app')).toHaveAttribute('data-sidebar-hidden', 'true');
+    await expect(b.shell.locator('#app')).toHaveAttribute('data-sidebar-animating', 'false');
+    await expect(b.shell.locator('#sidebar')).toBeHidden();
+    await expectTrafficLightClearance();
+    await captureShell('sidebar-hidden');
+    await nativeShortcut('S', ['meta']);
+    await expect(b.shell.locator('#app')).toHaveAttribute('data-sidebar-hidden', 'false');
+    await expect(b.shell.locator('#app')).toHaveAttribute('data-sidebar-animating', 'false');
+    await expect(b.shell.locator('#sidebar')).toBeVisible();
     await nativeShortcut(',', ['meta']);
     await expect(b.shell.locator('#panel-title')).toHaveText('Settings');
-    await b.shell.screenshot({ path: path.join(results, `mac-${process.arch}-settings.png`) });
+    await captureShell('settings');
     await b.shell.keyboard.press('Escape');
     await nativeShortcut('L', ['meta']);
     await expect(b.shell.locator('#command-input')).toBeFocused();
     await b.shell.keyboard.press('Escape');
 
+    await b.navigate(`${b.base}/initial`);
     const initial = (await b.state()).activeTabId;
     await active(initial);
     await focusChrome();
     await nativeShortcut('T', ['meta']);
     await expect(b.shell.locator('#command-input')).toBeFocused();
     await b.shell.keyboard.press('Escape');
+    assert.equal((await b.state()).activeTabId, initial);
+    assert.equal((await b.state()).tabs.length, 1);
+    await focusChrome();
+    await nativeShortcut('T', ['meta']);
+    await b.shell.locator('#command-input').fill(`${b.base}/second`);
+    await b.shell.locator('#command-input').press('Enter');
     await expect.poll(async () => (await b.state()).activeTabId).not.toBe(initial);
     const second = (await b.state()).activeTabId;
     assert.notEqual(initial, second);
@@ -259,17 +323,18 @@ test('macOS uses native window chrome, menu conventions and keyboard navigation'
     }, `${b.base}/restore`);
     await expect.poll(async () => (await b.state()).tabs.some((tab) => tab.id === second)).toBe(false);
     await active(initial);
-    // Closing the native guest must restore the shell as first responder without
-    // a test click/focus override. Otherwise the physical reopen shortcut is lost.
+    // Closing the active guest transfers input to the surviving page. Verify the
+    // actual first responder and exercise reopen there without a test focus/click
+    // override, so both page typing and the native browser shortcut stay usable.
     await expect
       .poll(() =>
         b.app.evaluate(
-          ({ BrowserWindow, webContents }) =>
-            webContents.getFocusedWebContents()?.id === BrowserWindow.getAllWindows()[0].webContents.id,
+          ({ webContents }, url) => webContents.getFocusedWebContents()?.getURL() === url,
+          `${b.base}/initial`,
         ),
       )
       .toBe(true);
-    await nativeShortcut('T', ['meta', 'shift']);
+    await nativeShortcut('T', ['meta', 'shift'], 'focused');
     await expect.poll(async () => (await b.state()).tabs.some((tab) => tab.id === second)).toBe(true);
 
     await b.invoke('window:fullscreen');
@@ -280,12 +345,21 @@ test('macOS uses native window chrome, menu conventions and keyboard navigation'
     );
     await b.invoke('window:fullscreen');
     await expect(b.shell.locator('html')).toHaveAttribute('data-fullscreen', 'false', { timeout: 15000 });
-    assert((await b.shell.locator('[data-key="sidebar-toggle"]').boundingBox()).x >= 88);
+    await expectTrafficLightClearance();
   } catch (error) {
     const diagnostics = await b.app
       .evaluate(({ BrowserWindow, webContents }) => ({
         inputs: globalThis.macShortcutTrace,
         shell: BrowserWindow.getAllWindows()[0]?.webContents.id,
+        window: BrowserWindow.getAllWindows()[0]
+          ? {
+              visible: BrowserWindow.getAllWindows()[0].isVisible(),
+              focused: BrowserWindow.getAllWindows()[0].isFocused(),
+              minimized: BrowserWindow.getAllWindows()[0].isMinimized(),
+              bounds: BrowserWindow.getAllWindows()[0].getBounds(),
+              contentBounds: BrowserWindow.getAllWindows()[0].getContentBounds(),
+            }
+          : null,
         focused: webContents.getFocusedWebContents()?.id,
         contents: webContents
           .getAllWebContents()
@@ -294,11 +368,20 @@ test('macOS uses native window chrome, menu conventions and keyboard navigation'
       .catch(() => null);
     const state = await b.state().catch(() => null);
     const domKeys = await b.shell.evaluate(() => window.macDOMKeys).catch(() => null);
+    const renderer = await b.shell
+      .evaluate(() => ({
+        visibility: document.visibilityState,
+        readyState: document.readyState,
+        width: innerWidth,
+        height: innerHeight,
+      }))
+      .catch(() => null);
     console.error(
       'Mac shortcut diagnostics:',
       JSON.stringify({
         diagnostics,
         domKeys,
+        renderer,
         activeTab: state?.activeTabId,
         tabs: state?.tabs,
         archive: state?.archive,

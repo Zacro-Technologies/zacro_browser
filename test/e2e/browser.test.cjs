@@ -11,6 +11,26 @@ const { _electron: electron, expect } = require('@playwright/test');
 let server, base;
 before(async () => {
   server = http.createServer((req, res) => {
+    const requestURL = new URL(req.url, 'http://fixture.local');
+    if (requestURL.pathname === '/login-fixture/set') {
+      const identity = requestURL.searchParams.get('identity');
+      if (!['personal', 'work', 'private'].includes(identity)) {
+        res.writeHead(400);
+        res.end('Unknown fixture identity');
+        return;
+      }
+      res.setHeader('Set-Cookie', `siteLogin=${identity}; Max-Age=3600; Path=/; HttpOnly; SameSite=Lax`);
+    }
+    if (requestURL.pathname === '/login-fixture/whoami') {
+      const cookies = new Map(
+        (req.headers.cookie || '').split(';').map((cookie) => cookie.trim().split('=')),
+      );
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+      res.end(
+        JSON.stringify({ login: cookies.get('siteLogin') || null, session: cookies.get('identity') || null }),
+      );
+      return;
+    }
     if (req.url.startsWith('/download')) {
       res.writeHead(200, {
         'Content-Type': 'text/plain',
@@ -42,7 +62,7 @@ after(async () => {
 
 async function launch(t, directory) {
   const dir = directory || (await fsp.mkdtemp(path.join(os.tmpdir(), 'zacro-e2e-')));
-  const env = { ...process.env, ZACRO_USER_DATA: dir };
+  const env = { ...process.env, ZACRO_SKIP_ONBOARDING: '1', ZACRO_USER_DATA: dir };
   delete env.ELECTRON_RUN_AS_NODE;
   const app = await electron.launch({ args: [path.resolve(__dirname, '../..')], env, timeout: 30000 });
   const errors = [];
@@ -73,6 +93,8 @@ async function launch(t, directory) {
   const page = await app.firstWindow();
   page.on('pageerror', (error) => errors.push(error.message));
   await page.waitForFunction(() => Boolean(window.zacro));
+  await expect(page.locator('[data-key="address"]')).toBeVisible();
+  if (await page.locator('#command-input').count()) await page.keyboard.press('Escape');
   const downloadDirectory = path.join(dir, 'downloads');
   await fsp.mkdir(downloadDirectory, { recursive: true });
   await app.evaluate(({ app }, directory) => app.setPath('downloads', directory), downloadDirectory);
@@ -112,7 +134,8 @@ test(
   async (t) => {
     const b = await launch(t);
     await expect(b.page.locator('#sidebar')).toBeVisible();
-    await expect(b.page.locator('#newtab')).toBeVisible();
+    await expect(b.page.locator('#newtab')).toBeHidden();
+    assert.equal((await b.state()).tabs.length, 0);
     await expect(b.page.locator('[data-key="space-picker"]')).toBeVisible();
     await expect(b.page.getByRole('button', { name: /New tab/, exact: false }).first()).toBeVisible();
     await b.navigate(`${base}/a`);
@@ -261,26 +284,58 @@ test(
 );
 
 test(
-  'profiles isolate real cookies and storage; private activity is absent after restart',
+  'website logins and storage survive restart within their profile; private activity does not',
   { timeout: 60000 },
   async (t) => {
     const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'zacro-isolation-'));
     t.after(() => fsp.rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
     const b = await launch(t, dir);
+    const websiteIdentity = (browser, target) =>
+      browser.guest('fetch("/login-fixture/whoami").then((response) => response.json())', target);
+    await b.navigate(`${base}/login-fixture/set?identity=personal`);
     await b.navigate(`${base}/a`);
     await b.guest(
       'document.cookie = "identity=personal; path=/"; localStorage.setItem("identity", "personal");',
     );
+    assert.deepEqual(await websiteIdentity(b, `${base}/a`), { login: 'personal', session: 'personal' });
+    assert(!/siteLogin=/.test(await b.guest('document.cookie', `${base}/a`)), 'Login cookie stays HttpOnly');
     const work = await b.invoke('profile:create', { name: 'Work' });
+    const workSpaceId = (await b.state()).activeSpaceId;
     await b.navigate(`${base}/b`);
     assert.equal(await b.guest('document.cookie', `${base}/b`), '');
     assert.equal(await b.guest('localStorage.getItem("identity")', `${base}/b`), null);
-    await b.guest('document.cookie = "identity=work; path=/"', `${base}/b`);
+    assert.deepEqual(await websiteIdentity(b, `${base}/b`), { login: null, session: null });
+    await b.navigate(`${base}/login-fixture/set?identity=work`);
+    await b.navigate(`${base}/b`);
+    await b.guest(
+      'document.cookie = "identity=work; path=/"; localStorage.setItem("identity", "work");',
+      `${base}/b`,
+    );
+    assert.deepEqual(await websiteIdentity(b, `${base}/b`), { login: 'work', session: 'work' });
     await b.invoke('space:activate', { id: 'home' });
     assert.match(await b.guest('document.cookie', `${base}/a`), /identity=personal/);
     assert.equal(await b.guest('localStorage.getItem("identity")', `${base}/a`), 'personal');
+    assert.deepEqual(await websiteIdentity(b, `${base}/a`), { login: 'personal', session: 'personal' });
     const privateProfile = await b.invoke('profile:create', { name: 'Private acceptance', private: true });
     await b.navigate(`${base}/private-secret`);
+    assert.deepEqual(await websiteIdentity(b, `${base}/private-secret`), { login: null, session: null });
+    assert.equal(await b.guest('localStorage.getItem("identity")', `${base}/private-secret`), null);
+    await b.navigate(`${base}/login-fixture/set?identity=private`);
+    await b.navigate(`${base}/private-secret`);
+    await b.guest('localStorage.setItem("identity", "private");', `${base}/private-secret`);
+    assert.deepEqual(await websiteIdentity(b, `${base}/private-secret`), { login: 'private', session: null });
+    assert.equal(
+      await b.app.evaluate(
+        ({ webContents }, url) =>
+          webContents
+            .getAllWebContents()
+            .find((contents) => contents.getURL() === url)
+            .session.isPersistent(),
+        `${base}/private-secret`,
+      ),
+      false,
+      'Private login cookies must remain in an in-memory Chromium session',
+    );
     assert.equal(
       (await b.state()).history.some((h) => h.profileId === privateProfile.id),
       false,
@@ -293,6 +348,28 @@ test(
     const restarted = await launch(t, dir);
     assert.equal((await restarted.state()).profiles.length, 2);
     assert((await restarted.state()).tabs.some((tab) => tab.url === `${base}/a`));
+    await restarted.invoke('space:activate', { id: 'home' });
+    await restarted.navigate(`${base}/a`);
+    assert.deepEqual(await websiteIdentity(restarted, `${base}/a`), { login: 'personal', session: null });
+    assert.equal(await restarted.guest('localStorage.getItem("identity")', `${base}/a`), 'personal');
+    assert(
+      !/siteLogin=/.test(await restarted.guest('document.cookie', `${base}/a`)),
+      'Restored login stays HttpOnly',
+    );
+    await restarted.invoke('space:activate', { id: workSpaceId });
+    await restarted.navigate(`${base}/b`);
+    assert.deepEqual(await websiteIdentity(restarted, `${base}/b`), { login: 'work', session: null });
+    assert.equal(await restarted.guest('localStorage.getItem("identity")', `${base}/b`), 'work');
+    await restarted.invoke('profile:create', { name: 'Private acceptance', private: true });
+    await restarted.navigate(`${base}/private-after-restart`);
+    assert.deepEqual(await websiteIdentity(restarted, `${base}/private-after-restart`), {
+      login: null,
+      session: null,
+    });
+    assert.equal(
+      await restarted.guest('localStorage.getItem("identity")', `${base}/private-after-restart`),
+      null,
+    );
     await restarted.close();
   },
 );
@@ -340,7 +417,10 @@ test(
         return s.spaces.find((space) => space.id === s.activeSpaceId)?.name;
       })
       .toBe('Research lab');
-    await expect(b.page.getByRole('dialog')).toHaveCount(0);
+    await expect(createSpace).toHaveCount(0);
+    await expect(b.page.locator('#command-input')).toBeFocused();
+    const emptySpace = await b.state();
+    assert.equal(emptySpace.tabs.filter((tab) => tab.spaceId === emptySpace.activeSpaceId).length, 0);
     await sidebar.locator('[data-key="add-menu"]').click();
     await b.page
       .getByRole('dialog', { name: 'Add', exact: true })
@@ -350,8 +430,10 @@ test(
     await createFolder.getByLabel('Folder name', { exact: true }).fill('Evidence');
     await createFolder.getByRole('button', { name: 'Create folder', exact: true }).click();
     await expect.poll(async () => (await b.state()).folders[0]?.name).toBe('Evidence');
-    await b.page.locator('#home-query').fill(`${base}/a`);
-    await b.page.locator('#home-query').press('Enter');
+    await expect(createFolder).toHaveCount(0);
+    await b.page.locator('[data-key="address"]').click();
+    await b.page.locator('#command-input').fill(`${base}/a`);
+    await b.page.locator('#command-input').press('Enter');
     await expect.poll(async () => (await b.state()).runtime.page.url).toBe(`${base}/a`);
     await expect
       .poll(async () => {
@@ -374,14 +456,13 @@ test(
     await b.page.locator(`[data-key="tab-${tabId}"]`).click({ button: 'right' });
     await b.page
       .getByRole('dialog', { name: 'Tab actions' })
-      .getByRole('button', { name: 'Pin to favorites', exact: true })
+      .getByRole('button', { name: 'Add to Favorites', exact: true })
       .click();
-    await expect.poll(async () => (await b.state()).tabs.find((tab) => tab.id === tabId)?.pinned).toBe(true);
+    await expect
+      .poll(async () => (await b.state()).tabs.find((tab) => tab.id === tabId)?.favorite)
+      .toBe(true);
     await sidebar.getByRole('button', { name: 'Library', exact: true }).click();
-    await b.page
-      .getByRole('dialog', { name: 'Library', exact: true })
-      .locator('[data-key="panel-settings"]')
-      .click();
+    await b.page.locator('#library-menu [data-key="panel-settings"]').click();
     await b.page.locator('select[data-setting="searchEngine"]').selectOption('brave');
     await expect.poll(async () => (await b.state()).settings.searchEngine).toBe('brave');
     await b.page.locator('#side-panel summary').filter({ hasText: 'About Zacro' }).click();
@@ -435,11 +516,11 @@ test(
     await b.page.keyboard.press('ArrowDown');
     await expect(menu.getByRole('button', { name: 'Split view', exact: true })).toBeFocused();
     await b.page.keyboard.press('End');
-    await expect(menu.getByRole('button', { name: 'Zoom in', exact: true })).toBeFocused();
+    await expect(menu.getByRole('button', { name: /^Browser menu/ })).toBeFocused();
     await b.page.keyboard.press('Home');
     await expect(menu.getByRole('button', { name: 'Split view', exact: true })).toBeFocused();
     await b.page.keyboard.press('ArrowUp');
-    await expect(menu.getByRole('button', { name: 'Zoom in', exact: true })).toBeFocused();
+    await expect(menu.getByRole('button', { name: /^Browser menu/ })).toBeFocused();
     await b.page.keyboard.press('Escape');
     await expect(pageActions).toBeFocused();
 
@@ -473,9 +554,12 @@ test(
 
     menu = await menuAtControl(b.page.locator('[data-key="add-menu"]'), 'Add', 'above');
     await menu.getByRole('button', { name: /^New tab(?:\s|$)/ }).click();
-    await expect(b.page.getByRole('dialog')).toHaveCount(0);
+    await expect(b.page.locator('#command-input')).toBeFocused();
+    assert.equal((await b.state()).activeTabId, first, 'Opening the palette does not create a tab');
+    await b.page.locator('#command-input').fill(`${base}/b`);
+    await b.page.locator('#command-input').press('Enter');
     await expect.poll(async () => (await b.state()).activeTabId).not.toBe(first);
-    await b.navigate(`${base}/b`);
+    await expect.poll(async () => (await b.state()).runtime.page.url).toBe(`${base}/b`);
     menu = await menuAtControl(pageActions, 'Page actions', 'below');
     await menu.getByRole('button', { name: 'Split view', exact: true }).click();
     await b.page
@@ -490,9 +574,11 @@ test(
     await menu.getByRole('button', { name: 'Close split view', exact: true }).click();
     await expect.poll(async () => (await b.state()).runtime.splitTabId).toBe(null);
 
-    menu = await menuAtControl(b.page.locator('[data-key="library"]'), 'Library', 'above');
-    await menu.getByRole('button', { name: 'Bookmarks', exact: true }).click();
+    await b.page.locator('[data-key="library"]').click();
+    await expect(b.page.getByRole('menu', { name: 'Library', exact: true })).toBeVisible();
+    await b.page.locator('#library-menu [data-key="panel-bookmarks"]').click();
     await expect(b.page.locator('#panel-title')).toHaveText('Bookmarks');
+    await expect(b.page.getByRole('dialog')).toHaveCount(0);
     await b.page.keyboard.press('Escape');
     await expect(b.page.locator('[data-key="library"]')).toBeFocused();
   },

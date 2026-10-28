@@ -12,19 +12,25 @@ const {
   shell,
   clipboard,
   nativeTheme,
+  systemPreferences,
   screen,
   webContents,
+  safeStorage,
 } = require('electron');
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const path = require('node:path');
+const os = require('node:os');
 const { pathToFileURL } = require('node:url');
 const { randomUUID } = require('node:crypto');
 const { BrowserStore, normalizeAddress } = require('../core/store.cjs');
+const { archiveCandidate } = require('../core/archive.cjs');
 const { webURL, safeFilename, unusedPath, renameWithoutOverwrite } = require('./security.cjs');
 const { browserLayout, presentView, resolveSplit, restoreWindowPlacement } = require('./layout.cjs');
 const { FaviconLoader } = require('./favicon.cjs');
-const { windowChrome, macShortcut, macMenuTemplate } = require('./mac.cjs');
+const { windowChrome, macMenuTemplate } = require('./mac.cjs');
+const { windowMaterial } = require('./window-material.cjs');
+const { shortcutCatalog, matchShortcut, updateShortcut, sidebarTabs } = require('../core/shortcuts.cjs');
 const { SyncController } = require('./sync/controller.cjs');
 const { ExtensionHost } = require('./extensions/host.cjs');
 const { createBrowserAdapter } = require('./extensions/browser.cjs');
@@ -42,17 +48,35 @@ const UI_FILE = path.join(__dirname, '../renderer/index.html');
 const UI_URL = pathToFileURL(UI_FILE).href;
 const NEW_TAB = 'zacro://newtab';
 const views = new Map();
+// Retain only validated raster data for this process, never in browser exports
+// or on disk. Keys are tab identities; each record is also bound to its exact
+// profile and page URL. Approximate UTF-16 storage is capped at 4 MiB / 128 tabs.
+const retainedFavicons = new Map();
+const MAX_RETAINED_FAVICONS = 128;
+const MAX_RETAINED_FAVICON_BYTES = 4 * 1024 * 1024;
+let retainedFaviconBytes = 0;
 const sessions = new Map();
 const liveDownloads = new Map();
 const downloadReservations = new Set();
 const promptRequests = new Set();
-let store, win, ai, syncAccount, extensionHost, extensionBrowser, archiveTimer, publishTimer;
+let store,
+  win,
+  ai,
+  syncAccount,
+  extensionHost,
+  extensionBrowser,
+  archiveTimer,
+  pinnedSleepTimer,
+  publishTimer;
 let extensionsReady = false;
 let extensionTabSnapshot = new Map();
+let sleepingPins = false;
+let archivingTabs = false;
 let splitTabId = null;
 let splitPair = null;
 let normalWindowBounds = null;
 let peek = null;
+let peekRequestSerial = 0;
 let layout = {
   sidebarWidth: 224,
   panelWidth: 0,
@@ -67,12 +91,25 @@ let popupTimes = [];
 let pendingAuth = null;
 let backdropGeneration = 0;
 let backdropContext = null;
+let backdropGeometry = null;
+const MAX_BACKDROP_PIXELS = 16 * 1024 * 1024;
+const MAX_BACKDROP_BYTES = 20 * 1024 * 1024;
 let windowReady = null;
 let startupReady = false;
 let quitRequested = false;
 let drainingExternalURLs = false;
+let recordingShortcut = false;
+let recentTabCycle = null;
+let recentTabModifiers = null;
 const externalURLs = [];
 let defaultBrowser = { supported: process.platform === 'darwin' && app.isPackaged, configured: false };
+let shellSurface = null;
+let windowMaterialState = null;
+let materialPreview = null;
+let spaceMaterialTransition = null;
+let spaceMaterialTimer = null;
+let materialSignature = null;
+let failedMaterialSignature = null;
 
 const activeSpace = () => store.state.spaces.find((item) => item.id === store.state.activeSpaceId);
 const activeTab = () => store.state.tabs.find((item) => item.id === store.state.activeTabId);
@@ -86,6 +123,103 @@ const activeEntry = () => {
 };
 const activeContents = () => activeEntry()?.contents;
 const validWindow = () => win && !win.isDestroyed();
+function clearSpaceMaterialTransition(token) {
+  if (token && token !== spaceMaterialTransition?.token) return false;
+  clearTimeout(spaceMaterialTimer);
+  spaceMaterialTimer = null;
+  spaceMaterialTransition = null;
+  return true;
+}
+function holdSpaceMaterialTransition(payload) {
+  if (typeof payload.token !== 'string' || !/^[a-z0-9-]{1,80}$/i.test(payload.token))
+    throw new Error('Invalid Space transition.');
+  const from = store.state.spaces.find((space) => space.id === payload.fromId);
+  const to = store.state.spaces.find((space) => space.id === payload.toId);
+  const current = activeSpace();
+  if (
+    !from ||
+    !to ||
+    from.profileId !== to.profileId ||
+    current?.profileId !== from.profileId ||
+    ![from.id, to.id].includes(current.id)
+  )
+    throw new Error('The Space transition is no longer current.');
+  clearSpaceMaterialTransition();
+  spaceMaterialTransition = {
+    token: payload.token,
+    fromId: from.id,
+    toId: to.id,
+    profileId: from.profileId,
+    opacity: Number.isFinite(payload.opacity) ? Math.max(0, Math.min(100, payload.opacity)) : 100,
+  };
+  // Renewed only while a gesture is still held. A lost renderer cannot leave an
+  // opaque Space with a permanent native material override.
+  spaceMaterialTimer = setTimeout(() => {
+    clearSpaceMaterialTransition(payload.token);
+    syncWindowMaterial();
+    publish();
+  }, 5000);
+  spaceMaterialTimer.unref();
+}
+function syncWindowMaterial() {
+  if (!validWindow() || !store || !shellSurface) return;
+  const space = activeSpace();
+  if (materialPreview?.spaceId !== space?.id) materialPreview = null;
+  const transition = spaceMaterialTransition;
+  const from = transition && store.state.spaces.find((item) => item.id === transition.fromId);
+  const to = transition && store.state.spaces.find((item) => item.id === transition.toId);
+  if (
+    transition &&
+    (!from ||
+      !to ||
+      space?.profileId !== transition.profileId ||
+      ![transition.fromId, transition.toId].includes(space?.id))
+  )
+    clearSpaceMaterialTransition();
+  const transitionOpacity = spaceMaterialTransition
+    ? Math.min(from.theme?.opacity ?? 100, to.theme?.opacity ?? 100, spaceMaterialTransition.opacity)
+    : undefined;
+  const next = windowMaterial({
+    platform: process.platform,
+    release: os.release(),
+    opacity: materialPreview?.opacity ?? transitionOpacity ?? space?.theme?.opacity ?? 100,
+    reducedTransparency: nativeTheme.prefersReducedTransparency,
+    highContrast: nativeTheme.shouldUseHighContrastColors || nativeTheme.inForcedColorsMode,
+  });
+  const signature = JSON.stringify([next.type, next.reason, nativeTheme.shouldUseDarkColors]);
+  if (signature === failedMaterialSignature) {
+    Object.assign(next, { enabled: false, type: 'opaque', opacity: 100, reason: 'native-error' });
+  } else if (signature !== materialSignature) {
+    const background = nativeTheme.shouldUseDarkColors ? '#222425' : '#f8f7f4';
+    try {
+      if (process.platform === 'win32' && next.supported)
+        win.setBackgroundMaterial(next.enabled ? 'acrylic' : 'none');
+      else if (process.platform === 'darwin') win.setVibrancy(next.enabled ? 'under-window' : null);
+      win.setBackgroundColor(next.enabled ? '#00000000' : background);
+      // These are the shell and its neutral native parent, never a website view.
+      // A single opaque native ancestor would otherwise hide the system blur.
+      win.contentView.setBackgroundColor('#00000000');
+      shellSurface.setBackgroundColor('#00000000');
+      materialSignature = signature;
+      failedMaterialSignature = null;
+    } catch (error) {
+      // An unavailable compositor must leave readable, opaque chrome. Do not
+      // fall back to whole-window setOpacity, which also fades webpages/text.
+      next.enabled = false;
+      next.type = 'opaque';
+      next.opacity = 100;
+      next.reason = 'native-error';
+      try {
+        win.setBackgroundColor(background);
+        shellSurface.setBackgroundColor(background);
+      } catch {}
+      console.error('[Zacro] Window material unavailable:', error.message);
+      materialSignature = null;
+      failedMaterialSignature = signature;
+    }
+  }
+  windowMaterialState = next;
+}
 function focusContentOrChrome(contents = activeContents()) {
   if (!validWindow() || closingWindow || quitting) return;
   if (!layout.overlay && contents && !contents.isDestroyed()) contents.focus();
@@ -105,7 +239,21 @@ function report(error) {
 function clearBackdrop() {
   backdropGeneration++;
   backdropContext = null;
+  backdropGeometry = null;
   emit({ type: 'page:backdrop', frames: [] });
+}
+function backdropLayoutKey() {
+  return JSON.stringify([
+    ...win.getContentSize(),
+    layout.sidebarWidth,
+    layout.panelWidth,
+    layout.contentTop,
+    store.state.settings.pageGutter,
+    store.state.settings.pageRadius,
+    screen.getDisplayMatching(win.getBounds()).scaleFactor,
+    Boolean(splitPair),
+    peek && [peek.id, Math.round(peek.offset || 0)],
+  ]);
 }
 async function captureBackdrop() {
   const generation = ++backdropGeneration;
@@ -124,24 +272,58 @@ async function captureBackdrop() {
     contentIds: new Set(entries.map((entry) => entry.contents.id)),
   };
   backdropContext = context;
+  backdropGeometry = backdropLayoutKey();
   for (const entry of entries) entry.backdropCaptureGeneration = generation;
   const frames = await Promise.all(
     entries.map(async (entry) => {
       const bounds = { ...entry.presentation.bounds };
       let timer;
       try {
+        // Bound ordinary compositor allocation before requesting the copy. A
+        // later check uses the returned representation and PNG's exact pixels.
+        const displayScale = screen.getDisplayMatching(win.getBounds()).scaleFactor;
+        if (
+          Math.ceil(bounds.width * displayScale) * Math.ceil(bounds.height * displayScale) >
+          MAX_BACKDROP_PIXELS
+        )
+          return null;
         const capture = await Promise.race([
           entry.contents.capturePage(undefined, { stayHidden: true }),
           new Promise((resolve) => {
-            timer = setTimeout(() => resolve(null), 200);
+            // A cold macOS compositor can finish a valid copy just after 200ms.
+            // The overlay and input focus update immediately; only the optional
+            // image waits, with a hard bound before its hidden view detaches.
+            timer = setTimeout(() => resolve(null), 750);
           }),
         ]);
-        if (!capture || capture.isEmpty()) return null;
-        const size = capture.getSize();
-        const image = size.width > 1024 ? capture.resize({ width: 1024, quality: 'good' }) : capture;
-        const bytes = image.toJPEG(65);
-        if (!bytes.length || bytes.length > 1024 * 1024) return null;
-        return { bounds, dataUrl: `data:image/jpeg;base64,${bytes.toString('base64')}` };
+        if (!capture || capture.isEmpty() || generation !== backdropGeneration || !layout.overlay)
+          return null;
+        // Encode an existing backing-pixel representation, never the implicit
+        // 1x conversion (which loses detail on Retina/HiDPI displays). The
+        // 16M-pixel / 20 MiB bounds admit full 4K and 5K frames; exceptional
+        // captures are omitted instead of replaced by a visibly degraded copy.
+        const scales = capture.getScaleFactors().filter((value) => Number.isFinite(value) && value > 0);
+        if (!scales.length) return null;
+        const scaleFactor = Math.max(...scales);
+        // getSize(scaleFactor) is measured in logical pixels for scaled
+        // NativeImage representations, even though toPNG preserves the bitmap.
+        const size = capture.getSize(scaleFactor);
+        if (
+          !Number.isSafeInteger(size.width) ||
+          !Number.isSafeInteger(size.height) ||
+          size.width <= 0 ||
+          size.height <= 0 ||
+          Math.ceil(size.width * scaleFactor) * Math.ceil(size.height * scaleFactor) > MAX_BACKDROP_PIXELS
+        )
+          return null;
+        const bytes = capture.toPNG({ scaleFactor });
+        if (bytes.length < 24 || bytes.length > MAX_BACKDROP_BYTES) return null;
+        // IHDR stores the actual backing dimensions. This final guard also
+        // covers fractional-scale rounding in NativeImage's logical size.
+        const pixelWidth = bytes.readUInt32BE(16),
+          pixelHeight = bytes.readUInt32BE(20);
+        if (!pixelWidth || !pixelHeight || pixelWidth * pixelHeight > MAX_BACKDROP_PIXELS) return null;
+        return { bounds, dataUrl: `data:image/png;base64,${bytes.toString('base64')}` };
       } catch {
         return null;
       } finally {
@@ -197,10 +379,73 @@ function requestAuthentication(event, contents, details, authInfo, callback) {
   });
   win.webContents.focus();
 }
-function pageState(entry) {
+function forgetRetainedFavicon(id) {
+  const record = retainedFavicons.get(id);
+  if (!record) return;
+  retainedFaviconBytes -= record.bytes;
+  retainedFavicons.delete(id);
+}
+function forgetProfileFavicons(profileId) {
+  for (const [id, record] of retainedFavicons) if (record.profileId === profileId) forgetRetainedFavicon(id);
+}
+function retainedFavicon(tab) {
+  if (!tab) return null;
+  const record = retainedFavicons.get(tab.id);
+  if (!record) return null;
+  if (record.profileId !== tab.profileId || record.url !== tab.url) {
+    forgetRetainedFavicon(tab.id);
+    return null;
+  }
+  return record.dataUrl;
+}
+function rememberFavicon(entry, pageURL, favicon) {
+  if (!favicon || entry.disposing || !entry.tabId) return;
+  const tab = store.state.tabs.find((item) => item.id === entry.tabId);
+  if (!tab || tab.profileId !== entry.profileId || tab.url !== pageURL) return;
+  if (!store.state.profiles.some((profile) => profile.id === tab.profileId)) return;
+  const bytes = 2 * (favicon.length + pageURL.length + tab.id.length + tab.profileId.length);
+  if (bytes > MAX_RETAINED_FAVICON_BYTES) return;
+  forgetRetainedFavicon(tab.id);
+  while (
+    retainedFavicons.size >= MAX_RETAINED_FAVICONS ||
+    retainedFaviconBytes + bytes > MAX_RETAINED_FAVICON_BYTES
+  )
+    forgetRetainedFavicon(retainedFavicons.keys().next().value);
+  retainedFavicons.set(tab.id, { profileId: tab.profileId, url: pageURL, dataUrl: favicon, bytes });
+  retainedFaviconBytes += bytes;
+}
+function pruneRetainedFavicons() {
+  const tabs = new Map(store.state.tabs.map((tab) => [tab.id, tab]));
+  const profiles = new Set(store.state.profiles.map((profile) => profile.id));
+  for (const [id, record] of retainedFavicons) {
+    const tab = tabs.get(id);
+    if (
+      !tab ||
+      !profiles.has(record.profileId) ||
+      tab.profileId !== record.profileId ||
+      tab.url !== record.url
+    )
+      forgetRetainedFavicon(id);
+  }
+}
+function pageState(entry, tab = null) {
   if (!entry || entry.dormant || entry.contents.isDestroyed())
-    return { loading: false, canGoBack: false, canGoForward: false, zoom: 1 };
+    return {
+      loading: false,
+      canGoBack: false,
+      canGoForward: false,
+      zoom: 1,
+      loaded: false,
+      sleeping: Boolean(tab?.pinned),
+      closed: Boolean(tab?.closed),
+      favicon: retainedFavicon(tab),
+    };
   const wc = entry.contents;
+  const boundTab = entry.tabId === tab?.id ? tab : null;
+  const currentFavicon =
+    entry.faviconURL === wc.getURL() && (!boundTab || boundTab.url === entry.faviconURL)
+      ? entry.favicon
+      : null;
   return {
     loading: wc.isLoading(),
     canGoBack: wc.navigationHistory.canGoBack(),
@@ -209,8 +454,11 @@ function pageState(entry) {
     error: entry.error || null,
     audible: wc.isCurrentlyAudible(),
     muted: wc.isAudioMuted(),
-    favicon: entry.favicon || null,
+    favicon: currentFavicon || retainedFavicon(boundTab),
     url: wc.getURL(),
+    loaded: true,
+    sleeping: false,
+    closed: false,
   };
 }
 function snapshot() {
@@ -218,12 +466,16 @@ function snapshot() {
   const status = ai?.status() || {};
   const preview = peek && !peek.entry.contents.isDestroyed() ? peek : null;
   result.runtime = {
-    page: pageState(activeEntry()),
+    page: pageState(activeEntry(), activeTab()),
+    pages: Object.fromEntries(result.tabs.map((tab) => [tab.id, pageState(views.get(tab.id), tab)])),
     extensionPanel: extensionHost?.sidePanel?.snapshot() || null,
-    pages: Object.fromEntries([...views].map(([id, entry]) => [id, pageState(entry)])),
     splitTabId,
     peek: preview
       ? {
+          id: preview.id,
+          phase: preview.phase || 'open',
+          offset: preview.offset || 0,
+          progress: preview.progress ?? 1,
           url: preview.entry.contents.getURL() || preview.url,
           title: preview.entry.contents.getTitle() || 'Peek',
           loading: preview.entry.contents.isLoading(),
@@ -231,6 +483,8 @@ function snapshot() {
         }
       : null,
     platform: process.platform,
+    onboardingEnabled: process.env.ZACRO_SKIP_ONBOARDING !== '1',
+    shortcuts: shortcutCatalog(process.platform, store.state.settings.shortcutOverrides),
     version: app.getVersion(),
     chromium: process.versions.chrome,
     aiConfigured: Boolean(status.configured),
@@ -242,6 +496,7 @@ function snapshot() {
     focused: Boolean(validWindow() && win.isFocused()),
     defaultBrowser,
     dark: nativeTheme.shouldUseDarkColors,
+    windowMaterial: windowMaterialState,
   };
   // Managed extension paths are operational details, not a renderer capability.
   result.extensions = extensionHost?.snapshot(activeProfile()?.id) || [];
@@ -288,9 +543,11 @@ function profileSession(profileId) {
       .replace(/\sZacro\/\S+/gi, '')
       .replace(/\szacro-browser\/\S+/gi, ''),
   );
-  ses.setPermissionCheckHandler((_contents, permission, requestingOrigin) => {
+  ses.setPermissionCheckHandler((contents, permission, requestingOrigin) => {
     const origin = permissionOrigin(requestingOrigin);
-    return Boolean(origin && savedPermission(profileId, origin, permission)?.allowed);
+    const allowed = Boolean(origin && savedPermission(profileId, origin, permission)?.allowed);
+    if (allowed && permission === 'media') markMediaPermission(contents);
+    return allowed;
   });
   ses.setPermissionRequestHandler(async (contents, permission, callback, details) => {
     const origin = permissionOrigin(details.requestingUrl || details.securityOrigin || contents?.getURL());
@@ -319,6 +576,7 @@ function profileSession(profileId) {
     }
     const recorded = savedPermission(profileId, origin, permission);
     if (recorded) {
+      if (recorded.allowed && permission === 'media') markMediaPermission(contents);
       callback(Boolean(recorded.allowed));
       return;
     }
@@ -364,6 +622,7 @@ function profileSession(profileId) {
           contents.mainFrame.framesInSubtree.some((frame) => permissionOrigin(frame.url) === origin));
       if (answer.checkboxChecked && stillCurrent)
         store.dispatch('permission:set', { profileId, origin, permission, allowed });
+      if (stillCurrent && allowed && permission === 'media') markMediaPermission(contents);
       callback(stillCurrent && allowed);
     } catch {
       callback(false);
@@ -434,6 +693,15 @@ function guestPreferences(profileId) {
     scrollBounce: process.platform === 'darwin',
   };
 }
+function syncPinNavigation(entry) {
+  if (entry.contents.isDestroyed() || !entry.pinDocumentId) return;
+  const tab = store.state.tabs.find((item) => item.id === entry.tabId);
+  const pinnedUrl = tab?.pinned ? webURL(tab.pinnedUrl || tab.url) : null;
+  const key = `${entry.pinDocumentId}:${pinnedUrl || ''}`;
+  if (entry.pinNavigationKey === key) return;
+  entry.pinNavigationKey = key;
+  entry.contents.send('zacro:pin-state', { documentId: entry.pinDocumentId, pinnedUrl });
+}
 function createEntry(profileId, tabId = null, suppliedOptions = {}) {
   // Electron supplies the actual popup WebContents here. Adopting it preserves
   // Chromium's opener/POST state; creating a different one breaks that contract.
@@ -452,10 +720,14 @@ function createEntry(profileId, tabId = null, suppliedOptions = {}) {
     dormant: !suppliedOptions.webContents,
     documentEpoch: 0,
     disposing: false,
+    inactiveSince: Date.now(),
+    activityVersion: 0,
+    navigationVersion: 0,
+    mediaPlaying: false,
     presentation: { visible: false, bounds: null, attached: false },
   };
   const wc = view.webContents;
-  view.setBorderRadius(10);
+  view.setBorderRadius(store.state.settings.pageRadius);
   view.setBackgroundColor(nativeTheme.shouldUseDarkColors ? '#1b1a1d' : '#ffffff');
   view.setVisible(false);
   wc.setWindowOpenHandler((details) => {
@@ -471,6 +743,11 @@ function createEntry(profileId, tabId = null, suppliedOptions = {}) {
     popupTimes.push(now);
     const source = tabForContents(wc);
     if (!source?.spaceId) return { action: 'deny' };
+    // An animation can be interrupted, but a document already inside native
+    // beforeunload/close cannot safely become a durable popup opener.
+    if (peek?.entry === entry && entry.closeRequest) return { action: 'deny' };
+    const opener = peek?.entry === entry ? promotePeek({ interruptClose: true }) : source;
+    if (!opener) return { action: 'deny' };
     // Returning the created webContents lets Chromium preserve form POST data,
     // opener relationships, referrers, and named-window navigation.
     return {
@@ -478,12 +755,17 @@ function createEntry(profileId, tabId = null, suppliedOptions = {}) {
       outlivesOpener: true,
       overrideBrowserWindowOptions: { webPreferences: guestPreferences(source.profileId) },
       createWindow: (options) => {
+        // The opener was made durable before Chromium allocates its popup,
+        // including when a callback arrived during the visual close motion.
         const tab = store.dispatch('tab:create', {
           url: url || NEW_TAB,
           spaceId: source.spaceId,
           active: false,
         });
         const child = createEntry(source.profileId, tab.id, options);
+        // Keep the relationship in memory only. A sign-in window may return a
+        // result through window.opener, then close itself; resume that page.
+        child.openerTabId = opener.id;
         child.requestedURL = url || 'about:blank';
         child.blankPopup = blank;
         views.set(tab.id, child);
@@ -509,17 +791,41 @@ function createEntry(profileId, tabId = null, suppliedOptions = {}) {
     publish();
   });
   wc.on('did-start-navigation', (_event, url, _isInPlace, isMainFrame) => {
-    if (isMainFrame && entry.tabId) publishExtensionTab(entry, { status: 'loading', url });
+    if (isMainFrame && entry.tabId)
+      publishExtensionTab(entry, {
+        status: 'loading',
+        ...(entry.closeRequest?.discarding && url === 'about:blank' ? {} : { url }),
+      });
+    if (isMainFrame) entry.navigationVersion++;
+    if (isMainFrame && !_isInPlace) entry.pinDocumentId = null;
+    if (
+      isMainFrame &&
+      !_isInPlace &&
+      !(entry.closeRequest?.discarding && url === 'about:blank') &&
+      retainedFavicons.get(entry.tabId)?.url !== url
+    )
+      forgetRetainedFavicon(entry.tabId);
     if (isMainFrame && !_isInPlace) {
       entry.faviconRequest?.abort();
       entry.favicon = null;
+      entry.faviconURL = null;
       publish();
     }
     if (isMainFrame && backdropContext?.contentIds.has(wc.id)) clearBackdrop();
     if (isMainFrame && pendingAuth?.contentsId === wc.id && url !== pendingAuth.url) finishAuth();
   });
+  wc.on('dom-ready', () => {
+    entry.pinDocumentId = randomUUID();
+    syncPinNavigation(entry);
+  });
   wc.on('did-stop-loading', () => {
     if (entry.tabId) publishExtensionTab(entry, { status: 'complete' });
+    // A beforeunload veto keeps the old document without another dom-ready.
+    // Give that retained document a fresh nonce after its attempted navigation.
+    if (!entry.pinDocumentId) {
+      entry.pinDocumentId = randomUUID();
+      syncPinNavigation(entry);
+    }
     arrangeViews();
     publish();
   });
@@ -553,12 +859,17 @@ function createEntry(profileId, tabId = null, suppliedOptions = {}) {
       .then((favicon) => {
         if (
           request.signal.aborted ||
+          entry.disposing ||
           wc.isDestroyed() ||
           wc.getURL() !== pageURL ||
           entry.faviconRequest !== request
         )
           return;
         entry.favicon = favicon;
+        entry.faviconURL = pageURL;
+        // FaviconLoader is the only source of retained bytes. A null response
+        // cannot replace a previously validated icon for the same exact page.
+        rememberFavicon(entry, pageURL, favicon);
         publish();
       })
       .catch(() => {});
@@ -588,8 +899,14 @@ function createEntry(profileId, tabId = null, suppliedOptions = {}) {
   wc.on('unresponsive', () =>
     toast('A page is taking longer than expected. You can reload or close its tab.'),
   );
-  wc.on('media-started-playing', publish);
-  wc.on('media-paused', publish);
+  wc.on('media-started-playing', () => {
+    entry.mediaPlaying = true;
+    publish();
+  });
+  wc.on('media-paused', () => {
+    entry.mediaPlaying = false;
+    publish();
+  });
   wc.on('found-in-page', (_event, result) => emit({ type: 'find:result', ...result }));
   wc.on('before-input-event', (event, input) => {
     extensionHost?.sidePanel?.recordTabInput(entry, input);
@@ -598,11 +915,22 @@ function createEntry(profileId, tabId = null, suppliedOptions = {}) {
   wc.on('before-mouse-event', (_event, input) => extensionHost?.sidePanel?.recordTabInput(entry, input));
   wc.on('context-menu', (_event, params) => showPageMenu(entry, params));
   wc.on('focus', () => {
+    emit({ type: 'page:focused' });
     if (!peek && splitPair?.includes(entry.tabId) && store.state.activeTabId !== entry.tabId) {
       store.dispatch('tab:activate', { id: entry.tabId });
     }
   });
   wc.on('will-prevent-unload', (event) => {
+    // Automatic unloading never interrupts the user with a discard prompt.
+    // Let Chromium cancel the close and retain the entire living document.
+    if (entry.sleepRequest) {
+      const request = entry.closeRequest;
+      entry.closeRequest = null;
+      entry.sleepRequest = false;
+      entry.inactiveSince = Date.now();
+      request?.resolve(false);
+      return;
+    }
     const answer = dialog.showMessageBoxSync(win, {
       type: 'warning',
       title: 'Leave this page?',
@@ -644,6 +972,7 @@ function createEntry(profileId, tabId = null, suppliedOptions = {}) {
     request?.resolve(true);
     if (pendingAuth?.contentsId === entry.contentsId) finishAuth();
     if (peek?.entry === entry) {
+      cancelPeekMotion(peek);
       peek = null;
       try {
         if (validWindow()) win.contentView.removeChildView(entry.view);
@@ -657,9 +986,19 @@ function createEntry(profileId, tabId = null, suppliedOptions = {}) {
     try {
       if (validWindow()) win.contentView.removeChildView(entry.view);
     } catch {}
+    if (entry.sleepRequest) {
+      publish();
+      return;
+    }
     if (!closingWindow && !entry.replacing && store.state.tabs.some((tab) => tab.id === entry.tabId)) {
       const wasActive = store.state.activeTabId === entry.tabId;
+      const opener =
+        wasActive &&
+        store.state.tabs.find(
+          (tab) => tab.id === entry.openerTabId && tab.profileId === entry.profileId && !tab.closed,
+        );
       store.dispatch('tab:close', { id: entry.tabId });
+      if (opener) store.dispatch('tab:activate', { id: opener.id });
       // The closing native view may still be Cocoa's first responder. Move
       // keyboard input to the surviving page (or shell for New Tab) only when
       // the active tab closed; background closes must not steal input focus.
@@ -674,7 +1013,14 @@ function createEntry(profileId, tabId = null, suppliedOptions = {}) {
 }
 function publishExtensionTab(entry, changes) {
   const tab = store.state.tabs.find((item) => item.id === entry.tabId);
-  if (tab && extensionBrowser && extensionHost)
+  if (
+    tab &&
+    !tab.closed &&
+    !entry.disposing &&
+    views.get(tab.id) === entry &&
+    extensionBrowser &&
+    extensionHost
+  )
     extensionHost.api.publish(entry.profileId, 'tabs.onUpdated', [
       entry.contents.id,
       changes,
@@ -683,9 +1029,20 @@ function publishExtensionTab(entry, changes) {
 }
 function navigated(entry, url, addHistory) {
   if (!webURL(url) && !extensionPageURL(entry.profileId, url)) return;
+  // Hash and history-state navigation keep the same document and validated
+  // icon. Rebind its URL here, after Chromium confirms an in-page navigation,
+  // rather than dropping it when no new favicon event will be emitted.
+  const sameDocumentIcon = !addHistory ? entry.favicon : null;
+  if (sameDocumentIcon) entry.faviconURL = url;
+  entry.navigationVersion++;
   entry.requestedURL = url;
   entry.blankPopup = false;
   entry.error = null;
+  if (addHistory) {
+    entry.userEdited = false;
+    entry.mediaPermissionGranted = false;
+    entry.mediaPlaying = false;
+  }
   if (entry.tabId && store.state.tabs.some((tab) => tab.id === entry.tabId)) {
     const title = entry.contents.getTitle() || new URL(url).hostname;
     store.dispatch(url.startsWith('chrome-extension:') ? 'tab:extension-page' : 'tab:update', {
@@ -693,6 +1050,7 @@ function navigated(entry, url, addHistory) {
       url,
       title,
     });
+    if (sameDocumentIcon) rememberFavicon(entry, url, sameDocumentIcon);
     if (addHistory && webURL(url)) store.dispatch('history:add', { profileId: entry.profileId, url, title });
   }
   publish();
@@ -707,16 +1065,64 @@ function destroyEntry(entry) {
   }
   if (!entry.contents.isDestroyed()) entry.contents.close({ waitForBeforeUnload: false });
 }
-function requestCloseEntry(entry) {
+function requestCloseEntry(entry, { sleep = false } = {}) {
   if (!entry || entry.contents.isDestroyed()) return Promise.resolve(true);
-  if (entry.closeRequest) return entry.closeRequest.promise;
+  if (entry.closeRequest) {
+    // A user's Close takes precedence over an automatic unload already in
+    // flight, including its normal discard prompt and Closed pin state.
+    if (!sleep) entry.sleepRequest = false;
+    return entry.closeRequest.promise;
+  }
   const request = {};
   request.promise = new Promise((resolve) => {
     request.resolve = resolve;
   });
   entry.closeRequest = request;
-  entry.contents.close({ waitForBeforeUnload: true });
+  entry.sleepRequest = sleep;
+  if (sleep) {
+    // The native ID is also Chromium's extension tab ID. Discard the document
+    // while retaining its dormant reservation, so sleeping never silently
+    // replaces extension authority with an unrelated WebContents ID.
+    request.discarding = true;
+    void discardEntryDocument(entry, request);
+  } else entry.contents.close({ waitForBeforeUnload: true });
   return request.promise;
+}
+async function discardEntryDocument(entry, request) {
+  try {
+    await entry.contents.loadURL('about:blank');
+    if (entry.closeRequest !== request) return;
+    if (entry.contents.isDestroyed() || entry.contents.getURL() !== 'about:blank')
+      throw new Error('The page changed while sleeping.');
+    if (!entry.sleepRequest) {
+      // An explicit Close superseded sleep. Finish the normal native close so
+      // the destroyed handler retains a Closed pin or archives an ordinary tab.
+      entry.contents.close({ waitForBeforeUnload: true });
+      return;
+    }
+    // Drop the discarded document's back/forward entries as well; a dormant
+    // reservation must not retain history access to its previous runtime.
+    entry.contents.navigationHistory.clear();
+    entry.dormant = true;
+    entry.requestedURL = null;
+    entry.error = null;
+    entry.pinDocumentId = null;
+    entry.pinNavigationKey = null;
+    entry.userEdited = false;
+    entry.mediaPlaying = false;
+    entry.mediaPermissionGranted = false;
+    entry.favicon = null;
+    entry.faviconURL = null;
+    entry.mimeType = null;
+    entry.closeRequest = null;
+    entry.sleepRequest = false;
+    request.resolve(true);
+  } catch {
+    if (entry.closeRequest !== request) return;
+    entry.closeRequest = null;
+    entry.sleepRequest = false;
+    request.resolve(false);
+  }
 }
 async function requestCloseTab(id) {
   const tab = store.state.tabs.find((item) => item.id === id);
@@ -728,20 +1134,300 @@ async function requestCloseTab(id) {
   }
   return requestCloseEntry(entry);
 }
-async function requestClosePeek() {
-  if (!peek) return true;
-  const entry = peek.entry;
-  const closed = await requestCloseEntry(entry);
-  if (closed && peek?.entry === entry) {
-    peek = null;
-    try {
-      if (validWindow()) win.contentView.removeChildView(entry.view);
-    } catch {}
-    arrangeViews();
-    publish();
-    focusContentOrChrome();
+
+async function resetPinnedTab(id, { activate = true } = {}) {
+  const tab = store.state.tabs.find((item) => item.id === id);
+  if (!tab?.pinned) throw new Error('Choose a Pinned Tab or Favorite first.');
+  if (activate && peek && !(await requestClosePeek())) return null;
+  const prior = views.get(id);
+  store.dispatch('tab:reset-pin', { id });
+  if (activate) store.dispatch('tab:activate', { id });
+  const entry = prior || (activate ? ensureView(id) : null);
+  // Live pages use Chromium's ordinary navigation path, including its
+  // beforeunload prompt. A dormant pin only changes its next destination.
+  if (
+    entry &&
+    !entry.dormant &&
+    !entry.contents.isDestroyed() &&
+    (webURL(tab.url) || extensionPageURL(tab.profileId, tab.url))
+  ) {
+    if (entry.requestedURL !== tab.url || entry.error) safeNavigate(entry, tab.url);
+    else if (prior) entry.contents.reload();
+    if (activate) focusContentOrChrome(entry.contents);
   }
-  return closed;
+  return store.state.tabs.find((item) => item.id === id);
+}
+
+function pageProtected(entry) {
+  const tab = store.state.tabs.find((item) => item.id === entry.tabId);
+  if (
+    !tab ||
+    tab.closed ||
+    views.get(entry.tabId) !== entry ||
+    entry.disposing ||
+    entry.dormant ||
+    entry.closeRequest ||
+    entry.contents.isDestroyed()
+  )
+    return true;
+  if (quitting || closingWindow || !validWindow()) return true;
+  if (tab.id === store.state.activeTabId || splitPair?.includes(tab.id) || peek?.sourceTabId === tab.id)
+    return true;
+  const wc = entry.contents;
+  if (
+    wc.isLoading() ||
+    wc.isCurrentlyAudible() ||
+    wc.isBeingCaptured() ||
+    wc.isDevToolsOpened() ||
+    entry.mediaPlaying ||
+    entry.userEdited ||
+    entry.mediaPermissionGranted
+  )
+    return true;
+  if (pendingAuth?.contentsId === wc.id) return true;
+  if (entry.openerTabId && views.has(entry.openerTabId)) return true;
+  // A popup can still need its opener for a login callback, even after a tab
+  // switch. Keep that document until the popup closes; sleeping would discard
+  // its callback listener. This relationship is never persisted across restarts.
+  if (
+    [...views.values()].some(
+      (popup) => popup.openerTabId === tab.id && !popup.disposing && !popup.contents.isDestroyed(),
+    )
+  )
+    return true;
+  return store.state.downloads.some(
+    (record) =>
+      liveDownloads.has(record.id) &&
+      record.profileId === tab.profileId &&
+      (record.sourceTabId === tab.id || (!record.sourceTabId && record.sourceUrl === tab.url)),
+  );
+}
+
+function pinProtected(entry) {
+  return !store.state.tabs.find((tab) => tab.id === entry.tabId)?.pinned || pageProtected(entry);
+}
+
+function markMediaPermission(contents) {
+  const entry = [...views.values(), ...(peek ? [peek.entry] : [])].find((item) => item.contents === contents);
+  if (entry) entry.mediaPermissionGranted = true;
+}
+
+function pinIsIdle(entry) {
+  const minutes = store.state.settings.pinnedSleepMinutes;
+  return Boolean(
+    minutes && entry.inactiveSince !== null && Date.now() - entry.inactiveSince >= minutes * 60000,
+  );
+}
+
+async function unloadIdleEntry(entry, eligible) {
+  if (!entry || !eligible() || pageProtected(entry)) return false;
+  const wc = entry.contents;
+  const { activityVersion, navigationVersion } = entry;
+  let timer;
+  try {
+    // Read in an isolated world so page-modified DOM prototypes cannot hide a
+    // draft. Unknown frames and editing surfaces are conservatively retained.
+    const safe = await Promise.race([
+      wc.executeJavaScriptInIsolatedWorld(1002, [
+        {
+          code: `(() => {
+        const inspect = (doc, depth = 0) => {
+          if (!doc || depth > 8 || doc.designMode === 'on' || doc.querySelector('[contenteditable]:not([contenteditable="false"])')) return false;
+          for (const input of doc.querySelectorAll('input')) {
+            if (input.type === 'checkbox' || input.type === 'radio') { if (input.checked !== input.defaultChecked) return false; }
+            else if (input.type === 'file') { if (input.files.length) return false; }
+            else if (input.value !== input.defaultValue) return false;
+          }
+          for (const input of doc.querySelectorAll('textarea')) if (input.value !== input.defaultValue) return false;
+          for (const select of doc.querySelectorAll('select')) {
+            const options = [...select.options];
+            const defaults = options.map((option, index) => option.defaultSelected ? index : -1).filter((index) => index >= 0);
+            if (!select.multiple && !defaults.length && options.length) defaults.push(0);
+            if (options.some((option, index) => option.selected !== defaults.includes(index))) return false;
+          }
+          for (const media of doc.querySelectorAll('audio,video')) if (!media.paused || media.srcObject) return false;
+          for (const frame of doc.querySelectorAll('iframe,frame')) { try { if (!inspect(frame.contentDocument, depth + 1)) return false; } catch { return false; } }
+          return true;
+        };
+        return inspect(document);
+      })()`,
+        },
+      ]),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(false), 1000);
+      }),
+    ]);
+    if (
+      safe !== true ||
+      pageProtected(entry) ||
+      entry.activityVersion !== activityVersion ||
+      entry.navigationVersion !== navigationVersion ||
+      !eligible()
+    )
+      return false;
+    const closed = await requestCloseEntry(entry, { sleep: true });
+    if (closed) {
+      // If a click selected this pin during the close, restore that selection
+      // immediately rather than leave an active tab without its native page.
+      if (store.state.activeTabId === entry.tabId || splitPair?.includes(entry.tabId)) reconcile();
+      publish();
+    }
+    return closed;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function sleepPinnedEntry(entry, { automatic = false } = {}) {
+  return unloadIdleEntry(entry, () => !pinProtected(entry) && (!automatic || pinIsIdle(entry)));
+}
+
+async function archiveIdleTabs() {
+  if (archivingTabs || !store || quitting || closingWindow) return;
+  archivingTabs = true;
+  try {
+    // The selected document and both visible split panes count as being read.
+    // Persist this activity so a later restart uses wall-clock idle time.
+    const now = Date.now();
+    for (const tab of store.state.tabs)
+      if (tab.id === store.state.activeTabId || splitPair?.includes(tab.id)) tab.lastActiveAt = now;
+    // Restored tabs without a native page can be archived immediately. Live
+    // pages go through the same conservative draft/media checks as idle pins.
+    store.dispatch('tab:archive-stale', {
+      excludeIds: [...views].filter(([, entry]) => !entry.dormant).map(([id]) => id),
+    });
+    for (const entry of [...views.values()]) {
+      const eligible = () => {
+        const tab = store.state.tabs.find((item) => item.id === entry.tabId);
+        return Boolean(tab && archiveCandidate(store.state, tab));
+      };
+      if (!(await unloadIdleEntry(entry, eligible))) continue;
+      // Selection, navigation or cadence may change while beforeunload runs.
+      // Automatic unload preserves the tab until this final eligibility check.
+      if (eligible()) store.dispatch('tab:archive-stale', { ids: [entry.tabId] });
+      else reconcile();
+    }
+  } finally {
+    archivingTabs = false;
+  }
+}
+
+async function sleepIdlePins() {
+  if (sleepingPins || !store?.state.settings.pinnedSleepMinutes || quitting || closingWindow) return;
+  sleepingPins = true;
+  try {
+    for (const entry of [...views.values()]) await sleepPinnedEntry(entry, { automatic: true });
+  } finally {
+    sleepingPins = false;
+  }
+}
+function prefersReducedPeekMotion() {
+  if (layout.reducedMotion) return true;
+  try {
+    const settings = systemPreferences.getAnimationSettings();
+    return settings.prefersReducedMotion || !settings.shouldRenderRichAnimation;
+  } catch {
+    return false;
+  }
+}
+function cancelPeekMotion(current) {
+  if (!current) return;
+  clearTimeout(current.motionTimer);
+  current.motionTimer = null;
+  const resolve = current.resolveMotion;
+  current.resolveMotion = null;
+  resolve?.(false);
+}
+function applyPeekMotion(current, offset, progress, phase) {
+  if (peek !== current || current.entry.contents.isDestroyed()) return false;
+  current.offset = offset;
+  current.progress = progress;
+  current.phase = phase;
+  arrangeViews();
+  emit({ type: 'peek:motion', id: current.id, phase, offset, progress });
+  return true;
+}
+function finishPeekMotion(current) {
+  if (!current?.resolveMotion) return;
+  const closing = current.phase === 'closing';
+  clearTimeout(current.motionTimer);
+  current.motionTimer = null;
+  const resolve = current.resolveMotion;
+  current.resolveMotion = null;
+  applyPeekMotion(
+    current,
+    closing && !prefersReducedPeekMotion() ? 10 : 0,
+    closing ? 0 : 1,
+    closing ? 'closing' : 'open',
+  );
+  publish();
+  resolve(true);
+}
+function animatePeek(current, phase) {
+  cancelPeekMotion(current);
+  if (peek !== current || current.entry.contents.isDestroyed()) return Promise.resolve(false);
+  const closing = phase === 'closing';
+  const fromOffset = current.offset || 0;
+  const fromProgress = current.progress ?? 1;
+  const targetOffset = closing ? 10 : 0;
+  const targetProgress = closing ? 0 : 1;
+  const duration =
+    (closing ? 120 : 180) * (store.state.settings.motionScale || 1) * Math.abs(targetProgress - fromProgress);
+  current.phase = phase;
+  publish();
+  return new Promise((resolve) => {
+    current.resolveMotion = resolve;
+    if (prefersReducedPeekMotion() || duration < 1) {
+      finishPeekMotion(current);
+      return;
+    }
+    const started = performance.now();
+    const tick = () => {
+      if (peek !== current || current.entry.contents.isDestroyed()) {
+        cancelPeekMotion(current);
+        return;
+      }
+      if (prefersReducedPeekMotion()) {
+        finishPeekMotion(current);
+        return;
+      }
+      const elapsed = Math.min(1, (performance.now() - started) / duration);
+      if (elapsed >= 1) {
+        finishPeekMotion(current);
+        return;
+      }
+      const eased = closing ? elapsed * elapsed : 1 - (1 - elapsed) ** 3;
+      applyPeekMotion(
+        current,
+        fromOffset + (targetOffset - fromOffset) * eased,
+        fromProgress + (targetProgress - fromProgress) * eased,
+        phase,
+      );
+      current.motionTimer = setTimeout(tick, 16);
+      current.motionTimer.unref?.();
+    };
+    tick();
+  });
+}
+async function requestClosePeek({ supersede = true } = {}) {
+  if (supersede) peekRequestSerial++;
+  if (!peek) return true;
+  const current = peek;
+  if (current.closePromise) return current.closePromise;
+  current.closePromise = (async () => {
+    await animatePeek(current, 'closing');
+    if (current.closeInterrupted) return false;
+    if (peek !== current) return true;
+    const closed = await requestCloseEntry(current.entry);
+    if (!closed && peek === current) {
+      current.closePromise = null;
+      await animatePeek(current, 'opening');
+    }
+    return closed;
+  })();
+  return current.closePromise;
 }
 function reserveView(tab) {
   if (!views.has(tab.id)) views.set(tab.id, createEntry(tab.profileId, tab.id));
@@ -749,7 +1435,7 @@ function reserveView(tab) {
 }
 function ensureView(tabId) {
   const tab = store.state.tabs.find((item) => item.id === tabId);
-  if (!tab) return null;
+  if (!tab || tab.closed) return null;
   const entry = reserveView(tab);
   if (extensionsReady && entry.dormant && (webURL(tab.url) || extensionPageURL(tab.profileId, tab.url))) {
     // Establish the native parent and visible bounds before the first load.
@@ -761,6 +1447,7 @@ function ensureView(tabId) {
   return entry;
 }
 function reconcile() {
+  pruneRetainedFavicons();
   if (!validWindow() || quitting || closingWindow) return;
   const profileId = activeSpace()?.profileId;
   if (
@@ -777,14 +1464,14 @@ function reconcile() {
   lastProfileId = profileId;
   for (const [id, entry] of views) {
     const tab = store.state.tabs.find((item) => item.id === id);
-    if (!tab) {
+    if (!tab || tab.closed) {
       destroyEntry(entry);
       views.delete(id);
-    }
+    } else syncPinNavigation(entry);
   }
   // Allocate stable native tab identities without starting renderers or
   // network navigation for restored/background pages.
-  for (const tab of store.state.tabs) reserveView(tab);
+  for (const tab of store.state.tabs) if (!tab.closed) reserveView(tab);
   extensionHost?.sidePanel?.reconcile();
   publishExtensionTabChanges();
   const split = resolveSplit(splitPair, store.state.tabs, store.state.activeTabId, store.state.activeSpaceId);
@@ -802,6 +1489,7 @@ function reconcile() {
     ? store.state.settings.theme
     : 'system';
   if (nativeTheme.themeSource !== theme) nativeTheme.themeSource = theme;
+  syncWindowMaterial();
   arrangeViews();
   publish();
 }
@@ -809,11 +1497,17 @@ function publishExtensionTabChanges() {
   if (!extensionBrowser || !extensionHost) return;
   const next = new Map();
   for (const tab of store.state.tabs) {
-    if (store.state.profiles.find((profile) => profile.id === tab.profileId)?.private) continue;
+    if (tab.closed || store.state.profiles.find((profile) => profile.id === tab.profileId)?.private) continue;
     const value = extensionBrowser.tabData(tab),
       previous = extensionTabSnapshot.get(tab.id);
     next.set(tab.id, { profileId: tab.profileId, value });
-    if (!previous) extensionHost.api.publish(tab.profileId, 'tabs.onCreated', [value]);
+    if (previous && previous.value.id !== value.id)
+      extensionHost.api.publish(previous.profileId, 'tabs.onRemoved', [
+        previous.value.id,
+        { windowId: previous.value.windowId, isWindowClosing: closingWindow },
+      ]);
+    if (!previous || previous.value.id !== value.id)
+      extensionHost.api.publish(tab.profileId, 'tabs.onCreated', [value]);
     else {
       const changed = {};
       for (const key of ['url', 'title', 'pinned', 'audible', 'status'])
@@ -836,11 +1530,26 @@ function publishExtensionTabChanges() {
 }
 function arrangeViews() {
   if (!validWindow()) return;
+  if (layout.overlay && backdropGeometry && backdropGeometry !== backdropLayoutKey())
+    // Hidden native surfaces defer viewport resizing on some platforms. Omit
+    // stale pixels until the next opening rather than stretch the old bitmap
+    // or expose the live page above the dialog to force another compositor copy.
+    clearBackdrop();
   const [width, height] = win.getContentSize();
-  const rectangles = browserLayout({ width, height, ...layout, split: Boolean(splitPair) });
+  const rectangles = browserLayout({
+    width,
+    height,
+    ...layout,
+    pageGutter: store.state.settings.pageGutter,
+    split: Boolean(splitPair),
+  });
   const desired = new Map();
   if (!layout.overlay) {
-    if (peek) desired.set(peek.entry, { bounds: rectangles.peek, visible: !peek.entry.error });
+    if (peek)
+      desired.set(peek.entry, {
+        bounds: { ...rectangles.peek, y: rectangles.peek.y + Math.round(peek.offset || 0) },
+        visible: !peek.entry.error,
+      });
     else {
       const first = views.get(splitPair?.[0] || store.state.activeTabId);
       const second = splitPair ? views.get(splitPair[1]) : null;
@@ -860,7 +1569,20 @@ function arrangeViews() {
     }
   }
   for (const entry of [...views.values(), ...(peek ? [peek.entry] : [])]) {
-    if (!entry.contents.isDestroyed())
+    if (!entry.contents.isDestroyed()) {
+      if (entry.tabId === store.state.activeTabId || splitPair?.includes(entry.tabId)) {
+        if (entry.inactiveSince !== null) entry.activityVersion++;
+        entry.inactiveSince = null;
+      } else if (entry.inactiveSince === null) {
+        entry.activityVersion++;
+        entry.inactiveSince = Date.now();
+        const tab = store.state.tabs.find((item) => item.id === entry.tabId);
+        if (tab) tab.lastActiveAt = entry.inactiveSince;
+      }
+      if (entry.radius !== store.state.settings.pageRadius) {
+        entry.view.setBorderRadius(store.state.settings.pageRadius);
+        entry.radius = store.state.settings.pageRadius;
+      }
       entry.presentation = presentView(
         entry.view,
         entry.presentation,
@@ -873,15 +1595,21 @@ function arrangeViews() {
         },
         win.contentView,
       );
+    }
   }
   extensionHost?.sidePanel?.arrange(layout);
 }
 async function openPeek(url, source = activeTab()) {
   url = webURL(url);
   if (!url || !source) throw new Error('Choose a web link to preview.');
-  if (!(await requestClosePeek())) return null;
+  const request = ++peekRequestSerial;
+  if (!(await requestClosePeek({ supersede: false })) || request !== peekRequestSerial) return null;
   const entry = createEntry(source.profileId);
   peek = {
+    id: randomUUID(),
+    phase: 'opening',
+    offset: 10,
+    progress: 0,
     entry,
     url,
     profileId: source.profileId,
@@ -890,11 +1618,14 @@ async function openPeek(url, source = activeTab()) {
   };
   arrangeViews();
   safeNavigate(entry, url);
+  void animatePeek(peek, 'opening');
   publish();
   focusContentOrChrome(entry.contents);
 }
 function closePeek(focus = true) {
+  peekRequestSerial++;
   if (!peek) return;
+  cancelPeekMotion(peek);
   const entry = peek.entry;
   peek = null;
   destroyEntry(entry);
@@ -902,17 +1633,27 @@ function closePeek(focus = true) {
   publish();
   if (focus) focusContentOrChrome();
 }
-function promotePeek() {
+function promotePeek({ interruptClose = false } = {}) {
   if (!peek) return;
+  if (peek.closePromise) {
+    if (!interruptClose || peek.entry.closeRequest) return;
+    // Retain the callback document and cancel the action waiting on this close.
+    // Native beforeunload has not begun, so no unload decision is bypassed.
+    peek.closeInterrupted = true;
+  }
+  peekRequestSerial++;
   const current = peek;
-  peek = null;
+  cancelPeekMotion(current);
   const url = current.entry.contents.getURL() || current.url;
-  const tab = store.dispatch('tab:create', { url, spaceId: current.spaceId });
+  // Adopt before activation so reconciliation cannot start a duplicate request
+  // for a page whose current document (or POST response) is already alive.
+  const tab = store.dispatch('tab:create', { url, spaceId: current.spaceId, active: false });
+  peek = null;
   // Reuse the living page, including its scroll position and back stack.
-  const redundant = views.get(tab.id);
-  if (redundant) destroyEntry(redundant);
   current.entry.tabId = tab.id;
   views.set(tab.id, current.entry);
+  store.dispatch('tab:activate', { id: tab.id });
+  if (current.entry.faviconURL === url) rememberFavicon(current.entry, url, current.entry.favicon);
   const title = current.entry.contents.getTitle() || tab.title;
   store.dispatch('tab:update', { id: tab.id, title });
   // A transient preview is not a visit until it becomes a tab. Record its
@@ -921,6 +1662,7 @@ function promotePeek() {
   arrangeViews();
   publish();
   focusContentOrChrome(current.entry.contents);
+  return tab;
 }
 
 function showPageMenu(entry, params) {
@@ -948,7 +1690,11 @@ function showPageMenu(entry, params) {
         click: () =>
           invoke('tab:create', { url: link, spaceId: source.spaceId, active: false }).catch(report),
       },
-      { label: 'Peek at link', accelerator: 'Alt+Click', click: () => openPeek(link, source).catch(report) },
+      {
+        label: 'Peek at link',
+        accelerator: 'Shift+Click',
+        click: () => openPeek(link, source).catch(report),
+      },
       { label: 'Copy link address', click: () => clipboard.writeText(link) },
       { type: 'separator' },
     );
@@ -1004,108 +1750,143 @@ function showPageMenu(entry, params) {
   Menu.buildFromTemplate(items).popup({ window: win });
 }
 
+function setShortcutRecording(active) {
+  recordingShortcut = Boolean(active && validWindow());
+  if (validWindow()) win.webContents.setIgnoreMenuShortcuts(recordingShortcut);
+}
 function handleShortcut(event, input, contents) {
-  if (input.type !== 'keyDown' || input.isComposing || !validWindow()) return;
-  const mod = process.platform === 'darwin' ? input.meta : input.control;
-  const key = input.key.toLowerCase();
-  const run = (callback) => {
-    event.preventDefault();
-    try {
-      const value = callback();
-      if (value?.catch) value.catch(report);
-    } catch (error) {
-      report(error);
+  if (input.type === 'keyUp') {
+    if (
+      recentTabModifiers &&
+      (!recentTabModifiers.length ||
+        recentTabModifiers.includes(input.key) ||
+        recentTabModifiers.some((name) => !input[{ Control: 'control', Meta: 'meta', Alt: 'alt' }[name]]))
+    ) {
+      recentTabCycle = null;
+      recentTabModifiers = null;
     }
-  };
+    return;
+  }
+  if (input.type !== 'keyDown' || input.isComposing || !validWindow()) return;
+  if (recordingShortcut && contents === win.webContents) return;
+  const action = matchShortcut(input, process.platform, store.state.settings.shortcutOverrides);
+  if (action) {
+    event.preventDefault();
+    if (['recent-tab', 'previous-recent-tab'].includes(action))
+      recentTabModifiers ||= [input.control && 'Control', input.meta && 'Meta', input.alt && 'Alt'].filter(
+        Boolean,
+      );
+    else {
+      recentTabCycle = null;
+      recentTabModifiers = null;
+    }
+    if (
+      input.isAutoRepeat &&
+      ![
+        'zoom-in',
+        'zoom-out',
+        'next-tab',
+        'previous-tab',
+        'recent-tab',
+        'previous-recent-tab',
+        'find-next',
+        'find-previous',
+      ].includes(action)
+    )
+      return;
+    // Command+Enter inside the palette submits the current query; dialog key
+    // handling stays in the renderer while the shared catalog owns the binding.
+    runMacAction(action, contents !== win.webContents).catch(report);
+    return;
+  }
+  // Browser bindings include user overrides; extensions only receive unclaimed keys.
   if (extensionHost?.shortcut(input)) {
     event.preventDefault();
     return;
   }
-  if (process.platform === 'darwin') {
-    const action = macShortcut(input);
-    if (action) return run(() => runMacAction(action, contents !== win.webContents));
-    // These belong to Cocoa: Command-H hides the app and Command-Tab is the
-    // system application switcher. They must never become browser actions.
-    // Unrecognized modified Command combinations also remain native. Falling
-    // through would turn, for example, Command-Option-T into a new tab.
-    if (input.meta && (input.control || input.alt || input.shift || ['h', 'q', 'tab'].includes(key))) return;
+  if (
+    input.key?.toLowerCase() === 'escape' &&
+    !input.control &&
+    !input.meta &&
+    !input.alt &&
+    !input.shift &&
+    contents !== win.webContents
+  ) {
+    if (peek) {
+      event.preventDefault();
+      requestClosePeek().catch(report);
+    } else if (contents.isLoading()) {
+      event.preventDefault();
+      contents.stop();
+    }
   }
-  if (key === 'f6') {
-    return run(() => {
-      const target = activeContents();
-      if (contents === win.webContents && !layout.overlay && target) target.focus();
-      else {
-        win.webContents.focus();
-        emit({ type: 'focus:chrome' });
-      }
-    });
+}
+async function savePage() {
+  const contents = activeContents();
+  if (!contents || contents.isDestroyed() || !webURL(contents.getURL())) return null;
+  const originalURL = contents.getURL();
+  let filename = String(contents.getTitle() || 'Page')
+    .normalize('NFKC')
+    .replace(/[<>:"/\\|?*\x00-\x1f\x7f\u202a-\u202e\u2066-\u2069]/g, '_')
+    .replace(/^[. ]+|[. ]+$/g, '')
+    .slice(0, 150);
+  try {
+    filename = safeFilename((filename || 'Page') + '.html');
+  } catch {
+    filename = 'Page.html';
   }
-  if (mod && input.shift && key === 'b')
-    return run(() => emit({ type: 'sidebar:toggle', fromPage: contents !== win.webContents }));
-  // The shell owns focused fields and command-panel shortcuts itself.
-  if (contents === win.webContents && !['f5', 'f11', 'f12'].includes(key)) return;
-  if (contents === win.webContents && ['f5', 'f12'].includes(key)) {
-    const target = activeContents();
-    return run(() => {
-      if (!target) return;
-      if (key === 'f12') target.openDevTools({ mode: 'detach' });
-      else if (input.shift) target.reloadIgnoringCache();
-      else target.reload();
-    });
-  }
-  if (key === 'escape' && peek) return run(() => requestClosePeek());
-  if (mod && key === 't' && input.shift) return run(() => invoke('tab:restore', {}));
-  if (mod && ['l', 'k', 't'].includes(key))
-    return run(async () => {
-      if (key === 't' && !(await invoke('tab:create', {}))) return;
-      emit({ type: 'command', mode: key === 't' ? 'navigate' : 'address' });
-      win.webContents.focus();
-    });
-  if (mod && key === 'w')
-    return run(() => (peek ? requestClosePeek() : requestCloseTab(store.state.activeTabId)));
-  if (mod && key === 'f')
-    return run(() => {
-      emit({ type: 'find' });
-      win.webContents.focus();
-    });
-  if (mod && key === 'd') return run(() => store.dispatch('bookmark:toggle', {}));
-  if (mod && key === 'enter')
-    return run(() => {
-      emit({ type: 'ai:shortcut' });
-      win.webContents.focus();
-    });
-  if (mod && ['h', 'j', ','].includes(key))
-    return run(() => {
-      emit({ type: 'panel', panel: { h: 'history', j: 'downloads', ',': 'settings' }[key] });
-      win.webContents.focus();
-    });
-  if (mod && key === 'p') return run(() => contents.print({}));
-  if ((mod && key === 'r') || key === 'f5')
-    return run(() => (input.shift ? contents.reloadIgnoringCache() : contents.reload()));
-  if (process.platform !== 'darwin' && mod && key === 'tab') return run(() => cycleTab(input.shift ? -1 : 1));
-  if (mod && /^[1-9]$/.test(key))
-    return run(() => {
-      const tabs = store.state.tabs.filter((tab) => tab.spaceId === store.state.activeSpaceId);
-      const tab = tabs[key === '9' ? tabs.length - 1 : Number(key) - 1];
-      if (tab) return invoke('tab:activate', { id: tab.id });
-    });
-  if (process.platform !== 'darwin' && input.alt && key === 'arrowleft')
-    return run(() => contents.navigationHistory.canGoBack() && contents.navigationHistory.goBack());
-  if (process.platform !== 'darwin' && input.alt && key === 'arrowright')
-    return run(() => contents.navigationHistory.canGoForward() && contents.navigationHistory.goForward());
-  if (mod && ['+', '=', '-', '0'].includes(key))
-    return run(() => zoom(contents, key === '0' ? { reset: true } : { delta: key === '-' ? -0.1 : 0.1 }));
-  if (key === 'f11') return run(() => win.setFullScreen(!win.isFullScreen()));
-  if (key === 'f12' || (mod && input.shift && key === 'i'))
-    return run(() => contents.openDevTools({ mode: 'detach' }));
+  const result = await dialog.showSaveDialog(win, {
+    title: 'Save page as',
+    defaultPath: path.join(app.getPath('downloads'), filename),
+    filters: [{ name: 'Web page, complete', extensions: ['html', 'htm'] }],
+  });
+  if (result.canceled || !result.filePath) return null;
+  if (contents.isDestroyed() || contents.getURL() !== originalURL)
+    throw new Error('The page changed while choosing a location. Save it again.');
+  await contents.savePage(result.filePath, 'HTMLComplete');
+  toast('Page saved.');
+  return { saved: true };
 }
 async function cycleTab(direction) {
-  const tabs = store.state.tabs.filter((tab) => tab.spaceId === store.state.activeSpaceId);
+  const tabs = sidebarTabs(store.state);
   if (!tabs.length) return;
   const index = tabs.findIndex((tab) => tab.id === store.state.activeTabId);
   const id = tabs[(index + direction + tabs.length) % tabs.length].id;
   const result = await invoke('tab:activate', { id });
   if (result && store.state.activeTabId === id) focusContentOrChrome();
+  return result;
+}
+async function cycleRecentTab(direction) {
+  const profileId = activeSpace()?.profileId;
+  if (
+    !recentTabCycle ||
+    recentTabCycle.profileId !== profileId ||
+    recentTabCycle.selected !== store.state.activeTabId
+  ) {
+    const active = activeTab();
+    const others = store.state.tabs
+      .filter(
+        (tab) =>
+          tab.profileId === profileId &&
+          tab.id !== active?.id &&
+          (tab.url !== NEW_TAB || tab.homePage || tab.pinned || tab.folderId),
+      )
+      .reverse()
+      .sort((a, b) => b.lastActiveAt - a.lastActiveAt);
+    recentTabCycle = {
+      profileId,
+      ids: [...(active ? [active.id] : []), ...others.map((tab) => tab.id)],
+      index: 0,
+      selected: active?.id,
+    };
+  }
+  const cycle = recentTabCycle;
+  cycle.ids = cycle.ids.filter((id) => store.state.tabs.some((tab) => tab.id === id));
+  if (!cycle.ids.length) return;
+  cycle.index = (cycle.index + direction + cycle.ids.length) % cycle.ids.length;
+  cycle.selected = cycle.ids[cycle.index];
+  const result = await invoke('tab:activate', { id: cycle.selected });
+  if (result) focusContentOrChrome();
   return result;
 }
 function zoom(contents, payload) {
@@ -1143,6 +1924,7 @@ async function onDownload(event, item, contents, profileId) {
     url: item.getURL(),
     sourceUrl: source?.url || '',
     sourceTitle: source?.title || '',
+    sourceTabId: source?.id || null,
     path: '',
     state: 'progressing',
     receivedBytes: 0,
@@ -1286,6 +2068,7 @@ async function clearProfileData(profileId) {
       views.delete(id);
     }
   const ses = profileSession(profileId);
+  forgetProfileFavicons(profileId);
   faviconLoader.clear(ses);
   await ses.clearStorageData();
   await ses.clearCache();
@@ -1305,7 +2088,7 @@ async function getPageContext(ids, signal) {
     const tab = store.state.tabs.find((item) => item.id === id && item.profileId === profile.id);
     if (!tab) throw new Error('Only tabs in the active profile can be shared.');
     const entry = views.get(id);
-    if (!entry || entry.contents.isDestroyed() || entry.error) {
+    if (!entry || entry.dormant || tab.closed || entry.contents.isDestroyed() || entry.error) {
       results.push({
         id,
         title: tab.title,
@@ -1444,6 +2227,7 @@ const CORE_ACTIONS = new Set([
   'tab:activate',
   'tab:close',
   'tab:pin',
+  'tab:favorite',
   'tab:move',
   'tab:restore',
   'space:create',
@@ -1451,6 +2235,7 @@ const CORE_ACTIONS = new Set([
   'space:activate',
   'space:delete',
   'profile:create',
+  'profile:update',
   'profile:delete',
   'folder:create',
   'folder:update',
@@ -1496,6 +2281,7 @@ async function invoke(action, payload = {}) {
       });
       if (answer.response !== 1) return null;
       if (!profile.private) await syncAccount?.client.deleteLocalProfile(profile.id);
+      await ai?.forgetProfile(profile.id);
       if (peek?.profileId === profile.id) closePeek(false);
       if (activeSpace()?.profileId === profile.id) await ai?.handle('ai:reset', {});
       for (const record of store.state.downloads.filter((item) => item.profileId === profile.id))
@@ -1506,6 +2292,7 @@ async function invoke(action, payload = {}) {
           views.delete(id);
         }
       const ses = profileSession(profile.id);
+      forgetProfileFavicons(profile.id);
       faviconLoader.clear(ses);
       if (!profile.private) await extensionHost.removeProfile(profile.id);
       await ses.clearStorageData();
@@ -1521,10 +2308,78 @@ async function invoke(action, payload = {}) {
     }
     if (action === 'settings:update' && payload.values?.sidebarWidth && layout.sidebarWidth !== 0)
       layout.sidebarWidth = store.state.settings.sidebarWidth;
+    if (action === 'settings:update' && payload.values?.shortcutOverrides) buildMenu();
+    if (action === 'settings:update') void sleepIdlePins();
+    if (
+      action === 'profile:update' ||
+      (action === 'settings:update' && Object.hasOwn(payload.values || {}, 'archiveAfterHours'))
+    )
+      void archiveIdleTabs();
     return result;
   }
   const contents = activeContents();
   switch (action) {
+    case 'clipboard:write-text':
+      if (typeof payload.text !== 'string' || Buffer.byteLength(payload.text, 'utf8') > 2 * 1024 * 1024)
+        throw new Error('Choose text of up to 2 MB to copy.');
+      clipboard.writeText(payload.text);
+      return null;
+    case 'tab:sleep':
+      return { slept: await sleepPinnedEntry(views.get(payload.id)) };
+    case 'tab:reset-pin':
+      return resetPinnedTab(payload.id || store.state.activeTabId);
+    case 'tab:replace-pin': {
+      const tab = store.state.tabs.find((item) => item.id === (payload.id || store.state.activeTabId));
+      if (!tab?.pinned) throw new Error('Choose a Pinned Tab or Favorite first.');
+      const live = views.get(tab.id)?.contents;
+      if (live && !live.isDestroyed() && webURL(live.getURL()))
+        store.dispatch('tab:update', { id: tab.id, url: live.getURL() });
+      return store.dispatch('tab:replace-pin', { id: tab.id });
+    }
+    case 'space:reset-pins': {
+      const space = store.state.spaces.find((item) => item.id === (payload.id || store.state.activeSpaceId));
+      if (!space) throw new Error('Space not found.');
+      const pins = store.state.tabs.filter((tab) => tab.spaceId === space.id && tab.pinned && !tab.favorite);
+      for (const pin of pins) await resetPinnedTab(pin.id, { activate: false });
+      return { reset: pins.length };
+    }
+    case 'shortcut:set': {
+      const overrides = updateShortcut(
+        store.state.settings.shortcutOverrides,
+        process.platform,
+        payload.id,
+        payload.accelerator,
+      );
+      store.dispatch('settings:update', { values: { shortcutOverrides: overrides } });
+      buildMenu();
+      return shortcutCatalog(process.platform, store.state.settings.shortcutOverrides);
+    }
+    case 'shortcut:reset': {
+      const current = store.state.settings.shortcutOverrides || {};
+      let overrides;
+      if (payload.id) {
+        const entry = shortcutCatalog(process.platform, current).find((item) => item.id === payload.id);
+        if (!entry) throw new Error('Unknown browser shortcut.');
+        overrides = updateShortcut(current, process.platform, payload.id, entry.defaultAccelerator);
+      } else overrides = { ...current, [process.platform]: {} };
+      store.dispatch('settings:update', { values: { shortcutOverrides: overrides } });
+      buildMenu();
+      return shortcutCatalog(process.platform, store.state.settings.shortcutOverrides);
+    }
+    case 'shortcut:record':
+      setShortcutRecording(payload.active === true);
+      return null;
+    case 'shortcut:run':
+      if (
+        payload.id !== 'new-tab' &&
+        !shortcutCatalog(process.platform, store.state.settings.shortcutOverrides).some(
+          (entry) => entry.id === payload.id,
+        )
+      )
+        throw new Error('Unknown browser shortcut.');
+      return runMacAction(payload.id);
+    case 'save-page':
+      return savePage();
     case 'app:quit':
       // Let the IPC reply settle before a successful quit destroys its sender.
       setImmediate(() => app.quit());
@@ -1615,6 +2470,25 @@ async function invoke(action, payload = {}) {
       if (entry) entry.contents.setAudioMuted(!entry.contents.isAudioMuted());
       break;
     }
+    case 'window:space-material-transition':
+      if (payload.clear === true) clearSpaceMaterialTransition(payload.token);
+      else holdSpaceMaterialTransition(payload);
+      syncWindowMaterial();
+      publish();
+      return windowMaterialState;
+    case 'window:material-preview':
+      clearSpaceMaterialTransition();
+      if (payload.clear === true) materialPreview = null;
+      else {
+        if (payload.spaceId !== activeSpace()?.id)
+          throw new Error('The Space changed. Reopen its appearance settings.');
+        if (!Number.isFinite(payload.opacity) || payload.opacity < 0 || payload.opacity > 100)
+          throw new Error('Choose a window tint opacity from 0 to 100.');
+        materialPreview = { spaceId: payload.spaceId, opacity: Math.round(payload.opacity) };
+      }
+      syncWindowMaterial();
+      publish();
+      return windowMaterialState;
     case 'window:minimize':
       win.minimize();
       break;
@@ -1629,17 +2503,27 @@ async function invoke(action, payload = {}) {
       break;
     case 'layout': {
       const previousOverlay = layout.overlay;
+      if (typeof payload.reducedMotion === 'boolean') {
+        layout.reducedMotion = payload.reducedMotion;
+        if (layout.reducedMotion && peek) finishPeekMotion(peek);
+      }
       const previousSidebarWidth = layout.sidebarWidth;
       if (Number.isFinite(payload.sidebarWidth))
-        layout.sidebarWidth =
-          payload.sidebarWidth === 0 ? 0 : Math.max(200, Math.min(380, payload.sidebarWidth));
+        layout.sidebarWidth = Math.max(0, Math.min(380, payload.sidebarWidth));
       if (Number.isFinite(payload.panelWidth))
         layout.panelWidth = Math.max(0, Math.min(650, payload.panelWidth));
-      if ([8, 36, 40].includes(payload.contentTop)) layout.contentTop = payload.contentTop;
+      if (Number.isFinite(payload.contentTop) && payload.contentTop >= 4 && payload.contentTop <= 40)
+        layout.contentTop = Math.round(payload.contentTop);
       else if (payload.contentTop !== undefined || layout.sidebarWidth === 0) layout.contentTop = 40;
       else if (previousSidebarWidth === 0)
         layout.contentTop = process.platform === 'darwin' || win.isFullScreen() ? 8 : 36;
-      if (typeof payload.overlay === 'boolean') layout.overlay = payload.overlay;
+      const nextOverlay = typeof payload.overlay === 'boolean' ? payload.overlay : previousOverlay;
+      // A dialog may interrupt a width animation. Present the final visible
+      // geometry before capturing it; otherwise both the bitmap and its bounds
+      // describe the previous animation sample. Capture still starts with the
+      // overlay flag set, so its bounded hidden-attachment lifecycle is intact.
+      if (nextOverlay && !previousOverlay) arrangeViews();
+      layout.overlay = nextOverlay;
       if (typeof payload.extensionPanel === 'boolean') layout.extensionPanel = payload.extensionPanel;
       if (layout.overlay && !previousOverlay) void captureBackdrop();
       else if (!layout.overlay && previousOverlay) clearBackdrop();
@@ -1675,6 +2559,8 @@ async function invoke(action, payload = {}) {
         splitPair = null;
         break;
       }
+      if (!activeTab() || activeTab().url === NEW_TAB)
+        throw new Error('Open a web page in the current tab before starting split view.');
       const selected =
         store.state.tabs.find(
           (tab) =>
@@ -1690,8 +2576,7 @@ async function invoke(action, payload = {}) {
             tab.url !== NEW_TAB,
         );
       if (!selected) throw new Error('Open a second web page in this Space to use split view.');
-      if (activeTab()?.url === NEW_TAB)
-        throw new Error('Open a web page in the current tab before starting split view.');
+      if (selected.closed) store.dispatch('tab:wake', { id: selected.id });
       splitTabId = selected.id;
       splitPair = [store.state.activeTabId, selected.id];
       ensureView(splitTabId);
@@ -1809,13 +2694,57 @@ function registerIPC() {
     )
       throw new Error('Untrusted browser action.');
     // Reject excessively large messages before privileged work begins.
-    if (JSON.stringify(payload ?? {}).length > 1024 * 1024) throw new Error('This request is too large.');
+    if (action === 'clipboard:write-text') {
+      if (typeof payload?.text !== 'string' || Buffer.byteLength(payload.text, 'utf8') > 2 * 1024 * 1024)
+        throw new Error('Choose text of up to 2 MB to copy.');
+    } else if (JSON.stringify(payload ?? {}).length > 1024 * 1024)
+      throw new Error('This request is too large.');
     return invoke(action, payload || {});
   });
-  ipcMain.on('zacro:peek-link', (event, url) => {
+  ipcMain.on('zacro:peek-link', (event, details) => {
     const tab = tabForContents(event.sender);
-    if (!tab || event.senderFrame !== event.sender.mainFrame || !webURL(url)) return;
-    openPeek(url, tab).catch(report);
+    const entry = tab?.id === 'peek' ? peek?.entry : tab && views.get(tab.id);
+    if (
+      !tab ||
+      !entry ||
+      event.senderFrame !== event.sender.mainFrame ||
+      details?.documentId !== entry.pinDocumentId ||
+      details?.sourceURL !== event.sender.getURL() ||
+      !webURL(details?.url) ||
+      (tab.id !== 'peek' && ![store.state.activeTabId, splitTabId].includes(tab.id))
+    )
+      return;
+    openPeek(details.url, tab).catch(report);
+  });
+  ipcMain.on('zacro:pin-peek-link', (event, details) => {
+    const tab = tabForContents(event.sender);
+    const entry = tab && views.get(tab.id);
+    if (
+      !tab?.pinned ||
+      !entry ||
+      event.senderFrame !== event.sender.mainFrame ||
+      !details ||
+      details.documentId !== entry.pinDocumentId ||
+      details.sourceURL !== event.sender.getURL() ||
+      !webURL(details.url) ||
+      ![store.state.activeTabId, splitTabId].includes(tab.id)
+    )
+      return;
+    const targetHost = new URL(details.url).hostname.replace(/^www\./, '');
+    const pinHost = new URL(tab.pinnedUrl || tab.url).hostname.replace(/^www\./, '');
+    if (targetHost === pinHost) return;
+    openPeek(details.url, tab).catch(report);
+  });
+  ipcMain.on('zacro:page-dirty', (event) => {
+    if (
+      !event.senderFrame ||
+      (event.senderFrame !== event.sender.mainFrame && event.senderFrame.top !== event.sender.mainFrame)
+    )
+      return;
+    const entry = [...views.values(), ...(peek ? [peek.entry] : [])].find(
+      (item) => item.contents === event.sender,
+    );
+    if (entry && !entry.contents.isDestroyed()) entry.userEdited = true;
   });
 }
 function buildMenu() {
@@ -1837,13 +2766,14 @@ function buildMenu() {
             const contents = webContents.getFocusedWebContents();
             if (contents && !contents.isDestroyed()) contents[action]();
           },
+          store.state.settings.shortcutOverrides,
         ),
       ),
     );
     app.dock?.setMenu(
       Menu.buildFromTemplate([
         { label: 'Open Browser Window', click: () => ensureWindow().catch(report) },
-        { label: 'New Tab', click: () => runMacAction('new-tab').catch(report) },
+        { label: 'Command Palette', click: () => runMacAction('command-palette').catch(report) },
         { label: 'New Private Space', click: () => runMacAction('new-private-space').catch(report) },
       ]),
     );
@@ -1855,16 +2785,11 @@ function buildMenu() {
       label: 'File',
       submenu: [
         {
-          label: 'New tab',
-          click: () =>
-            invoke('tab:create', {})
-              .then((tab) => {
-                if (!tab) return;
-                emit({ type: 'command', mode: 'navigate' });
-                win.webContents.focus();
-              })
-              .catch(report),
+          label: 'Command palette',
+          click: () => runMacAction('command-palette').catch(report),
         },
+        { label: 'New tab page', click: () => runMacAction('new-tab').catch(report) },
+        { label: 'Save page as…', click: () => savePage().catch(report) },
         {
           label: 'New private Space',
           click: () => invoke('profile:create', { name: 'Private', private: true }).catch(report),
@@ -1940,6 +2865,7 @@ function updateMacMenu() {
     enable(id, available);
   for (const id of [
     'print',
+    'save-page',
     'reload',
     'force-reload',
     'find',
@@ -1970,9 +2896,13 @@ async function runMacAction(action, fromPage = false) {
   switch (action) {
     case 'open-browser':
       return;
-    case 'new-tab':
-      if (!(await invoke('tab:create', {}))) return;
-      return showChrome({ type: 'command', mode: 'navigate' });
+    case 'new-tab': {
+      const tab = await invoke('tab:create', { homePage: true });
+      if (tab) return showChrome({ type: 'newtab:show', id: tab.id });
+      return;
+    }
+    case 'command-palette':
+      return showChrome({ type: 'command', mode: 'newtab' });
     case 'new-private-space':
       await invoke('profile:create', { name: 'Private', private: true });
       return;
@@ -1988,7 +2918,31 @@ async function runMacAction(action, fromPage = false) {
     case 'preferences':
     case 'history':
     case 'downloads':
+    case 'bookmarks':
+    case 'archive':
+    case 'extensions':
       return showChrome({ type: 'panel', panel: action === 'preferences' ? 'settings' : action });
+    case 'save-page':
+      return savePage();
+    case 'focus-chrome':
+      if (!fromPage && !layout.overlay && contents) contents.focus();
+      else showChrome({ type: 'focus:chrome' });
+      return;
+    case 'ai':
+      return showChrome({ type: 'ai:shortcut' });
+    case 'shortcuts':
+    case 'browser-menu':
+    case 'focus-sidebar':
+    case 'reveal-tab':
+    case 'onboarding':
+    case 'split':
+    case 'rename-tab':
+    case 'move-tab':
+    case 'new-space':
+    case 'new-folder':
+    case 'find-next':
+    case 'find-previous':
+      return showChrome({ type: 'shortcut', id: action });
     case 'find':
       return showChrome({ type: 'find' });
     case 'print':
@@ -1997,6 +2951,32 @@ async function runMacAction(action, fromPage = false) {
       return contents?.reload();
     case 'force-reload':
       return contents?.reloadIgnoringCache();
+    case 'stop':
+      return contents?.stop();
+    case 'copy-url':
+      if (contents && webURL(contents.getURL())) {
+        clipboard.writeText(contents.getURL());
+        toast('Address copied.');
+      }
+      return;
+    case 'peek-close':
+      return requestClosePeek();
+    case 'peek-promote':
+      return peek && promotePeek();
+    case 'pin-tab':
+      return activeTab() && invoke('tab:pin', {});
+    case 'duplicate-tab':
+      return activeTab() && invoke('tab:create', { url: activeTab().url, homePage: activeTab().homePage });
+    case 'mute-tab':
+      return contents && invoke('tab:mute', {});
+    case 'next-space':
+    case 'previous-space': {
+      const spaces = store.state.spaces.filter((space) => space.profileId === activeSpace()?.profileId);
+      const index = spaces.findIndex((space) => space.id === store.state.activeSpaceId);
+      const next = spaces[index + (action === 'next-space' ? 1 : -1)];
+      if (next) return invoke('space:activate', { id: next.id });
+      return;
+    }
     case 'sidebar-toggle':
       return emit({ type: 'sidebar:toggle', fromPage });
     case 'zoom-in':
@@ -2020,12 +3000,27 @@ async function runMacAction(action, fromPage = false) {
     case 'previous-tab':
     case 'next-tab':
       return cycleTab(action === 'previous-tab' ? -1 : 1);
+    case 'recent-tab':
+    case 'previous-recent-tab':
+      return cycleRecentTab(action === 'recent-tab' ? 1 : -1);
     case 'bookmark':
       return invoke('bookmark:toggle', {});
     case 'import':
       return importData();
     case 'export':
       return exportData();
+    default:
+      if (/^tab-[1-9]$/.test(action)) {
+        const tabs = sidebarTabs(store.state);
+        const number = Number(action.slice(4));
+        const selected = tabs[number === 9 ? tabs.length - 1 : number - 1];
+        if (selected) return invoke('tab:activate', { id: selected.id });
+      }
+      if (/^space-[1-9]$/.test(action)) {
+        const spaces = store.state.spaces.filter((space) => space.profileId === activeSpace()?.profileId);
+        const selected = spaces[Number(action.slice(6)) - 1];
+        if (selected) return invoke('space:activate', { id: selected.id });
+      }
   }
 }
 async function ensureWindow() {
@@ -2066,6 +3061,8 @@ async function endPrivateSessions() {
   // The Mac process survives closing its last window; private browsing must
   // not. Run only after every page has accepted the close, never on Cancel.
   for (const profile of store.state.profiles.filter((item) => item.private)) {
+    await ai?.forgetProfile(profile.id);
+    forgetProfileFavicons(profile.id);
     for (const record of store.state.downloads.filter((item) => item.profileId === profile.id))
       liveDownloads.get(record.id)?.cancel();
     const ses = sessions.get(profile.id);
@@ -2085,8 +3082,20 @@ async function endPrivateSessions() {
 async function createWindow() {
   closingWindow = false;
   allowWindowClose = false;
+  shellSurface = null;
+  windowMaterialState = null;
+  materialPreview = null;
+  clearSpaceMaterialTransition();
+  materialSignature = null;
+  failedMaterialSignature = null;
   splitTabId = null;
   splitPair = null;
+  // Apply the saved appearance before the native backdrop and first frame are
+  // created, avoiding a light material flash when reopening a dark window.
+  const theme = ['dark', 'light'].includes(store.state.settings.theme)
+    ? store.state.settings.theme
+    : 'system';
+  if (nativeTheme.themeSource !== theme) nativeTheme.themeSource = theme;
   layout = {
     sidebarWidth: store.state.settings.sidebarWidth || 224,
     panelWidth: 0,
@@ -2108,8 +3117,8 @@ async function createWindow() {
     y: bounds.y,
     width: bounds.width,
     height: bounds.height,
-    minWidth: Math.min(960, bounds.width),
-    minHeight: Math.min(640, bounds.height),
+    minWidth: Math.min(560, bounds.width),
+    minHeight: Math.min(420, bounds.height),
     title: 'Zacro',
     backgroundColor: '#f4f2ef',
     ...windowChrome(process.platform),
@@ -2150,6 +3159,8 @@ async function createWindow() {
   const pageHost = new View();
   win.setContentView(pageHost);
   pageHost.addChildView(shellView);
+  shellSurface = shellView;
+  syncWindowMaterial();
   const sizeShell = () => {
     const [width, height] = win.getContentSize();
     shellView.setBounds({ x: 0, y: 0, width, height });
@@ -2161,6 +3172,7 @@ async function createWindow() {
   win.webContents.on('will-attach-webview', (event) => event.preventDefault());
   win.webContents.on('before-input-event', (event, input) => handleShortcut(event, input, win.webContents));
   win.webContents.on('render-process-gone', () => {
+    setShortcutRecording(false);
     if (validWindow()) win.webContents.reload();
   });
   win.webContents.on('did-finish-load', () => {
@@ -2195,6 +3207,9 @@ async function createWindow() {
   win.on('blur', () => {
     if (extensionHost && activeProfile())
       extensionHost.api.publish(activeProfile().id, 'windows.onFocusChanged', [-1]);
+    recentTabCycle = null;
+    recentTabModifiers = null;
+    setShortcutRecording(false);
     publish();
   });
   const fullscreenChanged = () => {
@@ -2253,6 +3268,7 @@ async function createWindow() {
     }
   });
   win.on('closed', () => {
+    recordingShortcut = false;
     clearTimeout(publishTimer);
     publishTimer = null;
     finishAuth();
@@ -2260,10 +3276,17 @@ async function createWindow() {
     for (const entry of views.values()) destroyEntry(entry);
     views.clear();
     if (peek) {
+      cancelPeekMotion(peek);
       destroyEntry(peek.entry);
       peek = null;
     }
     win = null;
+    shellSurface = null;
+    windowMaterialState = null;
+    materialPreview = null;
+    clearSpaceMaterialTransition();
+    materialSignature = null;
+    failedMaterialSignature = null;
     updateMacMenu();
     splitTabId = null;
     splitPair = null;
@@ -2310,6 +3333,7 @@ app.on('before-quit', (event) => {
 app.on('will-quit', () => {
   quitting = true;
   clearInterval(archiveTimer);
+  clearInterval(pinnedSleepTimer);
   clearTimeout(publishTimer);
   for (const item of liveDownloads.values()) item.cancel();
   finishAuth();
@@ -2322,7 +3346,10 @@ app.on('will-quit', () => {
     console.error('Session save failed:', error.message);
   }
 });
-nativeTheme.on('updated', publish);
+nativeTheme.on('updated', () => {
+  syncWindowMaterial();
+  publish();
+});
 
 if (singleInstance)
   app
@@ -2391,6 +3418,7 @@ if (singleInstance)
           },
           userDataPath: app.getPath('userData'),
           openExternal: (url) => shell.openExternal(url),
+          safeStorage,
         });
         await ai.ready;
       } catch (error) {
@@ -2410,16 +3438,11 @@ if (singleInstance)
       store.changed();
       extensionsReady = true;
       reconcile();
-      store.dispatch('tab:archive-stale', {
-        excludeIds: [...views].filter(([, entry]) => !entry.dormant).map(([id]) => id),
-      });
-      archiveTimer = setInterval(
-        () =>
-          store.dispatch('tab:archive-stale', {
-            excludeIds: [...views].filter(([, entry]) => !entry.dormant).map(([id]) => id),
-          }),
-        60_000,
-      );
+      await archiveIdleTabs();
+      archiveTimer = setInterval(() => void archiveIdleTabs(), 60_000);
+      pinnedSleepTimer = setInterval(() => {
+        void sleepIdlePins();
+      }, 60000);
       startupReady = true;
       for (const url of process.argv.filter((value) => webURL(value)).slice(0, 32)) receiveExternalURL(url);
       await drainExternalURLs();

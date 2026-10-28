@@ -1,41 +1,90 @@
 # Zacro on macOS
 
-The Mac implementation targets **macOS 13 or later**, on **Apple silicon (`arm64`) and Intel (`x64`)**. It includes native window chrome and menus, Mac keyboard conventions, Dock reopening, safe web-link delivery, and architecture-matched application packaging. Native CI has passed on macOS 15 for both architectures. macOS 13 is the declared minimum, not a completed physical-device test result; physical Mac review and signed/notarized release acceptance remain open.
+The Mac implementation targets **macOS 13 or later**, on **Apple silicon (`arm64`) and Intel (`x64`)**. Version **0.9**, at runtime `8069153e0b5fc43fb5a0bcfdf4f96b1ab32e452b`, combines native window translucency, resizable browser rails, a compact Library chooser and distinct Favorites, Pinned Tabs and Today tabs with continuous Space colors, sharp command-palette backgrounds and animated Peek previews.
+
+Both Mac architectures passed **202 unit/security checks, 86 native desktop cases and one packaged-application check**, with one Windows-only skip each, in [final CI run 40713486954 at `dc0f445`](https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40713486954). Development DMG/ZIP creation and all validation/package uploads passed. The runtime is unchanged by that revision's test-readiness fixes. [VALIDATION.md](VALIDATION.md) records the exact evidence.
+
+These are native CI and development-package results. macOS 13 is the declared minimum, not a completed physical-device result. Physical Mac review, live Google/AI account acceptance and signed/notarized distribution remain open; Google sign-in is currently blocked as detailed below.
 
 ## Everyday use
 
-![Packaged Zacro in dark appearance on macOS, with native traffic lights, menu bar and Dock icon](screenshots/macos-dark.png)
+![Packaged Zacro 0.9 in dark appearance on macOS, with native traffic lights, aligned navigation, menu bar and Dock icon](screenshots/0.9/mac-arm64-dark.png)
 
-This is an unedited native desktop capture of the Apple silicon development package on macOS 15.7.9, using a disposable CI profile. The [README](../README.md#screenshots) also shows light appearance.
+This unedited 1024×768 native desktop capture shows the **0.9** Apple silicon development package at runtime `8069153`, using a disposable profile in [CI run 40706282417](https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40706282417). Both this image and its [light appearance counterpart](screenshots/0.9/mac-arm64-light.png) were visually reviewed for traffic-light/navigation alignment, compact chrome, page gutters and dark selection contrast. The optional Home page was opened explicitly during packaged acceptance; an empty Space normally opens the command palette. The source validation ZIP's SHA-256 was verified before extraction. [Capture provenance](screenshots/README.md) and the [0.9 manifest](screenshots/0.9/manifest.json) record artifact `12823049726`, image hashes and dimensions. Still images do not establish physical trackpad feel, desktop blur or live sign-in acceptance.
 
 The red, yellow and green window controls are native macOS controls. Their reserved area remains clear when the sidebar is hidden. Full screen uses the operating system's transition and screen arrangement; returning to a window restores the controls' layout. The interface follows system light/dark appearance, reduced motion, reduced transparency and increased contrast, uses the system font, and dims chrome when inactive.
 
 Zacro's menu bar exposes browser actions without adding another menu row inside the window. The application menu contains Settings, Services, Hide and Quit. Window actions use native Minimize, Zoom and Bring All to Front. Edit actions target the focused page or browser field, including Undo, Redo, Select All, and Paste and Match Style. Downloads offer **Show in Finder**. These choices follow [Apple's Mac design guidance](https://developer.apple.com/design/human-interface-guidelines/designing-for-macos) and [Electron's native menu behavior](https://www.electronjs.org/docs/latest/api/menu-item).
 
-Page context menus include spelling suggestions and macOS Look Up for selected text. Native pages use macOS scroll bounce. The Dock menu offers the browser window, a new tab and a new private Space without requiring an existing window.
+Page context menus include spelling suggestions and macOS Look Up for selected text. Native pages use macOS scroll bounce. The Dock menu offers the browser window, command palette and a new private Space without requiring an existing window.
 
-| Action                               | Mac shortcut               |
-| ------------------------------------ | -------------------------- |
-| Address / command bar                | ⌘L or ⌘K                   |
-| New tab / reopen closed tab          | ⌘T / ⇧⌘T                   |
-| Close tab / close window             | ⌘W / ⇧⌘W                   |
-| Open or bring forward browser window | ⌘N                         |
-| New private Space                    | ⇧⌘N                        |
-| Previous / next tab                  | ⌃⇧Tab / ⌃Tab, or ⌥⌘← / ⌥⌘→ |
-| Back / forward                       | ⌘[ / ⌘]                    |
-| Settings / History / Downloads       | ⌘, / ⌘Y / ⇧⌘J              |
-| Toggle sidebar / full screen         | ⇧⌘B / ⌃⌘F                  |
-| Find / print / reload                | ⌘F / ⌘P / ⌘R               |
-| Reload without cache                 | ⇧⌘R                        |
-| Quit                                 | ⌘Q                         |
+| Action                               | Mac shortcut |
+| ------------------------------------ | ------------ |
+| Command palette / edit current address | ⌘T or ⌘K / ⌘L |
+| Reopen closed tab | ⇧⌘T |
+| Close tab / close window | ⌘W / ⇧⌘W |
+| Open or bring forward browser window | ⌘N |
+| New private Space | ⇧⌘N |
+| Recent tabs / reverse recent tabs | ⌃Tab / ⌃⇧Tab |
+| Previous / next tab in sidebar order | ⌥⌘↑ / ⌥⌘↓ |
+| Previous / next Space | ⌥⌘← / ⌥⌘→ |
+| Space by position | ⌃1–9 |
+| Tab by position / last tab | ⌘1–8 / ⌘9 |
+| Pin or unpin / bookmark | ⌘D / ⌥⌘D |
+| Split view | ⌃⇧= |
+| Back / forward | ⌘[ / ⌘] |
+| Settings / History / Downloads | ⌘, / ⌘Y / ⌘J |
+| Toggle sidebar / full screen | ⌘S / ⌃⌘F |
+| Focus sidebar / page or browser controls | ⌥⌘S / F6 |
+| Copy page address | ⇧⌘C |
+| Save page / keyboard shortcuts | ⇧⌘S / ⌥⌘K |
+| Find / print / reload | ⌘F / ⌘P / ⌘R |
+| Reload without cache | ⇧⌘R |
+| Quit | ⌘Q |
 
-⌘Tab remains the system application switcher, and ⌘H hides the application. Horizontal scrolling over the sidebar switches Spaces within the current profile; ordinary webpage scrolling remains with the page. Each gesture moves one Space, respects the endpoints and restores that Space's tab-list position. Reduced-motion users get the same immediate state changes without the decorative transition.
+⌘T opens the command palette without creating a tab. An empty Space opens it automatically; submitting an address or search creates the page, and cancelling keeps the Space empty. Choose New Tab Page explicitly to open the home page. The sidebar stays interactive beside the palette. ⌘L edits the current destination. The palette filters All, Tabs, Spaces, Bookmarks, History and Actions; `/` or `>` searches actions, `@` searches tabs, and `#` searches Spaces. Space customization, sleeping unused favorites, and prepared AI questions are available as actions.
+
+⌃Tab returns to the most recent tab in the current profile. Keep Control held and press Tab again to move farther back; Shift reverses the direction. The Option-Command-Up/Down commands follow sidebar order instead: Favorites, pins and folders, then Today tabs. Open Keyboard Shortcuts to search, record, disable and reset bindings. Defaults and aliases come from the shared catalog, and overrides are stored separately for macOS. These conventions follow Arc's [command and recent-tab workflow](https://start.arc.net/master-multitasking), [pinning](https://resources.arc.net/hc/en-us/articles/19231060187159-Pinned-Tabs-Tabs-you-want-to-stick-around), and [Space navigation](https://resources.arc.net/hc/en-us/articles/19228064149143-Spaces-Distinct-Browsing-Areas).
+
+The welcome tour introduces commands, the sidebar, Spaces, favorites and preferences. Every shortcut displayed in the tour can be changed there, with the same conflict checks as Keyboard Shortcuts. Reopen the tour through browser commands. There is no permanent sidebar-toggle icon: ⌘S and the command menu provide that action. ⌥⌘S reveals and focuses the sidebar, arrows move through its tabs and folders, and Enter activates the focused destination. F6 returns to page/browser controls. The sidebar shortcut preserves an active webpage field's focus when invoked from that page.
+
+⌘Tab remains the system application switcher, and ⌘H hides the application. Horizontal scrolling over the sidebar switches Spaces within the current profile; ordinary webpage scrolling remains with the page. Favorites, folders and tabs follow the finger as one page, while the neighboring Space's contents enter beside them. Window colors and tint blend with the same gesture progress, including reversal and cancellation, without changing either Space's saved theme. The footer stays fixed and no extra Space-name badge appears. Sufficient distance or a qualifying projected flick settles into the neighbor at release, while a reversal or short movement can settle back. One gesture's momentum tail cannot advance repeatedly, and endpoints resist without wrapping. Each Space retains its tab-list position. Forms, text fields, dragging and pinch/zoom keep their input. Portable wheel events do not always expose contact phases, so release detection also uses a short pause/deceleration heuristic. Physical-trackpad acceptance remains open.
+
+Right-click a footer Space icon to switch, customize, rename, move the current tab there, create or delete a Space, with unavailable actions omitted or disabled. Shift+F10 opens the same menu from keyboard focus.
+
+At Balanced motion, keyboard Space changes use a 220ms transition. Sidebar and browser panels share a 220ms monotonic ease-out without spring or overshoot. Shell width and native page bounds follow the same samples, preserving the live page and focus; interrupted motion reverses from its displayed position. Quick/Relaxed/Gentle settings adjust both rails. Reduced motion settles both immediately, including when the system preference changes during a transition.
+
+Peek enters in 180ms and exits in 120ms at Balanced motion. Its live webpage translates with the surrounding preview chrome at a fixed document size and zoom; it is not scaled or replaced by a screenshot. Promoting Peek keeps the same document, history and form state. A cancelled unsaved-work close restores the preview, and reduced motion settles immediately.
+
+Library first opens a small menu beside its footer button: Bookmarks, History, Downloads and Archived tabs, followed by Settings, Extensions and Ask Zacro. The panel's title opens the same chooser. Arrow keys, Home/End and typing a destination's initial move through the choices; Enter selects and Escape returns to the opener. Search filters compact rows grouped by date. From a search field, Down enters the page list and Up from the first row returns to search. Download rows keep Show in Finder visible, with Rename, Suggest name and Undo rename in their action menu.
+
+The Library panel shares the Space's window tint and grain without another background layer. Its menu stays within browser chrome, so the native webpage retains its live document and pixel scale. Closing releases panel interaction immediately and slides the chrome away. Opening a panel from its keyboard shortcut remains direct.
+
+The browser window can shrink to 560×420. Drag the sidebar's right edge or Library panel's left edge to resize it; double-click an edge to restore its default width. The edges are keyboard-focusable and support arrow keys. A wide sidebar adapts to the available room while retaining its saved size. At narrow widths an open panel temporarily retracts the sidebar to retain a page at least 240px wide; closing the panel or expanding the window restores it. The command palette can use the full window width when the page is narrow. Its floating card has a shadow; the page behind it has no blur, tint or filter, and keeps its rounded frame. Settings, shortcut lists, theme controls and palette results scroll within short windows.
+
+The palette's static page backdrop preserves native-resolution PNG pixels, including HiDPI captures, within explicit pixel and byte limits. Resizing or otherwise changing page geometry while the palette is open clears that backdrop, preserving the query, focus and underlying document; dismissing and reopening captures the current page. It does not stretch an old image or display a blurred fallback. [Validation](VALIDATION.md) records the capture limits and this overlay-resize limitation.
+
+Customize Space offers searchable icons, two colors, gradient balance, grain and **Window tint opacity**, with a live preview before Save. Opacity spans 0–100; grain spans 0–200, preserving the strength of existing values through 100 and offering twice that strength at the new maximum. Below 100% tint, macOS uses behind-window vibrancy to reveal system-blurred content behind the browser chrome. Text and webpage surfaces stay fully opaque. The operating system controls blur strength; there is no separate blur-radius slider. Setting the tint to 100%, enabling Reduce Transparency or high contrast, or losing native material support restores opaque chrome while preserving the saved Space preference. Cancel restores the saved appearance. On Windows, the equivalent acrylic material requires Windows 11 22H2 or later; older Windows versions and other unsupported platforms use opaque chrome. Physical Mac review of this material remains open.
+
+**Settings → Layout & motion** adds tab spacing, a shared 4–20px page inset, corner radius, motion speed and idle-favorite timing. With the sidebar shown, Mac page top/side/bottom gutters use the selected inset; hidden-sidebar navigation or Find retains its 40px top reservation. Traffic-light clearance remains separate from page framing.
+
+Pinned Tabs are named rows saved within one Space, above Today. Favorites are icon tiles shared by Spaces using the same profile; they stay separate from other profiles and private sessions. Favorite rows balance their tile sizes as their count and sidebar width change. Drag a tab above Today to pin it or into the icon row to make it a Favorite. ⌘D pins or unpins; ⌥⌘D keeps the separate bookmark action. A pin's label resumes its current page, while its favicon resets to the saved destination. A Favorite tile activates its current live page; use an explicit Reset action in its menu or the command palette to return home. A closed pin or Favorite opens its saved destination.
+
+Saved titles and icons remain stable while browsing. A slash marks a pin or Favorite that has navigated away from its saved URL, including a changed page fragment; resetting or closing clears it. The context menu offers **Replace pin with current page** to change the saved destination. Ordinary links from pins and Favorites to another host open in Peek, while forms, redirects and site-owned popup flows keep their normal behavior. Shift-click previews a link explicitly. The [Arc behavior study](ARC-BEHAVIOR-STUDY.md) records the source behavior and implementation boundaries.
+
+⌘W on a Pinned Tab or Favorite closes its live page but keeps its name, position and saved destination, subject to any unsaved-work decision. Reopening starts a fresh page at that destination. Loaded, Sleeping or Closed remains in its tooltip and accessible name; the icon has no status dot beneath it. Idle sleep defaults to 20 minutes and can be disabled. Active/split/Peek-source pages, media/captures, downloads, authentication and detected edits are retained; beforeunload can silently veto sleeping. Unknown editing state is treated conservatively, but sleeping does not preserve arbitrary JavaScript state. Unpinning an open page moves it into Today; unpinning an already closed item removes the saved shortcut.
+
+Today tabs automatically archive after **12 hours of inactivity** by default. Profiles can inherit the browser default or choose their own interval, including Never. Recent activity restarts the interval. Clean background pages can expire even while loaded, while selected/split/Peek-source pages, media/capture, downloads, authentication relationships, detected edits and unsaved-work vetoes remain protected. Archived tabs can be restored from Library. Pins and Favorites never auto-archive.
+
+Ask Zacro and the command palette can prepare a summary, explanation, comparison or research question. They send nothing until submission. Context chips identify the selected page URLs, independent of the newly active tab; navigation or closure requires review before another send. Edit, Retry and Copy operate on the displayed conversation, with partial answers marked incomplete and drafts retained within the current profile. Enter sends and ⇧Enter inserts a line; IME composition does not submit. See [AI workflows](AI.md) for connection, storage and provider limits. Live ChatGPT/Claude sign-in, API model access and paid usage remain separate acceptance checks.
 
 Zacro currently uses one browser window. ⌘N opens that window if closed or brings it forward; it does not create an independent second browsing window. Closing the window keeps the application available in the Dock. Reopening restores tabs and the active Space from the session; pages reload after an approved window close. Beforeunload decisions still protect pages that report unsaved work. Quit exits the application, and cancelling a close warning cancels the pending quit.
 
 Successfully closing the last window ends private sessions: private profile metadata, cookies and session data are cleared before reopening. Cancelling the close keeps the private session intact. Regular profile sessions remain available, and user-saved downloads remain on disk.
 
 The application bundle declares HTTP/HTTPS handling so macOS can offer Zacro for web links. Links received before startup or while no window is open are validated and opened after the window is ready. An installed build exposes an explicit **Default browser** action in Settings that requests the operating system's choice; Zacro does not take over automatically. Local-file browsing and arbitrary protocol handlers remain unsupported.
+
+Website redirect and popup mechanics are tested, including POST login callbacks, but **Google currently rejects direct sign-in in this embedded browser**. The runtime also lacks a native FedCM account chooser, and macOS platform passkeys are not configured. **Open in default browser** is available; authentication there remains in that browser's session. See [website sign-in](WEB-SIGN-IN.md) for the engine limitations and live acceptance required before claiming Google support.
 
 ## Develop and package
 
@@ -67,10 +116,22 @@ Passing a build is only one release gate. A Mac release still needs clean-machin
 
 ## Native verification
 
-The GitHub Actions workflow has separate `macos-15` Apple silicon and `macos-15-intel` jobs. Both passed the 0.4 revision on macOS **15.7.9 (24G830)** in [run 40099796398](https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40099796398) at commit `f3101841f04cda2e9441734c0b711f6e63c697e2`: **99 unit/security tests, 32 desktop integration tests and one packaged-application test per architecture**, plus source formatting/syntax and native DMG/ZIP builds. The development artifacts are retained for seven days with explicit architecture labels; they are CI outputs, not a public signed/notarized release.
+The GitHub Actions workflow has separate `macos-15` Apple silicon and `macos-15-intel` jobs. At the **0.9 runtime `8069153`**, both passed in [final run 40713486954 at test revision `dc0f445`](https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40713486954):
 
-The Darwin-only suite covers native traffic-light position and layout, menu conventions, Cmd-based shortcuts, Ctrl-Tab, native full screen, guest-page editing, window close/Dock reopen, validated web links, pre-ready link delivery, cancellation of Quit with unsaved work, and private-session cleanup after the last window closes. It is skipped on non-Mac hosts. The Mac command also runs shared browser, renderer contract, motion, Space-scroll, security and startup native-paint tests. The packaged suite checks actual browsing, security fuses, PDF parsing and an isolated signed-out Codex handshake; it does not make authenticated model requests.
+| Check | Apple silicon | Intel |
+| --- | --- | --- |
+| Unit/security | 202 passed | 202 passed |
+| Native desktop | 86 passed; 1 Windows-only skip | 86 passed; 1 Windows-only skip |
+| Packaged application | 1 passed | 1 passed |
+| Development DMG and ZIP | Passed | Passed |
+| Validation and package uploads | Both passed | Both passed |
 
-Before release, test on physical Apple silicon and Intel Macs with a keyboard and trackpad, multiple displays, full screen, Spaces/Mission Control, Finder file dialogs, camera/microphone/location consent, printing, VoiceOver, keyboard-only navigation, reduced motion and display scaling. Complete ChatGPT authentication yourself to validate subscription behavior; tests never automate a personal login. Record OS versions, architecture, exact commit and observed limitations in [the validation record](VALIDATION.md).
+Formatting and syntax checks also passed. The Windows-only DPAPI restart check skips on Mac. The overall cross-platform run and all five artifact uploads completed successfully. These architecture-labeled packages are ad hoc signed development outputs, not signed/notarized public releases. The Apple silicon light/dark packaged desktop images above were retrieved, digest-verified and visually reviewed. [VALIDATION.md](VALIDATION.md) records the exact runtime, fixture-readiness corrections, subsequent test-only runs and remaining acceptance work.
+
+The Darwin-only suite covers native traffic-light position and layout, menu conventions, Cmd-based shortcuts, Ctrl-Tab, native full screen, guest-page editing, window close/Dock reopen, validated web links, pre-ready link delivery, cancellation of Quit with unsaved work, and private-session cleanup after the last window closes. It is skipped on non-Mac hosts. The Mac command also includes shared browser, renderer contract, motion, Space-scroll, pin/Favorite lifecycle, archive protection, rail resizing, personalization, lossless HiDPI backdrop, local-provider AI workflow, security and startup native-paint tests. The counts above apply to the stated revision. The packaged suite checks actual browsing, security fuses, PDF parsing and an isolated signed-out Codex handshake; it does not make authenticated model requests.
+
+Earlier evidence remains historical: [0.7 run 40680503131](https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40680503131) passed both architectures' 176 unit checks, 62 native cases, packaged acceptance and development builds at `9bf9af7`, but the overall run failed when Intel's validation upload timed out and its package upload was skipped. [0.6 run 40222980054](https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40222980054) passed 173 unit/security checks, 52 desktop cases, packaged acceptance and development builds per architecture at `9bfcd1c`. Those revisions and older screenshots do not establish acceptance of 0.9.
+
+Before release, test on physical Apple silicon and Intel Macs with a keyboard and trackpad, multiple displays, full screen, Spaces/Mission Control, Finder file dialogs, camera/microphone/location consent, printing, VoiceOver, keyboard-only navigation, reduced motion/transparency and display scaling. Include slow drags, reversals, release/momentum tails, rapid sidebar toggles, custom insets and favorite sleep vetoes. Complete ChatGPT/Claude authentication and provider-specific API inference with user-authorized accounts to validate access, sources, billing/limits and cancellation; controlled fixtures do not establish those results. Record OS versions, architecture, exact commit and observed limitations in [the validation record](VALIDATION.md).
 
 References: [Apple Mac design guidance](https://developer.apple.com/design/human-interface-guidelines/designing-for-macos), [Electron window controls](https://www.electronjs.org/docs/latest/api/browser-window), [Electron app lifecycle](https://www.electronjs.org/docs/latest/api/app), [Electron's macOS minimum version](https://www.electronjs.org/blog/electron-44-0), [GitHub's native Mac runners](https://docs.github.com/en/actions/reference/runners/github-hosted-runners), and [Electron macOS signing guidance](https://www.electronjs.org/docs/latest/tutorial/code-signing#macos).

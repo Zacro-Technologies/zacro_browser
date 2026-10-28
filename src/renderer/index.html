@@ -16,6 +16,7 @@
       <aside id="sidebar" class="sidebar" aria-label="Spaces and tabs">
         <header id="toolbar" class="toolbar" aria-label="Browser controls"></header>
         <div id="sidebar-content" class="sidebar-content"></div>
+        <div id="space-gesture-preview" class="space-gesture-preview" aria-hidden="true" inert hidden></div>
       </aside>
       <main class="main">
         <div id="captionbar" class="captionbar" aria-label="Window controls"></div>
@@ -26,6 +27,25 @@
         </div>
       </main>
       <aside id="side-panel" class="side-panel" aria-label="Library" hidden></aside>
+      <div
+        id="sidebar-resizer"
+        class="chrome-resizer"
+        role="separator"
+        aria-label="Resize sidebar"
+        aria-orientation="vertical"
+        tabindex="0"
+        title="Drag to resize · double-click to reset"
+      ></div>
+      <div
+        id="panel-resizer"
+        class="chrome-resizer"
+        role="separator"
+        aria-label="Resize Library panel"
+        aria-orientation="vertical"
+        tabindex="0"
+        title="Drag to resize · double-click to reset"
+        hidden
+      ></div>
       <div id="findbar" class="findbar" hidden></div>
       <div id="page-backdrop" aria-hidden="true" inert hidden></div>
       <div id="dialog-root"></div>

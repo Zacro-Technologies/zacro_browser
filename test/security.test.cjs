@@ -135,8 +135,7 @@ test('portable imports cannot introduce privileged extension paths, permissions,
 test('hydration derives tab profile from its Space and discards unsafe URLs', () => {
   const raw = createInitialState();
   raw.profiles.push({ id: 'other', name: 'Other', private: false });
-  raw.tabs[0].profileId = 'other';
-  raw.tabs[0].url = 'file:///C:/secret.txt';
+  raw.tabs.push({ id: 'unsafe-tab', spaceId: 'home', profileId: 'other', url: 'file:///C:/secret.txt' });
   const restored = hydrate(raw);
   assert.equal(restored.tabs[0].profileId, 'default');
   assert.equal(restored.tabs[0].url, 'zacro://newtab');

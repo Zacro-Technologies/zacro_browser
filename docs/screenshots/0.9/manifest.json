@@ -1,0 +1,171 @@
+{
+  "version": "0.9",
+  "captureDate": "2026-10-28",
+  "timezone": "Asia/Tokyo",
+  "retouched": false,
+  "asarSha256": "12f2d8300f5b1bc3d17117331f9cb795a454562c1e732aff58cd8fa1d0a3cbc2",
+  "captures": [
+    {
+      "file": "compact.jpg",
+      "sha256": "b98eb908e71ff6821fb1da287aa314340a4551f0a8e3ef8a76018353688892b1",
+      "width": 565,
+      "height": 424,
+      "runtimeCommit": "8069153e0b5fc43fb5a0bcfdf4f96b1ab32e452b",
+      "capturedStageAt": "2026-10-28T14:23:23.014Z",
+      "platform": "Windows 11 x64",
+      "method": "Computer whole-window capture, instrumented local review fixture",
+      "geometry": {
+        "width": 562,
+        "height": 423,
+        "dpr": 1.5,
+        "panel": "Bookmarks",
+        "dialog": null
+      }
+    },
+    {
+      "file": "dark.jpg",
+      "sha256": "e037946a26543b7d7a024e4b98f1215045733615493926ac3f64d785a4bb970c",
+      "width": 1285,
+      "height": 804,
+      "runtimeCommit": "8069153e0b5fc43fb5a0bcfdf4f96b1ab32e452b",
+      "capturedStageAt": "2026-10-28T14:23:06.214Z",
+      "platform": "Windows 11 x64",
+      "method": "Computer whole-window capture, instrumented local review fixture",
+      "geometry": {
+        "width": 1282,
+        "height": 803,
+        "dpr": 1.5,
+        "panel": null,
+        "dialog": "Command bar"
+      }
+    },
+    {
+      "file": "library-menu.jpg",
+      "sha256": "f9b155b26b02f609d0f0f39f8d93178520f5224410525e7a5a06e9f443f8b32d",
+      "width": 1285,
+      "height": 804,
+      "runtimeCommit": "8069153e0b5fc43fb5a0bcfdf4f96b1ab32e452b",
+      "capturedStageAt": "2026-10-28T14:21:28.334Z",
+      "platform": "Windows 11 x64",
+      "method": "Computer whole-window capture, instrumented local review fixture",
+      "geometry": {
+        "width": 1282,
+        "height": 803,
+        "dpr": 1.5,
+        "panel": null,
+        "dialog": null
+      }
+    },
+    {
+      "file": "library.jpg",
+      "sha256": "8f1402c083f7e1266535198f228d9f996638e3bbe335fa4d01c13cb9df228897",
+      "width": 1285,
+      "height": 804,
+      "runtimeCommit": "8069153e0b5fc43fb5a0bcfdf4f96b1ab32e452b",
+      "capturedStageAt": "2026-10-28T14:21:39.263Z",
+      "platform": "Windows 11 x64",
+      "method": "Computer whole-window capture, instrumented local review fixture",
+      "geometry": {
+        "width": 1282,
+        "height": 803,
+        "dpr": 1.5,
+        "panel": "Bookmarks",
+        "dialog": null
+      }
+    },
+    {
+      "file": "palette.jpg",
+      "sha256": "c9f7c474a3e43ede588d9cdb1692d8ce9adb971eddcf5a9dbd436f427f13665f",
+      "width": 1285,
+      "height": 804,
+      "runtimeCommit": "8069153e0b5fc43fb5a0bcfdf4f96b1ab32e452b",
+      "capturedStageAt": "2026-10-28T14:21:50.997Z",
+      "platform": "Windows 11 x64",
+      "method": "Computer whole-window capture, instrumented local review fixture",
+      "geometry": {
+        "width": 1282,
+        "height": 803,
+        "dpr": 1.5,
+        "panel": null,
+        "dialog": "Command bar"
+      }
+    },
+    {
+      "file": "peek.jpg",
+      "sha256": "2348f4204b941fa2f5926f8fa60294ba44378b3a63cd2996a029afd1776d8e59",
+      "width": 1285,
+      "height": 804,
+      "runtimeCommit": "8069153e0b5fc43fb5a0bcfdf4f96b1ab32e452b",
+      "capturedStageAt": "2026-10-28T14:22:37.532Z",
+      "platform": "Windows 11 x64",
+      "method": "Computer whole-window capture, instrumented local review fixture",
+      "geometry": {
+        "width": 1282,
+        "height": 803,
+        "dpr": 1.5,
+        "panel": null,
+        "dialog": null
+      }
+    },
+    {
+      "file": "space-theme.jpg",
+      "sha256": "8ff842b7241cb52951024c85adf0574dc2d86d452f7b5f5a5c7959c6ef479524",
+      "width": 1285,
+      "height": 804,
+      "runtimeCommit": "8069153e0b5fc43fb5a0bcfdf4f96b1ab32e452b",
+      "capturedStageAt": "2026-10-28T14:22:05.579Z",
+      "platform": "Windows 11 x64",
+      "method": "Computer whole-window capture, instrumented local review fixture",
+      "geometry": {
+        "width": 1282,
+        "height": 803,
+        "dpr": 1.5,
+        "panel": null,
+        "dialog": "Customize Space"
+      }
+    },
+    {
+      "file": "workspace.jpg",
+      "sha256": "66d979d8f060fd81688bcde79604999b2a85df7ad8542ea91330a5cc1fc5418e",
+      "width": 1285,
+      "height": 804,
+      "runtimeCommit": "8069153e0b5fc43fb5a0bcfdf4f96b1ab32e452b",
+      "capturedStageAt": "2026-10-28T14:21:09.132Z",
+      "platform": "Windows 11 x64",
+      "method": "Computer whole-window capture, instrumented local review fixture",
+      "geometry": {
+        "width": 1282,
+        "height": 803,
+        "dpr": 1.5,
+        "panel": null,
+        "dialog": null
+      }
+    }
+  ],
+  "macOS": {
+    "runUrl": "https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40706282417",
+    "headCommit": "0810fd114f649d33c7669be03bad8c149129251e",
+    "runtimeCommit": "8069153e0b5fc43fb5a0bcfdf4f96b1ab32e452b",
+    "artifactId": 12823049726,
+    "artifactName": "macos-arm64-validation",
+    "artifactZipSha256": "fa008b04b505054f612d9a377b86f1a520f2dd74a2d5d74a7e0338337f607e32",
+    "method": "Native macOS desktop capture of the packaged application's optional Home-page acceptance fixture",
+    "captures": [
+      {
+        "file": "mac-arm64-light.png",
+        "sourceFile": "packaged-mac-home-light-desktop.png",
+        "sha256": "ca492f544cc58720fbacef302a57e05fc0887b3342036d7e5845bf088c1584a4",
+        "width": 1024,
+        "height": 768
+      },
+      {
+        "file": "mac-arm64-dark.png",
+        "sourceFile": "packaged-mac-home-dark-desktop.png",
+        "sha256": "b4083f8a1a971e7aa6ea0e7dd0dc8cbdf4981c78abd6a6689242f063bcc9aeed",
+        "width": 1024,
+        "height": 768
+      }
+    ]
+  },
+  "limitations": "Windows images are opaque layout captures. Instrumented preparation is not native-input or physical Mac acceptance. Mac images show an explicitly opened optional Home page. Still images do not establish motion, desktop blur or live provider acceptance."
+}

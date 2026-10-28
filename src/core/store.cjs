@@ -3,6 +3,16 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const { EventEmitter } = require('node:events');
+const { sanitizeOverrides } = require('./shortcuts.cjs');
+const { normalizeSiteSearches } = require('./site-search.js');
+const {
+  DEFAULT_ARCHIVE_HOURS,
+  validArchiveHours,
+  defaultArchiveProfile,
+  normalizeDefaultArchive,
+  archiveHours,
+  archiveCandidate,
+} = require('./archive.cjs');
 
 const MAX_TABS = 1000;
 const MAX_HISTORY = 20000;
@@ -14,6 +24,53 @@ const RECOVERY_PURGE_ACTIONS = new Set([
   'profile:delete',
 ]);
 const THEMES = new Set(['system', 'light', 'dark']);
+const SPACE_ICONS = new Set([
+  'circle',
+  'briefcase',
+  'home',
+  'code',
+  'book',
+  'leaf',
+  'star',
+  'heart',
+  'globe',
+  'coffee',
+  'music',
+  'moon',
+  'plane',
+  'camera',
+  'gamepad',
+  'palette',
+  'beaker',
+  'rocket',
+  'compass',
+  'mountain',
+  'flame',
+  'cloud',
+  'bolt',
+  'diamond',
+  'flower',
+  'smile',
+  'headphones',
+  'calendar',
+  'film',
+  'building',
+  'bag',
+  'terminal',
+  'mail',
+  'shield',
+  'sun',
+  'monitor',
+  'eye',
+  'folder',
+]);
+const DEFAULT_SPACE_THEME = Object.freeze({
+  secondaryColor: '#b695b8',
+  gradient: 50,
+  grain: 0,
+  opacity: 100,
+  blur: 0,
+});
 const SEARCH = Object.freeze({
   duckduckgo: 'https://duckduckgo.com/?q=',
   google: 'https://www.google.com/search?q=',
@@ -27,6 +84,20 @@ const color = (value) => (/^#[\da-f]{6}$/i.test(value || '') ? value : '#9d4460'
 const array = (value) => (Array.isArray(value) ? value : []);
 const safeId = (value) => typeof value === 'string' && /^[a-zA-Z0-9_-]{1,100}$/.test(value);
 const time = (value) => (Number.isFinite(value) && value > 0 ? value : Date.now());
+const spaceIcon = (value) => (SPACE_ICONS.has(value) ? value : 'circle');
+function spaceTheme(value, base = DEFAULT_SPACE_THEME) {
+  const next = { ...base };
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return next;
+  if (/^#[\da-f]{6}$/i.test(value.secondaryColor || '')) next.secondaryColor = value.secondaryColor;
+  for (const [key, minimum, maximum] of [
+    ['gradient', 0, 100],
+    ['grain', 0, 200],
+    ['opacity', 0, 100],
+    ['blur', 0, 32],
+  ])
+    if (Number.isFinite(value[key])) next[key] = Math.round(Math.max(minimum, Math.min(maximum, value[key])));
+  return next;
+}
 
 function normalizeAddress(input, searchEngine = 'duckduckgo') {
   const value = str(input, 8192);
@@ -95,26 +166,22 @@ function extensionUrl(value) {
 }
 
 function createInitialState() {
-  const now = Date.now();
   return {
     version: 1,
-    profiles: [{ id: 'default', name: 'Personal', private: false }],
-    spaces: [{ id: 'home', profileId: 'default', name: 'Personal', color: '#9d4460', icon: 'P' }],
-    activeSpaceId: 'home',
-    activeTabId: 'welcome',
-    tabs: [
+    profiles: [{ id: 'default', name: 'Personal', private: false, archiveAfterHours: null }],
+    spaces: [
       {
-        id: 'welcome',
-        spaceId: 'home',
+        id: 'home',
         profileId: 'default',
-        title: 'New tab',
-        url: 'zacro://newtab',
-        pinned: false,
-        folderId: null,
-        createdAt: now,
-        lastActiveAt: now,
+        name: 'Personal',
+        color: '#9d4460',
+        icon: 'circle',
+        theme: spaceTheme(),
       },
     ],
+    activeSpaceId: 'home',
+    activeTabId: null,
+    tabs: [],
     folders: [],
     history: [],
     bookmarks: [],
@@ -125,13 +192,22 @@ function createInitialState() {
     settings: {
       theme: 'system',
       searchEngine: 'duckduckgo',
-      archiveAfterHours: 24,
+      archiveAfterHours: DEFAULT_ARCHIVE_HOURS,
       sidebarWidth: 224,
+      panelWidth: 336,
+      siteSearches: normalizeSiteSearches(),
       restoreSession: true,
+      onboardingCompleted: false,
       openSourcesLimit: 3,
       aiProvider: 'codex',
       aiModel: '',
       sharePageContext: false,
+      shortcutOverrides: {},
+      pinnedSleepMinutes: 20,
+      pageGutter: 8,
+      pageRadius: 12,
+      motionScale: 1,
+      tabDensity: 'comfortable',
     },
     windowBounds: { width: 1440, height: 940 },
   };
@@ -142,17 +218,36 @@ function validateSettings(values, base = createInitialState().settings) {
   if (!values || typeof values !== 'object' || Array.isArray(values)) return next;
   if (THEMES.has(values.theme)) next.theme = values.theme;
   if (Object.hasOwn(SEARCH, values.searchEngine)) next.searchEngine = values.searchEngine;
-  if ([0, 1, 6, 12, 24, 48, 72, 168, 720].includes(values.archiveAfterHours))
-    next.archiveAfterHours = values.archiveAfterHours;
+  if (validArchiveHours(values.archiveAfterHours)) next.archiveAfterHours = values.archiveAfterHours;
   if (Number.isFinite(values.sidebarWidth))
     next.sidebarWidth = Math.round(Math.min(380, Math.max(200, values.sidebarWidth)));
+  if (Number.isFinite(values.panelWidth))
+    next.panelWidth = Math.round(Math.min(560, Math.max(260, values.panelWidth)));
+  if (Object.hasOwn(values, 'siteSearches')) next.siteSearches = normalizeSiteSearches(values.siteSearches);
   if (Number.isInteger(values.openSourcesLimit))
     next.openSourcesLimit = Math.min(10, Math.max(1, values.openSourcesLimit));
-  for (const key of ['restoreSession', 'sharePageContext'])
+  for (const key of ['restoreSession', 'sharePageContext', 'onboardingCompleted'])
     if (typeof values[key] === 'boolean') next[key] = values[key];
-  next.aiProvider = 'codex';
-  if (values.aiProvider === 'codex' && typeof values.aiModel === 'string')
-    next.aiModel = str(values.aiModel, 100);
+  if (['codex', 'claude-code', 'openai', 'anthropic', 'compatible', 'openrouter'].includes(values.aiProvider))
+    next.aiProvider = values.aiProvider;
+  if (
+    typeof values.aiModel === 'string' &&
+    (!values.aiModel || /^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,159}$/.test(values.aiModel))
+  )
+    next.aiModel = values.aiModel;
+  if (Object.hasOwn(values, 'shortcutOverrides'))
+    next.shortcutOverrides = sanitizeOverrides(values.shortcutOverrides);
+  if ([0, 5, 10, 20, 30, 60, 120].includes(values.pinnedSleepMinutes))
+    next.pinnedSleepMinutes = values.pinnedSleepMinutes;
+  for (const [key, minimum, maximum] of [
+    ['pageGutter', 4, 20],
+    ['pageRadius', 0, 20],
+  ])
+    if (Number.isFinite(values[key]))
+      next[key] = Math.round(Math.max(minimum, Math.min(maximum, values[key])));
+  if (Number.isFinite(values.motionScale))
+    next.motionScale = Math.round(Math.max(0.7, Math.min(1.4, values.motionScale)) * 100) / 100;
+  if (['compact', 'comfortable'].includes(values.tabDensity)) next.tabDensity = values.tabDensity;
   return next;
 }
 
@@ -165,7 +260,12 @@ function hydrate(raw) {
   result.profiles = raw.profiles
     .filter((p) => unique(p) && !p.private)
     .slice(0, 100)
-    .map((p) => ({ id: p.id, name: str(p.name) || 'Profile', private: false }));
+    .map((p) => ({
+      id: p.id,
+      name: str(p.name) || 'Profile',
+      private: false,
+      archiveAfterHours: validArchiveHours(p.archiveAfterHours) ? p.archiveAfterHours : null,
+    }));
   if (!result.profiles.length) throw new Error('No valid profile found.');
   const profiles = new Set(result.profiles.map((p) => p.id));
   result.spaces = raw.spaces
@@ -176,7 +276,8 @@ function hydrate(raw) {
       profileId: s.profileId,
       name: str(s.name) || 'Space',
       color: color(s.color),
-      icon: str(s.icon, 4) || str(s.name, 1) || 'S',
+      icon: spaceIcon(s.icon),
+      theme: spaceTheme(s.theme),
       lastActiveTabId: str(s.lastActiveTabId, 100),
     }));
   for (const p of result.profiles)
@@ -186,7 +287,8 @@ function hydrate(raw) {
         profileId: p.id,
         name: p.name,
         color: '#9d4460',
-        icon: p.name[0],
+        icon: 'circle',
+        theme: spaceTheme(),
       });
   const spaces = new Map(result.spaces.map((s) => [s.id, s]));
   result.folders = array(raw.folders)
@@ -194,18 +296,39 @@ function hydrate(raw) {
     .slice(0, 1000)
     .map((f) => ({ id: f.id, spaceId: f.spaceId, name: str(f.name) || 'Folder' }));
   const folders = new Map(result.folders.map((f) => [f.id, f]));
-  const cleanTab = (t) => ({
-    id: t.id,
-    spaceId: t.spaceId,
-    profileId: spaces.get(t.spaceId).profileId,
-    title: str(t.customTitle, 500) || str(t.title, 500) || 'New tab',
-    ...(str(t.customTitle, 500) ? { customTitle: str(t.customTitle, 500) } : {}),
-    url: webUrl(t.url) || extensionUrl(t.url) || 'zacro://newtab',
-    pinned: Boolean(t.pinned),
-    folderId: folders.get(t.folderId)?.spaceId === t.spaceId ? t.folderId : null,
-    createdAt: time(t.createdAt),
-    lastActiveAt: time(t.lastActiveAt),
-  });
+  const cleanTab = (t) => {
+    const folderId = folders.get(t.folderId)?.spaceId === t.spaceId ? t.folderId : null;
+    const favorite = Boolean(t.pinned && t.favorite !== false && !folderId);
+    const pinned = Boolean(t.pinned || folderId);
+    return {
+      id: t.id,
+      spaceId: t.spaceId,
+      profileId: spaces.get(t.spaceId).profileId,
+      title: str(t.customTitle, 500) || str(t.title, 500) || 'New tab',
+      ...(str(t.customTitle, 500) ? { customTitle: str(t.customTitle, 500) } : {}),
+      url: webUrl(t.url) || extensionUrl(t.url) || 'zacro://newtab',
+      ...(t.homePage === true && !webUrl(t.url) && !extensionUrl(t.url) ? { homePage: true } : {}),
+      pinned,
+      // Before favorites and Space pins were distinct, every pin was an icon tile.
+      // Preserve that placement on upgrade rather than silently moving saved tabs.
+      favorite,
+      ...(pinned
+        ? {
+            pinnedUrl:
+              webUrl(t.pinnedUrl) ||
+              extensionUrl(t.pinnedUrl) ||
+              webUrl(t.url) ||
+              extensionUrl(t.url) ||
+              'zacro://newtab',
+            pinnedTitle: str(t.pinnedTitle, 500) || str(t.title, 500) || 'New tab',
+          }
+        : {}),
+      ...(pinned && t.closed === true ? { closed: true } : {}),
+      folderId: favorite ? null : folderId,
+      createdAt: time(t.createdAt),
+      lastActiveAt: time(t.lastActiveAt),
+    };
+  };
   result.tabs = array(raw.tabs)
     .filter((t) => unique(t) && spaces.has(t.spaceId))
     .slice(0, MAX_TABS)
@@ -262,15 +385,34 @@ function hydrate(raw) {
     .filter((e) => e && safeId(e.id) && profiles.has(e.profileId) && typeof e.path === 'string')
     .slice(0, 200);
   result.settings = validateSettings(raw.settings);
+  normalizeDefaultArchive(result);
   result.activeSpaceId = spaces.has(raw.activeSpaceId) ? raw.activeSpaceId : result.spaces[0].id;
-  result.activeTabId = result.tabs.some((t) => t.id === raw.activeTabId && t.spaceId === result.activeSpaceId)
+  for (const space of result.spaces)
+    if (
+      !result.tabs.some(
+        (tab) =>
+          tab.id === space.lastActiveTabId &&
+          (tab.spaceId === space.id || (tab.favorite && tab.profileId === space.profileId)),
+      )
+    )
+      delete space.lastActiveTabId;
+  const selectedFavorite = result.tabs.find(
+    (tab) =>
+      tab.id === raw.activeTabId &&
+      tab.favorite &&
+      tab.profileId === spaces.get(result.activeSpaceId).profileId,
+  );
+  if (selectedFavorite) selectedFavorite.spaceId = result.activeSpaceId;
+  result.activeTabId = result.tabs.some(
+    (t) => t.id === raw.activeTabId && t.spaceId === result.activeSpaceId && !t.closed,
+  )
     ? raw.activeTabId
-    : result.tabs.find((t) => t.spaceId === result.activeSpaceId)?.id || null;
+    : result.tabs.find((t) => t.spaceId === result.activeSpaceId && !t.closed)?.id || null;
   if (raw.windowBounds && typeof raw.windowBounds === 'object') {
     const { width, height, x, y } = raw.windowBounds;
     result.windowBounds = {
-      width: Math.min(7680, Math.max(900, Number(width) || 1440)),
-      height: Math.min(4320, Math.max(640, Number(height) || 940)),
+      width: Math.min(7680, Math.max(560, Number(width) || 1440)),
+      height: Math.min(4320, Math.max(420, Number(height) || 940)),
       maximized: raw.windowBounds.maximized === true,
       sizeKind: raw.windowBounds.sizeKind === 'window' ? 'window' : 'content',
     };
@@ -317,9 +459,13 @@ class BrowserStore extends EventEmitter {
         ...this.state.archive,
       ].slice(0, MAX_ARCHIVE);
       this.state.tabs = this.state.tabs.filter((t) => t.pinned);
-      this.state.activeTabId =
-        this.state.tabs.find((t) => t.spaceId === this.state.activeSpaceId)?.id || null;
+      this.state.activeTabId = null;
     }
+    // Favorites are destinations, not a request to start every saved renderer.
+    // Even a favorite selected at shutdown stays dormant until selected again.
+    if (this.state.tabs.find((tab) => tab.id === this.state.activeTabId)?.pinned)
+      this.state.activeTabId =
+        this.state.tabs.find((tab) => tab.spaceId === this.state.activeSpaceId && !tab.pinned)?.id || null;
   }
   readFile(file) {
     if (fs.statSync(file).size > 32 * 1024 * 1024) throw new Error('Browser data exceeds its safety limit.');
@@ -352,8 +498,8 @@ class BrowserStore extends EventEmitter {
     for (const key of ['tabs', 'history', 'archive', 'bookmarks', 'downloads', 'extensions', 'permissions'])
       s[key] = s[key].filter((r) => allowed.has(r.profileId));
     if (!spaces.has(s.activeSpaceId)) s.activeSpaceId = s.spaces[0]?.id;
-    if (!s.tabs.some((t) => t.id === s.activeTabId && t.spaceId === s.activeSpaceId))
-      s.activeTabId = s.tabs.find((t) => t.spaceId === s.activeSpaceId)?.id || null;
+    if (!s.tabs.some((t) => t.id === s.activeTabId && t.spaceId === s.activeSpaceId && !t.closed))
+      s.activeTabId = s.tabs.find((t) => t.spaceId === s.activeSpaceId && !t.pinned)?.id || null;
     return s;
   }
   save() {
@@ -415,11 +561,64 @@ class BrowserStore extends EventEmitter {
   }
   activateSpace(space) {
     this.state.activeSpaceId = space.id;
-    const tabs = this.state.tabs.filter((t) => t.spaceId === space.id);
-    this.state.activeTabId = tabs.find((t) => t.id === space.lastActiveTabId)?.id || tabs[0]?.id || null;
+    const remembered = this.state.tabs.find(
+      (tab) =>
+        tab.id === space.lastActiveTabId &&
+        !tab.closed &&
+        (tab.spaceId === space.id || (tab.favorite && tab.profileId === space.profileId)),
+    );
+    // A Favorite has one live document per profile. Its spaceId records where it
+    // was last used, rather than duplicating cookies, callbacks or tab renderers.
+    if (remembered?.favorite) remembered.spaceId = space.id;
+    this.state.activeTabId =
+      remembered?.id ||
+      this.state.tabs.find((tab) => tab.spaceId === space.id && !tab.favorite && !tab.closed)?.id ||
+      null;
+    const viewed = this.state.tabs.find((tab) => tab.id === this.state.activeTabId);
+    if (viewed) viewed.lastActiveAt = Date.now();
+  }
+  activateTab(tab, activate = true) {
+    const current = this.activeSpace();
+    if (tab.favorite && tab.profileId === current.profileId) tab.spaceId = current.id;
+    if (activate) {
+      this.state.activeTabId = tab.id;
+      this.state.activeSpaceId = tab.spaceId;
+      this.require('spaces', tab.spaceId, 'Space').lastActiveTabId = tab.id;
+    }
+    tab.lastActiveAt = Date.now();
+    delete tab.closed;
+  }
+  setPinned(tab, pinned, favorite = false) {
+    if (pinned) {
+      if (!tab.pinned) tab.pinnedUrl = tab.url;
+      tab.pinnedUrl ||= tab.url;
+      tab.pinnedTitle ||= tab.title;
+      tab.pinned = true;
+      tab.favorite = favorite;
+      if (favorite) tab.folderId = null;
+    } else {
+      tab.pinned = false;
+      tab.favorite = false;
+      tab.folderId = null;
+      delete tab.pinnedUrl;
+      delete tab.pinnedTitle;
+    }
   }
   closeTab(tab, archive = true) {
     const position = this.state.tabs.indexOf(tab);
+    if (tab.pinned) {
+      tab.closed = true;
+      tab.url = tab.pinnedUrl || tab.url;
+      if (this.state.activeTabId === tab.id)
+        this.state.activeTabId =
+          this.state.tabs.slice(position + 1).find((item) => item.spaceId === tab.spaceId && !item.pinned)
+            ?.id ||
+          this.state.tabs.filter((item) => item.spaceId === tab.spaceId && !item.pinned).at(-1)?.id ||
+          null;
+      if (this.state.activeSpaceId === tab.spaceId)
+        this.require('spaces', tab.spaceId, 'Space').lastActiveTabId = this.state.activeTabId;
+      return;
+    }
     if (archive && tab.url !== 'zacro://newtab' && !this.private(tab.profileId))
       this.state.archive = [
         { ...tab, archivedAt: Date.now() },
@@ -427,9 +626,10 @@ class BrowserStore extends EventEmitter {
       ].slice(0, MAX_ARCHIVE);
     this.state.tabs.splice(position, 1);
     if (this.state.activeTabId === tab.id) {
-      const same = this.state.tabs.filter((t) => t.spaceId === tab.spaceId);
-      const candidate = this.state.tabs.slice(position).find((t) => t.spaceId === tab.spaceId);
+      const same = this.state.tabs.filter((t) => t.spaceId === tab.spaceId && !t.pinned);
+      const candidate = this.state.tabs.slice(position).find((t) => t.spaceId === tab.spaceId && !t.pinned);
       this.state.activeTabId = candidate?.id || same.at(-1)?.id || null;
+      this.require('spaces', tab.spaceId, 'Space').lastActiveTabId = this.state.activeTabId;
     }
   }
   dispatch(action, payload = {}) {
@@ -438,6 +638,7 @@ class BrowserStore extends EventEmitter {
     const p = payload,
       s = this.state,
       now = Date.now();
+    const previousActiveId = s.activeTabId;
     let result = null;
     switch (action) {
       case 'tab:create': {
@@ -450,7 +651,9 @@ class BrowserStore extends EventEmitter {
           profileId: space.profileId,
           url,
           title: url === 'zacro://newtab' ? 'New tab' : new URL(url).hostname,
+          ...(p.homePage === true && (!p.url || p.url === 'zacro://newtab') ? { homePage: true } : {}),
           pinned: false,
+          favorite: false,
           folderId: null,
           createdAt: now,
           lastActiveAt: now,
@@ -464,12 +667,10 @@ class BrowserStore extends EventEmitter {
         result = tab;
         break;
       }
-      case 'tab:activate': {
+      case 'tab:activate':
+      case 'tab:wake': {
         const tab = this.require('tabs', p.id, 'Tab');
-        s.activeTabId = tab.id;
-        s.activeSpaceId = tab.spaceId;
-        tab.lastActiveAt = now;
-        this.require('spaces', tab.spaceId, 'Space').lastActiveTabId = tab.id;
+        this.activateTab(tab, action === 'tab:activate');
         result = tab;
         break;
       }
@@ -478,12 +679,15 @@ class BrowserStore extends EventEmitter {
         const url = extensionUrl(p.url);
         if (!url) throw new Error('Invalid extension page.');
         tab.url = url;
+        delete tab.homePage;
+        if (p.title !== undefined && !tab.customTitle) tab.title = str(p.title, 500) || tab.url;
         result = tab;
         break;
       }
       case 'tab:update': {
         const tab = this.require('tabs', p.id, 'Tab');
         if (p.url !== undefined) tab.url = normalizeAddress(p.url, s.settings.searchEngine);
+        if (tab.url !== 'zacro://newtab') delete tab.homePage;
         if (p.title !== undefined && !tab.customTitle) tab.title = str(p.title, 500) || tab.url;
         result = tab;
         break;
@@ -502,8 +706,34 @@ class BrowserStore extends EventEmitter {
         break;
       case 'tab:pin': {
         const tab = this.require('tabs', p.id || s.activeTabId, 'Tab');
-        tab.pinned = !tab.pinned;
-        if (tab.pinned) tab.folderId = null;
+        if (tab.favorite && tab.profileId === this.activeSpace().profileId) tab.spaceId = s.activeSpaceId;
+        this.setPinned(tab, !tab.pinned);
+        if (!tab.pinned && tab.closed) {
+          delete tab.closed;
+          this.closeTab(tab, false);
+        }
+        result = tab;
+        break;
+      }
+      case 'tab:favorite': {
+        const tab = this.require('tabs', p.id || s.activeTabId, 'Tab');
+        if (tab.profileId === this.activeSpace().profileId) tab.spaceId = s.activeSpaceId;
+        this.setPinned(tab, true, p.favorite !== false);
+        result = tab;
+        break;
+      }
+      case 'tab:reset-pin': {
+        const tab = this.require('tabs', p.id || s.activeTabId, 'Tab');
+        if (!tab.pinned) throw new Error('Only a Pinned Tab or Favorite has a saved destination.');
+        tab.url = tab.pinnedUrl || tab.url;
+        result = tab;
+        break;
+      }
+      case 'tab:replace-pin': {
+        const tab = this.require('tabs', p.id || s.activeTabId, 'Tab');
+        if (!tab.pinned) throw new Error('Only a Pinned Tab or Favorite has a saved destination.');
+        tab.pinnedUrl = tab.url;
+        tab.pinnedTitle = tab.title;
         result = tab;
         break;
       }
@@ -521,7 +751,17 @@ class BrowserStore extends EventEmitter {
         const oldSpace = tab.spaceId;
         tab.spaceId = space.id;
         if (p.folderId !== undefined || oldSpace !== space.id) tab.folderId = p.folderId || null;
-        if (tab.folderId) tab.pinned = false;
+        const favorite =
+          typeof p.favorite === 'boolean'
+            ? p.favorite
+            : p.folderId || p.pinned === false || (p.spaceId && oldSpace !== space.id)
+              ? false
+              : tab.favorite;
+        const pinned =
+          favorite || (typeof p.pinned === 'boolean' ? p.pinned : p.folderId ? true : Boolean(tab.pinned));
+        this.setPinned(tab, pinned, favorite);
+        if (favorite) tab.folderId = null;
+        if (!tab.pinned) delete tab.closed;
         if (Number.isInteger(p.index)) {
           s.tabs.splice(s.tabs.indexOf(tab), 1);
           s.tabs.splice(Math.min(s.tabs.length, Math.max(0, p.index)), 0, tab);
@@ -541,6 +781,7 @@ class BrowserStore extends EventEmitter {
         if (s.tabs.length >= MAX_TABS) throw new Error('Close some tabs before restoring more.');
         const tab = { ...match, lastActiveAt: now };
         delete tab.archivedAt;
+        delete tab.closed;
         if (s.tabs.some((t) => t.id === tab.id)) tab.id = id('tab');
         if (!s.folders.some((f) => f.id === tab.folderId && f.spaceId === tab.spaceId)) tab.folderId = null;
         s.archive = s.archive.filter((t) => t !== match);
@@ -551,11 +792,13 @@ class BrowserStore extends EventEmitter {
         break;
       }
       case 'tab:archive-stale': {
-        if (!s.settings.archiveAfterHours) break;
-        const cutoff = (Number.isFinite(p.now) ? p.now : now) - s.settings.archiveAfterHours * 3600000;
         const excluded = new Set(Array.isArray(p.excludeIds) ? p.excludeIds : []);
+        const included = Array.isArray(p.ids) ? new Set(p.ids) : null;
         const stale = s.tabs.filter(
-          (t) => !t.pinned && t.id !== s.activeTabId && !excluded.has(t.id) && t.lastActiveAt < cutoff,
+          (tab) =>
+            (!included || included.has(tab.id)) &&
+            !excluded.has(tab.id) &&
+            archiveCandidate(s, tab, Number.isFinite(p.now) ? p.now : now),
         );
         for (const tab of stale) this.closeTab(tab);
         result = stale.length;
@@ -570,7 +813,8 @@ class BrowserStore extends EventEmitter {
           profileId: profile.id,
           name: str(p.name),
           color: color(p.color),
-          icon: str(p.icon, 4) || str(p.name, 1).toUpperCase(),
+          icon: spaceIcon(p.icon),
+          theme: spaceTheme(p.theme),
         };
         s.spaces.push(space);
         this.activateSpace(space);
@@ -584,7 +828,8 @@ class BrowserStore extends EventEmitter {
           space.name = str(p.name);
         }
         if (p.color !== undefined) space.color = color(p.color);
-        if (p.icon !== undefined) space.icon = str(p.icon, 4) || space.name[0];
+        if (p.icon !== undefined) space.icon = spaceIcon(p.icon);
+        if (p.theme !== undefined) space.theme = spaceTheme(p.theme, space.theme || DEFAULT_SPACE_THEME);
         result = space;
         break;
       }
@@ -608,17 +853,34 @@ class BrowserStore extends EventEmitter {
       case 'profile:create': {
         if (s.profiles.length >= 100) throw new Error('Profile limit reached.');
         if (!str(p.name)) throw new Error('Give your profile a name.');
-        const profile = { id: id('profile'), name: str(p.name), private: p.private === true };
+        const profile = {
+          id: id('profile'),
+          name: str(p.name),
+          private: p.private === true,
+          archiveAfterHours: validArchiveHours(p.archiveAfterHours) ? p.archiveAfterHours : null,
+        };
         const space = {
           id: id('space'),
           profileId: profile.id,
           name: profile.private ? 'Private' : profile.name,
           color: profile.private ? '#69519c' : color(p.color),
-          icon: profile.private ? '◇' : profile.name[0].toUpperCase(),
+          icon: profile.private ? 'moon' : 'circle',
+          theme: spaceTheme(),
         };
         s.profiles.push(profile);
         s.spaces.push(space);
         this.activateSpace(space);
+        result = profile;
+        break;
+      }
+      case 'profile:update': {
+        const profile = this.require('profiles', p.id, 'Profile');
+        const value = p.values?.archiveAfterHours;
+        if (value !== null && !validArchiveHours(value)) throw new Error('Choose a valid archive cadence.');
+        if (profile === defaultArchiveProfile(s)) {
+          if (value !== null) s.settings.archiveAfterHours = value;
+          profile.archiveAfterHours = null;
+        } else profile.archiveAfterHours = value;
         result = profile;
         break;
       }
@@ -643,6 +905,7 @@ class BrowserStore extends EventEmitter {
         ])
           s[key] = s[key].filter((r) => r.profileId !== profile.id);
         if (removedSpaces.has(s.activeSpaceId)) this.activateSpace(s.spaces[0]);
+        normalizeDefaultArchive(s);
         break;
       }
       case 'folder:create': {
@@ -741,6 +1004,23 @@ class BrowserStore extends EventEmitter {
       default:
         throw new Error(`Unknown action: ${str(action, 80)}`);
     }
+    const tabsById = new Map(s.tabs.map((tab) => [tab.id, tab]));
+    for (const space of s.spaces) {
+      const remembered = tabsById.get(space.lastActiveTabId);
+      if (
+        space.lastActiveTabId &&
+        (!remembered ||
+          (remembered.spaceId !== space.id &&
+            !(remembered.favorite && remembered.profileId === space.profileId)))
+      )
+        delete space.lastActiveTabId;
+    }
+    // Time spent viewing a tab is activity too. Start its idle period on
+    // departure, rather than immediately archiving a page read for hours.
+    if (previousActiveId !== s.activeTabId) {
+      for (const tab of s.tabs)
+        if (tab.id === previousActiveId || tab.id === s.activeTabId) tab.lastActiveAt = now;
+    }
     if (this.file && RECOVERY_PURGE_ACTIONS.has(action)) this.recoveryPurgePending = true;
     this.changed();
     // Do not report an explicit clear as successful while deleted records still
@@ -788,7 +1068,12 @@ class BrowserStore extends EventEmitter {
         const next = { ...row, id: mappings.get(row.id) };
         for (const field of ['profileId', 'spaceId', 'folderId', 'lastActiveTabId'])
           if (next[field]) next[field] = mappings.get(next[field]) || null;
-        if (key === 'profiles') next.name = `${next.name} (imported)`;
+        if (key === 'profiles') {
+          next.name = `${next.name} (imported)`;
+          // Import keeps this browser's defaults, so capture each source
+          // profile's effective cadence instead of inheriting a different one.
+          next.archiveAfterHours = archiveHours(data, row.id);
+        }
         this.state[key].push(next);
       }
     }
@@ -830,4 +1115,7 @@ module.exports = {
   hydrate,
   validateSettings,
   SEARCH,
+  SPACE_ICONS,
+  DEFAULT_SPACE_THEME,
+  spaceTheme,
 };

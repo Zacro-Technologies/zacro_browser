@@ -25,6 +25,7 @@ function createShowcaseState(localUrl) {
     ...(url !== 'zacro://newtab' ? { customTitle: title } : {}),
     url,
     pinned: false,
+    favorite: false,
     folderId: null,
     createdAt: now - 3600000,
     lastActiveAt: now - 600000,
@@ -38,7 +39,8 @@ function createShowcaseState(localUrl) {
       profileId,
       name: 'Design studio',
       color: '#486786',
-      icon: 'D',
+      icon: 'code',
+      theme: { secondaryColor: '#ac85a7', gradient: 65, grain: 24, opacity: 70, blur: 16 },
       lastActiveTabId: 'showcase-tab-journal',
     },
     {
@@ -46,7 +48,8 @@ function createShowcaseState(localUrl) {
       profileId,
       name: 'Personal',
       color: '#a56545',
-      icon: 'P',
+      icon: 'home',
+      theme: { secondaryColor: '#e3b282', gradient: 60, grain: 15, opacity: 80, blur: 12 },
       lastActiveTabId: 'showcase-tab-personal',
     },
     {
@@ -54,7 +57,8 @@ function createShowcaseState(localUrl) {
       profileId,
       name: 'Reading',
       color: '#416958',
-      icon: 'R',
+      icon: 'book',
+      theme: { secondaryColor: '#84a5af', gradient: 70, grain: 12, opacity: 85, blur: 8 },
       lastActiveTabId: 'showcase-tab-reading',
     },
   ];
@@ -65,10 +69,10 @@ function createShowcaseState(localUrl) {
     { id: 'showcase-project', spaceId: studio, name: 'Project' },
   ];
   state.tabs = [
-    tab('github', 'GitHub', 'https://github.com/', { pinned: true }),
-    tab('mdn', 'MDN', 'https://developer.mozilla.org/', { pinned: true }),
-    tab('wikipedia', 'Wikipedia', 'https://www.wikipedia.org/', { pinned: true }),
-    tab('arena', 'Are.na', 'https://www.are.na/', { pinned: true }),
+    tab('github', 'GitHub', 'https://github.com/', { pinned: true, favorite: true }),
+    tab('mdn', 'MDN', 'https://developer.mozilla.org/', { pinned: true, favorite: true }),
+    tab('wikipedia', 'Wikipedia', 'https://www.wikipedia.org/', { pinned: true, favorite: true }),
+    tab('arena', 'Are.na', 'https://www.are.na/', { pinned: true, favorite: true }),
     tab('arc', 'Arc · Focus', 'https://start.arc.net/find-focus', { folderId: 'showcase-research' }),
     tab('zen', 'Zen · Compact mode', 'https://docs.zen-browser.app/user-manual/compact-mode', {
       folderId: 'showcase-research',

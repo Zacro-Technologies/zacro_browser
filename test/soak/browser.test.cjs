@@ -16,7 +16,7 @@ test(
     const site = createInteractiveSite();
     await new Promise((resolve) => site.listen(0, '127.0.0.1', resolve));
     const base = `http://127.0.0.1:${site.address().port}`;
-    const env = { ...process.env, ZACRO_USER_DATA: directory };
+    const env = { ...process.env, ZACRO_SKIP_ONBOARDING: '1', ZACRO_USER_DATA: directory };
     delete env.ELECTRON_RUN_AS_NODE;
     const browser = await electron.launch({ args: [path.resolve(__dirname, '../..')], env });
     const child = browser.process();

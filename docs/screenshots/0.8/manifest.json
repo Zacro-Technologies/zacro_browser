@@ -1,0 +1,104 @@
+{
+  "version": "0.8",
+  "captureDate": "2026-10-28",
+  "timezone": "Asia/Tokyo",
+  "retouched": false,
+  "captures": [
+    {
+      "file": "compact.jpg",
+      "sha256": "d29ae47f4c64279073f2e7658c15475bce611cf8557e397d1d676b6946719ea9",
+      "width": 565,
+      "height": 424,
+      "runtimeCommit": "4f486b52071f1627d00e115122c14be6dd4206a3",
+      "platform": "Windows 11 x64",
+      "method": "Computer whole-window capture, instrumented local review fixture"
+    },
+    {
+      "file": "dark.jpg",
+      "sha256": "c12b4ab549ded6c524d6d08d84b1ae82aa069d3a4f16db304d301dfe90795fbe",
+      "width": 1285,
+      "height": 804,
+      "runtimeCommit": "4f486b52071f1627d00e115122c14be6dd4206a3",
+      "platform": "Windows 11 x64",
+      "method": "Computer whole-window capture, instrumented local review fixture"
+    },
+    {
+      "file": "library-menu.jpg",
+      "sha256": "2ee4841eb5e3b690ff6a3f7c3878287be8a1dc423e5d1c0fd4ce307a5a5dfbc9",
+      "width": 1285,
+      "height": 804,
+      "runtimeCommit": "4f486b52071f1627d00e115122c14be6dd4206a3",
+      "platform": "Windows 11 x64",
+      "method": "Computer whole-window capture, instrumented local review fixture"
+    },
+    {
+      "file": "library.jpg",
+      "sha256": "95327cbefdcef232e50f9ebc5d4a90b52c518fc492cb8815ae6487b0e9538424",
+      "width": 1285,
+      "height": 804,
+      "runtimeCommit": "4f486b52071f1627d00e115122c14be6dd4206a3",
+      "platform": "Windows 11 x64",
+      "method": "Computer whole-window capture, instrumented local review fixture"
+    },
+    {
+      "file": "macos-dark.png",
+      "sha256": "48664097f217ec5b6cb5edec91b75f227d4c07bcf91900ff4e94acce36200b2c",
+      "width": 1024,
+      "height": 768,
+      "runtimeCommit": "33aa133e68179060327fe2bc4a6e55dc1c8d6b54",
+      "platform": "macOS Apple silicon",
+      "method": "CI native desktop capture, packaged acceptance fixture",
+      "runId": 40690651723,
+      "artifactId": 12817567039,
+      "artifactSha256": "672cb3bbe8b8d6db83f436ef69839047cf58cb015c64f66595b26cc687b1795e"
+    },
+    {
+      "file": "macos-light.png",
+      "sha256": "66d60ef98a3794f22f9a91d27cdf1832dad1220a7b6b0b6e087f3e55a59818b3",
+      "width": 1024,
+      "height": 768,
+      "runtimeCommit": "33aa133e68179060327fe2bc4a6e55dc1c8d6b54",
+      "platform": "macOS Apple silicon",
+      "method": "CI native desktop capture, packaged acceptance fixture",
+      "runId": 40690651723,
+      "artifactId": 12817567039,
+      "artifactSha256": "672cb3bbe8b8d6db83f436ef69839047cf58cb015c64f66595b26cc687b1795e"
+    },
+    {
+      "file": "palette.jpg",
+      "sha256": "3c2276bfcfb61cfebbacfb6bbb0d8e52bbbe4ab5cff06484c6957723b7db6bf7",
+      "width": 1285,
+      "height": 804,
+      "runtimeCommit": "4f486b52071f1627d00e115122c14be6dd4206a3",
+      "platform": "Windows 11 x64",
+      "method": "Computer whole-window capture, instrumented local review fixture"
+    },
+    {
+      "file": "peek.jpg",
+      "sha256": "4607898721249c747e4362b5775febc8d24f19b1dd0ec98bb07a4c153963909b",
+      "width": 1285,
+      "height": 804,
+      "runtimeCommit": "4f486b52071f1627d00e115122c14be6dd4206a3",
+      "platform": "Windows 11 x64",
+      "method": "Computer whole-window capture, instrumented local review fixture"
+    },
+    {
+      "file": "space-theme.jpg",
+      "sha256": "34ac77f0d9456c7b219b7baf4cb0896d87c310f23e2732241b0e76233b838009",
+      "width": 1285,
+      "height": 804,
+      "runtimeCommit": "26bd670a27f52eaa617a522acb7bec8f5fd0311f",
+      "platform": "Windows 11 x64",
+      "method": "Computer whole-window capture, instrumented local review fixture"
+    },
+    {
+      "file": "workspace.jpg",
+      "sha256": "4dde34d90f1a55f95242f6bdcec934a724b3e698eb80feef98fc166348ecd7fd",
+      "width": 1285,
+      "height": 804,
+      "runtimeCommit": "4f486b52071f1627d00e115122c14be6dd4206a3",
+      "platform": "Windows 11 x64",
+      "method": "Computer whole-window capture, instrumented local review fixture"
+    }
+  ]
+}

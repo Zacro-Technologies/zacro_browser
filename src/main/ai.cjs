@@ -5,7 +5,26 @@ const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 
 const { CodexClient, CodexError } = require('./codex.cjs');
-const DEFAULT_MODELS = Object.freeze({ codex: '' });
+const { ClaudeClient, ClaudeError, INSTALL_URL } = require('./claude.cjs');
+const { CredentialVault, CredentialError, credentialId } = require('./ai-credentials.cjs');
+const {
+  APIClient,
+  API_PROVIDERS,
+  ProviderError,
+  normalizeBaseUrl,
+  validateModel,
+  loopback,
+} = require('./ai-providers.cjs');
+const DEFAULT_MODELS = Object.freeze({
+  codex: '',
+  'claude-code': 'sonnet',
+  ...Object.fromEntries(Object.entries(API_PROVIDERS).map(([id, spec]) => [id, spec.model])),
+});
+const PROVIDERS = Object.freeze([
+  { id: 'codex', name: 'ChatGPT subscription', kind: 'subscription' },
+  { id: 'claude-code', name: 'Claude subscription', kind: 'subscription' },
+  ...Object.entries(API_PROVIDERS).map(([id, spec]) => ({ id, name: spec.name, kind: 'api' })),
+]);
 const MAX_QUESTION = 8000;
 const MAX_CONTEXT_CHARS = 60000;
 const MAX_HISTORY_TURNS = 8;
@@ -124,6 +143,10 @@ class AIService {
     userDataPath,
     openExternal,
     client,
+    claudeClient,
+    safeStorage,
+    fetch: fetchImpl,
+    apiClient,
     timeoutMs = REQUEST_TIMEOUT_MS,
   }) {
     this.getState = getState;
@@ -131,23 +154,55 @@ class AIService {
     this.emit = typeof emit === 'function' ? emit : () => {};
     this.openExternal = openExternal;
     this.client = client || new CodexClient({ userDataPath });
-    this.preferencePath = path.join(userDataPath, 'ai-model.json');
-    this.model = '';
+    this.claudeClient = claudeClient || new ClaudeClient({ userDataPath });
+    this.apiClient = apiClient || new APIClient({ fetch: fetchImpl, timeoutMs });
+    this.vault = new CredentialVault({ userDataPath, safeStorage });
+    this.preferencePath = path.join(userDataPath, 'ai-providers.json');
+    this.legacyPreferencePath = path.join(userDataPath, 'ai-model.json');
+    this.preferences = { version: 1, profiles: {} };
+    this.legacyModel = '';
     this.timeoutMs = timeoutMs;
     this.conversations = new Map();
     this.request = null;
     this.client.on('status', () => this.emit({ type: 'ai:status', ...this.status() }));
-    this.ready = this.loadPreference();
+    this.claudeClient.on('status', () => this.emit({ type: 'ai:status', ...this.status() }));
+    this.ready = Promise.all([this.loadPreference(), this.vault.ready]);
   }
 
   async loadPreference() {
     // Legacy API credential files are deliberately never opened or imported.
     try {
       const stat = await fs.stat(this.preferencePath);
-      if (stat.size > 4096) return;
+      if (stat.size > 128 * 1024) return;
       const value = JSON.parse(await fs.readFile(this.preferencePath, 'utf8'));
-      if (typeof value.model === 'string' && /^[a-zA-Z0-9._:-]{0,120}$/.test(value.model))
-        this.model = value.model;
+      if (value.version === 1 && value.profiles && typeof value.profiles === 'object') {
+        for (const [profileId, record] of Object.entries(value.profiles).slice(0, 100)) {
+          if (!record || typeof record !== 'object' || !PROVIDERS.some((item) => item.id === record.provider))
+            continue;
+          const configs = {};
+          for (const provider of PROVIDERS) {
+            const config = record.configs?.[provider.id];
+            if (!config || typeof config !== 'object') continue;
+            try {
+              const model = config.model ? validateModel(config.model) : '';
+              const baseUrl = API_PROVIDERS[provider.id]
+                ? normalizeBaseUrl(provider.id, config.baseUrl)
+                : undefined;
+              configs[provider.id] = { model, ...(baseUrl ? { baseUrl } : {}) };
+            } catch {}
+          }
+          this.preferences.profiles[profileId] = { provider: record.provider, configs };
+        }
+        if (value.codexAuthStorage === 'session') await this.client.setAuthStorage?.('session');
+      }
+    } catch {}
+    try {
+      const stat = await fs.stat(this.legacyPreferencePath);
+      if (stat.size <= 4096) {
+        const value = JSON.parse(await fs.readFile(this.legacyPreferencePath, 'utf8'));
+        if (typeof value.model === 'string' && /^[a-zA-Z0-9._:-]{0,120}$/.test(value.model))
+          this.legacyModel = value.model;
+      }
     } catch {}
   }
 
@@ -158,15 +213,72 @@ class AIService {
   }
 
   status() {
-    const status = this.client.status();
-    const model =
-      this.model || status.models.find((entry) => entry.isDefault)?.id || status.models[0]?.id || '';
-    return { ...status, provider: 'codex', model, busy: Boolean(this.request) };
+    const provider = this.selection().provider;
+    const selected = this.providerStatus(provider);
+    return {
+      ...selected,
+      provider,
+      busy: Boolean(this.request || this.configuring),
+      providers: PROVIDERS.map((item) => {
+        const status = this.providerStatus(item.id);
+        return { ...item, configured: status.configured, available: status.available };
+      }),
+    };
+  }
+
+  selection() {
+    return this.preferences.profiles[this.activeProfile()?.id] || { provider: 'codex', configs: {} };
+  }
+
+  configFor(provider = this.selection().provider) {
+    return {
+      model: DEFAULT_MODELS[provider],
+      ...(API_PROVIDERS[provider] ? { baseUrl: API_PROVIDERS[provider].baseUrl } : {}),
+      ...(provider === 'codex' && this.legacyModel ? { model: this.legacyModel } : {}),
+      ...this.selection().configs?.[provider],
+    };
+  }
+
+  subscriptionClient(provider = this.selection().provider) {
+    return provider === 'codex' ? this.client : provider === 'claude-code' ? this.claudeClient : null;
+  }
+
+  providerStatus(provider) {
+    const config = this.configFor(provider);
+    const client = this.subscriptionClient(provider);
+    if (client) {
+      const status = client.status();
+      return {
+        ...status,
+        model:
+          config.model || status.models.find((entry) => entry.isDefault)?.id || status.models[0]?.id || '',
+        researchSupported: provider === 'codex',
+        storageAvailable: true,
+      };
+    }
+    const id = credentialId(this.activeProfile()?.id, provider, config.baseUrl);
+    const status = this.vault.status(id);
+    const local = provider === 'compatible' && config.baseUrl && loopback(new URL(config.baseUrl));
+    return {
+      ...status,
+      ...config,
+      available: true,
+      configured: Boolean(config.baseUrl && config.model && (status.configured || local)),
+      account: null,
+      models: [],
+      loginPending: false,
+      researchSupported: API_PROVIDERS[provider].research,
+      storageNotice:
+        status.storageNotice ||
+        (status.credentialStorage === 'session'
+          ? 'This API key is kept in memory only and is removed when Zacro closes.'
+          : 'Saved API keys are encrypted with your operating system credential store and scoped to this browser profile and endpoint.'),
+    };
   }
 
   async refreshStatus() {
     try {
-      await this.client.refresh();
+      await this.subscriptionClient()?.refresh();
     } catch (error) {
       return { ...this.status(), error: error.message };
     }
@@ -174,16 +286,20 @@ class AIService {
   }
 
   async login() {
+    if (this.configuring || this.request)
+      throw new AIError('Stop the current request before signing in.', 'BUSY');
     if (this.activeProfile()?.private) throw new AIError('AI is unavailable in private profiles.', 'PRIVATE');
-    const url = await this.client.login();
+    const client = this.subscriptionClient();
+    if (!client) throw new AIError('Save an API key to connect this provider.', 'INPUT');
+    const url = await client.login();
     try {
       if (url) {
         if (!this.openExternal) throw new Error('External browser unavailable');
         await this.openExternal(url);
       }
     } catch {
-      await this.client.cancelLogin();
-      throw new AIError('Unable to open ChatGPT sign-in in your system browser.', 'AUTH');
+      await client.cancelLogin();
+      throw new AIError('Unable to open provider sign-in in your system browser.', 'AUTH');
     }
     return this.status();
   }
@@ -194,40 +310,170 @@ class AIService {
   }
 
   async configure(payload) {
-    if (this.request) throw new AIError('Stop the current answer before changing models.', 'BUSY');
-    if (Object.keys(payload).some((key) => key !== 'model'))
-      throw new AIError(
-        'Zacro uses ChatGPT subscription sign-in. API credentials are not supported.',
-        'INPUT',
-      );
-    const model = typeof payload.model === 'string' ? payload.model.trim() : '';
-    if (model && !this.client.status().models.some((entry) => entry.id === model))
-      throw new AIError('Choose a model available to your Codex account.', 'MODEL');
-    await fs.mkdir(path.dirname(this.preferencePath), { recursive: true });
-    const temporary = this.preferencePath + '.' + randomUUID() + '.tmp';
-    try {
-      await fs.writeFile(temporary, JSON.stringify({ model }), { mode: 0o600, flag: 'wx' });
-      await fs.rename(temporary, this.preferencePath);
-    } finally {
-      await fs.rm(temporary, { force: true }).catch(() => {});
+    if (this.request || this.configuring)
+      throw new AIError('Stop the current request before changing providers.', 'BUSY');
+    const profile = this.activeProfile();
+    if (!profile || profile.private) throw new AIError('AI is unavailable in private profiles.', 'PRIVATE');
+    if (
+      Object.keys(payload).some(
+        (key) => !['provider', 'model', 'baseUrl', 'apiKey', 'storage', 'authStorage'].includes(key),
+      )
+    )
+      throw new AIError('Invalid provider configuration.', 'INPUT');
+    const provider = payload.provider || this.selection().provider;
+    if (!PROVIDERS.some((item) => item.id === provider))
+      throw new AIError('Choose a supported AI provider.', 'INPUT');
+    const config = this.configFor(provider);
+    if (payload.model !== undefined) {
+      config.model = typeof payload.model === 'string' ? payload.model.trim() : '';
+      if (provider === 'codex') {
+        if (config.model && !this.client.status().models.some((entry) => entry.id === config.model))
+          throw new AIError('Choose a model available to your Codex account.', 'MODEL');
+      } else validateModel(config.model);
     }
-    this.model = model;
-    this.conversations.clear();
+    if (API_PROVIDERS[provider]) {
+      if (payload.baseUrl !== undefined || provider !== 'compatible')
+        config.baseUrl = normalizeBaseUrl(provider, payload.baseUrl ?? config.baseUrl);
+      if (payload.apiKey && !config.baseUrl)
+        throw new AIError('Set the API base URL before saving its key.', 'ENDPOINT');
+      if (payload.authStorage !== undefined)
+        throw new AIError('Subscription storage does not apply to API keys.', 'INPUT');
+      if (payload.storage !== undefined && !['encrypted', 'session'].includes(payload.storage))
+        throw new AIError('Choose encrypted storage or this session only.', 'INPUT');
+    } else if (payload.apiKey || payload.baseUrl || payload.storage)
+      throw new AIError('Use an API provider to configure an API key or endpoint.', 'INPUT');
+    if (
+      payload.authStorage !== undefined &&
+      (provider !== 'codex' || !['keyring', 'session'].includes(payload.authStorage))
+    )
+      throw new AIError('Choose keychain or session-only storage for ChatGPT.', 'INPUT');
+    this.configuring = true;
+    try {
+      if (API_PROVIDERS[provider]) {
+        const id = credentialId(profile.id, provider, config.baseUrl);
+        if (payload.apiKey) await this.vault.set(id, payload.apiKey, payload.storage || 'encrypted');
+        else if (
+          payload.storage &&
+          this.vault.status(id).configured &&
+          this.vault.status(id).credentialStorage !== payload.storage
+        )
+          await this.vault.set(id, await this.vault.get(id), payload.storage);
+      }
+      this.assertProfile(profile.id);
+      const prior = this.selection();
+      const next = {
+        ...this.preferences,
+        profiles: {
+          ...this.preferences.profiles,
+          [profile.id]: { provider, configs: { ...prior.configs, [provider]: config } },
+        },
+        ...(payload.authStorage ? { codexAuthStorage: payload.authStorage } : {}),
+      };
+      if (payload.authStorage) await this.client.setAuthStorage?.(payload.authStorage);
+      await fs.mkdir(path.dirname(this.preferencePath), { recursive: true });
+      const temporary = this.preferencePath + '.' + randomUUID() + '.tmp';
+      try {
+        await fs.writeFile(temporary, JSON.stringify(next), { mode: 0o600, flag: 'wx' });
+        await fs.rename(temporary, this.preferencePath);
+      } finally {
+        await fs.rm(temporary, { force: true }).catch(() => {});
+      }
+      if (prior.provider !== provider) await this.subscriptionClient(prior.provider)?.cancelLogin();
+      this.preferences = next;
+      this.conversations.clear();
+      this.emit({ type: 'ai:reset', profileId: profile.id });
+    } finally {
+      this.configuring = false;
+    }
     this.emit({ type: 'ai:status', ...this.status() });
     return this.status();
   }
 
   async disconnect() {
-    this.cancel();
-    await this.client.logout();
-    this.conversations.clear();
+    if (this.configuring) throw new AIError('Wait for the current provider change to finish.', 'BUSY');
+    this.configuring = true;
+    try {
+      this.cancel();
+      const provider = this.selection().provider;
+      const client = this.subscriptionClient(provider);
+      if (client) await client.logout();
+      else
+        await this.vault.remove(
+          credentialId(this.activeProfile()?.id, provider, this.configFor(provider).baseUrl),
+        );
+      this.conversations.clear();
+    } finally {
+      this.configuring = false;
+    }
     this.emit({ type: 'ai:status', ...this.status() });
     return this.status();
+  }
+
+  async forgetProfile(profileId) {
+    if (this.configuring)
+      throw new AIError(
+        'Wait for the current provider change to finish before deleting this profile.',
+        'BUSY',
+      );
+    this.configuring = true;
+    try {
+      if (this.request?.profileId === profileId) this.cancel();
+      await this.vault.forgetProfile(profileId);
+      this.conversations.delete(profileId);
+      delete this.preferences.profiles[profileId];
+      const temporary = this.preferencePath + '.' + randomUUID() + '.tmp';
+      try {
+        await fs.mkdir(path.dirname(this.preferencePath), { recursive: true });
+        await fs.writeFile(temporary, JSON.stringify(this.preferences), { mode: 0o600, flag: 'wx' });
+        await fs.rename(temporary, this.preferencePath);
+      } finally {
+        await fs.rm(temporary, { force: true }).catch(() => {});
+      }
+    } finally {
+      this.configuring = false;
+    }
+  }
+
+  async testConnection() {
+    const profile = this.activeProfile();
+    if (!profile || profile.private) throw new AIError('AI is unavailable in private profiles.', 'PRIVATE');
+    if (this.request || this.configuring)
+      throw new AIError('Stop the current request before testing a connection.', 'BUSY');
+    const provider = this.selection().provider;
+    const client = this.subscriptionClient(provider);
+    if (client) {
+      const status = await client.refresh();
+      return {
+        ok: status.configured,
+        message: status.configured
+          ? 'Subscription connected. No inference request was made.'
+          : status.error || 'Sign in to connect this subscription.',
+        models: status.models,
+      };
+    }
+    const config = this.configFor(provider);
+    normalizeBaseUrl(provider, config.baseUrl);
+    const controller = new AbortController();
+    const request = { id: randomUUID(), profileId: profile.id, controller };
+    this.request = request;
+    this.emit({ type: 'ai:status', ...this.status() });
+    try {
+      const key = await this.vault.get(credentialId(profile.id, provider, config.baseUrl));
+      this.assertProfile(profile.id);
+      const result = await this.apiClient.test({ ...config, provider, key, signal: controller.signal });
+      this.assertProfile(profile.id);
+      return result;
+    } finally {
+      if (this.request === request) this.request = null;
+      this.emit({ type: 'ai:status', ...this.status() });
+    }
   }
 
   close() {
     this.cancel();
     this.client.close();
+    this.claudeClient.close();
+    this.vault.close();
   }
 
   cancel() {
@@ -253,14 +499,40 @@ class AIService {
       ids.push(state.activeTabId);
     }
     if (ids.length > 6) throw new AIError('Choose up to six tabs for one question.', 'INPUT');
+    const grants = payload.contextTabs;
+    if (
+      grants !== undefined &&
+      (!Array.isArray(grants) ||
+        grants.length !== ids.length ||
+        grants.some((grant) => !grant || !ids.includes(grant.id) || !safeSourceUrl(grant.url)) ||
+        new Set(grants.map((grant) => grant.id)).size !== ids.length)
+    )
+      throw new AIError('Choose the pages to share again.', 'INPUT');
     for (const id of ids) {
       const tab = state.tabs.find((item) => item.id === id);
       if (!tab || tab.profileId !== profileId)
         throw new AIError('Only tabs in the current profile can be shared.', 'SCOPE');
+      if (grants && grants.find((grant) => grant.id === id).url !== tab.url)
+        throw new AIError(
+          'A selected page changed. Review the context and choose it again before sharing.',
+          'CONTEXT_CHANGED',
+        );
     }
     if (!ids.length) return { pages: [], unreadable: [], scope: 'research' };
     const received = await this.getPageContext(ids, signal);
     this.assertProfile(profileId);
+    if (
+      grants?.some(
+        (grant) =>
+          this.getState().tabs.find((tab) => tab.id === grant.id)?.url !== grant.url ||
+          (received.find((page) => page.id === grant.id)?.url &&
+            received.find((page) => page.id === grant.id).url !== grant.url),
+      )
+    )
+      throw new AIError(
+        'A selected page changed while it was being read. Review the context and try again.',
+        'CONTEXT_CHANGED',
+      );
     const unreadable = [];
     const pages = [];
     let remaining = MAX_CONTEXT_CHARS;
@@ -317,11 +589,27 @@ class AIService {
           : 'None of the selected pages could be read. Open readable pages or text PDFs and try again.',
         'NO_CONTEXT',
       );
-    return { pages, unreadable, scope: `pages:${[...ids].sort().join(',')}` };
+    // A tab retains its ID across navigation. Old page extracts must not become
+    // implicit context when the same tab now shows a different document.
+    return {
+      pages,
+      unreadable,
+      scope: `pages:${JSON.stringify(pages.map(({ id, url }) => [id, url]).sort())}`,
+    };
   }
 
   async requestProvider(messages, research, signal, instructions = SYSTEM, { stream = true } = {}) {
     const profileId = this.request?.profileId;
+    const requestId = this.request?.id;
+    const provider = this.selection().provider;
+    if (API_PROVIDERS[provider]) {
+      const config = this.configFor(provider);
+      const key = await this.vault.get(credentialId(profileId, provider, config.baseUrl));
+      this.assertProfile(profileId);
+      return this.apiClient.run({ ...config, provider, key, messages, research, signal, instructions });
+    }
+    if (provider === 'claude-code')
+      return this.claudeClient.run({ model: this.status().model, messages, signal, instructions });
     const items = await this.client.run({
       model: this.status().model || undefined,
       messages,
@@ -330,7 +618,7 @@ class AIService {
       instructions,
       onDelta: (delta) => {
         if (stream && !signal.aborted && this.activeProfile()?.id === profileId)
-          this.emit({ type: 'ai:delta', delta, profileId });
+          this.emit({ type: 'ai:delta', delta, profileId, requestId });
       },
     });
     const answers = items.filter((item) => item.type === 'agentMessage' && item.phase !== 'commentary');
@@ -367,13 +655,19 @@ class AIService {
   }
 
   async ask(payload) {
+    if (this.activeProfile()?.private) throw new AIError('AI is unavailable in private profiles.', 'PRIVATE');
     if (!this.status().configured)
-      throw new AIError('Sign in with ChatGPT in Settings to use your Codex subscription.', 'NOT_CONFIGURED');
-    if (this.request)
+      throw new AIError('Connect the selected AI provider in Settings first.', 'NOT_CONFIGURED');
+    if (this.request || this.configuring)
       throw new AIError('An answer is already running. Stop it before asking another question.', 'BUSY');
     const question = cleanText(payload.question, MAX_QUESTION + 1).trim();
     if (!question || question.length > MAX_QUESTION)
       throw new AIError(`Enter a question of 1–${MAX_QUESTION} characters.`, 'INPUT');
+    if (
+      payload.requestId !== undefined &&
+      (typeof payload.requestId !== 'string' || !/^[\w-]{1,80}$/.test(payload.requestId))
+    )
+      throw new AIError('Invalid AI request identifier.', 'INPUT');
     const profile = this.activeProfile();
     if (!profile || profile.private)
       throw new AIError(
@@ -381,20 +675,28 @@ class AIService {
         'PRIVATE',
       );
     const controller = new AbortController();
-    const request = { id: randomUUID(), profileId: profile.id, controller };
+    const request = { id: payload.requestId || randomUUID(), profileId: profile.id, controller };
     this.request = request;
     const timer = setTimeout(
       () => controller.abort(new AIError('The provider took too long. Please try again.', 'TIMEOUT')),
       this.timeoutMs,
     );
     timer.unref?.();
-    this.emit({ type: 'ai:progress', message: 'Preparing your question…', profileId: profile.id });
+    this.emit({
+      type: 'ai:progress',
+      message: 'Preparing your question…',
+      profileId: profile.id,
+      requestId: request.id,
+    });
     try {
       const { pages, unreadable, scope } = await this.contextFor(payload, profile.id, controller.signal);
       if (controller.signal.aborted) throw controller.signal.reason;
-      const research = scope === 'research';
+      const research = scope === 'research' && this.status().researchSupported;
+      const general = scope === 'research' && !research;
+      const provider = this.selection().provider;
       let conversation = this.conversations.get(profile.id);
-      if (!conversation || conversation.scope !== scope) conversation = { scope, turns: [], latest: null };
+      if (!conversation || conversation.scope !== scope || conversation.provider !== provider)
+        conversation = { scope, provider, turns: [], latest: null };
       const sharedTabs = pages.map(({ id, title, url, truncated, pdf }) => ({
         id,
         title,
@@ -404,12 +706,15 @@ class AIService {
       }));
       this.emit({
         type: 'ai:progress',
-        message: research
-          ? 'Researching the web and checking sources…'
-          : `Reading ${pages.length} shared ${pages.length === 1 ? 'page' : 'pages'}…`,
+        message: general
+          ? 'Answering without web research…'
+          : research
+            ? 'Researching the web and checking sources…'
+            : `Reading ${pages.length} shared ${pages.length === 1 ? 'page' : 'pages'}…`,
         sharedTabs,
         unreadable,
         profileId: profile.id,
+        requestId: request.id,
       });
       let context = '';
       if (pages.length) {
@@ -436,11 +741,13 @@ class AIService {
         SYSTEM +
         (research
           ? '\nResearch this question using web search before answering. Open the evidence pages with web search and cite them using Markdown links with their actual URLs. If no credible sources are available, say so. Do not state that opening source tabs or other browser actions has occurred.'
-          : '\nAnswer only from the explicitly shared page extracts and the conversation. Do not use outside research or pretend to read a full PDF or truncated content. Cite factual claims with exact paragraph identifiers such as [1:3]. Quote short passages where helpful. Say when the answer is absent. Identify pages that cannot be compared due to missing information.');
+          : general
+            ? '\nNo live web search is available on this connection. Answer from the conversation and your general knowledge. Explicitly state when current facts require verification. Do not claim to have searched, opened, checked, or verified web sources. Do not invent citations.'
+            : '\nAnswer only from the explicitly shared page extracts and the conversation. Do not use outside research or pretend to read a full PDF or truncated content. Cite factual claims with exact paragraph identifiers such as [1:3]. Quote short passages where helpful. Say when the answer is absent. Identify pages that cannot be compared due to missing information.');
       const result = await this.requestProvider(messages, research, controller.signal, instructions);
       this.assertProfile(profile.id);
       if (controller.signal.aborted) throw controller.signal.reason;
-      if (!research) Object.assign(result, pageCitations(result.answer, pages));
+      if (pages.length) Object.assign(result, pageCitations(result.answer, pages));
       const answer = result.answer;
       const complete = {
         answer,
@@ -450,12 +757,16 @@ class AIService {
         question,
         sharedTabs,
         unreadable,
-        mode: research ? 'research' : 'pages',
+        mode: research ? 'research' : general ? 'general' : 'pages',
         complete: true,
         profileId: profile.id,
-        provider: 'codex',
+        requestId: request.id,
+        provider,
         model: this.status().model,
       };
+      if (general)
+        complete.warning =
+          'This connection does not provide web research. The answer uses general knowledge and has no verified web sources. Share a page for grounded questions or select a provider with web search.';
       if (research && !result.sources.length) {
         complete.warning = result.searchError
           ? 'Web search did not finish successfully. This answer has no supporting sources.'
@@ -470,11 +781,16 @@ class AIService {
       return complete;
     } catch (error) {
       const failure = controller.signal.aborted ? controller.signal.reason : error;
-      const message =
-        failure instanceof AIError || failure instanceof CodexError
-          ? failure.message
-          : 'Unable to reach the AI provider. Check your internet connection and try again.';
-      this.emit({ type: 'ai:error', message, code: failure?.code || 'NETWORK', profileId: profile.id });
+      const message = isKnownError(failure)
+        ? failure.message
+        : 'Unable to reach the AI provider. Check your internet connection and try again.';
+      this.emit({
+        type: 'ai:error',
+        message,
+        code: failure?.code || 'NETWORK',
+        profileId: profile.id,
+        requestId: request.id,
+      });
       throw new AIError(message, failure?.code || 'NETWORK');
     } finally {
       clearTimeout(timer);
@@ -485,8 +801,9 @@ class AIService {
 
   async suggestName(payload) {
     if (!this.status().configured)
-      throw new AIError('Sign in with ChatGPT in Settings first.', 'NOT_CONFIGURED');
-    if (this.request) throw new AIError('Stop the current answer before requesting a filename.', 'BUSY');
+      throw new AIError('Connect the selected AI provider in Settings first.', 'NOT_CONFIGURED');
+    if (this.request || this.configuring)
+      throw new AIError('Stop the current request before requesting a filename.', 'BUSY');
     const profile = this.activeProfile();
     if (!profile || profile.private) throw new AIError('AI is unavailable in private profiles.', 'PRIVATE');
     const name = cleanText(payload.name, 300);
@@ -528,7 +845,7 @@ class AIService {
       };
     } catch (error) {
       const failure = controller.signal.aborted ? controller.signal.reason : error;
-      throw failure instanceof AIError || failure instanceof CodexError
+      throw isKnownError(failure)
         ? failure
         : new AIError('Unable to reach the AI provider. Please try again.', 'NETWORK');
     } finally {
@@ -546,8 +863,16 @@ class AIService {
       case 'ai:login':
         return this.login();
       case 'ai:login-cancel':
-        await this.client.cancelLogin();
+        await this.subscriptionClient()?.cancelLogin();
         return this.status();
+      case 'ai:test-connection':
+        return this.testConnection();
+      case 'ai:install':
+        if (this.selection().provider !== 'claude-code')
+          throw new AIError('This provider does not need a separate installation.', 'INPUT');
+        if (!this.openExternal) throw new AIError('The system browser is unavailable.', 'UNAVAILABLE');
+        await this.openExternal(INSTALL_URL);
+        return null;
       case 'ai:configure':
         return this.configure(payload);
       case 'ai:disconnect':
@@ -571,10 +896,21 @@ class AIService {
   }
 }
 
+function isKnownError(error) {
+  return (
+    error instanceof AIError ||
+    error instanceof CodexError ||
+    error instanceof ClaudeError ||
+    error instanceof ProviderError ||
+    error instanceof CredentialError
+  );
+}
+
 module.exports = {
   AIService,
   AIError,
   DEFAULT_MODELS,
+  PROVIDERS,
   safeSourceUrl,
   dedupeSources,
   sanitizeSuggestedFilename,

@@ -80,6 +80,7 @@ async function fake(t, options = {}) {
     userDataPath: dir,
     executable: 'fixture-codex',
     rpcTimeoutMs: 1000,
+    authStorage: options.authStorage,
     spawn: (executable, args, config) => {
       launch = { executable, args, config };
       return child;
@@ -149,6 +150,40 @@ test('login URLs allow only the official HTTPS identity host', () => {
     'https://auth.openai.com:999/',
   ])
     assert.throws(() => loginUrl(url));
+});
+
+test('failed keychain persistence never becomes configured and offers only explicit secure/session recovery', async (t) => {
+  const f = await fake(t, { account: null });
+  await f.client.login();
+  f.notification('account/login/completed', {
+    loginId: 'login-one',
+    success: false,
+    error: 'persist_failed: token-sensitive failed to write OAuth tokens keyring: default keychain not found',
+  });
+  await waitFor(() => f.child.killed);
+  const status = f.client.status();
+  assert.equal(status.configured, false);
+  assert.equal(status.loginPending, false);
+  assert.equal(status.errorCode, 'AUTH_STORAGE');
+  assert.match(status.error, /This session only/);
+  assert.ok(!status.error.includes('token-sensitive'));
+  assert.equal(status.credentialStorage, 'keyring');
+  await f.client.setAuthStorage('session');
+  assert.equal(f.client.status().credentialStorage, 'session');
+  assert.equal(lockedConfig('session').cli_auth_credentials_store, 'ephemeral');
+  await assert.rejects(f.client.setAuthStorage('file'), { code: 'INPUT' });
+  assert.equal((await fs.readdir(f.client.home)).includes('auth.json'), false);
+});
+
+test('switching an active keychain connection to session-only logs out the durable sign-in first', async (t) => {
+  const f = await fake(t);
+  await f.client.refresh();
+  assert.equal(f.client.status().configured, true);
+  await f.client.setAuthStorage('session');
+  assert.ok(f.messages.some((message) => message.method === 'account/logout'));
+  assert.equal(f.client.status().configured, false);
+  assert.equal(f.client.status().credentialStorage, 'session');
+  assert.equal(f.child.killed, true);
 });
 test('initialization is isolated and subscription account/model status contains no credentials', async (t) => {
   const f = await fake(t);
@@ -423,7 +458,7 @@ test(
   async (t) => {
     assert.ok(executablePath(), 'The official pinned platform runtime must be installed');
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'zacro-codex-native-test-'));
-    const client = new CodexClient({ userDataPath: dir, rpcTimeoutMs: 5000 });
+    const client = new CodexClient({ userDataPath: dir, rpcTimeoutMs: 5000, authStorage: 'session' });
     t.after(async () => {
       client.close();
       await new Promise((resolve) => setTimeout(resolve, 100));
@@ -435,6 +470,8 @@ test(
     assert.equal(status.available, true);
     assert.equal(status.loginPending, false);
     assert.deepEqual(status.models, []);
+    assert.equal(status.credentialStorage, 'session');
+    assert.equal((await fs.readdir(client.home)).includes('auth.json'), false);
     await assert.rejects(client.run(request(new AbortController().signal)), { code: 'NOT_CONFIGURED' });
   },
 );

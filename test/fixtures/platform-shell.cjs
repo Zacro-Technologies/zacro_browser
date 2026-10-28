@@ -5,14 +5,17 @@
 const { app, BrowserWindow, ipcMain } = require('electron');
 const path = require('node:path');
 const { BrowserStore } = require('../../src/core/store.cjs');
+const { shortcutCatalog } = require('../../src/core/shortcuts.cjs');
 app.enableSandbox();
 app.setPath('userData', process.env.ZACRO_USER_DATA);
 const store = new BrowserStore(process.env.ZACRO_USER_DATA);
 let window;
 const runtime = {
   fullScreen: false,
+  onboardingEnabled: false,
   focused: true,
   pages: {},
+  shortcuts: shortcutCatalog('darwin'),
   defaultBrowser: { supported: true, configured: false },
 };
 const calls = [];
@@ -21,6 +24,7 @@ app.on('fixture:runtime', (_event, update) => {
   Object.assign(runtime, update);
   window.webContents.send('fixture:state', snapshot());
 });
+app.on('fixture:event', (_event, event) => window.webContents.send('fixture:event', event));
 app.on('fixture:downloads', () => {
   const space = store.state.spaces.find((item) => item.id === store.state.activeSpaceId);
   store.state.downloads.push({

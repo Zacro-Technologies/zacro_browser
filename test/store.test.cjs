@@ -57,6 +57,127 @@ test('user tab names survive document updates, archive, restart, and portable im
   assert.throws(() => store.dispatch('tab:rename', { id: tab.id, title: '   ' }));
 });
 
+test('closing a favorite retains its destination, title and bookmark until explicitly unpinned', () => {
+  const store = memory();
+  const ordinary = store.dispatch('tab:create', { url: 'https://ordinary.example' });
+  let favorite = store.dispatch('tab:create', { url: 'https://favorite.example/path' });
+  store.dispatch('tab:rename', { id: favorite.id, title: 'Daily reading' });
+  store.dispatch('tab:favorite', { id: favorite.id });
+  favorite = store.state.tabs.find((tab) => tab.id === favorite.id);
+  store.dispatch('bookmark:toggle', { url: favorite.url, title: favorite.title });
+  store.dispatch('tab:close', { id: favorite.id });
+  assert.equal(store.state.tabs.find((tab) => tab.id === favorite.id).closed, true);
+  assert.equal(store.state.activeTabId, ordinary.id);
+  assert.equal(store.state.spaces[0].lastActiveTabId, ordinary.id);
+  assert.equal(store.state.archive.length, 0);
+  assert.equal(store.state.bookmarks.length, 1);
+  store.dispatch('tab:wake', { id: favorite.id });
+  assert.equal(favorite.closed, undefined);
+  assert.equal(store.state.activeTabId, ordinary.id, 'Opening a second pane preserves the selected tab');
+  store.dispatch('tab:activate', { id: favorite.id });
+  assert.equal(favorite.closed, undefined);
+  assert.equal(favorite.title, 'Daily reading');
+  assert.equal(favorite.url, 'https://favorite.example/path');
+  store.dispatch('tab:pin', { id: favorite.id });
+  assert.equal(favorite.pinned, false);
+  assert.equal(store.state.tabs.length, 2, 'Removing an open pin keeps its ordinary tab');
+  store.dispatch('tab:favorite', { id: favorite.id });
+  store.dispatch('tab:close', { id: favorite.id });
+  store.dispatch('tab:pin', { id: favorite.id });
+  assert.equal(
+    store.state.tabs.some((tab) => tab.id === favorite.id),
+    false,
+  );
+  assert.equal(store.state.archive.length, 0);
+  assert.equal(store.state.bookmarks.length, 1);
+});
+
+test('closed and restored favorites remain lazy across restart and retain portable metadata', (t) => {
+  const directory = temp(t);
+  const store = new BrowserStore(directory);
+  const favorite = store.dispatch('tab:create', { url: 'https://favorite.example' });
+  store.dispatch('tab:favorite', { id: favorite.id });
+  store.flush();
+  const reopened = new BrowserStore(directory);
+  assert.equal(reopened.state.activeTabId, null);
+  assert.equal(reopened.state.tabs[0].pinned, true);
+  reopened.dispatch('tab:close', { id: favorite.id });
+  reopened.flush();
+  const closed = new BrowserStore(directory);
+  assert.equal(closed.state.tabs[0].closed, true);
+  assert.equal(closed.state.activeTabId, null);
+  const imported = memory();
+  imported.importData(closed.exportData());
+  const copy = imported.state.tabs.find((tab) => tab.url === favorite.url);
+  assert.equal(copy.closed, true);
+  assert.equal(copy.pinned, true);
+  assert.equal(copy.favorite, true);
+  imported.dispatch('tab:activate', { id: copy.id });
+  assert.equal(copy.closed, undefined);
+});
+
+test('Space appearance and layout preferences round-trip with bounded untrusted imports', (t) => {
+  const directory = temp(t);
+  const store = new BrowserStore(directory);
+  store.dispatch('space:update', {
+    id: 'home',
+    icon: 'leaf',
+    color: '#123456',
+    theme: { secondaryColor: '#abcdef', gradient: 82, grain: 9, opacity: 62, blur: 18 },
+  });
+  store.dispatch('settings:update', {
+    values: { pinnedSleepMinutes: 0, pageGutter: 14, pageRadius: 7, motionScale: 0.8, tabDensity: 'compact' },
+  });
+  store.flush();
+  const reopened = new BrowserStore(directory);
+  assert.equal(reopened.state.spaces[0].icon, 'leaf');
+  assert.deepEqual(reopened.state.spaces[0].theme, {
+    secondaryColor: '#abcdef',
+    gradient: 82,
+    grain: 9,
+    opacity: 62,
+    blur: 18,
+  });
+  assert.equal(reopened.state.settings.pinnedSleepMinutes, 0);
+  assert.equal(reopened.state.settings.pageGutter, 14);
+  const exported = reopened.exportData();
+  exported.spaces[0].icon = '<svg onload=evil>';
+  exported.spaces[0].theme = {
+    secondaryColor: 'url(javascript:evil)',
+    gradient: -9,
+    grain: 999,
+    opacity: 2,
+    blur: 999,
+    arbitrary: 'discard',
+  };
+  exported.settings = {
+    pinnedSleepMinutes: -1,
+    pageGutter: 999,
+    pageRadius: -5,
+    motionScale: Infinity,
+    tabDensity: 'evil',
+  };
+  const clean = hydrate(exported);
+  assert.equal(clean.spaces[0].color, '#123456');
+  assert.equal(clean.spaces[0].icon, 'circle');
+  assert.deepEqual(clean.spaces[0].theme, {
+    secondaryColor: '#b695b8',
+    gradient: 0,
+    grain: 200,
+    opacity: 2,
+    blur: 32,
+  });
+  assert.equal(clean.settings.pinnedSleepMinutes, 20);
+  assert.equal(clean.settings.pageGutter, 20);
+  assert.equal(clean.settings.pageRadius, 0);
+  assert.equal(clean.settings.motionScale, 1);
+  assert.equal(clean.settings.tabDensity, 'comfortable');
+  const imported = memory();
+  imported.importData(exported);
+  assert.deepEqual(imported.state.spaces[1].theme, clean.spaces[0].theme);
+  assert.equal(imported.state.settings.pageGutter, 8, 'Collection import never replaces local preferences');
+});
+
 test('address parsing preserves web addresses, encodes queries and supports localhost', () => {
   assert.equal(normalizeAddress('example.com/a?q=hello'), 'https://example.com/a?q=hello');
   assert.equal(normalizeAddress('localhost:3300/test'), 'http://localhost:3300/test');
@@ -143,13 +264,23 @@ test('spaces remember their last active tab and deleting spaces preserves their 
   invariant(store.state);
 });
 
-test('folder deletion releases contained and archived tabs', () => {
+test('folder deletion releases retained pins and legacy archived tabs', () => {
   const store = memory();
   const folder = store.dispatch('folder:create', { name: 'Ideas' });
   const tab = store.dispatch('tab:create', { url: 'https://example.com' });
   store.dispatch('tab:move', { id: tab.id, folderId: folder.id });
   store.dispatch('tab:close', { id: tab.id });
+  store.state.archive.push({
+    ...store.state.tabs.find((item) => item.id === tab.id),
+    id: 'legacy-archive',
+    pinned: false,
+    favorite: false,
+    archivedAt: Date.now(),
+  });
   store.dispatch('folder:delete', { id: folder.id });
+  assert.equal(store.state.tabs[0].folderId, null);
+  assert.equal(store.state.tabs[0].pinned, true);
+  assert.equal(store.state.tabs[0].closed, true);
   assert.equal(store.state.archive[0].folderId, null);
   invariant(store.state);
 });
@@ -336,7 +467,7 @@ test('settings validate types and bounds and cannot introduce secrets or unknown
   assert.equal(store.state.settings.sidebarWidth, 380);
   assert.equal(store.state.settings.openSourcesLimit, 1);
   assert.equal(store.state.settings.apiKey, undefined);
-  assert.equal(store.state.settings.archiveAfterHours, 24);
+  assert.equal(store.state.settings.archiveAfterHours, 12);
   assert.equal(store.state.settings.restoreSession, true);
 });
 

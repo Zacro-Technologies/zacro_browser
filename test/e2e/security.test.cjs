@@ -10,8 +10,10 @@ const { _electron: electron, expect } = require('@playwright/test');
 const { makePDF } = require('../fixtures/pdf.cjs');
 
 let server, base;
+const requestCounts = new Map();
 before(async () => {
   server = http.createServer(async (request, response) => {
+    requestCounts.set(request.url, (requestCounts.get(request.url) || 0) + 1);
     if (request.url === '/document.pdf' || request.url === '/document-without-suffix') {
       response.writeHead(200, { 'Content-Type': 'application/pdf', 'Content-Disposition': 'inline' });
       response.end(
@@ -68,7 +70,7 @@ async function bounded(promise, milliseconds) {
 
 async function launch(t) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'zacro-e2e-security-'));
-  const env = { ...process.env, ZACRO_USER_DATA: directory };
+  const env = { ...process.env, ZACRO_SKIP_ONBOARDING: '1', ZACRO_USER_DATA: directory };
   delete env.ELECTRON_RUN_AS_NODE;
   const app = await electron.launch({ args: [path.resolve(__dirname, '../..')], env, timeout: 30000 });
   let stderr = '';
@@ -175,6 +177,258 @@ test(
       await browser.guest('document.getElementById("submitted").textContent', `${base}/posted`),
       'value=retained-body',
     );
+  },
+);
+
+test(
+  'cross-origin login popups keep their pinned opener alive and return focus after a callback',
+  { timeout: 60000 },
+  async (t) => {
+    const identity = http.createServer((_request, response) => {
+      response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      response.end('<!doctype html><title>Local identity fixture</title><button>Continue</button>');
+    });
+    await new Promise((resolve) => identity.listen(0, '127.0.0.1', resolve));
+    t.after(
+      () =>
+        new Promise((resolve) => {
+          identity.closeAllConnections();
+          identity.close(resolve);
+        }),
+    );
+    const identityURL = `http://127.0.0.1:${identity.address().port}/authorize`;
+    const browser = await launch(t);
+    const openerURL = `${base}/login-opener`;
+    await browser.navigate(openerURL);
+    const opener = (await browser.state()).activeTabId;
+    await browser.invoke('tab:pin', { id: opener });
+    // An intervening tab makes the normal adjacent-tab close policy incorrect
+    // for a login popup: success needs to return to the original document.
+    await browser.invoke('tab:create', { url: `${base}/unrelated`, active: false });
+    await browser.guest(
+      `
+      window.loginResult = null;
+      window.addEventListener('message', (event) => {
+        if (event.origin === ${JSON.stringify(new URL(identityURL).origin)}) window.loginResult = event.data;
+      });
+      window.open(${JSON.stringify(identityURL)}, 'identity-login'); undefined;
+    `,
+      openerURL,
+    );
+    await expect.poll(() => browser.guest('document.readyState', identityURL)).toBe('complete');
+    await expect.poll(async () => (await browser.state()).runtime.page.url).toBe(identityURL);
+    assert.equal((await browser.invoke('tab:sleep', { id: opener })).slept, false);
+    assert.equal(await browser.guest('window.loginResult', openerURL), null);
+    const openerAlive = await browser.app.evaluate(
+      ({ webContents }, url) => webContents.getAllWebContents().some((item) => item.getURL() === url),
+      openerURL,
+    );
+    assert(openerAlive, 'the callback listener must survive while its popup is active');
+    await browser
+      .guest(
+        `window.opener.postMessage({ signedIn: true }, ${JSON.stringify(base)}); window.close(); undefined`,
+        identityURL,
+      )
+      .catch(() => {});
+    await expect.poll(async () => (await browser.state()).activeTabId).toBe(opener);
+    await expect.poll(() => browser.guest('window.loginResult', openerURL)).toEqual({ signedIn: true });
+    assert.equal((await browser.state()).tabs.filter((tab) => tab.url === identityURL).length, 0);
+  },
+);
+
+for (const { mode, duringClose } of ['script', 'post'].flatMap((mode) =>
+  [false, true].map((duringClose) => ({ mode, duringClose })),
+))
+  test(
+    `a ${mode} login popup promotes Peek${duringClose ? ' during close motion' : ''} without replacing its callback document`,
+    { timeout: 60000 },
+    async (t) => {
+      const identity = http.createServer(async (request, response) => {
+        let body = '';
+        for await (const chunk of request) body += chunk;
+        response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        response.end(
+          `<!doctype html><title>Identity callback</title><p id="method">${request.method}</p><p id="body">${body.replace(/[<>&]/g, '')}</p>`,
+        );
+      });
+      await new Promise((resolve) => identity.listen(0, '127.0.0.1', resolve));
+      t.after(
+        () =>
+          new Promise((resolve) => {
+            identity.closeAllConnections();
+            identity.close(resolve);
+          }),
+      );
+      const identityURL = `http://127.0.0.1:${identity.address().port}/authorize`;
+      const browser = await launch(t);
+      await browser.navigate(`${base}/underlying-${mode}`);
+      const underlyingId = (await browser.state()).activeTabId;
+      if (duringClose) {
+        await browser.app.evaluate(({ systemPreferences }) => {
+          systemPreferences.getAnimationSettings = () => ({
+            prefersReducedMotion: false,
+            shouldRenderRichAnimation: true,
+            scrollAnimationsEnabledBySystem: true,
+          });
+        });
+        await browser.shell.emulateMedia({ reducedMotion: 'no-preference' });
+        await browser.invoke('settings:update', { values: { motionScale: 1.4 } });
+      }
+      const previewPath = `/peek-login-${mode}${duringClose ? '-closing' : ''}`;
+      const previewURL = `${base}${previewPath}`;
+      await browser.invoke('peek:open', { url: previewURL });
+      await expect.poll(() => browser.guest('document.readyState', previewURL)).toBe('complete');
+      await expect.poll(async () => (await browser.state()).runtime.peek?.phase).toBe('open');
+      const previewId = await browser.app.evaluate(
+        ({ webContents }, url) => webContents.getAllWebContents().find((item) => item.getURL() === url).id,
+        previewURL,
+      );
+      await browser.guest(
+        `
+        window.previewMarker = 'same-preview-document';
+        window.unloadAttempts = 0;
+        window.addEventListener('beforeunload', () => { window.unloadAttempts++; });
+        document.querySelector('input').value = 'unsaved-preview-draft';
+        window.loginResult = null;
+        window.addEventListener('message', (event) => {
+          if (event.origin === ${JSON.stringify(new URL(identityURL).origin)}) window.loginResult = event.data;
+        });
+        window.startLogin = () => { ${
+          mode === 'post'
+            ? `document.getElementById('post').action = ${JSON.stringify(identityURL)}; document.getElementById('post').target = 'identity-login-post'; document.getElementById('post').submit();`
+            : `window.identityPopup = window.open('about:blank', 'identity-login'); setTimeout(() => { window.identityPopup.location.href = ${JSON.stringify(identityURL)}; }, 25);`
+        } };
+        undefined;
+      `,
+        previewURL,
+      );
+      try {
+        if (duringClose) {
+          // Hold the host animation at its first closing frame until Chromium
+          // delivers the popup. Several IPC trips must not race a real 168ms
+          // deadline on a busy runner. Real-clock motion has separate coverage;
+          // native timers, guest scripts and the popup/POST path remain live.
+          await browser.app.evaluate(() => {
+            const clock = globalThis.performance;
+            const descriptor = Object.getOwnPropertyDescriptor(clock, 'now');
+            const heldTime = clock.now();
+            globalThis.__latePeekClock = { clock, descriptor };
+            Object.defineProperty(clock, 'now', { configurable: true, value: () => heldTime });
+          });
+          await browser.shell.evaluate(() => {
+            window.__latePeekClose = window.zacro.invoke('peek:close');
+          });
+          assert.equal((await browser.state()).runtime.peek?.phase, 'closing');
+        }
+        await browser.guest('window.startLogin(); undefined', previewURL);
+        if (duringClose)
+          assert.equal(
+            await browser.shell.evaluate(() => window.__latePeekClose),
+            false,
+            'a live login callback interrupts the visual close before native beforeunload',
+          );
+      } finally {
+        if (duringClose)
+          await browser.app.evaluate(() => {
+            const saved = globalThis.__latePeekClock;
+            if (!saved) return;
+            if (saved.descriptor) Object.defineProperty(saved.clock, 'now', saved.descriptor);
+            else delete saved.clock.now;
+            delete globalThis.__latePeekClock;
+          });
+      }
+      await expect.poll(() => browser.guest('document.readyState', identityURL)).toBe('complete');
+      await expect.poll(async () => (await browser.state()).runtime.page.url).toBe(identityURL);
+      const afterOpen = await browser.state();
+      const promoted = afterOpen.tabs.find((tab) => tab.url === previewURL);
+      assert(promoted, 'the preview must become a durable tab');
+      assert.notEqual(promoted.id, underlyingId);
+      assert.equal(afterOpen.runtime.peek, null);
+      assert.equal(afterOpen.history.filter((visit) => visit.url === previewURL).length, 1);
+      assert.equal(requestCounts.get(previewPath), 1, 'promotion must not refetch the preview');
+      assert.deepEqual(
+        await browser.guest(
+          '[window.previewMarker, window.unloadAttempts, document.querySelector("input").value]',
+          previewURL,
+        ),
+        ['same-preview-document', 0, 'unsaved-preview-draft'],
+      );
+      assert.equal(
+        await browser.app.evaluate(
+          ({ webContents }, { previewId, identityURL }) => {
+            const original = webContents.fromId(previewId);
+            const child = webContents.getAllWebContents().find((item) => item.getURL() === identityURL);
+            return Boolean(original && child && original.session === child.session);
+          },
+          { previewId, identityURL },
+        ),
+        true,
+        'the original WebContents and popup must share the same profile session',
+      );
+      assert.equal(
+        await browser.guest('document.getElementById("method").textContent', identityURL),
+        mode === 'post' ? 'POST' : 'GET',
+      );
+      if (mode === 'post')
+        assert.equal(
+          await browser.guest('document.getElementById("body").textContent', identityURL),
+          'value=unsaved-preview-draft',
+        );
+      await browser
+        .guest(
+          `window.opener.postMessage({ signedIn: true }, ${JSON.stringify(base)}); window.close(); undefined`,
+          identityURL,
+        )
+        .catch(() => {});
+      await expect.poll(() => browser.guest('window.loginResult', previewURL)).toEqual({ signedIn: true });
+      await expect.poll(async () => (await browser.state()).activeTabId).toBe(promoted.id);
+      await expect
+        .poll(() => browser.app.evaluate(({ webContents }) => webContents.getFocusedWebContents()?.id))
+        .toBe(previewId);
+      assert.equal((await browser.state()).tabs.filter((tab) => tab.url === identityURL).length, 0);
+      assert.equal(await browser.guest('window.unloadAttempts', previewURL), 0);
+      await browser.invoke('tab:close', { id: promoted.id });
+      assert.equal(
+        await browser.app.evaluate(({ webContents }, id) => Boolean(webContents.fromId(id)), previewId),
+        false,
+      );
+    },
+  );
+
+test(
+  'a popup from the secondary split pane retains its real opener and restores keyboard focus',
+  { timeout: 60000 },
+  async (t) => {
+    const browser = await launch(t);
+    await browser.navigate(`${base}/split-primary`);
+    const primary = (await browser.state()).activeTabId;
+    const secondary = await browser.invoke('tab:create', { url: `${base}/split-secondary` });
+    await expect.poll(() => browser.guest('document.readyState', `${base}/split-secondary`)).toBe('complete');
+    await browser.invoke('tab:activate', { id: primary });
+    await browser.invoke('split:toggle', { id: secondary.id });
+    const sourceId = await browser.app.evaluate(
+      ({ webContents }, url) => webContents.getAllWebContents().find((item) => item.getURL() === url).id,
+      `${base}/split-secondary`,
+    );
+    await browser.guest(
+      `window.splitMarker = 'retained'; window.loginResult = null; window.addEventListener('message', event => { if (event.origin === ${JSON.stringify(base)}) window.loginResult = event.data; }); window.open('/split-identity', 'split-login'); undefined;`,
+      `${base}/split-secondary`,
+    );
+    await expect.poll(() => browser.guest('document.readyState', `${base}/split-identity`)).toBe('complete');
+    await expect.poll(async () => (await browser.state()).runtime.page.url).toBe(`${base}/split-identity`);
+    await browser
+      .guest(
+        `window.opener.postMessage('signed-in', ${JSON.stringify(base)}); window.close(); undefined`,
+        `${base}/split-identity`,
+      )
+      .catch(() => {});
+    await expect.poll(async () => (await browser.state()).activeTabId).toBe(secondary.id);
+    await expect.poll(() => browser.guest('window.loginResult', `${base}/split-secondary`)).toBe('signed-in');
+    assert.equal(await browser.guest('window.splitMarker', `${base}/split-secondary`), 'retained');
+    await expect
+      .poll(() => browser.app.evaluate(({ webContents }) => webContents.getFocusedWebContents()?.id))
+      .toBe(sourceId);
+    assert((await browser.state()).tabs.some((tab) => tab.id === primary));
   },
 );
 

@@ -36,6 +36,7 @@ test(
     const url = `http://127.0.0.1:${server.address().port}/`;
     const env = {
       ...process.env,
+      ZACRO_SKIP_ONBOARDING: '1',
       ZACRO_USER_DATA: path.join(directory, 'profile'),
       ZACRO_PAINT_RESULT: resultPath,
     };
