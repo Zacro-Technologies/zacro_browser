@@ -52,16 +52,37 @@ async function fixture(t) {
       shell.evaluate(([action, payload]) => window.zacro.invoke(action, payload), [action, payload]);
     const state = () => invoke('state:get');
     const windowSize = async (width, height) => {
-      const size = await app.evaluate(
+      await app.evaluate(
         ({ BrowserWindow }, { width, height }) => {
           const win = BrowserWindow.getAllWindows()[0];
           win.setContentSize(width, height);
-          return win.getContentSize();
         },
         { width, height },
       );
-      await expect.poll(() => shell.evaluate(() => [innerWidth, innerHeight])).toEqual(size);
-      return size;
+      let acceptedSize,
+        previous,
+        stableObservations = 0;
+      // Cocoa can accept the requested bounds first, then clamp them to the
+      // display. Observe current native and renderer geometry until both agree
+      // across several polls, instead of retaining that optimistic first size.
+      await expect
+        .poll(
+          async () => {
+            const native = await app.evaluate(({ BrowserWindow }) =>
+              BrowserWindow.getAllWindows()[0].getContentSize(),
+            );
+            const rendered = await shell.evaluate(() => [innerWidth, innerHeight]);
+            const signature = native.join(':');
+            const agrees = native.every((value, index) => value === rendered[index]);
+            stableObservations = agrees && signature === previous ? stableObservations + 1 : agrees ? 1 : 0;
+            previous = signature;
+            acceptedSize = native;
+            return stableObservations >= 3;
+          },
+          { intervals: [50, 100, 100] },
+        )
+        .toBe(true);
+      return acceptedSize;
     };
     const guest = (expression) =>
       app.evaluate(

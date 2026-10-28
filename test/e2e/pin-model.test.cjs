@@ -482,6 +482,9 @@ test(
       0,
       'superseded previews cannot leave orphan native renderers',
     );
+    // The entrance can finish before Chromium commits a slow local page.
+    // Wait for the living document before dispatching the trusted interaction.
+    await browser.ready(second);
     await browser.click(second, 'activate');
     await browser.guest(
       second,

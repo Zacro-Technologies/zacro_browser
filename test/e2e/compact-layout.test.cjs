@@ -73,6 +73,36 @@ test(
       assert(box, `${selector} must have a visible rectangle`);
       return Object.fromEntries(['x', 'y', 'width', 'height'].map((key) => [key, Math.round(box[key])]));
     };
+    const windowSize = async (width, height) => {
+      await app.evaluate(
+        ({ BrowserWindow }, { width, height }) => {
+          BrowserWindow.getAllWindows()[0].setContentSize(width, height);
+        },
+        { width, height },
+      );
+      let accepted,
+        previous,
+        stable = 0;
+      // The final Cocoa-clamped size can arrive after setContentSize returns.
+      await expect
+        .poll(
+          async () => {
+            const native = await app.evaluate(({ BrowserWindow }) =>
+              BrowserWindow.getAllWindows()[0].getContentSize(),
+            );
+            const rendered = await shell.evaluate(() => [innerWidth, innerHeight]);
+            const signature = native.join(':');
+            const agrees = native.every((value, index) => value === rendered[index]);
+            stable = agrees && signature === previous ? stable + 1 : agrees ? 1 : 0;
+            previous = signature;
+            accepted = native;
+            return stable >= 3;
+          },
+          { intervals: [50, 100, 100] },
+        )
+        .toBe(true);
+      return accepted;
+    };
     const aligned = async ({ split = false, peek = false } = {}) => {
       await expect(shell.locator('#app')).toHaveAttribute('data-sidebar-animating', 'false');
       await expect(shell.locator('#app')).toHaveAttribute('data-panel-animating', 'false');
@@ -133,11 +163,7 @@ test(
       [1001, 701],
       [1440, 900],
     ]) {
-      await app.evaluate(
-        ({ BrowserWindow }, { width, height }) =>
-          BrowserWindow.getAllWindows()[0].setContentSize(width, height),
-        { width, height },
-      );
+      await windowSize(width, height);
       const box = await aligned();
       assert.equal(box.y, baselineTop);
       assert.equal(box.x, 232);
@@ -177,11 +203,7 @@ test(
 
     // An existing wide sidebar preference must leave the same usable page and
     // panel rectangles in both Chromium and the shell at the minimum window.
-    const minimumSize = await app.evaluate(({ BrowserWindow }) => {
-      const window = BrowserWindow.getAllWindows()[0];
-      window.setContentSize(960, 640);
-      return window.getContentSize();
-    });
+    const minimumSize = await windowSize(960, 640);
     // Windows fractional scaling can round the requested content size by a
     // pixel. Native/DOM alignment must be exact at the actual window size.
     assert(Math.abs(minimumSize[0] - 960) <= 2 && Math.abs(minimumSize[1] - 640) <= 2);
@@ -205,11 +227,7 @@ test(
 
     // The smallest window temporarily retracts a wide sidebar for its panel,
     // while retaining both the saved preference and at least 240px of live page.
-    const compactSize = await app.evaluate(({ BrowserWindow }) => {
-      const window = BrowserWindow.getAllWindows()[0];
-      window.setContentSize(560, 420);
-      return window.getContentSize();
-    });
+    const compactSize = await windowSize(560, 420);
     await expect.poll(() => shell.evaluate(() => [innerWidth, innerHeight])).toEqual(compactSize);
     await aligned();
     await emit({ type: 'panel', panel: 'settings' });
@@ -260,11 +278,7 @@ test(
     assert.equal(compactRestored.width, 240);
     assert.equal(compactRestored.x, compactSize[0] - 248);
     await invoke('settings:update', { values: { sidebarWidth: 224 } });
-    const restoredSize = await app.evaluate(({ BrowserWindow }) => {
-      const window = BrowserWindow.getAllWindows()[0];
-      window.setContentSize(1440, 900);
-      return window.getContentSize();
-    });
+    const restoredSize = await windowSize(1440, 900);
     await expect.poll(() => shell.evaluate(() => [innerWidth, innerHeight])).toEqual(restoredSize);
     await expect.poll(async () => (await rectangle('#sidebar')).width).toBe(224);
     await aligned();

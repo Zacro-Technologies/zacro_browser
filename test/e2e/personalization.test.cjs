@@ -62,6 +62,37 @@ async function fixture(t) {
           ?.executeJavaScript(expression),
       { url, expression },
     );
+  const resize = async (width, height) => {
+    await app.evaluate(
+      ({ BrowserWindow }, { width, height }) => {
+        BrowserWindow.getAllWindows()[0].setContentSize(width, height);
+      },
+      { width, height },
+    );
+    let accepted,
+      previous,
+      stable = 0;
+    // Cocoa may clamp a requested size after the native setter returns. Read
+    // current native and DOM dimensions until they agree across several polls.
+    await expect
+      .poll(
+        async () => {
+          const native = await app.evaluate(({ BrowserWindow }) =>
+            BrowserWindow.getAllWindows()[0].getContentSize(),
+          );
+          const rendered = await shell.evaluate(() => [innerWidth, innerHeight]);
+          const signature = native.join(':');
+          const agrees = native.every((value, index) => value === rendered[index]);
+          stable = agrees && signature === previous ? stable + 1 : agrees ? 1 : 0;
+          previous = signature;
+          accepted = native;
+          return stable >= 3;
+        },
+        { intervals: [50, 100, 100] },
+      )
+      .toBe(true);
+    return accepted;
+  };
   await launch();
   return {
     get app() {
@@ -75,6 +106,7 @@ async function fixture(t) {
     invoke,
     emit,
     guest,
+    resize,
     url,
   };
 }
@@ -425,14 +457,7 @@ test(
       [960, 780],
       [960, 795],
     ]) {
-      const accepted = await b.app.evaluate(
-        ({ BrowserWindow }, { width, height }) => {
-          const window = BrowserWindow.getAllWindows()[0];
-          window.setContentSize(width, height);
-          return window.getContentSize();
-        },
-        { width, height },
-      );
+      const accepted = await b.resize(width, height);
       // macOS constrains a window to the runner's available display height;
       // Windows may round a DIP by one pixel at fractional desktop scaling.
       // Verify the size the OS accepted, without claiming the request was met.
@@ -667,7 +692,7 @@ test(
     await expect
       .poll(() => b.app.evaluate(() => Boolean(globalThis.__resizeBackdropCaptures[0]?.pixels)))
       .toBe(true);
-    await b.app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].setContentSize(980, 720));
+    await b.resize(980, 720);
     await b.invoke('settings:update', { values: { pageRadius: 16 } });
     await expect(b.shell.locator('#page-backdrop img')).toHaveCount(0);
     await b.app.evaluate(async () => {
@@ -690,7 +715,23 @@ test(
     // Native hidden views can defer resizing. Dismissal resumes the unchanged
     // document; the next ordinary opening takes its actual newly painted frame.
     await b.shell.keyboard.press('Escape');
-    const resized = await b.app.evaluate(() => globalThis.__resizeBackdropView.getBounds());
+    await expect(b.shell.locator('#command-input')).toHaveCount(0);
+    let resized;
+    await expect
+      .poll(async () => {
+        const rectangle = await b.shell.locator('#workspace').boundingBox();
+        const native = await b.app.evaluate(() => ({
+          visible: globalThis.__resizeBackdropView.getVisible(),
+          bounds: globalThis.__resizeBackdropView.getBounds(),
+        }));
+        resized = native.bounds;
+        return (
+          native.visible &&
+          Boolean(rectangle) &&
+          ['x', 'y', 'width', 'height'].every((key) => Math.round(rectangle[key]) === native.bounds[key])
+        );
+      })
+      .toBe(true);
     assert.notDeepEqual(resized, before.bounds);
     await expect
       .poll(() => b.guest('({width:innerWidth,height:innerHeight})'))
@@ -753,7 +794,7 @@ test(
     await b.shell.evaluate(() => {
       window.__resizeBackdropEvents = [];
     });
-    await b.app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].setContentSize(1120, 780));
+    await b.resize(1120, 780);
     await expect(b.shell.locator('#page-backdrop img')).toHaveCount(0);
     await expect.poll(() => b.shell.evaluate(() => window.__resizeBackdropEvents.at(-1)?.length)).toBe(0);
     await expect(b.shell.locator('#command-input')).toBeFocused();

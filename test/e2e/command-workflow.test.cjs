@@ -532,9 +532,28 @@ test(
         },
         { width, height, origin: sizes.origin },
       );
-      const accepted = await b.app.evaluate(({ BrowserWindow }) =>
-        BrowserWindow.getAllWindows()[0].getContentSize(),
-      );
+      let accepted,
+        previous,
+        stableObservations = 0;
+      // A display may clamp Cocoa's initial accepted size asynchronously.
+      // Use the settled native/renderer geometry for the layout assertions.
+      await expect
+        .poll(
+          async () => {
+            const native = await b.app.evaluate(({ BrowserWindow }) =>
+              BrowserWindow.getAllWindows()[0].getContentSize(),
+            );
+            const rendered = await b.shell.evaluate(() => [innerWidth, innerHeight]);
+            const signature = native.join(':');
+            const agrees = native.every((value, index) => value === rendered[index]);
+            stableObservations = agrees && signature === previous ? stableObservations + 1 : agrees ? 1 : 0;
+            previous = signature;
+            accepted = native;
+            return stableObservations >= 3;
+          },
+          { intervals: [50, 100, 100] },
+        )
+        .toBe(true);
       t.diagnostic(
         `${name} shortcut viewport: requested ${width}×${height}, native accepted ${accepted.join('×')}`,
       );
@@ -544,14 +563,6 @@ test(
           'The second geometry check must exercise the real native minimum window',
         );
       }
-      await expect
-        .poll(() =>
-          b.shell.evaluate(
-            ({ width, height }) => Math.abs(innerWidth - width) <= 2 && Math.abs(innerHeight - height) <= 2,
-            { width: accepted[0], height: accepted[1] },
-          ),
-        )
-        .toBe(true);
       await expect
         .poll(() =>
           b.shell
