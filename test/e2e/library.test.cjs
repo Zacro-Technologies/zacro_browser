@@ -151,7 +151,12 @@ test(
     await expect(menu).toHaveCount(0);
     await library.click();
     await menu.locator('[data-key="panel-bookmarks"]').click();
-    await expect(shell.locator('#side-panel')).toHaveCSS('background-color', 'rgba(0, 0, 0, 0)');
+    // Accessibility preferences may make both rails opaque. Library must
+    // share the sidebar's window material in either transparency mode.
+    await expect(shell.locator('#side-panel')).toHaveCSS(
+      'background-color',
+      await shell.locator('#sidebar').evaluate((element) => getComputedStyle(element).backgroundColor),
+    );
     await expect(shell.locator('#side-panel')).toHaveCSS('backdrop-filter', 'none');
     await expect(shell.locator('.resource-title')).toHaveText('Library reference');
     assert.equal(await app.evaluate(() => globalThis.libraryCaptures), 0);
