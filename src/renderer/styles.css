@@ -3327,6 +3327,9 @@ details.setting-section[open] > :not(summary) {
   font-size: 12px;
   color: var(--muted);
 }
+.dialog-backdrop:has(.space-theme-dialog) {
+  --dialog-top: clamp(24px, 5vh, 48px);
+}
 .space-theme-dialog {
   width: 460px;
   max-height: min(760px, calc(100vh - var(--dialog-top) - 24px));
