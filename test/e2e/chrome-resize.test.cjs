@@ -197,7 +197,7 @@ test(
   async (t) => {
     const session = await fixture(t);
     const browser = await session.launch();
-    await browser.windowSize(1320, 850);
+    const wideSize = await browser.windowSize(1320, 850);
     await browser.navigate();
     await browser.openLibrary();
     const sidebar = browser.shell.getByRole('separator', { name: 'Resize sidebar', exact: true });
@@ -219,7 +219,8 @@ test(
     await key(panel, 'panel', 'ArrowLeft', 352);
     await key(panel, 'panel', 'ArrowRight', 336);
     await key(panel, 'panel', 'Home', 260);
-    await key(panel, 'panel', 'End', 560);
+    const panelMaximum = Math.min(560, wideSize[0] - 224 - 240 - 16);
+    await key(panel, 'panel', 'End', panelMaximum);
     await panel.dblclick();
     await expect.poll(async () => (await browser.state()).settings.panelWidth).toBe(336);
 
