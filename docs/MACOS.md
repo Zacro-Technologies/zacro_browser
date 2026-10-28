@@ -2,7 +2,7 @@
 
 The Mac implementation targets **macOS 13 or later**, on **Apple silicon (`arm64`) and Intel (`x64`)**. Version **0.9**, at runtime `8069153e0b5fc43fb5a0bcfdf4f96b1ab32e452b`, combines native window translucency, resizable browser rails, a compact Library chooser and distinct Favorites, Pinned Tabs and Today tabs with continuous Space colors, sharp command-palette backgrounds and animated Peek previews.
 
-Both Mac architectures passed **202 unit/security checks, 86 native desktop cases and one packaged-application check**, with one Windows-only skip each, in [CI run 40706282417 at `0810fd1`](https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40706282417). Development DMG/ZIP creation and all validation/package uploads passed. The runtime is unchanged by that revision's test-readiness fixes. [VALIDATION.md](VALIDATION.md) records subsequent test-only verification and exact evidence.
+Both Mac architectures passed **202 unit/security checks, 86 native desktop cases and one packaged-application check**, with one Windows-only skip each, in [final CI run 40713486954 at `dc0f445`](https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40713486954). Development DMG/ZIP creation and all validation/package uploads passed. The runtime is unchanged by that revision's test-readiness fixes. [VALIDATION.md](VALIDATION.md) records the exact evidence.
 
 These are native CI and development-package results. macOS 13 is the declared minimum, not a completed physical-device result. Physical Mac review, live Google/AI account acceptance and signed/notarized distribution remain open; Google sign-in is currently blocked as detailed below.
 
@@ -116,7 +116,7 @@ Passing a build is only one release gate. A Mac release still needs clean-machin
 
 ## Native verification
 
-The GitHub Actions workflow has separate `macos-15` Apple silicon and `macos-15-intel` jobs. At the **0.9 runtime `8069153`**, both passed in [run 40706282417 at test revision `0810fd1`](https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40706282417):
+The GitHub Actions workflow has separate `macos-15` Apple silicon and `macos-15-intel` jobs. At the **0.9 runtime `8069153`**, both passed in [final run 40713486954 at test revision `dc0f445`](https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40713486954):
 
 | Check | Apple silicon | Intel |
 | --- | --- | --- |

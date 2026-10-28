@@ -6,7 +6,7 @@ Validated locally on Windows 11 x64 (OS build 26200), Node.js 24.19.0, Electron 
 
 The final runtime is **`8069153`**. The changes distinguish profile-wide Favorites, per-Space pins and Today tabs; balance Favorite rows; preserve pin destinations and icons; use a 12-hour archive default with profile overrides; blend Space appearance continuously; and coordinate native Peek motion without scaling the document.
 
-Cross-platform [CI at `0810fd1`](https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40706282417) passed with the same runtime:
+Final cross-platform [CI at `dc0f445`](https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40713486954) completed successfully on October 29, 2026 (JST), with the same runtime:
 
 | Platform | Unit/security | Native desktop | Packaged app | Additional |
 | --- | --- | --- | --- | --- |
@@ -14,7 +14,7 @@ Cross-platform [CI at `0810fd1`](https://github.com/Zacro-Technologies/zacro_bro
 | macOS, Apple silicon | 202 passed | 86 passed; 1 Windows-only skip | 1 passed | Development DMG/ZIP and both uploads passed |
 | macOS, Intel | 202 passed | 86 passed; 1 Windows-only skip | 1 passed | Development DMG/ZIP and both uploads passed |
 
-All three jobs and the overall run completed successfully, including formatting, syntax and all five artifact uploads. The Mac packages are ad hoc signed development builds, not notarized releases. Decoded logs and artifact provenance are retained under `test-results/ci-40706282417/`.
+All three jobs and the overall run completed successfully, including formatting, syntax and all five artifact uploads. The Mac packages are ad hoc signed development builds, not notarized releases. Decoded logs and artifact provenance are retained under `test-results/ci-40713486954/`. The subsequent publication commits change documentation and its generator only; the tested application runtime is unchanged.
 
 Local verification on October 28–29, 2026 (JST):
 
