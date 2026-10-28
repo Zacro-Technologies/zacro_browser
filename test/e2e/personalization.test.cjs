@@ -1,6 +1,7 @@
 'use strict';
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
+const { createHash } = require('node:crypto');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const os = require('node:os');
@@ -605,5 +606,263 @@ test(
           (await b.invoke('state:get')).profiles.find((item) => item.id === profile.id).archiveAfterHours,
       )
       .toBe(null);
+  },
+);
+
+test(
+  'resizing a palette clears pending and settled backdrops and its next opening captures the resized page',
+  { timeout: 45000 },
+  async (t) => {
+    const b = await fixture(t);
+    await b.invoke('navigate', { url: b.url });
+    await expect.poll(() => b.guest('document.readyState')).toBe('complete');
+    await b.guest(
+      'window.resizeDraft="Keep the page";document.querySelector("textarea").value="Unsaved draft";undefined',
+    );
+    await b.guest('new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))');
+    await b.shell.evaluate(() => {
+      window.__resizeBackdropEvents = [];
+      window.zacro.onEvent((event) => {
+        if (event.type === 'page:backdrop') window.__resizeBackdropEvents.push(event.frames);
+      });
+    });
+    const before = await b.app.evaluate(({ BrowserWindow }, url) => {
+      const view = BrowserWindow.getAllWindows()[0].contentView.children.find(
+        (item) => item.webContents?.getURL() === url,
+      );
+      const contents = view.webContents;
+      const originalCapture = contents.capturePage.bind(contents);
+      const originalVisible = view.setVisible.bind(view);
+      const originalRadius = view.setBorderRadius.bind(view);
+      globalThis.__resizeBackdropView = view;
+      globalThis.__resizeBackdropCaptures = [];
+      globalThis.__resizeBackdropVisibility = [];
+      globalThis.__resizeBackdropRadii = [];
+      view.setVisible = (visible) => {
+        globalThis.__resizeBackdropVisibility.push(visible);
+        originalVisible(visible);
+      };
+      view.setBorderRadius = (radius) => {
+        globalThis.__resizeBackdropRadii.push(radius);
+        originalRadius(radius);
+      };
+      contents.capturePage = (...args) => {
+        const record = { id: contents.id, bounds: view.getBounds(), visible: view.getVisible() };
+        globalThis.__resizeBackdropCaptures.push(record);
+        const result = originalCapture(...args).then((image) => {
+          const bytes = image.toPNG({ scaleFactor: Math.max(...image.getScaleFactors()) });
+          record.pixels = { width: bytes.readUInt32BE(16), height: bytes.readUInt32BE(20) };
+          return image;
+        });
+        if (globalThis.__resizeBackdropCaptures.length === 1)
+          return new Promise((resolve) => {
+            globalThis.__releaseResizeBackdrop = async () => resolve(await result);
+          });
+        return result;
+      };
+      return { id: contents.id, zoom: contents.getZoomFactor(), bounds: view.getBounds() };
+    }, b.url);
+    await b.emit({ type: 'command', mode: 'newtab', query: 'Keep this unfinished search' });
+    await expect(b.shell.locator('#command-input')).toBeFocused();
+    await expect
+      .poll(() => b.app.evaluate(() => Boolean(globalThis.__resizeBackdropCaptures[0]?.pixels)))
+      .toBe(true);
+    await b.app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].setContentSize(980, 720));
+    await b.invoke('settings:update', { values: { pageRadius: 16 } });
+    await expect(b.shell.locator('#page-backdrop img')).toHaveCount(0);
+    await b.app.evaluate(async () => {
+      await globalThis.__releaseResizeBackdrop();
+    });
+    await b.invoke('state:get');
+    const published = await b.shell.evaluate(() =>
+      window.__resizeBackdropEvents.flat().map((frame) => frame.bounds),
+    );
+    assert.deepEqual(published, [], 'The pre-resize copy never publishes at its former bounds');
+    assert.equal(await b.app.evaluate(() => globalThis.__resizeBackdropCaptures.length), 1);
+    assert(
+      (await b.app.evaluate(() => globalThis.__resizeBackdropVisibility)).every(
+        (visible) => visible === false,
+      ),
+    );
+    await expect(b.shell.locator('#command-input')).toBeFocused();
+    await expect(b.shell.locator('#command-input')).toHaveValue('Keep this unfinished search');
+
+    // Native hidden views can defer resizing. Dismissal resumes the unchanged
+    // document; the next ordinary opening takes its actual newly painted frame.
+    await b.shell.keyboard.press('Escape');
+    const resized = await b.app.evaluate(() => globalThis.__resizeBackdropView.getBounds());
+    assert.notDeepEqual(resized, before.bounds);
+    await expect
+      .poll(() => b.guest('({width:innerWidth,height:innerHeight})'))
+      .toEqual({ width: resized.width, height: resized.height });
+    await b.guest('new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))');
+    await b.app.evaluate(() => {
+      globalThis.__resizeBackdropVisibility = [];
+    });
+    await b.emit({ type: 'command', mode: 'newtab', query: 'Keep this unfinished search' });
+    await expect(b.shell.locator('#page-backdrop img')).toHaveCount(1);
+    await b.shell.locator('#page-backdrop img').evaluate((image) => image.decode());
+    const after = await b.app.evaluate(({ BrowserWindow, webContents, screen }) => ({
+      id: globalThis.__resizeBackdropView.webContents.id,
+      zoom: globalThis.__resizeBackdropView.webContents.getZoomFactor(),
+      bounds: globalThis.__resizeBackdropView.getBounds(),
+      capture: globalThis.__resizeBackdropCaptures.at(-1),
+      visible: globalThis.__resizeBackdropView.getVisible(),
+      visibleCalls: globalThis.__resizeBackdropVisibility,
+      radii: globalThis.__resizeBackdropRadii,
+      firstPixels: globalThis.__resizeBackdropCaptures[0].pixels,
+      displayScale: screen.getDisplayMatching(BrowserWindow.getAllWindows()[0].getBounds()).scaleFactor,
+      shellFocused:
+        webContents.getFocusedWebContents()?.id === BrowserWindow.getAllWindows()[0].webContents.id,
+    }));
+    const rendered = await b.shell.locator('.page-backdrop-frame').evaluate((clip) => {
+      const rect = clip.getBoundingClientRect();
+      const image = clip.querySelector('img');
+      return {
+        bounds: {
+          x: Math.round(rect.x),
+          y: Math.round(rect.y),
+          width: Math.round(rect.width),
+          height: Math.round(rect.height),
+        },
+        pixels: { width: image.naturalWidth, height: image.naturalHeight },
+        radius: getComputedStyle(clip).borderRadius,
+      };
+    });
+    assert.deepEqual(rendered.bounds, after.bounds);
+    assert.deepEqual(rendered.pixels, after.capture.pixels);
+    assert.notDeepEqual(rendered.pixels, after.firstPixels);
+    assert.deepEqual(rendered.pixels, {
+      width: Math.ceil(after.bounds.width * after.displayScale),
+      height: Math.ceil(after.bounds.height * after.displayScale),
+    });
+    assert.equal(rendered.radius, '16px');
+    assert(after.radii.includes(16));
+    assert(
+      after.visibleCalls.every((visible) => visible === false),
+      'No live surface flashes over the palette',
+    );
+    assert.equal(after.visible, false);
+    assert.equal(after.id, before.id);
+    assert.equal(after.zoom, before.zoom);
+    assert.equal(after.shellFocused, true);
+    await expect(b.shell.locator('#command-input')).toBeFocused();
+    await expect(b.shell.locator('#command-input')).toHaveValue('Keep this unfinished search');
+
+    // A settled snapshot is also removed immediately when its geometry changes.
+    await b.shell.evaluate(() => {
+      window.__resizeBackdropEvents = [];
+    });
+    await b.app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].setContentSize(1120, 780));
+    await expect(b.shell.locator('#page-backdrop img')).toHaveCount(0);
+    await expect.poll(() => b.shell.evaluate(() => window.__resizeBackdropEvents.at(-1)?.length)).toBe(0);
+    await expect(b.shell.locator('#command-input')).toBeFocused();
+    await expect(b.shell.locator('#command-input')).toHaveValue('Keep this unfinished search');
+    await b.shell.keyboard.press('Escape');
+    assert.deepEqual(await b.guest('[window.resizeDraft,document.querySelector("textarea").value]'), [
+      'Keep the page',
+      'Unsaved draft',
+    ]);
+  },
+);
+
+test(
+  '4K HiDPI backdrop representations retain backing pixels and oversized captures are omitted',
+  { timeout: 45000 },
+  async (t) => {
+    const browser = await fixture(t);
+    const url = browser.url;
+    await browser.invoke('navigate', { url });
+    await expect.poll(() => browser.guest('document.readyState')).toBe('complete');
+    await browser.guest('window.backdropDraft="Keep this document"');
+    await browser.shell.evaluate(() => {
+      window.__qualityFrames = [];
+      window.zacro.onEvent((event) => {
+        if (event.type === 'page:backdrop') window.__qualityFrames.push(event.frames);
+      });
+    });
+    const expected = await browser.app.evaluate(({ nativeImage, webContents }, url) => {
+      // A genuine NativeImage with only a 2x representation reproduces Retina
+      // encoding semantics independently of the display attached to the runner.
+      const bitmap = Buffer.alloc(3840 * 2160 * 4, 255);
+      bitmap.fill(0, 0, 3840 * 4);
+      const image = nativeImage.createFromBitmap(bitmap, { width: 3840, height: 2160, scaleFactor: 2 });
+      const bytes = image.toPNG({ scaleFactor: 2 });
+      globalThis.__qualityMode = 'full';
+      globalThis.__qualityEncodes = 0;
+      let roundingBoundary;
+      const contents = webContents.getAllWebContents().find((item) => item.getURL() === url);
+      contents.capturePage = async () => {
+        if (globalThis.__qualityMode === 'rounding' && !roundingBoundary)
+          roundingBoundary = nativeImage.createFromBitmap(Buffer.alloc(4097 * 4096 * 4, 255), {
+            width: 4097,
+            height: 4096,
+            scaleFactor: 2,
+          });
+        const frame = globalThis.__qualityMode === 'rounding' ? roundingBoundary : image;
+        return {
+          isEmpty: () => frame.isEmpty(),
+          getScaleFactors: () => frame.getScaleFactors(),
+          getSize: (scale) =>
+            globalThis.__qualityMode === 'pixels' ? { width: 2048, height: 2049 } : frame.getSize(scale),
+          toPNG: (options) => {
+            globalThis.__qualityEncodes++;
+            return globalThis.__qualityMode === 'bytes'
+              ? Buffer.alloc(20 * 1024 * 1024 + 1)
+              : frame.toPNG(options);
+          },
+        };
+      };
+      return {
+        scales: image.getScaleFactors(),
+        size: image.getSize(2),
+        pngSize: { width: bytes.readUInt32BE(16), height: bytes.readUInt32BE(20) },
+        png: bytes.toString('base64'),
+      };
+    }, url);
+    assert.deepEqual(expected.scales, [2]);
+    assert.deepEqual(expected.size, { width: 1920, height: 1080 });
+    assert.deepEqual(
+      expected.pngSize,
+      { width: 3840, height: 2160 },
+      'PNG retains the actual backing pixels of a 2x representation',
+    );
+    await browser.shell.locator('[data-key="address"]').click();
+    await expect(browser.shell.locator('#page-backdrop img')).toHaveCount(1);
+    await browser.shell.locator('#page-backdrop img').evaluate((image) => image.decode());
+    const rendered = await browser.shell.locator('#page-backdrop img').evaluate((image) => ({
+      width: image.naturalWidth,
+      height: image.naturalHeight,
+      src: image.src,
+    }));
+    assert.deepEqual({ width: rendered.width, height: rendered.height }, expected.pngSize);
+    const bytes = Buffer.from(rendered.src.slice('data:image/png;base64,'.length), 'base64');
+    assert.equal(
+      createHash('sha256').update(bytes).digest('hex'),
+      createHash('sha256').update(Buffer.from(expected.png, 'base64')).digest('hex'),
+    );
+    await browser.shell.keyboard.press('Escape');
+    await expect(browser.shell.locator('#command-input')).toHaveCount(0);
+
+    // The odd-pixel 2x image rounds down to 2048×2048 logical pixels. Only
+    // checking the encoded IHDR catches its one-column-over-16M bitmap.
+    for (const mode of ['pixels', 'rounding', 'bytes']) {
+      await browser.app.evaluate((_electron, mode) => {
+        globalThis.__qualityMode = mode;
+        globalThis.__qualityEncodes = 0;
+      }, mode);
+      await browser.shell.evaluate(() => {
+        window.__qualityFrames = [];
+      });
+      await browser.shell.locator('[data-key="address"]').click();
+      await expect(browser.shell.locator('#command-input')).toBeFocused();
+      await expect.poll(() => browser.shell.evaluate(() => window.__qualityFrames.at(-1)?.length)).toBe(0);
+      assert.equal(await browser.app.evaluate(() => globalThis.__qualityEncodes), mode === 'pixels' ? 0 : 1);
+      await expect(browser.shell.locator('#page-backdrop img')).toHaveCount(0);
+      await browser.shell.locator('#command-input').fill('The palette stays interactive');
+      await browser.shell.keyboard.press('Escape');
+      await expect(browser.shell.locator('#command-input')).toHaveCount(0);
+      assert.equal(await browser.guest('window.backdropDraft'), 'Keep this document');
+    }
   },
 );

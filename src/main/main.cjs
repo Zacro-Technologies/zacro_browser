@@ -78,6 +78,7 @@ let popupTimes = [];
 let pendingAuth = null;
 let backdropGeneration = 0;
 let backdropContext = null;
+let backdropGeometry = null;
 const MAX_BACKDROP_PIXELS = 16 * 1024 * 1024;
 const MAX_BACKDROP_BYTES = 20 * 1024 * 1024;
 let windowReady = null;
@@ -219,7 +220,21 @@ function report(error) {
 function clearBackdrop() {
   backdropGeneration++;
   backdropContext = null;
+  backdropGeometry = null;
   emit({ type: 'page:backdrop', frames: [] });
+}
+function backdropLayoutKey() {
+  return JSON.stringify([
+    ...win.getContentSize(),
+    layout.sidebarWidth,
+    layout.panelWidth,
+    layout.contentTop,
+    store.state.settings.pageGutter,
+    store.state.settings.pageRadius,
+    screen.getDisplayMatching(win.getBounds()).scaleFactor,
+    Boolean(splitPair),
+    peek && [peek.id, Math.round(peek.offset || 0)],
+  ]);
 }
 async function captureBackdrop() {
   const generation = ++backdropGeneration;
@@ -238,6 +253,7 @@ async function captureBackdrop() {
     contentIds: new Set(entries.map((entry) => entry.contents.id)),
   };
   backdropContext = context;
+  backdropGeometry = backdropLayoutKey();
   for (const entry of entries) entry.backdropCaptureGeneration = generation;
   const frames = await Promise.all(
     entries.map(async (entry) => {
@@ -1348,6 +1364,11 @@ function reconcile() {
 }
 function arrangeViews() {
   if (!validWindow()) return;
+  if (layout.overlay && backdropGeometry && backdropGeometry !== backdropLayoutKey())
+    // Hidden native surfaces defer viewport resizing on some platforms. Omit
+    // stale pixels until the next opening rather than stretch the old bitmap
+    // or expose the live page above the dialog to force another compositor copy.
+    clearBackdrop();
   const [width, height] = win.getContentSize();
   const rectangles = browserLayout({
     width,

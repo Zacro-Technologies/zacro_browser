@@ -40,6 +40,38 @@ test(
     const invoke = (action, payload = {}) =>
       shell.evaluate(([action, payload]) => window.zacro.invoke(action, payload), [action, payload]);
     const state = () => invoke('state:get');
+    await shell.evaluate(() => {
+      window.zacro.onState((state) => {
+        window.__materialPublishedSpace = {
+          id: state.activeSpaceId,
+          opacity: state.spaces.find((space) => space.id === state.activeSpaceId)?.theme.opacity,
+        };
+      });
+    });
+    const settleRenderedSpace = async (id, opacity) => {
+      await expect
+        .poll(() =>
+          shell.evaluate(
+            ({ id, opacity }) =>
+              window.__materialPublishedSpace?.id === id &&
+              window.__materialPublishedSpace?.opacity === opacity &&
+              document.querySelector('.space-dot.active')?.dataset.id === id &&
+              !document.querySelector('.space-transition-snapshot') &&
+              !document
+                .getAnimations()
+                .some(
+                  (animation) =>
+                    animation.effect?.target?.matches('#sidebar-content > .space-page') &&
+                    (animation.playState === 'running' || animation.pending),
+                ),
+            { id, opacity },
+          ),
+        )
+        .toBe(true);
+      // The renderer's completion handler submits its token-scoped release
+      // before removing the snapshot. Flush that IPC before injecting a lease.
+      await state();
+    };
     await invoke('navigate', { url });
     await expect
       .poll(() =>
@@ -176,17 +208,30 @@ test(
     );
     await invoke('space:update', { id: spaceId, theme: { opacity: 100 } });
     await expect.poll(async () => (await state()).runtime.windowMaterial.requestedOpacity).toBe(100);
+    // state:get can see saved opacity 100 before the debounced state event
+    // reaches the renderer. Its older 55% appearance would otherwise start an
+    // independent real lease during the following host-token assertions.
+    await settleRenderedSpace(spaceId, 100);
     const lease = { token: 'material-test-first', fromId: spaceId, toId: nextSpace.id, opacity: 0 };
     await invoke('window:space-material-transition', lease);
     assert.equal((await state()).runtime.windowMaterial.requestedOpacity, 0);
     await invoke('space:activate', { id: nextSpace.id });
+    await settleRenderedSpace(nextSpace.id, 100);
     assert.equal(
       (await state()).runtime.windowMaterial.requestedOpacity,
       0,
       'Native material remains available across activation until the visual transition releases it',
     );
     await invoke('window:space-material-transition', { ...lease, token: 'material-test-next', opacity: 30 });
-    await invoke('window:space-material-transition', { clear: true, token: lease.token });
+    const afterStaleClear = await invoke('window:space-material-transition', {
+      clear: true,
+      token: lease.token,
+    });
+    assert.equal(
+      afterStaleClear.requestedOpacity,
+      30,
+      'A stale token must preserve the current lease immediately',
+    );
     assert.equal(
       (await state()).runtime.windowMaterial.requestedOpacity,
       30,
