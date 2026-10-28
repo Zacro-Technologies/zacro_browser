@@ -207,3 +207,96 @@ test('browser defaults and custom bindings take priority over extension shortcut
   host.handleShortcut(event, { type: 'keyDown', key: 'u', meta: true, shift: true }, contents);
   assert.deepEqual(calls, ['sidebar-toggle', 'sidebar-toggle', 'extension']);
 });
+
+test('Peek promotion adopts the live document and retires its synchronous reservation', () => {
+  const fs = require('node:fs'),
+    path = require('node:path'),
+    vm = require('node:vm');
+  const { BrowserStore } = require('../src/core/store.cjs');
+  const main = fs.readFileSync(path.join(__dirname, '../src/main/main.cjs'), 'utf8');
+  const store = new BrowserStore();
+  const first = store.dispatch('tab:create', { url: 'https://example.test/parent' });
+  const allocated = [];
+  let id = 100;
+  const makeEntry = (_profile, tabId) => {
+    const entry = {
+      tabId,
+      dormant: true,
+      view: {},
+      contents: {
+        id: id++,
+        isDestroyed: () => !!entry.dead,
+        close: () => {
+          entry.dead = true;
+        },
+      },
+    };
+    allocated.push(entry);
+    return entry;
+  };
+  const preview = makeEntry(first.profileId, null);
+  preview.dormant = false;
+  preview.document = { draft: 'retained POST response' };
+  Object.assign(preview.contents, { getURL: () => 'https://example.test/result', getTitle: () => 'Result' });
+  const host = vm.createContext({
+    store,
+    views: new Map(),
+    createEntry: makeEntry,
+    validWindow: () => true,
+    win: { contentView: { removeChildView: () => {} } },
+    quitting: false,
+    closingWindow: false,
+    pruneRetainedFavicons: () => {},
+    activeSpace: () => store.state.spaces[0],
+    backdropContext: null,
+    pendingAuth: null,
+    lastProfileId: null,
+    extensionHost: null,
+    syncPinNavigation: () => {},
+    publishExtensionTabChanges: () => {},
+    resolveSplit: () => null,
+    splitPair: null,
+    splitTabId: null,
+    extensionsReady: false,
+    nativeTheme: { themeSource: 'system' },
+    syncWindowMaterial: () => {},
+    arrangeViews: () => {},
+    publish: () => {},
+    peekRequestSerial: 0,
+    cancelPeekMotion: () => {},
+    focusContentOrChrome: () => {},
+    peek: { entry: preview, spaceId: store.state.activeSpaceId, profileId: first.profileId },
+  });
+  const extract = (from, to) => main.slice(main.indexOf(from), main.indexOf(to, main.indexOf(from)));
+  new vm.Script(
+    extract('function destroyEntry(', 'function requestCloseEntry(') +
+      extract('function adoptView(', 'function publishExtensionTabChanges(') +
+      extract('function promotePeek(', 'function showPageMenu('),
+  ).runInContext(host);
+  host.reconcile();
+  store.on('change', () => host.reconcile());
+  const promoted = host.promotePeek();
+  assert.equal(host.views.get(promoted.id), preview);
+  assert.equal(preview.document.draft, 'retained POST response');
+  assert.equal(preview.dead, undefined);
+  assert.equal(allocated.length, 3, 'dispatch synchronously creates a reservation before adoption');
+  assert.equal(allocated.at(-1).dead, true);
+  assert.equal(allocated.at(-1).disposing, true, 'reservation destruction cannot close the promoted tab');
+  assert.deepEqual(
+    allocated
+      .filter((entry) => !entry.dead)
+      .map((entry) => entry.contents.id)
+      .sort(),
+    [...host.views.values()].map((entry) => entry.contents.id).sort(),
+  );
+  assert.equal(store.state.activeTabId, promoted.id);
+  assert.equal(store.state.tabs.length, 2);
+});
+
+test('tabless profiles expose no active extension tab ID', () => {
+  const browser = createBrowserAdapter({
+    store: { state: { tabs: [], activeTabId: null } },
+    views: new Map(),
+  });
+  assert.equal(browser.activeTabId('p'), undefined);
+});

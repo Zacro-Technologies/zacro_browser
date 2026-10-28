@@ -18,14 +18,24 @@ function panelBounds(size, layout) {
   const width = Math.max(1, Math.round(size[0])),
     height = Math.max(1, Math.round(size[1]));
   const page = browserLayout({ width, height, ...layout }).primary;
+  // The renderer owns the rail, header and animation geometry. Clamp its
+  // measured content rectangle to the native window; the fallback uses the
+  // same 42px header for callers without a shell measurement.
+  const measured = layout.extensionPanelBounds;
+  const valid = measured && ['x', 'y', 'width', 'height'].every((key) => Number.isFinite(measured[key]));
   const requested = Number.isFinite(layout.panelWidth) ? layout.panelWidth : 0;
-  const panelWidth = Math.max(
-    1,
-    Math.min(width, Math.round(Math.max(0, Math.min(requested, width - page.x - 316)))),
-  );
-  const x = Math.max(0, width - panelWidth - Math.min(8, width - panelWidth));
-  const y = Math.min(height - 1, page.y + 48);
-  return { x, y, width: panelWidth, height: Math.max(1, height - y - Math.min(8, height - y - 1)) };
+  const left = valid ? measured.x : width - Math.max(0, Math.min(width, requested));
+  const top = valid ? measured.y : page.y + 42;
+  const x = Math.max(0, Math.min(width - 1, Math.round(left)));
+  const y = Math.max(0, Math.min(height - 1, Math.round(top)));
+  const right = valid ? Math.round(measured.x + measured.width) : width;
+  const bottom = valid ? Math.round(measured.y + measured.height) : height;
+  return {
+    x,
+    y,
+    width: Math.max(1, Math.min(width, right) - x),
+    height: Math.max(1, Math.min(height, bottom) - y),
+  };
 }
 class SidePanelController {
   constructor(options) {

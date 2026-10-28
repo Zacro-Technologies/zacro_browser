@@ -768,7 +768,7 @@ function createEntry(profileId, tabId = null, suppliedOptions = {}) {
         child.openerTabId = opener.id;
         child.requestedURL = url || 'about:blank';
         child.blankPopup = blank;
-        views.set(tab.id, child);
+        adoptView(tab, child);
         if (details.disposition !== 'background-tab') {
           // Complete Chromium's popup creation before a preview can be closed.
           setImmediate(() => invoke('tab:activate', { id: tab.id }).catch(report));
@@ -1429,6 +1429,15 @@ async function requestClosePeek({ supersede = true } = {}) {
   })();
   return current.closePromise;
 }
+function adoptView(tab, entry) {
+  // tab:create synchronously reconciles and reserves a dormant native ID.
+  // The supplied popup/Peek document owns this tab now; retire that reservation
+  // before replacing the map entry so every native view remains accounted for.
+  const reserved = views.get(tab.id);
+  if (reserved && reserved !== entry) destroyEntry(reserved);
+  entry.tabId = tab.id;
+  views.set(tab.id, entry);
+}
 function reserveView(tab) {
   if (!views.has(tab.id)) views.set(tab.id, createEntry(tab.profileId, tab.id));
   return views.get(tab.id);
@@ -1597,7 +1606,7 @@ function arrangeViews() {
       );
     }
   }
-  extensionHost?.sidePanel?.arrange(layout);
+  extensionHost?.sidePanel?.arrange({ ...layout, pageGutter: store.state.settings.pageGutter });
 }
 async function openPeek(url, source = activeTab()) {
   url = webURL(url);
@@ -1650,8 +1659,7 @@ function promotePeek({ interruptClose = false } = {}) {
   const tab = store.dispatch('tab:create', { url, spaceId: current.spaceId, active: false });
   peek = null;
   // Reuse the living page, including its scroll position and back stack.
-  current.entry.tabId = tab.id;
-  views.set(tab.id, current.entry);
+  adoptView(tab, current.entry);
   store.dispatch('tab:activate', { id: tab.id });
   if (current.entry.faviconURL === url) rememberFavicon(current.entry, url, current.entry.favicon);
   const title = current.entry.contents.getTitle() || tab.title;
@@ -2525,6 +2533,11 @@ async function invoke(action, payload = {}) {
       if (nextOverlay && !previousOverlay) arrangeViews();
       layout.overlay = nextOverlay;
       if (typeof payload.extensionPanel === 'boolean') layout.extensionPanel = payload.extensionPanel;
+      layout.extensionPanelBounds =
+        payload.extensionPanelBounds &&
+        ['x', 'y', 'width', 'height'].every((key) => Number.isFinite(payload.extensionPanelBounds[key]))
+          ? payload.extensionPanelBounds
+          : null;
       if (layout.overlay && !previousOverlay) void captureBackdrop();
       else if (!layout.overlay && previousOverlay) clearBackdrop();
       arrangeViews();
@@ -3393,6 +3406,8 @@ if (singleInstance)
         getSession: profileSession,
         getWindow: () => win,
         browser: extensionBrowser,
+        browserShortcutClaimed: (input) =>
+          Boolean(matchShortcut(input, process.platform, store.state.settings.shortcutOverrides)),
         panelChanged: () => {
           arrangeViews();
           publish();

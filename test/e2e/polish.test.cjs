@@ -178,7 +178,8 @@ test(
     });
     assert.equal(geometry.sidebarWidth, 224);
     assert(
-      geometry.rows[0].top <= 190,
+      // macOS reserves four additional pixels for its native title controls.
+      geometry.rows[0].top <= (process.platform === 'darwin' ? 194 : 190),
       'Navigation, favorites and a folder must leave the working tabs near the top',
     );
     assert(geometry.rows.every((row) => row.height === 32 && row.bottom < geometry.footerTop));
@@ -838,6 +839,8 @@ test(
     const browser = await launch(t);
     await browser.navigate(`${base}/reload`);
     const initial = requests.get('/reload');
+    // F5 is an alias on Windows/Linux; macOS retains its Command+R default.
+    await browser.invoke('shortcut:set', { id: 'reload', accelerator: 'F5' });
     await browser.shell.evaluate(() => {
       document.documentElement.dataset.reloadSentinel = 'retained';
     });

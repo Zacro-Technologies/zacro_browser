@@ -422,29 +422,22 @@ test('action updates notify the host renderer with current profile and generatio
   assert.equal(notified?.profile, 'p1');
   assert.equal(notified.state.badgeText, '8');
 });
-test('all browser and OS reserved commands remain visibly unassigned', () => {
+test('default browser shortcuts and immutable OS shortcuts remain visibly unassigned', () => {
   const { api, metadata } = setup();
   for (const shortcut of [
     'Ctrl+F',
-    'Command+D',
+    'Ctrl+D',
     'Ctrl+K',
-    'Command+H',
-    'Ctrl+J',
-    'Command+B',
-    'Command+Comma',
+    'Ctrl+S',
+    'Ctrl+Comma',
     'Ctrl+P',
     'Ctrl+Enter',
     'Ctrl+Plus',
     'Ctrl+Minus',
     'Ctrl+0',
     'Ctrl+9',
-    'Command+Tab',
-    'F5',
     'F6',
-    'F11',
-    'F12',
-    'Ctrl+Shift+I',
-    'Command+M',
+    'Command+Tab',
     'Alt+Tab',
     'Command+Space',
   ]) {
@@ -722,4 +715,65 @@ test('extensions cannot toggle local user scripts consent and native reductions 
   assert.ok((await api.call(context, 'tabs.get', [10])).url);
   metadata.activeTabRevision = 1;
   assert.equal((await api.call(context, 'tabs.get', [10])).url, undefined);
+});
+
+test('tabless commands and default popups work without granting page authority', async () => {
+  let grants = 0;
+  const { api, context, data, events, effects } = setup({ grantActiveTab: async () => grants++ });
+  data.length = 0;
+  await api.call(context, 'action.openPopup', []);
+  assert.equal(api.state(context).gesture, 0, 'programmatic popup is not a gesture');
+  await api.activateAction('p1', id, undefined);
+  await api.dispatchCommand('p1', id, 'hello', undefined);
+  assert.equal(grants, 0);
+  assert.equal(api.state(context).active.size, 0);
+  assert.equal(effects.length, 2);
+  assert.ok(effects.every((effect) => effect.tabId === undefined && effect.url.endsWith('/popup.html')));
+  assert.deepEqual(events.at(-1).slice(2), ['commands.onCommand', ['hello', undefined]]);
+  await assert.rejects(api.call(context, 'tabs.reload', []), /tab/i);
+  await assert.rejects(api.activateAction('p1', id, 999), /tab/i);
+});
+
+test('command conflicts follow the live browser shortcut owner including aliases and restored overrides', () => {
+  const { matchShortcut, updateShortcut } = require('../src/core/shortcuts.cjs');
+  let overrides = {};
+  const { api, metadata } = setup({
+    browserShortcutClaimed: (input) => !!matchShortcut(input, process.platform, overrides),
+  });
+  const set = (shortcut) => {
+    metadata.manifest.commands.hello.suggested_key = { default: shortcut };
+    return api.commandsState('p1', id)[0];
+  };
+  assert.equal(set('Ctrl+S').status, 'conflict');
+  assert.equal(set('Ctrl+Alt+S').status, 'conflict');
+  assert.equal(set('Ctrl+Shift+Y').status, 'assigned');
+  overrides = updateShortcut({}, process.platform, 'sidebar-toggle', 'Mod+Shift+Y');
+  assert.equal(set('Ctrl+Shift+Y').status, 'conflict');
+  overrides = JSON.parse(JSON.stringify(overrides));
+  assert.equal(set('Ctrl+Shift+Y').status, 'conflict', 'persisted override remains owned by browser');
+  overrides = updateShortcut(overrides, process.platform, 'reload', 'Mod+Shift+U');
+  assert.equal(set('Ctrl+R').status, 'assigned', 'released default follows the current browser owner');
+  assert.equal(set('Ctrl+Shift+U').status, 'conflict');
+  overrides = {};
+  assert.equal(set('Ctrl+Shift+Y').status, 'assigned');
+  assert.equal(set('Command+Space').status, 'conflict', 'OS reservations cannot be overridden');
+  assert.equal(set('Ctrl+C').status, 'conflict', 'editing shortcuts remain owned by the focused document');
+});
+
+test('tabless action side panels target the real window without manufacturing a tab', async () => {
+  const calls = [];
+  const { api, metadata, data, context } = setup({
+    sidePanel: {
+      recordGesture: () => calls.push('gesture'),
+      call: async (_context, name, args) => {
+        calls.push([name, args]);
+        return { openPanelOnActionClick: true };
+      },
+    },
+  });
+  metadata.grants.permissions.push('sidePanel');
+  data.length = 0;
+  await api.activateAction('p1', id, undefined);
+  assert.deepEqual(calls, ['gesture', ['getPanelBehavior', []], ['open', [{ windowId: 1 }]]]);
+  assert.equal(api.state(context).active.size, 0);
 });

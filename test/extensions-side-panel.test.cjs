@@ -133,7 +133,7 @@ test('attached panel uses bounded right region, hides for overlays and tears dow
   c.arrange({ sidebarWidth: 224, panelWidth: 336, contentTop: 8, extensionPanel: true, overlay: false });
   const v = f.created[0];
   assert.equal(f.attached.has(v), true);
-  assert.deepEqual(v.bounds, { x: 656, y: 56, width: 336, height: 636 });
+  assert.deepEqual(v.bounds, { x: 664, y: 50, width: 336, height: 650 });
   assert.deepEqual(v.options.webPreferences, {
     session: 'owned-session',
     sandbox: true,
@@ -307,4 +307,44 @@ test('self replacement still destroys its new view if the extension generation c
   await assert.rejects(c.call(origin, 'setOptions', [{ path: 'replacement.html' }]), /Expired/);
   assert.equal(c.snapshot(), null);
   assert.equal(f.created[1].dead, true);
+});
+
+test('measured panel rail aligns at minimum width and custom gutters; chooser detaches without reloading', async (t) => {
+  const f = fixture(t),
+    c = f.controller;
+  c.recordGesture(f.context);
+  await c.call(f.context, 'open', [{ windowId: 1 }]);
+  const layout = {
+    panelWidth: 336,
+    extensionPanel: true,
+    pageGutter: 20,
+    extensionPanelBounds: { x: 224, y: 62, width: 336, height: 638 },
+  };
+  assert.deepEqual(panelBounds([560, 700], layout), layout.extensionPanelBounds);
+  assert.deepEqual(
+    panelBounds([560, 700], { ...layout, extensionPanelBounds: { x: 540, y: 62, width: 336, height: 638 } }),
+    { x: 540, y: 62, width: 20, height: 638 },
+  );
+  assert.deepEqual(
+    panelBounds([560, 700], {
+      ...layout,
+      extensionPanelBounds: { x: NaN, y: 0, width: 500, height: 500 },
+      contentTop: 8,
+    }),
+    { x: 224, y: 62, width: 336, height: 638 },
+    'nonfinite measurements use bounded fallback and saved gutter',
+  );
+  assert.deepEqual(
+    panelBounds([560, 700], { ...layout, extensionPanelBounds: { x: -30, y: -10, width: 100, height: 100 } }),
+    { x: 0, y: 0, width: 70, height: 90 },
+    'negative measurements clip to content bounds',
+  );
+  c.arrange(layout);
+  const view = f.created[0];
+  c.arrange({ ...layout, extensionPanel: false });
+  assert.equal(f.attached.has(view), false);
+  assert.equal(view.dead, undefined);
+  c.arrange(layout);
+  assert.equal(f.attached.has(view), true);
+  assert.equal(f.created.length, 1, 'chooser dismissal reattaches the same document');
 });

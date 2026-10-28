@@ -245,7 +245,7 @@ function createBrowserAdapter({
     tabData,
     activeTabId: (profile) => {
       const tab = tabsFor(profile).find((item) => item.id === store.state.activeTabId);
-      if (!tab) throw new Error('There is no active tab in this profile.');
+      if (!tab) return undefined;
       return reserveView(tab).contents.id;
     },
     documents: (profile) =>

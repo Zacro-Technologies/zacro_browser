@@ -1581,7 +1581,14 @@ function syncLayout() {
   const layout = {
     sidebarWidth: width,
     panelWidth: panel,
-    extensionPanel: ui.panel === 'extension',
+    extensionPanel: ui.panel === 'extension' && !(ui.libraryMenuOpen && ui.libraryMenuRail === 'panel'),
+    extensionPanelBounds:
+      ui.panel === 'extension'
+        ? (() => {
+            const box = $('.extension-panel-surface')?.getBoundingClientRect();
+            return box ? { x: box.x, y: box.y, width: box.width, height: box.height } : null;
+          })()
+        : null,
     contentTop,
     overlay: Boolean(ui.dialog),
     peek: Boolean(state.runtime?.peek),
@@ -2802,6 +2809,7 @@ function closeLibraryChooser({ restore = false } = {}) {
   const menu = $('#library-menu');
   const opener = ui.libraryMenuReturn;
   ui.libraryMenuOpen = false;
+  ui.libraryMenuRail = null;
   ui.libraryMenuReturn = null;
   if (menu) {
     if (menu.matches(':popover-open')) menu.hidePopover();
@@ -2810,6 +2818,7 @@ function closeLibraryChooser({ restore = false } = {}) {
   for (const control of $$('[data-library-chooser],[data-download-menu],[data-key="library"]'))
     control.setAttribute('aria-expanded', 'false');
   if (restore && opener) restoreFocus(opener);
+  syncLayout();
 }
 function openLibraryChooser(anchor, html, label = 'Library') {
   if (!anchor) return;
@@ -2818,11 +2827,13 @@ function openLibraryChooser(anchor, html, label = 'Library') {
     return;
   }
   closeLibraryChooser();
-  // This top-layer menu stays inside its chrome rail. Native web contents keep
-  // rendering at their original scale: no overlay IPC or page snapshot is used.
+  // Keep the ordinary page live; only a native extension surface sharing this
+  // rail must detach while the shell popover occupies its region.
   finishChromeMotion();
   interruptSpaceScroll();
   ui.libraryMenuOpen = true;
+  ui.libraryMenuRail = anchor.closest('#side-panel') ? 'panel' : 'sidebar';
+  syncLayout();
   if (ui.dialog) closeDialog({ restore: false });
   const menu = document.createElement('div');
   menu.id = 'library-menu';

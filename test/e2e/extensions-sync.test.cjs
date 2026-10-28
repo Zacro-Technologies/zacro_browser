@@ -24,6 +24,7 @@ async function fixture(t, { seed, entry, environment = {} } = {}) {
     ...process.env,
     ZACRO_USER_DATA: path.join(directory, 'browser'),
     ZACRO_SYNC_DEV_LOOPBACK: '1',
+    ZACRO_SKIP_ONBOARDING: '1',
     ...environment,
   };
   delete env.ELECTRON_RUN_AS_NODE;
@@ -118,6 +119,9 @@ test(
   { timeout: 90000 },
   async (t) => {
     const b = await fixture(t);
+    await expect(b.page.locator('#command-input')).toBeVisible();
+    await b.page.keyboard.press('Escape');
+    await expect(b.page.locator('#command-input')).toHaveCount(0);
     await b.page.getByRole('button', { name: 'Library', exact: true }).click();
     await b.page.locator('[data-key="panel-settings"]').click();
     await expect(b.page.getByText('Account & sync', { exact: true })).toBeVisible({ timeout: 3000 });
@@ -210,7 +214,9 @@ test(
           .filter((c) => !c.getURL().startsWith('file:'))
           .map((c) => ({ id: c.id, url: c.getURL() })),
       );
-    await expect.poll(async () => (await contents()).length).toBe(3);
+    // Startup is tabless: only the two explicitly restored tabs own IDs.
+    await expect.poll(async () => (await contents()).length).toBe(2);
+    assert.equal((await b.invoke('state:get')).tabs.filter((tab) => !tab.closed).length, 2);
     assert.deepEqual(requests, []);
     await b.invoke('tab:activate', { id: loadedId });
     await expect.poll(async () => (await contents()).some((c) => c.url === base + '/first')).toBe(true);
@@ -279,6 +285,12 @@ test(
     await b.invoke('extension:options', { id: extension.id });
     await expect.poll(() => native('options', 'typeof chrome.storage.sync?.set')).toBe('function');
     assert.equal(await native('options', 'typeof window.zacro'), 'undefined');
+    assert.deepEqual(
+      await native('options', 'chrome.tabs.query({})'),
+      [],
+      'tabless startup excludes internal frames',
+    );
+    await b.invoke('tab:create');
     const tabs = await native('options', 'chrome.tabs.query({})');
     assert.equal(tabs.length, 1, 'internal shell/broker/options frames are excluded');
     const created = await native('options', 'chrome.tabs.create({active:false})');
@@ -594,6 +606,7 @@ for (const backgroundKind of ['module', 'classic', 'mv2-scripts', 'mv2-html', 'm
           ...process.env,
           ZACRO_USER_DATA: path.join(root, name),
           ZACRO_SYNC_DEV_LOOPBACK: '1',
+          ZACRO_SKIP_ONBOARDING: '1',
           ZACRO_FIXTURE_CRX: packagePath,
         };
         delete env.ELECTRON_RUN_AS_NODE;

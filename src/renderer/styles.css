@@ -1952,6 +1952,11 @@ kbd {
   overflow: hidden;
 }
 
+.extension-panel-surface {
+  flex: 1;
+  min-height: 0;
+}
+
 .panel-header {
   display: flex;
   align-items: center;

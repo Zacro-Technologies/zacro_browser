@@ -277,3 +277,54 @@ test('trusted local user script control changes only local consent and rejects s
   );
   assert.equal(writes, 1);
 });
+
+test('tabless snapshots retain default action and current command assignment', () => {
+  const { ExtensionHost } = require('../src/main/extensions/host.cjs');
+  const { ExtensionAPI } = require('../src/main/extensions/api.cjs');
+  const { createBrowserAdapter } = require('../src/main/extensions/browser.cjs');
+  const id = 'a'.repeat(32);
+  const manifest = {
+    manifest_version: 3,
+    name: 'Tabless',
+    version: '1',
+    action: { default_popup: 'popup.html' },
+    commands: { hello: { suggested_key: { default: 'Ctrl+Shift+Y' } } },
+  };
+  const record = {
+    id,
+    profileId: 'p',
+    enabled: true,
+    generation: 'g',
+    source: { kind: 'local' },
+    grants: { permissions: [], origins: [] },
+    current: { manifest, verification: {} },
+  };
+  const { matchShortcut, updateShortcut } = require('../src/core/shortcuts.cjs');
+  let overrides = {};
+  const api = new ExtensionAPI({
+    resolveExtension: () => ({ ...record, manifest }),
+    browserShortcutClaimed: (input) => !!matchShortcut(input, process.platform, overrides),
+  });
+  const browser = createBrowserAdapter({
+    store: { state: { tabs: [], activeTabId: null } },
+    views: new Map(),
+  });
+  const host = Object.assign(Object.create(ExtensionHost.prototype), {
+    getProfile: () => ({ id: 'p' }),
+    intents: () => [],
+    manager: { list: () => [record], capabilities: () => ({}) },
+    remoteErrors: new Map(),
+    notificationErrors: new Map(),
+    icon: () => null,
+    api,
+    browser,
+  });
+  const value = host.snapshot('p')[0];
+  assert.equal(value.action.popup, 'popup.html');
+  assert.equal(value.commands[0].status, 'assigned');
+  assert.equal(browser.activeTabId('p'), undefined);
+  overrides = updateShortcut({}, process.platform, 'sidebar-toggle', 'Mod+Shift+Y');
+  assert.equal(host.snapshot('p')[0].commands[0].status, 'conflict');
+  overrides = {};
+  assert.equal(host.snapshot('p')[0].commands[0].status, 'assigned', 'reset republishes current assignment');
+});

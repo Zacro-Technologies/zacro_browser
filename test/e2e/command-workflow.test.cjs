@@ -162,8 +162,18 @@ test(
       // Hover waits for a stable, attached row and retries if page metadata
       // replaces the sidebar while a newly restored tab finishes loading.
       await source.hover();
-      const start = await source.boundingBox();
-      assert(start, 'The dragged tab must be visible');
+      let start;
+      // Metadata can replace the row between hover and measurement. Re-query
+      // the semantic locator until its current attached row has actual bounds.
+      await expect
+        .poll(
+          async () => {
+            start = await source.boundingBox();
+            return !!start && start.width > 0 && start.height > 0;
+          },
+          { message: 'The dragged tab must be visible' },
+        )
+        .toBe(true);
       const startX = start.x + start.width * 0.4;
       const startY = start.y + start.height / 2;
       await b.shell.mouse.move(startX, startY);

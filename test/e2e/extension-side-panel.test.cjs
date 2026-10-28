@@ -57,7 +57,12 @@ test(
     );
     const crxPath = path.join(root, 'panel.crx');
     await fs.writeFile(crxPath, signed.buffer);
-    const env = { ...process.env, ZACRO_USER_DATA: path.join(root, 'browser'), ZACRO_FIXTURE_CRX: crxPath };
+    const env = {
+      ...process.env,
+      ZACRO_SKIP_ONBOARDING: '1',
+      ZACRO_USER_DATA: path.join(root, 'browser'),
+      ZACRO_FIXTURE_CRX: crxPath,
+    };
     delete env.ELECTRON_RUN_AS_NODE;
     const app = await electron.launch({
       args: [path.resolve(__dirname, '../fixtures/extensions/sync-browser.cjs')],
@@ -152,7 +157,7 @@ test(
     await expect.poll(async () => (await state()).runtime.extensionPanel).toBe(null);
     await invoke('tab:close', { id: (await state()).activeTabId });
     // Open the visible manage control through the actual shell event path.
-    await shell.keyboard.press(process.platform === 'darwin' ? 'Meta+,' : 'Control+,');
+    await invoke('shortcut:run', { id: 'preferences' });
     await shell
       .locator('details.setting-section')
       .filter({ has: shell.locator('summary', { hasText: 'Extensions' }) })
@@ -160,7 +165,7 @@ test(
       .click();
     await shell.getByRole('button', { name: 'Manage extensions', exact: true }).click();
     await shell.getByRole('button', { name: 'Open side panel', exact: true }).click();
-    await expect(shell.getByRole('heading', { name: 'Side panel fixture', exact: true })).toBeVisible();
+    await expect(shell.locator('#panel-title')).toHaveText('Side panel fixture');
     await expect.poll(async () => (await state()).runtime.extensionPanel?.extensionId).toBe(signed.id);
     let panelId = await app.evaluate(
       ({ webContents }, id) =>
@@ -199,7 +204,59 @@ test(
     assert.ok(geometry.panel.x > geometry.page.x + geometry.page.width);
     assert.ok(geometry.panel.x + geometry.panel.width <= geometry.size[0]);
     assert.ok(geometry.panel.y + geometry.panel.height <= geometry.size[1]);
-    await shell.keyboard.press(process.platform === 'darwin' ? 'Meta+k' : 'Control+k');
+    const aligned = async () => {
+      const expected = await shell.locator('.extension-panel-surface').evaluate((element) => {
+        const rect = element.getBoundingClientRect();
+        return {
+          x: Math.round(rect.x),
+          y: Math.round(rect.y),
+          width: Math.round(rect.width),
+          height: Math.round(rect.height),
+        };
+      });
+      const actual = (await native()).panel;
+      return !!actual && Object.keys(expected).every((key) => expected[key] === actual[key]);
+    };
+    await expect.poll(aligned).toBe(true);
+    await invoke('settings:update', { values: { pageGutter: 20 } });
+    await app.evaluate(({ BrowserWindow }) =>
+      BrowserWindow.getAllWindows()
+        .find((w) => w.webContents.getURL().startsWith('file:'))
+        .setContentSize(560, 700),
+    );
+    await expect.poll(aligned).toBe(true);
+    await app.evaluate(
+      ({ BrowserWindow }, size) =>
+        BrowserWindow.getAllWindows()
+          .find((w) => w.webContents.getURL().startsWith('file:'))
+          .setContentSize(...size),
+      geometry.size,
+    );
+    await invoke('settings:update', { values: { pageGutter: 8 } });
+    await expect.poll(aligned).toBe(true);
+    await shell.locator('#panel-chooser').click();
+    await expect(shell.locator('#library-menu')).toBeVisible();
+    await expect.poll(async () => (await native()).attached).toBe(false);
+    await shell.keyboard.press('Escape');
+    await expect.poll(async () => (await native()).attached).toBe(true);
+    assert.equal(await execute(panelId, 'document.querySelector("#panelDraft").value'), 'keep panel');
+    // Native input must reach the shell chooser's destination in the panel rail.
+    await shell.locator('#panel-chooser').click();
+    const destination = shell.locator('#library-menu [data-key="panel-bookmarks"]');
+    await expect(destination).toBeVisible();
+    await expect.poll(async () => (await native()).attached).toBe(false);
+    await destination.click();
+    await expect(shell.locator('#panel-title')).toHaveText('Bookmarks');
+    await expect.poll(async () => (await state()).runtime.extensionPanel).toBe(null);
+    await invoke('extension:panel-open', { id: signed.id });
+    panelId = await app.evaluate(
+      ({ webContents }, id) =>
+        webContents.getAllWebContents().find((w) => w.getURL() === `chrome-extension://${id}/panel.html`)?.id,
+      signed.id,
+    );
+    await expect.poll(() => execute(panelId, '!!document.querySelector("#panelDraft")')).toBe(true);
+    await execute(panelId, 'document.querySelector("#panelDraft").value="keep panel";undefined');
+    await invoke('shortcut:run', { id: 'command-palette' });
     await expect.poll(async () => (await native()).attached).toBe(false);
     await shell.keyboard.press('Escape');
     await expect.poll(async () => (await native()).attached).toBe(true);

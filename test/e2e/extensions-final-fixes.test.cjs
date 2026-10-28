@@ -95,6 +95,7 @@ async function fixture(t, { entry } = {}) {
     async launch() {
       const env = {
         ...process.env,
+        ZACRO_SKIP_ONBOARDING: '1',
         ZACRO_USER_DATA: path.join(root, 'browser'),
         ZACRO_SYNC_DEV_LOOPBACK: '1',
         ZACRO_FIXTURE_CRX: crxPath,

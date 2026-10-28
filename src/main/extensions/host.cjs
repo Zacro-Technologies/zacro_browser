@@ -97,6 +97,7 @@ class ExtensionHost {
     publish,
     report,
     panelChanged = publish,
+    browserShortcutClaimed,
     native = require('electron'),
   }) {
     Object.assign(this, {
@@ -189,6 +190,7 @@ class ExtensionHost {
       changed: panelChanged,
     });
     this.api = new ExtensionAPI({
+      browserShortcutClaimed,
       fontSettings: this.fontSettings,
       identity: this.identity,
       sidePanel: this.sidePanel,
@@ -906,7 +908,9 @@ class ExtensionHost {
             const context = this.api.context(profile.id, id);
             this.sidePanel.recordGesture(context);
             const tabId = this.browser.activeTabId(profile.id);
-            return this.sidePanel.call(context, 'open', [{ tabId }]);
+            return this.sidePanel.call(context, 'open', [
+              tabId === undefined ? { windowId: this.getWindow().id } : { tabId },
+            ]);
           }
           case 'extension:action':
             return this.api.activateAction(profile.id, id, this.browser.activeTabId(profile.id));

@@ -4,59 +4,62 @@ const { imageDataIcons } = require('./icons.cjs');
 const clone = (value) => structuredClone(value);
 const metadataSidePanel = (context) => context.metadata.grants.permissions.includes('sidePanel');
 const trusted = (context) => context.kind !== 'content-script';
+const { matchShortcut } = require('../../core/shortcuts.cjs');
+// OS/window-manager combinations are unavailable even when browser shortcuts
+// are customized. Browser bindings and aliases come from their live owner.
 const reserved = new Set([
-  'F5',
-  'F6',
-  'F11',
-  'F12',
   'Alt+Tab',
-  'Alt+Left',
-  'Alt+Right',
-  'Alt+ArrowLeft',
-  'Alt+ArrowRight',
+  'Alt+F4',
   'Ctrl+Alt+Delete',
+  'Ctrl+Shift+Escape',
   'Command+Space',
   'Ctrl+Space',
+  'Command+Tab',
+  'Command+Shift+Tab',
+  'Command+Q',
+  'Command+H',
+  'Command+Alt+H',
+  'Command+M',
+  'Ctrl+A',
+  'Ctrl+C',
+  'Ctrl+V',
+  'Ctrl+X',
+  'Ctrl+Z',
+  'Ctrl+Y',
+  'Ctrl+Shift+Z',
+  'Command+A',
+  'Command+C',
+  'Command+V',
+  'Command+X',
+  'Command+Z',
+  'Command+Shift+Z',
 ]);
-for (const mod of ['Ctrl', 'Command', 'MacCtrl'])
-  for (const key of [
-    'T',
-    'W',
-    'N',
-    'L',
-    'R',
-    'Q',
-    'F',
-    'D',
-    'K',
-    'H',
-    'J',
-    'B',
-    ',',
-    'Comma',
-    'P',
-    'Enter',
-    '+',
-    'Plus',
-    '-',
-    'Minus',
-    '0',
-    '1',
-    '2',
-    '3',
-    '4',
-    '5',
-    '6',
-    '7',
-    '8',
-    '9',
-    'Tab',
-    'M',
-  ]) {
-    reserved.add(mod + '+' + key);
-    reserved.add(mod + '+Shift+' + key);
-  }
-for (const mod of ['Ctrl', 'Command', 'MacCtrl']) reserved.add(mod + '+Shift+I');
+
+function commandInput(shortcut) {
+  const parts = shortcut.split('+');
+  let key = parts.pop();
+  key =
+    {
+      Comma: ',',
+      Period: '.',
+      Plus: '+',
+      Minus: '-',
+      Space: ' ',
+      Up: 'ArrowUp',
+      Down: 'ArrowDown',
+      Left: 'ArrowLeft',
+      Right: 'ArrowRight',
+    }[key] || key;
+  return {
+    type: 'keyDown',
+    key,
+    code: /^[A-Z]$/.test(key) ? `Key${key}` : /^\d$/.test(key) ? `Digit${key}` : undefined,
+    meta: parts.includes('Command'),
+    control: parts.includes('Ctrl') || parts.includes('MacCtrl'),
+    alt: parts.includes('Alt'),
+    shift: parts.includes('Shift'),
+  };
+}
 
 function object(value = {}) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid properties');
@@ -209,7 +212,12 @@ class ExtensionAPI {
       }
     return Object.entries(commands).map(([name, command]) => {
       const requested = this.shortcut(command);
-      const conflict = reserved.has(requested) || used.has(requested);
+      const conflict =
+        reserved.has(requested) ||
+        used.has(requested) ||
+        (this.browserShortcutClaimed
+          ? this.browserShortcutClaimed(commandInput(requested))
+          : matchShortcut(commandInput(requested), process.platform));
       used.add(requested);
       return {
         name,
@@ -256,11 +264,12 @@ class ExtensionAPI {
   }
   async gesture(context, tabId) {
     const state = this.state(context),
-      tab = await this.tab(context, tabId);
+      tab = tabId === undefined ? undefined : await this.tab(context, tabId);
     this.guard(context);
     state.gesture = Date.now() + 5000;
     if (metadataSidePanel(context)) this.sidePanel?.recordGesture(context);
     if (
+      tab &&
       this.guard(context).grants.permissions.includes('activeTab') &&
       typeof this.grantActiveTab === 'function'
     ) {
@@ -291,7 +300,11 @@ class ExtensionAPI {
       metadataSidePanel(context) &&
       (await this.sidePanel.call(context, 'getPanelBehavior', [])).openPanelOnActionClick
     ) {
-      await this.sidePanel.call(context, 'open', [{ tabId }]);
+      const target =
+        tabId === undefined
+          ? { windowId: (await this.host(context, 'windows', 'getCurrent', [{}])).id }
+          : { tabId };
+      await this.sidePanel.call(context, 'open', [target]);
     } else if (action.popup)
       await this.host(context, 'dialogs', 'openView', [
         id,
@@ -592,8 +605,7 @@ class ExtensionAPI {
           throw new Error('Unknown profile window');
         const tabs = await this.host(context, 'tabs', 'query', [{}]);
         const tab = tabs.find((item) => item.active && item.windowId === window.id);
-        if (!tab) throw new Error('No active profile tab');
-        const action = this.actionState(context.profileId, context.extensionId, tab.id);
+        const action = this.actionState(context.profileId, context.extensionId, tab?.id);
         if (!action.enabled) throw new Error('Extension action is disabled');
         if (!action.popup) throw new Error('No action popup configured');
         await this.host(context, 'dialogs', 'openView', [
@@ -601,7 +613,7 @@ class ExtensionAPI {
           {
             kind: 'action',
             url: resource(context, action.popup),
-            tabId: tab.id,
+            tabId: tab?.id,
             generation: context.generation,
           },
         ]);
