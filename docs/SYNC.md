@@ -1,13 +1,11 @@
 # Accounts, profiles and extension synchronization
 
-Implementation and independent code review are complete on `extensions-and-sync`. The
-account service and desktop client have passed real HTTP/SQLite tests, and the
-native account screen and two complete Electron browsers have passed genuine
-extension-API synchronization, offline restart and device-revocation flows.
-Native background suspend/wake and the final arm64 development package also
-pass. Review findings and fixes, manual package confirmation and remaining
-platform checks are tracked in
-[the validation record](EXTENSIONS-SYNC-VALIDATION.md).
+The account service and desktop client implement profile-scoped extension
+synchronization on `extensions-and-sync`. Real HTTP/SQLite and two-browser
+tests cover extension APIs, offline restart and device revocation. The
+[validation record](EXTENSIONS-SYNC-VALIDATION.md) identifies the tested
+revisions, current main-integration checks and remaining platform, custom
+runtime and public-service gates.
 
 ## Start a development service
 

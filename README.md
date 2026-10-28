@@ -389,7 +389,7 @@ The technical goals are to:
 - Keep pace with upstream security and compatibility updates.
 - Build the sidebar, Spaces, tab management, and command bar as a cohesive browser experience.
 
-The initial integration uses Electron 45, a sandboxed HTML/CSS/JavaScript interface, isolated native WebContentsViews, Node.js 24 development tooling, and electron-builder packaging. Windows is the first validation target. Chromium compatibility is a foundation, not a promise that every Chrome feature or Google service is available. Zacro supplies a bounded host adapter for missing browser integration and sync storage; engine features such as native activeTab, DNR and offscreen remain unsupported. Broad Chrome compatibility requires additional engine work.
+The initial integration uses Electron 45, a sandboxed HTML/CSS/JavaScript interface, isolated native WebContentsViews, Node.js 24 development tooling, and electron-builder packaging. Windows is the first validation target. Chromium compatibility is a foundation, not a promise that every Chrome feature or Google service is available. Zacro supplies a bounded host adapter for browser integration and sync storage, including managed native DNR, offscreen and alarms. Native activeTab, in-place permission changes, userScripts and fontSettings require the separate Zacro Electron build and its acceptance gates. Broad Chrome compatibility is not promised.
 
 ## Principles
 

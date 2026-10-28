@@ -1,16 +1,104 @@
 # Extensions and sync validation
 
-This record preserves the original accepted implementation and its historical
-validation. The sections below describe the baseline that preceded the
-[remaining capability work](superpowers/specs/2026-10-25-remaining-extensions-sync-design.md);
-they do not certify the current branch or the custom runtime.
+This record separates current main-integration checks from earlier accepted
+implementation and validation. Only the dated main-integration section describes
+the prepared revision. Historical baseline results do not certify the current
+branch or the [remaining capability work](superpowers/specs/2026-10-25-remaining-extensions-sync-design.md).
 
 The original [approved design](superpowers/specs/2026-10-25-extensions-and-sync-design.md)
 was implemented through `cae78db`. Its full verification passed 240 Node and
 96 native checks after the Mac was unlocked. Its arm64 development package
 passed acceptance after the user handled the OS Keychain confirmation.
 
-## Current follow-up status, 2026-10-26
+## Main integration preparation, 2026-10-29
+
+The PR preparation integrates main `109b2a3` (0.9) into the extension/sync
+branch from `4703c2e`. Main's AI connections, command workflow, Favorites,
+pins, archive policy and visual behavior must remain intact. Results below
+from older commits do not validate this combined revision.
+
+The earlier [feature-branch CI run](https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40227725369)
+finished successfully on both Mac architectures, including soak tests and
+packaged development builds. Windows passed the corrected sync backup/CLI
+checks but failed seven native-messaging tests. Those fixtures attempted to
+execute JavaScript shebang files as Windows programs, and a cross-platform
+path test used the host OS separator. The preparation fixes the fixture launch
+boundary and explicit POSIX registration paths without changing the production
+broker's executable launch or consent checks. Actual Windows re-verification
+of the prepared revision remains required.
+
+The [native-runtime workflow failure](https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40227724263)
+was a configuration error: job-level environment expressions cannot read
+`runner.temp`. The workflow now computes its build directory in a step via
+`RUNNER_TEMP` and `GITHUB_ENV`. Actionlint reproduces the old error and accepts
+the corrected workflow. This does not provision the dedicated self-hosted
+runners or establish a successful custom build.
+
+The custom runtime build is incomplete. No validated custom binary is included
+in the PR. Stock Electron continues to reject engine-dependent capabilities;
+positive native-runtime and representative-provider acceptance, public sync
+hosting, Google token/account integration, and signed/notarized distribution
+remain open. These are development-preview limits, not completed release gates.
+
+Fresh checks on macOS 27.2 (26B123), Apple silicon, Node.js 24.22.1 and
+stock Electron 45.0.0 cover production source through `5189d09`:
+
+- `npm ci`, full formatting and JavaScript syntax validation pass. The final
+  `npm test` run passes **535/535**, without skipped Node tests. Two existing
+  module-type warnings for main's ES modules remain; they are not assertion
+  failures.
+- The complete native suite was partitioned into 71 and 95 disjoint cases at
+  `b6763ab`. The second batch passed 94 with one Windows-only test skipped.
+  The first passed 70 but exposed one intermittent local-uninstall warning
+  test failure; an unchanged isolated local/remote rerun passed 2/2. The
+  fixture was then corrected to use real attached-control clicks and observe
+  actual native cancellation/reload completion. At `5189d09`, all **8/8**
+  affected native cases passed, including both warning flows. Their traces
+  show Stay cancelling the first load, Leave committing exactly one replacement,
+  no overlapping loads, preserved drafts and retired warnings. Across the
+  disjoint suite and affected reruns, **165 native cases pass and one
+  Windows-only case is skipped**; the initial failure is retained here rather
+  than represented as a clean first run.
+- Main integration preserves native tab identity through idle document discard,
+  explicitly disposes reservations displaced by Peek/popup adoption, aligns
+  the native extension panel with its actual rail and chooser, and derives
+  command conflict status from the live browser shortcut catalog. Native
+  acceptance covers tabless startup, two-browser sync in all five background
+  forms, document protection, actual chooser clicks and minimum-window bounds.
+- The 40-cycle browsing/Peek/split soak passes. Observed native page count
+  remains two throughout; this is resource-lifecycle evidence, not a general
+  memory or performance guarantee.
+- Actionlint 1.7.12 accepts all workflows after reproducing the earlier context
+  error. The Windows registration reader now uses Unicode Win32 APIs through
+  a bounded Windows PowerShell helper and rejects present-invalid registrations
+  instead of falling through. Its production-reader/subprocess-boundary tests
+  pass, but the actual Windows helper and installed native host remain unrun
+  on this Mac.
+- Independent integration and final spec/quality reviews are complete; their
+  actionable source findings are fixed and the scoped re-review is approved.
+  The provider-fixture-only startup correction at `c4c005c` is also reviewed.
+
+The development arm64 DMG and ZIP build succeeds with ad-hoc signing and no
+notarization. All 52 packaged `src` files match the prepared checkout byte for
+byte. The package passes fuse inspection, shell startup, packaged plaintext-sync
+rejection and isolated Codex initialization. Its first navigation waits for the
+macOS `Zacro Safe Storage` prompt: OS logs show the original five-second poll
+expired before manual approval. The test-only correction at `1ea360a` applies
+the existing explicit interactive allowance to that poll and its enclosing
+stage, preserving normal CI deadlines and every assertion; scoped review passes.
+The interactive run remains at this OS confirmation gate. Complete package
+acceptance, including the later packaged PDF/storage/adapter checks, is therefore
+still pending and is not represented as a successful run.
+
+The approved provider recheck at `c4c005c` passes **3/3**: real JSON Formatter
+0.10.2 formatting/options, real React Developer Tools 8.0.0 panels/component
+tree, and Bitwarden 2026.10.0 required-API denial without native activation.
+The Bitwarden result does not establish password-manager functionality. The full
+online provider run is not green: Dark Reader and uBOL distribution archives differ from the approved
+SHA-256 pins and remain blocked for separate package review. Their pins were
+not changed to make this run pass.
+
+## Pre-integration evidence, 2026-10-26
 
 - Independent library/settings sync, device activity times and the remaining
   extension API slices now have implementation and focused validation. All four
@@ -30,7 +118,7 @@ passed acceptance after the user handled the OS Keychain confirmation.
   [Provider acceptance](EXTENSION-PROVIDER-VALIDATION.md). React Developer Tools
   now displays its genuine panels and component tree on stock Electron.
   Dark Reader and uBOL still require positive acceptance on the custom binary.
-- The custom Electron source is building on the external APFS volume. Passing
+- The custom Electron build on the external APFS volume stopped before completion. Passing
   patch application or individual compiler checks is not a completed build,
   native capability acceptance, or a newly validated package. See the
   [runtime instructions](../runtime/electron/README.md).
@@ -38,9 +126,10 @@ passed acceptance after the user handled the OS Keychain confirmation.
   including a second backup and restore after a recovery cutover (`ad47ee7`).
   No public domain or service has been provisioned.
 - Windows backup and CLI portability fixes are committed at `b6662e4`, with
-  15 focused local checks passing and an independent review. Native Windows
-  execution of this revision remains pending. Earlier Windows/Intel/arm64 CI
-  failures at `1da83e3` are historical evidence, not current revision results.
+  15 focused local checks passing and an independent review. The later Windows
+  CI at `4703c2e` passed these backup/CLI checks but failed native-messaging
+  fixtures. Earlier Windows/Intel/arm64 CI failures at `1da83e3` are historical
+  evidence, not current revision results.
 - Custom runtime acceptance on all three targets, a new packaged acceptance,
   Google provider account/token access and signed/notarized distribution remain
   open. These gates must pass before the whole follow-up is called complete.

@@ -62,8 +62,8 @@ production dependency is added. Pins match the task ledger's
   sandbox requirements, and no native activation. No password-manager behavior,
   vault access or login is claimed.
 
-Actual run evidence, failures and unrun custom gates are recorded in
-`.superpowers/sdd/2026-10-25-native-extension-capabilities/task-14-report.md`.
+Actual run evidence, failures and unrun custom gates are recorded below and
+in the [combined validation record](EXTENSIONS-SYNC-VALIDATION.md).
 The custom positive branches remain unvalidated until run on the compiled real
 native binary; the presence of their assertions is not compatibility evidence.
 
@@ -86,3 +86,25 @@ including genuine relative imports, strict mode, native worker identity and
 unchanged source/managed-original bytes. Ambiguous/foreign paths and package
 symlinks remain rejected. The demanded custom run on stock correctly failed at
 the native ABI gate; that expected failure is not positive custom evidence.
+## PR preparation recheck, 2026-10-29
+
+The initial online run after main 0.9 integration passed JSON Formatter 0.10.2.
+React Developer Tools and Bitwarden matched their approved acquisition pins,
+but their old fixtures attempted Library input behind the new first-run dialog.
+Commit `c4c005c` opts out of unrelated onboarding and explicitly dismisses the
+actual initial palette. It preserves all provider pins and behavior assertions.
+The focused recheck passes **3/3**: React Developer Tools 8.0.0 renders its real
+panels/component tree; JSON Formatter 0.10.2 formats the loopback JSON and opens
+its real options; Bitwarden 2026.10.0 shows required-API incompatibility and is
+not activated. The Bitwarden result is a denial check, not vault/login support.
+See the [combined validation record](EXTENSIONS-SYNC-VALIDATION.md).
+
+Dark Reader and uBOL failed the immutable original-archive check before activation.
+Observed SHA-256 values were respectively
+`864a7301c6841b34066c3537c12eab1c17a2f4cc8f27c5f05ece2b11b2615586` and
+`6763ff30cb7b89bf3b411908c03674b5d4e98c12a38fbae776fd057d1a8d1837`.
+These are observed changes, not newly approved pins or evidence of a changed
+version number. No new package review or native positive acceptance is claimed.
+The existing fixed hashes remain in place; a future provider run must review
+those original packages before accepting replacements. Historical denial results
+above do not certify the newly supplied archives.
