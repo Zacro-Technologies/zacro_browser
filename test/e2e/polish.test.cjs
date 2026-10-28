@@ -115,9 +115,9 @@ async function launch(t, existingDirectory) {
 
 async function openLibrarySection(shell, section) {
   await shell.getByRole('button', { name: 'Library', exact: true }).click();
-  const sectionButton = shell.locator(`#side-panel [data-key="panel-${section}"]`);
+  const sectionButton = shell.locator(`#library-menu [data-key="panel-${section}"]`);
   await sectionButton.click();
-  await expect(sectionButton).toHaveAttribute('aria-pressed', 'true');
+  await expect(shell.locator('#panel-chooser')).toHaveAttribute('aria-expanded', 'false');
 }
 
 test(
@@ -134,7 +134,7 @@ test(
     for (let index = 0; index < 4; index++) {
       const tab = await browser.invoke('tab:create', { url: `${base}/favorite-${index}`, active: false });
       await browser.invoke('tab:update', { id: tab.id, title: `Favorite ${index + 1}` });
-      await browser.invoke('tab:pin', { id: tab.id });
+      await browser.invoke('tab:favorite', { id: tab.id });
     }
     for (let index = 0; index < 8; index++) {
       const tab = await browser.invoke('tab:create', { url: `${base}/research-${index}`, active: false });
@@ -235,23 +235,30 @@ test(
 );
 
 test(
-  'Library sections remain one click apart and closing returns focus to the Library opener',
+  'Library offers named destinations before opening a panel and preserves the original opener',
   { timeout: 45000 },
   async (t) => {
     const { shell } = await launch(t);
     const library = shell.getByRole('button', { name: 'Library', exact: true });
     await library.click();
+    const menu = shell.getByRole('menu', { name: 'Library', exact: true });
+    await expect(menu).toBeVisible();
+    await expect(menu.getByRole('menuitemradio')).toHaveCount(7);
+    await expect(shell.locator('#side-panel')).toBeHidden();
+    await menu.getByRole('menuitemradio', { name: 'Bookmarks', exact: true }).click();
     await expect(shell.locator('#panel-title')).toHaveText('Bookmarks');
     await expect(shell.getByRole('dialog')).toHaveCount(0);
-    const navigation = shell.getByRole('navigation', { name: 'Browser panels' });
-    await expect(navigation.getByRole('button')).toHaveCount(6);
-    for (const section of ['History', 'Downloads', 'Archived tabs', 'Bookmarks']) {
-      await navigation.getByRole('button', { name: section, exact: true }).click();
+    await expect(shell.locator('.panel-tabs')).toHaveCount(0);
+    for (const [id, section] of [
+      ['history', 'History'],
+      ['downloads', 'Downloads'],
+      ['archive', 'Archived tabs'],
+      ['bookmarks', 'Bookmarks'],
+    ]) {
+      await shell.locator('#panel-chooser').click();
+      await menu.locator(`[data-key="panel-${id}"]`).click();
       await expect(shell.locator('#panel-title')).toHaveText(section);
-      await expect(navigation.getByRole('button', { name: section, exact: true })).toHaveAttribute(
-        'aria-pressed',
-        'true',
-      );
+      await expect(menu).toHaveCount(0);
       await expect(shell.locator('#panel-search')).toBeFocused();
     }
     await shell.getByRole('button', { name: 'Close panel', exact: true }).click();
@@ -269,7 +276,7 @@ test(
     const url = `${base}/saved-favorite`;
     const tab = await browser.invoke('tab:create', { url, active: false });
     await browser.invoke('tab:update', { id: tab.id, title: 'Saved favorite' });
-    await browser.invoke('tab:pin', { id: tab.id });
+    await browser.invoke('tab:favorite', { id: tab.id });
     await browser.invoke('bookmark:toggle', { url, title: 'Saved favorite' });
     await browser.invoke('bookmark:toggle', { url: `${base}/saved-page`, title: 'Saved page' });
     await browser.invoke('tab:create', { homePage: true });
@@ -615,8 +622,9 @@ test(
     const library = shell.getByRole('button', { name: 'Library', exact: true });
     await library.focus();
     await shell.keyboard.press('Enter');
-    await expect(shell.locator('#panel-search')).toBeFocused();
-    await shell.locator('#side-panel [data-key="panel-history"]').focus();
+    await expect(shell.locator('#library-menu [data-key="panel-bookmarks"]')).toBeFocused();
+    await shell.keyboard.press('h');
+    await expect(shell.locator('#library-menu [data-key="panel-history"]')).toBeFocused();
     await shell.keyboard.press('Enter');
     const search = shell.locator('#panel-search');
     await expect(search).toBeFocused();
@@ -633,9 +641,9 @@ test(
     await expect(library).toBeFocused();
     await library.focus();
     await shell.keyboard.press('Enter');
-    await expect(shell.locator('#panel-search')).toBeFocused();
-    const settings = shell.locator('#side-panel [data-key="panel-settings"]');
-    await settings.focus();
+    await expect(shell.locator('#library-menu')).toBeVisible();
+    await shell.keyboard.press('s');
+    await expect(shell.locator('#library-menu [data-key="panel-settings"]')).toBeFocused();
     await shell.keyboard.press('Enter');
     await expect
       .poll(() =>
@@ -683,8 +691,11 @@ test(
             element = element.parentElement;
           }
           let candidates = [[255, 255, 255]];
-          for (const ancestor of ancestors) {
-            const style = getComputedStyle(ancestor);
+          const layers = ancestors.flatMap((ancestor) => [
+            getComputedStyle(ancestor),
+            ...(ancestor.id === 'app' ? [getComputedStyle(ancestor, '::after')] : []),
+          ]);
+          for (const style of layers) {
             // Test every gradient endpoint, including alpha compositing, so
             // the weakest painted background still meets the text threshold.
             const stops =
@@ -697,12 +708,14 @@ test(
               (stops.length ? stops : [null]).map((stop) => {
                 context.fillStyle = `rgb(${behind.join(',')})`;
                 context.fillRect(0, 0, 1, 1);
+                context.globalAlpha = Number(style.opacity);
                 context.fillStyle = style.backgroundColor;
                 context.fillRect(0, 0, 1, 1);
                 if (stop) {
                   context.fillStyle = stop;
                   context.fillRect(0, 0, 1, 1);
                 }
+                context.globalAlpha = 1;
                 return pixel();
               }),
             );

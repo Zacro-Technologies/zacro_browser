@@ -288,6 +288,7 @@ test(
   async (t) => {
     const b = await launch(t);
     const favorite = await b.open('icon-retention', true);
+    await b.invoke('tab:favorite', { id: favorite.id });
     const initial = await b.state();
     const spaceId = initial.activeSpaceId;
     const profileId = initial.spaces.find((space) => space.id === spaceId).profileId;
@@ -302,7 +303,7 @@ test(
     // including an unloaded favorite which has never contacted the fixture.
     await b.invoke('profile:create', { name: 'Isolated favorite icons' });
     const other = await b.invoke('tab:create', { url: favorite.url, active: false });
-    await b.invoke('tab:pin', { id: other.id });
+    await b.invoke('tab:favorite', { id: other.id });
     const isolated = (await b.state()).runtime.pages[other.id];
     assert.equal(isolated.loaded, false);
     assert.equal(isolated.favicon, null);
@@ -332,11 +333,10 @@ test(
       'Another tab in the same profile must not inherit a retained icon by URL',
     );
 
-    // The public tab:update action only renames a tab. Return through the real
-    // navigation action so the new document must obtain its own validated icon.
+    // Closing a Favorite discards its navigated page and reopens the saved
+    // destination. That new document must obtain its own validated icon.
     await b.invoke('tab:activate', { id: favorite.id });
-    await expect.poll(() => b.guest(noIconURL, 'document.readyState')).toBe('complete');
-    await b.invoke('navigate', { url: favorite.url });
+    assert.equal((await b.state()).tabs.find((tab) => tab.id === favorite.id).pinnedUrl, favorite.url);
     await expect.poll(() => b.guest(favorite.url, 'document.readyState')).toBe('complete');
     await until(
       async () => (await b.state()).runtime.pages[favorite.id].favicon,

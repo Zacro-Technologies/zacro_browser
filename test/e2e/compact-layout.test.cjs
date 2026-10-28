@@ -228,11 +228,12 @@ test(
       });
     assert.equal((await state()).settings.sidebarWidth, 380);
     for (const panel of ['bookmarks', 'history', 'downloads', 'archive', 'ai', 'settings']) {
+      await shell.locator('#panel-chooser').click();
       await shell.locator(`[data-key="panel-${panel}"]`).click();
       const fits = await shell.locator('#side-panel').evaluate((panel) => ({
         horizontal: panel.scrollWidth <= panel.clientWidth,
         bottom: Math.round(panel.getBoundingClientRect().bottom) <= innerHeight,
-        buttons: [...panel.querySelectorAll('.panel-tabs button')].every((button) => {
+        buttons: [...panel.querySelectorAll('.panel-header button')].every((button) => {
           const rect = button.getBoundingClientRect();
           return rect.left >= 0 && rect.right <= innerWidth;
         }),
@@ -415,6 +416,16 @@ test(
       '({ dpr:devicePixelRatio, identity:window.liveIdentity=crypto.randomUUID() })',
     );
     await shell.locator('[data-key="library"]').click();
+    await expect(shell.getByRole('menu', { name: 'Library', exact: true })).toBeVisible();
+    await expect(shell.locator('#side-panel')).toBeHidden();
+    assert.equal(await guest(url, 'document.visibilityState'), 'visible');
+    assert.deepEqual(
+      await guest(url, '({dpr:devicePixelRatio, identity:window.liveIdentity})'),
+      liveBeforeLibrary,
+      'The Library chooser leaves the native document and device scale untouched',
+    );
+    assert.equal(await app.evaluate(() => globalThis.popoverCaptureCount), 0);
+    await shell.locator('[data-key="panel-bookmarks"]').click();
     await expect(shell.locator('#panel-title')).toHaveText('Bookmarks');
     await expect(shell.locator('#app')).toHaveAttribute('data-panel-animating', 'false');
     await expect(shell.locator('#page-backdrop img')).toHaveCount(0);
@@ -428,10 +439,12 @@ test(
       liveBeforeLibrary,
     );
     assert.equal(await guest(url, 'document.visibilityState'), 'visible');
+    await shell.locator('#panel-chooser').click();
     await shell.locator('[data-key="panel-settings"]').click();
     await shell.locator('[data-key="panel-close"]').click();
     await expect(shell.locator('#side-panel')).toBeHidden();
     await shell.locator('[data-key="library"]').click();
+    await shell.locator('[data-key="panel-settings"]').click();
     await expect(shell.locator('#panel-title')).toHaveText('Settings');
     await shell.locator('[data-key="panel-close"]').click();
     await expect(shell.locator('#side-panel')).toBeHidden();

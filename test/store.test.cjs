@@ -62,7 +62,7 @@ test('closing a favorite retains its destination, title and bookmark until expli
   const ordinary = store.dispatch('tab:create', { url: 'https://ordinary.example' });
   let favorite = store.dispatch('tab:create', { url: 'https://favorite.example/path' });
   store.dispatch('tab:rename', { id: favorite.id, title: 'Daily reading' });
-  store.dispatch('tab:pin', { id: favorite.id });
+  store.dispatch('tab:favorite', { id: favorite.id });
   favorite = store.state.tabs.find((tab) => tab.id === favorite.id);
   store.dispatch('bookmark:toggle', { url: favorite.url, title: favorite.title });
   store.dispatch('tab:close', { id: favorite.id });
@@ -81,7 +81,7 @@ test('closing a favorite retains its destination, title and bookmark until expli
   store.dispatch('tab:pin', { id: favorite.id });
   assert.equal(favorite.pinned, false);
   assert.equal(store.state.tabs.length, 2, 'Removing an open pin keeps its ordinary tab');
-  store.dispatch('tab:pin', { id: favorite.id });
+  store.dispatch('tab:favorite', { id: favorite.id });
   store.dispatch('tab:close', { id: favorite.id });
   store.dispatch('tab:pin', { id: favorite.id });
   assert.equal(
@@ -96,7 +96,7 @@ test('closed and restored favorites remain lazy across restart and retain portab
   const directory = temp(t);
   const store = new BrowserStore(directory);
   const favorite = store.dispatch('tab:create', { url: 'https://favorite.example' });
-  store.dispatch('tab:pin', { id: favorite.id });
+  store.dispatch('tab:favorite', { id: favorite.id });
   store.flush();
   const reopened = new BrowserStore(directory);
   assert.equal(reopened.state.activeTabId, null);
@@ -111,6 +111,7 @@ test('closed and restored favorites remain lazy across restart and retain portab
   const copy = imported.state.tabs.find((tab) => tab.url === favorite.url);
   assert.equal(copy.closed, true);
   assert.equal(copy.pinned, true);
+  assert.equal(copy.favorite, true);
   imported.dispatch('tab:activate', { id: copy.id });
   assert.equal(copy.closed, undefined);
 });
@@ -263,13 +264,23 @@ test('spaces remember their last active tab and deleting spaces preserves their 
   invariant(store.state);
 });
 
-test('folder deletion releases contained and archived tabs', () => {
+test('folder deletion releases retained pins and legacy archived tabs', () => {
   const store = memory();
   const folder = store.dispatch('folder:create', { name: 'Ideas' });
   const tab = store.dispatch('tab:create', { url: 'https://example.com' });
   store.dispatch('tab:move', { id: tab.id, folderId: folder.id });
   store.dispatch('tab:close', { id: tab.id });
+  store.state.archive.push({
+    ...store.state.tabs.find((item) => item.id === tab.id),
+    id: 'legacy-archive',
+    pinned: false,
+    favorite: false,
+    archivedAt: Date.now(),
+  });
   store.dispatch('folder:delete', { id: folder.id });
+  assert.equal(store.state.tabs[0].folderId, null);
+  assert.equal(store.state.tabs[0].pinned, true);
+  assert.equal(store.state.tabs[0].closed, true);
   assert.equal(store.state.archive[0].folderId, null);
   invariant(store.state);
 });

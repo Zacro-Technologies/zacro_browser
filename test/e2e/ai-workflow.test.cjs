@@ -117,7 +117,7 @@ async function fixture(t, { configured = true } = {}) {
     await invoke('ai:configure', { provider: 'compatible', baseUrl: `${base}/v1`, model: 'fixture' });
   const open = async (section) => {
     await shell.getByRole('button', { name: 'Library', exact: true }).click();
-    await shell.locator(`#side-panel [data-key="panel-${section}"]`).click();
+    await shell.locator(`#library-menu [data-key="panel-${section}"]`).click();
     await expect(shell.locator('#panel-title')).toHaveText(section === 'ai' ? 'Ask Zacro' : 'Settings');
   };
   await open('ai');

@@ -19,6 +19,7 @@ const {
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const path = require('node:path');
+const os = require('node:os');
 const { pathToFileURL } = require('node:url');
 const { randomUUID } = require('node:crypto');
 const { BrowserStore, normalizeAddress } = require('../core/store.cjs');
@@ -26,6 +27,7 @@ const { webURL, safeFilename, unusedPath, renameWithoutOverwrite } = require('./
 const { browserLayout, presentView, resolveSplit, restoreWindowPlacement } = require('./layout.cjs');
 const { FaviconLoader } = require('./favicon.cjs');
 const { windowChrome, macMenuTemplate } = require('./mac.cjs');
+const { windowMaterial } = require('./window-material.cjs');
 const { shortcutCatalog, matchShortcut, updateShortcut, sidebarTabs } = require('../core/shortcuts.cjs');
 const faviconLoader = new FaviconLoader();
 
@@ -81,6 +83,11 @@ let recentTabCycle = null;
 let recentTabModifiers = null;
 const externalURLs = [];
 let defaultBrowser = { supported: process.platform === 'darwin' && app.isPackaged, configured: false };
+let shellSurface = null;
+let windowMaterialState = null;
+let materialPreview = null;
+let materialSignature = null;
+let failedMaterialSignature = null;
 
 const activeSpace = () => store.state.spaces.find((item) => item.id === store.state.activeSpaceId);
 const activeTab = () => store.state.tabs.find((item) => item.id === store.state.activeTabId);
@@ -88,6 +95,51 @@ const activeProfile = () => store.state.profiles.find((item) => item.id === acti
 const activeEntry = () => peek?.entry || views.get(store.state.activeTabId);
 const activeContents = () => activeEntry()?.contents;
 const validWindow = () => win && !win.isDestroyed();
+function syncWindowMaterial() {
+  if (!validWindow() || !store || !shellSurface) return;
+  const space = activeSpace();
+  if (materialPreview?.spaceId !== space?.id) materialPreview = null;
+  const next = windowMaterial({
+    platform: process.platform,
+    release: os.release(),
+    opacity: materialPreview?.opacity ?? space?.theme?.opacity ?? 100,
+    reducedTransparency: nativeTheme.prefersReducedTransparency,
+    highContrast: nativeTheme.shouldUseHighContrastColors || nativeTheme.inForcedColorsMode,
+  });
+  const signature = JSON.stringify([next.type, next.reason, nativeTheme.shouldUseDarkColors]);
+  if (signature === failedMaterialSignature) {
+    Object.assign(next, { enabled: false, type: 'opaque', opacity: 100, reason: 'native-error' });
+  } else if (signature !== materialSignature) {
+    const background = nativeTheme.shouldUseDarkColors ? '#222425' : '#f8f7f4';
+    try {
+      if (process.platform === 'win32' && next.supported)
+        win.setBackgroundMaterial(next.enabled ? 'acrylic' : 'none');
+      else if (process.platform === 'darwin') win.setVibrancy(next.enabled ? 'under-window' : null);
+      win.setBackgroundColor(next.enabled ? '#00000000' : background);
+      // These are the shell and its neutral native parent, never a website view.
+      // A single opaque native ancestor would otherwise hide the system blur.
+      win.contentView.setBackgroundColor('#00000000');
+      shellSurface.setBackgroundColor('#00000000');
+      materialSignature = signature;
+      failedMaterialSignature = null;
+    } catch (error) {
+      // An unavailable compositor must leave readable, opaque chrome. Do not
+      // fall back to whole-window setOpacity, which also fades webpages/text.
+      next.enabled = false;
+      next.type = 'opaque';
+      next.opacity = 100;
+      next.reason = 'native-error';
+      try {
+        win.setBackgroundColor(background);
+        shellSurface.setBackgroundColor(background);
+      } catch {}
+      console.error('[Zacro] Window material unavailable:', error.message);
+      materialSignature = null;
+      failedMaterialSignature = signature;
+    }
+  }
+  windowMaterialState = next;
+}
 function focusContentOrChrome(contents = activeContents()) {
   if (!validWindow() || closingWindow || quitting) return;
   if (!layout.overlay && contents && !contents.isDestroyed()) contents.focus();
@@ -314,6 +366,7 @@ function snapshot() {
     focused: Boolean(validWindow() && win.isFocused()),
     defaultBrowser,
     dark: nativeTheme.shouldUseDarkColors,
+    windowMaterial: windowMaterialState,
   };
   // Managed extension paths are operational details, not a renderer capability.
   result.extensions = result.extensions.map(({ path: _path, ...extension }) => extension);
@@ -514,6 +567,15 @@ function guestPreferences(profileId) {
     scrollBounce: process.platform === 'darwin',
   };
 }
+function syncPinNavigation(entry) {
+  if (entry.contents.isDestroyed() || !entry.pinDocumentId) return;
+  const tab = store.state.tabs.find((item) => item.id === entry.tabId);
+  const pinnedUrl = tab?.pinned ? webURL(tab.pinnedUrl || tab.url) : null;
+  const key = `${entry.pinDocumentId}:${pinnedUrl || ''}`;
+  if (entry.pinNavigationKey === key) return;
+  entry.pinNavigationKey = key;
+  entry.contents.send('zacro:pin-state', { documentId: entry.pinDocumentId, pinnedUrl });
+}
 function createEntry(profileId, tabId = null, suppliedOptions = {}) {
   // Electron supplies the actual popup WebContents here. Adopting it preserves
   // Chromium's opener/POST state; creating a different one breaks that contract.
@@ -599,6 +661,7 @@ function createEntry(profileId, tabId = null, suppliedOptions = {}) {
   });
   wc.on('did-start-navigation', (_event, url, _isInPlace, isMainFrame) => {
     if (isMainFrame) entry.navigationVersion++;
+    if (isMainFrame && !_isInPlace) entry.pinDocumentId = null;
     if (isMainFrame && retainedFavicons.get(entry.tabId)?.url !== url) forgetRetainedFavicon(entry.tabId);
     if (isMainFrame && !_isInPlace) {
       entry.faviconRequest?.abort();
@@ -609,7 +672,17 @@ function createEntry(profileId, tabId = null, suppliedOptions = {}) {
     if (isMainFrame && backdropContext?.contentIds.has(wc.id)) clearBackdrop();
     if (isMainFrame && pendingAuth?.contentsId === wc.id && url !== pendingAuth.url) finishAuth();
   });
+  wc.on('dom-ready', () => {
+    entry.pinDocumentId = randomUUID();
+    syncPinNavigation(entry);
+  });
   wc.on('did-stop-loading', () => {
+    // A beforeunload veto keeps the old document without another dom-ready.
+    // Give that retained document a fresh nonce after its attempted navigation.
+    if (!entry.pinDocumentId) {
+      entry.pinDocumentId = randomUUID();
+      syncPinNavigation(entry);
+    }
     arrangeViews();
     publish();
   });
@@ -688,6 +761,7 @@ function createEntry(profileId, tabId = null, suppliedOptions = {}) {
   wc.on('before-input-event', (event, input) => handleShortcut(event, input, wc));
   wc.on('context-menu', (_event, params) => showPageMenu(entry, params));
   wc.on('focus', () => {
+    emit({ type: 'page:focused' });
     if (!peek && splitPair?.includes(entry.tabId) && store.state.activeTabId !== entry.tabId) {
       store.dispatch('tab:activate', { id: entry.tabId });
     }
@@ -827,6 +901,24 @@ async function requestCloseTab(id) {
     return true;
   }
   return requestCloseEntry(entry);
+}
+
+async function resetPinnedTab(id, { activate = true } = {}) {
+  const tab = store.state.tabs.find((item) => item.id === id);
+  if (!tab?.pinned) throw new Error('Choose a Pinned Tab or Favorite first.');
+  if (activate && peek && !(await requestClosePeek())) return null;
+  const prior = views.get(id);
+  store.dispatch('tab:reset-pin', { id });
+  if (activate) store.dispatch('tab:activate', { id });
+  const entry = prior || (activate ? ensureView(id) : null);
+  // Live pages use Chromium's ordinary navigation path, including its
+  // beforeunload prompt. A dormant pin only changes its next destination.
+  if (entry && !entry.contents.isDestroyed() && webURL(tab.url)) {
+    if (entry.requestedURL !== tab.url || entry.error) safeNavigate(entry, tab.url);
+    else if (prior) entry.contents.reload();
+    if (activate) focusContentOrChrome(entry.contents);
+  }
+  return store.state.tabs.find((item) => item.id === id);
 }
 
 function pinProtected(entry) {
@@ -999,7 +1091,7 @@ function reconcile() {
     if (!tab || (tab.url === NEW_TAB && !entry.blankPopup)) {
       destroyEntry(entry);
       views.delete(id);
-    }
+    } else syncPinNavigation(entry);
   }
   const split = resolveSplit(splitPair, store.state.tabs, store.state.activeTabId, store.state.activeSpaceId);
   splitTabId = split?.otherId || null;
@@ -1016,6 +1108,7 @@ function reconcile() {
     ? store.state.settings.theme
     : 'system';
   if (nativeTheme.themeSource !== theme) nativeTheme.themeSource = theme;
+  syncWindowMaterial();
   arrangeViews();
   publish();
 }
@@ -1143,7 +1236,11 @@ function showPageMenu(entry, params) {
         click: () =>
           invoke('tab:create', { url: link, spaceId: source.spaceId, active: false }).catch(report),
       },
-      { label: 'Peek at link', accelerator: 'Alt+Click', click: () => openPeek(link, source).catch(report) },
+      {
+        label: 'Peek at link',
+        accelerator: 'Shift+Click',
+        click: () => openPeek(link, source).catch(report),
+      },
       { label: 'Copy link address', click: () => clipboard.writeText(link) },
       { type: 'separator' },
     );
@@ -1795,6 +1892,7 @@ const CORE_ACTIONS = new Set([
   'tab:activate',
   'tab:close',
   'tab:pin',
+  'tab:favorite',
   'tab:move',
   'tab:restore',
   'space:create',
@@ -1883,6 +1981,23 @@ async function invoke(action, payload = {}) {
       return null;
     case 'tab:sleep':
       return { slept: await sleepPinnedEntry(views.get(payload.id)) };
+    case 'tab:reset-pin':
+      return resetPinnedTab(payload.id || store.state.activeTabId);
+    case 'tab:replace-pin': {
+      const tab = store.state.tabs.find((item) => item.id === (payload.id || store.state.activeTabId));
+      if (!tab?.pinned) throw new Error('Choose a Pinned Tab or Favorite first.');
+      const live = views.get(tab.id)?.contents;
+      if (live && !live.isDestroyed() && webURL(live.getURL()))
+        store.dispatch('tab:update', { id: tab.id, url: live.getURL() });
+      return store.dispatch('tab:replace-pin', { id: tab.id });
+    }
+    case 'space:reset-pins': {
+      const space = store.state.spaces.find((item) => item.id === (payload.id || store.state.activeSpaceId));
+      if (!space) throw new Error('Space not found.');
+      const pins = store.state.tabs.filter((tab) => tab.spaceId === space.id && tab.pinned && !tab.favorite);
+      for (const pin of pins) await resetPinnedTab(pin.id, { activate: false });
+      return { reset: pins.length };
+    }
     case 'shortcut:set': {
       const overrides = updateShortcut(
         store.state.settings.shortcutOverrides,
@@ -2004,6 +2119,18 @@ async function invoke(action, payload = {}) {
       if (entry) entry.contents.setAudioMuted(!entry.contents.isAudioMuted());
       break;
     }
+    case 'window:material-preview':
+      if (payload.clear === true) materialPreview = null;
+      else {
+        if (payload.spaceId !== activeSpace()?.id)
+          throw new Error('The Space changed. Reopen its appearance settings.');
+        if (!Number.isFinite(payload.opacity) || payload.opacity < 40 || payload.opacity > 100)
+          throw new Error('Choose a window tint opacity from 40 to 100.');
+        materialPreview = { spaceId: payload.spaceId, opacity: Math.round(payload.opacity) };
+      }
+      syncWindowMaterial();
+      publish();
+      return windowMaterialState;
     case 'window:minimize':
       win.minimize();
       break;
@@ -2215,10 +2342,39 @@ function registerIPC() {
       throw new Error('This request is too large.');
     return invoke(action, payload || {});
   });
-  ipcMain.on('zacro:peek-link', (event, url) => {
+  ipcMain.on('zacro:peek-link', (event, details) => {
     const tab = tabForContents(event.sender);
-    if (!tab || event.senderFrame !== event.sender.mainFrame || !webURL(url)) return;
-    openPeek(url, tab).catch(report);
+    const entry = tab?.id === 'peek' ? peek?.entry : tab && views.get(tab.id);
+    if (
+      !tab ||
+      !entry ||
+      event.senderFrame !== event.sender.mainFrame ||
+      details?.documentId !== entry.pinDocumentId ||
+      details?.sourceURL !== event.sender.getURL() ||
+      !webURL(details?.url) ||
+      (tab.id !== 'peek' && ![store.state.activeTabId, splitTabId].includes(tab.id))
+    )
+      return;
+    openPeek(details.url, tab).catch(report);
+  });
+  ipcMain.on('zacro:pin-peek-link', (event, details) => {
+    const tab = tabForContents(event.sender);
+    const entry = tab && views.get(tab.id);
+    if (
+      !tab?.pinned ||
+      !entry ||
+      event.senderFrame !== event.sender.mainFrame ||
+      !details ||
+      details.documentId !== entry.pinDocumentId ||
+      details.sourceURL !== event.sender.getURL() ||
+      !webURL(details.url) ||
+      ![store.state.activeTabId, splitTabId].includes(tab.id)
+    )
+      return;
+    const targetHost = new URL(details.url).hostname.replace(/^www\./, '');
+    const pinHost = new URL(tab.pinnedUrl || tab.url).hostname.replace(/^www\./, '');
+    if (targetHost === pinHost) return;
+    openPeek(details.url, tab).catch(report);
   });
   ipcMain.on('zacro:page-dirty', (event) => {
     if (
@@ -2567,8 +2723,19 @@ async function endPrivateSessions() {
 async function createWindow() {
   closingWindow = false;
   allowWindowClose = false;
+  shellSurface = null;
+  windowMaterialState = null;
+  materialPreview = null;
+  materialSignature = null;
+  failedMaterialSignature = null;
   splitTabId = null;
   splitPair = null;
+  // Apply the saved appearance before the native backdrop and first frame are
+  // created, avoiding a light material flash when reopening a dark window.
+  const theme = ['dark', 'light'].includes(store.state.settings.theme)
+    ? store.state.settings.theme
+    : 'system';
+  if (nativeTheme.themeSource !== theme) nativeTheme.themeSource = theme;
   layout = {
     sidebarWidth: store.state.settings.sidebarWidth || 224,
     panelWidth: 0,
@@ -2632,6 +2799,8 @@ async function createWindow() {
   const pageHost = new View();
   win.setContentView(pageHost);
   pageHost.addChildView(shellView);
+  shellSurface = shellView;
+  syncWindowMaterial();
   const sizeShell = () => {
     const [width, height] = win.getContentSize();
     shellView.setBounds({ x: 0, y: 0, width, height });
@@ -2747,6 +2916,11 @@ async function createWindow() {
       peek = null;
     }
     win = null;
+    shellSurface = null;
+    windowMaterialState = null;
+    materialPreview = null;
+    materialSignature = null;
+    failedMaterialSignature = null;
     updateMacMenu();
     splitTabId = null;
     splitPair = null;
@@ -2804,7 +2978,10 @@ app.on('will-quit', () => {
     console.error('Session save failed:', error.message);
   }
 });
-nativeTheme.on('updated', publish);
+nativeTheme.on('updated', () => {
+  syncWindowMaterial();
+  publish();
+});
 
 if (singleInstance)
   app

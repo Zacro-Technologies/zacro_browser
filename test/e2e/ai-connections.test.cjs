@@ -114,9 +114,9 @@ async function fixture(t) {
     );
   const openSection = async (section) => {
     await shell.getByRole('button', { name: 'Library', exact: true }).click();
-    const sectionButton = shell.locator(`#side-panel [data-key="panel-${section}"]`);
+    const sectionButton = shell.locator(`#library-menu [data-key="panel-${section}"]`);
     await sectionButton.click();
-    await expect(sectionButton).toHaveAttribute('aria-pressed', 'true');
+    await expect(shell.locator('#panel-title')).toHaveText(section === 'ai' ? 'Ask Zacro' : 'Settings');
   };
   const openConnections = async () => {
     await openSection('settings');

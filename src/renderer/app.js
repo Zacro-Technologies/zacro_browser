@@ -1,5 +1,6 @@
 import { createSpaceGesture } from './space-gesture.js';
 import { deriveSpaceTheme } from './theme.js';
+import '../core/site-search.js';
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -74,6 +75,27 @@ const icons = {
   terminal: 'm4 6 6 6-6 6M12 18h8',
   mail: 'M3 5h18v14H3zM3 5l9 7 9-7',
   heart: 'M20.5 5.5a5 5 0 0 0-7 0L12 7l-1.5-1.5a5 5 0 0 0-7 7L12 21l8.5-8.5a5 5 0 0 0 0-7z',
+  plane: 'm22 2-7 20-4-9-9-4zM11 13 22 2',
+  camera: 'M3 7h4l2-3h6l2 3h4v14H3zM16 13a4 4 0 1 1-8 0 4 4 0 0 1 8 0',
+  gamepad: 'M7 7h10c3 0 5 12 2 12l-4-3H9l-4 3C2 19 4 7 7 7zM7 10v5M4.5 12.5h5M16 11h.01M19 14h.01',
+  palette:
+    'M12 3a9 9 0 1 0 0 18h2a2 2 0 0 0 0-4 2 2 0 0 1 0-4h3a4 4 0 0 0 4-4c0-3-4-6-9-6zM7 8h.01M12 6h.01M6 13h.01M17 8h.01',
+  beaker: 'M8 3h8M9 3v7L3 20h18l-6-10V3M7 14h10',
+  rocket: 'M14 4c3-2 6-2 7-1 1 1 1 4-1 7l-8 8-6-6zM14 4H7l-4 7 5 1M20 10v7l-7 4-1-5M5 16l-2 5 5-2M17 6h.01',
+  compass: 'M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0M16 8l-3 5-5 3 3-5z',
+  mountain: 'm2 20 7-14 5 9 3-5 5 10zM6 12l3 2 3-2',
+  flame: 'M12 2c1 6-5 7-5 12a5 5 0 0 0 10 0c0-3-1-5-2-7 0 4-2 4-2 4 1-4 0-7-1-9z',
+  cloud: 'M6 19a5 5 0 0 1-1-10 7 7 0 0 1 13-1 5.5 5.5 0 0 1 0 11z',
+  bolt: 'm13 2-9 12h7l-1 8 10-13h-8z',
+  diamond: 'm12 2 10 10-10 10L2 12z',
+  flower: 'M12 8c-8-12-13 1-5 4-8 3-3 16 5 4 8 12 13-1 5-4 8-3 3-16-5-4zM14 12a2 2 0 1 1-4 0 2 2 0 0 1 4 0',
+  smile: 'M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0M8 9h.01M16 9h.01M8 14q4 5 8 0',
+  headphones:
+    'M4 14v-3a8 8 0 0 1 16 0v3M4 12h3v9H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2M20 12h-3v9h3a2 2 0 0 0 2-2v-5a2 2 0 0 0-2-2',
+  calendar: 'M3 5h18v16H3zM3 10h18M8 2v6M16 2v6M8 14h.01M12 14h.01M16 14h.01M8 18h.01M12 18h.01',
+  film: 'M3 3h18v18H3zM7 3v18M17 3v18M3 8h4M3 16h4M17 8h4M17 16h4',
+  building: 'M4 21V7h6V3h10v18M2 21h20M14 7h2M14 11h2M14 15h2M7 11h.01M7 15h.01M10 21v-4h4v4',
+  bag: 'M4 7h16l1 14H3zM8 8V6a4 4 0 0 1 8 0v2',
 };
 const icon = (name) =>
   `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="${icons[name] || icons.globe}"/></svg>`;
@@ -136,6 +158,32 @@ const spaceIcons = [
   'coffee',
   'music',
   'moon',
+  'plane',
+  'camera',
+  'gamepad',
+  'palette',
+  'beaker',
+  'rocket',
+  'compass',
+  'mountain',
+  'flame',
+  'cloud',
+  'bolt',
+  'diamond',
+  'flower',
+  'smile',
+  'headphones',
+  'calendar',
+  'film',
+  'building',
+  'bag',
+  'terminal',
+  'mail',
+  'shield',
+  'sun',
+  'monitor',
+  'eye',
+  'folder',
 ];
 let state = null;
 let toastTimer;
@@ -152,6 +200,9 @@ const ui = {
   commandFilter: 'all',
   commandAuto: false,
   commandBusy: false,
+  commandTrail: [],
+  commandContext: null,
+  commandSiteSearch: null,
   blankPaletteContext: null,
   shortcutQuery: '',
   recordingShortcut: null,
@@ -198,12 +249,20 @@ const shortcutLabel = (label, id, fallback = '') => {
 const blankContext = () => `${state?.activeSpaceId || ''}:${state?.activeTabId || 'empty'}`;
 const isBlankPage = () => !activeTab() || (activeTab().url === 'zacro://newtab' && !activeTab().homePage);
 function maybeOpenBlankPalette() {
-  if (!state || ui.commandBusy || !isBlankPage() || ui.dialog || ui.panel || ui.dragTab) return;
+  if (!state || ui.commandBusy || !isBlankPage() || ui.dialog || ui.panel || ui.dragTab || ui.libraryMenuOpen)
+    return;
   const context = blankContext();
   if (ui.blankPaletteContext === context) return;
   ui.blankPaletteContext = context;
   requestAnimationFrame(() => {
-    if (!ui.dialog && !ui.panel && !ui.commandBusy && isBlankPage() && blankContext() === context)
+    if (
+      !ui.dialog &&
+      !ui.panel &&
+      !ui.commandBusy &&
+      !ui.libraryMenuOpen &&
+      isBlankPage() &&
+      blankContext() === context
+    )
       openCommand('newtab', '', { automatic: true });
   });
 }
@@ -729,8 +788,12 @@ function setTheme() {
     ['--space-grain', 'grainOpacity'],
   ])
     root.style.setProperty(token, String(tones[key]));
-  root.style.setProperty('--space-opacity', `${material.opacity ?? 100}%`);
-  root.style.setProperty('--space-blur', `${material.blur || 0}px`);
+  const nativeMaterial = state.runtime?.windowMaterial;
+  root.dataset.windowMaterial = nativeMaterial?.enabled ? nativeMaterial.type : 'opaque';
+  root.style.setProperty('--space-opacity', `${nativeMaterial?.enabled ? (material.opacity ?? 100) : 100}%`);
+  root.style.setProperty('--space-blur', '0px');
+  const materialHint = $('#window-material-hint');
+  if (materialHint) materialHint.textContent = windowMaterialHint(nativeMaterial);
   for (const [name, duration] of [
     ['fast', 100],
     ['base', 160],
@@ -742,12 +805,38 @@ function setTheme() {
     /^#[\da-f]{6}$/i.test(base || '') ? base : '#9d4460',
   );
 }
+function windowMaterialHint(material = state.runtime?.windowMaterial) {
+  if (material?.reason === 'reduced-transparency')
+    return 'Your system’s Reduce Transparency setting keeps the window opaque.';
+  if (material?.reason === 'high-contrast') return 'Your system’s contrast setting keeps the window opaque.';
+  if (material?.reason === 'native-error')
+    return 'Window blur is unavailable in this session. Your tint preference is kept.';
+  if (!material?.supported) return 'Window blur is available on macOS and Windows 11 22H2 or later.';
+  return 'Below 100%, system blur reveals windows behind Zacro. Text and pages stay sharp.';
+}
+function previewWindowMaterial(opacity) {
+  const serial = (ui.materialPreviewSerial = (ui.materialPreviewSerial || 0) + 1);
+  safely(
+    invoke(
+      'window:material-preview',
+      opacity === null ? { clear: true } : { spaceId: state.activeSpaceId, opacity },
+    ).then((material) => {
+      if (serial !== ui.materialPreviewSerial || !state?.runtime) return;
+      state.runtime.windowMaterial = material;
+      setTheme();
+    }),
+  );
+}
 function applyState(next) {
   if (!next?.profiles || !next?.tabs) return;
   const previousProfile = activeProfile()?.id;
   const previousSpace = state?.activeSpaceId;
   const previousTab = state?.activeTabId;
   state = next;
+  if (previousSpace !== state.activeSpaceId || previousProfile !== activeProfile()?.id) {
+    closeLibraryChooser();
+    cancelRailResize();
+  }
   if (ui.themePreview && (previousSpace !== state.activeSpaceId || previousProfile !== activeProfile()?.id))
     closeDialog({ restore: false });
   if (ui.commandAuto && ui.dialog === 'command' && !isBlankPage()) closeDialog({ restore: false });
@@ -760,6 +849,9 @@ function applyState(next) {
     if (ui.dialog === 'command') {
       ui.commandQuery = '';
       ui.commandIndex = 0;
+      ui.commandTrail = [];
+      ui.commandContext = null;
+      ui.commandSiteSearch = null;
       $('#command-input').value = '';
     }
     invalidateAIRequest();
@@ -938,56 +1030,61 @@ function handleSidebarKeyboard(event) {
   }
   return false;
 }
+function tabLabel(tab) {
+  return (
+    tab.customTitle || (tab.pinned && tab.pinnedTitle) || tab.title || hostname(tab.pinnedUrl || tab.url)
+  );
+}
 function renderSpacePage(space) {
   const profile = state.profiles.find((item) => item.id === space?.profileId);
-  const tabs = state.tabs.filter((tab) => tab.spaceId === space?.id);
-  const selectedTabId =
-    space?.id === state.activeSpaceId
-      ? state.activeTabId
-      : tabs.find((tab) => tab.id === space?.lastActiveTabId && !tab.closed)?.id ||
-        tabs.find((tab) => !tab.closed)?.id;
-  const pins = tabs.filter((tab) => tab.pinned);
+  const favorites = state.tabs.filter((tab) => tab.favorite && tab.profileId === space?.profileId);
+  const tabs = state.tabs.filter((tab) => tab.spaceId === space?.id && !tab.favorite);
+  const selectedTabId = space?.id === state.activeSpaceId ? state.activeTabId : space?.lastActiveTabId;
+  const pins = tabs.filter((tab) => tab.pinned && !tab.folderId);
   const loose = tabs.filter(
     (tab) => !tab.pinned && !tab.folderId && (tab.url !== 'zacro://newtab' || tab.homePage),
   );
   const folders = state.folders.filter((folder) => folder.spaceId === space?.id);
   const tabRow = (tab) => {
     const page = state.runtime?.pages?.[tab.id];
-    return `<div class="tab-row ${tab.id === selectedTabId ? 'active' : ''}" draggable="true" data-tab-id="${esc(tab.id)}" data-drop-tab="${esc(tab.id)}"><button type="button" class="tab-main" data-action="tab:activate" data-id="${esc(tab.id)}" data-key="tab-${esc(tab.id)}" ${tab.id === selectedTabId ? 'aria-current="page"' : ''} title="${esc(tab.title)} — ${esc(tab.url)}">${page?.loading ? '<span class="spinner"></span>' : favicon(tab.url)}<span class="title">${esc(tab.title || 'New tab')}</span>${state.runtime?.splitTabId === tab.id ? icon('split') : ''}</button>${page?.audible || page?.muted ? button('tab:mute', page.muted ? 'Unmute tab' : 'Mute tab', page.muted ? 'muted' : 'volume', `data-id="${esc(tab.id)}"`, 'tab-audio') : ''}${button('tab:close', `Close ${tab.title || 'tab'}`, 'close', `data-id="${esc(tab.id)}" data-key="close-${esc(tab.id)}"`, 'tab-close')}</div>`;
+    const label = tabLabel(tab);
+    const status = tab.closed ? 'Closed' : page?.loaded ? 'Loaded' : 'Sleeping';
+    const glyph = page?.loading ? '<span class="spinner"></span>' : favicon(tab.pinnedUrl || tab.url, tab.id);
+    return `<div class="tab-row ${tab.pinned ? 'pinned-row' : ''} ${tab.id === selectedTabId && !tab.closed ? 'active' : ''}" draggable="true" data-tab-id="${esc(tab.id)}" data-drop-tab="${esc(tab.id)}">${tab.pinned ? `<button type="button" class="tab-pin-reset" data-action="tab:reset-pin" data-id="${esc(tab.id)}" tabindex="-1" aria-label="Reset ${esc(label)} to saved page" title="Reset to ${esc(tab.pinnedUrl || tab.url)}">${glyph}</button>` : ''}<button type="button" class="tab-main" data-action="tab:activate" data-id="${esc(tab.id)}" data-key="tab-${esc(tab.id)}" ${tab.id === selectedTabId && !tab.closed ? 'aria-current="page"' : ''} title="${esc(label)} — ${esc(tab.url)}${tab.pinned ? ' · ' + status : ''}">${tab.pinned ? '' : glyph}<span class="title">${esc(label || 'New tab')}</span>${state.runtime?.splitTabId === tab.id ? icon('split') : ''}</button>${page?.audible || page?.muted ? button('tab:mute', page.muted ? 'Unmute tab' : 'Mute tab', page.muted ? 'muted' : 'volume', `data-id="${esc(tab.id)}"`, 'tab-audio') : ''}${button('tab:close', `Close ${label || 'tab'}${tab.pinned ? ' · keep pin' : ''}`, 'close', `data-id="${esc(tab.id)}" data-key="close-${esc(tab.id)}"`, 'tab-close')}</div>`;
   };
-  return `${
-    pins.length
-      ? `<div class="favorites" aria-label="Pinned tabs" data-drop-pinned>${pins
-          .map((tab) => {
-            const page = state.runtime?.pages?.[tab.id];
-            const status = page?.closed || tab.closed ? 'Closed' : page?.loaded ? 'Loaded' : 'Sleeping';
-            return `<button type="button" class="favorite ${tab.id === selectedTabId ? 'active' : ''} ${status.toLowerCase()}" draggable="true" data-tab-id="${esc(tab.id)}" data-drop-tab="${esc(tab.id)}" data-action="tab:activate" data-id="${esc(tab.id)}" data-key="pin-${esc(tab.id)}" ${tab.id === selectedTabId ? 'aria-current="page"' : ''} aria-label="${esc(tab.title || hostname(tab.url))} — ${status}" title="${esc(tab.title)} — ${status}${status === 'Loaded' ? '' : ' · Click to open'}\n${esc(tab.url)}">${favicon(tab.url, tab.id)}</button>`;
-          })
-          .join('')}</div>`
-      : '<div class="favorites favorites-empty" aria-label="Pinned tabs" data-drop-pinned><span class="pin-drop-hint">Drop to pin</span></div>'
-  }<div class="tabs-scroll">
+  const favoriteTiles = favorites
+    .map((tab) => {
+      const page = state.runtime?.pages?.[tab.id];
+      const status = tab.closed ? 'Closed' : page?.loaded ? 'Loaded' : 'Sleeping';
+      const label = tabLabel(tab);
+      return `<button type="button" class="favorite ${tab.id === selectedTabId && !tab.closed ? 'active' : ''} ${status.toLowerCase()}" draggable="true" data-tab-id="${esc(tab.id)}" data-drop-tab="${esc(tab.id)}" data-action="tab:reset-pin" data-id="${esc(tab.id)}" data-key="pin-${esc(tab.id)}" ${tab.id === selectedTabId && !tab.closed ? 'aria-current="page"' : ''} aria-label="${esc(label)} — ${status}" title="${esc(label)} — ${status}\n${esc(tab.pinnedUrl || tab.url)}">${favicon(tab.pinnedUrl || tab.url, tab.id)}</button>`;
+    })
+    .join('');
+  return `<div class="favorites ${favorites.length ? '' : 'favorites-empty'}" aria-label="Favorites" data-drop-favorites>${favoriteTiles || '<span class="pin-drop-hint">Drop to favorite</span>'}</div><div class="tabs-scroll">
     <div class="space-header"><button type="button" class="space-picker" data-action="ui:spaces" data-key="space-picker" aria-label="Switch Space or profile" title="${esc(space?.name)} · ${esc(profile?.name)}${profile?.private ? ' · Private session' : ''}">${icon(profile?.private ? 'shield' : space?.icon || 'circle')}<span class="space-title">${esc(space?.name || 'My Space')}</span>${profile?.private ? '<span class="private-indicator">Private</span>' : ''}${icon('down')}</button></div>
-    ${folders
+    <div class="pinned-tabs" data-drop-pinned aria-label="Pinned tabs">${folders
       .map(
         (folder) =>
-          `<div class="folder" data-folder-id="${esc(folder.id)}" data-drop-folder="${esc(folder.id)}"><button type="button" class="folder-heading" data-action="ui:folder-toggle" data-id="${esc(folder.id)}" data-key="folder-${esc(folder.id)}" aria-expanded="${!ui.closedFolders.has(folder.id)}"><span class="folder-icon">${icon('folder')}${icon('down')}</span><span class="truncate">${esc(folder.name)}</span><span class="folder-count">${tabs.filter((t) => t.folderId === folder.id).length}</span></button>${
+          `<div class="folder" data-folder-id="${esc(folder.id)}" data-drop-folder="${esc(folder.id)}"><button type="button" class="folder-heading" data-action="ui:folder-toggle" data-id="${esc(folder.id)}" data-key="folder-${esc(folder.id)}" aria-expanded="${!ui.closedFolders.has(folder.id)}"><span class="folder-icon">${icon('folder')}${icon('down')}</span><span class="truncate">${esc(folder.name)}</span></button>${
             ui.closedFolders.has(folder.id)
               ? ''
               : `<div class="folder-tabs">${
                   tabs
-                    .filter((t) => t.folderId === folder.id && !t.pinned)
+                    .filter((tab) => tab.folderId === folder.id)
                     .map(tabRow)
                     .join('') || '<div class="empty-tabs">Drop tabs here</div>'
                 }</div>`
           }</div>`,
       )
-      .join('')}
-    <div class="loose-tabs" data-drop-folder="">${loose.map(tabRow).join('')}</div></div>`;
+      .join('')}${pins.map(tabRow).join('')}<span class="pin-drop-hint">Drop to pin in this Space</span></div>
+    <div class="today-divider" aria-hidden="true"></div><div class="loose-tabs" data-drop-folder="" aria-label="Today tabs">${loose.map(tabRow).join('')}</div></div>`;
 }
 function renderSidebar() {
   const space = activeSpace();
   const profile = activeProfile();
-  const tabs = currentTabs();
+  const tabs = state.tabs.filter(
+    (tab) => tab.spaceId === space?.id || (tab.favorite && tab.profileId === profile?.id),
+  );
   const folders = state.folders.filter((f) => f.spaceId === space?.id);
   const spaces = state.spaces.filter((s) => s.profileId === profile?.id);
   const signature = JSON.stringify([
@@ -1043,7 +1140,8 @@ function renderSidebar() {
     else clearSpaceTransition();
   }
   $('#sidebar-content').innerHTML = `<div class="space-page">${renderSpacePage(space)}</div>
-    <footer class="sidebar-footer">${button('ui:library', 'Library', 'library', 'data-key="library" aria-haspopup="dialog"')}<div class="space-dots" aria-label="Your Spaces">${spaces.map((s) => `<button type="button" class="space-dot ${s.id === space?.id ? 'active' : ''}" data-action="space:activate" data-id="${esc(s.id)}" data-key="space-${esc(s.id)}" aria-haspopup="dialog" title="${esc(s.name)}" aria-label="Switch to ${esc(s.name)}" ${s.id === space?.id ? 'aria-current="true"' : ''}>${icon(s.icon || 'circle')}</button>`).join('')}</div>${button('ui:add-menu', 'New tab, folder or Space', 'plus', 'data-key="add-menu" aria-haspopup="dialog"')}</footer>`;
+    <footer class="sidebar-footer">${button('ui:library', 'Library', 'library', 'data-key="library" aria-haspopup="menu" aria-expanded="false"')}<div class="space-dots" aria-label="Your Spaces">${spaces.map((s) => `<button type="button" class="space-dot ${s.id === space?.id ? 'active' : ''}" data-action="space:activate" data-id="${esc(s.id)}" data-key="space-${esc(s.id)}" aria-haspopup="dialog" title="${esc(s.name)}" aria-label="Switch to ${esc(s.name)}" ${s.id === space?.id ? 'aria-current="true"' : ''}>${icon(s.icon || 'circle')}</button>`).join('')}</div>${button('ui:add-menu', 'New tab, folder or Space', 'plus', 'data-key="add-menu" aria-haspopup="dialog"')}</footer>`;
+  syncLibraryChooserAnchor();
   for (const dot of $$('.space-dot')) {
     const color = spaces.find((item) => item.id === dot.dataset.id)?.color;
     if (/^#[\da-f]{6}$/i.test(color || '')) dot.style.setProperty('--dot-color', color);
@@ -1195,14 +1293,22 @@ let lastLayout = '';
 function expandedSidebarWidth() {
   const gutter = state?.settings.pageGutter ?? 8;
   return Math.min(
-    Math.max(200, Math.min(380, Number(state?.settings.sidebarWidth) || 224)),
+    Math.max(
+      200,
+      Math.min(
+        380,
+        ui.chromeResize?.kind === 'sidebar'
+          ? ui.chromeResize.width
+          : Number(state?.settings.sidebarWidth) || 224,
+      ),
+    ),
     Math.max(0, innerWidth - 240 - gutter * 2),
   );
 }
 function effectiveSidebarHidden() {
   const gutter = state?.settings.pageGutter ?? 8;
   return (
-    ui.sidebarHidden || Boolean(ui.panel && innerWidth < expandedSidebarWidth() + 288 + 240 + gutter * 2)
+    ui.sidebarHidden || Boolean(ui.panel && innerWidth < expandedSidebarWidth() + 260 + 240 + gutter * 2)
   );
 }
 function chromeTargets() {
@@ -1210,7 +1316,14 @@ function chromeTargets() {
   const gutter = state?.settings.pageGutter ?? 8;
   return {
     sidebar,
-    panel: ui.panel ? Math.min(336, Math.max(0, innerWidth - sidebar - 240 - gutter * 2)) : 0,
+    panel: ui.panel
+      ? Math.min(
+          ui.chromeResize?.kind === 'panel'
+            ? ui.chromeResize.width
+            : Number(state.settings.panelWidth) || 336,
+          Math.max(0, innerWidth - sidebar - 240 - gutter * 2),
+        )
+      : 0,
   };
 }
 function currentChromeWidths() {
@@ -1279,6 +1392,17 @@ function syncLayout() {
   document.documentElement.style.setProperty('--panel-expanded', `${ui.panelExpandedWidth || 336}px`);
   document.documentElement.style.setProperty('--page-top', `${contentTop}px`);
   document.documentElement.style.setProperty('--canvas-right', `${panel + gutter}px`);
+  for (const [kind, value, hiddenResize] of [
+    ['sidebar', width, hidden],
+    ['panel', panel, !ui.panel],
+  ]) {
+    const handle = $(`#${kind}-resizer`);
+    handle.hidden = hiddenResize || Boolean(ui.dialog) || value === 0;
+    handle.setAttribute('aria-valuemin', kind === 'sidebar' ? '200' : '260');
+    handle.setAttribute('aria-valuemax', String(clampRailWidth(kind, 1000)));
+    handle.setAttribute('aria-valuenow', String(Math.round(value)));
+    handle.setAttribute('aria-valuetext', `${Math.round(value)} pixels`);
+  }
   const layout = {
     sidebarWidth: width,
     panelWidth: panel,
@@ -1295,6 +1419,96 @@ function syncLayout() {
 function empty(symbol, title, description) {
   return `<div class="empty-state"><div class="empty-icon">${icon(symbol)}</div><h3>${esc(title)}</h3><p>${esc(description)}</p></div>`;
 }
+function clampRailWidth(kind, value) {
+  const gutter = state.settings.pageGutter ?? 8;
+  const minimum = kind === 'sidebar' ? 200 : 260;
+  const maximum = kind === 'sidebar' ? 380 : 560;
+  // A deliberate sidebar resize must leave the open panel usable; otherwise
+  // crossing its minimum would retract the very rail being dragged.
+  const other =
+    kind === 'sidebar' && ui.panel
+      ? 260
+      : kind === 'panel' && !effectiveSidebarHidden()
+        ? expandedSidebarWidth()
+        : 0;
+  return Math.round(Math.max(minimum, Math.min(maximum, innerWidth - other - 240 - gutter * 2, value)));
+}
+async function saveRailWidth(kind, width) {
+  const key = kind === 'sidebar' ? 'sidebarWidth' : 'panelWidth';
+  const value = clampRailWidth(kind, width);
+  try {
+    await invoke('settings:update', { values: { [key]: value } });
+    state.settings[key] = value;
+  } finally {
+    ui.chromeResize = null;
+    delete $('#app').dataset.chromeResizing;
+    syncLayout();
+  }
+}
+document.addEventListener('pointerdown', (event) => {
+  const handle = event.target.closest?.('.chrome-resizer');
+  if (!handle || event.button !== 0 || !state) return;
+  event.preventDefault();
+  closeLibraryChooser();
+  interruptSpaceScroll();
+  finishChromeMotion();
+  const kind = handle.id === 'sidebar-resizer' ? 'sidebar' : 'panel';
+  const width = currentChromeWidths()[kind];
+  ui.chromeResize = { kind, width, startWidth: width, startX: event.clientX, pointerId: event.pointerId };
+  $('#app').dataset.chromeResizing = 'true';
+  handle.focus({ preventScroll: true });
+  handle.setPointerCapture(event.pointerId);
+});
+document.addEventListener('pointermove', (event) => {
+  const resize = ui.chromeResize;
+  if (!resize || resize.pointerId !== event.pointerId) return;
+  resize.width = clampRailWidth(
+    resize.kind,
+    resize.startWidth + (event.clientX - resize.startX) * (resize.kind === 'sidebar' ? 1 : -1),
+  );
+  syncLayout();
+});
+document.addEventListener('pointerup', (event) => {
+  const resize = ui.chromeResize;
+  if (!resize || resize.pointerId !== event.pointerId) return;
+  if (event.target.hasPointerCapture?.(event.pointerId)) event.target.releasePointerCapture(event.pointerId);
+  safely(saveRailWidth(resize.kind, resize.width));
+});
+function cancelRailResize() {
+  if (!ui.chromeResize) return;
+  ui.chromeResize = null;
+  delete $('#app').dataset.chromeResizing;
+  syncLayout();
+}
+document.addEventListener('pointercancel', cancelRailResize);
+document.addEventListener('dblclick', (event) => {
+  const handle = event.target.closest?.('.chrome-resizer');
+  if (!handle) return;
+  const kind = handle.id === 'sidebar-resizer' ? 'sidebar' : 'panel';
+  safely(saveRailWidth(kind, kind === 'sidebar' ? 224 : 336));
+});
+document.addEventListener(
+  'keydown',
+  (event) => {
+    if (ui.chromeResize && event.key === 'Escape') {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      cancelRailResize();
+      return;
+    }
+    const handle = event.target.closest?.('.chrome-resizer');
+    if (!handle || !['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    const kind = handle.id === 'sidebar-resizer' ? 'sidebar' : 'panel';
+    const step = event.shiftKey ? 32 : event.altKey ? 1 : 16;
+    const change = (event.key === 'ArrowRight' ? 1 : -1) * (kind === 'sidebar' ? 1 : -1) * step;
+    const width =
+      event.key === 'Home' ? 0 : event.key === 'End' ? 1000 : currentChromeWidths()[kind] + change;
+    safely(saveRailWidth(kind, width));
+  },
+  true,
+);
 const panelNames = {
   history: ['history', 'History'],
   bookmarks: ['bookmark', 'Bookmarks'],
@@ -1306,7 +1520,7 @@ const panelNames = {
 };
 function panelHeader() {
   const [symbol, title] = panelNames[ui.panel] || ['info', 'Library'];
-  return `<header class="panel-header">${icon(symbol)}<h2 id="panel-title" tabindex="-1">${title}</h2><span class="panel-owner" aria-hidden="true">Zacro</span>${ui.panel === 'ai' ? button('ui:ai-reset', 'New conversation', 'plus') : ''}${button('ui:panel-close', 'Close panel', 'close', 'data-key="panel-close"')}</header><nav class="panel-tabs" aria-label="Browser panels">${['bookmarks', 'history', 'downloads', 'archive', 'ai', 'settings'].map((panel) => button('ui:panel', panelNames[panel][1], panelNames[panel][0], `data-panel="${panel}" data-key="panel-${panel}" aria-pressed="${ui.panel === panel}"`)).join('')}</nav>`;
+  return `<header class="panel-header"><button type="button" id="panel-chooser" class="panel-chooser" aria-label="${esc(title)} · Switch browser panel" aria-haspopup="menu" aria-expanded="false" data-library-chooser>${icon(symbol)}<span id="panel-title" tabindex="-1">${title}</span>${icon('down')}</button>${ui.panel === 'ai' ? button('ui:ai-reset', 'New conversation', 'plus') : ''}${button('ui:panel-close', 'Close panel', 'close', 'data-key="panel-close"')}</header>`;
 }
 function patchAIContent(current, incoming) {
   // Keep the composer, native select, focused controls, and unchanged messages
@@ -1417,6 +1631,7 @@ function renderPanel(force = false) {
       panelHeader() +
       `<div class="panel-toolbar"><input id="panel-search" type="search" placeholder="Search ${label.toLowerCase()}" aria-label="Search ${label.toLowerCase()}" value="${esc(ui.panelQuery)}">${ui.panel === 'history' ? button('ui:history-clear', 'Clear history', 'trash') : ui.panel === 'archive' ? button('ui:archive-clear', 'Empty archive', 'trash') : ''}</div><div class="panel-body">${renderResourcePanel()}</div>`;
   }
+  syncLibraryChooserAnchor();
   const body = $('.panel-body', element);
   if (body) body.scrollTop = scroll;
   const composer = $('#ai-question', element);
@@ -1443,50 +1658,56 @@ function renderPanel(force = false) {
 function renderResourcePanel() {
   const key = ui.panel;
   const query = ui.panelQuery.trim().toLowerCase();
-  let records = profileItems(key).filter((item) =>
+  const records = profileItems(key).filter((item) =>
     `${item.title || item.name || item.filename || ''} ${item.url || ''}`.toLowerCase().includes(query),
   );
-  if (key === 'downloads') return renderDownloads(records);
   if (!records.length) {
     if (query) return empty('search', 'No matches', 'Try a different title or address.');
     const messages = {
       history: ['history', 'No history yet', 'Pages you visit appear here.'],
       bookmarks: ['bookmark', 'No bookmarks yet', 'Use the star to save a page.'],
       archive: ['archive', 'No archived tabs', 'Closed tabs will appear here.'],
+      downloads: ['download', 'No downloads yet', 'Files you download appear here.'],
     };
     return empty(...messages[key]);
   }
-  let lastDate = '';
-  return records
-    .slice(0, 500)
-    .map((item) => {
-      const date = dateLabel(item.visitedAt || item.archivedAt || item.createdAt);
-      const heading =
-        key !== 'bookmarks' && date !== lastDate ? `<div class="list-label">${esc(date)}</div>` : '';
-      lastDate = date;
-      return (
-        heading +
-        `<div class="resource">${favicon(item.url)}<button type="button" class="resource-main" data-action="${key === 'archive' ? 'tab:restore' : 'ui:open-url'}" data-id="${esc(item.id)}" data-url="${esc(item.url)}" title="${esc(item.url)}"><div class="resource-title">${esc(item.title || hostname(item.url))}</div><div class="resource-meta">${esc(hostname(item.url))}${key === 'history' ? ` · ${esc(new Date(item.visitedAt).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' }))}` : ''}</div></button><div class="resource-actions">${key === 'bookmarks' ? button('bookmark:delete', 'Remove bookmark', 'close', `data-id="${esc(item.id)}"`) : key === 'archive' ? button('tab:restore', 'Restore tab', 'undo', `data-id="${esc(item.id)}"`) : button('peek:open', 'Preview page', 'eye', `data-url="${esc(item.url)}"`)}</div></div>`
-      );
-    })
+  if (key === 'downloads') return renderDownloads(records);
+  return libraryGroups(records, (item) => {
+    const timestamp = key === 'history' ? new Date(item.visitedAt) : null;
+    const time =
+      timestamp && !Number.isNaN(timestamp.getTime())
+        ? timestamp.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })
+        : '';
+    return `<div class="resource" data-resource-id="${esc(item.id)}">${favicon(item.url)}<button type="button" class="resource-main" id="library-item-${esc(item.id)}" data-action="${key === 'archive' ? 'tab:restore' : 'ui:open-url'}" data-id="${esc(item.id)}" data-url="${esc(item.url)}" title="${esc(item.url)}"><span class="resource-title">${esc(item.title || hostname(item.url))}</span><span class="resource-meta">${esc(hostname(item.url))}</span></button>${time ? `<time class="resource-time" datetime="${timestamp.toISOString()}">${esc(time)}</time>` : ''}<div class="resource-actions">${key === 'bookmarks' ? button('bookmark:delete', 'Remove bookmark', 'close', `data-id="${esc(item.id)}"`) : key === 'archive' ? button('tab:restore', 'Restore tab', 'undo', `data-id="${esc(item.id)}"`) : button('peek:open', 'Preview page', 'eye', `data-url="${esc(item.url)}"`)}</div></div>`;
+  });
+}
+function libraryGroups(records, renderRow) {
+  const groups = new Map();
+  const timestamp = (item) => item.visitedAt || item.archivedAt || item.startedAt || item.createdAt || 0;
+  for (const item of [...records].sort((a, b) => timestamp(b) - timestamp(a)).slice(0, 500)) {
+    const date = timestamp(item) ? dateLabel(timestamp(item)) : 'Earlier';
+    if (!groups.has(date)) groups.set(date, []);
+    groups.get(date).push(item);
+  }
+  return [...groups]
+    .map(
+      ([label, items]) =>
+        `<section class="library-group" aria-label="${esc(label)}"><h3 class="list-label">${esc(label)}<span>${items.length}</span></h3>${items.map(renderRow).join('')}</section>`,
+    )
     .join('');
 }
 function renderDownloads(records) {
   if (!records.length) return empty('download', 'No downloads yet', 'Files you download appear here.');
-  return records
-    .map((file) => {
-      const name = file.name || file.filename || 'Download';
-      const status = file.state || file.status || 'progressing';
-      const progress =
-        Number(file.totalBytes) > 0
-          ? Math.round((Number(file.receivedBytes || 0) / file.totalBytes) * 100)
-          : 0;
-      const complete = status === 'completed';
-      const paused = file.paused || status === 'paused';
-      const running = ['progressing', 'paused'].includes(status);
-      return `<div class="resource"><span class="download-file">${icon('file')}</span><div class="grow"><div class="resource-title" title="${esc(name)}">${esc(name)}</div><div class="resource-meta">${esc(complete ? bytes(file.totalBytes || file.receivedBytes) : status === 'cancelled' ? 'Cancelled' : status === 'interrupted' ? 'Interrupted' : paused ? 'Paused' : `${bytes(file.receivedBytes || 0)}${file.totalBytes > 0 ? ' / ' + bytes(file.totalBytes) : ''}`)}</div>${running ? `<div class="download-progress"><progress max="100" value="${progress}" aria-label="Download progress"></progress></div>` : ''}<div class="download-operations">${complete ? `<button type="button" class="text-button" data-action="download:show" data-id="${esc(file.id)}">${isMac ? 'Show in Finder' : 'Show in folder'}</button><button type="button" class="text-button" data-action="ui:download-rename" data-id="${esc(file.id)}">Rename</button><button type="button" class="text-button" data-action="ui:download-suggest" data-id="${esc(file.id)}">${icon('sparkle')}${ui.downloadSuggestions.has(file.id) ? 'Review name' : 'Suggest name'}</button>${file.originalName || file.previousPath || file.previousName ? `<button type="button" class="text-button" data-action="download:undo" data-id="${esc(file.id)}">Undo rename</button>` : ''}` : running ? `<button type="button" class="text-button" data-action="download:${paused ? 'resume' : 'pause'}" data-id="${esc(file.id)}">${paused ? 'Resume' : 'Pause'}</button><button type="button" class="text-button danger" data-action="download:cancel" data-id="${esc(file.id)}">Cancel</button>` : ''}</div></div></div>`;
-    })
-    .join('');
+  return libraryGroups(records, (file) => {
+    const name = file.name || file.filename || 'Download';
+    const status = file.state || file.status || 'progressing';
+    const progress =
+      Number(file.totalBytes) > 0 ? Math.round((Number(file.receivedBytes || 0) / file.totalBytes) * 100) : 0;
+    const complete = status === 'completed';
+    const paused = file.paused || status === 'paused';
+    const running = ['progressing', 'paused'].includes(status);
+    return `<div class="resource download-resource" data-resource-id="${esc(file.id)}"><span class="download-file">${icon('file')}</span><div class="grow"><div class="resource-title" title="${esc(name)}">${esc(name)}</div><div class="resource-meta">${esc(complete ? bytes(file.totalBytes || file.receivedBytes) : status === 'cancelled' ? 'Cancelled' : status === 'interrupted' ? 'Interrupted' : paused ? 'Paused' : `${bytes(file.receivedBytes || 0)}${file.totalBytes > 0 ? ' / ' + bytes(file.totalBytes) : ''}`)}</div>${running ? `<div class="download-progress"><progress max="100" value="${progress}" aria-label="Download progress"></progress></div>` : ''}</div><div class="resource-actions">${complete ? button('download:show', isMac ? 'Show in Finder' : 'Show in folder', 'folder', `data-id="${esc(file.id)}"`) : running ? button(`download:${paused ? 'resume' : 'pause'}`, paused ? 'Resume download' : 'Pause download', paused ? 'play' : 'pause', `data-id="${esc(file.id)}"`) : ''}${complete || running ? `<button type="button" class="icon-button" aria-label="Actions for ${esc(name)}" title="Download actions" id="download-menu-${esc(file.id)}" data-download-menu="${esc(file.id)}" aria-haspopup="menu" aria-expanded="false">${icon('more')}</button>` : ''}</div></div>`;
+  });
 }
 function selectOptions(values, current) {
   return values
@@ -1978,6 +2199,8 @@ function renderAI() {
 }
 function openPanel(panel, { refreshStatus = true } = {}) {
   if (!panelNames[panel]) return;
+  closeLibraryChooser();
+  cancelRailResize();
   interruptSpaceScroll();
   if (ui.dialog) closeDialog();
   const start = currentChromeWidths();
@@ -2009,6 +2232,8 @@ function openPanel(panel, { refreshStatus = true } = {}) {
   });
 }
 function closePanel() {
+  closeLibraryChooser();
+  cancelRailResize();
   if (!ui.panel) return;
   const start = currentChromeWidths();
   ui.panelMotion = (ui.panelMotion || 0) + 1;
@@ -2024,12 +2249,15 @@ function closePanel() {
   maybeOpenBlankPalette();
 }
 function openDialog(kind, html, { title, focus } = {}) {
+  closeLibraryChooser();
+  cancelRailResize();
   // The native page snapshot and its clipped shell frame must use the same
   // settled bounds, even when a shortcut interrupts a moving chrome rail.
   finishChromeMotion();
   stopShortcutRecording();
   if (ui.themePreview) {
     ui.themePreview = null;
+    previewWindowMaterial(null);
     setTheme();
   }
   if (kind !== 'command') interruptSpaceScroll();
@@ -2074,6 +2302,7 @@ function closeDialog({ restore = true } = {}) {
   ui.modalSubmit = null;
   if (ui.themePreview) {
     ui.themePreview = null;
+    previewWindowMaterial(null);
     setTheme();
   }
   ui.dialogToken = (ui.dialogToken || 0) + 1;
@@ -2182,7 +2411,7 @@ function showSpaceForm(id) {
             activeProfile()?.id,
           )}</select></label>`
         : '') +
-      `<input type="hidden" name="space-icon" value="${esc(space?.icon || 'circle')}"><div class="space-icon-options" role="group" aria-label="Space icon">${spaceIcons.map((name) => `<button type="button" data-action="ui:space-icon" data-icon="${name}" aria-label="${name} icon" title="${name}" aria-pressed="${(space?.icon || 'circle') === name}">${icon(name)}</button>`).join('')}</div><div class="theme-preview-tile" aria-hidden="true"><div class="theme-preview-sidebar">${icon(space?.icon || 'circle')}<i></i><i></i><i></i></div><div class="theme-preview-page"></div><span>Preview</span></div><div class="field"><span>Space color</span><div class="color-options" role="group" aria-label="Space color">${colors.map(([name, color]) => `<button type="button" class="color-option swatch-${name} ${ui.selectedColor === color ? 'selected' : ''}" data-action="ui:color" data-color="${color}" aria-label="${name}" aria-pressed="${ui.selectedColor === color}"></button>`).join('')}</div></div><div class="theme-colors"><label>Primary<input type="color" name="theme-color" value="${ui.selectedColor}" aria-label="Primary color"></label><label>Secondary<input type="color" name="theme-secondaryColor" value="${theme.secondaryColor}" aria-label="Secondary color"></label></div><details class="theme-material"><summary>Gradient & texture</summary>${range('gradient', 'Color blend', 0, 100)}${range('grain', 'Grain', 0, 100)}</details><details class="theme-material"><summary>Glass & transparency</summary>${range('opacity', 'Opacity', 40, 100)}${range('blur', 'Background blur', 0, 32, 'px')}<p class="provider-note">Glass blends with the Space colors. Reduced transparency follows your system preference.</p></details>`,
+      `<input type="hidden" name="space-icon" value="${esc(space?.icon || 'circle')}"><input id="space-icon-search" type="search" placeholder="Find an icon" aria-label="Find a Space icon" autocomplete="off"><div class="space-icon-options" role="group" aria-label="Space icon">${spaceIcons.map((name) => `<button type="button" data-action="ui:space-icon" data-icon="${name}" aria-label="${name} icon" title="${name}" aria-pressed="${(space?.icon || 'circle') === name}">${icon(name)}</button>`).join('')}</div><div class="theme-preview-tile" aria-hidden="true"><div class="theme-preview-sidebar">${icon(space?.icon || 'circle')}<i></i><i></i><i></i></div><div class="theme-preview-page"></div><span>Preview</span></div><div class="field"><span>Space color</span><div class="color-options" role="group" aria-label="Space color">${colors.map(([name, color]) => `<button type="button" class="color-option swatch-${name} ${ui.selectedColor === color ? 'selected' : ''}" data-action="ui:color" data-color="${color}" aria-label="${name}" aria-pressed="${ui.selectedColor === color}"></button>`).join('')}</div></div><div class="theme-colors"><label>Primary<input type="color" name="theme-color" value="${ui.selectedColor}" aria-label="Primary color"></label><label>Secondary<input type="color" name="theme-secondaryColor" value="${theme.secondaryColor}" aria-label="Secondary color"></label></div><details class="theme-material"><summary>Gradient & texture</summary>${range('gradient', 'Color blend', 0, 100)}${range('grain', 'Grain', 0, 100)}</details><details class="theme-material"><summary>Glass & transparency</summary>${range('opacity', 'Window tint opacity', 40, 100)}<input type="hidden" name="theme-blur" value="${theme.blur}"><p class="provider-note" id="window-material-hint">${esc(windowMaterialHint())}</p></details>`,
     space ? 'Save changes' : 'Create Space',
     async (data, context) => {
       if (!context.isCurrent()) return;
@@ -2218,7 +2447,9 @@ function updateSpacePreview() {
   const form = $('#modal-form');
   if (!form?.elements['theme-color']) return;
   ui.selectedColor = form.elements['theme-color'].value;
+  const previousOpacity = ui.themePreview?.theme.opacity;
   ui.themePreview = { color: ui.selectedColor, theme: readSpaceTheme() };
+  if (previousOpacity !== ui.themePreview.theme.opacity) previewWindowMaterial(ui.themePreview.theme.opacity);
   for (const output of $$('[data-theme-output]', form)) {
     const key = output.dataset.themeOutput;
     output.value = `${ui.themePreview.theme[key]}${key === 'blur' ? 'px' : '%'}`;
@@ -2236,6 +2467,11 @@ function updateSpacePreview() {
 }
 document.addEventListener('input', (event) => {
   if (event.target.name?.startsWith('theme-')) updateSpacePreview();
+  if (event.target.id === 'space-icon-search') {
+    const query = event.target.value.trim().toLowerCase();
+    for (const option of $$('.space-icon-options button'))
+      option.hidden = !option.dataset.icon.includes(query);
+  }
 });
 function showProfiles() {
   openDialog(
@@ -2296,11 +2532,226 @@ function renderPageMenu() {
     `${Math.round((state.runtime?.page?.zoom || 1) * 100)}%`;
 }
 function showLibrary() {
-  // Library is browser chrome, not an overlay over the page. Keep the native
-  // web surface alive and crisp instead of replacing it with a captured JPEG.
-  openPanel(ui.lastPanel || 'bookmarks');
+  showLibraryChooser($('[data-key="library"]'));
 }
+function syncLibraryChooserAnchor() {
+  if (!ui.libraryMenuOpen) return;
+  const descriptor = ui.libraryMenuReturn;
+  const anchor =
+    (descriptor?.id && document.getElementById(descriptor.id)) ||
+    (descriptor?.key && $(`[data-key="${CSS.escape(descriptor.key)}"]`)) ||
+    (descriptor?.element?.isConnected && descriptor.element);
+  if (!anchor) return closeLibraryChooser();
+  ui.libraryMenuReturn = focusDescriptor(anchor);
+  anchor.setAttribute('aria-expanded', 'true');
+}
+function closeLibraryChooser({ restore = false } = {}) {
+  const menu = $('#library-menu');
+  const opener = ui.libraryMenuReturn;
+  ui.libraryMenuOpen = false;
+  ui.libraryMenuReturn = null;
+  if (menu) {
+    if (menu.matches(':popover-open')) menu.hidePopover();
+    menu.remove();
+  }
+  for (const control of $$('[data-library-chooser],[data-download-menu],[data-key="library"]'))
+    control.setAttribute('aria-expanded', 'false');
+  if (restore && opener) restoreFocus(opener);
+}
+function openLibraryChooser(anchor, html, label = 'Library') {
+  if (!anchor) return;
+  if (ui.libraryMenuOpen && ui.libraryMenuReturn?.element === anchor) {
+    closeLibraryChooser({ restore: true });
+    return;
+  }
+  closeLibraryChooser();
+  // This top-layer menu stays inside its chrome rail. Native web contents keep
+  // rendering at their original scale: no overlay IPC or page snapshot is used.
+  finishChromeMotion();
+  interruptSpaceScroll();
+  ui.libraryMenuOpen = true;
+  if (ui.dialog) closeDialog({ restore: false });
+  const menu = document.createElement('div');
+  menu.id = 'library-menu';
+  menu.className = 'library-menu';
+  menu.setAttribute('popover', 'auto');
+  menu.setAttribute('role', 'menu');
+  menu.setAttribute('aria-label', label);
+  menu.innerHTML = html;
+  document.body.append(menu);
+  ui.libraryMenuReturn = focusDescriptor(anchor);
+  anchor.setAttribute('aria-expanded', 'true');
+  const rail = anchor.closest('#side-panel') || $('#sidebar');
+  const bounds = rail.getBoundingClientRect();
+  const control = anchor.getBoundingClientRect();
+  const edge = 8;
+  menu.style.width = `${Math.max(168, Math.min(244, bounds.width - edge * 2))}px`;
+  menu.style.maxHeight = `${innerHeight - edge * 2}px`;
+  menu.showPopover();
+  const rect = menu.getBoundingClientRect();
+  menu.style.left = `${Math.max(edge, Math.min(control.left, bounds.right - rect.width - edge))}px`;
+  const below = control.bottom + 5;
+  menu.style.top = `${Math.max(edge, Math.min(below + rect.height > innerHeight - edge ? control.top - rect.height - 5 : below, innerHeight - rect.height - edge))}px`;
+  menu.addEventListener('click', (event) => {
+    if (event.target.closest('[data-action]')) closeLibraryChooser({ restore: true });
+  });
+  menu.addEventListener('toggle', (event) => {
+    if (event.newState === 'closed' && $('#library-menu') === menu) {
+      closeLibraryChooser();
+      maybeOpenBlankPalette();
+    }
+  });
+  motion(
+    menu,
+    [
+      { opacity: 0, transform: 'translateY(3px)' },
+      { opacity: 1, transform: 'translateY(0)' },
+    ],
+    120,
+  );
+  ($('[aria-checked="true"]', menu) || $('button', menu))?.focus({ preventScroll: true });
+}
+function showLibraryChooser(anchor) {
+  const item = (panel) => {
+    const [symbol, label] = panelNames[panel];
+    const shortcutId = panel === 'settings' ? 'preferences' : panel;
+    const key = shortcutId ? shortcutFor(shortcutId) : '';
+    return `<button type="button" class="context-action" role="menuitemradio" aria-label="${esc(label)}" aria-checked="${ui.panel === panel}" data-action="ui:panel" data-panel="${panel}" data-key="panel-${panel}">${icon(symbol)}<span>${label}</span>${key ? `<kbd aria-hidden="true">${esc(key)}</kbd>` : ''}${ui.panel === panel ? `<span class="menu-check">${icon('check')}</span>` : ''}</button>`;
+  };
+  openLibraryChooser(
+    anchor,
+    ['bookmarks', 'history', 'downloads', 'archive'].map(item).join('') +
+      '<hr class="context-separator" role="separator">' +
+      ['settings', 'extensions', 'ai'].map(item).join(''),
+  );
+}
+function showDownloadMenu(anchor, id) {
+  const file = profileItems('downloads').find((item) => item.id === id);
+  if (!file) return;
+  const item = (action, label, symbol) =>
+    `<button type="button" class="context-action" role="menuitem" data-action="${action}" data-id="${esc(id)}">${icon(symbol)}<span>${label}</span></button>`;
+  const complete = (file.state || file.status) === 'completed';
+  openLibraryChooser(
+    anchor,
+    complete
+      ? item('ui:download-rename', 'Rename', 'edit') +
+          item(
+            'ui:download-suggest',
+            ui.downloadSuggestions.has(id) ? 'Review name' : 'Suggest name',
+            'sparkle',
+          ) +
+          (file.originalName || file.previousPath || file.previousName
+            ? item('download:undo', 'Undo rename', 'undo')
+            : '')
+      : item('download:cancel', 'Cancel download', 'close'),
+    'Download actions',
+  );
+}
+document.addEventListener(
+  'click',
+  (event) => {
+    const chooser = event.target.closest('[data-library-chooser]');
+    const download = event.target.closest('[data-download-menu]');
+    if (!chooser && !download) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    if (chooser) showLibraryChooser(chooser);
+    else showDownloadMenu(download, download.dataset.downloadMenu);
+  },
+  true,
+);
+document.addEventListener(
+  'keydown',
+  (event) => {
+    const menu = $('#library-menu');
+    if (!menu || !ui.libraryMenuOpen || event.isComposing) return;
+    const items = $$('button:not(:disabled)', menu);
+    const current = items.indexOf(document.activeElement);
+    if (['Escape', 'Tab'].includes(event.key)) {
+      closeLibraryChooser({ restore: true });
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+      }
+      return;
+    }
+    if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      const next =
+        event.key === 'Home'
+          ? 0
+          : event.key === 'End'
+            ? items.length - 1
+            : (current + (event.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length;
+      items[next]?.focus({ preventScroll: true });
+      items[next]?.scrollIntoView({ block: 'nearest' });
+    } else if (
+      event.key.length === 1 &&
+      !event.ctrlKey &&
+      !event.metaKey &&
+      !event.altKey &&
+      event.key !== ' '
+    ) {
+      const ordered = [...items.slice(current + 1), ...items.slice(0, current + 1)];
+      const next = ordered.find((item) =>
+        $('span', item)?.textContent.toLowerCase().startsWith(event.key.toLowerCase()),
+      );
+      if (next) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        next.focus({ preventScroll: true });
+        next.scrollIntoView({ block: 'nearest' });
+      }
+    }
+  },
+  true,
+);
+window.addEventListener('blur', () => closeLibraryChooser());
+window.addEventListener('resize', () => closeLibraryChooser());
+document.addEventListener('dragstart', () => closeLibraryChooser(), true);
+document.addEventListener(
+  'keydown',
+  (event) => {
+    if (
+      ui.dialog ||
+      ui.libraryMenuOpen ||
+      event.isComposing ||
+      event.ctrlKey ||
+      event.metaKey ||
+      event.altKey
+    )
+      return;
+    const search = event.target.id === 'panel-search';
+    const row = event.target.closest?.('#side-panel .resource-main');
+    if (
+      (!search && !row) ||
+      (search && event.key !== 'ArrowDown') ||
+      (!search && !['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key))
+    )
+      return;
+    const items = $$('#side-panel .resource-main');
+    if (!items.length) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    const index = items.indexOf(row);
+    if (event.key === 'ArrowUp' && index === 0) $('#panel-search')?.focus();
+    else {
+      const next =
+        search || event.key === 'Home'
+          ? 0
+          : event.key === 'End'
+            ? items.length - 1
+            : Math.max(0, Math.min(items.length - 1, index + (event.key === 'ArrowDown' ? 1 : -1)));
+      items[next].focus({ preventScroll: true });
+      items[next].scrollIntoView({ block: 'nearest' });
+    }
+  },
+  true,
+);
 function toggleSidebar(fromPage = false) {
+  closeLibraryChooser();
+  cancelRailResize();
   interruptSpaceScroll();
   if (ui.dialog) closeDialog({ restore: false });
   if (!ui.sidebarHidden && effectiveSidebarHidden() && ui.panel) {
@@ -2348,7 +2799,7 @@ function showTabMenu(id) {
     `<button type="button" class="context-action" data-action="${name}" data-id="${esc(id)}">${icon(symbol)}${esc(label)}</button>`;
   openPopover(
     'menu',
-    `<div class="dialog-body"><div class="section-label truncate">${esc(tab.title || 'New tab')}</div>${action('ui:tab-pin', tab.pinned ? 'Remove pin' : 'Pin to favorites', 'pin')}${action('ui:tab-duplicate', 'Duplicate tab', 'copy')}${action('ui:tab-split', 'Open in split view', 'split')}${action('ui:tab-move', 'Move to Space or folder', 'folder')}${action('ui:tab-rename', 'Rename tab', 'edit')}${tab.pinned && state.runtime?.pages?.[id]?.loaded && id !== state.activeTabId ? action('ui:tab-sleep', 'Put to sleep', 'moon') : ''}<hr class="context-separator">${action('ui:tab-close', tab.pinned ? 'Close page · keep pin' : 'Close tab', 'close')}</div>`,
+    `<div class="dialog-body"><div class="section-label truncate">${esc(tabLabel(tab))}</div>${action('ui:tab-pin', tab.pinned ? 'Unpin tab' : 'Pin tab', 'pin')}${action('ui:tab-favorite', tab.favorite ? 'Move to pinned tabs' : 'Add to Favorites', 'star')}${tab.pinned ? action('ui:tab-reset-pin', 'Reset to saved page', 'undo') + (!tab.closed && tab.url !== tab.pinnedUrl ? action('ui:tab-replace-pin', 'Replace pin with current page', 'edit') : '') : ''}<hr class="context-separator">${action('ui:tab-duplicate', 'Duplicate tab', 'copy')}${action('ui:tab-split', 'Open in split view', 'split')}${action('ui:tab-move', 'Move to Space or folder', 'folder')}${action('ui:tab-rename', 'Rename tab', 'edit')}${tab.pinned && state.runtime?.pages?.[id]?.loaded && id !== state.activeTabId ? action('ui:tab-sleep', 'Put to sleep', 'moon') : ''}<hr class="context-separator">${action('ui:tab-close', tab.pinned ? 'Close page · keep pin' : 'Close tab', 'close')}</div>`,
     { title: 'Tab actions', anchor: $(`[data-tab-id="${CSS.escape(id)}"]`) },
   );
 }
@@ -2470,7 +2921,8 @@ const onboardingSteps = [
   },
   {
     title: 'Keep the good ones close.',
-    description: 'Pin a tab to keep it. Closing a pin unloads the page without removing it.',
+    description:
+      'Pins stay in their Space. Favorites follow you between Spaces. Close either to unload its page.',
     symbol: 'pin',
     shortcuts: ['pin-tab', 'close-tab', 'reopen-tab'],
   },
@@ -2778,14 +3230,62 @@ function commandActionOptions() {
     () => showSpaceForm(state.activeSpaceId),
   );
   extra(
+    'site-searches',
+    'Manage Site Search',
+    'search',
+    'site search engines keyword shortcut custom website',
+    () => {
+      openCommand('newtab');
+      showSiteSearches();
+    },
+  );
+  if (currentTabs().some((item) => item.pinned && !item.favorite))
+    extra(
+      'reset-space-pins',
+      'Reset pins in this Space',
+      'undo',
+      'reset space pinned tabs original saved urls',
+      () => invoke('space:reset-pins', { id: state.activeSpaceId }),
+    );
+  if (real) {
+    extra('pin-destination', 'Pin tab to…', 'pin', 'pin to space folder organize', () => {
+      openCommand('newtab');
+      showCommandDestinations(tab.id, true);
+    });
+    extra(
+      'favorite-tab',
+      tab.favorite ? 'Move favorite to this Space' : 'Favorite tab',
+      'star',
+      'favorite icon all spaces',
+      () => invoke('tab:favorite', { id: tab.id, favorite: !tab.favorite }),
+    );
+    if (tab.pinned) {
+      extra('reset-pin', 'Reset pinned tab', 'undo', 'reset tab original pinned saved url', () =>
+        invoke('tab:reset-pin', { id: tab.id }),
+      );
+      if (tab.pinnedUrl !== tab.url)
+        extra(
+          'replace-pin',
+          'Replace pin with current page',
+          'pin',
+          'replace original pinned saved url',
+          () => invoke('tab:replace-pin', { id: tab.id }),
+        );
+    }
+  }
+  extra(
     'sleep-favorites',
     'Sleep unused favorites',
     'moon',
     'memory suspend unload idle pinned tabs',
     async () => {
       let count = 0;
-      for (const pin of currentTabs().filter(
-        (item) => item.pinned && item.id !== state.activeTabId && state.runtime?.pages?.[item.id]?.loaded,
+      for (const pin of state.tabs.filter(
+        (item) =>
+          item.favorite &&
+          item.profileId === activeProfile()?.id &&
+          item.id !== state.activeTabId &&
+          state.runtime?.pages?.[item.id]?.loaded,
       ))
         if ((await invoke('tab:sleep', { id: pin.id }))?.slept) count++;
       toast(
@@ -2812,6 +3312,226 @@ function commandActionOptions() {
     );
   }
   return results;
+}
+
+function pushCommandStep() {
+  ui.commandTrail.push({
+    query: ui.commandQuery,
+    index: ui.commandIndex,
+    filter: ui.commandFilter,
+    context: ui.commandContext,
+    siteSearch: ui.commandSiteSearch,
+  });
+  ui.commandQuery = '';
+  ui.commandIndex = 0;
+  ui.commandFilter = 'all';
+  ui.commandContext = null;
+  ui.commandSiteSearch = null;
+}
+function refreshCommandStep() {
+  const input = $('#command-input');
+  if (!input) return;
+  input.value = ui.commandQuery;
+  renderCommands();
+  input.focus();
+}
+function backCommandStep() {
+  const previous = ui.commandTrail.pop();
+  if (!previous) return false;
+  ui.commandQuery = previous.query;
+  ui.commandIndex = previous.index;
+  ui.commandFilter = previous.filter;
+  ui.commandContext = previous.context;
+  ui.commandSiteSearch = previous.siteSearch;
+  refreshCommandStep();
+  return true;
+}
+function enterCommandContext(title, options, ariaLabel = title) {
+  pushCommandStep();
+  ui.commandContext = { title, options, ariaLabel };
+  refreshCommandStep();
+}
+function commandTask(id, label, symbol, run, description = '') {
+  return { id, kind: 'action', label, symbol, description, type: '', run };
+}
+function closeAndRunCommand(run) {
+  closeDialog({ restore: false });
+  return run();
+}
+function showCommandDestinations(tabId, pin = false) {
+  const tab = state.tabs.find((item) => item.id === tabId && item.profileId === activeProfile()?.id);
+  if (!tab) return;
+  enterCommandContext(pin ? 'Pin to…' : 'Move to…', () => {
+    const fresh = state.tabs.find((item) => item.id === tabId && item.profileId === activeProfile()?.id);
+    if (!fresh) return [];
+    return state.spaces
+      .filter((space) => space.profileId === fresh.profileId)
+      .flatMap((space) => [
+        { id: space.id, name: space.name, symbol: space.icon || 'layers', spaceId: space.id, folderId: null },
+        ...state.folders
+          .filter((folder) => folder.spaceId === space.id)
+          .map((folder) => ({
+            id: folder.id,
+            name: folder.name,
+            description: space.name,
+            symbol: 'folder',
+            spaceId: space.id,
+            folderId: folder.id,
+          })),
+      ])
+      .map((destination) =>
+        commandTask(
+          `destination:${destination.id}`,
+          destination.name,
+          destination.symbol,
+          () =>
+            closeAndRunCommand(() =>
+              invoke('tab:move', {
+                id: tabId,
+                spaceId: destination.spaceId,
+                folderId: destination.folderId,
+                ...(pin ? { pinned: true, favorite: false } : {}),
+              }),
+            ),
+          destination.description || '',
+        ),
+      );
+  });
+}
+function showCommandResultActions(item) {
+  if (!item || !['tab', 'history', 'bookmark'].includes(item.kind)) return false;
+  const itemId = item.id;
+  const tabId = item.kind === 'tab' ? itemId.slice(4) : null;
+  enterCommandContext(
+    item.label,
+    () => {
+      const tab = tabId
+        ? state.tabs.find(
+            (candidate) => candidate.id === tabId && candidate.profileId === activeProfile()?.id,
+          )
+        : null;
+      if (tabId && !tab) return [];
+      const url = tab?.url || item.url;
+      const actions = [
+        commandTask('result:open', tab ? 'Switch to tab' : 'Open page', 'forward', () => item.run()),
+      ];
+      if (url && url !== 'zacro://newtab') {
+        actions.push(
+          commandTask('result:newtab', 'Open in new tab', 'plus', () => commitNavigation(url, true)),
+          commandTask('result:peek', 'Peek at page', 'eye', () =>
+            closeAndRunCommand(() => invoke('peek:open', { url })),
+          ),
+          commandTask('result:copy', 'Copy address', 'copy', () =>
+            closeAndRunCommand(async () => {
+              await invoke('clipboard:write-text', { text: url });
+              toast('Address copied.');
+            }),
+          ),
+        );
+      }
+      if (tab) {
+        if (tab.spaceId === state.activeSpaceId && tab.id !== state.activeTabId && url !== 'zacro://newtab')
+          actions.push(
+            commandTask('result:split', 'Open in split view', 'split', () =>
+              closeAndRunCommand(() => invoke('split:toggle', { id: tab.id })),
+            ),
+          );
+        actions.push(
+          commandTask('result:pin', tab.pinned ? 'Unpin tab' : 'Pin tab', 'pin', () =>
+            closeAndRunCommand(() => invoke('tab:pin', { id: tab.id })),
+          ),
+          commandTask(
+            'result:favorite',
+            tab.favorite ? 'Move favorite to this Space' : 'Favorite tab',
+            'star',
+            () => closeAndRunCommand(() => invoke('tab:favorite', { id: tab.id, favorite: !tab.favorite })),
+          ),
+          commandTask('result:move', 'Move to…', 'folder', () => showCommandDestinations(tab.id)),
+          commandTask('result:pin-to', 'Pin to…', 'pin', () => showCommandDestinations(tab.id, true)),
+        );
+        if (tab.pinned) {
+          actions.push(
+            commandTask('result:reset', 'Reset pinned tab', 'undo', () =>
+              closeAndRunCommand(() => invoke('tab:reset-pin', { id: tab.id })),
+            ),
+          );
+          if (tab.pinnedUrl !== tab.url)
+            actions.push(
+              commandTask('result:replace', 'Replace pin with current page', 'pin', () =>
+                closeAndRunCommand(() => invoke('tab:replace-pin', { id: tab.id })),
+              ),
+            );
+        }
+        if (!tab.closed)
+          actions.push(
+            commandTask('result:close', tab.pinned ? 'Close page · keep pin' : 'Close tab', 'close', () =>
+              closeAndRunCommand(() => invoke('tab:close', { id: tab.id })),
+            ),
+          );
+      }
+      return actions;
+    },
+    `Actions for ${item.label}`,
+  );
+  return true;
+}
+function enterSiteSearch(engine) {
+  pushCommandStep();
+  ui.commandSiteSearch = engine;
+  refreshCommandStep();
+}
+function siteSearches() {
+  return globalThis.ZacroSiteSearch.normalizeSiteSearches(state.settings.siteSearches);
+}
+function showSiteSearches() {
+  enterCommandContext('Site Search', () => [
+    commandTask('search:add', 'Add site search', 'plus', () => showSiteSearchForm()),
+    ...siteSearches().map((engine) => ({
+      ...commandTask(
+        `search:edit:${engine.id}`,
+        engine.name,
+        'search',
+        () => showSiteSearchForm(engine.id),
+        hostname(engine.url),
+      ),
+      type: engine.keyword,
+    })),
+  ]);
+}
+function showSiteSearchForm(id) {
+  const engine = siteSearches().find((item) => item.id === id);
+  if (!engine && siteSearches().length >= 20) return toast('You can save up to 20 site searches.');
+  formDialog(
+    engine ? 'Edit site search' : 'Add site search',
+    'Type its keyword, press Tab, then enter your search.',
+    `<label class="field">Name<input name="name" value="${esc(engine?.name || '')}" maxlength="40" required></label><label class="field">Keyword<input name="keyword" value="${esc(engine?.keyword || '')}" maxlength="24" placeholder="e.g. docs" required autocapitalize="none" spellcheck="false"></label><label class="field">Search URL<input name="url" value="${esc(engine?.url || '')}" maxlength="2048" placeholder="https://example.com/search?q=%s" required spellcheck="false"></label><p class="provider-note">Use %s in place of the search query.</p>${engine ? `<button type="button" class="secondary" data-action="ui:site-search-delete" data-id="${esc(engine.id)}">Remove search</button>` : ''}`,
+    'Save',
+    async (data, context) => {
+      if (!context.isCurrent()) return;
+      const next = {
+        id: engine?.id || crypto.randomUUID(),
+        name: String(data.get('name') || ''),
+        keyword: String(data.get('keyword') || ''),
+        url: String(data.get('url') || ''),
+      };
+      const error = globalThis.ZacroSiteSearch.siteSearchError(next);
+      if (error) throw new Error(error);
+      if (
+        siteSearches().some(
+          (item) => item.id !== next.id && item.keyword === next.keyword.trim().toLowerCase(),
+        )
+      )
+        throw new Error('That keyword is already assigned to another site search.');
+      await invoke('settings:update', {
+        values: { siteSearches: [...siteSearches().filter((item) => item.id !== next.id), next] },
+      });
+      applyState(await invoke('state:get'));
+      if (context.close()) {
+        openCommand('newtab');
+        showSiteSearches();
+      }
+    },
+  );
 }
 function fuzzyScore(query, value) {
   const normalize = (text) =>
@@ -2846,6 +3566,32 @@ function fuzzyScore(query, value) {
 }
 function commandOptions(query) {
   const raw = query.trim();
+  if (ui.commandSiteSearch) {
+    const engine = siteSearches().find((item) => item.id === ui.commandSiteSearch.id);
+    if (!engine || !raw || raw.length > 8000) return [];
+    const url = globalThis.ZacroSiteSearch.siteSearchURL(engine, raw);
+    return [
+      {
+        id: 'site-search',
+        kind: 'navigation',
+        label: raw,
+        symbol: 'search',
+        type: `Search ${engine.name}`,
+        url,
+        run: () => commitNavigation(url),
+      },
+    ];
+  }
+  if (ui.commandContext) {
+    return ui.commandContext
+      .options()
+      .map((item, index) => ({
+        ...item,
+        score: raw ? Math.max(fuzzyScore(raw, item.label), fuzzyScore(raw, item.description) * 0.8) : -index,
+      }))
+      .filter((item) => !raw || item.score >= 20)
+      .sort((a, b) => b.score - a.score);
+  }
   const prefix = { '>': 'action', '/': 'action', '@': 'tab', '#': 'space' }[raw[0]];
   const filter = prefix || ui.commandFilter || 'all';
   const actionsOnly = filter === 'action';
@@ -2873,15 +3619,20 @@ function commandOptions(query) {
       add({
         id: `tab:${tab.id}`,
         kind: 'tab',
-        label: tab.title || hostname(tab.url),
+        label: tabLabel(tab),
         description:
           tab.spaceId === state.activeSpaceId
             ? hostname(tab.url)
             : state.spaces.find((space) => space.id === tab.spaceId)?.name,
-        keywords: tab.url,
+        keywords: `${tab.url} ${tab.title || ''} ${tab.pinnedUrl || ''}`,
         url: tab.url,
         symbol: 'globe',
-        type: tab.pinned && !state.runtime?.pages?.[tab.id]?.loaded ? 'Wake favorite' : 'Switch to tab',
+        type:
+          tab.pinned && !state.runtime?.pages?.[tab.id]?.loaded
+            ? tab.favorite
+              ? 'Open favorite'
+              : 'Open pinned tab'
+            : 'Switch to tab',
         priority: q ? 14 : 100 - index,
         run: () => {
           closeDialog({ restore: false });
@@ -2936,6 +3687,34 @@ function commandOptions(query) {
           return invoke('space:activate', { id: space.id });
         },
       });
+    for (const folder of state.folders) {
+      const space = state.spaces.find(
+        (item) => item.id === folder.spaceId && item.profileId === activeProfile()?.id,
+      );
+      if (!space) continue;
+      add({
+        id: `folder:${folder.id}`,
+        kind: 'folder',
+        label: folder.name,
+        description: space.name,
+        keywords: 'folder reveal find organize',
+        symbol: 'folder',
+        type: 'Folder',
+        priority: q ? 10 : 15,
+        run: async () => {
+          closeDialog({ restore: false });
+          await invoke('space:activate', { id: space.id });
+          ui.closedFolders.delete(folder.id);
+          applyState(await invoke('state:get'));
+          await focusSidebar();
+          requestAnimationFrame(() => {
+            const heading = $(`[data-key="folder-${CSS.escape(folder.id)}"]`);
+            heading?.focus();
+            heading?.scrollIntoView({ block: 'nearest' });
+          });
+        },
+      });
+    }
   }
   for (const option of commandActionOptions()) {
     if (
@@ -2947,6 +3726,18 @@ function commandOptions(query) {
     add({ ...option, priority: q ? option.priority : 20 });
   }
   if (q && filter === 'all') {
+    const site = siteSearches().find((item) => item.keyword === q.toLowerCase());
+    if (site)
+      options.push({
+        id: `site:${site.id}`,
+        kind: 'action',
+        label: `Search ${site.name}`,
+        description: hostname(site.url),
+        symbol: 'search',
+        type: 'Tab',
+        score: 44,
+        run: () => enterSiteSearch(site),
+      });
     const address =
       /^(?:[a-z][a-z\d+.-]*:\/\/|localhost(?::\d+)?(?:[/?#]|$)|(?:[\w-]+\.)+[a-z]{2,}(?:[:/?#]|$)|(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?(?:[/?#]|$))/i.test(
         q,
@@ -2986,6 +3777,9 @@ function commandOptions(query) {
     .slice(0, actionsOnly ? 80 : q || filter !== 'all' ? 32 : 8);
 }
 function openCommand(mode = 'newtab', query, { automatic = false } = {}) {
+  ui.commandTrail = [];
+  ui.commandContext = null;
+  ui.commandSiteSearch = null;
   ui.commandFilter = 'all';
   ui.commandMode = mode === 'address' || mode === 'navigate' ? 'address' : 'newtab';
   ui.commandAuto = automatic;
@@ -2998,7 +3792,7 @@ function openCommand(mode = 'newtab', query, { automatic = false } = {}) {
   ui.commandIndex = 0;
   openDialog(
     'command',
-    `<div class="command-input-wrap">${icon('search')}<input id="command-input" type="text" role="combobox" aria-autocomplete="list" aria-expanded="true" aria-controls="command-results" aria-label="Search tabs, history, Spaces and actions, or enter a URL" placeholder="Search or enter a URL" value="${esc(ui.commandQuery)}" autocomplete="off" spellcheck="false"><button type="button" class="command-mode" data-action="ui:command-mode" aria-label="Change navigation destination"></button></div><div id="command-results" class="command-results" role="listbox" aria-label="Suggestions"></div><footer class="command-footer"><span><kbd>↑↓</kbd> Select <kbd>↵</kbd> Open</span><span><kbd>Alt ↵</kbd> New tab <kbd>/</kbd> Actions</span></footer>`,
+    `<div class="command-input-wrap">${icon('search')}<input id="command-input" type="text" role="combobox" aria-autocomplete="list" aria-expanded="true" aria-controls="command-results" aria-label="Search tabs, history, Spaces and actions, or enter a URL" placeholder="Search or enter a URL" value="${esc(ui.commandQuery)}" autocomplete="off" spellcheck="false"><button type="button" class="command-mode" data-action="ui:command-mode" aria-label="Change navigation destination"></button></div><div id="command-results" class="command-results" role="listbox" aria-label="Suggestions"></div><footer class="command-footer"><span><kbd>↑↓</kbd> Select <kbd>↵</kbd> Open</span><span class="command-context-hint"></span></footer>`,
     { title: 'Command bar', focus: '#command-input' },
   );
   renderCommands();
@@ -3021,6 +3815,7 @@ function renderCommands({ preserve = false } = {}) {
       ['all', 'All'],
       ['tab', 'Tabs'],
       ['space', 'Spaces'],
+      ['folder', 'Folders'],
       ['bookmark', 'Bookmarks'],
       ['history', 'History'],
       ['action', 'Actions'],
@@ -3032,6 +3827,7 @@ function renderCommands({ preserve = false } = {}) {
       .join('');
     root.before(filters);
   }
+  filters.hidden = Boolean(ui.commandContext || ui.commandSiteSearch);
   const prefixFilter = { '>': 'action', '/': 'action', '@': 'tab', '#': 'space' }[ui.commandQuery.trim()[0]];
   for (const item of $$('button', filters))
     item.setAttribute('aria-pressed', item.dataset.filter === (prefixFilter || ui.commandFilter));
@@ -3045,17 +3841,55 @@ function renderCommands({ preserve = false } = {}) {
         (item, index) =>
           `<button type="button" class="command-result ${index === ui.commandIndex ? 'selected' : ''}" data-action="ui:command-select" data-index="${index}" data-command-id="${esc(item.id)}" data-command-kind="${item.kind}" role="option" tabindex="-1" aria-selected="${index === ui.commandIndex}" id="command-option-${index}"><span class="command-result-icon">${item.url && item.kind !== 'navigation' ? favicon(item.url) : icon(item.symbol)}</span><span class="grow command-result-copy"><span class="command-result-label truncate">${esc(item.label)}</span>${item.description ? `<span class="command-result-description">${esc(item.description)}</span>` : ''}</span><span class="command-result-type">${esc(item.type)}</span></button>`,
       )
-      .join('') || '<div class="command-empty" role="presentation">No matches in this scope</div>';
+      .join('') ||
+    `<div class="command-empty" role="presentation">${ui.commandSiteSearch ? (ui.commandQuery.trim().length > 8000 ? 'Use a search of up to 8,000 characters' : `Type to search ${esc(ui.commandSiteSearch.name)}`) : 'No matches in this scope'}</div>`;
   const input = $('#command-input');
+  input.placeholder = ui.commandSiteSearch
+    ? `Search ${ui.commandSiteSearch.name}`
+    : ui.commandContext
+      ? ui.commandContext.title
+      : 'Search or enter a URL';
+  const inputLabel = ui.commandSiteSearch
+    ? `Search ${ui.commandSiteSearch.name}`
+    : ui.commandContext?.ariaLabel || 'Search tabs, history, Spaces and actions, or enter a URL';
+  input.setAttribute('aria-label', inputLabel);
+  let status = $('#command-status');
+  if (!status) {
+    status = document.createElement('div');
+    status.id = 'command-status';
+    status.className = 'sr-only';
+    status.setAttribute('role', 'status');
+    status.setAttribute('aria-live', 'polite');
+    status.setAttribute('aria-atomic', 'true');
+    root.after(status);
+  }
+  const announcement = `${inputLabel}. ${ui.commandItems.length ? `${ui.commandItems.length} results` : $('.command-empty', root)?.textContent || 'No matches'}`;
+  if (status.textContent !== announcement) status.textContent = announcement;
   if (ui.commandItems.length)
     input?.setAttribute('aria-activedescendant', `command-option-${ui.commandIndex}`);
   else input?.removeAttribute('aria-activedescendant');
   const mode = $('.command-mode');
-  mode.textContent = ui.commandMode === 'address' ? 'This tab' : 'New tab';
+  const nested = Boolean(ui.commandContext || ui.commandSiteSearch);
+  mode.textContent = nested ? 'Back' : ui.commandMode === 'address' ? 'This tab' : 'New tab';
   mode.setAttribute(
     'aria-label',
-    `Destination: ${ui.commandMode === 'address' ? 'current tab' : 'new tab'}. Change destination`,
+    nested
+      ? 'Back to previous command step'
+      : `Destination: ${ui.commandMode === 'address' ? 'current tab' : 'new tab'}. Change destination`,
   );
+  const selectedItem = ui.commandItems[ui.commandIndex];
+  $('.command-context-hint').innerHTML = nested
+    ? '<kbd>Esc</kbd> Back'
+    : ui.commandFilter === 'all' &&
+        siteSearches().some((engine) => engine.keyword === ui.commandQuery.trim().toLowerCase())
+      ? '<kbd>Tab</kbd> Search site'
+      : ['tab', 'bookmark', 'history'].includes(selectedItem?.kind)
+        ? '<kbd>Tab</kbd> Actions <kbd>Alt ↵</kbd> New tab'
+        : ['', '/', '>'].includes(ui.commandQuery.trim())
+          ? '<kbd>Tab</kbd> Actions <kbd>/</kbd> Commands'
+          : selectedItem?.kind === 'navigation'
+            ? '<kbd>Alt ↵</kbd> New tab <kbd>/</kbd> Commands'
+            : '<kbd>/</kbd> Commands';
 }
 function selectCommand(index, { separate = false } = {}) {
   const item = ui.commandItems[index];
@@ -3273,6 +4107,9 @@ function handleEvent(event) {
     case 'page:backdrop':
       showPageBackdrop(event.frames);
       break;
+    case 'page:focused':
+      closeLibraryChooser();
+      break;
     case 'focus:chrome':
       if (ui.dialog) ($('#command-input') || $('#dialog-root button:not(:disabled)'))?.focus();
       else $('[data-key="address"]')?.focus();
@@ -3288,7 +4125,13 @@ function handleEvent(event) {
       }
       break;
     case 'command':
-      openCommand(event.mode || 'navigate', event.query);
+      if (
+        ui.dialog === 'command' &&
+        !event.query &&
+        ui.commandMode === (event.mode === 'newtab' ? 'newtab' : 'address')
+      )
+        dismissDialog();
+      else openCommand(event.mode || 'navigate', event.query);
       break;
     case 'panel':
       openPanel(event.panel);
@@ -3479,12 +4322,13 @@ async function handleAction(action, data = {}, target) {
     case 'ui:home-page':
       return showHomePage();
     case 'ui:command-mode':
+      if (backCommandStep()) return;
       ui.commandMode = ui.commandMode === 'address' ? 'newtab' : 'address';
       renderCommands({ preserve: true });
       $('#command-input')?.focus();
       return;
     case 'ui:command-filter':
-      if (!['all', 'tab', 'space', 'bookmark', 'history', 'action'].includes(data.filter)) return;
+      if (!['all', 'tab', 'space', 'folder', 'bookmark', 'history', 'action'].includes(data.filter)) return;
       ui.commandFilter = data.filter;
       ui.commandQuery = ui.commandQuery.replace(/^[\s]*[/>@#]\s*/, '');
       $('#command-input').value = ui.commandQuery;
@@ -3492,6 +4336,15 @@ async function handleAction(action, data = {}, target) {
       renderCommands();
       $('#command-input').focus();
       return;
+    case 'ui:site-search-delete': {
+      await invoke('settings:update', {
+        values: { siteSearches: siteSearches().filter((engine) => engine.id !== id) },
+      });
+      applyState(await invoke('state:get'));
+      openCommand('newtab');
+      showSiteSearches();
+      return;
+    }
     case 'ui:shortcut-record':
       return recordShortcut(id);
     case 'ui:shortcut-reset':
@@ -3737,13 +4590,24 @@ async function handleAction(action, data = {}, target) {
       return;
     case 'ui:pin-help':
       if (activeTab() && activeTab().url !== 'zacro://newtab') {
-        if (!activeTab().pinned) await invoke('tab:pin', { id: state.activeTabId });
+        if (!activeTab().favorite) await invoke('tab:favorite', { id: state.activeTabId });
         else toast('This page is already a favorite.');
-      } else toast('Open a page, then pin it to favorites.');
+      } else toast('Open a page, then add it to Favorites.');
       return;
     case 'ui:tab-pin':
       closeDialog();
       return invoke('tab:pin', { id });
+    case 'ui:tab-favorite': {
+      const tab = state.tabs.find((item) => item.id === id);
+      closeDialog();
+      return invoke('tab:favorite', { id, favorite: !tab?.favorite });
+    }
+    case 'ui:tab-reset-pin':
+      closeDialog();
+      return invoke('tab:reset-pin', { id });
+    case 'ui:tab-replace-pin':
+      closeDialog();
+      return invoke('tab:replace-pin', { id });
     case 'ui:tab-close':
       closeDialog();
       return invoke('tab:close', { id });
@@ -4295,7 +5159,38 @@ document.addEventListener('keydown', (event) => {
   if (handleSidebarKeyboard(event)) return;
   const cmd = primaryModifier(event);
   if (ui.dialog === 'command' && event.target.id === 'command-input') {
-    if (event.key === 'Tab' && !event.shiftKey && ['', '/', '>'].includes(ui.commandQuery.trim())) {
+    if (
+      (event.key === 'Escape' ||
+        (event.key === 'Tab' && event.shiftKey) ||
+        (event.key === 'Backspace' && !ui.commandQuery)) &&
+      ui.commandTrail.length
+    ) {
+      event.preventDefault();
+      backCommandStep();
+      return;
+    }
+    if (event.key === 'Tab' && !event.shiftKey && !ui.commandContext && !ui.commandSiteSearch) {
+      const engine =
+        ui.commandFilter === 'all'
+          ? siteSearches().find((item) => item.keyword === ui.commandQuery.trim().toLowerCase())
+          : null;
+      if (engine) {
+        event.preventDefault();
+        enterSiteSearch(engine);
+        return;
+      }
+      if (showCommandResultActions(ui.commandItems[ui.commandIndex])) {
+        event.preventDefault();
+        return;
+      }
+    }
+    if (
+      event.key === 'Tab' &&
+      !event.shiftKey &&
+      !ui.commandContext &&
+      !ui.commandSiteSearch &&
+      ['', '/', '>'].includes(ui.commandQuery.trim())
+    ) {
       event.preventDefault();
       ui.commandQuery = ui.commandQuery.trim() ? '' : '/';
       $('#command-input').value = ui.commandQuery;
@@ -4303,22 +5198,23 @@ document.addEventListener('keydown', (event) => {
       renderCommands();
       return;
     }
-    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+    if (['ArrowDown', 'ArrowUp', 'PageDown', 'PageUp'].includes(event.key)) {
       event.preventDefault();
-      ui.commandIndex =
-        (ui.commandIndex + (event.key === 'ArrowDown' ? 1 : -1) + ui.commandItems.length) %
-        Math.max(1, ui.commandItems.length);
+      const step = event.key.startsWith('Page') ? 6 : 1;
+      const direction = ['ArrowDown', 'PageDown'].includes(event.key) ? 1 : -1;
+      ui.commandIndex = event.key.startsWith('Page')
+        ? Math.max(0, Math.min(ui.commandItems.length - 1, ui.commandIndex + direction * step))
+        : (ui.commandIndex + direction + ui.commandItems.length) % Math.max(1, ui.commandItems.length);
       renderCommands();
       $(`#command-option-${ui.commandIndex}`)?.scrollIntoView({ block: 'nearest' });
       return;
     }
     if (event.key === 'Enter') {
+      // Configurable shortcuts are dispatched by the native shortcut catalog.
+      // An unassigned modifier+Enter must not retain an obsolete AI binding.
+      if (event.ctrlKey || event.metaKey || event.shiftKey) return;
       event.preventDefault();
-      if (cmd) {
-        const question = ui.commandQuery;
-        closeDialog();
-        safely(askAI(question));
-      } else selectCommand(ui.commandIndex, { separate: event.altKey });
+      selectCommand(ui.commandIndex, { separate: event.altKey });
       return;
     }
   }
@@ -4414,39 +5310,40 @@ function clearDragFeedback() {
   );
 }
 function dragDestination(event) {
-  const drop = event.target.closest('[data-drop-tab],[data-drop-pinned],[data-drop-folder]');
+  const drop = event.target.closest(
+    '[data-drop-tab],[data-drop-favorites],[data-drop-pinned],[data-drop-folder]',
+  );
   const source = state?.tabs.find((tab) => tab.id === ui.dragTab);
   if (!drop || !source || source.profileId !== activeProfile()?.id) return null;
   const target = drop.dataset.dropTab ? state.tabs.find((tab) => tab.id === drop.dataset.dropTab) : null;
   if (target?.id === source.id) return null;
-  const pinned = Boolean(drop.closest('[data-drop-pinned]'));
+  const favorite = Boolean(drop.closest('[data-drop-favorites]'));
+  const pinned = favorite || Boolean(drop.closest('[data-drop-pinned]'));
+  const folderId = favorite ? null : target ? target.folderId : drop.dataset.dropFolder || null;
   const rectangle = drop.getBoundingClientRect();
   const after =
     target &&
-    (pinned
+    (favorite
       ? event.clientX > rectangle.left + rectangle.width / 2
       : event.clientY > rectangle.top + rectangle.height / 2);
   const remaining = state.tabs.filter((tab) => tab.id !== source.id);
   let index;
   if (target) index = remaining.findIndex((tab) => tab.id === target.id) + (after ? 1 : 0);
   else {
-    const siblings = remaining.filter(
-      (tab) =>
-        tab.spaceId === state.activeSpaceId &&
-        (pinned ? tab.pinned : !tab.pinned && (tab.folderId || '') === (drop.dataset.dropFolder || '')),
+    const siblings = remaining.filter((tab) =>
+      favorite
+        ? tab.favorite && tab.profileId === activeProfile()?.id
+        : tab.spaceId === state.activeSpaceId &&
+          !tab.favorite &&
+          tab.pinned === pinned &&
+          (tab.folderId || null) === folderId,
     );
     index = siblings.length ? remaining.indexOf(siblings.at(-1)) + 1 : remaining.length;
   }
   return {
     drop,
     after,
-    payload: {
-      id: source.id,
-      spaceId: target?.spaceId || state.activeSpaceId,
-      pinned,
-      folderId: pinned ? null : target ? target.folderId : drop.dataset.dropFolder || null,
-      index,
-    },
+    payload: { id: source.id, spaceId: state.activeSpaceId, favorite, pinned, folderId, index },
   };
 }
 document.addEventListener('dragstart', (event) => {
@@ -4469,7 +5366,9 @@ document.addEventListener('dragover', (event) => {
   );
 });
 document.addEventListener('dragleave', (event) => {
-  const drop = event.target.closest('[data-drop-tab],[data-drop-pinned],[data-drop-folder]');
+  const drop = event.target.closest(
+    '[data-drop-tab],[data-drop-favorites],[data-drop-pinned],[data-drop-folder]',
+  );
   if (drop && !drop.contains(event.relatedTarget))
     drop.classList.remove('drag-over', 'drop-before', 'drop-after');
 });
@@ -4542,11 +5441,13 @@ document.addEventListener(
 $('#sidebar').addEventListener('wheel', onSpaceScroll, { passive: false });
 $('#sidebar').addEventListener('pointerleave', interruptSpaceScroll);
 window.addEventListener('blur', () => {
+  cancelRailResize();
   interruptSpaceScroll();
   stopShortcutRecording();
   refreshShortcutEditor();
 });
 window.addEventListener('resize', () => {
+  cancelRailResize();
   interruptSpaceScroll();
   finishChromeMotion();
   if (state) {

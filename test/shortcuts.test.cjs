@@ -45,6 +45,37 @@ test('numbered and sequential tab shortcuts follow rendered sidebar order withou
   assert.deepEqual(state, before);
 });
 
+test('sidebar shortcuts include profile favorites once before local pins and pinned folders', () => {
+  const state = {
+    activeSpaceId: 'work',
+    spaces: [
+      { id: 'work', profileId: 'personal' },
+      { id: 'reading', profileId: 'personal' },
+      { id: 'isolated', profileId: 'other' },
+    ],
+    folders: [{ id: 'research', spaceId: 'work' }],
+    tabs: [
+      { id: 'today', spaceId: 'work', profileId: 'personal', url: 'https://example.com' },
+      { id: 'folder-pin', spaceId: 'work', profileId: 'personal', pinned: true, folderId: 'research' },
+      { id: 'shared', spaceId: 'reading', profileId: 'personal', pinned: true, favorite: true },
+      { id: 'private-favorite', spaceId: 'isolated', profileId: 'other', pinned: true, favorite: true },
+      { id: 'local-pin', spaceId: 'work', profileId: 'personal', pinned: true },
+    ],
+  };
+  assert.deepEqual(
+    sidebarTabs(state).map((tab) => tab.id),
+    ['shared', 'local-pin', 'folder-pin', 'today'],
+  );
+  assert.deepEqual(
+    sidebarTabs(state, 'reading').map((tab) => tab.id),
+    ['shared'],
+  );
+  assert.deepEqual(
+    sidebarTabs(state, 'isolated').map((tab) => tab.id),
+    ['private-favorite'],
+  );
+});
+
 test('essential shortcuts share exact modifiers on Mac and Windows without taking over editor or OS keys', () => {
   for (const platform of ['darwin', 'win32']) {
     const mod = platform === 'darwin' ? { meta: true } : { control: true };
@@ -200,8 +231,12 @@ test('fresh browser is empty; explicit home pages and drag pin transitions persi
   store.dispatch('tab:move', { id: home.id, folderId: folder.id });
   store.dispatch('tab:move', { id: home.id, pinned: true });
   assert.equal(store.state.tabs[0].pinned, true);
+  assert.equal(store.state.tabs[0].folderId, folder.id);
+  assert.equal(store.state.tabs[0].favorite, false);
+  store.dispatch('tab:move', { id: home.id, favorite: true });
+  assert.equal(store.state.tabs[0].favorite, true);
   assert.equal(store.state.tabs[0].folderId, null);
   store.dispatch('tab:move', { id: home.id, pinned: false, folderId: folder.id });
   assert.equal(store.state.tabs[0].pinned, false);
-  assert.equal(store.state.tabs[0].folderId, folder.id);
+  assert.equal(store.state.tabs[0].folderId, null);
 });

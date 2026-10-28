@@ -86,7 +86,9 @@ test(
     await b.emit({ type: 'panel', panel: 'settings' });
     await b.shell.getByRole('button', { name: 'Customize Space', exact: true }).click();
     const original = (await b.invoke('state:get')).spaces[0];
-    await b.shell.getByRole('button', { name: 'book icon', exact: true }).click();
+    await b.shell.locator('#space-icon-search').fill('rocket');
+    await expect(b.shell.locator('.space-icon-options button:visible')).toHaveCount(1);
+    await b.shell.getByRole('button', { name: 'rocket icon', exact: true }).click();
     await b.shell.getByRole('button', { name: 'sky', exact: true }).click();
     await expect
       .poll(() => b.shell.evaluate(() => document.documentElement.style.getPropertyValue('--space-color')))
@@ -98,7 +100,9 @@ test(
       .toBe(original.color);
     assert.deepEqual((await b.invoke('state:get')).spaces[0], original);
     await b.shell.getByRole('button', { name: 'Customize Space', exact: true }).click();
-    await b.shell.getByRole('button', { name: 'book icon', exact: true }).click();
+    await b.shell.locator('#space-icon-search').fill('rocket');
+    await expect(b.shell.locator('.space-icon-options button:visible')).toHaveCount(1);
+    await b.shell.getByRole('button', { name: 'rocket icon', exact: true }).click();
     await b.shell.locator('input[name="name"]').fill('Reading room');
     await b.shell.getByRole('button', { name: 'sky', exact: true }).click();
     await b.shell.locator('summary').filter({ hasText: 'Gradient & texture' }).click();
@@ -110,10 +114,7 @@ test(
       input.dispatchEvent(new Event('input', { bubbles: true }));
     });
     await b.shell.locator('summary').filter({ hasText: 'Glass & transparency' }).click();
-    for (const [name, value] of [
-      ['opacity', '60'],
-      ['blur', '20'],
-    ])
+    for (const [name, value] of [['opacity', '60']])
       await b.shell.locator(`input[name="theme-${name}"]`).evaluate((input, value) => {
         input.value = value;
         input.dispatchEvent(new Event('input', { bubbles: true }));
@@ -121,16 +122,26 @@ test(
     await b.shell.getByRole('button', { name: 'Save changes', exact: true }).click();
     await expect.poll(async () => (await b.invoke('state:get')).spaces[0].name).toBe('Reading room');
     const saved = (await b.invoke('state:get')).spaces[0];
-    assert.equal(saved.icon, 'book');
+    assert.equal(saved.icon, 'rocket');
     assert.equal(saved.theme.grain, 40);
     assert.equal(saved.theme.opacity, 60);
-    assert.equal(saved.theme.blur, 20);
+    assert.equal(
+      saved.theme.blur,
+      original.theme.blur,
+      'Legacy blur is retained; native blur strength is system controlled',
+    );
+    await expect
+      .poll(async () => (await b.invoke('state:get')).runtime.windowMaterial.requestedOpacity)
+      .toBe(60);
+    const material = (await b.invoke('state:get')).runtime.windowMaterial;
+    await expect(b.shell.locator('html')).toHaveAttribute('data-window-material', material.type);
+    assert.equal(await b.shell.evaluate(() => getComputedStyle(document.body).opacity), '1');
     await expect(b.shell.locator('.space-dot.active svg')).toHaveCount(1);
     await b.close();
     await b.launch();
     const restored = (await b.invoke('state:get')).spaces[0];
     assert.deepEqual(restored.theme, saved.theme);
-    assert.equal(restored.icon, 'book');
+    assert.equal(restored.icon, 'rocket');
     await b.shell.emulateMedia({ reducedMotion: 'reduce' });
     await b.emit({ type: 'panel', panel: 'settings' });
     await b.shell.locator('summary').filter({ hasText: 'Layout & motion' }).click();

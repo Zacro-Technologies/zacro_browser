@@ -161,6 +161,8 @@ async function main() {
   const directory = await fs.mkdtemp(path.join(scratch, 'interactive-qa-'));
   const showcase = process.argv.includes('--showcase');
   const compact = process.argv.includes('--compact');
+  const dark = process.argv.includes('--dark');
+  const opaque = process.argv.includes('--opaque');
   const server = showcase ? createShowcaseSite() : createInteractiveSite();
   await new Promise((resolve, reject) => {
     server.once('error', reject);
@@ -168,9 +170,11 @@ async function main() {
   });
   const url = `http://127.0.0.1:${server.address().port}/`;
   const packaged = process.argv.includes('--packaged');
-  if (showcase || compact) {
+  if (showcase || compact || dark || opaque) {
     const store = new BrowserStore(directory);
     if (showcase) store.state = populateLocalFavorites(createShowcaseState(url), url);
+    if (dark) store.state.settings.theme = 'dark';
+    if (opaque) for (const space of store.state.spaces) space.theme = { ...space.theme, opacity: 100 };
     if (compact)
       store.state.windowBounds = { width: 560, height: 420, maximized: false, sizeKind: 'content' };
     store.save();
@@ -190,7 +194,7 @@ async function main() {
       'Showcase: local Mail, Calendar, Notes and Studio favorites. Visit each once to load its icon; the journal opens first.',
     );
   console.log(
-    'Options: --showcase for the demo workspace; --packaged for the built application; --onboarding to show the welcome tour; --compact for a 560×420 content window.',
+    'Options: --showcase for the demo workspace; --packaged for the built application; --onboarding for the tour; --compact for 560×420; --dark for dark appearance; --opaque for opaque window chrome.',
   );
   console.log(
     `${process.platform === 'darwin' ? 'Quit Zacro with Command-Q' : 'Close the browser'} when finished. No real browser profile is modified.`,

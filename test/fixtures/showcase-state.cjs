@@ -25,6 +25,7 @@ function createShowcaseState(localUrl) {
     ...(url !== 'zacro://newtab' ? { customTitle: title } : {}),
     url,
     pinned: false,
+    favorite: false,
     folderId: null,
     createdAt: now - 3600000,
     lastActiveAt: now - 600000,
@@ -68,10 +69,10 @@ function createShowcaseState(localUrl) {
     { id: 'showcase-project', spaceId: studio, name: 'Project' },
   ];
   state.tabs = [
-    tab('github', 'GitHub', 'https://github.com/', { pinned: true }),
-    tab('mdn', 'MDN', 'https://developer.mozilla.org/', { pinned: true }),
-    tab('wikipedia', 'Wikipedia', 'https://www.wikipedia.org/', { pinned: true }),
-    tab('arena', 'Are.na', 'https://www.are.na/', { pinned: true }),
+    tab('github', 'GitHub', 'https://github.com/', { pinned: true, favorite: true }),
+    tab('mdn', 'MDN', 'https://developer.mozilla.org/', { pinned: true, favorite: true }),
+    tab('wikipedia', 'Wikipedia', 'https://www.wikipedia.org/', { pinned: true, favorite: true }),
+    tab('arena', 'Are.na', 'https://www.are.na/', { pinned: true, favorite: true }),
     tab('arc', 'Arc · Focus', 'https://start.arc.net/find-focus', { folderId: 'showcase-research' }),
     tab('zen', 'Zen · Compact mode', 'https://docs.zen-browser.app/user-manual/compact-mode', {
       folderId: 'showcase-research',

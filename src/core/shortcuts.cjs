@@ -292,15 +292,22 @@ function matchShortcut(input, platform, overrides) {
   );
 }
 function sidebarTabs(state, spaceId = state.activeSpaceId) {
+  const space = state.spaces?.find((item) => item.id === spaceId);
+  const favorites = state.tabs.filter(
+    (tab) => tab.favorite && (space?.profileId ? tab.profileId === space.profileId : tab.spaceId === spaceId),
+  );
   const tabs = state.tabs.filter(
     (tab) =>
-      tab.spaceId === spaceId && (tab.pinned || tab.folderId || tab.url !== 'zacro://newtab' || tab.homePage),
+      !tab.favorite &&
+      tab.spaceId === spaceId &&
+      (tab.pinned || tab.folderId || tab.url !== 'zacro://newtab' || tab.homePage),
   );
-  const pins = tabs.filter((tab) => tab.pinned);
+  const pins = tabs.filter((tab) => tab.pinned && !tab.folderId);
   const folders = state.folders.filter((folder) => folder.spaceId === spaceId);
   return [
+    ...favorites,
     ...pins,
-    ...folders.flatMap((folder) => tabs.filter((tab) => !tab.pinned && tab.folderId === folder.id)),
+    ...folders.flatMap((folder) => tabs.filter((tab) => tab.folderId === folder.id)),
     ...tabs.filter((tab) => !tab.pinned && !tab.folderId),
   ];
 }

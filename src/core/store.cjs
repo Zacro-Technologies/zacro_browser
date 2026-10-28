@@ -4,6 +4,7 @@ const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const { EventEmitter } = require('node:events');
 const { sanitizeOverrides } = require('./shortcuts.cjs');
+const { normalizeSiteSearches } = require('./site-search.js');
 
 const MAX_TABS = 1000;
 const MAX_HISTORY = 20000;
@@ -28,6 +29,32 @@ const SPACE_ICONS = new Set([
   'coffee',
   'music',
   'moon',
+  'plane',
+  'camera',
+  'gamepad',
+  'palette',
+  'beaker',
+  'rocket',
+  'compass',
+  'mountain',
+  'flame',
+  'cloud',
+  'bolt',
+  'diamond',
+  'flower',
+  'smile',
+  'headphones',
+  'calendar',
+  'film',
+  'building',
+  'bag',
+  'terminal',
+  'mail',
+  'shield',
+  'sun',
+  'monitor',
+  'eye',
+  'folder',
 ]);
 const DEFAULT_SPACE_THEME = Object.freeze({
   secondaryColor: '#b695b8',
@@ -142,6 +169,8 @@ function createInitialState() {
       searchEngine: 'duckduckgo',
       archiveAfterHours: 24,
       sidebarWidth: 224,
+      panelWidth: 336,
+      siteSearches: normalizeSiteSearches(),
       restoreSession: true,
       onboardingCompleted: false,
       openSourcesLimit: 3,
@@ -168,6 +197,9 @@ function validateSettings(values, base = createInitialState().settings) {
     next.archiveAfterHours = values.archiveAfterHours;
   if (Number.isFinite(values.sidebarWidth))
     next.sidebarWidth = Math.round(Math.min(380, Math.max(200, values.sidebarWidth)));
+  if (Number.isFinite(values.panelWidth))
+    next.panelWidth = Math.round(Math.min(560, Math.max(260, values.panelWidth)));
+  if (Object.hasOwn(values, 'siteSearches')) next.siteSearches = normalizeSiteSearches(values.siteSearches);
   if (Number.isInteger(values.openSourcesLimit))
     next.openSourcesLimit = Math.min(10, Math.max(1, values.openSourcesLimit));
   for (const key of ['restoreSession', 'sharePageContext', 'onboardingCompleted'])
@@ -235,20 +267,34 @@ function hydrate(raw) {
     .slice(0, 1000)
     .map((f) => ({ id: f.id, spaceId: f.spaceId, name: str(f.name) || 'Folder' }));
   const folders = new Map(result.folders.map((f) => [f.id, f]));
-  const cleanTab = (t) => ({
-    id: t.id,
-    spaceId: t.spaceId,
-    profileId: spaces.get(t.spaceId).profileId,
-    title: str(t.customTitle, 500) || str(t.title, 500) || 'New tab',
-    ...(str(t.customTitle, 500) ? { customTitle: str(t.customTitle, 500) } : {}),
-    url: webUrl(t.url) || 'zacro://newtab',
-    ...(t.homePage === true && !webUrl(t.url) ? { homePage: true } : {}),
-    pinned: Boolean(t.pinned),
-    ...(t.pinned && t.closed === true ? { closed: true } : {}),
-    folderId: folders.get(t.folderId)?.spaceId === t.spaceId ? t.folderId : null,
-    createdAt: time(t.createdAt),
-    lastActiveAt: time(t.lastActiveAt),
-  });
+  const cleanTab = (t) => {
+    const folderId = folders.get(t.folderId)?.spaceId === t.spaceId ? t.folderId : null;
+    const favorite = Boolean(t.pinned && t.favorite !== false && !folderId);
+    const pinned = Boolean(t.pinned || folderId);
+    return {
+      id: t.id,
+      spaceId: t.spaceId,
+      profileId: spaces.get(t.spaceId).profileId,
+      title: str(t.customTitle, 500) || str(t.title, 500) || 'New tab',
+      ...(str(t.customTitle, 500) ? { customTitle: str(t.customTitle, 500) } : {}),
+      url: webUrl(t.url) || 'zacro://newtab',
+      ...(t.homePage === true && !webUrl(t.url) ? { homePage: true } : {}),
+      pinned,
+      // Before favorites and Space pins were distinct, every pin was an icon tile.
+      // Preserve that placement on upgrade rather than silently moving saved tabs.
+      favorite,
+      ...(pinned
+        ? {
+            pinnedUrl: webUrl(t.pinnedUrl) || webUrl(t.url) || 'zacro://newtab',
+            pinnedTitle: str(t.pinnedTitle, 500) || str(t.title, 500) || 'New tab',
+          }
+        : {}),
+      ...(pinned && t.closed === true ? { closed: true } : {}),
+      folderId: favorite ? null : folderId,
+      createdAt: time(t.createdAt),
+      lastActiveAt: time(t.lastActiveAt),
+    };
+  };
   result.tabs = array(raw.tabs)
     .filter((t) => unique(t) && spaces.has(t.spaceId))
     .slice(0, MAX_TABS)
@@ -306,6 +352,22 @@ function hydrate(raw) {
     .slice(0, 200);
   result.settings = validateSettings(raw.settings);
   result.activeSpaceId = spaces.has(raw.activeSpaceId) ? raw.activeSpaceId : result.spaces[0].id;
+  for (const space of result.spaces)
+    if (
+      !result.tabs.some(
+        (tab) =>
+          tab.id === space.lastActiveTabId &&
+          (tab.spaceId === space.id || (tab.favorite && tab.profileId === space.profileId)),
+      )
+    )
+      delete space.lastActiveTabId;
+  const selectedFavorite = result.tabs.find(
+    (tab) =>
+      tab.id === raw.activeTabId &&
+      tab.favorite &&
+      tab.profileId === spaces.get(result.activeSpaceId).profileId,
+  );
+  if (selectedFavorite) selectedFavorite.spaceId = result.activeSpaceId;
   result.activeTabId = result.tabs.some(
     (t) => t.id === raw.activeTabId && t.spaceId === result.activeSpaceId && !t.closed,
   )
@@ -464,13 +526,52 @@ class BrowserStore extends EventEmitter {
   }
   activateSpace(space) {
     this.state.activeSpaceId = space.id;
-    const tabs = this.state.tabs.filter((t) => t.spaceId === space.id && !t.closed);
-    this.state.activeTabId = tabs.find((t) => t.id === space.lastActiveTabId)?.id || tabs[0]?.id || null;
+    const remembered = this.state.tabs.find(
+      (tab) =>
+        tab.id === space.lastActiveTabId &&
+        !tab.closed &&
+        (tab.spaceId === space.id || (tab.favorite && tab.profileId === space.profileId)),
+    );
+    // A Favorite has one live document per profile. Its spaceId records where it
+    // was last used, rather than duplicating cookies, callbacks or tab renderers.
+    if (remembered?.favorite) remembered.spaceId = space.id;
+    this.state.activeTabId =
+      remembered?.id ||
+      this.state.tabs.find((tab) => tab.spaceId === space.id && !tab.favorite && !tab.closed)?.id ||
+      null;
+  }
+  activateTab(tab, activate = true) {
+    const current = this.activeSpace();
+    if (tab.favorite && tab.profileId === current.profileId) tab.spaceId = current.id;
+    if (activate) {
+      this.state.activeTabId = tab.id;
+      this.state.activeSpaceId = tab.spaceId;
+      this.require('spaces', tab.spaceId, 'Space').lastActiveTabId = tab.id;
+    }
+    tab.lastActiveAt = Date.now();
+    delete tab.closed;
+  }
+  setPinned(tab, pinned, favorite = false) {
+    if (pinned) {
+      if (!tab.pinned) tab.pinnedUrl = tab.url;
+      tab.pinnedUrl ||= tab.url;
+      tab.pinnedTitle ||= tab.title;
+      tab.pinned = true;
+      tab.favorite = favorite;
+      if (favorite) tab.folderId = null;
+    } else {
+      tab.pinned = false;
+      tab.favorite = false;
+      tab.folderId = null;
+      delete tab.pinnedUrl;
+      delete tab.pinnedTitle;
+    }
   }
   closeTab(tab, archive = true) {
     const position = this.state.tabs.indexOf(tab);
     if (tab.pinned) {
       tab.closed = true;
+      tab.url = tab.pinnedUrl || tab.url;
       if (this.state.activeTabId === tab.id)
         this.state.activeTabId =
           this.state.tabs.slice(position + 1).find((item) => item.spaceId === tab.spaceId && !item.pinned)
@@ -514,6 +615,7 @@ class BrowserStore extends EventEmitter {
           title: url === 'zacro://newtab' ? 'New tab' : new URL(url).hostname,
           ...(p.homePage === true && (!p.url || p.url === 'zacro://newtab') ? { homePage: true } : {}),
           pinned: false,
+          favorite: false,
           folderId: null,
           createdAt: now,
           lastActiveAt: now,
@@ -530,13 +632,7 @@ class BrowserStore extends EventEmitter {
       case 'tab:activate':
       case 'tab:wake': {
         const tab = this.require('tabs', p.id, 'Tab');
-        if (action === 'tab:activate') {
-          s.activeTabId = tab.id;
-          s.activeSpaceId = tab.spaceId;
-          this.require('spaces', tab.spaceId, 'Space').lastActiveTabId = tab.id;
-        }
-        tab.lastActiveAt = now;
-        delete tab.closed;
+        this.activateTab(tab, action === 'tab:activate');
         result = tab;
         break;
       }
@@ -562,12 +658,34 @@ class BrowserStore extends EventEmitter {
         break;
       case 'tab:pin': {
         const tab = this.require('tabs', p.id || s.activeTabId, 'Tab');
-        tab.pinned = !tab.pinned;
-        if (tab.pinned) tab.folderId = null;
-        else if (tab.closed) {
+        if (tab.favorite && tab.profileId === this.activeSpace().profileId) tab.spaceId = s.activeSpaceId;
+        this.setPinned(tab, !tab.pinned);
+        if (!tab.pinned && tab.closed) {
           delete tab.closed;
           this.closeTab(tab, false);
         }
+        result = tab;
+        break;
+      }
+      case 'tab:favorite': {
+        const tab = this.require('tabs', p.id || s.activeTabId, 'Tab');
+        if (tab.profileId === this.activeSpace().profileId) tab.spaceId = s.activeSpaceId;
+        this.setPinned(tab, true, p.favorite !== false);
+        result = tab;
+        break;
+      }
+      case 'tab:reset-pin': {
+        const tab = this.require('tabs', p.id || s.activeTabId, 'Tab');
+        if (!tab.pinned) throw new Error('Only a Pinned Tab or Favorite has a saved destination.');
+        tab.url = tab.pinnedUrl || tab.url;
+        result = tab;
+        break;
+      }
+      case 'tab:replace-pin': {
+        const tab = this.require('tabs', p.id || s.activeTabId, 'Tab');
+        if (!tab.pinned) throw new Error('Only a Pinned Tab or Favorite has a saved destination.');
+        tab.pinnedUrl = tab.url;
+        tab.pinnedTitle = tab.title;
         result = tab;
         break;
       }
@@ -585,11 +703,16 @@ class BrowserStore extends EventEmitter {
         const oldSpace = tab.spaceId;
         tab.spaceId = space.id;
         if (p.folderId !== undefined || oldSpace !== space.id) tab.folderId = p.folderId || null;
-        if (typeof p.pinned === 'boolean') {
-          tab.pinned = p.pinned;
-          if (p.pinned) tab.folderId = null;
-        }
-        if (tab.folderId) tab.pinned = false;
+        const favorite =
+          typeof p.favorite === 'boolean'
+            ? p.favorite
+            : p.folderId || p.pinned === false || (p.spaceId && oldSpace !== space.id)
+              ? false
+              : tab.favorite;
+        const pinned =
+          favorite || (typeof p.pinned === 'boolean' ? p.pinned : p.folderId ? true : Boolean(tab.pinned));
+        this.setPinned(tab, pinned, favorite);
+        if (favorite) tab.folderId = null;
         if (!tab.pinned) delete tab.closed;
         if (Number.isInteger(p.index)) {
           s.tabs.splice(s.tabs.indexOf(tab), 1);
@@ -813,6 +936,17 @@ class BrowserStore extends EventEmitter {
         break;
       default:
         throw new Error(`Unknown action: ${str(action, 80)}`);
+    }
+    const tabsById = new Map(s.tabs.map((tab) => [tab.id, tab]));
+    for (const space of s.spaces) {
+      const remembered = tabsById.get(space.lastActiveTabId);
+      if (
+        space.lastActiveTabId &&
+        (!remembered ||
+          (remembered.spaceId !== space.id &&
+            !(remembered.favorite && remembered.profileId === space.profileId)))
+      )
+        delete space.lastActiveTabId;
     }
     if (this.file && RECOVERY_PURGE_ACTIONS.has(action)) this.recoveryPurgePending = true;
     this.changed();

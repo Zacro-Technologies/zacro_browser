@@ -148,7 +148,7 @@ test(
 );
 
 test(
-  'mouse drags pin into empty and occupied favorites, reorder pins and unpin back into the tab list across restarts',
+  'mouse drags through favorites, Space pins and Today preserve live pages and persist across restarts',
   { timeout: 60000 },
   async (t) => {
     const b = await fixture(t);
@@ -188,8 +188,9 @@ test(
     await b.submit(`${b.base}/drag-pin`);
     const id = (await b.state()).activeTabId;
     await b.guest(`${b.base}/drag-pin`, 'document.querySelector("textarea").value="Pinned draft"');
-    await mouseDrag(row(id), b.shell.locator('.favorites[data-drop-pinned]'));
+    await mouseDrag(row(id), b.shell.locator('.favorites[data-drop-favorites]'));
     await expect.poll(async () => (await b.state()).tabs.find((tab) => tab.id === id)?.pinned).toBe(true);
+    assert.equal((await b.state()).tabs.find((tab) => tab.id === id).favorite, true);
     await expect(pin(id)).toBeVisible();
     assert.equal((await b.state()).tabs.length, 1);
     assert.equal(
@@ -206,11 +207,12 @@ test(
       .toBe(true);
     await expect.poll(pinnedOrder).toEqual([id, second.id]);
     assert.equal((await b.state()).tabs.find((tab) => tab.id === second.id).folderId, null);
+    assert.equal((await b.state()).tabs.find((tab) => tab.id === second.id).favorite, true);
 
     await mouseDrag(pin(second.id), pin(id), { x: 0.25, feedback: 'drop-before' });
     await expect.poll(pinnedOrder).toEqual([second.id, id]);
     assert.deepEqual(
-      (await b.state()).tabs.filter((tab) => tab.pinned).map((tab) => tab.id),
+      (await b.state()).tabs.filter((tab) => tab.favorite).map((tab) => tab.id),
       [second.id, id],
     );
     assert.equal(
@@ -243,7 +245,174 @@ test(
     await expect(row(second.id)).toBeVisible();
     assert.equal((await b.state()).tabs.find((tab) => tab.id === id).pinned, true);
     assert.equal((await b.state()).tabs.find((tab) => tab.id === second.id).pinned, false);
+    assert.equal((await b.state()).tabs.find((tab) => tab.id === second.id).favorite, false);
     assert.equal((await b.state()).tabs.find((tab) => tab.id === second.id).folderId, null);
+    await mouseDrag(row(second.id), b.shell.locator('.pinned-tabs[data-drop-pinned]'));
+    await expect
+      .poll(async () => (await b.state()).tabs.find((tab) => tab.id === second.id)?.pinned)
+      .toBe(true);
+    assert.equal((await b.state()).tabs.find((tab) => tab.id === second.id).favorite, false);
+    await expect(b.shell.locator(`.pinned-tabs .tab-row[data-tab-id="${second.id}"]`)).toBeVisible();
+    await expect(pin(second.id)).toHaveCount(0);
+    await expect.poll(pinnedOrder).toEqual([id]);
+    await b.close();
+    await b.launch();
+    await expect(b.shell.locator(`.pinned-tabs .tab-row[data-tab-id="${second.id}"]`)).toBeVisible();
+    await expect.poll(pinnedOrder).toEqual([id]);
+    assert.equal((await b.state()).tabs.length, 3);
+  },
+);
+
+test(
+  'keyword Tab site search supports custom templates, validation, encoded queries and restart',
+  { timeout: 60000 },
+  async (t) => {
+    const b = await fixture(t);
+    const input = () => b.shell.locator('#command-input');
+    await input().fill('/manage site search');
+    await input().press('Enter');
+    await expect(input()).toHaveAttribute('placeholder', 'Site Search');
+    await input().press('Enter');
+    const editor = b.shell.getByRole('dialog', { name: 'Add site search', exact: true });
+    await editor.getByRole('textbox', { name: 'Name', exact: true }).fill('Local documentation');
+    await editor.getByRole('textbox', { name: 'Keyword', exact: true }).fill('w');
+    await editor
+      .getByRole('textbox', { name: 'Search URL', exact: true })
+      .fill(`${b.base}/search?q=%s&source=docs`);
+    await editor.getByRole('button', { name: 'Save', exact: true }).click();
+    await expect(editor.getByRole('alert')).toContainText('already assigned');
+    await editor.getByRole('textbox', { name: 'Keyword', exact: true }).fill('docs');
+    await editor.getByRole('button', { name: 'Save', exact: true }).click();
+    await expect(input()).toHaveAttribute('placeholder', 'Site Search');
+    const saved = (await b.state()).settings.siteSearches.find((engine) => engine.keyword === 'docs');
+    assert(saved, 'Custom site search must persist through the settings validator');
+    await input().press('Escape');
+    await input().fill('DOCS');
+    await input().press('Tab');
+    await expect(input()).toHaveAttribute('placeholder', 'Search Local documentation');
+    await expect(input()).toHaveAttribute('aria-label', 'Search Local documentation');
+    await expect(b.shell.locator('#command-status')).toHaveAttribute('aria-live', 'polite');
+    await expect(b.shell.locator('#command-status')).toContainText('Type to search Local documentation');
+    await expect(input()).toHaveValue('');
+    const query = 'browser & state=other / 日本語';
+    await input().fill(query);
+    await input().press('Escape');
+    await expect(input()).toHaveValue('DOCS');
+    await input().press('Tab');
+    await input().fill(query);
+    await input().press('Enter');
+    const url = `${b.base}/search?q=${encodeURIComponent(query)}&source=docs`;
+    await expect.poll(() => b.guest(url, 'document.readyState')).toBe('complete');
+    assert.equal(new URL((await b.state()).tabs[0].url).searchParams.get('q'), query);
+    assert.equal((await b.state()).tabs.length, 1, 'Site search creates only its submitted destination');
+    await b.close();
+    await b.launch();
+    assert.deepEqual(
+      (await b.state()).settings.siteSearches.find((engine) => engine.id === saved.id),
+      saved,
+    );
+    await b.key('T', [b.mod]);
+    await expect(input()).toBeFocused();
+    await b.key('T', [b.mod]);
+    await expect(input()).toHaveCount(0);
+  },
+);
+
+test(
+  'command result actions support reversible keyboard drill-down and pinning directly into a folder',
+  { timeout: 60000 },
+  async (t) => {
+    const b = await fixture(t);
+    await b.submit(`${b.base}/target`);
+    const target = (await b.state()).activeTabId;
+    await b.guest(`${b.base}/target`, 'window.retainedCommandDraft="same document"');
+    await b.invoke('tab:create', { url: `${b.base}/current` });
+    await expect.poll(() => b.guest(`${b.base}/current`, 'document.readyState')).toBe('complete');
+    const folder = await b.invoke('folder:create', { name: 'Research' });
+    await b.shell.locator(`[data-key="folder-${folder.id}"]`).click();
+    await expect(b.shell.locator(`[data-key="folder-${folder.id}"]`)).toHaveAttribute(
+      'aria-expanded',
+      'false',
+    );
+    await b.key('T', [b.mod]);
+    const input = () => b.shell.locator('#command-input');
+    await b.shell.getByRole('button', { name: 'Tabs', exact: true }).click();
+    await input().fill('w');
+    await expect(b.shell.locator('.command-context-hint')).not.toContainText('Search site');
+    const scopedTab = await b.shell.locator('.command-result.selected .command-result-label').innerText();
+    await input().press('Tab');
+    await expect(input()).toHaveAttribute('aria-label', `Actions for ${scopedTab}`);
+    await expect(b.shell.locator('[data-command-id="result:move"]')).toBeVisible();
+    await input().press('Escape');
+    await b.shell.getByRole('button', { name: 'All', exact: true }).click();
+    await input().fill('@target');
+    await input().press('Tab');
+    await expect(input()).toHaveAttribute('placeholder', 'Workflow /target');
+    await expect(input()).toHaveAttribute('aria-label', 'Actions for Workflow /target');
+    await input().fill('pin to');
+    await input().press('Enter');
+    await expect(input()).toHaveAttribute('placeholder', 'Pin to…');
+    await expect(input()).toHaveAttribute('aria-label', 'Pin to…');
+    await input().press('Escape');
+    await expect(input()).toHaveValue('pin to');
+    await input().press('Escape');
+    await expect(input()).toHaveValue('@target');
+    await input().press('Tab');
+    await input().fill('pin to');
+    await input().press('Enter');
+    await input().fill('Research');
+    await input().press('Enter');
+    await expect(input()).toHaveCount(0);
+    const pinned = (await b.state()).tabs.find((tab) => tab.id === target);
+    assert.equal(pinned.folderId, folder.id);
+    assert.equal(pinned.pinned, true);
+    assert.equal(pinned.favorite, false);
+    assert.equal(await b.guest(`${b.base}/target`, 'window.retainedCommandDraft'), 'same document');
+    await b.key('T', [b.mod]);
+    await input().fill('Research');
+    await b.shell.getByRole('button', { name: 'Folders', exact: true }).click();
+    await expect(b.shell.getByRole('button', { name: 'Folders', exact: true })).toHaveAttribute(
+      'aria-pressed',
+      'true',
+    );
+    await expect(b.shell.locator('[data-command-kind="navigation"]')).toHaveCount(0);
+    await b.shell.locator(`[data-command-id="folder:${folder.id}"]`).click();
+    await expect(b.shell.locator(`[data-key="folder-${folder.id}"]`)).toHaveAttribute(
+      'aria-expanded',
+      'true',
+    );
+    await expect(input()).toHaveCount(0);
+    await b.key('T', [b.mod]);
+    await input().fill('@target');
+    await input().press('Tab');
+    await b.invoke('profile:create', { name: 'Isolated commands' });
+    await expect(input()).toHaveValue('');
+    await expect(input()).toHaveAttribute('placeholder', 'Search or enter a URL');
+    await expect(b.shell.locator('[data-command-id="result:move"]')).toHaveCount(0);
+  },
+);
+
+test(
+  'rebinding the AI shortcut disables its former palette key and uses the configured binding',
+  { timeout: 60000 },
+  async (t) => {
+    const b = await fixture(t);
+    await b.submit(`${b.base}/shortcut-page`);
+    await b.invoke('shortcut:set', { id: 'ai', accelerator: 'Mod+Alt+8' });
+    await b.key('T', [b.mod]);
+    const input = b.shell.locator('#command-input');
+    // Keep the query empty so exercising the configured AI key opens its panel
+    // without sending a request to any locally connected provider.
+    await input.fill('');
+    await input.press(`${process.platform === 'darwin' ? 'Meta' : 'Control'}+Enter`);
+    await expect(input).toBeFocused();
+    await expect(input).toHaveValue('');
+    await expect(b.shell.locator('#ai-question')).toHaveCount(0);
+    assert.equal((await b.state()).tabs.length, 1);
+    await b.key('8', [b.mod, 'alt']);
+    await expect(b.shell.locator('#ai-question')).toBeVisible();
+    await expect(input).toHaveCount(0);
+    await expect(b.shell.locator('#ai-question')).toHaveValue('');
   },
 );
 
@@ -289,6 +458,9 @@ test(
       .poll(async () => (await b.state()).tabs.find((tab) => tab.id === records[1].id).pinned)
       .toBe(true);
     assert.equal((await b.state()).bookmarks.length, 0, 'Arc pin shortcut pins instead of bookmarking');
+    assert.equal((await b.state()).tabs.find((tab) => tab.id === records[1].id).favorite, false);
+    await expect(b.shell.locator(`.pinned-tabs .tab-row[data-tab-id="${records[1].id}"]`)).toBeVisible();
+    await expect(b.shell.locator(`.favorite[data-tab-id="${records[1].id}"]`)).toHaveCount(0);
     await b.key('1', [b.mod]);
     await expect.poll(current).toBe(records[1].id);
     await b.key('Down', [b.mod, 'alt']);

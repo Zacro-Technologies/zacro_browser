@@ -234,6 +234,7 @@ test(
     }, url);
     const opening = await shell.evaluate(() => {
       document.querySelector('[data-key="library"]').click();
+      document.querySelector('[data-key="panel-bookmarks"]').click();
       const moving = document.querySelector('#app').dataset.panelAnimating;
       // The next action occurs before any animation frame can settle the panel.
       document.querySelector('[data-key="address"]').click();

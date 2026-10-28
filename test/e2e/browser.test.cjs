@@ -456,11 +456,13 @@ test(
     await b.page.locator(`[data-key="tab-${tabId}"]`).click({ button: 'right' });
     await b.page
       .getByRole('dialog', { name: 'Tab actions' })
-      .getByRole('button', { name: 'Pin to favorites', exact: true })
+      .getByRole('button', { name: 'Add to Favorites', exact: true })
       .click();
-    await expect.poll(async () => (await b.state()).tabs.find((tab) => tab.id === tabId)?.pinned).toBe(true);
+    await expect
+      .poll(async () => (await b.state()).tabs.find((tab) => tab.id === tabId)?.favorite)
+      .toBe(true);
     await sidebar.getByRole('button', { name: 'Library', exact: true }).click();
-    await b.page.locator('#side-panel [data-key="panel-settings"]').click();
+    await b.page.locator('#library-menu [data-key="panel-settings"]').click();
     await b.page.locator('select[data-setting="searchEngine"]').selectOption('brave');
     await expect.poll(async () => (await b.state()).settings.searchEngine).toBe('brave');
     await b.page.locator('#side-panel summary').filter({ hasText: 'About Zacro' }).click();
@@ -573,6 +575,8 @@ test(
     await expect.poll(async () => (await b.state()).runtime.splitTabId).toBe(null);
 
     await b.page.locator('[data-key="library"]').click();
+    await expect(b.page.getByRole('menu', { name: 'Library', exact: true })).toBeVisible();
+    await b.page.locator('#library-menu [data-key="panel-bookmarks"]').click();
     await expect(b.page.locator('#panel-title')).toHaveText('Bookmarks');
     await expect(b.page.getByRole('dialog')).toHaveCount(0);
     await b.page.keyboard.press('Escape');

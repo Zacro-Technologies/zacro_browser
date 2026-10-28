@@ -136,6 +136,9 @@ test(
       await expect(b.shell.locator('#space-gesture-preview')).toBeHidden();
       await expect(b.shell.locator('.space-transition-snapshot')).toHaveCount(0);
       if (action === 'library') {
+        await expect(b.shell.getByRole('menu', { name: 'Library', exact: true })).toBeVisible();
+        await expect(b.shell.locator('#app')).toHaveAttribute('data-sidebar-hidden', 'false');
+        await b.shell.locator('[data-key="panel-bookmarks"]').click();
         await expect(b.shell.locator('#app')).toHaveAttribute('data-sidebar-hidden', 'true');
         await expect(b.shell.locator('#panel-title')).toHaveText('Bookmarks');
         await b.shell.locator('[data-key="panel-close"]').click();
@@ -580,7 +583,7 @@ test(
     const folder = await b.invoke('folder:create', { spaceId: b.third, name: 'Reading list' });
     const pin = await b.invoke('tab:create', { spaceId: b.third, homePage: true, active: false });
     await b.invoke('tab:update', { id: pin.id, title: 'Favorite reference' });
-    await b.invoke('tab:pin', { id: pin.id });
+    await b.invoke('tab:favorite', { id: pin.id });
     const article = await b.invoke('tab:create', { spaceId: b.third, homePage: true, active: false });
     await b.invoke('tab:update', { id: article.id, title: 'Neighbor article' });
     await b.invoke('tab:move', { id: article.id, spaceId: b.third, folderId: folder.id });
@@ -662,7 +665,7 @@ test(
     });
     const b = await launch(t);
     const tab = await b.invoke('tab:create', { url: `http://127.0.0.1:${server.address().port}/` });
-    await b.invoke('tab:pin', { id: tab.id });
+    await b.invoke('tab:favorite', { id: tab.id });
     await expect(b.shell.locator(`.favorite[data-tab-id="${tab.id}"]`)).toHaveAttribute(
       'aria-label',
       / — (Loaded|Sleeping|Closed)$/,
