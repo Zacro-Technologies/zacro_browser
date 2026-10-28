@@ -16,6 +16,8 @@ Implement vertical tabs, favorites, folders, drag and keyboard organization, Spa
 
 Acceptance: exercise every exposed control, keyboard-only flows, narrow/large windows, light/dark/high-contrast themes, reduced motion, native dialogs, long titles and empty/error states. Run actual Chromium integration tests and inspect rendered UI, rather than testing only reducer behavior.
 
+Shift-click Peek currently handles main-document links, including new-window targets. Embedded-frame links retain native modifier behavior and offer Peek through the context menu. Complete isolated per-frame click handling with source-document validation before claiming modifier-click support for all embedded content; navigation heuristics must not intercept form submissions or scripted login flows.
+
 ## 3. Optional AI with explicit data boundaries
 
 Version 0.5 implements six explicitly selected connections: ChatGPT subscription through the bundled official Codex app-server, Claude subscription through the installed official native Claude Code CLI, OpenAI API, Claude API, OpenRouter, and OpenAI-compatible APIs. Subscription sign-ins use separate Zacro configurations without importing personal developer credentials. API keys/configuration belong to one browser profile, provider and exact endpoint. Ordinary browsing remains independent of AI, and inference requires an explicit question. Subscription access and API billing stay separate; failures never trigger an automatic provider, model or credential fallback.

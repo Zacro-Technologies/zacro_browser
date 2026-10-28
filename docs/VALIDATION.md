@@ -2,6 +2,49 @@
 
 Validated locally on Windows 11 x64 (OS build 26200), Node.js 24.19.0, Electron 45.0.0 and Chromium 156.0.8078.48. This record describes engineering verification of the development build, not commercial certification or a security audit.
 
+## 0.8 native glass, resizable chrome, Arc pins and command workflows
+
+Final [CI run 40692880415](https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40692880415) passed at runtime commit **`1a64f6d82ba1e43468a14d95b676fbdf87205796`**:
+
+| Platform | Unit/security | Native desktop | Packaged app | Additional |
+| --- | --- | --- | --- | --- |
+| Windows x64 | 188 passed | 87 passed; 6 Mac-only skips | 1 passed | 40-cycle lifecycle check and validation upload passed |
+| macOS, Apple silicon | 188 passed | 72 passed; 1 Windows-only skip | 1 passed | Development DMG/ZIP and both uploads passed |
+| macOS, Intel | 188 passed | 72 passed; 1 Windows-only skip | 1 passed | Development DMG/ZIP and both uploads passed |
+
+All three jobs and the overall run completed successfully, including formatting and syntax. All five validation/development artifacts were published. Decoded job logs are retained locally under `test-results/ci-40692880415/`. The Mac packages are ad hoc signed development builds; this result does not establish notarized distribution or physical-device acceptance. The subsequent documentation-only commit does not change this tested runtime.
+
+Local automated verification on October 28, 2026 (JST) passed **188 unit/security tests** and established passing results for **87 distinct Windows desktop cases**, with **six Mac-only cases skipped**. The desktop total combines the initial full run with corrected regression runs; it is not a claim that the initial full run passed.
+
+| Check | Confirmed local result | Evidence |
+| --- | --- | --- |
+| Unit/security | 188 passed, zero failures | `test-results/0.8-unit.log` |
+| Initial full desktop run | 82 passed, four failed, six Mac-only skips | `test-results/0.8-e2e.log` |
+| Corrected desktop regressions | 34 passed, including all four previously failing cases and all seven command workflow cases | `test-results/0.8-regression.log` |
+| Library/material follow-up | Two passed | `test-results/0.8-library-material.log` |
+| Formatting and syntax | Both passed | `test-results/0.8-format-check.log`, `test-results/0.8-syntax.log` |
+| Windows development build | Unsigned `Zacro-0.8.0-x64-Setup.exe` and block map produced | `test-results/0.8-build.log` |
+| Packaged application | One passed | `test-results/0.8-package.log` |
+| Resource lifecycle soak | One passed, 40 cycles | `test-results/0.8-soak.log` |
+
+The initial desktop failures covered a retained-favicon fixture expecting the navigated URL instead of the Favorite's saved destination, keyboard events whose target was not an element, dark Space-title contrast, and Windows forced-color selection. The fixture, event handling and style corrections passed in the subsequent 34-case regression run. The new AI-shortcut rebinding case increases the distinct Windows desktop total from 86 to 87; repeat executions of existing tests are not counted again. The two Library/material follow-up cases also repeat cases already included in that total.
+
+- **Native materials and resizing:** Windows native glass preserves opaque live web pages and restores the saved Space material after a canceled preview. Sidebar and Library edge dragging retains document identity and native page resolution; chosen widths survive restart. Keyboard sizing, reset, cancellation and compact-window constraints pass. Library opens a destination chooser and preserves its opener, keyboard navigation and download actions.
+- **Pins and Favorites:** durable Space pins, pinned folders and profile-wide Favorites have distinct ordering and drag targets. Tests cover saved URL/title behavior, reset and replacement, closing and reopening without deleting a pin, safe navigation with unsaved work, and retained favicon isolation. Trusted Shift-click cases cover ordinary main-document links and links with a new-window target while retaining the original document and tab count. Iframe modifier-click interception is not implemented; embedded-frame links retain native behavior. Existing automatic-sleep protections remain covered by the plain Electron lifecycle suite.
+- **Command workflows:** all seven native cases pass, including tabless opening, reversible result-action and destination steps, folder search/reveal, profile isolation, custom keyword-Tab Site Search with encoded queries and restart persistence, Arc-style Space/tab navigation, editable shortcuts and Save Page. Regression assertions verify that an explicit Tabs scope prevents a site keyword from taking over Tab, command contexts expose accessible names and status, and rebinding AI disables its former palette key. The rebinding test opens AI with an empty query and sends no provider request. Shortcut geometry was also checked at the native minimum content size accepted on this host, 561×421.
+- **Package and soak:** the built Windows executable passed security-fuse checks, real page navigation, packaged PDF worker parsing and the bundled Codex runtime's isolated signed-out handshake. The 40-cycle local soak retained two WebContents at every sample, with a 361 ms cycle median and 612 ms p95. Sampled process memory increased from 359,464 to 668,772 KiB. These bounded fixture observations do not establish general browsing performance or long-term memory behavior.
+
+The final Space-form refinements at `33aa133` and `26bd670` reduce the preview and icon grid and use the available window height. Six personalization/compact-layout cases passed after each change, including short-window layouts. The Windows package was rebuilt after the changes.
+
+Intel CI at `33aa133` exposed an AI Settings validation race. A background refresh preserved a typed localhost endpoint but restored an outdated required API-key constraint, preventing Save. A deterministic reproduction confirmed that the same endpoint changed from valid to invalid after a Space update. Runtime fix `1a64f6d` recomputes validation after restoring the draft. The existing workflow test now forces local, remote and local endpoint redraws, verifying that local keys remain optional and remote keys remain required. All three AI workflow cases and all three AI connection cases passed locally. The final unsigned Windows installer was rebuilt and packaged acceptance passed (`test-results/0.8-final-build.log`, `test-results/0.8-final-package.log`); formatting and syntax passed as well. Packaged renderer, styles and main-process sources match the checkout.
+
+Computer initially failed to activate both translucent and opaque review windows. Native input recovered in a fresh packaged `33aa133` session. Pointer review verified Library menu selection and edge dragging from 224 to 278px for the sidebar and 336 to 442px for Library. Native keyboard Tab after entering `w` opened the Wikipedia search context without navigating or sending a query. The documentation gallery uses intact Computer captures of instrumented review states; [capture provenance](screenshots/README.md) distinguishes those from native-input checks. Desktop blur behind a translucent window has API coverage but is not claimed visually accepted by these opaque captures.
+
+All ten documentation images passed hash and dimension checks against their manifest. The eight-page PDF was rendered and visually reviewed; every page contains one intact capture and extractable text. Its SHA-256 is `43a12242d595fbb32b9f502b09efc78c4edd14283137c24f4deadf212a44b005`.
+
+Physical Mac trackpad/VoiceOver, live Google/AI account acceptance and signed distribution remain open. Historical 0.7 evidence below applies only to its recorded revisions. See [website sign-in](WEB-SIGN-IN.md) for the current direct Google account rejection and separate FedCM limitation.
+
+
 ## 0.7 compact windows, browser panels and keyboard onboarding
 
 ### Website sign-in follow-up

@@ -14,8 +14,6 @@ Zacro is an independent project, not an official continuation of Arc or an affil
 
 This is **not yet a complete implementation of the vision or a commercial release**. Zacro account sync, full Chrome extension compatibility and `chrome.storage.sync`, consequential browser agents, signed automatic updates, and operational/security release gates remain open. AI connection code and controlled-transport tests are implemented; live subscription sign-in, API model access, billing/limits and inference acceptance remain pending with user-authorized accounts. The [implementation roadmap](docs/ROADMAP.md) separates working features from required release work; [AI documentation](docs/AI.md) describes the connection and data boundaries.
 
-The previous 0.7 website-sign-in follow-up at `9bf9af7` passed all test and build steps in [cross-platform CI](https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40680503131): 176 unit/security checks per platform, 77 Windows desktop cases, 62 native cases on each Mac architecture, and packaged-application acceptance on all three. The Windows lifecycle check also passed. The overall run failed when GitHub timed out finalizing the Intel validation artifact; its later package upload was skipped. See the [validation record](docs/VALIDATION.md) for exact results and remaining acceptance work.
-
 Navigation and the address field live in the sidebar. Profile-wide icon Favorites sit above the Space name, followed by folders, saved Space pins and ordinary tabs. Drag between those regions to organize the same live page. Library, Space icons and one creation menu share the footer; page actions live in compact menus. The default sidebar is 224px wide, with 32px Comfortable tab rows and footer; existing custom widths are preserved. See the historical [0.4 design study](docs/DESIGN-REVIEW-0.4.md) and current [interaction notes](docs/DESIGN.md).
 
 The command workflow opens a palette in an empty Space instead of creating a blank tab. New Tab and **Ctrl/Command + T** open that palette; submitting an address or search creates the page. Tab on a result opens relevant actions and destination choices; Escape steps back. Search folders, reset or replace pins, and use a configured site keyword followed by Tab to search that site. Site-search shortcuts are editable. The shortcut editor, Space keys and recent-tab switching remain available.
@@ -27,6 +25,43 @@ The welcome tour explains the keyboard workflow, including **Command/Ctrl+S** to
 Favorites share one live document across Spaces in a profile; saved Space pins remain in their own Space. Closing either keeps the saved destination. Click a Favorite icon or a pin favicon to reset to it, or use Replace Pin to save the current page. Idle Favorites sleep when safe. Shift-click a link to Peek; ordinary off-host links from pins can also open Peek. AI actions prepare a question and show the pages selected for sharing before sending. Website login popups retain their session and callback document, then return to their opener; a Peek opener becomes a tab without reloading. Persistent website login cookies stay within their profile across normal restarts. **Direct Google account sign-in is currently reported blocked by Google.** This is separate from the missing FedCM account chooser required by some third-party flows. Full Google support requires further browser-engine work and real-provider acceptance; the 0.8 changes do not solve that restriction. See [website sign-in](docs/WEB-SIGN-IN.md) for supported mechanics, remaining engine work and the default-browser option.
 
 ## Screenshots
+
+These **0.8** captures show the packaged Windows application in an isolated local demo. Application states were prepared by the review harness and captured intact through Computer; they are not proof of native-input acceptance. See [capture provenance](docs/screenshots/README.md), [design decisions](docs/DESIGN-REVIEW-0.8.md) and the [eight-page feature guide (PDF)](docs/Zacro-0.8-Design-and-Feature-Guide.pdf).
+
+![Zacro 0.8 with profile Favorites, saved Space pins and a compact sidebar beside a real page](docs/screenshots/0.8/workspace.jpg)
+
+| Library destinations | Integrated Library |
+| --- | --- |
+| ![Named Library options appear before a panel opens](docs/screenshots/0.8/library-menu.jpg) | ![A flat searchable Library shares the browser window material](docs/screenshots/0.8/library.jpg) |
+| Choose a destination with keys or a pointer. | Resize the panel and sidebar from their edges. |
+
+| Command workflow | Dark selection |
+| --- | --- |
+| ![Command palette with text filters and page-only blur](docs/screenshots/0.8/palette.jpg) | ![Clear selected command and active tab in dark appearance](docs/screenshots/0.8/dark.jpg) |
+| Result actions, folder search and keyword-Tab Site Search. | Defined selection and keyboard focus. |
+
+| Space customization | Peek |
+| --- | --- |
+| ![Searchable Space icons and native window material controls](docs/screenshots/0.8/space-theme.jpg) | ![Peek opens a real page while retaining the original document](docs/screenshots/0.8/peek.jpg) |
+| 38 icons, two colors, grain and window tint. | Shift-click a link, then dismiss or promote it. |
+
+![Compact Zacro with adaptive navigation and a usable Library panel](docs/screenshots/0.8/compact.jpg)
+
+Still images document layout. The [validation record](docs/VALIDATION.md) distinguishes automated tests, native capture, physical-device input and live-provider acceptance.
+
+<details>
+<summary>Native macOS 0.8 · light and dark</summary>
+
+| Light | Dark |
+| --- | --- |
+| ![Zacro 0.8 on macOS with native controls and compact navigation](docs/screenshots/0.8/macos-light.png) | ![Zacro 0.8 in dark appearance with a clearly selected tab](docs/screenshots/0.8/macos-dark.png) |
+
+Original Apple silicon desktop captures from packaged `33aa133` in [CI run 40690651723](https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40690651723). The optional New Tab Page was opened explicitly; empty Spaces normally open the command palette. Exact artifact provenance and remaining physical-device acceptance are documented separately.
+
+</details>
+
+<details>
+<summary>Historical 0.7 · Windows and native macOS</summary>
 
 These **0.7** Windows captures show the packaged development application in an isolated local demo workspace. They were captured through native Computer interactions without retouching. See [capture provenance](docs/screenshots/README.md), the [0.7 design decisions](docs/DESIGN-REVIEW-0.7.md), and the [design and feature guide (PDF)](docs/Zacro-0.7-Design-and-Feature-Guide.pdf).
 
@@ -54,6 +89,8 @@ Still images document layout; native interaction tests and hands-on review cover
 | ![Zacro 0.7 on macOS with native traffic lights, compact controls and the revised Dock icon](docs/screenshots/0.7/macos-light.png) | ![Zacro 0.7 in dark appearance on macOS](docs/screenshots/0.7/macos-dark.png) |
 
 Unedited desktop captures from the Apple silicon package at `7766947`, from successful [Windows and native Mac CI](https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40579207712). The optional New Tab Page was opened explicitly during package acceptance; empty Spaces normally open the command palette. Both Mac architectures passed 176 unit checks, 59 native cases and package acceptance at this revision.
+
+</details>
 
 </details>
 
@@ -216,11 +253,11 @@ Use **Ctrl/Command + T** to open the command palette and **Ctrl/Command + L** to
 
 **Scroll sideways over the sidebar** to switch Spaces within the current profile; **Shift + mouse wheel** works too. The tab list follows the movement. At release, distance and recent speed decide whether it settles into the neighboring Space or returns; crossing a small fixed threshold no longer switches immediately. Reversing unwinds the preview, and the endpoints resist without wrapping. One gesture's momentum cannot advance through several Spaces. The sidebar remains usable beside the command palette. Other dialogs, text fields, dragging and pinch/zoom keep their own input. Webpage scrolling stays with the page, and each Space remembers its tab-list position. Portable wheel events require release/momentum heuristics; physical Mac trackpad acceptance remains open.
 
-**Favorites remain when closed.** Closing a pinned page releases its live page, after any unsaved-work decision, while retaining its name, address and position. Click it to open again, or choose Remove pin to return it to the ordinary tab list. Loaded, Sleeping or Closed states remain in tooltips and accessible labels, without status dots. Idle sleep defaults to 20 minutes and can be changed or disabled in **Settings → Layout & motion**. Active/split pages, media, captures, pending authentication and live popup openers, downloads and detected edits are protected; a page's beforeunload veto keeps it awake without an automatic discard prompt. Sleeping reloads the page when reopened, so it is not a promise to preserve arbitrary in-memory application state.
+**Favorites and Space pins remain when closed.** Closing a pinned page releases its live page, after any unsaved-work decision, while retaining its name, saved address and position. Click it to open again. **Unpin tab** returns an open pin to the ordinary tab list; unpinning a closed pin removes it. Loaded, Sleeping or Closed states remain in tooltips and accessible labels, without status dots. Idle sleep defaults to 20 minutes and can be changed or disabled in **Settings → Layout & motion**. Active/split pages, media, captures, pending authentication and live popup openers, downloads and detected edits are protected; a page's beforeunload veto keeps it awake without an automatic discard prompt. Sleeping reloads the page when reopened, so it is not a promise to preserve arbitrary in-memory application state.
 
-**Customize the frame and Space.** Edit a Space to choose from twelve icons, primary/secondary colors, gradient balance, grain, glass opacity and blur. Changes preview before Save. Layout & motion offers Compact/Comfortable tab spacing, 4–20px page insets, square through rounded corners, and motion speed. The same frame settings drive shell and native pages; title controls, hidden-sidebar navigation and Find retain their required top space. System reduced-motion and reduced-transparency preferences take precedence.
+**Customize the frame and Space.** Edit a Space to choose from 38 searchable icons, primary/secondary colors, gradient balance, grain and window tint opacity. Native blur strength follows the operating system. Changes preview before Save. Layout & motion offers Compact/Comfortable tab spacing, 4–20px page insets, square through rounded corners, and motion speed. The same frame settings drive shell and native pages; title controls, hidden-sidebar navigation and Find retain their required top space. System reduced-motion and reduced-transparency preferences take precedence.
 
-The sidebar footer opens Library or creates a tab, folder or Space. Right-click a tab to pin it, rename it, move it to a folder/Space, or split it beside another page. **Alt + click** or a link's context menu opens Peek; **Escape** dismisses it. For optional AI, see [AI workflows and connection limits](docs/AI.md).
+The sidebar footer opens the Library destination chooser or creates a tab, folder or Space. Right-click a tab to pin it, rename it, move it to a folder/Space, or split it beside another page. **Shift + click**, **Alt + click** or a link's context menu opens Peek; **Escape** dismisses it. For optional AI, see [AI workflows and connection limits](docs/AI.md).
 
 ## The experience
 
@@ -245,7 +282,9 @@ Peek is part of the implemented browsing experience:
 - Keep previews in the originating profile so account and browsing contexts stay consistent.
 - Support keyboard navigation and accessible focus handling, including returning focus when the preview closes.
 
-Use **Alt + click** or a link's context menu to open Peek. Promotion preserves the live page's draft, scroll position, and navigation history while adding its current destination to browser History.
+Use **Shift + click**, **Alt + click** or a link's context menu to open Peek. Promotion preserves the live page's draft, scroll position, and navigation history while adding its current destination to browser History.
+
+Modifier-click Peek currently applies to links in the main page. Links inside embedded frames retain their native behavior; use their context menu's Peek action.
 
 ## Your extensions, across devices
 

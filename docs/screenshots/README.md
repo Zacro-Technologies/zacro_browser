@@ -1,6 +1,23 @@
 # Screenshot assets
 
-## Current 0.7 captures
+## 0.8 Windows captures
+
+The eight JPEGs under `0.8/` are intact native Computer window captures of the packaged 0.8 application on Windows 11, taken October 28, 2026 (JST). The isolated local showcase is prepared by `scripts/review-captures.cjs` using the same application controls and real Chromium documents as the desktop tests. Favorites load their original fixture PNG icons by actual navigation. No UI was composited, retouched or generated for these images.
+
+The package runtime for workspace, Library menu, Library, palette, Peek, dark and compact captures is **`4f486b52071f1627d00e115122c14be6dd4206a3`**. The test-only commit `7d56b0b` does not change that runtime. The Space customization image uses **`26bd670a27f52eaa617a522acb7bec8f5fd0311f`**, after the compact form and top-inset corrections. Per-file hashes and exact source revisions are recorded in [the capture manifest](0.8/manifest.json).
+
+Normal captures are 1285×804 image pixels; compact is 565×424. Requested content sizes were 1280×800 and 560×420 logical pixels; Windows accepted 1282×803 and 562×423 at DPR 1.5. Chrome is opaque for these layout captures. They do not demonstrate the desktop blur behind a translucent window.
+
+Computer initially returned **“failed to activate captured window”** for native input in both translucent and opaque launches, so gallery states were prepared with the instrumented own-application harness. Native input recovered in a subsequent packaged `33aa133` session: Library menu clicks, dragging both rails (sidebar 224→278px, panel 336→442px), and keyword `w` followed by Tab into Wikipedia search were checked through Computer. No search or provider request was submitted. These screenshots still establish layout, not physical Mac trackpad behavior or live Google/AI sign-in. Automated native interaction and material API tests are recorded separately in [validation](../VALIDATION.md).
+
+The new [eight-page PDF](../Zacro-0.8-Design-and-Feature-Guide.pdf) embeds one whole capture per page. Every page was rendered with Poppler and visually inspected; page count, image count and extracted text were verified. Historical captures and their prior input methods below retain their original provenance.
+
+
+## 0.8 macOS captures
+
+`0.8/macos-light.png` and `0.8/macos-dark.png` are original 1024×768 Apple silicon desktop captures from runtime **`33aa133e68179060327fe2bc4a6e55dc1c8d6b54`**, [run 40690651723](https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40690651723), artifact `12817567039` (`macos-arm64-validation`). The downloaded ZIP matched SHA-256 `672cb3bbe8b8d6db83f436ef69839047cf58cb015c64f66595b26cc687b1795e`. The exact entries `packaged-mac-home-light-desktop.png` and `packaged-mac-home-dark-desktop.png` were copied without recompression; per-image hashes are in the manifest. The package fixture explicitly opens the optional New Tab Page. Both images were visually inspected. These captures do not establish physical trackpad or Google acceptance.
+
+## Historical 0.7 captures
 
 Eight unretouched captures document the 0.7 interface. The six Windows JPEGs were captured with native Computer interactions on October 28, 2026 (JST), using disposable showcase profiles and local demo pages. Original capture bytes are preserved; the blue pointer highlight comes from the capture tool. No account credentials, personal browsing data or simulated AI answers are present.
 
