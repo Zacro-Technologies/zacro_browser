@@ -30,8 +30,13 @@ Zacro checks Google Chrome registrations in this order:
 On Windows the registry key's default `REG_SZ` value supplies the absolute
 manifest path. Zacro queries HKCU then HKLM in the 32-bit view, followed by
 HKCU then HKLM in the 64-bit view, stopping at the first registration. It uses
-`reg.exe` directly with fixed arguments. Windows executable paths may be
-relative to the manifest directory; macOS and Linux executable paths must be
+the built-in Windows PowerShell executable with a fixed, noninteractive,
+profile-free helper that calls `RegOpenKeyExW` and `RegQueryValueExW` using
+explicit registry views. The helper returns numeric Win32 results and base64
+UTF-16 data, so localized registry labels and console code pages are not parsed.
+Only `ERROR_FILE_NOT_FOUND` continues discovery. Invalid types or strings,
+access errors, unknown failures, and an unavailable or blocked PowerShell helper
+fail closed. Windows executable paths may be relative to the manifest directory; macOS and Linux executable paths must be
 absolute. A malformed existing registration is denied instead of falling
 through to a different host. Chromium, Chrome for Testing, other browsers,
 custom profile directories and arbitrary executable directories are not searched.
@@ -109,8 +114,10 @@ mode. The real broker still verifies the registered script, obtains approval,
 passes origin/parent arguments and exercises framed pipes, failures and child
 termination. These tests never start a personal installed native host.
 
-Injected discovery and registry reads cover registration boundaries for all
-supported OSes. Passing these protocol fixtures does not establish discovery
+Injected discovery and subprocess responses cover registration boundaries for
+all supported OSes. The Windows tests exercise the production reader's numeric
+status, type and Unicode decoding at its subprocess boundary, including absent,
+malformed and failed reads. Passing these protocol fixtures does not establish discovery
 and launch of an actual installed Windows host; that remains a native Windows
 acceptance check. Windows and Linux execution results must come from those
 platforms, separately from local macOS results.

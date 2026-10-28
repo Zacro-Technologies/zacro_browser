@@ -386,3 +386,131 @@ test('early cancellation bounds fail closed until the authenticated context is r
   b.dispose();
   assert.equal(b.cancellations.size, 0);
 });
+
+async function registryBoundary(replies) {
+  const calls = [];
+  const sandbox = {
+    module: { exports: {} },
+    process: { env: { SystemRoot: 'C:\\Windows' } },
+    Buffer,
+    TextDecoder,
+    setTimeout,
+    clearTimeout,
+    require: (name) =>
+      name === 'node:child_process'
+        ? {
+            ...require(name),
+            execFile(executable, args, options, callback) {
+              calls.push({
+                executable,
+                args: Array.from(args),
+                options,
+                script: Buffer.from(args.at(-1), 'base64').toString('utf16le'),
+              });
+              const reply = replies[calls.length - 1] || { stdout: 'OPEN:2' };
+              callback(reply.error || null, reply.stdout ?? '', reply.stderr || '');
+            },
+          }
+        : require(name),
+  };
+  vm.runInNewContext(
+    await fs.readFile(path.join(__dirname, '../src/main/extensions/native-messaging.cjs'), 'utf8'),
+    sandbox,
+  );
+  return {
+    calls,
+    read: sandbox.readWindowsRegistry,
+    resolver: sandbox.module.exports.createHostResolver({ platform: 'win32' }),
+  };
+}
+const registryString = (value) => 'QUERY:0:1:' + Buffer.from(value + '\0', 'utf16le').toString('base64');
+
+test('production Windows reader preserves non-ASCII REG_SZ through explicit Unicode APIs without localized labels', async () => {
+  const filename = "C:\\利用者\\Élodie\\主機 '資料'\\host.json";
+  const f = await registryBoundary([{ stdout: registryString(filename) }]);
+  const key = 'Software\\Google\\Chrome\\NativeMessagingHosts\\com.zacro.test';
+  assert.equal(await f.read('HKCU', 32, key), filename);
+  assert.equal(f.calls[0].executable, 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe');
+  assert.deepEqual(f.calls[0].args.slice(0, -1), [
+    '-NoLogo',
+    '-NoProfile',
+    '-NonInteractive',
+    '-EncodedCommand',
+  ]);
+  assert.equal(f.calls[0].options.shell, undefined);
+  assert.match(f.calls[0].script, /RegOpenKeyExW/);
+  assert.match(f.calls[0].script, /RegQueryValueExW\(registration, ""/);
+  assert.match(f.calls[0].script, /Read\(-2147483647, 32,/);
+  assert.ok(f.calls[0].script.includes(Buffer.from(key).toString('base64')));
+});
+
+for (const [label, reply] of [
+  ['REG_EXPAND_SZ', { stdout: 'QUERY:0:2:' + Buffer.from('C:\\host.json\0', 'utf16le').toString('base64') }],
+  ['empty REG_SZ', { stdout: registryString('') }],
+  [
+    'unterminated REG_SZ',
+    { stdout: 'QUERY:0:1:' + Buffer.from('C:\\host.json', 'utf16le').toString('base64') },
+  ],
+  ['invalid Unicode', { stdout: 'QUERY:0:1:' + Buffer.from([0, 0xd8, 0, 0]).toString('base64') }],
+  ['embedded NUL', { stdout: registryString('C:\\host.json\0other') }],
+  ['malformed transport', { stdout: 'QUERY:0:1:not-base64' }],
+  ['localized diagnostic', { stdout: '(既定) REG_SZ C:\\主機\\host.json' }],
+  ['access denied', { stdout: 'OPEN:5' }],
+  ['query access denied', { stdout: 'QUERY:5:0:' }],
+  ['unknown native failure', { stdout: 'OPEN:1018' }],
+  ['oversized value', { stdout: 'QUERY:234:0:' }],
+  [
+    'subprocess failure',
+    { error: Object.assign(new Error('blocked'), { code: 'EACCES' }), stdout: 'OPEN:2' },
+  ],
+  ['unexpected stderr', { stdout: 'OPEN:2', stderr: 'access failure' }],
+])
+  test(`production Windows reader fails closed for ${label} without trying another registration`, async () => {
+    const f = await registryBoundary([reply, { stdout: registryString('C:\\other.json') }]);
+    await assert.rejects(f.resolver('com.zacro.test', context()), /registry registration/);
+    assert.equal(f.calls.length, 1);
+  });
+
+test('production Windows reader continues only on absent keys/defaults, preserving hive and view order', async () => {
+  const f = await registryBoundary([
+    { stdout: 'OPEN:2' },
+    { stdout: 'QUERY:2:0:' },
+    { stdout: 'OPEN:2' },
+    { stdout: 'QUERY:2:0:' },
+  ]);
+  await assert.rejects(f.resolver('com.zacro.test', context()), /not found/);
+  assert.deepEqual(
+    f.calls.map((call) => call.script.match(/Read\((-\d+), (32|64),/).slice(1)),
+    [
+      ['-2147483647', '32'],
+      ['-2147483646', '32'],
+      ['-2147483647', '64'],
+      ['-2147483646', '64'],
+    ],
+  );
+});
+
+test('an empty injected Windows registration is present and cannot fall through either', async () => {
+  let reads = 0;
+  const resolve = createHostResolver({
+    platform: 'win32',
+    readRegistry: async () => {
+      reads++;
+      return '';
+    },
+  });
+  await assert.rejects(resolve('com.zacro.test', context()), /registered manifest path/);
+  assert.equal(reads, 1);
+});
+
+test('production Windows reader does not erase a leading Unicode character or try a later valid registration', async () => {
+  const value = '\ufeffC:\\zacro-missing-fixture\\主機.json';
+  const f = await registryBoundary([{ stdout: registryString(value) }]);
+  assert.equal(await f.read('HKCU', 32, 'Software\\test'), value);
+  const lookup = await registryBoundary([
+    { stdout: registryString(value) },
+    { stdout: registryString('C:\\other.json') },
+  ]);
+  await assert.rejects(lookup.resolver('com.zacro.test', context()), /registered manifest path/);
+  assert.equal(lookup.calls.length, 1);
+});

@@ -29,16 +29,84 @@ function hostRegistrationPaths(name, { platform = process.platform, home = os.ho
   return [];
 }
 function readWindowsRegistry(hive, view, key) {
-  return new Promise((resolve) => {
-    const executable = path.win32.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'reg.exe');
+  if (!['HKCU', 'HKLM'].includes(hive) || ![32, 64].includes(view) || typeof key !== 'string')
+    return Promise.reject(fail('registry query is invalid'));
+  // Use Win32 Unicode APIs and numeric results: managed OpenSubKey may return
+  // null for an unknown failure, and reg.exe formats localized display text.
+  // The fixed helper transports raw UTF-16 bytes as ASCII, without a code page.
+  const script = `
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [Text.Encoding]::ASCII
+try {
+  Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class ZacroRegistry {
+  [DllImport("advapi32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+  static extern int RegOpenKeyExW(IntPtr hive, string key, uint options, int access, out IntPtr result);
+  [DllImport("advapi32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+  static extern int RegQueryValueExW(IntPtr key, string name, IntPtr reserved, out uint type, [Out] byte[] data, ref uint size);
+  [DllImport("advapi32.dll", ExactSpelling = true)]
+  static extern int RegCloseKey(IntPtr key);
+  public static string Read(int hive, int view, string encodedKey) {
+    string key = System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(encodedKey));
+    IntPtr registration;
+    // KEY_QUERY_VALUE plus explicit KEY_WOW64_32KEY / KEY_WOW64_64KEY.
+    int status = RegOpenKeyExW(new IntPtr(hive), key, 0, 1 | (view == 32 ? 0x200 : 0x100), out registration);
+    if (status != 0) return "OPEN:" + status.ToString(System.Globalization.CultureInfo.InvariantCulture);
+    try {
+      byte[] data = new byte[65536];
+      uint size = (uint)data.Length;
+      uint type;
+      status = RegQueryValueExW(registration, "", IntPtr.Zero, out type, data, ref size);
+      return String.Format(System.Globalization.CultureInfo.InvariantCulture, "QUERY:{0}:{1}:{2}", status, status == 0 ? type : 0, status == 0 ? Convert.ToBase64String(data, 0, checked((int)size)) : "");
+    } finally { RegCloseKey(registration); }
+  }
+}
+'@
+  [Console]::Write([ZacroRegistry]::Read(${hive === 'HKCU' ? '-2147483647' : '-2147483646'}, ${view}, '${Buffer.from(key, 'utf8').toString('base64')}'))
+} catch {
+  [Console]::Write('ERROR')
+  exit 1
+}`;
+  return new Promise((resolve, reject) => {
+    const executable = path.win32.join(
+      process.env.SystemRoot || 'C:\\Windows',
+      'System32',
+      'WindowsPowerShell',
+      'v1.0',
+      'powershell.exe',
+    );
     execFile(
       executable,
-      ['query', `${hive}\\${key}`, '/ve', `/reg:${view}`],
-      { windowsHide: true, timeout: 3000, maxBuffer: 64 * 1024, encoding: 'utf8' },
-      (error, stdout) => {
-        if (error) return resolve(null);
-        const match = stdout.match(/^\s*(?:\(Default\)|<NO NAME>)\s+REG_SZ\s+(.+)\s*$/im);
-        resolve(match ? match[1].trim() : null);
+      [
+        '-NoLogo',
+        '-NoProfile',
+        '-NonInteractive',
+        '-EncodedCommand',
+        Buffer.from(script, 'utf16le').toString('base64'),
+      ],
+      { windowsHide: true, timeout: 5000, maxBuffer: 128 * 1024, encoding: 'utf8' },
+      (error, stdout, stderr) => {
+        if (error || stderr) return reject(fail('registry registration cannot be read'));
+        // ERROR_FILE_NOT_FOUND (2) is the only absent registration result.
+        if (stdout === 'OPEN:2' || stdout === 'QUERY:2:0:') return resolve(null);
+        const match = /^QUERY:0:1:([A-Za-z0-9+/]+={0,2})$/.exec(stdout);
+        if (!match || match[0] !== stdout)
+          return reject(fail('registry registration is invalid or unreadable'));
+        try {
+          const bytes = Buffer.from(match[1], 'base64');
+          if (bytes.toString('base64') !== match[1] || bytes.length > 65536 || bytes.length % 2 !== 0)
+            throw fail('registry registration is invalid');
+          const value = new TextDecoder('utf-16le', { fatal: true, ignoreBOM: true }).decode(bytes);
+          // REG_SZ must contain one terminated, nonempty string; never trim or
+          // expand a registered path or silently accept a different value type.
+          if (value.length < 2 || !value.endsWith('\0') || value.slice(0, -1).includes('\0'))
+            throw fail('registry registration is invalid');
+          resolve(value.slice(0, -1));
+        } catch {
+          reject(fail('registry registration is invalid'));
+        }
       },
     );
   });
@@ -86,7 +154,7 @@ function createHostResolver({
             view,
             `Software\\Google\\Chrome\\NativeMessagingHosts\\${name}`,
           );
-          if (result) {
+          if (result !== null) {
             paths.push(result);
             break registration;
           }

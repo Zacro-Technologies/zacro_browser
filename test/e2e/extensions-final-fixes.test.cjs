@@ -216,117 +216,185 @@ test(
   },
 );
 
+// Observe the actual page's native navigation promise without changing its
+// result or bypassing the user's beforeunload decision. Bounded trace data is
+// diagnostic only; reload, cancellation and document retirement stay real.
+async function traceReloads(app, id) {
+  await app.evaluate(({ webContents }, id) => {
+    const contents = webContents.fromId(id);
+    const trace = (globalThis.r8ReloadTrace = {
+      started: 0,
+      settled: 0,
+      pending: 0,
+      maxPending: 0,
+      events: [],
+    });
+    const record = (event, details = {}) => {
+      if (trace.events.length < 40) trace.events.push({ event, at: performance.now(), ...details });
+    };
+    const original = contents.loadURL.bind(contents);
+    contents.loadURL = (...args) => {
+      const call = ++trace.started;
+      trace.pending++;
+      trace.maxPending = Math.max(trace.maxPending, trace.pending);
+      record('load-start', { call });
+      const settle = (result, error) => {
+        trace.pending--;
+        trace.settled++;
+        record(error ? 'load-rejected' : 'load-resolved', { call, code: error?.code });
+        if (error) throw error;
+        return result;
+      };
+      try {
+        return original(...args).then(
+          (result) => settle(result),
+          (error) => settle(undefined, error),
+        );
+      } catch (error) {
+        return settle(undefined, error);
+      }
+    };
+    contents.on('will-prevent-unload', () =>
+      record('beforeunload', { decision: globalThis.reloadDecisions, prompts: globalThis.reloadPrompts }),
+    );
+    contents.on('did-start-navigation', (_event, _url, inPlace, main) => {
+      if (main) record('navigation-start', { inPlace });
+    });
+    contents.on('did-navigate', () => record('navigation-committed'));
+    contents.on('did-fail-load', (_event, code, _description, _url, main) => {
+      if (main) record('navigation-failed', { code });
+    });
+    contents.on('did-stop-loading', () => record('loading-stopped'));
+  }, id);
+  return () => app.evaluate(() => globalThis.r8ReloadTrace);
+}
+
 for (const remote of [false, true])
   test(
     `R8 ${remote ? 'remote' : 'local'} uninstall retains a visible document warning and respects draft cancellation`,
     { timeout: 60000 },
     async (t) => {
       const f = await fixture(t);
+      await expect(f.page.locator('#command-input')).toBeVisible();
+      await f.page.keyboard.press('Escape');
+      await expect(f.page.locator('#command-input')).toHaveCount(0);
       await f.install();
       await f.options();
       const draftId = await f.draft(),
         tabId = (await f.invoke('state:get')).activeTabId;
-      await f.app.evaluate(({ dialog }) => {
-        globalThis.extensionPrompts = 0;
-        dialog.showMessageBox = async () => {
-          globalThis.extensionPrompts++;
-          return { response: 0 };
-        };
-      });
-      if (remote) {
-        const password = 'Synthetic final fix account password';
-        await f.invoke('sync:configure', { endpoint: f.service.url });
-        await f.invoke('sync:register', { username: 'final.native', password, deviceName: 'Browser' });
-        const dataset = await f.invoke('sync:create-dataset', { name: 'Removal test' });
-        await f.invoke('sync:link', {
-          datasetId: dataset.id,
-          libraryChoice: 'merge-local',
-          settingsSync: false,
+      const trace = await traceReloads(f.app, draftId);
+      try {
+        await f.app.evaluate(({ dialog }) => {
+          globalThis.extensionPrompts = 0;
+          dialog.showMessageBox = async () => {
+            globalThis.extensionPrompts++;
+            return { response: 0 };
+          };
         });
-        await f.invoke('sync:now');
-        const request = async (route, body, token) => {
-          const r = await fetch(f.service.url + '/v1' + route, {
-            method: body ? 'POST' : 'GET',
-            headers: {
-              'content-type': 'application/json',
-              ...(token ? { authorization: `Bearer ${token}` } : {}),
-            },
-            body: body ? JSON.stringify(body) : undefined,
+        if (remote) {
+          const password = 'Synthetic final fix account password';
+          await f.invoke('sync:configure', { endpoint: f.service.url });
+          await f.invoke('sync:register', { username: 'final.native', password, deviceName: 'Browser' });
+          const dataset = await f.invoke('sync:create-dataset', { name: 'Removal test' });
+          await f.invoke('sync:link', {
+            datasetId: dataset.id,
+            libraryChoice: 'merge-local',
+            settingsSync: false,
           });
-          assert.equal(r.status, 200);
-          return r.json();
-        };
-        const session = await request('/sessions', {
-          username: 'final.native',
-          password,
-          deviceName: 'Other device',
-          platform: 'test',
-        });
-        const snapshot = await request(
-          `/datasets/${dataset.id}/snapshot?settings=0`,
-          null,
-          session.accessToken,
-        );
-        await request(
-          `/datasets/${dataset.id}/operations`,
-          {
-            epoch: dataset.epoch,
-            operations: [
-              {
-                id: randomUUID(),
-                kind: 'extension',
-                extensionId: f.id,
-                generation: snapshot.extensions[0].generation,
-                baseRevision: snapshot.cursor,
-                payload: { state: 'removed', source: { kind: 'web-store', id: f.id } },
+          await f.invoke('sync:now');
+          const request = async (route, body, token) => {
+            const r = await fetch(f.service.url + '/v1' + route, {
+              method: body ? 'POST' : 'GET',
+              headers: {
+                'content-type': 'application/json',
+                ...(token ? { authorization: `Bearer ${token}` } : {}),
               },
-            ],
-          },
-          session.accessToken,
-        );
-        await f.invoke('sync:now');
-      } else await f.invoke('extension:remove', { id: f.id });
-      await expect.poll(async () => (await f.invoke('state:get')).extensions.length).toBe(0);
-      assert.equal(await f.app.evaluate(() => globalThis.extensionPrompts), remote ? 0 : 1);
-      let state = await f.invoke('state:get');
-      assert.equal(
-        state.extensionPageWarnings?.some((w) => w.tabId === tabId),
-        true,
-      );
-      await expect(f.page.locator('[data-action="extension:reload-pages"]')).toBeVisible();
-      await f.page.locator('[data-action="extension:reload-pages"]').evaluate((button) => button.click());
-      await expect.poll(() => f.app.evaluate(() => globalThis.reloadPrompts)).toBe(1);
-      assert.equal(await f.document(draftId, 'document.querySelector("#draft").value'), 'keep my draft');
-      assert.equal((await f.invoke('state:get')).extensionPageWarnings.length, 1);
-      await f.page.locator('[data-key="library"]').evaluate((button) => button.click());
-      await f.page.locator('[data-key="panel-settings"]').evaluate((button) => button.click());
-      await f.page
-        .locator('summary')
-        .filter({ hasText: 'Extensions' })
-        .evaluate((summary) => summary.click());
-      await f.page.locator('[data-panel="extensions"]').evaluate((button) => button.click());
-      await expect(f.page.locator('#side-panel [data-action="extension:reload-pages"]')).toBeVisible();
-      if (process.env.ZACRO_FINAL_WARNING_SCREENSHOT && !remote) {
-        const image = await f.app.evaluate(async ({ BrowserWindow }) => {
-          const shell = BrowserWindow.getAllWindows().find((window) =>
-            window.webContents.getURL().startsWith('file:'),
+              body: body ? JSON.stringify(body) : undefined,
+            });
+            assert.equal(r.status, 200);
+            return r.json();
+          };
+          const session = await request('/sessions', {
+            username: 'final.native',
+            password,
+            deviceName: 'Other device',
+            platform: 'test',
+          });
+          const snapshot = await request(
+            `/datasets/${dataset.id}/snapshot?settings=0`,
+            null,
+            session.accessToken,
           );
-          return (await shell.capturePage()).toPNG().toString('base64');
+          await request(
+            `/datasets/${dataset.id}/operations`,
+            {
+              epoch: dataset.epoch,
+              operations: [
+                {
+                  id: randomUUID(),
+                  kind: 'extension',
+                  extensionId: f.id,
+                  generation: snapshot.extensions[0].generation,
+                  baseRevision: snapshot.cursor,
+                  payload: { state: 'removed', source: { kind: 'web-store', id: f.id } },
+                },
+              ],
+            },
+            session.accessToken,
+          );
+          await f.invoke('sync:now');
+        } else await f.invoke('extension:remove', { id: f.id });
+        await expect.poll(async () => (await f.invoke('state:get')).extensions.length).toBe(0);
+        assert.equal(await f.app.evaluate(() => globalThis.extensionPrompts), remote ? 0 : 1);
+        let state = await f.invoke('state:get');
+        assert.equal(
+          state.extensionPageWarnings?.some((w) => w.tabId === tabId),
+          true,
+        );
+        await expect(f.page.locator('[data-action="extension:reload-pages"]')).toBeVisible();
+        await f.page.locator('[data-action="extension:reload-pages"]').click();
+        await expect.poll(() => f.app.evaluate(() => globalThis.reloadPrompts)).toBe(1);
+        await expect.poll(async () => (await trace()).settled).toBe(1);
+        assert.equal((await trace()).pending, 0, 'Stay has finished cancelling the actual native load');
+        assert.equal(await f.document(draftId, 'document.querySelector("#draft").value'), 'keep my draft');
+        assert.equal((await f.invoke('state:get')).extensionPageWarnings.length, 1);
+        await f.page.locator('[data-key="library"]').click();
+        await f.page.locator('[data-key="panel-settings"]').click();
+        await f.page.locator('summary').filter({ hasText: 'Extensions' }).click();
+        await f.page.locator('[data-panel="extensions"]').click();
+        await expect(f.page.locator('#side-panel [data-action="extension:reload-pages"]')).toBeVisible();
+        if (process.env.ZACRO_FINAL_WARNING_SCREENSHOT && !remote) {
+          const image = await f.app.evaluate(async ({ BrowserWindow }) => {
+            const shell = BrowserWindow.getAllWindows().find((window) =>
+              window.webContents.getURL().startsWith('file:'),
+            );
+            return (await shell.capturePage()).toPNG().toString('base64');
+          });
+          await fs.writeFile(process.env.ZACRO_FINAL_WARNING_SCREENSHOT, Buffer.from(image, 'base64'));
+        }
+        await f.app.evaluate(() => {
+          globalThis.reloadDecisions = 1;
         });
-        await fs.writeFile(process.env.ZACRO_FINAL_WARNING_SCREENSHOT, Buffer.from(image, 'base64'));
+        await f.page.locator('#side-panel [data-action="extension:reload-pages"]').click();
+        await expect.poll(() => f.app.evaluate(() => globalThis.reloadPrompts)).toBe(2);
+        await expect.poll(async () => (await trace()).settled).toBe(2);
+        const completed = await trace();
+        assert.equal(completed.started, 2);
+        assert.equal(completed.maxPending, 1, 'the second user action follows cancellation settlement');
+        assert.deepEqual(
+          completed.events.filter((event) => event.event === 'beforeunload').map((event) => event.decision),
+          [0, 1],
+        );
+        assert.equal(completed.events.filter((event) => event.event === 'navigation-committed').length, 1);
+        await expect.poll(async () => (await f.invoke('state:get')).extensionPageWarnings.length).toBe(0);
+        assert.equal(
+          await f.document(draftId, 'document.documentElement.dataset.extensionInjected'),
+          undefined,
+        );
+        await expect(f.page.locator('[data-action="extension:reload-pages"]')).toHaveCount(0);
+      } finally {
+        t.diagnostic('R8 native reload trace: ' + JSON.stringify(await trace()));
       }
-      await f.app.evaluate(() => {
-        globalThis.reloadDecisions = 1;
-      });
-      await f.page
-        .locator('#side-panel [data-action="extension:reload-pages"]')
-        .evaluate((button) => button.click());
-      await expect.poll(async () => (await f.invoke('state:get')).extensionPageWarnings.length).toBe(0);
-      assert.equal(
-        await f.document(draftId, 'document.documentElement.dataset.extensionInjected'),
-        undefined,
-      );
-      await expect(f.page.locator('[data-action="extension:reload-pages"]')).toHaveCount(0);
     },
   );
 
