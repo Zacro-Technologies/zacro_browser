@@ -45,7 +45,7 @@ for (const [key, pin] of Object.entries(PINS)) {
     });
     await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
     const url = `http://127.0.0.1:${server.address().port}/`;
-    const env = { ...process.env, ZACRO_USER_DATA: directory };
+    const env = { ...process.env, ZACRO_USER_DATA: directory, ZACRO_SKIP_ONBOARDING: '1' };
     delete env.ELECTRON_RUN_AS_NODE;
     delete env.ZACRO_SYNC_URL;
     let app;
@@ -62,6 +62,9 @@ for (const [key, pin] of Object.entries(PINS)) {
     });
     const page = await app.firstWindow();
     await page.waitForFunction(() => !!window.zacro);
+    await expect(page.locator('#command-input')).toBeVisible();
+    await page.keyboard.press('Escape');
+    await expect(page.locator('#command-input')).toHaveCount(0);
     const invoke = (action, payload = {}) =>
       page.evaluate(([action, payload]) => window.zacro.invoke(action, payload), [action, payload]);
     await invoke('navigate', { url });

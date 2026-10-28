@@ -19,7 +19,7 @@ test(
     });
     await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
     const url = `http://127.0.0.1:${server.address().port}/example.json`;
-    const env = { ...process.env, ZACRO_USER_DATA: directory };
+    const env = { ...process.env, ZACRO_USER_DATA: directory, ZACRO_SKIP_ONBOARDING: '1' };
     delete env.ELECTRON_RUN_AS_NODE;
     delete env.ZACRO_SYNC_URL;
     const app = await electron.launch({ args: [path.resolve(__dirname, '../..')], env });
@@ -31,6 +31,9 @@ test(
     });
     const page = await app.firstWindow();
     await page.waitForFunction(() => !!window.zacro);
+    await expect(page.locator('#command-input')).toBeVisible();
+    await page.keyboard.press('Escape');
+    await expect(page.locator('#command-input')).toHaveCount(0);
     const invoke = (action, payload = {}) =>
       page.evaluate(([action, payload]) => window.zacro.invoke(action, payload), [action, payload]);
     // A newly published version is held for explicit compatibility review.
