@@ -50,10 +50,18 @@ load('electron').app.emit('open-url', { preventDefault() {} }, ${JSON.stringify(
   }
   app = await electron.launch({ args: [entry], env });
   let shell = await app.firstWindow();
+  // DOM readiness can precede main's loadFile continuation and win.show().
+  // Establish the native display precondition before focusing or capturing.
+  await expect
+    .poll(() => app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].isVisible()))
+    .toBe(true);
   await app.evaluate(({ app, BrowserWindow }) => {
     app.focus({ steal: true });
     BrowserWindow.getAllWindows()[0].focus();
   });
+  await expect
+    .poll(() => app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].isFocused()))
+    .toBe(true);
   await expect(shell.locator('[data-key="space-picker"]')).toBeVisible();
   if (await shell.locator('#command-input').count()) await shell.keyboard.press('Escape');
   const invoke = (action, payload = {}) =>
@@ -104,6 +112,23 @@ test('macOS uses native window chrome, menu conventions and keyboard navigation'
   const b = await launch(t);
   const results = path.resolve(__dirname, '../../test-results');
   await fs.mkdir(results, { recursive: true });
+  const captureShell = async (name) => {
+    await expect
+      .poll(() =>
+        b.app.evaluate(({ BrowserWindow }) => {
+          const window = BrowserWindow.getAllWindows()[0];
+          return window.isVisible() && window.isFocused() && !window.isMinimized();
+        }),
+      )
+      .toBe(true);
+    await b.shell.waitForFunction(() => document.visibilityState === 'visible');
+    // Cross two visible compositor opportunities, rather than asking CDP for
+    // the first surface before the native window has presented it.
+    await b.shell.evaluate(
+      () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))),
+    );
+    await b.shell.screenshot({ path: path.join(results, `mac-${process.arch}-${name}.png`) });
+  };
   await b.app.evaluate(({ BrowserWindow, Menu }) => {
     globalThis.macShortcutTrace = [];
     BrowserWindow.getAllWindows()[0].webContents.on('before-input-event', (event, input) => {
@@ -224,7 +249,7 @@ test('macOS uses native window chrome, menu conventions and keyboard navigation'
     assert.equal(native.menu.find((item) => item.id === 'close-window')?.accelerator, 'Command+Shift+W');
     assert((await b.shell.locator('[data-key="back"]').boundingBox()).x >= 88);
     assert((await b.shell.locator('.space-picker').boundingBox()).x < 30);
-    await b.shell.screenshot({ path: path.join(results, `mac-${process.arch}-shell.png`) });
+    await captureShell('shell');
     // Only capture the disposable CI desktop; local developers may have personal
     // windows visible. Native window controls are outside the shell screenshot.
     if (process.env.CI === 'true' && process.env.GITHUB_ACTIONS === 'true') {
@@ -239,11 +264,11 @@ test('macOS uses native window chrome, menu conventions and keyboard navigation'
 
     await nativeShortcut('S', ['meta']);
     assert((await b.shell.locator('[data-key="back"]').boundingBox()).x >= 88);
-    await b.shell.screenshot({ path: path.join(results, `mac-${process.arch}-sidebar-hidden.png`) });
+    await captureShell('sidebar-hidden');
     await nativeShortcut('S', ['meta']);
     await nativeShortcut(',', ['meta']);
     await expect(b.shell.locator('#panel-title')).toHaveText('Settings');
-    await b.shell.screenshot({ path: path.join(results, `mac-${process.arch}-settings.png`) });
+    await captureShell('settings');
     await b.shell.keyboard.press('Escape');
     await nativeShortcut('L', ['meta']);
     await expect(b.shell.locator('#command-input')).toBeFocused();
@@ -309,6 +334,15 @@ test('macOS uses native window chrome, menu conventions and keyboard navigation'
       .evaluate(({ BrowserWindow, webContents }) => ({
         inputs: globalThis.macShortcutTrace,
         shell: BrowserWindow.getAllWindows()[0]?.webContents.id,
+        window: BrowserWindow.getAllWindows()[0]
+          ? {
+              visible: BrowserWindow.getAllWindows()[0].isVisible(),
+              focused: BrowserWindow.getAllWindows()[0].isFocused(),
+              minimized: BrowserWindow.getAllWindows()[0].isMinimized(),
+              bounds: BrowserWindow.getAllWindows()[0].getBounds(),
+              contentBounds: BrowserWindow.getAllWindows()[0].getContentBounds(),
+            }
+          : null,
         focused: webContents.getFocusedWebContents()?.id,
         contents: webContents
           .getAllWebContents()
@@ -317,11 +351,20 @@ test('macOS uses native window chrome, menu conventions and keyboard navigation'
       .catch(() => null);
     const state = await b.state().catch(() => null);
     const domKeys = await b.shell.evaluate(() => window.macDOMKeys).catch(() => null);
+    const renderer = await b.shell
+      .evaluate(() => ({
+        visibility: document.visibilityState,
+        readyState: document.readyState,
+        width: innerWidth,
+        height: innerHeight,
+      }))
+      .catch(() => null);
     console.error(
       'Mac shortcut diagnostics:',
       JSON.stringify({
         diagnostics,
         domKeys,
+        renderer,
         activeTab: state?.activeTabId,
         tabs: state?.tabs,
         archive: state?.archive,

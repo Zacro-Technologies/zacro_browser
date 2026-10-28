@@ -302,19 +302,41 @@ for (const { mode, duringClose } of ['script', 'post'].flatMap((mode) =>
       `,
         previewURL,
       );
-      if (duringClose) {
-        await browser.shell.evaluate(() => {
-          window.__latePeekClose = window.zacro.invoke('peek:close');
-        });
-        assert.equal((await browser.state()).runtime.peek?.phase, 'closing');
+      try {
+        if (duringClose) {
+          // Hold the host animation at its first closing frame until Chromium
+          // delivers the popup. Several IPC trips must not race a real 168ms
+          // deadline on a busy runner. Real-clock motion has separate coverage;
+          // native timers, guest scripts and the popup/POST path remain live.
+          await browser.app.evaluate(() => {
+            const clock = globalThis.performance;
+            const descriptor = Object.getOwnPropertyDescriptor(clock, 'now');
+            const heldTime = clock.now();
+            globalThis.__latePeekClock = { clock, descriptor };
+            Object.defineProperty(clock, 'now', { configurable: true, value: () => heldTime });
+          });
+          await browser.shell.evaluate(() => {
+            window.__latePeekClose = window.zacro.invoke('peek:close');
+          });
+          assert.equal((await browser.state()).runtime.peek?.phase, 'closing');
+        }
+        await browser.guest('window.startLogin(); undefined', previewURL);
+        if (duringClose)
+          assert.equal(
+            await browser.shell.evaluate(() => window.__latePeekClose),
+            false,
+            'a live login callback interrupts the visual close before native beforeunload',
+          );
+      } finally {
+        if (duringClose)
+          await browser.app.evaluate(() => {
+            const saved = globalThis.__latePeekClock;
+            if (!saved) return;
+            if (saved.descriptor) Object.defineProperty(saved.clock, 'now', saved.descriptor);
+            else delete saved.clock.now;
+            delete globalThis.__latePeekClock;
+          });
       }
-      await browser.guest('window.startLogin(); undefined', previewURL);
-      if (duringClose)
-        assert.equal(
-          await browser.shell.evaluate(() => window.__latePeekClose),
-          false,
-          'a live login callback interrupts the visual close before native beforeunload',
-        );
       await expect.poll(() => browser.guest('document.readyState', identityURL)).toBe('complete');
       await expect.poll(async () => (await browser.state()).runtime.page.url).toBe(identityURL);
       const afterOpen = await browser.state();
