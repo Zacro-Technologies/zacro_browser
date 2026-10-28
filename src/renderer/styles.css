@@ -3367,7 +3367,7 @@ details.setting-section[open] > :not(summary) {
 }
 .theme-preview-tile {
   position: relative;
-  height: 88px;
+  height: 56px;
   overflow: hidden;
   display: flex;
   gap: 6px;
@@ -3388,8 +3388,8 @@ details.setting-section[open] > :not(summary) {
   width: 24%;
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  padding: 6px;
+  gap: 3px;
+  padding: 4px;
   border-radius: 5px;
   background: color-mix(in srgb, var(--chrome) var(--space-opacity), transparent);
   backdrop-filter: blur(var(--space-blur));
@@ -3400,7 +3400,7 @@ details.setting-section[open] > :not(summary) {
 }
 .theme-preview-sidebar i {
   width: 85%;
-  height: 4px;
+  height: 3px;
   border-radius: 2px;
   background: var(--muted);
   opacity: 0.25;
@@ -3949,13 +3949,13 @@ details.setting-section[open] > :not(summary) {
   white-space: nowrap;
 }
 .space-icon-options {
-  grid-template-columns: repeat(8, minmax(0, 1fr));
-  max-height: 176px;
+  grid-template-columns: repeat(10, minmax(0, 1fr));
+  max-height: 126px;
   overflow-y: auto;
   scrollbar-width: thin;
 }
 .space-icon-options button {
-  height: 34px;
+  height: 30px;
 }
 .space-icon-options button[hidden] {
   display: none;
