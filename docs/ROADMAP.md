@@ -1,6 +1,6 @@
 # Zacro implementation and commercial release gates
 
-This repository started with a vision and no implementation. The desktop implementation uses Electron 45's Chromium/Blink/V8 runtime. Windows 11 x64 has local and CI acceptance evidence. macOS 13+ is the target for native window/menu/lifecycle integration and separate Apple silicon and Intel builds; native macOS 15 CI has passed on both architectures, including packaged browsing and development DMG/ZIP generation. Physical Mac and signed/notarized release acceptance remain open. Linux remains a packaging target requiring implementation review and platform validation. The work below distinguishes runnable code from release acceptance. An unchecked gate is not a shipped capability. See [the Mac guide](MACOS.md).
+The 0.9 desktop implementation uses Electron 45's Chromium/Blink/V8 runtime. Windows 11 x64 has local and CI evidence at the revisions recorded in [validation](VALIDATION.md). macOS 13+ is the target for native window/menu/lifecycle integration and separate Apple silicon and Intel builds; native macOS 15 CI has passed on both architectures at recorded earlier revisions, including packaged browsing and development DMG/ZIP generation. Those results do not automatically validate later runtime changes. Physical Mac and signed/notarized release acceptance remain open. Linux remains a packaging target requiring implementation review and platform validation. The work below distinguishes runnable code from release acceptance. An unchecked gate is not a shipped capability. See [the Mac guide](MACOS.md).
 
 ## 1. A reliable local browser
 
@@ -10,9 +10,15 @@ Acceptance: real navigation, redirects, popup handling, keyboard actions, sessio
 
 Direct Google account sign-in is currently reported rejected by Google. Website identity acceptance requires a browser engine Google accepts, as well as a native FedCM account chooser and permission model, which the current Electron runtime does not provide. These are separate requirements; fixing popups or FedCM alone does not resolve embedded-browser rejection. Resolve that engine capability and validate real Google account and third-party Google sign-in flows before claiming Google support. Popup callbacks, persistent cookies and profile isolation have local regression coverage; they do not establish provider acceptance. See [website sign-in](WEB-SIGN-IN.md).
 
+Required identity-engine work: evaluate a maintained full Chromium browser integration with truthful browser identity, browser-owned account selection and permission handling, platform passkeys, and signed security updates. Preserve profile isolation, opener callbacks, form POSTs, unsaved-work decisions and session recovery during migration. A Chromium fork or OAuth client registration does not guarantee Google acceptance; direct login, third-party callbacks, account choice, sign-out and restart need real-provider validation.
+
 ## 2. The complete browsing interface
 
 Implement vertical tabs, favorites, folders, drag and keyboard organization, Space themes, navigation/command bar, split pages and Peek with promotion and focus return. Deliver downloads with pause/cancel/reveal and reversible renaming, history, bookmark imports, archive recovery, printing, find, zoom, developer tools and readable errors. No inert feature buttons.
+
+The current interface distinguishes profile-wide Favorites, saved Space pins and temporary Today tabs. Favorites use balanced rows and activate their existing page; saved pin reset is a separate action. The New tab row opens commands. Space colors and material settings follow swipe progress, including reversal and cancellation. The palette floats above a sharp, untinted page, Library shares the window material without a dividing line, and Peek coordinates native page and chrome motion. Window tint spans 0–100 and grain spans 0–200. These implementations still require the platform and accessibility acceptance below.
+
+Today auto-archive defaults to 12 hours, with an inherited default or per-profile choices including Never; existing choices remain intact. Clean loaded background tabs are eligible after draft/media/authentication/download checks and a silent beforeunload decision. Active and split pages, Favorites, pins and folder tabs remain protected. Archive recovery and race regressions must accompany this policy; safe unloading cannot promise to detect arbitrary website memory state.
 
 Acceptance: exercise every exposed control, keyboard-only flows, narrow/large windows, light/dark/high-contrast themes, reduced motion, native dialogs, long titles and empty/error states. Run actual Chromium integration tests and inspect rendered UI, rather than testing only reducer behavior.
 

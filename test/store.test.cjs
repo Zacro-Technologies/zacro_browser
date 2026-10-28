@@ -163,8 +163,8 @@ test('Space appearance and layout preferences round-trip with bounded untrusted 
   assert.deepEqual(clean.spaces[0].theme, {
     secondaryColor: '#b695b8',
     gradient: 0,
-    grain: 100,
-    opacity: 40,
+    grain: 200,
+    opacity: 2,
     blur: 32,
   });
   assert.equal(clean.settings.pinnedSleepMinutes, 20);
@@ -467,7 +467,7 @@ test('settings validate types and bounds and cannot introduce secrets or unknown
   assert.equal(store.state.settings.sidebarWidth, 380);
   assert.equal(store.state.settings.openSourcesLimit, 1);
   assert.equal(store.state.settings.apiKey, undefined);
-  assert.equal(store.state.settings.archiveAfterHours, 24);
+  assert.equal(store.state.settings.archiveAfterHours, 12);
   assert.equal(store.state.settings.restoreSession, true);
 });
 

@@ -1,5 +1,5 @@
 import { createSpaceGesture } from './space-gesture.js';
-import { deriveSpaceTheme } from './theme.js';
+import { blendSpaceAppearance, deriveSpaceTheme } from './theme.js';
 import '../core/site-search.js';
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -274,6 +274,103 @@ let spaceGesturePending = false;
 let spaceGestureFeedback = null;
 let spaceTransition = null;
 let spacePreview = null;
+let spaceAppearance = null;
+let spaceAppearanceSerial = 0;
+let spaceMaterialRequestSerial = 0;
+function presentedSpaceAppearance() {
+  return spaceAppearance
+    ? blendSpaceAppearance(spaceAppearance.from, spaceAppearance.to, spaceAppearance.progress)
+    : activeSpace();
+}
+function releaseSpaceAppearanceMaterial(record) {
+  if (!record?.materialToken) return;
+  const token = record.materialToken;
+  const serial = ++spaceMaterialRequestSerial;
+  record.materialToken = null;
+  void invoke('window:space-material-transition', { clear: true, token })
+    .then((material) => {
+      if (serial !== spaceMaterialRequestSerial || spaceAppearance || ui.themePreview || !state?.runtime)
+        return;
+      state.runtime.windowMaterial = material;
+      setTheme();
+    })
+    .catch(() => {});
+}
+function holdSpaceAppearanceMaterial(record) {
+  if (Math.min(record.from.theme?.opacity ?? 100, record.to.theme?.opacity ?? 100) >= 100) return;
+  const now = performance.now();
+  if (record.materialToken && now - record.materialRequestedAt < 1000) return;
+  record.materialToken ||= `space-${Date.now()}-${++spaceAppearanceSerial}`;
+  record.materialRequestedAt = now;
+  const token = record.materialToken;
+  const serial = ++spaceMaterialRequestSerial;
+  void invoke('window:space-material-transition', {
+    token,
+    fromId: record.fromId,
+    toId: record.toId,
+    opacity: Math.min(record.from.theme?.opacity ?? 100, record.to.theme?.opacity ?? 100),
+  })
+    .then((material) => {
+      if (
+        serial !== spaceMaterialRequestSerial ||
+        spaceAppearance !== record ||
+        record.materialToken !== token ||
+        !state?.runtime
+      )
+        return;
+      state.runtime.windowMaterial = material;
+      setTheme();
+    })
+    .catch(() => {});
+}
+function clearSpaceAppearance({ paint = true } = {}) {
+  const previous = spaceAppearance;
+  spaceAppearance = null;
+  if (previous) cancelAnimationFrame(previous.frame);
+  releaseSpaceAppearanceMaterial(previous);
+  if (paint && state) setTheme();
+}
+function beginSpaceAppearance(from, to, { fromId = from?.id, progress = 0, tracking = false } = {}) {
+  clearSpaceAppearance({ paint: false });
+  if (!from || !to || !fromId) return null;
+  spaceAppearance = {
+    from: structuredClone(from),
+    to: structuredClone(to),
+    fromId,
+    toId: to.id,
+    profileId: to.profileId,
+    progress,
+    tracking,
+  };
+  holdSpaceAppearanceMaterial(spaceAppearance);
+  return spaceAppearance;
+}
+function paintSpaceAppearance(record, progress) {
+  if (!record || spaceAppearance !== record) return;
+  record.progress = Math.max(0, Math.min(1, progress));
+  setTheme();
+}
+function settleSpaceAppearance(record, animation, destination) {
+  if (!record || spaceAppearance !== record) return;
+  cancelAnimationFrame(record.frame);
+  record.tracking = false;
+  const start = record.progress;
+  const finish = () => {
+    if (spaceAppearance !== record) return;
+    paintSpaceAppearance(record, destination);
+    clearSpaceAppearance();
+  };
+  if (!animation || reducedMotion.matches) return finish();
+  const sample = () => {
+    if (spaceAppearance !== record) return;
+    const progress = animation.effect?.getComputedTiming().progress;
+    if (progress !== null && progress !== undefined)
+      paintSpaceAppearance(record, start + (destination - start) * progress);
+    if (animation.playState === 'running' || animation.pending) record.frame = requestAnimationFrame(sample);
+  };
+  sample();
+  animation.finished.then(finish).catch(() => {});
+}
 const visibleSpacePage = () => $('#sidebar-content > .space-page');
 function clearSpacePreview() {
   const preview = $('#space-gesture-preview');
@@ -313,6 +410,7 @@ function resetSpaceFeedback({ animate = false, preserveTransition = false, durat
   const list = visibleSpacePage();
   const feedback = spaceGestureFeedback;
   const offset = feedback?.offset || 0;
+  let returnAnimation = null;
   spaceGestureFeedback = null;
   if (list) {
     list.style.removeProperty('transform');
@@ -320,7 +418,11 @@ function resetSpaceFeedback({ animate = false, preserveTransition = false, durat
     list.style.removeProperty('visibility');
     list.classList.remove('gesture-tracking');
     if (animate && offset)
-      motion(list, [{ transform: `translateX(${offset}px)` }, { transform: 'translateX(0)' }], duration);
+      returnAnimation = motion(
+        list,
+        [{ transform: `translateX(${offset}px)` }, { transform: 'translateX(0)' }],
+        duration,
+      );
   }
   const preview = spacePreview;
   if (animate && offset && preview && !reducedMotion.matches) {
@@ -336,7 +438,11 @@ function resetSpaceFeedback({ animate = false, preserveTransition = false, durat
       })
       .catch(() => {});
   } else clearSpacePreview();
-  if (!preserveTransition) clearSpaceTransition();
+  if (!preserveTransition) {
+    clearSpaceTransition();
+    if (animate && offset) settleSpaceAppearance(spaceAppearance, returnAnimation, 0);
+    else clearSpaceAppearance();
+  }
 }
 function interruptSpaceScroll({ preserveTransition = false } = {}) {
   clearTimeout(spaceGestureTimer);
@@ -357,6 +463,16 @@ function paintSpaceFeedback(result) {
   }
   const spaces = state.spaces.filter((space) => space.profileId === activeProfile()?.id);
   const next = spaces[result.targetIndex];
+  if (next) {
+    if (
+      !spaceAppearance?.tracking ||
+      spaceAppearance.fromId !== state.activeSpaceId ||
+      spaceAppearance.toId !== next.id
+    )
+      beginSpaceAppearance(activeSpace(), next, { tracking: true });
+    holdSpaceAppearanceMaterial(spaceAppearance);
+    paintSpaceAppearance(spaceAppearance, Math.min(1, Math.abs(result.offset) / result.travel));
+  } else clearSpaceAppearance();
   const preview = $('#space-gesture-preview');
   if (!preview || !list) return;
   if (!next) return clearSpacePreview();
@@ -390,6 +506,7 @@ function prepareSpaceTransition(nextId, result, gesture = false) {
     fromSpaceId: ui.sidebarSpaceId,
     toSpaceId: nextId,
     profileId: activeProfile()?.id,
+    appearance: spaceAppearance?.toId === nextId ? spaceAppearance : null,
   };
   spaceTransition = record;
   if (!list || reducedMotion.matches) return record;
@@ -454,6 +571,7 @@ function animateSpaceTransition(
       record.duration,
     );
   const animation = record.incoming;
+  settleSpaceAppearance(record.appearance, animation, 1);
   if (!animation) clearSpaceTransition();
   else animation.finished.then(() => finishSpaceTransition(record, animation)).catch(() => {});
 }
@@ -759,7 +877,14 @@ function setTheme() {
   const theme = state.settings.theme;
   const dark = theme === 'dark' || (theme === 'system' && matchMedia('(prefers-color-scheme: dark)').matches);
   document.documentElement.dataset.theme = dark ? 'dark' : 'light';
-  const space = ui.themePreview || activeSpace();
+  if (
+    spaceAppearance &&
+    (spaceAppearance.profileId !== activeProfile()?.id ||
+      ![spaceAppearance.fromId, spaceAppearance.toId].includes(state.activeSpaceId) ||
+      !state.spaces.some((item) => item.id === spaceAppearance.toId))
+  )
+    clearSpaceAppearance({ paint: false });
+  const space = ui.themePreview || presentedSpaceAppearance();
   const base = space?.color;
   const material = space?.theme || {};
   const root = document.documentElement;
@@ -792,8 +917,6 @@ function setTheme() {
   root.dataset.windowMaterial = nativeMaterial?.enabled ? nativeMaterial.type : 'opaque';
   root.style.setProperty('--space-opacity', `${nativeMaterial?.enabled ? (material.opacity ?? 100) : 100}%`);
   root.style.setProperty('--space-blur', '0px');
-  const materialHint = $('#window-material-hint');
-  if (materialHint) materialHint.textContent = windowMaterialHint(nativeMaterial);
   for (const [name, duration] of [
     ['fast', 100],
     ['base', 160],
@@ -804,15 +927,6 @@ function setTheme() {
     '--space-color',
     /^#[\da-f]{6}$/i.test(base || '') ? base : '#9d4460',
   );
-}
-function windowMaterialHint(material = state.runtime?.windowMaterial) {
-  if (material?.reason === 'reduced-transparency')
-    return 'Your system’s Reduce Transparency setting keeps the window opaque.';
-  if (material?.reason === 'high-contrast') return 'Your system’s contrast setting keeps the window opaque.';
-  if (material?.reason === 'native-error')
-    return 'Window blur is unavailable in this session. Your tint preference is kept.';
-  if (!material?.supported) return 'Window blur is available on macOS and Windows 11 22H2 or later.';
-  return 'Below 100%, system blur reveals windows behind Zacro. Text and pages stay sharp.';
 }
 function previewWindowMaterial(opacity) {
   const serial = (ui.materialPreviewSerial = (ui.materialPreviewSerial || 0) + 1);
@@ -831,8 +945,17 @@ function applyState(next) {
   if (!next?.profiles || !next?.tabs) return;
   const previousProfile = activeProfile()?.id;
   const previousSpace = state?.activeSpaceId;
+  const previousAppearance = presentedSpaceAppearance();
   const previousTab = state?.activeTabId;
   state = next;
+  if (previousProfile && previousProfile !== activeProfile()?.id) clearSpaceAppearance({ paint: false });
+  else if (
+    previousSpace &&
+    previousSpace !== state.activeSpaceId &&
+    !ui.themePreview &&
+    !(spaceTransition?.toSpaceId === state.activeSpaceId && spaceAppearance?.toId === state.activeSpaceId)
+  )
+    beginSpaceAppearance(previousAppearance, activeSpace(), { fromId: previousSpace });
   if (previousSpace !== state.activeSpaceId || previousProfile !== activeProfile()?.id) {
     closeLibraryChooser();
     cancelRailResize();
@@ -1049,15 +1172,22 @@ function renderSpacePage(space) {
     const page = state.runtime?.pages?.[tab.id];
     const label = tabLabel(tab);
     const status = tab.closed ? 'Closed' : page?.loaded ? 'Loaded' : 'Sleeping';
+    const away = tab.pinned && !tab.closed && tab.pinnedUrl && tab.url !== tab.pinnedUrl;
     const glyph = page?.loading ? '<span class="spinner"></span>' : favicon(tab.pinnedUrl || tab.url, tab.id);
-    return `<div class="tab-row ${tab.pinned ? 'pinned-row' : ''} ${tab.id === selectedTabId && !tab.closed ? 'active' : ''}" draggable="true" data-tab-id="${esc(tab.id)}" data-drop-tab="${esc(tab.id)}">${tab.pinned ? `<button type="button" class="tab-pin-reset" data-action="tab:reset-pin" data-id="${esc(tab.id)}" tabindex="-1" aria-label="Reset ${esc(label)} to saved page" title="Reset to ${esc(tab.pinnedUrl || tab.url)}">${glyph}</button>` : ''}<button type="button" class="tab-main" data-action="tab:activate" data-id="${esc(tab.id)}" data-key="tab-${esc(tab.id)}" ${tab.id === selectedTabId && !tab.closed ? 'aria-current="page"' : ''} title="${esc(label)} — ${esc(tab.url)}${tab.pinned ? ' · ' + status : ''}">${tab.pinned ? '' : glyph}<span class="title">${esc(label || 'New tab')}</span>${state.runtime?.splitTabId === tab.id ? icon('split') : ''}</button>${page?.audible || page?.muted ? button('tab:mute', page.muted ? 'Unmute tab' : 'Mute tab', page.muted ? 'muted' : 'volume', `data-id="${esc(tab.id)}"`, 'tab-audio') : ''}${button('tab:close', `Close ${label || 'tab'}${tab.pinned ? ' · keep pin' : ''}`, 'close', `data-id="${esc(tab.id)}" data-key="close-${esc(tab.id)}"`, 'tab-close')}</div>`;
+    return `<div class="tab-row ${tab.pinned ? 'pinned-row' : ''} ${away ? 'pin-navigated' : ''} ${tab.id === selectedTabId && !tab.closed ? 'active' : ''}" draggable="true" data-tab-id="${esc(tab.id)}" data-drop-tab="${esc(tab.id)}">${tab.pinned ? `<button type="button" class="tab-pin-reset" data-action="tab:reset-pin" data-id="${esc(tab.id)}" tabindex="-1" aria-label="Reset ${esc(label)} to saved page" title="Reset to ${esc(tab.pinnedUrl || tab.url)}">${glyph}<span class="pin-reset-symbol">${icon('back')}</span></button>` : ''}<button type="button" class="tab-main" data-action="tab:activate" data-id="${esc(tab.id)}" data-key="tab-${esc(tab.id)}" ${tab.id === selectedTabId && !tab.closed ? 'aria-current="page"' : ''} title="${esc(label)} — ${esc(tab.url)}${tab.pinned ? ' · ' + status + (away ? ' · Away from saved page' : '') : ''}">${tab.pinned ? '' : glyph}${away ? '<span class="pin-away" aria-hidden="true">/</span>' : ''}<span class="title">${esc(label || 'New tab')}</span>${state.runtime?.splitTabId === tab.id ? icon('split') : ''}</button>${page?.audible || page?.muted ? button('tab:mute', page.muted ? 'Unmute tab' : 'Mute tab', page.muted ? 'muted' : 'volume', `data-id="${esc(tab.id)}"`, 'tab-audio') : ''}${button('tab:close', `Close ${label || 'tab'}${tab.pinned ? ' · keep pin' : ''}`, 'close', `data-id="${esc(tab.id)}" data-key="close-${esc(tab.id)}"`, 'tab-close')}</div>`;
   };
+  // Balance every row, rather than leaving unused favorite slots. Twelve grid
+  // tracks divide evenly into one, two, three or four tiles.
+  const favoriteRows = Math.max(1, Math.ceil(favorites.length / 4));
+  const rowSize = Math.floor(favorites.length / favoriteRows);
+  const fullerRows = favorites.length % favoriteRows;
   const favoriteTiles = favorites
-    .map((tab) => {
+    .map((tab, index) => {
+      const columns = index < fullerRows * (rowSize + 1) ? rowSize + 1 : rowSize;
       const page = state.runtime?.pages?.[tab.id];
       const status = tab.closed ? 'Closed' : page?.loaded ? 'Loaded' : 'Sleeping';
       const label = tabLabel(tab);
-      return `<button type="button" class="favorite ${tab.id === selectedTabId && !tab.closed ? 'active' : ''} ${status.toLowerCase()}" draggable="true" data-tab-id="${esc(tab.id)}" data-drop-tab="${esc(tab.id)}" data-action="tab:reset-pin" data-id="${esc(tab.id)}" data-key="pin-${esc(tab.id)}" ${tab.id === selectedTabId && !tab.closed ? 'aria-current="page"' : ''} aria-label="${esc(label)} — ${status}" title="${esc(label)} — ${status}\n${esc(tab.pinnedUrl || tab.url)}">${favicon(tab.pinnedUrl || tab.url, tab.id)}</button>`;
+      return `<button type="button" data-columns="${columns}" class="favorite ${tab.id === selectedTabId && !tab.closed ? 'active' : ''} ${status.toLowerCase()}" draggable="true" data-tab-id="${esc(tab.id)}" data-drop-tab="${esc(tab.id)}" data-action="tab:activate" data-id="${esc(tab.id)}" data-key="pin-${esc(tab.id)}" ${tab.id === selectedTabId && !tab.closed ? 'aria-current="page"' : ''} aria-label="${esc(label)} — ${status}" title="${esc(label)} — ${status}\n${esc(tab.pinnedUrl || tab.url)}">${favicon(tab.pinnedUrl || tab.url, tab.id)}</button>`;
     })
     .join('');
   return `<div class="favorites ${favorites.length ? '' : 'favorites-empty'}" aria-label="Favorites" data-drop-favorites>${favoriteTiles || '<span class="pin-drop-hint">Drop to favorite</span>'}</div><div class="tabs-scroll">
@@ -1077,7 +1207,7 @@ function renderSpacePage(space) {
           }</div>`,
       )
       .join('')}${pins.map(tabRow).join('')}<span class="pin-drop-hint">Drop to pin in this Space</span></div>
-    <div class="today-divider" aria-hidden="true"></div><div class="loose-tabs" data-drop-folder="" aria-label="Today tabs">${loose.map(tabRow).join('')}</div></div>`;
+    <div class="today-divider" aria-hidden="true"></div><button type="button" class="new-tab today-new-tab" data-action="ui:new-tab" data-key="today-new-tab">${icon('plus')}<span>New tab</span><kbd>${shortcutFor('command-palette', 'Mod+T')}</kbd></button><div class="loose-tabs" data-drop-folder="" aria-label="Today tabs">${loose.map(tabRow).join('')}</div></div>`;
 }
 function renderSidebar() {
   const space = activeSpace();
@@ -1251,13 +1381,22 @@ function renderWorkspace() {
   } else bar?.remove();
   const peek = state.runtime?.peek;
   $('#peek').hidden = !peek;
-  const peekSignature = JSON.stringify(peek);
+  const peekSignature = JSON.stringify(peek && [peek.id, peek.url, peek.title, peek.error]);
   if (peek && peekSignature !== ui.peekSignature) {
     $('#peek').innerHTML =
       `<div class="peek-bar"><span class="peek-label">Peek</span><span class="peek-url">${esc(peek.title || peek.url)}</span>${button('peek:promote', 'Open preview as a tab', 'external')}${button('peek:close', 'Close preview (Escape)', 'close', 'data-key="peek-close"')}</div><div class="peek-body">${peek.error ? `<div class="error-card"><div class="error-symbol">${icon('globe')}</div><h2>This preview couldn’t be loaded.</h2><p>${esc(peek.error.description || peek.error.message || 'Check the address and your connection.')}</p>${primary('reload', 'Try again', 'reload')}</div>` : ''}</div>`;
-    if (!ui.peekSignature) motion($('.peek-bar'), [{ opacity: 0.55 }, { opacity: 1 }], 120);
   }
+  if (peek) paintPeekMotion(peek);
   ui.peekSignature = peekSignature;
+}
+function paintPeekMotion(frame) {
+  const peek = state.runtime?.peek;
+  if (!peek || !frame || frame.id !== peek.id) return;
+  const offset = reducedMotion.matches ? 0 : Math.round(Math.max(0, Math.min(16, Number(frame.offset) || 0)));
+  const progress = reducedMotion.matches ? 1 : Math.max(0, Math.min(1, frame.progress ?? 1));
+  $('#peek').style.setProperty('--peek-offset', `${offset}px`);
+  $('#peek').style.setProperty('--peek-progress', String(progress));
+  $('#peek').dataset.phase = frame.phase || 'open';
 }
 function renderHome() {
   const draft = $('#home-query')?.value || '';
@@ -1409,6 +1548,7 @@ function syncLayout() {
     contentTop,
     overlay: Boolean(ui.dialog),
     peek: Boolean(state.runtime?.peek),
+    reducedMotion: reducedMotion.matches,
   };
   const signature = JSON.stringify(layout);
   if (signature !== lastLayout) {
@@ -1898,6 +2038,28 @@ function renderCustomization() {
     [120, 'After 2 hours'],
   ])}<p class="provider-note">Active pages, media and unsaved edits stay awake.</p></details>`;
 }
+function archiveSelect(profile) {
+  if (!profile) return '';
+  const primary =
+    state.profiles.find((item) => item.id === 'default' && !item.private) ||
+    state.profiles.find((item) => !item.private);
+  const inherited = profile.id !== primary?.id;
+  const values = [
+    [12, 'After 12 hours'],
+    [24, 'After 24 hours'],
+    [72, 'After 3 days'],
+    [168, 'After 7 days'],
+    [720, 'After 30 days'],
+    [0, 'Never'],
+  ];
+  const current = inherited ? (profile.archiveAfterHours ?? 'inherit') : state.settings.archiveAfterHours;
+  if (inherited) {
+    const hours = state.settings.archiveAfterHours;
+    values.unshift(['inherit', `Use default · ${hours ? `${hours} hours` : 'Never'}`]);
+  }
+  if (!values.some(([value]) => value === current)) values.push([current, `After ${current} hours`]);
+  return `<label class="setting-field"><span>Archive Today tabs</span><select data-profile-archive="${esc(profile.id)}" aria-label="Archive Today tabs for ${esc(profile.name)}">${values.map(([value, label]) => `<option value="${value}" ${value === current ? 'selected' : ''}>${label}</option>`).join('')}</select></label>`;
+}
 function renderSettings() {
   const settings = state.settings;
   const profile = activeProfile();
@@ -1918,25 +2080,14 @@ function renderSettings() {
     ['google', 'Google'],
     ['bing', 'Bing'],
     ['brave', 'Brave Search'],
-  ])}${settingSelect('archiveAfterHours', 'Archive inactive tabs', [
-    [0, 'Never'],
-    [12, 'After 12 hours'],
-    [24, 'After 24 hours'],
-    [72, 'After 3 days'],
-    [168, 'After 7 days'],
-    [720, 'After 30 days'],
-  ])}<p class="provider-note">Live pages stay open to protect unsaved work.</p>${settingSelect(
-    'sidebarWidth',
-    'Sidebar width',
-    [
-      [224, 'Compact'],
-      [260, 'Comfortable'],
-      [300, 'Spacious'],
-      ...(![224, 260, 300].includes(settings.sidebarWidth)
-        ? [[settings.sidebarWidth, `${settings.sidebarWidth}px`]]
-        : []),
-    ],
-  )}<label class="setting-toggle"><span>Restore session</span><input type="checkbox" data-setting="restoreSession" ${settings.restoreSession ? 'checked' : ''}></label><div class="setting-actions">${secondary('ui:edit-space', 'Customize Space', 'edit')}${secondary('ui:profiles', 'Profiles', 'user')}${secondary('ui:shortcuts', 'Shortcuts', 'keyboard')}</div></section><details class="setting-section" id="ai-settings"><summary>AI providers</summary>${renderAIConnection()}${settingSelect(
+  ])}${archiveSelect(profile)}${settingSelect('sidebarWidth', 'Sidebar width', [
+    [224, 'Compact'],
+    [260, 'Comfortable'],
+    [300, 'Spacious'],
+    ...(![224, 260, 300].includes(settings.sidebarWidth)
+      ? [[settings.sidebarWidth, `${settings.sidebarWidth}px`]]
+      : []),
+  ])}<label class="setting-toggle"><span>Restore session</span><input type="checkbox" data-setting="restoreSession" ${settings.restoreSession ? 'checked' : ''}></label><div class="setting-actions">${secondary('ui:edit-space', 'Customize Space', 'edit')}${secondary('ui:profiles', 'Profiles', 'user')}${secondary('ui:shortcuts', 'Shortcuts', 'keyboard')}</div></section><details class="setting-section" id="ai-settings"><summary>AI providers</summary>${renderAIConnection()}${settingSelect(
     'openSourcesLimit',
     'Pages to open from each answer',
     [
@@ -2428,7 +2579,7 @@ function showSpaceForm(id) {
             activeProfile()?.id,
           )}</select></label>`
         : '') +
-      `<input type="hidden" name="space-icon" value="${esc(space?.icon || 'circle')}"><input id="space-icon-search" type="search" placeholder="Find an icon" aria-label="Find a Space icon" autocomplete="off"><div class="space-icon-options" role="group" aria-label="Space icon">${spaceIcons.map((name) => `<button type="button" data-action="ui:space-icon" data-icon="${name}" aria-label="${name} icon" title="${name}" aria-pressed="${(space?.icon || 'circle') === name}">${icon(name)}</button>`).join('')}</div><div class="theme-preview-tile" aria-hidden="true"><div class="theme-preview-sidebar">${icon(space?.icon || 'circle')}<i></i><i></i><i></i></div><div class="theme-preview-page"></div><span>Preview</span></div><div class="field"><span>Space color</span><div class="color-options" role="group" aria-label="Space color">${colors.map(([name, color]) => `<button type="button" class="color-option swatch-${name} ${ui.selectedColor === color ? 'selected' : ''}" data-action="ui:color" data-color="${color}" aria-label="${name}" aria-pressed="${ui.selectedColor === color}"></button>`).join('')}</div></div><div class="theme-colors"><label>Primary<input type="color" name="theme-color" value="${ui.selectedColor}" aria-label="Primary color"></label><label>Secondary<input type="color" name="theme-secondaryColor" value="${theme.secondaryColor}" aria-label="Secondary color"></label></div><details class="theme-material"><summary>Gradient & texture</summary>${range('gradient', 'Color blend', 0, 100)}${range('grain', 'Grain', 0, 100)}</details><details class="theme-material"><summary>Glass & transparency</summary>${range('opacity', 'Window tint opacity', 40, 100)}<input type="hidden" name="theme-blur" value="${theme.blur}"><p class="provider-note" id="window-material-hint">${esc(windowMaterialHint())}</p></details>`,
+      `<input type="hidden" name="space-icon" value="${esc(space?.icon || 'circle')}"><input id="space-icon-search" type="search" placeholder="Find an icon" aria-label="Find a Space icon" autocomplete="off"><div class="space-icon-options" role="group" aria-label="Space icon">${spaceIcons.map((name) => `<button type="button" data-action="ui:space-icon" data-icon="${name}" aria-label="${name} icon" title="${name}" aria-pressed="${(space?.icon || 'circle') === name}">${icon(name)}</button>`).join('')}</div><div class="theme-preview-tile" aria-hidden="true"><div class="theme-preview-sidebar">${icon(space?.icon || 'circle')}<i></i><i></i><i></i></div><div class="theme-preview-page"></div><span>Preview</span></div><div class="field"><span>Space color</span><div class="color-options" role="group" aria-label="Space color">${colors.map(([name, color]) => `<button type="button" class="color-option swatch-${name} ${ui.selectedColor === color ? 'selected' : ''}" data-action="ui:color" data-color="${color}" aria-label="${name}" aria-pressed="${ui.selectedColor === color}"></button>`).join('')}</div></div><div class="theme-colors"><label>Primary<input type="color" name="theme-color" value="${ui.selectedColor}" aria-label="Primary color"></label><label>Secondary<input type="color" name="theme-secondaryColor" value="${theme.secondaryColor}" aria-label="Secondary color"></label></div><details class="theme-material"><summary>Gradient & texture</summary>${range('gradient', 'Color blend', 0, 100)}${range('grain', 'Grain', 0, 200)}</details><details class="theme-material"><summary>Glass & transparency</summary>${range('opacity', 'Window tint opacity', 0, 100)}<input type="hidden" name="theme-blur" value="${theme.blur}"></details>`,
     space ? 'Save changes' : 'Create Space',
     async (data, context) => {
       if (!context.isCurrent()) return;
@@ -2493,7 +2644,7 @@ document.addEventListener('input', (event) => {
 function showProfiles() {
   openDialog(
     'profiles',
-    `<div class="dialog-header"><h2>Browser profiles</h2>${button('ui:dialog-close', 'Close', 'close')}</div><div class="dialog-body"><p class="dialog-description">Each profile keeps its accounts, cookies, history, and extensions separate.</p>${state.profiles.map((profile) => `<div class="profile-option"><div class="row"><span class="profile-avatar">${profile.private ? icon('shield') : esc(profile.name.slice(0, 1).toUpperCase())}</span><div class="grow"><strong>${esc(profile.name)}</strong><div class="profile-caption">${profile.private ? 'Private · cleared when closed' : 'Persistent profile'} · ${state.spaces.filter((s) => s.profileId === profile.id).length} Spaces</div></div>${button('ui:delete-profile', 'Delete profile', 'trash', `data-id="${esc(profile.id)}"`)}</div></div>`).join('')}<div class="space-manager-actions">${primary('ui:new-profile', 'New profile', 'plus')}${secondary('ui:new-private', 'Private session', 'shield')}</div></div>`,
+    `<div class="dialog-header"><h2>Browser profiles</h2>${button('ui:dialog-close', 'Close', 'close')}</div><div class="dialog-body"><p class="dialog-description">Each profile keeps its accounts, cookies, history, and extensions separate.</p>${state.profiles.map((profile) => `<div class="profile-option"><div class="row"><span class="profile-avatar">${profile.private ? icon('shield') : esc(profile.name.slice(0, 1).toUpperCase())}</span><div class="grow"><strong>${esc(profile.name)}</strong><div class="profile-caption">${profile.private ? 'Private · cleared when closed' : 'Persistent profile'} · ${state.spaces.filter((s) => s.profileId === profile.id).length} Spaces</div></div>${button('ui:delete-profile', 'Delete profile', 'trash', `data-id="${esc(profile.id)}"`)}</div>${archiveSelect(profile)}</div>`).join('')}<div class="space-manager-actions">${primary('ui:new-profile', 'New profile', 'plus')}${secondary('ui:new-private', 'Private session', 'shield')}</div></div>`,
     { title: 'Browser profiles' },
   );
 }
@@ -4124,6 +4275,9 @@ function handleEvent(event) {
     case 'page:backdrop':
       showPageBackdrop(event.frames);
       break;
+    case 'peek:motion':
+      paintPeekMotion(event);
+      break;
     case 'page:focused':
       closeLibraryChooser();
       break;
@@ -5083,7 +5237,24 @@ document.addEventListener('input', (event) => {
 });
 document.addEventListener('change', (event) => {
   const target = event.target;
-  if (target.dataset.setting) {
+  if (target.dataset.profileArchive) {
+    const value = target.value === 'inherit' ? null : Number(target.value);
+    safely(
+      invoke('profile:update', {
+        id: target.dataset.profileArchive,
+        values: { archiveAfterHours: value },
+      }).then(async () => {
+        applyState(await invoke('state:get'));
+        if (ui.dialog === 'profiles') {
+          for (const select of $$('[data-profile-archive]')) {
+            const option = select.querySelector('option[value="inherit"]');
+            const hours = state.settings.archiveAfterHours;
+            if (option) option.textContent = `Use default · ${hours ? `${hours} hours` : 'Never'}`;
+          }
+        }
+      }),
+    );
+  } else if (target.dataset.setting) {
     let value = target.type === 'checkbox' ? target.checked : target.value;
     if (
       [

@@ -698,6 +698,7 @@ test(
     assert.equal((await b.state()).tabs.find((item) => item.id === tab.id).pinned, true);
     await b.invoke('space:delete', { id: b.third });
     await b.invoke('space:delete', { id: b.first });
+    await expect(b.shell.locator('.space-dot')).toHaveCount(1);
     await second.click({ button: 'right' });
     await expect(b.shell.locator('[data-action="ui:delete-space"]')).toBeDisabled();
     await b.shell.keyboard.press('Escape');
@@ -800,5 +801,142 @@ test(
     assert(incoming.duration >= 140 && incoming.duration <= 240);
     await expect(b.shell.locator('.space-page')).not.toHaveClass(/gesture-tracking/);
     await expect(b.shell.locator('.space-transition-snapshot')).toHaveCount(0);
+  },
+);
+
+test(
+  'Space colors track displacement, reverse and settle with the same clock as the rows',
+  { timeout: 45000 },
+  async (t) => {
+    const b = await launch(t);
+    const first = {
+      color: '#b34f68',
+      theme: { secondaryColor: '#d4a772', gradient: 10, grain: 20, opacity: 100 },
+    };
+    const second = {
+      color: '#4f79c6',
+      theme: { secondaryColor: '#85bcb1', gradient: 90, grain: 180, opacity: 0 },
+    };
+    await b.invoke('space:update', { id: b.first, ...first });
+    await b.invoke('space:update', { id: b.second, ...second });
+    const tab = await b.invoke('tab:create', { homePage: true });
+    await expect(b.shell.locator(`.tab-row[data-tab-id="${tab.id}"]`)).toBeVisible();
+    await b.shell.emulateMedia({ reducedMotion: 'no-preference' });
+    await b.idle();
+    const samples = await b.shell.evaluate(async (tabId) => {
+      const frame = () => new Promise((resolve) => requestAnimationFrame(resolve));
+      const wheel = (fraction, phase) => {
+        const event = new WheelEvent('wheel', {
+          deltaX: document.querySelector('#sidebar').clientWidth * fraction,
+          bubbles: true,
+          cancelable: true,
+        });
+        Object.defineProperty(event, 'phase', { value: phase });
+        document.querySelector('.space-page').dispatchEvent(event);
+      };
+      const appearance = () => ({
+        color: document.documentElement.style.getPropertyValue('--space-color'),
+        gradient: parseFloat(document.documentElement.style.getPropertyValue('--space-gradient')),
+        grain: parseFloat(document.documentElement.style.getPropertyValue('--space-grain')),
+      });
+      wheel(0.25, 'began');
+      const quarter = appearance();
+      wheel(0.25, 'changed');
+      const half = appearance();
+      await window.zacro.invoke('tab:update', { id: tabId, title: 'Metadata during theme gesture' });
+      await frame();
+      await frame();
+      const afterMetadata = appearance();
+      const nativeEnabled = (await window.zacro.invoke('state:get')).runtime.windowMaterial.enabled;
+      const tintOpacity = parseFloat(document.documentElement.style.getPropertyValue('--space-opacity'));
+      wheel(-0.25, 'changed');
+      const reversed = appearance();
+      wheel(0, 'cancelled');
+      const cancelled = [appearance()];
+      const deadline = performance.now() + 1000;
+      while (appearance().gradient !== 10 && performance.now() < deadline) {
+        await frame();
+        cancelled.push(appearance());
+      }
+      return { quarter, half, afterMetadata, nativeEnabled, tintOpacity, reversed, cancelled };
+    }, tab.id);
+    const { blendSpaceAppearance } = await import('../../src/renderer/theme.js');
+    assert.equal(samples.quarter.color, blendSpaceAppearance(first, second, 0.25).color);
+    assert.equal(samples.quarter.gradient, 30);
+    assert.equal(samples.half.color, blendSpaceAppearance(first, second, 0.5).color);
+    assert.equal(samples.half.gradient, 50);
+    assert.deepEqual(samples.afterMetadata, samples.half, 'Metadata refresh cannot replace presented colors');
+    assert.equal(
+      samples.tintOpacity,
+      samples.nativeEnabled ? 50 : 100,
+      'Tint follows gesture progress or the native accessibility fallback',
+    );
+    assert.deepEqual(samples.reversed, samples.quarter, 'Reverse movement retraces the color blend');
+    assert.equal(samples.cancelled[0].gradient, 30, 'Cancellation starts from the presented blend');
+    assert.equal(samples.cancelled.at(-1).gradient, 10);
+    assert(samples.cancelled.some((sample) => sample.gradient > 10 && sample.gradient < 30));
+    for (let index = 1; index < samples.cancelled.length; index++)
+      assert(samples.cancelled[index].gradient <= samples.cancelled[index - 1].gradient + 0.001);
+    assert.equal(await b.current(), b.first);
+    await b.idle();
+    const committed = await b.shell.evaluate(async (nextId) => {
+      const frame = () => new Promise((resolve) => requestAnimationFrame(resolve));
+      const wheel = (fraction, phase) => {
+        const event = new WheelEvent('wheel', {
+          deltaX: document.querySelector('#sidebar').clientWidth * fraction,
+          bubbles: true,
+          cancelable: true,
+        });
+        Object.defineProperty(event, 'phase', { value: phase });
+        document.querySelector('.space-page').dispatchEvent(event);
+      };
+      const read = () => parseFloat(document.documentElement.style.getPropertyValue('--space-gradient'));
+      wheel(0.5, 'began');
+      wheel(0, 'ended');
+      const values = [read()];
+      const deadline = performance.now() + 3000;
+      while (
+        (document.querySelector('.space-dot[aria-current="true"]')?.dataset.id !== nextId ||
+          document.querySelector('.space-transition-snapshot') ||
+          read() !== 90) &&
+        performance.now() < deadline
+      ) {
+        await frame();
+        values.push(read());
+      }
+      return values;
+    }, b.second);
+    assert.equal(committed[0], 50, 'Release must not jump directly to the destination theme');
+    assert.equal(committed.at(-1), 90);
+    assert(committed.some((value) => value > 50 && value < 90));
+    for (let index = 1; index < committed.length; index++)
+      assert(committed[index] + 0.001 >= committed[index - 1]);
+    await b.changedTo(b.second);
+    for (const [id, expected] of [
+      [b.first, first],
+      [b.second, second],
+    ]) {
+      const saved = (await b.state()).spaces.find((space) => space.id === id);
+      assert.equal(saved.color, expected.color);
+      for (const [key, value] of Object.entries(expected.theme)) assert.equal(saved.theme[key], value);
+    }
+    await b.shell.emulateMedia({ reducedMotion: 'reduce' });
+    await b.invoke('space:activate', { id: b.first });
+    await b.idle();
+    const reduced = await b.shell.evaluate(() => {
+      const dispatch = (deltaX, phase) => {
+        const event = new WheelEvent('wheel', { deltaX, bubbles: true, cancelable: true });
+        Object.defineProperty(event, 'phase', { value: phase });
+        document.querySelector('.space-page').dispatchEvent(event);
+      };
+      dispatch(document.querySelector('#sidebar').clientWidth / 4, 'began');
+      dispatch(0, 'cancelled');
+      return {
+        color: document.documentElement.style.getPropertyValue('--space-color'),
+        animations: document.getAnimations().filter((animation) => animation.playState === 'running').length,
+      };
+    });
+    assert.equal(reduced.color, first.color);
+    assert.equal(reduced.animations, 0);
   },
 );

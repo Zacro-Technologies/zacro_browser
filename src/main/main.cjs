@@ -12,6 +12,7 @@ const {
   shell,
   clipboard,
   nativeTheme,
+  systemPreferences,
   screen,
   webContents,
   safeStorage,
@@ -23,6 +24,7 @@ const os = require('node:os');
 const { pathToFileURL } = require('node:url');
 const { randomUUID } = require('node:crypto');
 const { BrowserStore, normalizeAddress } = require('../core/store.cjs');
+const { archiveCandidate } = require('../core/archive.cjs');
 const { webURL, safeFilename, unusedPath, renameWithoutOverwrite } = require('./security.cjs');
 const { browserLayout, presentView, resolveSplit, restoreWindowPlacement } = require('./layout.cjs');
 const { FaviconLoader } = require('./favicon.cjs');
@@ -56,10 +58,12 @@ const downloadReservations = new Set();
 const promptRequests = new Set();
 let store, win, ai, archiveTimer, pinnedSleepTimer, publishTimer;
 let sleepingPins = false;
+let archivingTabs = false;
 let splitTabId = null;
 let splitPair = null;
 let normalWindowBounds = null;
 let peek = null;
+let peekRequestSerial = 0;
 let layout = {
   sidebarWidth: 224,
   panelWidth: 0,
@@ -86,6 +90,8 @@ let defaultBrowser = { supported: process.platform === 'darwin' && app.isPackage
 let shellSurface = null;
 let windowMaterialState = null;
 let materialPreview = null;
+let spaceMaterialTransition = null;
+let spaceMaterialTimer = null;
 let materialSignature = null;
 let failedMaterialSignature = null;
 
@@ -95,14 +101,66 @@ const activeProfile = () => store.state.profiles.find((item) => item.id === acti
 const activeEntry = () => peek?.entry || views.get(store.state.activeTabId);
 const activeContents = () => activeEntry()?.contents;
 const validWindow = () => win && !win.isDestroyed();
+function clearSpaceMaterialTransition(token) {
+  if (token && token !== spaceMaterialTransition?.token) return false;
+  clearTimeout(spaceMaterialTimer);
+  spaceMaterialTimer = null;
+  spaceMaterialTransition = null;
+  return true;
+}
+function holdSpaceMaterialTransition(payload) {
+  if (typeof payload.token !== 'string' || !/^[a-z0-9-]{1,80}$/i.test(payload.token))
+    throw new Error('Invalid Space transition.');
+  const from = store.state.spaces.find((space) => space.id === payload.fromId);
+  const to = store.state.spaces.find((space) => space.id === payload.toId);
+  const current = activeSpace();
+  if (
+    !from ||
+    !to ||
+    from.profileId !== to.profileId ||
+    current?.profileId !== from.profileId ||
+    ![from.id, to.id].includes(current.id)
+  )
+    throw new Error('The Space transition is no longer current.');
+  clearSpaceMaterialTransition();
+  spaceMaterialTransition = {
+    token: payload.token,
+    fromId: from.id,
+    toId: to.id,
+    profileId: from.profileId,
+    opacity: Number.isFinite(payload.opacity) ? Math.max(0, Math.min(100, payload.opacity)) : 100,
+  };
+  // Renewed only while a gesture is still held. A lost renderer cannot leave an
+  // opaque Space with a permanent native material override.
+  spaceMaterialTimer = setTimeout(() => {
+    clearSpaceMaterialTransition(payload.token);
+    syncWindowMaterial();
+    publish();
+  }, 5000);
+  spaceMaterialTimer.unref();
+}
 function syncWindowMaterial() {
   if (!validWindow() || !store || !shellSurface) return;
   const space = activeSpace();
   if (materialPreview?.spaceId !== space?.id) materialPreview = null;
+  const transition = spaceMaterialTransition;
+  const from = transition && store.state.spaces.find((item) => item.id === transition.fromId);
+  const to = transition && store.state.spaces.find((item) => item.id === transition.toId);
+  if (
+    transition &&
+    (!from ||
+      !to ||
+      space?.profileId !== transition.profileId ||
+      ![transition.fromId, transition.toId].includes(space?.id))
+  )
+    clearSpaceMaterialTransition();
+  const transitionOpacity = spaceMaterialTransition
+    ? Math.min(from.theme?.opacity ?? 100, to.theme?.opacity ?? 100, spaceMaterialTransition.opacity)
+    : undefined;
   const next = windowMaterial({
     platform: process.platform,
     release: os.release(),
-    opacity: materialPreview?.opacity ?? space?.theme?.opacity ?? 100,
+    opacity: materialPreview?.opacity ?? transitionOpacity ?? space?.theme?.opacity ?? 100,
     reducedTransparency: nativeTheme.prefersReducedTransparency,
     highContrast: nativeTheme.shouldUseHighContrastColors || nativeTheme.inForcedColorsMode,
   });
@@ -346,6 +404,10 @@ function snapshot() {
     splitTabId,
     peek: preview
       ? {
+          id: preview.id,
+          phase: preview.phase || 'open',
+          offset: preview.offset || 0,
+          progress: preview.progress ?? 1,
           url: preview.entry.contents.getURL() || preview.url,
           title: preview.entry.contents.getTitle() || 'Peek',
           loading: preview.entry.contents.isLoading(),
@@ -615,6 +677,11 @@ function createEntry(profileId, tabId = null, suppliedOptions = {}) {
     popupTimes.push(now);
     const source = tabForContents(wc);
     if (!source?.spaceId) return { action: 'deny' };
+    // An animation can be interrupted, but a document already inside native
+    // beforeunload/close cannot safely become a durable popup opener.
+    if (peek?.entry === entry && entry.closeRequest) return { action: 'deny' };
+    const opener = peek?.entry === entry ? promotePeek({ interruptClose: true }) : source;
+    if (!opener) return { action: 'deny' };
     // Returning the created webContents lets Chromium preserve form POST data,
     // opener relationships, referrers, and named-window navigation.
     return {
@@ -622,10 +689,8 @@ function createEntry(profileId, tabId = null, suppliedOptions = {}) {
       outlivesOpener: true,
       overrideBrowserWindowOptions: { webPreferences: guestPreferences(source.profileId) },
       createWindow: (options) => {
-        // A preview becomes a durable tab before its popup takes focus. Closing
-        // Peek during activation would destroy the document waiting for a login
-        // callback, even though Chromium correctly retained window.opener.
-        const opener = peek?.entry === entry ? promotePeek() : source;
+        // The opener was made durable before Chromium allocates its popup,
+        // including when a callback arrived during the visual close motion.
         const tab = store.dispatch('tab:create', {
           url: url || NEW_TAB,
           spaceId: source.spaceId,
@@ -662,7 +727,8 @@ function createEntry(profileId, tabId = null, suppliedOptions = {}) {
   wc.on('did-start-navigation', (_event, url, _isInPlace, isMainFrame) => {
     if (isMainFrame) entry.navigationVersion++;
     if (isMainFrame && !_isInPlace) entry.pinDocumentId = null;
-    if (isMainFrame && retainedFavicons.get(entry.tabId)?.url !== url) forgetRetainedFavicon(entry.tabId);
+    if (isMainFrame && !_isInPlace && retainedFavicons.get(entry.tabId)?.url !== url)
+      forgetRetainedFavicon(entry.tabId);
     if (isMainFrame && !_isInPlace) {
       entry.faviconRequest?.abort();
       entry.favicon = null;
@@ -809,6 +875,7 @@ function createEntry(profileId, tabId = null, suppliedOptions = {}) {
     request?.resolve(true);
     if (pendingAuth?.contentsId === entry.contentsId) finishAuth();
     if (peek?.entry === entry) {
+      cancelPeekMotion(peek);
       peek = null;
       try {
         if (validWindow()) win.contentView.removeChildView(entry.view);
@@ -849,6 +916,11 @@ function createEntry(profileId, tabId = null, suppliedOptions = {}) {
 }
 function navigated(entry, url, addHistory) {
   if (!webURL(url)) return;
+  // Hash and history-state navigation keep the same document and validated
+  // icon. Rebind its URL here, after Chromium confirms an in-page navigation,
+  // rather than dropping it when no new favicon event will be emitted.
+  const sameDocumentIcon = !addHistory ? entry.favicon : null;
+  if (sameDocumentIcon) entry.faviconURL = url;
   entry.navigationVersion++;
   entry.requestedURL = url;
   entry.blankPopup = false;
@@ -861,6 +933,7 @@ function navigated(entry, url, addHistory) {
   if (entry.tabId && store.state.tabs.some((tab) => tab.id === entry.tabId)) {
     const title = entry.contents.getTitle() || new URL(url).hostname;
     store.dispatch('tab:update', { id: entry.tabId, url, title });
+    if (sameDocumentIcon) rememberFavicon(entry, url, sameDocumentIcon);
     if (addHistory) store.dispatch('history:add', { profileId: entry.profileId, url, title });
   }
   publish();
@@ -921,10 +994,10 @@ async function resetPinnedTab(id, { activate = true } = {}) {
   return store.state.tabs.find((item) => item.id === id);
 }
 
-function pinProtected(entry) {
+function pageProtected(entry) {
   const tab = store.state.tabs.find((item) => item.id === entry.tabId);
   if (
-    !tab?.pinned ||
+    !tab ||
     tab.closed ||
     views.get(entry.tabId) !== entry ||
     entry.disposing ||
@@ -940,12 +1013,14 @@ function pinProtected(entry) {
     wc.isLoading() ||
     wc.isCurrentlyAudible() ||
     wc.isBeingCaptured() ||
+    wc.isDevToolsOpened() ||
     entry.mediaPlaying ||
     entry.userEdited ||
     entry.mediaPermissionGranted
   )
     return true;
   if (pendingAuth?.contentsId === wc.id) return true;
+  if (entry.openerTabId && views.has(entry.openerTabId)) return true;
   // A popup can still need its opener for a login callback, even after a tab
   // switch. Keep that document until the popup closes; sleeping would discard
   // its callback listener. This relationship is never persisted across restarts.
@@ -963,6 +1038,10 @@ function pinProtected(entry) {
   );
 }
 
+function pinProtected(entry) {
+  return !store.state.tabs.find((tab) => tab.id === entry.tabId)?.pinned || pageProtected(entry);
+}
+
 function markMediaPermission(contents) {
   const entry = [...views.values(), ...(peek ? [peek.entry] : [])].find((item) => item.contents === contents);
   if (entry) entry.mediaPermissionGranted = true;
@@ -975,8 +1054,8 @@ function pinIsIdle(entry) {
   );
 }
 
-async function sleepPinnedEntry(entry, { automatic = false } = {}) {
-  if (!entry || pinProtected(entry) || (automatic && !pinIsIdle(entry))) return false;
+async function unloadIdleEntry(entry, eligible) {
+  if (!entry || !eligible() || pageProtected(entry)) return false;
   const wc = entry.contents;
   const { activityVersion, navigationVersion } = entry;
   let timer;
@@ -1015,10 +1094,10 @@ async function sleepPinnedEntry(entry, { automatic = false } = {}) {
     ]);
     if (
       safe !== true ||
-      pinProtected(entry) ||
+      pageProtected(entry) ||
       entry.activityVersion !== activityVersion ||
       entry.navigationVersion !== navigationVersion ||
-      (automatic && !pinIsIdle(entry))
+      !eligible()
     )
       return false;
     const closed = await requestCloseEntry(entry, { sleep: true });
@@ -1036,6 +1115,38 @@ async function sleepPinnedEntry(entry, { automatic = false } = {}) {
   }
 }
 
+async function sleepPinnedEntry(entry, { automatic = false } = {}) {
+  return unloadIdleEntry(entry, () => !pinProtected(entry) && (!automatic || pinIsIdle(entry)));
+}
+
+async function archiveIdleTabs() {
+  if (archivingTabs || !store || quitting || closingWindow) return;
+  archivingTabs = true;
+  try {
+    // The selected document and both visible split panes count as being read.
+    // Persist this activity so a later restart uses wall-clock idle time.
+    const now = Date.now();
+    for (const tab of store.state.tabs)
+      if (tab.id === store.state.activeTabId || splitPair?.includes(tab.id)) tab.lastActiveAt = now;
+    // Restored tabs without a native page can be archived immediately. Live
+    // pages go through the same conservative draft/media checks as idle pins.
+    store.dispatch('tab:archive-stale', { excludeIds: [...views.keys()] });
+    for (const entry of [...views.values()]) {
+      const eligible = () => {
+        const tab = store.state.tabs.find((item) => item.id === entry.tabId);
+        return Boolean(tab && archiveCandidate(store.state, tab));
+      };
+      if (!(await unloadIdleEntry(entry, eligible))) continue;
+      // Selection, navigation or cadence may change while beforeunload runs.
+      // Automatic unload preserves the tab until this final eligibility check.
+      if (eligible()) store.dispatch('tab:archive-stale', { ids: [entry.tabId] });
+      else reconcile();
+    }
+  } finally {
+    archivingTabs = false;
+  }
+}
+
 async function sleepIdlePins() {
   if (sleepingPins || !store?.state.settings.pinnedSleepMinutes || quitting || closingWindow) return;
   sleepingPins = true;
@@ -1045,20 +1156,111 @@ async function sleepIdlePins() {
     sleepingPins = false;
   }
 }
-async function requestClosePeek() {
-  if (!peek) return true;
-  const entry = peek.entry;
-  const closed = await requestCloseEntry(entry);
-  if (closed && peek?.entry === entry) {
-    peek = null;
-    try {
-      if (validWindow()) win.contentView.removeChildView(entry.view);
-    } catch {}
-    arrangeViews();
-    publish();
-    focusContentOrChrome();
+function prefersReducedPeekMotion() {
+  if (layout.reducedMotion) return true;
+  try {
+    const settings = systemPreferences.getAnimationSettings();
+    return settings.prefersReducedMotion || !settings.shouldRenderRichAnimation;
+  } catch {
+    return false;
   }
-  return closed;
+}
+function cancelPeekMotion(current) {
+  if (!current) return;
+  clearTimeout(current.motionTimer);
+  current.motionTimer = null;
+  const resolve = current.resolveMotion;
+  current.resolveMotion = null;
+  resolve?.(false);
+}
+function applyPeekMotion(current, offset, progress, phase) {
+  if (peek !== current || current.entry.contents.isDestroyed()) return false;
+  current.offset = offset;
+  current.progress = progress;
+  current.phase = phase;
+  arrangeViews();
+  emit({ type: 'peek:motion', id: current.id, phase, offset, progress });
+  return true;
+}
+function finishPeekMotion(current) {
+  if (!current?.resolveMotion) return;
+  const closing = current.phase === 'closing';
+  clearTimeout(current.motionTimer);
+  current.motionTimer = null;
+  const resolve = current.resolveMotion;
+  current.resolveMotion = null;
+  applyPeekMotion(
+    current,
+    closing && !prefersReducedPeekMotion() ? 10 : 0,
+    closing ? 0 : 1,
+    closing ? 'closing' : 'open',
+  );
+  publish();
+  resolve(true);
+}
+function animatePeek(current, phase) {
+  cancelPeekMotion(current);
+  if (peek !== current || current.entry.contents.isDestroyed()) return Promise.resolve(false);
+  const closing = phase === 'closing';
+  const fromOffset = current.offset || 0;
+  const fromProgress = current.progress ?? 1;
+  const targetOffset = closing ? 10 : 0;
+  const targetProgress = closing ? 0 : 1;
+  const duration =
+    (closing ? 120 : 180) * (store.state.settings.motionScale || 1) * Math.abs(targetProgress - fromProgress);
+  current.phase = phase;
+  publish();
+  return new Promise((resolve) => {
+    current.resolveMotion = resolve;
+    if (prefersReducedPeekMotion() || duration < 1) {
+      finishPeekMotion(current);
+      return;
+    }
+    const started = performance.now();
+    const tick = () => {
+      if (peek !== current || current.entry.contents.isDestroyed()) {
+        cancelPeekMotion(current);
+        return;
+      }
+      if (prefersReducedPeekMotion()) {
+        finishPeekMotion(current);
+        return;
+      }
+      const elapsed = Math.min(1, (performance.now() - started) / duration);
+      if (elapsed >= 1) {
+        finishPeekMotion(current);
+        return;
+      }
+      const eased = closing ? elapsed * elapsed : 1 - (1 - elapsed) ** 3;
+      applyPeekMotion(
+        current,
+        fromOffset + (targetOffset - fromOffset) * eased,
+        fromProgress + (targetProgress - fromProgress) * eased,
+        phase,
+      );
+      current.motionTimer = setTimeout(tick, 16);
+      current.motionTimer.unref?.();
+    };
+    tick();
+  });
+}
+async function requestClosePeek({ supersede = true } = {}) {
+  if (supersede) peekRequestSerial++;
+  if (!peek) return true;
+  const current = peek;
+  if (current.closePromise) return current.closePromise;
+  current.closePromise = (async () => {
+    await animatePeek(current, 'closing');
+    if (current.closeInterrupted) return false;
+    if (peek !== current) return true;
+    const closed = await requestCloseEntry(current.entry);
+    if (!closed && peek === current) {
+      current.closePromise = null;
+      await animatePeek(current, 'opening');
+    }
+    return closed;
+  })();
+  return current.closePromise;
 }
 function ensureView(tabId) {
   if (views.has(tabId)) return views.get(tabId);
@@ -1124,7 +1326,11 @@ function arrangeViews() {
   });
   const desired = new Map();
   if (!layout.overlay) {
-    if (peek) desired.set(peek.entry, { bounds: rectangles.peek, visible: !peek.entry.error });
+    if (peek)
+      desired.set(peek.entry, {
+        bounds: { ...rectangles.peek, y: rectangles.peek.y + Math.round(peek.offset || 0) },
+        visible: !peek.entry.error,
+      });
     else {
       const first = views.get(splitPair?.[0] || store.state.activeTabId);
       const second = splitPair ? views.get(splitPair[1]) : null;
@@ -1141,6 +1347,8 @@ function arrangeViews() {
       } else if (entry.inactiveSince === null) {
         entry.activityVersion++;
         entry.inactiveSince = Date.now();
+        const tab = store.state.tabs.find((item) => item.id === entry.tabId);
+        if (tab) tab.lastActiveAt = entry.inactiveSince;
       }
       if (entry.radius !== store.state.settings.pageRadius) {
         entry.view.setBorderRadius(store.state.settings.pageRadius);
@@ -1164,9 +1372,14 @@ function arrangeViews() {
 async function openPeek(url, source = activeTab()) {
   url = webURL(url);
   if (!url || !source) throw new Error('Choose a web link to preview.');
-  if (!(await requestClosePeek())) return null;
+  const request = ++peekRequestSerial;
+  if (!(await requestClosePeek({ supersede: false })) || request !== peekRequestSerial) return null;
   const entry = createEntry(source.profileId);
   peek = {
+    id: randomUUID(),
+    phase: 'opening',
+    offset: 10,
+    progress: 0,
     entry,
     url,
     profileId: source.profileId,
@@ -1175,11 +1388,14 @@ async function openPeek(url, source = activeTab()) {
   };
   arrangeViews();
   safeNavigate(entry, url);
+  void animatePeek(peek, 'opening');
   publish();
   focusContentOrChrome(entry.contents);
 }
 function closePeek(focus = true) {
+  peekRequestSerial++;
   if (!peek) return;
+  cancelPeekMotion(peek);
   const entry = peek.entry;
   peek = null;
   destroyEntry(entry);
@@ -1187,9 +1403,17 @@ function closePeek(focus = true) {
   publish();
   if (focus) focusContentOrChrome();
 }
-function promotePeek() {
+function promotePeek({ interruptClose = false } = {}) {
   if (!peek) return;
+  if (peek.closePromise) {
+    if (!interruptClose || peek.entry.closeRequest) return;
+    // Retain the callback document and cancel the action waiting on this close.
+    // Native beforeunload has not begun, so no unload decision is bypassed.
+    peek.closeInterrupted = true;
+  }
+  peekRequestSerial++;
   const current = peek;
+  cancelPeekMotion(current);
   const url = current.entry.contents.getURL() || current.url;
   // Adopt before activation so reconciliation cannot start a duplicate request
   // for a page whose current document (or POST response) is already alive.
@@ -1900,6 +2124,7 @@ const CORE_ACTIONS = new Set([
   'space:activate',
   'space:delete',
   'profile:create',
+  'profile:update',
   'profile:delete',
   'folder:create',
   'folder:update',
@@ -1970,6 +2195,11 @@ async function invoke(action, payload = {}) {
       layout.sidebarWidth = store.state.settings.sidebarWidth;
     if (action === 'settings:update' && payload.values?.shortcutOverrides) buildMenu();
     if (action === 'settings:update') void sleepIdlePins();
+    if (
+      action === 'profile:update' ||
+      (action === 'settings:update' && Object.hasOwn(payload.values || {}, 'archiveAfterHours'))
+    )
+      void archiveIdleTabs();
     return result;
   }
   const contents = activeContents();
@@ -2119,13 +2349,20 @@ async function invoke(action, payload = {}) {
       if (entry) entry.contents.setAudioMuted(!entry.contents.isAudioMuted());
       break;
     }
+    case 'window:space-material-transition':
+      if (payload.clear === true) clearSpaceMaterialTransition(payload.token);
+      else holdSpaceMaterialTransition(payload);
+      syncWindowMaterial();
+      publish();
+      return windowMaterialState;
     case 'window:material-preview':
+      clearSpaceMaterialTransition();
       if (payload.clear === true) materialPreview = null;
       else {
         if (payload.spaceId !== activeSpace()?.id)
           throw new Error('The Space changed. Reopen its appearance settings.');
-        if (!Number.isFinite(payload.opacity) || payload.opacity < 40 || payload.opacity > 100)
-          throw new Error('Choose a window tint opacity from 40 to 100.');
+        if (!Number.isFinite(payload.opacity) || payload.opacity < 0 || payload.opacity > 100)
+          throw new Error('Choose a window tint opacity from 0 to 100.');
         materialPreview = { spaceId: payload.spaceId, opacity: Math.round(payload.opacity) };
       }
       syncWindowMaterial();
@@ -2145,6 +2382,10 @@ async function invoke(action, payload = {}) {
       break;
     case 'layout': {
       const previousOverlay = layout.overlay;
+      if (typeof payload.reducedMotion === 'boolean') {
+        layout.reducedMotion = payload.reducedMotion;
+        if (layout.reducedMotion && peek) finishPeekMotion(peek);
+      }
       const previousSidebarWidth = layout.sidebarWidth;
       if (Number.isFinite(payload.sidebarWidth))
         layout.sidebarWidth = Math.max(0, Math.min(380, payload.sidebarWidth));
@@ -2726,6 +2967,7 @@ async function createWindow() {
   shellSurface = null;
   windowMaterialState = null;
   materialPreview = null;
+  clearSpaceMaterialTransition();
   materialSignature = null;
   failedMaterialSignature = null;
   splitTabId = null;
@@ -2912,6 +3154,7 @@ async function createWindow() {
     for (const entry of views.values()) destroyEntry(entry);
     views.clear();
     if (peek) {
+      cancelPeekMotion(peek);
       destroyEntry(peek.entry);
       peek = null;
     }
@@ -2919,6 +3162,7 @@ async function createWindow() {
     shellSurface = null;
     windowMaterialState = null;
     materialPreview = null;
+    clearSpaceMaterialTransition();
     materialSignature = null;
     failedMaterialSignature = null;
     updateMacMenu();
@@ -3021,11 +3265,8 @@ if (singleInstance)
       await ensureWindow();
       if (store.recoveryWarning) toast(store.recoveryWarning);
       await restoreExtensions();
-      store.dispatch('tab:archive-stale', { excludeIds: [...views.keys()] });
-      archiveTimer = setInterval(
-        () => store.dispatch('tab:archive-stale', { excludeIds: [...views.keys()] }),
-        60_000,
-      );
+      await archiveIdleTabs();
+      archiveTimer = setInterval(() => void archiveIdleTabs(), 60_000);
       pinnedSleepTimer = setInterval(() => {
         void sleepIdlePins();
       }, 60000);

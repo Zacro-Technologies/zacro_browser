@@ -5,6 +5,14 @@ const { randomUUID } = require('node:crypto');
 const { EventEmitter } = require('node:events');
 const { sanitizeOverrides } = require('./shortcuts.cjs');
 const { normalizeSiteSearches } = require('./site-search.js');
+const {
+  DEFAULT_ARCHIVE_HOURS,
+  validArchiveHours,
+  defaultArchiveProfile,
+  normalizeDefaultArchive,
+  archiveHours,
+  archiveCandidate,
+} = require('./archive.cjs');
 
 const MAX_TABS = 1000;
 const MAX_HISTORY = 20000;
@@ -83,8 +91,8 @@ function spaceTheme(value, base = DEFAULT_SPACE_THEME) {
   if (/^#[\da-f]{6}$/i.test(value.secondaryColor || '')) next.secondaryColor = value.secondaryColor;
   for (const [key, minimum, maximum] of [
     ['gradient', 0, 100],
-    ['grain', 0, 100],
-    ['opacity', 40, 100],
+    ['grain', 0, 200],
+    ['opacity', 0, 100],
     ['blur', 0, 32],
   ])
     if (Number.isFinite(value[key])) next[key] = Math.round(Math.max(minimum, Math.min(maximum, value[key])));
@@ -143,7 +151,7 @@ function webUrl(value) {
 function createInitialState() {
   return {
     version: 1,
-    profiles: [{ id: 'default', name: 'Personal', private: false }],
+    profiles: [{ id: 'default', name: 'Personal', private: false, archiveAfterHours: null }],
     spaces: [
       {
         id: 'home',
@@ -167,7 +175,7 @@ function createInitialState() {
     settings: {
       theme: 'system',
       searchEngine: 'duckduckgo',
-      archiveAfterHours: 24,
+      archiveAfterHours: DEFAULT_ARCHIVE_HOURS,
       sidebarWidth: 224,
       panelWidth: 336,
       siteSearches: normalizeSiteSearches(),
@@ -193,8 +201,7 @@ function validateSettings(values, base = createInitialState().settings) {
   if (!values || typeof values !== 'object' || Array.isArray(values)) return next;
   if (THEMES.has(values.theme)) next.theme = values.theme;
   if (Object.hasOwn(SEARCH, values.searchEngine)) next.searchEngine = values.searchEngine;
-  if ([0, 1, 6, 12, 24, 48, 72, 168, 720].includes(values.archiveAfterHours))
-    next.archiveAfterHours = values.archiveAfterHours;
+  if (validArchiveHours(values.archiveAfterHours)) next.archiveAfterHours = values.archiveAfterHours;
   if (Number.isFinite(values.sidebarWidth))
     next.sidebarWidth = Math.round(Math.min(380, Math.max(200, values.sidebarWidth)));
   if (Number.isFinite(values.panelWidth))
@@ -236,7 +243,12 @@ function hydrate(raw) {
   result.profiles = raw.profiles
     .filter((p) => unique(p) && !p.private)
     .slice(0, 100)
-    .map((p) => ({ id: p.id, name: str(p.name) || 'Profile', private: false }));
+    .map((p) => ({
+      id: p.id,
+      name: str(p.name) || 'Profile',
+      private: false,
+      archiveAfterHours: validArchiveHours(p.archiveAfterHours) ? p.archiveAfterHours : null,
+    }));
   if (!result.profiles.length) throw new Error('No valid profile found.');
   const profiles = new Set(result.profiles.map((p) => p.id));
   result.spaces = raw.spaces
@@ -351,6 +363,7 @@ function hydrate(raw) {
     .filter((e) => e && safeId(e.id) && profiles.has(e.profileId) && typeof e.path === 'string')
     .slice(0, 200);
   result.settings = validateSettings(raw.settings);
+  normalizeDefaultArchive(result);
   result.activeSpaceId = spaces.has(raw.activeSpaceId) ? raw.activeSpaceId : result.spaces[0].id;
   for (const space of result.spaces)
     if (
@@ -539,6 +552,8 @@ class BrowserStore extends EventEmitter {
       remembered?.id ||
       this.state.tabs.find((tab) => tab.spaceId === space.id && !tab.favorite && !tab.closed)?.id ||
       null;
+    const viewed = this.state.tabs.find((tab) => tab.id === this.state.activeTabId);
+    if (viewed) viewed.lastActiveAt = Date.now();
   }
   activateTab(tab, activate = true) {
     const current = this.activeSpace();
@@ -601,6 +616,7 @@ class BrowserStore extends EventEmitter {
     const p = payload,
       s = this.state,
       now = Date.now();
+    const previousActiveId = s.activeTabId;
     let result = null;
     switch (action) {
       case 'tab:create': {
@@ -744,11 +760,13 @@ class BrowserStore extends EventEmitter {
         break;
       }
       case 'tab:archive-stale': {
-        if (!s.settings.archiveAfterHours) break;
-        const cutoff = (Number.isFinite(p.now) ? p.now : now) - s.settings.archiveAfterHours * 3600000;
         const excluded = new Set(Array.isArray(p.excludeIds) ? p.excludeIds : []);
+        const included = Array.isArray(p.ids) ? new Set(p.ids) : null;
         const stale = s.tabs.filter(
-          (t) => !t.pinned && t.id !== s.activeTabId && !excluded.has(t.id) && t.lastActiveAt < cutoff,
+          (tab) =>
+            (!included || included.has(tab.id)) &&
+            !excluded.has(tab.id) &&
+            archiveCandidate(s, tab, Number.isFinite(p.now) ? p.now : now),
         );
         for (const tab of stale) this.closeTab(tab);
         result = stale.length;
@@ -803,7 +821,12 @@ class BrowserStore extends EventEmitter {
       case 'profile:create': {
         if (s.profiles.length >= 100) throw new Error('Profile limit reached.');
         if (!str(p.name)) throw new Error('Give your profile a name.');
-        const profile = { id: id('profile'), name: str(p.name), private: p.private === true };
+        const profile = {
+          id: id('profile'),
+          name: str(p.name),
+          private: p.private === true,
+          archiveAfterHours: validArchiveHours(p.archiveAfterHours) ? p.archiveAfterHours : null,
+        };
         const space = {
           id: id('space'),
           profileId: profile.id,
@@ -815,6 +838,17 @@ class BrowserStore extends EventEmitter {
         s.profiles.push(profile);
         s.spaces.push(space);
         this.activateSpace(space);
+        result = profile;
+        break;
+      }
+      case 'profile:update': {
+        const profile = this.require('profiles', p.id, 'Profile');
+        const value = p.values?.archiveAfterHours;
+        if (value !== null && !validArchiveHours(value)) throw new Error('Choose a valid archive cadence.');
+        if (profile === defaultArchiveProfile(s)) {
+          if (value !== null) s.settings.archiveAfterHours = value;
+          profile.archiveAfterHours = null;
+        } else profile.archiveAfterHours = value;
         result = profile;
         break;
       }
@@ -839,6 +873,7 @@ class BrowserStore extends EventEmitter {
         ])
           s[key] = s[key].filter((r) => r.profileId !== profile.id);
         if (removedSpaces.has(s.activeSpaceId)) this.activateSpace(s.spaces[0]);
+        normalizeDefaultArchive(s);
         break;
       }
       case 'folder:create': {
@@ -948,6 +983,12 @@ class BrowserStore extends EventEmitter {
       )
         delete space.lastActiveTabId;
     }
+    // Time spent viewing a tab is activity too. Start its idle period on
+    // departure, rather than immediately archiving a page read for hours.
+    if (previousActiveId !== s.activeTabId) {
+      for (const tab of s.tabs)
+        if (tab.id === previousActiveId || tab.id === s.activeTabId) tab.lastActiveAt = now;
+    }
     if (this.file && RECOVERY_PURGE_ACTIONS.has(action)) this.recoveryPurgePending = true;
     this.changed();
     // Do not report an explicit clear as successful while deleted records still
@@ -995,7 +1036,12 @@ class BrowserStore extends EventEmitter {
         const next = { ...row, id: mappings.get(row.id) };
         for (const field of ['profileId', 'spaceId', 'folderId', 'lastActiveTabId'])
           if (next[field]) next[field] = mappings.get(next[field]) || null;
-        if (key === 'profiles') next.name = `${next.name} (imported)`;
+        if (key === 'profiles') {
+          next.name = `${next.name} (imported)`;
+          // Import keeps this browser's defaults, so capture each source
+          // profile's effective cadence instead of inheriting a different one.
+          next.archiveAfterHours = archiveHours(data, row.id);
+        }
         this.state[key].push(next);
       }
     }

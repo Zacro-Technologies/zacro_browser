@@ -44,7 +44,8 @@ test('malformed opacity cannot accidentally make the window transparent', () => 
     assert.equal(material.enabled, false);
     assert.equal(material.opacity, 100);
   }
-  assert.equal(windowMaterial({ platform: 'darwin', opacity: -20 }).opacity, 40);
+  assert.equal(windowMaterial({ platform: 'darwin', opacity: -20 }).opacity, 0);
+  assert.equal(windowMaterial({ platform: 'darwin', opacity: 0 }).enabled, true);
   assert.equal(windowMaterial({ platform: 'darwin', opacity: 120 }).enabled, false);
   assert.equal(windowMaterial({ platform: 'darwin', opacity: 60.8 }).opacity, 61);
 });

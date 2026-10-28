@@ -236,9 +236,11 @@ test(
   },
 );
 
-for (const mode of ['script', 'post'])
+for (const { mode, duringClose } of ['script', 'post'].flatMap((mode) =>
+  [false, true].map((duringClose) => ({ mode, duringClose })),
+))
   test(
-    `a ${mode} login popup promotes Peek without replacing its callback document`,
+    `a ${mode} login popup promotes Peek${duringClose ? ' during close motion' : ''} without replacing its callback document`,
     { timeout: 60000 },
     async (t) => {
       const identity = http.createServer(async (request, response) => {
@@ -261,10 +263,22 @@ for (const mode of ['script', 'post'])
       const browser = await launch(t);
       await browser.navigate(`${base}/underlying-${mode}`);
       const underlyingId = (await browser.state()).activeTabId;
-      const previewPath = `/peek-login-${mode}`;
+      if (duringClose) {
+        await browser.app.evaluate(({ systemPreferences }) => {
+          systemPreferences.getAnimationSettings = () => ({
+            prefersReducedMotion: false,
+            shouldRenderRichAnimation: true,
+            scrollAnimationsEnabledBySystem: true,
+          });
+        });
+        await browser.shell.emulateMedia({ reducedMotion: 'no-preference' });
+        await browser.invoke('settings:update', { values: { motionScale: 1.4 } });
+      }
+      const previewPath = `/peek-login-${mode}${duringClose ? '-closing' : ''}`;
       const previewURL = `${base}${previewPath}`;
       await browser.invoke('peek:open', { url: previewURL });
       await expect.poll(() => browser.guest('document.readyState', previewURL)).toBe('complete');
+      await expect.poll(async () => (await browser.state()).runtime.peek?.phase).toBe('open');
       const previewId = await browser.app.evaluate(
         ({ webContents }, url) => webContents.getAllWebContents().find((item) => item.getURL() === url).id,
         previewURL,
@@ -279,15 +293,28 @@ for (const mode of ['script', 'post'])
         window.addEventListener('message', (event) => {
           if (event.origin === ${JSON.stringify(new URL(identityURL).origin)}) window.loginResult = event.data;
         });
-        ${
+        window.startLogin = () => { ${
           mode === 'post'
             ? `document.getElementById('post').action = ${JSON.stringify(identityURL)}; document.getElementById('post').target = 'identity-login-post'; document.getElementById('post').submit();`
             : `window.identityPopup = window.open('about:blank', 'identity-login'); setTimeout(() => { window.identityPopup.location.href = ${JSON.stringify(identityURL)}; }, 25);`
-        }
+        } };
         undefined;
       `,
         previewURL,
       );
+      if (duringClose) {
+        await browser.shell.evaluate(() => {
+          window.__latePeekClose = window.zacro.invoke('peek:close');
+        });
+        assert.equal((await browser.state()).runtime.peek?.phase, 'closing');
+      }
+      await browser.guest('window.startLogin(); undefined', previewURL);
+      if (duringClose)
+        assert.equal(
+          await browser.shell.evaluate(() => window.__latePeekClose),
+          false,
+          'a live login callback interrupts the visual close before native beforeunload',
+        );
       await expect.poll(() => browser.guest('document.readyState', identityURL)).toBe('complete');
       await expect.poll(async () => (await browser.state()).runtime.page.url).toBe(identityURL);
       const afterOpen = await browser.state();

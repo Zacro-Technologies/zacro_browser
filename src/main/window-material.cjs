@@ -11,7 +11,7 @@ function windowMaterial({
 } = {}) {
   const requestedOpacity =
     typeof opacity === 'number' && Number.isFinite(opacity)
-      ? Math.round(Math.max(40, Math.min(100, opacity)))
+      ? Math.round(Math.max(0, Math.min(100, opacity)))
       : 100;
   const windowsBuild = Number(String(release).split('.')[2]);
   const supported = platform === 'darwin' || (platform === 'win32' && windowsBuild >= 22621);

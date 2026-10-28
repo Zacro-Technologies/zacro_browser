@@ -8,8 +8,21 @@ const http = require('node:http');
 const { _electron: electron, expect } = require('@playwright/test');
 
 let server, base, outside;
+const requestCounts = new Map();
 before(async () => {
+  const favicon = await fs.readFile(path.resolve(__dirname, '../../assets/icon-256.png'));
   server = http.createServer(async (request, response) => {
+    requestCounts.set(request.url, (requestCounts.get(request.url) || 0) + 1);
+    if (request.url === '/favicon.png') {
+      response.writeHead(200, { 'Content-Type': 'image/png' });
+      response.end(favicon);
+      return;
+    }
+    if (request.url === '/pin-redirect-home' && requestCounts.get(request.url) > 1) {
+      response.writeHead(302, { Location: `${base}/pin-redirect-result` });
+      response.end();
+      return;
+    }
     if (request.url === '/redirect') {
       response.writeHead(302, { Location: `${outside}/redirected` });
       response.end();
@@ -18,7 +31,7 @@ before(async () => {
     let body = '';
     for await (const chunk of request) body += chunk;
     response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
-    response.end(`<!doctype html><title>Saved ${request.url}</title>
+    response.end(`<!doctype html><title>Saved ${request.url}</title><link rel="icon" href="/favicon.png">
       <style>body{font:18px system-ui}a,button{display:block;margin:12px;padding:8px}</style>
       <button id="activate">Activate</button>
       <a id="same" href="/inside">Same host</a>
@@ -91,8 +104,95 @@ async function launch(t) {
       { url, point, modifiers },
     );
   };
-  return { app, invoke, state, guest, ready, navigate, click };
+  return { app, shell, invoke, state, guest, ready, navigate, click };
 }
+
+test(
+  'same-document pin navigation keeps its validated icon, saved title and exact home URL until native Close',
+  { timeout: 60000 },
+  async (t) => {
+    const browser = await launch(t);
+    const homeURL = `${base}/hash-saved#original`;
+    const awayURL = `${base}/hash-saved?view=detail#section`;
+    await browser.navigate(homeURL);
+    const tabId = (await browser.state()).activeTabId;
+    await browser.invoke('tab:pin', { id: tabId });
+    await expect
+      .poll(async () => (await browser.state()).runtime.pages[tabId].favicon)
+      .toMatch(/^data:image\/png;base64,/);
+    const savedIcon = (await browser.state()).runtime.pages[tabId].favicon;
+    const savedTitle = (await browser.state()).tabs.find((tab) => tab.id === tabId).pinnedTitle;
+    const homeRequests = requestCounts.get('/hash-saved');
+    await browser.guest(
+      homeURL,
+      'window.pinDocumentMarker="retained";history.pushState(null,"","?view=detail#section");undefined',
+    );
+    await expect
+      .poll(async () => (await browser.state()).tabs.find((tab) => tab.id === tabId).url)
+      .toBe(awayURL);
+    const moved = await browser.state();
+    assert.equal(moved.tabs.find((tab) => tab.id === tabId).pinnedUrl, homeURL);
+    assert.equal(moved.tabs.find((tab) => tab.id === tabId).pinnedTitle, savedTitle);
+    assert.equal(moved.runtime.pages[tabId].favicon, savedIcon);
+    assert.equal(await browser.guest(awayURL, 'window.pinDocumentMarker'), 'retained');
+    assert.equal(requestCounts.get('/hash-saved'), homeRequests);
+    await expect(browser.shell.locator(`[data-tab-id="${tabId}"] .pin-away`)).toHaveText('/');
+    await browser.app.evaluate(({ webContents }, url) => {
+      const contents = webContents.getAllWebContents().find((item) => item.getURL() === url);
+      contents.focus();
+      const modifiers = [process.platform === 'darwin' ? 'meta' : 'control'];
+      contents.sendInputEvent({ type: 'keyDown', keyCode: 'W', modifiers });
+      contents.sendInputEvent({ type: 'keyUp', keyCode: 'W', modifiers });
+    }, awayURL);
+    await expect
+      .poll(async () => (await browser.state()).tabs.find((tab) => tab.id === tabId).closed)
+      .toBe(true);
+    const closed = (await browser.state()).tabs.find((tab) => tab.id === tabId);
+    assert.equal(closed.url, homeURL);
+    assert.equal(closed.pinnedUrl, homeURL);
+    assert.equal(closed.pinnedTitle, savedTitle);
+    assert.equal((await browser.state()).runtime.pages[tabId].loaded, false);
+    await expect(browser.shell.locator(`[data-tab-id="${tabId}"] .pin-away`)).toHaveCount(0);
+    await browser.invoke('tab:activate', { id: tabId });
+    await browser.ready(homeURL);
+    assert.equal(await browser.guest(homeURL, 'window.pinDocumentMarker'), undefined);
+  },
+);
+
+test(
+  'redirects never overwrite a pin home and canceled Close preserves the navigated document',
+  { timeout: 60000 },
+  async (t) => {
+    const browser = await launch(t);
+    const homeURL = `${base}/pin-redirect-home`;
+    const targetURL = `${base}/pin-redirect-result`;
+    await browser.navigate(homeURL);
+    const tabId = (await browser.state()).activeTabId;
+    await browser.invoke('tab:pin', { id: tabId });
+    await browser.invoke('tab:reset-pin', { id: tabId });
+    await browser.ready(targetURL);
+    assert.equal((await browser.state()).tabs.find((tab) => tab.id === tabId).pinnedUrl, homeURL);
+    await browser.click(targetURL, 'activate');
+    await browser.guest(
+      targetURL,
+      'window.keptDraft="draft";window.addEventListener("beforeunload", event=>{event.preventDefault();event.returnValue="Unsaved"});undefined',
+    );
+    await browser.app.evaluate(({ dialog }) => {
+      dialog.showMessageBoxSync = () => 0;
+    });
+    assert.equal(await browser.invoke('tab:close', { id: tabId }), false);
+    const retained = (await browser.state()).tabs.find((tab) => tab.id === tabId);
+    assert.equal(retained.closed, undefined);
+    assert.equal(retained.url, targetURL);
+    assert.equal(retained.pinnedUrl, homeURL);
+    assert.equal(await browser.guest(targetURL, 'window.keptDraft'), 'draft');
+    await browser.app.evaluate(({ dialog }) => {
+      dialog.showMessageBoxSync = () => 1;
+    });
+    await browser.invoke('tab:close', { id: tabId });
+    assert.equal((await browser.state()).tabs.find((tab) => tab.id === tabId).url, homeURL);
+  },
+);
 
 test(
   'Favorites share their living document across Spaces and retained pins reopen at their saved destination',
@@ -239,5 +339,161 @@ test(
     await browser.invoke('tab:reset-pin', { id: tabId });
     await browser.ready(homeURL);
     assert.equal((await browser.state()).tabs.find((tab) => tab.id === tabId).pinnedUrl, homeURL);
+  },
+);
+
+test(
+  'Peek motion retains native resolution and documents through promotion, replacement, cancellation and reduced motion',
+  { timeout: 60000 },
+  async (t) => {
+    const browser = await launch(t);
+    const source = `${base}/peek-parent`;
+    const previewURL = `${base}/peek-motion`;
+    await browser.navigate(source);
+    await browser.guest(source, 'window.parentDraft="kept"');
+    await browser.shell.evaluate((url) => {
+      window.__peekShellFrames = [];
+      const sample = (frame, channel) => {
+        const element = document.getElementById('peek');
+        if (!frame || element.hidden || !['opening', 'open'].includes(frame.phase)) return;
+        window.__peekShellFrames.push({
+          id: frame.id,
+          channel,
+          offset: frame.offset,
+          paintedOffset: parseFloat(element.style.getPropertyValue('--peek-offset')),
+          progress: frame.progress,
+          paintedProgress: Number(element.style.getPropertyValue('--peek-progress')),
+        });
+      };
+      window.__stopPeekShellFrames = [
+        window.zacro.onState((value) => {
+          if (value.runtime?.peek?.url === url) sample(value.runtime.peek, 'state');
+        }),
+        window.zacro.onEvent((event) => {
+          if (event.type === 'peek:motion') sample(event, 'motion');
+        }),
+      ];
+    }, previewURL);
+    await browser.app.evaluate(({ systemPreferences, BrowserWindow }, url) => {
+      systemPreferences.getAnimationSettings = () => ({
+        prefersReducedMotion: false,
+        shouldRenderRichAnimation: true,
+        scrollAnimationsEnabledBySystem: true,
+      });
+      globalThis.__peekMotionSamples = [];
+      globalThis.__peekMotionTimer = setInterval(() => {
+        const view = BrowserWindow.getAllWindows()[0]?.contentView.children.find(
+          (item) => item.webContents?.getURL() === url,
+        );
+        if (view)
+          globalThis.__peekMotionSamples.push({
+            id: view.webContents.id,
+            bounds: view.getBounds(),
+            zoom: view.webContents.getZoomFactor(),
+          });
+      }, 8);
+    }, previewURL);
+    await browser.invoke('peek:open', { url: previewURL });
+    await browser.ready(previewURL);
+    await browser.guest(
+      previewURL,
+      'window.peekDraft="retained";document.querySelector("input[name=draft]").value="Unsaved preview text";undefined',
+    );
+    await expect.poll(async () => (await browser.state()).runtime.peek?.phase).toBe('open');
+    const samples = await browser.app.evaluate(() => {
+      clearInterval(globalThis.__peekMotionTimer);
+      return globalThis.__peekMotionSamples;
+    });
+    const shellFrames = await browser.shell.evaluate(() => {
+      window.__stopPeekShellFrames.forEach((stop) => stop());
+      return window.__peekShellFrames;
+    });
+    assert(shellFrames.some((frame) => frame.channel === 'state'));
+    assert(shellFrames.some((frame) => frame.channel === 'motion' && frame.offset > 0));
+    for (const [index, frame] of shellFrames.entries()) {
+      assert.equal(frame.paintedOffset, Math.round(frame.offset), 'chrome uses the same native offset');
+      assert.equal(frame.paintedProgress, frame.progress);
+      if (index) {
+        assert.equal(frame.id, shellFrames[index - 1].id);
+        assert(frame.progress >= shellFrames[index - 1].progress, 'metadata must not rewind the motion');
+      }
+    }
+    assert(samples.length > 2, 'the native entrance is sampled through multiple frames');
+    assert(
+      new Set(samples.map((sample) => sample.bounds.y)).size > 1,
+      'the live surface translates into place',
+    );
+    assert.equal(new Set(samples.map((sample) => sample.id)).size, 1);
+    assert.equal(
+      new Set(samples.map((sample) => `${sample.bounds.width}:${sample.bounds.height}:${sample.zoom}`)).size,
+      1,
+      'translation must not scale or resize the document',
+    );
+    const resting = samples.at(-1);
+    const peekRectangle = await browser.shell.locator('.peek-body').boundingBox();
+    for (const key of ['x', 'y', 'width', 'height'])
+      assert.equal(Math.round(peekRectangle[key]), resting.bounds[key]);
+    await browser.invoke('peek:promote');
+    assert.equal((await browser.state()).runtime.peek, null);
+    assert.equal(await browser.guest(previewURL, 'window.peekDraft'), 'retained');
+    assert.equal(
+      await browser.guest(previewURL, 'document.querySelector("input[name=draft]").value'),
+      'Unsaved preview text',
+    );
+    const promotedId = await browser.app.evaluate(
+      ({ webContents }, url) => webContents.getAllWebContents().find((item) => item.getURL() === url).id,
+      previewURL,
+    );
+    assert.equal(promotedId, resting.id);
+    const promoted = (await browser.state()).activeTabId;
+    await browser.invoke('tab:close', { id: promoted });
+    assert.equal(await browser.guest(source, 'window.parentDraft'), 'kept');
+
+    const first = `${base}/peek-race-a`,
+      second = `${base}/peek-race-b`;
+    await Promise.all([
+      browser.invoke('peek:open', { url: first }),
+      browser.invoke('peek:open', { url: second }),
+    ]);
+    await expect.poll(async () => (await browser.state()).runtime.peek?.url).toBe(second);
+    await expect.poll(async () => (await browser.state()).runtime.peek?.phase).toBe('open');
+    assert.equal(
+      await browser.app.evaluate(
+        ({ webContents }, url) =>
+          webContents.getAllWebContents().filter((item) => item.getURL() === url).length,
+        first,
+      ),
+      0,
+      'superseded previews cannot leave orphan native renderers',
+    );
+    await browser.click(second, 'activate');
+    await browser.guest(
+      second,
+      'window.previewMarker="unsaved";window.addEventListener("beforeunload", event=>{event.preventDefault();event.returnValue="Unsaved"});undefined',
+    );
+    await browser.app.evaluate(({ dialog }) => {
+      dialog.showMessageBoxSync = () => 0;
+    });
+    assert.equal(await browser.invoke('peek:close'), false);
+    assert.equal((await browser.state()).runtime.peek.phase, 'open');
+    assert.equal((await browser.state()).runtime.peek.offset, 0);
+    assert.equal(await browser.guest(second, 'window.previewMarker'), 'unsaved');
+    await browser.app.evaluate(({ dialog }) => {
+      dialog.showMessageBoxSync = () => 1;
+    });
+    await browser.invoke('peek:close');
+    assert.equal((await browser.state()).runtime.peek, null);
+    assert.equal(await browser.guest(source, 'window.parentDraft'), 'kept');
+
+    await browser.shell.emulateMedia({ reducedMotion: 'reduce' });
+    await browser.shell.waitForFunction(() => matchMedia('(prefers-reduced-motion: reduce)').matches);
+    await browser.invoke('layout', { reducedMotion: true });
+    await browser.invoke('peek:open', { url: `${base}/peek-reduced` });
+    const reduced = (await browser.state()).runtime.peek;
+    assert.equal(reduced.phase, 'open');
+    assert.equal(reduced.offset, 0);
+    assert.equal(reduced.progress, 1);
+    await browser.invoke('peek:close');
+    assert.equal((await browser.state()).runtime.peek, null);
   },
 );

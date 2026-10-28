@@ -14,6 +14,8 @@ const demoFavorites = [
   { id: 'calendar', title: 'Calendar', color: '#ec6b69', heading: 'Make room for the day ahead.' },
   { id: 'notes', title: 'Notes', color: '#d4a348', heading: 'Keep a thought close by.' },
   { id: 'studio', title: 'Studio', color: '#8870c7', heading: 'A place for work in progress.' },
+  { id: 'music', title: 'Music', color: '#cf6688', heading: 'Find your rhythm.' },
+  { id: 'compass', title: 'Explore', color: '#4d9d8d', heading: 'Follow your curiosity.' },
 ];
 
 // Original fixture icons, rendered from simple vector shapes into bounded PNGs.
@@ -52,6 +54,21 @@ function demoIcon(id) {
   } else if (id === 'notes') {
     shapes.push([rect(7, 5, 18, 23, 2), '#fffbee']);
     for (const y of [12, 17, 22]) shapes.push([line(11, y, 21, y, 1.6), '#b99857']);
+  } else if (id === 'music') {
+    shapes.push(
+      [line(12, 11, 23, 8, 2.4), '#ffffff'],
+      [line(12, 11, 12, 23, 2.4), '#ffffff'],
+      [line(23, 8, 23, 20, 2.4), '#ffffff'],
+      [rect(7, 21, 6, 5, 2.4), '#ffffff'],
+      [rect(18, 18, 6, 5, 2.4), '#ffffff'],
+    );
+  } else if (id === 'compass') {
+    shapes.push(
+      [rect(5, 5, 22, 22, 11), '#ffffff'],
+      [line(12, 20, 20, 12, 3), color],
+      [line(12, 20, 15, 13, 1.5), color],
+      [line(15, 13, 20, 12, 1.5), color],
+    );
   } else
     shapes.push(
       [rect(6, 6, 20, 20, 3), '#ffffff'],
@@ -112,7 +129,7 @@ function createShowcaseSite() {
   server.removeListener('request', original);
   server.on('request', (request, response) => {
     const url = new URL(request.url, 'http://127.0.0.1');
-    const match = /^\/showcase\/(mail|calendar|notes|studio)(\.png)?$/.exec(url.pathname);
+    const match = /^\/showcase\/(mail|calendar|notes|studio|music|compass)(\.png)?$/.exec(url.pathname);
     if (!match) return original(request, response);
     const [, id, image] = match;
     if (image) {

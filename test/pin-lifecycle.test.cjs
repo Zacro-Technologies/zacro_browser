@@ -37,6 +37,7 @@ function harness() {
     isLoading: () => false,
     isCurrentlyAudible: () => false,
     isBeingCaptured: () => false,
+    isDevToolsOpened: () => false,
     executeJavaScriptInIsolatedWorld: () => {
       entry.inspectCount++;
       return new Promise((resolve) => {
@@ -128,4 +129,12 @@ test('explicit Close upgrades a pending sleep close without issuing a second nat
   assert.equal(b.entry.closeCount, 1);
   b.entry.closeRequest.resolve(true);
   assert.equal(await explicit, true);
+});
+
+test('a page under DevTools inspection stays live without starting the automatic unload probe', async () => {
+  const b = harness();
+  b.entry.contents.isDevToolsOpened = () => true;
+  assert.equal(await b.host.sleepPinnedEntry(b.entry, { automatic: true }), false);
+  assert.equal(b.entry.inspectCount, 0);
+  assert.equal(b.entry.closeCount, 0);
 });

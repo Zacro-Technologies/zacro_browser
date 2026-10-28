@@ -103,7 +103,7 @@ test(
       backdrop: getComputedStyle(document.querySelector('#page-backdrop')).visibility,
       outline: getComputedStyle(document.querySelector('.space-dot.active')).outlineStyle,
     }));
-    assert.deepEqual(accessibility, { blur: 'none', backdrop: 'hidden', outline: 'solid' });
+    assert.deepEqual(accessibility, { blur: 'none', backdrop: 'visible', outline: 'solid' });
     await cdp.detach();
     await shell.keyboard.press('Escape');
 

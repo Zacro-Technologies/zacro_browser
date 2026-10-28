@@ -42,6 +42,20 @@ async function main() {
   const url = `http://127.0.0.1:${server.address().port}/`;
   const store = new BrowserStore(directory);
   store.state = populateLocalFavorites(createShowcaseState(url), url);
+  for (const [id, title] of [
+    ['music', 'Music'],
+    ['compass', 'Explore'],
+  ]) {
+    store.state.tabs.push({
+      ...store.state.tabs[0],
+      id: `showcase-favorite-${id}`,
+      title,
+      customTitle: title,
+      url: new URL(`/showcase/${id}`, url).href,
+      pinned: true,
+      favorite: true,
+    });
+  }
   store.state.windowBounds = {
     width: 1280,
     height: 800,
@@ -173,6 +187,9 @@ async function main() {
         `local Favorite icon ${tab.customTitle || tab.title}`,
       );
     }
+    await invoke('tab:activate', { id: 'showcase-tab-repo' });
+    await invoke('navigate', { url: new URL('/reference/handbook/layout', url).href });
+    await settled();
     await invoke('tab:activate', { id: 'showcase-tab-journal' });
     await settled();
   }
@@ -273,8 +290,8 @@ async function main() {
         await invoke('settings:update', { values: { theme } });
       }
       if (command.opacity !== undefined) {
-        if (!Number.isFinite(command.opacity) || command.opacity < 40 || command.opacity > 100)
-          throw new Error('Opacity must be from 40 to 100.');
+        if (!Number.isFinite(command.opacity) || command.opacity < 0 || command.opacity > 100)
+          throw new Error('Opacity must be from 0 to 100.');
         await invoke('space:update', { id: 'showcase-studio', theme: { opacity: command.opacity } });
       }
       await settled();
@@ -301,6 +318,7 @@ async function main() {
       } else if (name === 'peek') {
         await invoke('peek:open', { url: new URL('/notes', url).href });
         await until(async () => (await state()).runtime.peek?.loading === false, 'Peek content');
+        await until(async () => (await state()).runtime.peek?.phase === 'open', 'Peek entrance');
       }
       await settled();
     }

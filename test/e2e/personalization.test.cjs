@@ -86,6 +86,21 @@ test(
     await b.emit({ type: 'panel', panel: 'settings' });
     await b.shell.getByRole('button', { name: 'Customize Space', exact: true }).click();
     const original = (await b.invoke('state:get')).spaces[0];
+    const swatches = await b.shell.locator('.space-theme-dialog .color-option').evaluateAll((nodes) =>
+      nodes.map((node) => {
+        const rect = node.getBoundingClientRect();
+        return { width: rect.width, height: rect.height, radius: getComputedStyle(node).borderRadius };
+      }),
+    );
+    assert(swatches.length > 8);
+    assert(
+      swatches.every(({ width, height, radius }) => Math.abs(width - height) < 0.1 && radius === '50%'),
+      'Every color swatch stays circular',
+    );
+    await expect(b.shell.locator('input[name="theme-opacity"]')).toHaveAttribute('min', '0');
+    await expect(b.shell.locator('input[name="theme-grain"]')).toHaveAttribute('max', '200');
+    await expect(b.shell.locator('#window-material-hint')).toHaveCount(0);
+
     await b.shell.locator('#space-icon-search').fill('rocket');
     await expect(b.shell.locator('.space-icon-options button:visible')).toHaveCount(1);
     await b.shell.getByRole('button', { name: 'rocket icon', exact: true }).click();
@@ -263,6 +278,8 @@ test(
         filter: getComputedStyle(document.querySelector('.command-backdrop')).backdropFilter,
         background: getComputedStyle(document.querySelector('.command-backdrop')).backgroundColor,
         imageFilter: getComputedStyle(clip.firstElementChild).filter,
+        overlay: getComputedStyle(clip, '::after').content,
+        shadow: getComputedStyle(document.querySelector('.command-dialog')).boxShadow,
         bounds: {
           x: Math.round(rect.x),
           y: Math.round(rect.y),
@@ -275,7 +292,9 @@ test(
     assert.equal(backdrop.radius, '16px');
     assert.equal(backdrop.filter, 'none');
     assert.equal(backdrop.background, 'rgba(0, 0, 0, 0)');
-    assert.equal(backdrop.imageFilter, 'blur(6px)');
+    assert.equal(backdrop.imageFilter, 'none', 'The palette leaves page pixels sharp');
+    assert.equal(backdrop.overlay, 'none', 'The palette does not tint the page');
+    assert.notEqual(backdrop.shadow, 'none', 'A shadow separates the palette from the unchanged page');
     assert.deepEqual(backdrop.bounds, pageBounds);
     const media = await b.shell.context().newCDPSession(b.shell);
     try {
@@ -286,7 +305,7 @@ test(
         clickSurface: getComputedStyle(document.querySelector('.command-backdrop')).backgroundColor,
         pageSnapshot: getComputedStyle(document.querySelector('#page-backdrop')).visibility,
       }));
-      assert.deepEqual(reduced, { clickSurface: 'rgba(0, 0, 0, 0)', pageSnapshot: 'hidden' });
+      assert.deepEqual(reduced, { clickSurface: 'rgba(0, 0, 0, 0)', pageSnapshot: 'visible' });
     } finally {
       await media.detach();
     }
@@ -318,7 +337,7 @@ test(
       'The command dialog stays centered in the page canvas',
     );
     assert.equal(commandAlignment.panelInert, true);
-    assert.equal(commandAlignment.panelFilter, 'none', 'Page-only blur must not blur the Library panel');
+    assert.equal(commandAlignment.panelFilter, 'none', 'The palette leaves Library unchanged');
     await b.shell.mouse.click(closePanel.x + closePanel.width / 2, closePanel.y + closePanel.height / 2);
     await expect(b.shell.locator('.command-dialog')).toHaveCount(0);
     await expect(b.shell.locator('#side-panel')).toBeVisible();
@@ -490,5 +509,94 @@ test(
         'A dismissed preview must not modify any previous Space',
       );
     }
+  },
+);
+
+test(
+  'Favorite tiles balance complete rows as the count and sidebar width change',
+  { timeout: 60000 },
+  async (t) => {
+    const b = await fixture(t);
+    await b.shell.emulateMedia({ reducedMotion: 'reduce' });
+    const rowsByCount = new Map();
+    for (let count = 1; count <= 12; count++) {
+      const tab = await b.invoke('tab:create', { url: `${b.url}?favorite=${count}`, active: false });
+      await b.invoke('tab:favorite', { id: tab.id });
+      await expect(b.shell.locator('.space-page .favorite')).toHaveCount(count);
+      const geometry = await b.shell.locator('.space-page .favorites').evaluate((grid) => {
+        const bounds = grid.getBoundingClientRect();
+        return {
+          left: bounds.left,
+          right: bounds.right,
+          tiles: [...grid.querySelectorAll('.favorite')].map((tile) => {
+            const rect = tile.getBoundingClientRect();
+            return { left: rect.left, right: rect.right, top: rect.top, width: rect.width };
+          }),
+        };
+      });
+      const rows = Object.values(Object.groupBy(geometry.tiles, (tile) => Math.round(tile.top)));
+      assert.equal(rows.length, Math.ceil(count / 4));
+      assert(Math.max(...rows.map((row) => row.length)) - Math.min(...rows.map((row) => row.length)) <= 1);
+      for (const row of rows) {
+        assert(Math.abs(row[0].left - geometry.left) < 1);
+        assert(
+          Math.abs(row.at(-1).right - geometry.right) < 1,
+          `Each row fills the available width: ${JSON.stringify({ count, geometry })}`,
+        );
+        assert(
+          row.every((tile) => tile.width >= 36),
+          'Favorite tiles keep usable pointer targets',
+        );
+      }
+      rowsByCount.set(count, geometry.tiles[0].width);
+    }
+    assert(rowsByCount.get(1) > rowsByCount.get(2));
+    assert(rowsByCount.get(2) > rowsByCount.get(3));
+    assert(rowsByCount.get(3) > rowsByCount.get(4));
+    assert(rowsByCount.get(5) > rowsByCount.get(4));
+    await b.invoke('settings:update', { values: { sidebarWidth: 380 } });
+    await expect(b.shell.locator('#sidebar-resizer')).toHaveAttribute('aria-valuenow', '380');
+    const expanded = await b.shell.locator('.space-page .favorite').first().boundingBox();
+    assert(expanded.width > rowsByCount.get(12));
+    const other = await b.invoke('space:create', { name: 'Other Space' });
+    await expect(b.shell.locator('.space-page .favorite')).toHaveCount(12);
+    assert.equal((await b.invoke('state:get')).activeSpaceId, other.id);
+    await b.invoke('profile:create', { name: 'Separate profile' });
+    await expect(b.shell.locator('.space-page .favorite')).toHaveCount(0);
+  },
+);
+
+test(
+  'Today archive controls use the 12-hour default, inherit per profile and persist overrides',
+  { timeout: 45000 },
+  async (t) => {
+    const b = await fixture(t);
+    assert.equal((await b.invoke('state:get')).settings.archiveAfterHours, 12);
+    await b.emit({ type: 'panel', panel: 'settings' });
+    await expect(b.shell.locator('[data-profile-archive="default"]')).toHaveValue('12');
+    await b.shell.locator('[data-profile-archive="default"]').selectOption('24');
+    await expect.poll(async () => (await b.invoke('state:get')).settings.archiveAfterHours).toBe(24);
+    const profile = await b.invoke('profile:create', { name: 'Research' });
+    const control = b.shell.locator(`[data-profile-archive="${profile.id}"]`);
+    await expect(control).toHaveValue('inherit');
+    await control.selectOption('72');
+    await expect
+      .poll(
+        async () =>
+          (await b.invoke('state:get')).profiles.find((item) => item.id === profile.id).archiveAfterHours,
+      )
+      .toBe(72);
+    await b.close();
+    await b.launch();
+    await b.emit({ type: 'panel', panel: 'settings' });
+    await expect(b.shell.locator(`[data-profile-archive="${profile.id}"]`)).toHaveValue('72');
+    await b.shell.getByRole('button', { name: 'Profiles', exact: true }).click();
+    await b.shell.locator(`.dialog [data-profile-archive="${profile.id}"]`).selectOption('inherit');
+    await expect
+      .poll(
+        async () =>
+          (await b.invoke('state:get')).profiles.find((item) => item.id === profile.id).archiveAfterHours,
+      )
+      .toBe(null);
   },
 );

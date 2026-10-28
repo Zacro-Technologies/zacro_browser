@@ -98,11 +98,16 @@ test(
     );
     await invoke('window:material-preview', { clear: true });
     assert.equal((await state()).runtime.windowMaterial.enabled, false);
+    const transparent = await invoke('window:material-preview', { spaceId, opacity: 0 });
+    assert.equal(transparent.requestedOpacity, 0);
+    if (transparent.enabled) assert.equal(transparent.opacity, 0);
+    assert.equal(await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].getOpacity()), 1);
+    await invoke('window:material-preview', { clear: true });
     await invoke('space:update', { id: spaceId, theme: { opacity: 55 } });
     assert.equal((await state()).runtime.windowMaterial.requestedOpacity, 55);
     await invoke('window:material-preview', { spaceId, opacity: 40 });
     const nextSpace = await invoke('space:create', { name: 'Opaque neighbor', theme: { opacity: 100 } });
-    assert.equal((await state()).runtime.windowMaterial.enabled, false);
+    await expect.poll(async () => (await state()).runtime.windowMaterial.enabled).toBe(false);
     await assert.rejects(invoke('window:material-preview', { spaceId, opacity: 40 }), /Space changed/);
     await invoke('space:activate', { id: spaceId });
     assert.equal(
@@ -139,15 +144,10 @@ test(
     await shell.evaluate(
       () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))),
     );
-    // Exercise renderer fallback messages with host status fixtures. These do
+    // Exercise renderer opaque fallback with host status fixtures. These do
     // not pretend to change the user's real operating-system preferences.
     const previewState = await state();
-    for (const [reason, text] of [
-      ['reduced-transparency', 'Reduce Transparency'],
-      ['high-contrast', 'contrast setting'],
-      ['native-error', 'unavailable in this session'],
-      ['unsupported-platform', 'Windows 11 22H2'],
-    ]) {
+    for (const reason of ['reduced-transparency', 'high-contrast', 'native-error', 'unsupported-platform']) {
       const status = structuredClone(previewState);
       status.runtime.windowMaterial = {
         ...status.runtime.windowMaterial,
@@ -161,7 +161,7 @@ test(
         ({ BrowserWindow }, state) => BrowserWindow.getAllWindows()[0].webContents.send('zacro:state', state),
         status,
       );
-      await expect(shell.locator('#window-material-hint')).toContainText(text);
+      await expect(shell.locator('html')).toHaveAttribute('data-window-material', 'opaque');
       assert.equal(
         await shell.evaluate(() => document.documentElement.style.getPropertyValue('--space-opacity')),
         '100%',
@@ -174,5 +174,37 @@ test(
       55,
       'Cancelling the renderer preview restores the saved material',
     );
+    await invoke('space:update', { id: spaceId, theme: { opacity: 100 } });
+    await expect.poll(async () => (await state()).runtime.windowMaterial.requestedOpacity).toBe(100);
+    const lease = { token: 'material-test-first', fromId: spaceId, toId: nextSpace.id, opacity: 0 };
+    await invoke('window:space-material-transition', lease);
+    assert.equal((await state()).runtime.windowMaterial.requestedOpacity, 0);
+    await invoke('space:activate', { id: nextSpace.id });
+    assert.equal(
+      (await state()).runtime.windowMaterial.requestedOpacity,
+      0,
+      'Native material remains available across activation until the visual transition releases it',
+    );
+    await invoke('window:space-material-transition', { ...lease, token: 'material-test-next', opacity: 30 });
+    await invoke('window:space-material-transition', { clear: true, token: lease.token });
+    assert.equal(
+      (await state()).runtime.windowMaterial.requestedOpacity,
+      30,
+      'Stale completion cannot end a newer lease',
+    );
+    await invoke('window:space-material-transition', { clear: true, token: 'material-test-next' });
+    assert.equal((await state()).runtime.windowMaterial.requestedOpacity, 100);
+    await invoke('window:space-material-transition', lease);
+    const third = await invoke('space:create', { name: 'Outside transition', theme: { opacity: 100 } });
+    await expect.poll(async () => (await state()).runtime.windowMaterial.requestedOpacity).toBe(100);
+    await assert.rejects(invoke('window:space-material-transition', lease), /no longer current/);
+    assert.equal((await state()).activeSpaceId, third.id);
+    assert.equal(
+      await app.evaluate(({ webContents }, id) => webContents.fromId(id)?.id, original.id),
+      original.id,
+      'The material lease never replaces website contents',
+    );
+    for (const space of (await state()).spaces)
+      assert.equal(space.theme.opacity, 100, 'Leases never persist');
   },
 );
