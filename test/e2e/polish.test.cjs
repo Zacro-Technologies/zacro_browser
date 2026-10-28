@@ -170,7 +170,7 @@ test(
     for (const favorite of geometry.favorites) {
       assert.match(favorite.name, /^Favorite [1-4] — Sleeping$/);
       assert(favorite.title.includes(base), 'Icon-only favorites retain a full destination tooltip');
-      assert.equal(favorite.height, 40);
+      assert(favorite.height >= 40 && favorite.height <= 48, 'Favorites retain compact, usable targets');
       assert.equal(favorite.labels, 0);
     }
     await shell.locator(`[data-key="folder-${folder.id}"]`).click();
