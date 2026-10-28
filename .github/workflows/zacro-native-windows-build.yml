@@ -189,16 +189,31 @@ jobs:
             'Any produced prototype is unsigned. Google account acceptance remains untested; no live Google authentication is automated.'
           ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
-      - name: Upload only build evidence and SDK receipts
+      - name: Collect explicit SDK and mechanics receipts into the evidence directory
+        if: ${{ always() && env.ZACRO_BUILD_EVIDENCE != '' }}
+        run: |
+          $sdkReceipts = Join-Path $env:ZACRO_TOOLCHAIN_ROOT 'receipts'
+          if (Test-Path -LiteralPath $sdkReceipts -PathType Container) {
+            foreach ($receipt in Get-ChildItem -LiteralPath $sdkReceipts -File -Filter 'provision-*.json') {
+              if ($receipt.Name -notmatch '^provision-[a-f0-9-]{36}\.json$') { continue }
+              if ($receipt.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'SDK evidence must be an ordinary receipt file.' }
+              $name = "sdk-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT-$($receipt.Name)"
+              Copy-Item -LiteralPath $receipt.FullName -Destination (Join-Path $env:ZACRO_BUILD_EVIDENCE $name)
+            }
+          }
+          $mechanics = Join-Path $env:ZACRO_NATIVE_ROOT 'results/mechanics-zacro-native-win32-x64-native-branded.json'
+          if (Test-Path -LiteralPath $mechanics -PathType Leaf) {
+            if ((Get-Item -LiteralPath $mechanics -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Mechanics evidence must be an ordinary receipt file.' }
+            Copy-Item -LiteralPath $mechanics -Destination (Join-Path $env:ZACRO_BUILD_EVIDENCE "mechanics-native-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT.json")
+          }
+
+      - name: Upload only the collected build evidence directory
         uses: actions/upload-artifact@v4
         if: ${{ always() && env.ZACRO_BUILD_EVIDENCE != '' }}
         timeout-minutes: 10
         with:
           name: zacro-native-windows-evidence-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            ${{ env.ZACRO_BUILD_EVIDENCE }}/*.json
-            ${{ env.ZACRO_TOOLCHAIN_ROOT }}/receipts/*.json
-            ${{ env.ZACRO_NATIVE_ROOT }}/results/mechanics-zacro-native-win32-x64-native-branded.json
+          path: ${{ env.ZACRO_BUILD_EVIDENCE }}/*.json
           if-no-files-found: warn
           retention-days: 7
           compression-level: 0

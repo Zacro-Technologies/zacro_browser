@@ -195,7 +195,9 @@ test('hidden ancestors remain usable while nested junctions are rejected', { ski
   assert.notEqual(missing.status, 0);
   assert.match(missing.text, /Run this script with -Download first/);
   const owner = JSON.parse(await fs.readFile(path.join(root, '.zacro-native-toolchain.json'), 'utf8'));
-  assert.equal(owner.root, root);
+  assert.equal(owner.schemaVersion, 1);
+  assert.equal(owner.kind, 'zacro-native-toolchain');
+  assert.equal(await fs.realpath(owner.root), await fs.realpath(root));
 
   const foreign = path.join(directory, 'foreign'),
     junction = path.join(hidden, 'redirect');
@@ -217,7 +219,9 @@ test(
     assert.notEqual(missing.status, 0);
     assert.match(missing.text, /Run this script with -Download first/);
     const owner = JSON.parse(await fs.readFile(path.join(root, '.zacro-native-toolchain.json'), 'utf8'));
-    assert.equal(owner.root, root);
+    assert.equal(owner.schemaVersion, 1);
+    assert.equal(owner.kind, 'zacro-native-toolchain');
+    assert.equal(await fs.realpath(owner.root), await fs.realpath(root));
     const cached = path.join(root, 'installers', manifest.installers[0].file);
     await fs.writeFile(cached, 'corrupt existing bytes');
     const corrupt = invoke('-ExternalRoot', root);
