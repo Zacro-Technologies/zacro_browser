@@ -4,7 +4,7 @@ This is an isolated engine-compatibility experiment for **Windows x64 and macOS 
 
 It does not replace the Electron application, install over another browser, or migrate an existing profile. **No Google sign-in result is established by downloading a browser or passing local fixtures.** See the separate [manual acceptance procedure](docs/MANUAL-ACCEPTANCE.md).
 
-The [native Zacro source-build pipeline](build/NATIVE-BUILD.md) is implemented with a separate Chromium **156.0.8078.48** pin for Windows x64, Mac arm64 and Mac x64. Its actual Windows Chromium source checkout and branding patch are verified; dependency synchronization, compilation and native Zacro execution have not run. The required Windows toolchain installation has not completed. See the [saved source and preflight evidence](evidence/windows-native-source.json). The pipeline does not relabel the upstream binaries below.
+The [native Zacro source-build pipeline](build/NATIVE-BUILD.md) uses a separate Chromium **156.0.8078.48** pin for Windows x64, Mac arm64 and Mac x64. [Source/tooling CI passed on all three platforms](evidence/native-source-ci-b47b74e.json), including the nine-file branding patch. The separate [hosted Windows build](evidence/windows-hosted-build-milestones.json) completed SDK installation, full toolchain preflight, source preparation, dependency synchronization and branding/GN configuration, then started the compiler. That dated progress record does not yet establish a compiled executable or Google acceptance. The [earlier local checkout receipt](evidence/windows-native-source.json) records a different machine whose toolchain was incomplete. The pipeline does not relabel the upstream binaries below.
 
 ## Upstream experiment deliverables
 
@@ -65,11 +65,11 @@ node experiments/google-browser-compat/mechanics.cjs --root ROOT --engine chromi
 node experiments/google-browser-compat/mechanics.cjs --root ROOT --engine brave
 ```
 
-Replace `ROOT` with the same absolute experiment root used for fetching artifacts. In an extracted kit, install optional test dependencies with `npm ci --ignore-scripts`, run its experiment tests with `npm test`, and use `node mechanics.cjs` for that kit's engine. The kit includes the experiment tests, not the existing Electron application's complete suite. Mechanics results belong to `ROOT/results/`; failures or incomplete runs remain failures or incomplete runs, and never populate the human Google acceptance matrix. The prebuilt-kit workflow tests the bare Chromium, workspace and Brave configurations independently. It preserves a failed job even when diagnostic kits can still be assembled. The separate [native source workflow](../../.github/workflows/zacro-native.yml) runs small source/tooling checks on hosted runners; compilation requires explicit dispatch to a provisioned native worker.
+Replace `ROOT` with the same absolute experiment root used for fetching artifacts. In an extracted kit, install optional test dependencies with `npm ci --ignore-scripts`, run its experiment tests with `npm test`, and use `node mechanics.cjs` for that kit's engine. The kit includes the experiment tests, not the existing Electron application's complete suite. Mechanics results belong to `ROOT/results/`; failures or incomplete runs remain failures or incomplete runs, and never populate the human Google acceptance matrix. The prebuilt-kit workflow tests the bare Chromium, workspace and Brave configurations independently. It preserves a failed job even when diagnostic kits can still be assembled. The separate [native source workflow](../../.github/workflows/zacro-native.yml) runs small source/tooling checks on hosted runners and supports explicit compilation on a provisioned worker. A [bounded Windows workflow](../../.github/workflows/zacro-native-windows-build.yml) also attempts compilation after measuring and provisioning its hosted runner.
 
 ## Source-build path and current boundary
 
-For the branded Chromium 156 build, use [NATIVE-BUILD.md](build/NATIVE-BUILD.md). The older `source-plan` command below describes the unmodified Chromium 159 snapshot's source and does not apply Zacro branding.
+For the branded Chromium 156 build, use [NATIVE-BUILD.md](build/NATIVE-BUILD.md). When a CI build produces a package, follow [the native artifact import procedure](docs/NATIVE-ARTIFACT.md) to verify and manually launch it without a local Chromium checkout or compiler. The older `source-plan` command below describes the unmodified Chromium 159 snapshot's source and does not apply Zacro branding.
 
 Print the native source-build plan with:
 
@@ -83,7 +83,7 @@ node experiments/google-browser-compat/cli.cjs source-plan --platform darwin-arm
 
 The recommendation is a thin **full Chromium browser-layer fork**, retaining native browser services and initially the standard native chrome. A later Zacro interface should use native Views/WebUI and typed Mojo interfaces. A source plan, configuration or downloaded upstream artifact is not evidence that this fork has been compiled. Source builds and live account tests have their own gates.
 
-The [saved Windows preflight](evidence/windows-native-source.json) records 31.93 GiB RAM and 152.6 GiB free after the initial source preparation, with the required VS 2026/SDK/debugging tools still unavailable. That free-space margin is not a guarantee that dependencies, compilation and packaging will fit. Mac compilation requires a suitable native Mac environment; hosted source-only checks do not establish that their runner can build Chromium.
+The [initial local Windows preflight](evidence/windows-native-source.json) recorded 31.93 GiB RAM and 152.6 GiB free with missing tools; it is historical local evidence, not the hosted build's status. The [completed hosted source checks](evidence/native-source-ci-b47b74e.json) record each runner's actual resources: Mac arm64 had 42.46 GiB free and 7 GiB RAM, below this project's guards; Mac Intel had 107.29 GiB free and 14 GiB RAM, passing the minimum guards with limited headroom. A successful preflight or source-only check is not proof that a full build will fit or complete.
 
 Existing Zacro also supports **Intel macOS**. The two-platform snapshot assembly does not silently remove that obligation: a separate native Intel build and acceptance gate remains in the migration plan. There is no Mac Intel artifact in this experiment's snapshot matrix.
 
@@ -94,5 +94,7 @@ Existing Zacro also supports **Intel macOS**. The two-platform snapshot assembly
 - [Staged migration and reusable application modules](docs/MIGRATION.md)
 - [Platform distribution, storage, updates and rollback](docs/DISTRIBUTION.md)
 - [Manual acceptance and platform-specific results](docs/MANUAL-ACCEPTANCE.md)
+- [Verify and launch a native CI artifact](docs/NATIVE-ARTIFACT.md)
+- [Saved execution evidence and limits](evidence/README.md)
 
 Google website sessions, third-party OAuth callbacks, FedCM, Chrome Sync and Google API keys are separate concerns. External-browser fallback remains available in the existing application, but it does not authenticate Google websites inside Zacro. This experiment claims neither Google certification nor production readiness.

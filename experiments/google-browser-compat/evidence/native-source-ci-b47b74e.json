@@ -1,0 +1,152 @@
+{
+  "schemaVersion": 1,
+  "kind": "completed-native-source-ci-observation",
+  "observedAt": "2026-10-28T18:24:07Z",
+  "run": {
+    "id": 40742047074,
+    "url": "https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40742047074",
+    "headRevision": "b47b74e742f9d1385c8222436d66295bbf67a13b",
+    "conclusion": "success",
+    "completedAt": "2026-10-28T18:11:33Z"
+  },
+  "sourceVersion": "156.0.8078.48",
+  "sourceRevision": "d0c02bfad08ec92a6ffcf989e53cd995e6381a4c",
+  "brandingPatchSha256": "96b0e95da0b7ed44e728299a0926d5e34f6f06a4ad4158d4547817718126c005",
+  "platforms": [
+    {
+      "platform": "win32-x64",
+      "jobId": 123005931110,
+      "jobUrl": "https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40742047074/job/123005931110",
+      "conclusion": "success",
+      "tests": {
+        "tests": 121,
+        "pass": 116,
+        "fail": 0,
+        "skipped": 5
+      },
+      "patch": {
+        "checkedAt": "2026-10-28T18:07:44.087Z",
+        "selectedUpstreamFilesVerified": 9,
+        "forwardApply": "passed",
+        "reverseApplyCheck": "passed",
+        "outputHashes": "passed",
+        "fullCheckoutRevisionVerified": false
+      },
+      "preflight": {
+        "observedAt": "2026-10-28T18:07:06.804Z",
+        "node": "24.22.1",
+        "osRelease": "10.0.26100",
+        "logicalCpus": 4,
+        "ramGiB": 15.99,
+        "freeGiB": 146.98,
+        "fileSystem": "NTFS",
+        "visualStudioVersions": ["18.11.12315.225"],
+        "sdkIncludeDirectories": ["10.0.26100.0"],
+        "debuggingTools": "10.0.26100.9457",
+        "sourceBuild": {
+          "ready": false,
+          "blockers": [
+            "Windows SDK headers for 10.0.28000.0 or newer were not found. Required SDK release is 10.0.28000.2270."
+          ],
+          "warnings": [
+            "Less than 200 GiB free: toolchain installation, dependencies and outputs may exceed the remaining headroom.",
+            "Less than 32 GiB RAM: linking and local compile throughput may be constrained."
+          ]
+        }
+      }
+    },
+    {
+      "platform": "darwin-arm64",
+      "jobId": 123005931051,
+      "jobUrl": "https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40742047074/job/123005931051",
+      "conclusion": "success",
+      "tests": {
+        "tests": 121,
+        "pass": 114,
+        "fail": 0,
+        "skipped": 7
+      },
+      "patch": {
+        "checkedAt": "2026-10-28T18:09:54.376Z",
+        "selectedUpstreamFilesVerified": 9,
+        "forwardApply": "passed",
+        "reverseApplyCheck": "passed",
+        "outputHashes": "passed",
+        "fullCheckoutRevisionVerified": false
+      },
+      "preflight": {
+        "observedAt": "2026-10-28T18:09:47.407Z",
+        "node": "24.20.0",
+        "osRelease": "24.6.0",
+        "logicalCpus": 3,
+        "ramGiB": 7,
+        "freeGiB": 42.46,
+        "fileSystem": "apfs",
+        "xcode": "Xcode 16.4\nBuild version 16F6",
+        "macSdk": "15.5",
+        "sourceBuild": {
+          "ready": false,
+          "blockers": [
+            "Available disk is below the experiment source-checkout guard of 100 GiB.",
+            "Available RAM is below the experiment source-build guard of 8 GiB."
+          ],
+          "warnings": [
+            "Less than 200 GiB free: toolchain installation, dependencies and outputs may exceed the remaining headroom.",
+            "Less than 32 GiB RAM: linking and local compile throughput may be constrained.",
+            "SDK differs from Chromium 156 official SDK 26.5 / 25F70; minimum SDK 15 still applies."
+          ]
+        }
+      }
+    },
+    {
+      "platform": "darwin-x64",
+      "jobId": 123005930425,
+      "jobUrl": "https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40742047074/job/123005930425",
+      "conclusion": "success",
+      "tests": {
+        "tests": 121,
+        "pass": 114,
+        "fail": 0,
+        "skipped": 7
+      },
+      "patch": {
+        "checkedAt": "2026-10-28T18:11:26.366Z",
+        "selectedUpstreamFilesVerified": 9,
+        "forwardApply": "passed",
+        "reverseApplyCheck": "passed",
+        "outputHashes": "passed",
+        "fullCheckoutRevisionVerified": false
+      },
+      "preflight": {
+        "observedAt": "2026-10-28T18:11:12.553Z",
+        "node": "24.19.0",
+        "osRelease": "24.6.0",
+        "logicalCpus": 4,
+        "ramGiB": 14,
+        "freeGiB": 107.29,
+        "fileSystem": "apfs",
+        "xcode": "Xcode 16.4\nBuild version 16F6",
+        "macSdk": "15.5",
+        "sourceBuild": {
+          "ready": true,
+          "blockers": [],
+          "warnings": [
+            "Less than 200 GiB free: toolchain installation, dependencies and outputs may exceed the remaining headroom.",
+            "Less than 32 GiB RAM: linking and local compile throughput may be constrained.",
+            "SDK differs from Chromium 156 official SDK 26.5 / 25F70; minimum SDK 15 still applies."
+          ]
+        }
+      }
+    }
+  ],
+  "boundary": {
+    "referenceFilesPerPlatform": 9,
+    "fullSourceCheckout": false,
+    "dependencySync": false,
+    "compiled": false,
+    "browserExecuted": false,
+    "compileJob": "skipped",
+    "googleAcceptance": "untested",
+    "resourceMeasurements": "Observed on each named job before reference-file fetching; these are not capacity guarantees for another runner or a full build."
+  }
+}

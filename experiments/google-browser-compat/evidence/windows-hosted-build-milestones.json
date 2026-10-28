@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "kind": "hosted-native-build-milestone-observation",
+  "observedAt": "2026-10-28T18:25:05Z",
+  "run": {
+    "id": 40742047125,
+    "url": "https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40742047125",
+    "jobId": 123005931432,
+    "headRevision": "b47b74e742f9d1385c8222436d66295bbf67a13b",
+    "statusAtObservation": "in_progress"
+  },
+  "platform": "win32-x64",
+  "sourceVersion": "156.0.8078.48",
+  "sourceRevision": "d0c02bfad08ec92a6ffcf989e53cd995e6381a4c",
+  "completedMilestones": [
+    "Native resources and existing Visual Studio checked",
+    "Pinned SDK bootstrapper downloaded and verified",
+    "Pinned Windows SDK installed without replacing Visual Studio",
+    "Full native toolchain preflight passed",
+    "Exact Chromium and depot revisions prepared",
+    "Pinned native dependencies synchronized and actual revisions recorded",
+    "Reviewed Zacro branding applied and GN configuration generated",
+    "Compiler time budget checked with time reserved for fixtures and packaging"
+  ],
+  "activeStepAtObservation": "Compile the full native browser with four local jobs",
+  "boundary": {
+    "compilation": "started; completion not established at observation",
+    "compiledExecutable": "not-established-at-observation",
+    "nativeBrowserExecution": "not-established-at-observation",
+    "googleAcceptance": "untested",
+    "scope": "Hosted runner only; does not alter or certify the local Windows toolchain. Later completion or failure must be read from the linked run and its output receipts."
+  }
+}

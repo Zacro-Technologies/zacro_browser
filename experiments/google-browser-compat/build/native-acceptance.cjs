@@ -51,6 +51,9 @@ const HELP = `Native Zacro acceptance (no browser or account automation)
   --platform PLATFORM --check CHECK --result RESULT --reason REASON
     --human-observed [--root ABSOLUTE_PATH]
     Record only a check a human actually performed on that complete runtime.
+  Add --artifact SHA to either platform command to use an already imported
+    artifact. Its complete runtime is verified without a local source build.
+    Imported evidence is separate and explicitly records locallyCompiled:false.
 
 Platforms: ${PLATFORMS.join(', ')}
 Checks: ${CHECKS.join(', ')}
@@ -59,8 +62,9 @@ Reasons: ${[...new Set([...UNTESTED_REASONS, ...FAILURE_REASONS, ...NA_REASONS, 
 
 The password step means only that entering the identifier reached a password
 field. It does not establish sign-in, Gmail, Drive or persistence acceptance.
-Observed results require a matching compiled native build receipt. Receipts
-identify artifacts, not successful authentication. New runtime hashes start
+Observed results require a matching compiled native build receipt or a verified
+imported compiled runtime. Unsigned import receipts do not authenticate CI origin.
+Receipts identify artifacts, not successful authentication. New runtime hashes start
 untested. Templates need no receipt and cannot contain observed results.
 No emails, URLs, account identifiers, credentials or free-text notes are accepted.
 `;
@@ -118,16 +122,47 @@ async function verifyBrandingPatch() {
 }
 
 function validateArtifact(artifact) {
+  const imported =
+    artifact !== null && typeof artifact === 'object' && Object.hasOwn(artifact, 'importedArtifactSha256');
+  const keys = ['platform', 'executableSha256', 'runtimeSha256'];
+  if (imported) keys.push('importedArtifactSha256', 'locallyCompiled');
   if (
-    !exactKeys(artifact, ['platform', 'executableSha256', 'runtimeSha256']) ||
+    !exactKeys(artifact, keys) ||
     !PLATFORMS.includes(artifact.platform) ||
     typeof artifact.executableSha256 !== 'string' ||
     !SHA256.test(artifact.executableSha256) ||
     typeof artifact.runtimeSha256 !== 'string' ||
-    !SHA256.test(artifact.runtimeSha256)
+    !SHA256.test(artifact.runtimeSha256) ||
+    (imported &&
+      (typeof artifact.importedArtifactSha256 !== 'string' ||
+        !SHA256.test(artifact.importedArtifactSha256) ||
+        artifact.locallyCompiled !== false))
   )
     throw new Error('Invalid native runtime identity.');
   return artifact;
+}
+
+function artifactFromImport(verified, platform, requestedSha256) {
+  const artifact = artifactFromReceipt(verified?.buildReceipt, platform);
+  const imported = verified?.imported;
+  if (
+    typeof requestedSha256 !== 'string' ||
+    !SHA256.test(requestedSha256) ||
+    !imported ||
+    imported.schemaVersion !== 1 ||
+    imported.kind !== 'zacro-imported-native-artifact' ||
+    imported.artifactId !== requestedSha256 ||
+    imported.archiveSha256 !== requestedSha256 ||
+    imported.locallyCompiled !== false ||
+    imported.sourceBuildReported !== true ||
+    imported.googleAcceptance !== 'untested' ||
+    imported.platform !== platform ||
+    imported.runtimeSha256 !== artifact.runtimeSha256 ||
+    imported.executableSha256 !== artifact.executableSha256 ||
+    Object.entries(sourcePins()).some(([key, value]) => imported[key] !== value)
+  )
+    throw new Error('Verified import does not identify the selected compiled native runtime.');
+  return validateArtifact({ ...artifact, importedArtifactSha256: requestedSha256, locallyCompiled: false });
 }
 
 function artifactFromReceipt(receipt, platform) {
@@ -275,9 +310,21 @@ function validateSelection({ platform, check, result, reason, humanObserved = fa
 }
 
 function recordResult(matrix, receipt, selection, now = new Date().toISOString()) {
+  return applyObservation(matrix, artifactFromReceipt(receipt, selection.platform), selection, now);
+}
+
+function recordImportedResult(matrix, verified, selection, now = new Date().toISOString()) {
+  return applyObservation(
+    matrix,
+    artifactFromImport(verified, selection.platform, selection.artifact),
+    selection,
+    now,
+  );
+}
+
+function applyObservation(matrix, artifact, selection, now) {
   validateMatrix(matrix);
   validateSelection(selection);
-  const artifact = artifactFromReceipt(receipt, selection.platform);
   if (!isDeepStrictEqual(matrix.artifact, artifact))
     throw new Error('This report belongs to another runtime. Initialize the new artifact separately.');
   const next = structuredClone(matrix);
@@ -297,13 +344,14 @@ function recordResult(matrix, receipt, selection, now = new Date().toISOString()
 function reportBasename(artifact = null) {
   if (artifact !== null) validateArtifact(artifact);
   const pins = sourcePins();
-  const base = `native-${pins.sourceVersion}-${pins.brandingPatchSha256.slice(0, 12)}`;
-  return `${base}${artifact ? `-${artifact.platform}-${artifact.runtimeSha256}` : ''}.json`;
+  const imported = artifact?.importedArtifactSha256;
+  const base = `native${imported ? '-import' : ''}-${pins.sourceVersion}-${pins.brandingPatchSha256.slice(0, 12)}`;
+  return `${base}${artifact ? `-${artifact.platform}-${artifact.runtimeSha256}` : ''}${imported ? `-${imported}` : ''}.json`;
 }
 
 function parseArguments(argv) {
   const result = {};
-  const values = new Set(['root', 'platform', 'check', 'result', 'reason']);
+  const values = new Set(['root', 'platform', 'artifact', 'check', 'result', 'reason']);
   for (let index = 0; index < argv.length; index++) {
     const arg = argv[index];
     const key = arg.startsWith('--') ? arg.slice(2) : '';
@@ -321,6 +369,11 @@ function parseArguments(argv) {
     } else
       throw new Error('Unknown or incomplete option. Account data and free-text notes are not accepted.');
   }
+  if (
+    result.artifact !== undefined &&
+    (!SHA256.test(result.artifact) || !PLATFORMS.includes(result.platform))
+  )
+    throw new Error('--artifact requires a complete lowercase SHA-256 and a declared platform.');
   if (result.help) {
     if (Object.keys(result).length !== 1) throw new Error('--help must be used alone.');
   } else if (result.init) {
@@ -347,7 +400,13 @@ async function main(argv) {
   const root = await ensureRoot(args.root);
   let receipt = null;
   let artifact = null;
-  if (args.platform !== undefined) {
+  let verifiedImport = null;
+  if (args.artifact !== undefined) {
+    // This API rechecks the imported payload, receipts and full runtime inventory.
+    // It does not compile, launch or synthesize a local source-build receipt.
+    verifiedImport = await require('./native-artifact.cjs').verifyImported({ root, artifact: args.artifact });
+    artifact = artifactFromImport(verifiedImport, args.platform, args.artifact);
+  } else if (args.platform !== undefined) {
     receipt = await readSmallJSON(
       root,
       path.join(root, 'native-builds', sourcePins().sourceVersion, args.platform, 'build.json'),
@@ -374,7 +433,10 @@ async function main(argv) {
       if (error.code !== 'ENOENT') throw error;
       matrix = emptyMatrix(artifact);
     }
-    if (!args.init) matrix = recordResult(matrix, receipt, args);
+    if (!args.init)
+      matrix = verifiedImport
+        ? recordImportedResult(matrix, verifiedImport, args)
+        : recordResult(matrix, receipt, args);
     if (!args.init || !existing) {
       temporary = await assertContained(root, `${target}.${randomUUID()}.tmp`);
       const output = await fs.open(temporary, 'wx', 0o600);
@@ -414,9 +476,11 @@ module.exports = {
   sourcePins,
   verifyBrandingPatch,
   artifactFromReceipt,
+  artifactFromImport,
   emptyMatrix,
   validateMatrix,
   recordResult,
+  recordImportedResult,
   reportBasename,
   parseArguments,
   main,

@@ -13,9 +13,11 @@ const {
   sourcePins,
   verifyBrandingPatch,
   artifactFromReceipt,
+  artifactFromImport,
   emptyMatrix,
   validateMatrix,
   recordResult,
+  recordImportedResult,
   reportBasename,
   parseArguments,
   main,
@@ -28,6 +30,8 @@ const HASH = 'a'.repeat(64);
 const NEXT_HASH = 'b'.repeat(64);
 const ENGINE_HASH = 'c'.repeat(64);
 const NEXT_ENGINE_HASH = 'd'.repeat(64);
+const ARCHIVE_HASH = 'e'.repeat(64);
+const OTHER_ARCHIVE_HASH = 'f'.repeat(64);
 const digestInventory = (files) => createHash('sha256').update(JSON.stringify(files)).digest('hex');
 const RUNTIME_HASH = receipt().runtimeSha256;
 const NEXT_RUNTIME_HASH = receipt('win32-x64', HASH, NEXT_ENGINE_HASH).runtimeSha256;
@@ -72,6 +76,29 @@ function receipt(platform = 'win32-x64', executableSha256 = HASH, engineSha256 =
     runtimeSha256: digestInventory(files),
     files,
     compiled: true,
+  };
+}
+
+function verifiedImport(build = receipt(), archive = ARCHIVE_HASH) {
+  return {
+    directory: 'private-import-directory',
+    executable: 'private-executable-path',
+    buildReceipt: build,
+    imported: {
+      schemaVersion: 1,
+      kind: 'zacro-imported-native-artifact',
+      ...sourcePins(),
+      platform: build.platform,
+      artifactId: archive,
+      archiveSha256: archive,
+      runtimeSha256: build.runtimeSha256,
+      executableSha256: build.executableSha256,
+      locallyCompiled: false,
+      sourceBuildReported: true,
+      googleAcceptance: 'untested',
+      ciRunUrl: 'https://github.com/fixture/repository/actions/runs/123',
+      ciProvenance: 'operator-supplied; unsigned receipts do not authenticate the CI origin',
+    },
   };
 }
 
@@ -406,4 +433,154 @@ test('an exclusive record lock prevents overwriting another writer or its existi
   await assert.rejects(main(recordArgs(root)), { code: 'EEXIST' });
   assert.equal(await fs.readFile(initial.target, 'utf8'), before);
   assert.equal(await fs.readFile(`${initial.target}.lock`, 'utf8'), 'other-run');
+});
+
+test('imported acceptance records hash identity without local compilation or private import metadata', () => {
+  for (const platform of PLATFORMS) {
+    const verified = verifiedImport(receipt(platform));
+    const artifact = artifactFromImport(verified, platform, ARCHIVE_HASH);
+    assert.deepEqual(artifact, {
+      platform,
+      executableSha256: HASH,
+      runtimeSha256: verified.buildReceipt.runtimeSha256,
+      importedArtifactSha256: ARCHIVE_HASH,
+      locallyCompiled: false,
+    });
+    const template = emptyMatrix(artifact, NOW);
+    const selection = { ...passed, platform, artifact: ARCHIVE_HASH };
+    const result = recordImportedResult(template, verified, selection, LATER);
+    assert.equal(result.observations.filter((row) => row.result === 'passed').length, 1);
+    assert.equal(
+      result.observations.find((row) => row.platform === platform && row.check === 'direct-google-login')
+        .result,
+      'untested',
+    );
+    assert.doesNotMatch(
+      JSON.stringify(result),
+      /private-import|private-executable|ciRunUrl|fixture\/repository|sourceBuildReported/u,
+    );
+    assert.notEqual(
+      reportBasename(artifact),
+      reportBasename(artifactFromReceipt(verified.buildReceipt, platform)),
+    );
+    assert.ok(reportBasename(artifact).includes(artifact.runtimeSha256));
+    assert.ok(reportBasename(artifact).endsWith(`-${ARCHIVE_HASH}.json`));
+    assert.throws(
+      () => recordImportedResult(template, verified, { ...selection, humanObserved: false }, LATER),
+      /human-observed/u,
+    );
+    assert.throws(() => recordResult(template, verified.buildReceipt, selection, LATER), /another runtime/u);
+    const local = emptyMatrix(artifactFromReceipt(verified.buildReceipt, platform), NOW);
+    assert.throws(() => recordImportedResult(local, verified, selection, LATER), /another runtime/u);
+    const other = verifiedImport(verified.buildReceipt, OTHER_ARCHIVE_HASH);
+    assert.throws(
+      () => recordImportedResult(template, other, { ...selection, artifact: OTHER_ARCHIVE_HASH }, LATER),
+      /another runtime/u,
+    );
+  }
+});
+
+test('import acceptance rejects unbuilt, mismatched or falsely local provenance', () => {
+  for (const update of [
+    (value) => {
+      value.buildReceipt.compiled = false;
+    },
+    (value) => {
+      value.imported.locallyCompiled = true;
+    },
+    (value) => {
+      value.imported.sourceBuildReported = false;
+    },
+    (value) => {
+      value.imported.googleAcceptance = 'passed';
+    },
+    (value) => {
+      value.imported.artifactId = OTHER_ARCHIVE_HASH;
+    },
+    (value) => {
+      value.imported.archiveSha256 = OTHER_ARCHIVE_HASH;
+    },
+    (value) => {
+      value.imported.runtimeSha256 = '0'.repeat(64);
+    },
+    (value) => {
+      value.imported.executableSha256 = NEXT_HASH;
+    },
+    (value) => {
+      value.imported.sourceRevision = '0'.repeat(40);
+    },
+    (value) => {
+      value.imported.platform = 'darwin-arm64';
+    },
+  ]) {
+    const invalid = verifiedImport();
+    update(invalid);
+    assert.throws(() => artifactFromImport(invalid, 'win32-x64', ARCHIVE_HASH));
+  }
+  const artifact = artifactFromImport(verifiedImport(), 'win32-x64', ARCHIVE_HASH);
+  assert.throws(() => emptyMatrix({ ...artifact, locallyCompiled: true }, NOW));
+  assert.throws(() => emptyMatrix({ ...artifact, ciRunUrl: 'private-input' }, NOW));
+  assert.throws(() => artifactFromImport(verifiedImport(), 'win32-x64', OTHER_ARCHIVE_HASH));
+});
+
+test('artifact CLI requires full hash and platform while preserving existing source-build options', () => {
+  assert.equal(
+    parseArguments(['--init', '--platform', 'win32-x64', '--artifact', ARCHIVE_HASH]).artifact,
+    ARCHIVE_HASH,
+  );
+  assert.equal(
+    parseArguments([...recordArgs('fixture-root'), '--artifact', ARCHIVE_HASH]).artifact,
+    ARCHIVE_HASH,
+  );
+  for (const values of [
+    ['--init', '--artifact', ARCHIVE_HASH],
+    ['--init', '--platform', 'win32-x64', '--artifact', ARCHIVE_HASH.slice(0, 12)],
+    ['--init', '--platform', 'win32-x64', '--artifact', 'private-input'],
+    ['--init', '--platform', 'win32-x64', '--artifact', ARCHIVE_HASH.toUpperCase()],
+    ['--init', '--platform', 'win32-x64', '--artifact', ARCHIVE_HASH, '--artifact', OTHER_ARCHIVE_HASH],
+  ])
+    assert.throws(() => parseArguments(values));
+  assert.deepEqual(parseArguments(['--init']), { init: true });
+});
+
+test('artifact CLI calls read-only verification for each observation and never creates or falls back to a local build', async (t) => {
+  const temporary = await scratch(t);
+  const root = await ensureRoot(path.join(temporary, 'owned'));
+  const importer = require('../build/native-artifact.cjs');
+  const calls = [];
+  let available = true;
+  t.mock.method(importer, 'verifyImported', async (args) => {
+    calls.push(args);
+    if (!available) throw new Error('Imported runtime verification failed.');
+    return verifiedImport();
+  });
+  const init = ['--root', root, '--init', '--platform', 'win32-x64', '--artifact', ARCHIVE_HASH];
+  const initial = await main(init);
+  assert.ok(initial.matrix.observations.every((row) => row.result === 'untested'));
+  assert.equal(initial.matrix.artifact.locallyCompiled, false);
+  const recorded = await main([...recordArgs(root), '--artifact', ARCHIVE_HASH]);
+  assert.equal(recorded.target, initial.target);
+  assert.equal(recorded.matrix.observations.filter((row) => row.result === 'passed').length, 1);
+  assert.deepEqual(calls, [
+    { root, artifact: ARCHIVE_HASH },
+    { root, artifact: ARCHIVE_HASH },
+  ]);
+  await assert.rejects(fs.access(path.join(root, 'native-builds')), { code: 'ENOENT' });
+  const before = await fs.readFile(recorded.target, 'utf8');
+  // A valid local receipt must not rescue a missing/tampered selected import.
+  await writeReceipt(root);
+  const local = await main(['--root', root, '--init', '--platform', 'win32-x64']);
+  assert.notEqual(local.target, recorded.target);
+  available = false;
+  await assert.rejects(
+    main([...recordArgs(root, 'gmail'), '--artifact', ARCHIVE_HASH]),
+    /verification failed/u,
+  );
+  assert.equal(await fs.readFile(recorded.target, 'utf8'), before);
+  assert.ok(
+    (await main(['--root', root, '--init', '--platform', 'win32-x64'])).matrix.observations.every(
+      (row) => row.result === 'untested',
+    ),
+  );
+  assert.equal(calls.length, 3);
 });
