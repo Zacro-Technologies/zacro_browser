@@ -1,4 +1,4 @@
-"""Build the eight-page 0.8 guide after final application captures are approved.
+"""Build the eight-page 0.9 guide after final application captures are approved.
 
 Requires ReportLab and Pillow; both are included in the Codex workspace runtime.
 Run from any directory: python scripts/create-feature-guide.py
@@ -19,28 +19,28 @@ from reportlab.platypus import Paragraph
 ROOT = Path(__file__).resolve().parents[1]
 PAGES = [
     ("workspace.jpg", "01 / THE WORKSPACE", "A place for everything.",
-     "Profile-wide Favorites sit above saved Space pins, folders and ordinary tabs. The saved destination "
-     "survives navigation and closing. Click a Favorite icon or pin favicon to return home; Replace Pin "
-     "deliberately saves the current page. Drag between the three regions to reorganize a live tab."),
+     "Balanced profile-wide Favorites sit above saved Space pins and Today tabs. The saved destination "
+     "survives navigation and closing. A slash marks a navigated pin; its favicon returns home. Replace Pin "
+     "saves the current page. Today tabs archive after 12 idle hours by default, with per-profile controls."),
     ("library-menu.jpg", "02 / LIBRARY", "Choose where to go.",
      "Library first offers named destinations in a compact menu. Arrow keys, typeahead and Escape keep "
      "it usable without a pointer. Opening the chooser leaves the live page visible, without capturing "
      "or changing its rendering scale."),
     ("library.jpg", "03 / BROWSER PANELS", "One continuous window.",
-     "A single title chooser replaces the crowded section strip. Search, flat rows and date groups keep "
+     "A borderless panel shares the window material. Search, flat rows and date groups keep "
      "saved resources easy to scan. Drag either rail edge to resize, or focus the separator and use "
      "arrow keys. Native page bounds follow the change without reloading."),
     ("palette.jpg", "04 / KEYBOARD WORKFLOW", "Find it. Then act.",
      "Find tabs, folders, Spaces, bookmarks, history and commands. Tab opens a result's actions and "
      "destination choices; Escape steps back. A configured site keyword followed by Tab enters Site Search. "
-     "The palette opens without inserting a blank tab and blurs only the existing page frame."),
+     "The palette casts a layered shadow without blurring, dimming or changing the page underneath."),
     ("space-theme.jpg", "05 / PERSONALIZATION", "Make room for your world.",
-     "Choose from 38 searchable Space icons, two colors, gradient blend, grain and window tint opacity. "
-     "Supported systems use desktop acrylic or behind-window vibrancy; blur strength follows the OS. "
+     "Choose from 38 Space icons, circular color swatches, grain from 0-200 and window tint from 0-100. "
+     "Space colors blend with swipe progress. Supported systems use acrylic or vibrancy with OS blur. "
      "Text and webpages remain opaque. Accessibility preferences can force opaque chrome."),
     ("peek.jpg", "06 / PEEK", "Follow a link, stay here.",
-     "Shift-click a link to open Peek. Promote it to a full tab without replacing its document, or dismiss "
-     "it to return to the original page. Trusted ordinary links from a saved pin to another hostname can "
+     "Shift-click a link to open Peek. Its 180ms entrance and 120ms exit move the live page without scaling. Promote "
+     "it without replacing the document, or dismiss it to return. Links from a saved pin to another hostname can "
      "also Peek; forms, redirects and explicit window semantics retain native behavior."),
     ("dark.jpg", "07 / DARK APPEARANCE", "Selection you can see.",
      "Selected rows and command results have a distinct fill, outline and accent edge. Focus remains "
@@ -62,9 +62,9 @@ def build(screenshots, output):
     width, height = 792, 612  # US Letter, landscape; one intact screenshot per page.
     margin = 32
     doc = canvas.Canvas(str(output), pagesize=(width, height), pageCompression=1)
-    doc.setTitle("Zacro 0.8 - Design and Feature Guide")
+    doc.setTitle("Zacro 0.9 - Design and Feature Guide")
     doc.setAuthor("Zacro Technologies")
-    doc.setSubject("Zacro 0.8 native materials, resizable Library, saved pins, command workflows and Peek")
+    doc.setSubject("Zacro 0.9 balanced Favorites, Space pins, Today archive, continuous themes and Peek motion")
     body = ParagraphStyle(
         "caption", fontName="Helvetica", fontSize=9, leading=12,
         textColor=HexColor("#5f5661"), spaceAfter=0,
@@ -79,7 +79,7 @@ def build(screenshots, output):
 
         doc.setFont("Helvetica-Bold", 8)
         doc.setFillColor(muted)
-        doc.drawString(margin, height - 27, "ZACRO / INTERFACE 0.8")
+        doc.drawString(margin, height - 27, "ZACRO / INTERFACE 0.9")
         doc.drawRightString(width - margin, height - 27, label)
         doc.setFont("Helvetica", 23)
         doc.setFillColor(ink)
@@ -121,10 +121,10 @@ def build(screenshots, output):
 
 if __name__ == "__main__":
     parser = ArgumentParser(description=__doc__)
-    parser.add_argument("--screenshots", type=Path, default=ROOT / "docs/screenshots/0.8")
+    parser.add_argument("--screenshots", type=Path, default=ROOT / "docs/screenshots/0.9")
     parser.add_argument(
         "--output", type=Path,
-        default=ROOT / "output/pdf/Zacro-0.8-Design-and-Feature-Guide.pdf",
+        default=ROOT / "output/pdf/Zacro-0.9-Design-and-Feature-Guide.pdf",
     )
     args = parser.parse_args()
     build(args.screenshots.resolve(), args.output.resolve())

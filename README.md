@@ -2,7 +2,7 @@
 
 **The next chapter of Arc-inspired browsing. Built on Chromium.**
 
-Zacro Browser is an open-source browser by Zacro Technologies, built from scratch on Chromium to bring the experience we love about Arc into a new home. A sidebar that keeps everything in reach. Spaces that separate your worlds. A command bar that lets you move at the speed you think.
+Zacro Browser is an open-source browser by Zacro Technologies, built with Electron and Chromium to bring the experience we love about Arc into a new home. A sidebar that keeps everything in reach. Spaces that separate your worlds. A command bar that lets you move at the speed you think.
 
 Our ambition is to become the new home for Arc users: familiar in the ways that matter, shaped by the people who use it, and built to keep evolving.
 
@@ -10,7 +10,7 @@ Zacro is an independent project, not an official continuation of Arc or an affil
 
 ## Project status
 
-**Desktop development preview · 0.8.** This repository contains a runnable Chromium browser built with Electron, with Windows 11 x64 and native macOS integration for Apple silicon and Intel. It includes real page rendering, sandboxed tabs, Spaces, separate profiles, Peek, split view, local session recovery, library panels, compatible unpacked extensions, and six optional AI connections: ChatGPT subscription, Claude subscription, OpenAI API, Claude API, OpenRouter, and OpenAI-compatible servers. Version 0.8 adds native window translucency, resizable chrome, a compact Library chooser, profile-wide Favorites, saved Space pins, Shift-click Peek, richer commands and editable site searches. See the [validation record](docs/VALIDATION.md) and [Mac support boundary](docs/MACOS.md) for exact test evidence and remaining release checks.
+**Desktop development preview · 0.9.** This repository contains a runnable Chromium browser built with Electron, with Windows 11 x64 and native macOS integration for Apple silicon and Intel. It includes real page rendering, sandboxed tabs, Spaces, separate profiles, Peek, split view, local session recovery, library panels, compatible unpacked extensions, and six optional AI connections: ChatGPT subscription, Claude subscription, OpenAI API, Claude API, OpenRouter, and OpenAI-compatible servers. Version 0.9 corrects the tab lifecycle and interaction details: balanced Favorite tiles, navigated-pin markers, a 12-hour Today archive default with profile controls, continuously blended Space colors, an unblurred command palette and coordinated Peek motion. The [Arc behavior study](docs/ARC-BEHAVIOR-STUDY.md) records the reference evidence and design decisions. See the [validation record](docs/VALIDATION.md) and [Mac support boundary](docs/MACOS.md) for exact test evidence and remaining release checks.
 
 This is **not yet a complete implementation of the vision or a commercial release**. Zacro account sync, full Chrome extension compatibility and `chrome.storage.sync`, consequential browser agents, signed automatic updates, and operational/security release gates remain open. AI connection code and controlled-transport tests are implemented; live subscription sign-in, API model access, billing/limits and inference acceptance remain pending with user-authorized accounts. The [implementation roadmap](docs/ROADMAP.md) separates working features from required release work; [AI documentation](docs/AI.md) describes the connection and data boundaries.
 
@@ -18,13 +18,45 @@ Navigation and the address field live in the sidebar. Profile-wide icon Favorite
 
 The command workflow opens a palette in an empty Space instead of creating a blank tab. New Tab and **Ctrl/Command + T** open that palette; submitting an address or search creates the page. Tab on a result opens relevant actions and destination choices; Escape steps back. Search folders, reset or replace pins, and use a configured site keyword followed by Tab to search that site. Site-search shortcuts are editable. The shortcut editor, Space keys and recent-tab switching remain available.
 
-Choose from 38 searchable Space icons, two colors, gradient balance, grain and window tint opacity with a live preview. Native acrylic on Windows 11 22H2+ and behind-window vibrancy on macOS show blurred desktop content through the chrome; text and webpages stay opaque. The operating system controls blur strength, with opaque accessibility and platform fallbacks. Sideways gestures reveal the next Space's actual favorites, folders and tabs until release. Right-click a footer Space icon, or use Shift+F10, for its actions. The sidebar and browser panels share a 220ms ease at Balanced speed, with no spring overshoot. Library first offers named destinations, then opens a flat, searchable panel using the window material. Its edge and the sidebar edge resize by dragging or keyboard, preserving the live page at its original rendering scale. Windows as small as **560 × 420** logical pixels are supported; panels temporarily make room by hiding the sidebar while retaining its saved preference.
+Choose from 38 searchable Space icons, two colors, gradient balance, grain from 0–200 and window tint opacity from 0–100 with a live preview. Native acrylic on Windows 11 22H2+ and behind-window vibrancy on macOS show blurred desktop content through the chrome; text and webpages stay opaque. The operating system controls blur strength, with opaque accessibility and platform fallbacks. Sideways gestures reveal the next Space's actual favorites, folders and tabs while both theme colors, grain and tint follow the swipe. Reversing or canceling unwinds the same transition. Right-click a footer Space icon, or use Shift+F10, for its actions. The sidebar and browser panels share a 220ms ease at Balanced speed, with no spring overshoot. Library first offers named destinations, then opens a flat, searchable panel using the window material. Its edge and the sidebar edge resize by dragging or keyboard, preserving the live page at its original rendering scale. Windows as small as **560 × 420** logical pixels are supported; panels temporarily make room by hiding the sidebar while retaining its saved preference.
 
 The welcome tour explains the keyboard workflow, including **Command/Ctrl+S** to toggle the sidebar. Every shortcut it displays can be edited directly on that slide. Focus the sidebar with **Command/Ctrl+Alt+S**, use arrows to navigate tabs and folders, and open row actions with Shift+F10. **F10** opens the browser menu on Windows; macOS has native menu routes. The toolbar no longer includes the sidebar-toggle button or the top-left application mark. Favorites retain accessible state labels without visual status dots.
 
-Favorites share one live document across Spaces in a profile; saved Space pins remain in their own Space. Closing either keeps the saved destination. Click a Favorite icon or a pin favicon to reset to it, or use Replace Pin to save the current page. Idle Favorites sleep when safe. Shift-click a link to Peek; ordinary off-host links from pins can also open Peek. AI actions prepare a question and show the pages selected for sharing before sending. Website login popups retain their session and callback document, then return to their opener; a Peek opener becomes a tab without reloading. Persistent website login cookies stay within their profile across normal restarts. **Direct Google account sign-in is currently reported blocked by Google.** This is separate from the missing FedCM account chooser required by some third-party flows. Full Google support requires further browser-engine work and real-provider acceptance; the 0.8 changes do not solve that restriction. See [website sign-in](docs/WEB-SIGN-IN.md) for supported mechanics, remaining engine work and the default-browser option.
+Favorites share one live document across Spaces in a profile; saved Space pins remain in their own Space. Closing either keeps the saved destination. Favorites activate their existing page. A navigated pin shows `/` beside its saved name; click its favicon or use Reset Tab to return home. Command/Ctrl-W closes the page, retains the pin at its saved address and clears the marker. Replace Pin saves the current page. Idle Favorites sleep when safe. Today tabs sit below the divider and archive after 12 hours of inactivity by default; timing can inherit the default or differ by profile. Existing choices are preserved, and active pages, media and unsaved work stay protected. Shift-click a link to Peek; ordinary off-host links from pins can also open Peek. AI actions prepare a question and show the pages selected for sharing before sending. Website login popups retain their session and callback document, then return to their opener; a Peek opener becomes a tab without reloading. Persistent website login cookies stay within their profile across normal restarts. **Direct Google account sign-in is currently reported blocked by Google.** This is separate from the missing FedCM account chooser required by some third-party flows. Full Google support requires further browser-engine work and real-provider acceptance; the 0.9 changes do not solve that restriction. See [website sign-in](docs/WEB-SIGN-IN.md) for supported mechanics, remaining engine work and the default-browser option.
 
 ## Screenshots
+
+The current **0.9** gallery shows the packaged Windows browser, captured intact with Computer in an isolated local demo, and native Mac captures from CI. See the [Arc behavior study](docs/ARC-BEHAVIOR-STUDY.md), [capture provenance](docs/screenshots/README.md) and [feature guide (PDF)](docs/Zacro-0.9-Design-and-Feature-Guide.pdf).
+
+![Zacro 0.9 with six balanced Favorites, a navigated pin marker and Today tabs](docs/screenshots/0.9/workspace.jpg)
+
+| Command palette | Space customization |
+| --- | --- |
+| ![The command palette casts a shadow over a sharp unchanged page](docs/screenshots/0.9/palette.jpg) | ![Circular color swatches and wider theme controls](docs/screenshots/0.9/space-theme.jpg) |
+
+| Library | Peek |
+| --- | --- |
+| ![Library shares the window material without a vertical divider](docs/screenshots/0.9/library.jpg) | ![Peek retains the live page at its original rendering scale](docs/screenshots/0.9/peek.jpg) |
+
+| Dark appearance | Compact window |
+| --- | --- |
+| ![Readable selections and a sharp palette backdrop in dark appearance](docs/screenshots/0.9/dark.jpg) | ![A compact window with adaptive navigation and Library](docs/screenshots/0.9/compact.jpg) |
+
+Still images show layout; the [validation record](docs/VALIDATION.md) separately covers motion, native input and remaining acceptance limits.
+
+<details>
+<summary>0.9 · Native macOS</summary>
+
+Unedited Apple silicon desktop captures from [the passing packaged-app run](https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40706282417), including native traffic lights, menu bar and Dock. The optional Home page was explicitly opened for these acceptance fixtures; the default workflow uses the command palette.
+
+| Light | Dark |
+| --- | --- |
+| ![Zacro 0.9 on macOS in light appearance](docs/screenshots/0.9/mac-arm64-light.png) | ![Zacro 0.9 on macOS in dark appearance](docs/screenshots/0.9/mac-arm64-dark.png) |
+
+</details>
+
+<details>
+<summary>Historical 0.8 · Windows and native macOS</summary>
 
 These **0.8** captures show the packaged Windows application in an isolated local demo. Application states were prepared by the review harness and captured intact through Computer; they are not proof of native-input acceptance. See [capture provenance](docs/screenshots/README.md), [design decisions](docs/DESIGN-REVIEW-0.8.md) and the [eight-page feature guide (PDF)](docs/Zacro-0.8-Design-and-Feature-Guide.pdf).
 
@@ -57,6 +89,8 @@ Still images document layout. The [validation record](docs/VALIDATION.md) distin
 | ![Zacro 0.8 on macOS with native controls and compact navigation](docs/screenshots/0.8/macos-light.png) | ![Zacro 0.8 in dark appearance with a clearly selected tab](docs/screenshots/0.8/macos-dark.png) |
 
 Original Apple silicon desktop captures from packaged `33aa133` in [CI run 40690651723](https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40690651723). The optional New Tab Page was opened explicitly; empty Spaces normally open the command palette. Exact artifact provenance and remaining physical-device acceptance are documented separately.
+
+</details>
 
 </details>
 
@@ -282,7 +316,7 @@ Peek is part of the implemented browsing experience:
 - Keep previews in the originating profile so account and browsing contexts stay consistent.
 - Support keyboard navigation and accessible focus handling, including returning focus when the preview closes.
 
-Use **Shift + click**, **Alt + click** or a link's context menu to open Peek. Promotion preserves the live page's draft, scroll position, and navigation history while adding its current destination to browser History.
+Use **Shift + click**, **Alt + click** or a link's context menu to open Peek. Its short lift, shadow and scrim animate together without scaling the webpage; reduced motion removes the travel. Promotion preserves the live page's draft, scroll position, and navigation history while adding its current destination to browser History.
 
 Modifier-click Peek currently applies to links in the main page. Links inside embedded frames retain their native behavior; use their context menu's Peek action.
 

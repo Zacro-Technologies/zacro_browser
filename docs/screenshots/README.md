@@ -1,5 +1,21 @@
 # Screenshot assets
 
+## 0.9 Windows captures
+
+The eight JPEGs under `0.9/` are intact Computer captures of packaged runtime **`8069153e0b5fc43fb5a0bcfdf4f96b1ab32e452b`** on Windows 11, taken October 28, 2026 (JST). `scripts/review-captures.cjs --opaque` prepared an isolated local demo; Computer captured each whole window separately. Every image was inspected before saving. Six Favorites load their original fixture icons through actual navigation, and the Design handbook pin is deliberately away from its saved address. No interface was composited, retouched or generated for these images.
+
+The [capture manifest](0.9/manifest.json) records original image hashes, dimensions, exact runtime and stage geometry. The source package SHA-256 is `12f2d8300f5b1bc3d17117331f9cb795a454562c1e732aff58cd8fa1d0a3cbc2`. Normal captures are 1285×804 pixels; compact is 565×424. Requested content sizes were 1280×800 and 560×420 logical pixels; Windows accepted 1282×803 and 562×423 at DPR 1.5. Chrome is opaque for layout review, so these images do not demonstrate behind-window desktop blur.
+
+Computer pointer review separately confirmed the Library chooser and Bookmarks opening. Keyboard review was inconclusive after the helper returned `failed to activate captured window`; an incorrect foreground capture was discarded and was never included here. Fresh-session passive capture recovered. The gallery's instrumented preparation does not establish native keyboard or physical-trackpad acceptance. Automated native checks and remaining limits are in [validation](../VALIDATION.md).
+
+The [eight-page guide](../Zacro-0.9-Design-and-Feature-Guide.pdf) contains one complete capture per page. All eight pages were rendered with Poppler and visually inspected, and page/image counts and extractable text passed verification. PDF SHA-256: `d10557460fa3267853423bbde09ab921e052cc6c53d3950476fdd059815ce548`. Historical versions below retain their original provenance.
+
+### 0.9 native Mac captures
+
+The two `mac-arm64-*.png` images show the same runtime in the packaged Apple silicon build from [passing CI run 40706282417](https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40706282417), at test-only head `0810fd1`. The `macos-arm64-validation` artifact `12823049726` was SHA-256 verified against GitHub before extraction: `fa008b04b505054f612d9a377b86f1a520f2dd74a2d5d74a7e0338337f607e32`. Both intact 1024×768 desktop images were visually reviewed for native controls, gutters, selection visibility and clipping. Their individual hashes and original filenames are in the manifest.
+
+These images show the optional Home page explicitly opened by the acceptance fixture, including its local Recent entry. They do not show the populated Windows demo, establish physical trackpad or live account acceptance, or change the default command-palette workflow. The eight-page PDF contains the Windows captures only.
+
 ## 0.8 Windows captures
 
 The eight JPEGs under `0.8/` are intact native Computer window captures of the packaged 0.8 application on Windows 11, taken October 28, 2026 (JST). The isolated local showcase is prepared by `scripts/review-captures.cjs` using the same application controls and real Chromium documents as the desktop tests. Favorites load their original fixture PNG icons by actual navigation. No UI was composited, retouched or generated for these images.

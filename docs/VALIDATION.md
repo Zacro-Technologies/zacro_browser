@@ -2,6 +2,76 @@
 
 Validated locally on Windows 11 x64 (OS build 26200), Node.js 24.19.0, Electron 45.0.0 and Chromium 156.0.8078.48. This record describes engineering verification of the development build, not commercial certification or a security audit.
 
+## 0.9 tab behavior, sharp overlays and Peek motion
+
+The final runtime is **`8069153`**. The changes distinguish profile-wide Favorites, per-Space pins and Today tabs; balance Favorite rows; preserve pin destinations and icons; use a 12-hour archive default with profile overrides; blend Space appearance continuously; and coordinate native Peek motion without scaling the document.
+
+Cross-platform [CI at `0810fd1`](https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40706282417) passed with the same runtime:
+
+| Platform | Unit/security | Native desktop | Packaged app | Additional |
+| --- | --- | --- | --- | --- |
+| Windows x64 | 202 passed | 101 passed; 6 Mac-only skips | 1 passed | 40-cycle lifecycle check and validation upload passed |
+| macOS, Apple silicon | 202 passed | 86 passed; 1 Windows-only skip | 1 passed | Development DMG/ZIP and both uploads passed |
+| macOS, Intel | 202 passed | 86 passed; 1 Windows-only skip | 1 passed | Development DMG/ZIP and both uploads passed |
+
+All three jobs and the overall run completed successfully, including formatting, syntax and all five artifact uploads. The Mac packages are ad hoc signed development builds, not notarized releases. Decoded logs and artifact provenance are retained under `test-results/ci-40706282417/`.
+
+Local verification on October 28–29, 2026 (JST):
+
+| Check | Confirmed result | Evidence |
+| --- | --- | --- |
+| Final unit/security suite | 202 passed | `test-results/0.9-release-units.log` |
+| Final formatting and syntax | Both passed | `test-results/0.9-release-format-check.log`, `test-results/0.9-release-syntax.log` |
+| Earlier full desktop run | 98 passed, one stale layout assertion failed, six Mac-only skips | `test-results/0.9-verify-final.log` |
+| Corrected compact Favorite check | Passed; targets remain compact and eight rows fit | `test-results/0.9-compact-favorite-regression.log` |
+| Final backdrop/resize and Peek regressions | Five passed | `test-results/0.9-backdrop-resize-final.log` |
+| Material lease synchronization regression | Three consecutive runs passed | `test-results/0.9-material-lease-ci-regression.log` |
+| Native resize and Peek readiness regressions | Two passed | `test-results/0.9-native-readiness.log` |
+| Adjacent native readiness checks | Six passed | `test-results/0.9-all-native-readiness.log` |
+| Ordinary and closing-Peek login popup checks | Four passed | `test-results/0.9-peek-popup-clock.log` |
+| Settings target measurement | One passed | `test-results/0.9-panel-target-readiness.log` |
+| Current Peek and Favorite geometry | Two passed | `test-results/0.9-current-geometry-readiness.log` |
+| Local 40-cycle lifecycle soak | Passed; two WebContents at every sample | `test-results/0.9-soak.log` |
+
+The earlier full run's sole failure expected the former 40px Favorite height; its corrected acceptance range retains the meaningful compact-target and visible-row checks. The first unit run also exposed a stale WebContents mock missing `isDevToolsOpened`; the corrected fixture additionally verifies that open DevTools protects a page. The final unit suite passes independently. Repeated targeted runs are not additional distinct cases.
+
+- **Archive and pins:** clean loaded Today pages can expire, while selected/split/Peek-source pages, media/capture, downloads, authentication relationships, detected edits and beforeunload vetoes stay protected. An intervening selection cancels automatic closing. Startup inactivity, recovery, profile inheritance, changed defaults and imported Never/custom intervals are covered. Favorite row geometry is checked for one through twelve tiles, wider rails and profile isolation. Same-document navigation keeps the saved favicon/title, shows the slash and retains the saved pin when closed.
+- **Peek:** native bounds change during the entrance while document identity, size and zoom stay constant. Promotion, replacement, reduced motion and a vetoed close retain page state. GET and POST popups arriving during the visual close retain the actual opener and callback; a popup cannot allocate an orphan once native closing has begun. The Intel sampling fixture now observes the native view from its first bounds update, before navigation commits.
+- **Backdrops:** the palette has a shadow with no page filter, tint or radius change. Native PNG bytes and decoded backing dimensions match the source, including a 3840×2160 image represented at 2× scale. Pixel and byte bounds, an exact odd-pixel rounding boundary, privacy, dismissal and stale-copy rejection pass. Geometry changes clear the static image while retaining query, focus and page state; reopening captures current pixels. Hidden Chromium views did not reliably repaint at resized viewport dimensions, so live overlay recomposition remains an engine limitation. No off-window rendering workaround ships.
+- **Lifecycle observations:** the local soak recorded a 483ms cycle median and 499ms p95; sampled process memory changed from 401,128 to 734,808 KiB. These fixture observations establish bounded lifecycle behavior, not general browsing performance or a long-term memory guarantee.
+
+Historical CI at [`4fd9822`](https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40699437474) passed Windows and Apple silicon but failed one Intel Peek sampling assertion because URL commit could follow the completed animation. The later [`ed36ad7` run](https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40702549878) exposed a material fixture issuing manual leases before the renderer's real transition settled. The corrected fixture waits for publication and completed motion; stale-token protection is still checked immediately. Neither historical failed run is represented as fully green.
+
+Subsequent Mac runs exposed fixture assumptions about screen size and page readiness. Cocoa can constrain a requested window after the initial native call returns, so resize checks now wait for stable agreement between the accepted native size and the renderer. Peek's entrance can finish before its document commits; the interaction check waits for that document before clicking. These corrections retain geometry, document identity, orphan prevention and unsaved-work assertions; they do not change the application runtime.
+
+The later [`d409ee5` run](https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40708506726) passed Windows and Apple silicon but failed two Intel cases: a compositor screenshot capture and a POST-popup interaction that could arrive after the real 168ms closing interval. The capture fixture lacked native visibility/paint preconditions; the original compositor state was not logged, so its precise cause is unconfirmed. Captures now require a visible, focused window and presented frames, with richer diagnostics. The popup race holds only the main animation clock during the closing-state interaction, then restores it in `finally`; native timers, Chromium, POST data, opener callbacks and document-identity checks remain live. Separate motion tests retain the real clock. This failed run is not presented as fully green.
+
+In [`64cd45d` CI](https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40711047275), those two Intel cases passed. Windows and Apple silicon completed successfully, but Intel's Settings test dereferenced a null button rectangle during an asynchronous header refresh. Its corrected measurement polls for a real, nonempty click target and retains the original coordinate click, palette dismissal and panel-state assertions.
+
+The final unsigned Windows installer and executable built successfully. Packaged acceptance passed (one test), covering hardened fuses, browsing, PDF parsing and the isolated bundled Codex runtime: `test-results/0.9-release-build.log` and `test-results/0.9-release-package.log`. Packaged main, renderer, styles, theme, store and archive sources match the checkout (`test-results/0.9-release-package-source.log`).
+
+Computer pointer review confirmed Library menu selection and opening Bookmarks. Native keyboard review hit the helper error `failed to activate captured window`; it is not counted as passed. One incorrect foreground capture was discarded. The final fresh-session gallery contains eight inspected whole-window captures of the exact runtime above, prepared with the instrumented local review harness. All eight PDF pages were rendered and visually reviewed; image hashes, page/image counts and extracted text passed. PDF SHA-256: `d10557460fa3267853423bbde09ab921e052cc6c53d3950476fdd059815ce548`. See [capture provenance](screenshots/README.md).
+
+Two native Mac desktop captures from the `0810fd1` Apple silicon packaged-app run were also visually reviewed. The source ZIP matched GitHub's SHA-256 before extraction; all ten gallery images match their recorded hashes and dimensions. The Mac images show native traffic lights, aligned navigation, page gutters and dark selection, using the explicitly opened optional Home-page fixture. They do not establish physical trackpad behavior, desktop blur or live Google sign-in.
+
+### Focused Space color and material checks
+
+These focused checks supplement the full validation above. They do not count repeat executions as additional distinct tests.
+
+| Check | Confirmed result | Evidence |
+| --- | --- | --- |
+| Theme interpolation, contrast and native material policy | Nine passed | `test-results/0.9-space-theme-unit.log` |
+| Initial Space-swipe and native-material run | Nine passed, one failed | `test-results/space-theme-motion-validation.log` |
+| Corrected menu fixture plus color/material regressions | Three passed | `test-results/space-theme-motion-targeted.log` |
+
+The initial failure was a test timing race: after deleting two Spaces through host commands, the fixture opened the remaining Space's menu before the renderer received the updated list. Waiting for the single rendered Space icon corrected the fixture. The three-case rerun includes that case and repeats the color-transition and native-material cases; it is not three additional desktop tests or a claim that the initial run passed.
+
+- **Presented appearance:** quarter- and half-width drags produce the expected perceptual color blend; reversal retraces it. Title updates preserve the in-progress theme. Cancellation and commitment settle monotonically with the tab rows, and reduced motion settles immediately. Saved colors, gradient balance, grain and opacity remain unchanged by gestures.
+- **Native material continuity:** the tint follows swipe progress from 100 to 0 when the compositor supports transparency, and stays opaque under the tested fallback statuses. The native material lease survives activation until the transition finishes; stale completion cannot clear a newer lease, and leaving its Space pair releases it. Zero tint does not change whole-window opacity from 1 or replace the website's WebContents. Existing draft, rendering-scale and canceled-preview checks also pass.
+- **Expanded controls:** opacity accepts 0–100 and grain accepts 0–200. Existing grain values through 100 retain their previous strength; the new maximum doubles it. Unit checks cover interpolation endpoints, reverse symmetry, invalid values and readable foreground/accent tones on opaque tint surfaces with the strongest single grain layer. Arbitrary desktop content visible through low-opacity chrome is outside that contrast guarantee.
+
+These checks use controlled gestures and local documents in the actual Windows Electron runtime. They do not establish physical Mac trackpad feel, VoiceOver acceptance, macOS vibrancy quality or visual acceptance of desktop blur. Live Google sign-in remains blocked as described in [website sign-in](WEB-SIGN-IN.md); Google/AI account acceptance and signed distribution remain open. Prior screenshots and CI runs retain their recorded revisions and do not certify the 0.9 changes.
+
 ## 0.8 native glass, resizable chrome, Arc pins and command workflows
 
 Final [CI run 40692880415](https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40692880415) passed at runtime commit **`1a64f6d82ba1e43468a14d95b676fbdf87205796`**:
@@ -210,4 +280,4 @@ The baseline pass used UIA clicks/edits and F6/Escape. Control-key delivery was 
 - Signed installer acceptance, automatic-update infrastructure, signature/rollback testing and release incident processes.
 - Physical-device macOS acceptance and signed/notarized installation checks on Apple silicon and Intel. Native macOS 15 CI has passed on both architectures; Linux validation remains open. Only Windows was exercised locally in this development session.
 
-Local file navigation, native Arc database migration, a password manager, full Chrome extension APIs and Web Store installation, device pairing choosers, and default-browser registration on Windows/Linux are not implemented. Packaged macOS builds offer an explicit default-browser action in Settings. Loaded pages are deliberately excluded from automatic archiving to protect live form state. See the [roadmap](ROADMAP.md) for remaining commercial release requirements and [AI documentation](AI.md) for supported context and provider boundaries.
+Local file navigation, native Arc database migration, a password manager, full Chrome extension APIs and Web Store installation, device pairing choosers, and default-browser registration on Windows/Linux are not implemented. Packaged macOS builds offer an explicit default-browser action in Settings. In 0.9, clean background pages may archive after the profile interval. Active/split/Peek-source pages, media, downloads, authentication relationships, detected edits and beforeunload vetoes prevent automatic unloading; arbitrary website memory cannot be inferred perfectly. See the [roadmap](ROADMAP.md) for remaining commercial release requirements and [AI documentation](AI.md) for supported context and provider boundaries.
