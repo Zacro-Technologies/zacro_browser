@@ -240,6 +240,27 @@ test(
     await expect(shell.locator('#api-provider-form')).toHaveAttribute('data-provider', 'compatible');
     await shell.locator('#ai-base-url').fill(`${b.base}/v1`);
     await shell.locator('#ai-api-model').fill('fixture');
+    const redrawConnectionForm = async (name) => {
+      await b.invoke('space:update', { id: (await b.invoke('state:get')).activeSpaceId, name });
+      await expect(shell.locator('.space-title')).toHaveText(name);
+    };
+    await expect(shell.locator('#ai-api-key')).toHaveJSProperty('required', false);
+    await redrawConnectionForm('Retained local endpoint');
+    await expect(shell.locator('#ai-base-url')).toHaveValue(`${b.base}/v1`);
+    await expect(shell.locator('#ai-api-model')).toHaveValue('fixture');
+    await expect(shell.locator('#ai-api-key')).toHaveJSProperty('required', false);
+    await expect(shell.locator('#ai-api-key')).toHaveAttribute('placeholder', 'Optional for localhost');
+    await shell.locator('#ai-base-url').fill('https://api.example.com/v1');
+    await redrawConnectionForm('Retained remote endpoint');
+    await expect(shell.locator('#ai-base-url')).toHaveValue('https://api.example.com/v1');
+    await expect(shell.locator('#ai-api-key')).toHaveJSProperty('required', true);
+    await expect(shell.locator('#ai-api-key')).toHaveAttribute(
+      'placeholder',
+      'New key required for this endpoint',
+    );
+    await shell.locator('#ai-base-url').fill(`${b.base}/v1`);
+    await redrawConnectionForm('Ready local endpoint');
+    await expect(shell.locator('#ai-api-key')).toHaveJSProperty('required', false);
     await shell.locator('#api-provider-form button[type="submit"]').click();
     await expect(shell.locator('#ai-connection-status')).toContainText('Local API ready');
     await b.open('ai');

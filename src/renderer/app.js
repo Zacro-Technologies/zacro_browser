@@ -1644,6 +1644,7 @@ function renderPanel(force = false) {
     const field = $('#' + id, element);
     if (field) field.value = value;
   }
+  syncAPIKeyRequirement();
   if (focusedId) {
     const replacement = $(`#${focusedId}`);
     if (replacement && replacement !== document.activeElement) {
@@ -1751,6 +1752,22 @@ function isLocalAPIEndpoint(value) {
   } catch {
     return false;
   }
+}
+function syncAPIKeyRequirement() {
+  const endpoint = $('#ai-base-url');
+  const key = $('#ai-api-key');
+  if (!endpoint || !key) return;
+  const value = endpoint.value.trim();
+  const changed = value !== (ui.aiStatus?.baseUrl || '');
+  const local = isLocalAPIEndpoint(value);
+  key.required = !local && (changed || !ui.aiStatus?.configured);
+  key.placeholder = local
+    ? 'Optional for localhost'
+    : changed
+      ? 'New key required for this endpoint'
+      : ui.aiStatus?.configured
+        ? 'Leave blank to keep saved key'
+        : 'Paste an API key';
 }
 function renderAIConnection() {
   const status = ui.aiStatus || {};
@@ -5047,19 +5064,7 @@ document.addEventListener('input', (event) => {
     ui.shortcutQuery = target.value;
     renderShortcutRows();
   } else if (target.id === 'ai-base-url') {
-    const key = $('#ai-api-key');
-    const changed = target.value.trim() !== (ui.aiStatus?.baseUrl || '');
-    if (key) {
-      const local = isLocalAPIEndpoint(target.value.trim());
-      key.required = !local && (changed || !ui.aiStatus?.configured);
-      key.placeholder = local
-        ? 'Optional for localhost'
-        : changed
-          ? 'New key required for this endpoint'
-          : ui.aiStatus?.configured
-            ? 'Leave blank to keep saved key'
-            : 'Paste an API key';
-    }
+    syncAPIKeyRequirement();
   } else if (target.id === 'panel-search') {
     ui.panelQuery = target.value;
     renderPanel();
