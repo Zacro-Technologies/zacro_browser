@@ -31,6 +31,106 @@ function invoke(...args) {
   return { ...result, text: result.stdout + result.stderr };
 }
 
+function markHidden(directory) {
+  const result = spawnSync(
+    'powershell.exe',
+    [
+      '-NoLogo',
+      '-NoProfile',
+      '-NonInteractive',
+      '-Command',
+      "$ErrorActionPreference = 'Stop'; $item = Get-Item -LiteralPath $env:ZACRO_TEST_HIDDEN_DIRECTORY -Force; $item.Attributes = $item.Attributes -bor [IO.FileAttributes]::Hidden; if (-not ((Get-Item -LiteralPath $env:ZACRO_TEST_HIDDEN_DIRECTORY -Force).Attributes -band [IO.FileAttributes]::Hidden)) { throw 'Hidden fixture attribute was not applied.' }",
+    ],
+    {
+      encoding: 'utf8',
+      windowsHide: true,
+      timeout: 15000,
+      env: { ...process.env, ZACRO_TEST_HIDDEN_DIRECTORY: directory },
+    },
+  );
+  assert.ifError(result.error);
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+}
+
+function invokeProvisionFunctions(body) {
+  // Load only these pure function declarations from the real script's AST.
+  // The script body, downloads, privilege handling and installers never run.
+  const setup = `
+    $ErrorActionPreference = 'Stop'
+    Set-StrictMode -Version Latest
+    $parseTokens = $null; $parseErrors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseFile($env:ZACRO_TEST_PROVISION_SCRIPT, [ref]$parseTokens, [ref]$parseErrors)
+    if ($parseErrors.Count) { throw 'Provisioning script failed syntax validation.' }
+    $names = @('Get-ZacroInstallerSpecifications', 'Select-ZacroQualifiedCompiler', 'Assert-ZacroPreservedInstances')
+    $functions = @($ast.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $names -contains $node.Name }, $false))
+    if ($functions.Count -ne $names.Count) { throw 'Expected provisioning guards were not found.' }
+    foreach ($function in $functions) { Invoke-Expression $function.Extent.Text }
+    ${body}
+  `;
+  const result = spawnSync(
+    'powershell.exe',
+    ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', setup],
+    {
+      encoding: 'utf8',
+      windowsHide: true,
+      timeout: 15000,
+      env: {
+        ...process.env,
+        ZACRO_TEST_PROVISION_SCRIPT: script,
+        ZACRO_TEST_INSTALLER_MANIFEST: path.join(path.dirname(script), 'windows-installers.lock.json'),
+      },
+    },
+  );
+  assert.ifError(result.error);
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  return JSON.parse(result.stdout);
+}
+
+test(
+  'SDK-only selection retains the SDK pin and excludes Visual Studio in every mode',
+  { skip: !windows },
+  () => {
+    const result = invokeProvisionFunctions(`
+    $manifest = Get-Content -LiteralPath $env:ZACRO_TEST_INSTALLER_MANIFEST -Raw | ConvertFrom-Json
+    $full = @(Get-ZacroInstallerSpecifications $manifest $false)
+    $sdk = @(Get-ZacroInstallerSpecifications $manifest $true)
+    [ordered]@{ full=@($full.id); sdk=@($sdk.id); sdkSha256=$sdk[0].sha256; originalCount=$manifest.installers.Count } | ConvertTo-Json -Compress
+  `);
+    assert.deepEqual(result.full, ['visual-studio', 'windows-sdk']);
+    assert.deepEqual(result.sdk, ['windows-sdk']);
+    assert.equal(result.sdkSha256, manifest.installers.find((entry) => entry.id === 'windows-sdk').sha256);
+    assert.equal(result.originalCount, 2);
+  },
+);
+
+test(
+  'SDK-only compiler qualification requires a complete VS18+ and preserves all existing instances',
+  { skip: !windows },
+  () => {
+    const result = invokeProvisionFunctions(`
+    $old = [pscustomobject]@{ instanceId='old'; installationVersion='17.12.0.0'; installationPath='C:\\FixtureVS17'; isComplete=$true; isLaunchable=$true }
+    $current = [pscustomobject]@{ instanceId='current'; installationVersion='18.11.12315.225'; installationPath='C:\\FixtureVS18'; isComplete=$true; isLaunchable=$true }
+    $incomplete = [pscustomobject]@{ instanceId='incomplete'; installationVersion='19.0.0.0'; installationPath='C:\\FixtureVS19'; isComplete=$false; isLaunchable=$true }
+    $selected = Select-ZacroQualifiedCompiler @($old, $current, $incomplete)
+    $rejected = 0
+    foreach ($invalid in @(@(), @($old), @($incomplete))) {
+      try { Select-ZacroQualifiedCompiler $invalid | Out-Null } catch { $rejected++ }
+    }
+    Assert-ZacroPreservedInstances @($old, $current) @($old, $current)
+    $changedVersion = [pscustomobject]@{ instanceId='current'; installationVersion='18.12.0.0'; installationPath=$current.installationPath }
+    $changedPath = [pscustomobject]@{ instanceId='current'; installationVersion=$current.installationVersion; installationPath='C:\\ChangedVS18' }
+    $preservationRejected = 0
+    foreach ($changed in @($changedVersion, $changedPath)) {
+      try { Assert-ZacroPreservedInstances @($old, $current) @($old, $changed) } catch { $preservationRejected++ }
+    }
+    [ordered]@{ selected=$selected.instanceId; rejected=$rejected; preservationRejected=$preservationRejected } | ConvertTo-Json -Compress
+  `);
+    assert.equal(result.selected, 'current');
+    assert.equal(result.rejected, 3);
+    assert.equal(result.preservationRejected, 2);
+  },
+);
+
 test('provisioning pins small Microsoft installers and selects full C++/SDK prerequisites', () => {
   assert.equal(manifest.schemaVersion, 1);
   assert.deepEqual(
@@ -83,6 +183,30 @@ test('provisioning preserves nonempty foreign roots and rejects junctions', { sk
   await assert.rejects(fs.access(path.join(foreign, 'new-cache')));
 });
 
+test('hidden ancestors remain usable while nested junctions are rejected', { skip: !windows }, async (t) => {
+  const directory = await scratch(t),
+    hidden = path.join(directory, 'hidden-parent'),
+    root = path.join(hidden, 'owned');
+  await fs.mkdir(hidden);
+  markHidden(hidden);
+  // Reproduces AppData on hosted Windows runners without modifying AppData or
+  // requiring any cached installer, download, elevation, or installed toolchain.
+  const missing = invoke('-ExternalRoot', root);
+  assert.notEqual(missing.status, 0);
+  assert.match(missing.text, /Run this script with -Download first/);
+  const owner = JSON.parse(await fs.readFile(path.join(root, '.zacro-native-toolchain.json'), 'utf8'));
+  assert.equal(owner.root, root);
+
+  const foreign = path.join(directory, 'foreign'),
+    junction = path.join(hidden, 'redirect');
+  await fs.mkdir(foreign);
+  await fs.symlink(foreign, junction, 'junction');
+  const redirected = invoke('-ExternalRoot', path.join(junction, 'new-cache'));
+  assert.notEqual(redirected.status, 0);
+  assert.match(redirected.text, /junction or symbolic link/);
+  await assert.rejects(fs.access(path.join(foreign, 'new-cache')), { code: 'ENOENT' });
+});
+
 test(
   'validation never downloads missing files and never replaces corrupt cached files',
   { skip: !windows },
@@ -112,5 +236,8 @@ test(
     const result = invoke('-Install', '-ExternalRoot', path.parse(script).root);
     assert.notEqual(result.status, 0);
     assert.match(result.text, /Administrator PowerShell is required|dedicated directory/);
+    const sdkOnly = invoke('-Install', '-SdkOnly', '-ExternalRoot', path.parse(script).root);
+    assert.notEqual(sdkOnly.status, 0);
+    assert.match(sdkOnly.text, /Administrator PowerShell is required|dedicated directory/);
   },
 );

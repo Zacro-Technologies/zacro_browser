@@ -2,7 +2,8 @@
 param(
   [string]$ExternalRoot = 'C:\zacro-google-prototype\toolchains',
   [switch]$Download,
-  [switch]$Install
+  [switch]$Install,
+  [switch]$SdkOnly
 )
 
 Set-StrictMode -Version Latest
@@ -12,6 +13,7 @@ $ErrorActionPreference = 'Stop'
 # the two pinned small bootstrappers. Only -Install runs official installers.
 # Execute -Install from an Administrator PowerShell after reviewing this file.
 # No elevation, uninstall, reboot, policy change or portable extraction is attempted.
+# -SdkOnly keeps a qualified existing VS 18+ instance and selects only the SDK.
 if ($env:OS -ne 'Windows_NT') { throw 'Provision this toolchain on native Windows only.' }
 $zacroIdentity = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
 $zacroElevated = $zacroIdentity.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -26,6 +28,45 @@ function Write-ZacroJson([string]$Path, $Value, [switch]$Exclusive) {
   $zacroStream = [IO.File]::Open($Path, $zacroMode, [IO.FileAccess]::Write, [IO.FileShare]::None)
   $zacroWriter = [IO.StreamWriter]::new($zacroStream, [Text.UTF8Encoding]::new($false))
   try { $zacroWriter.WriteLine(($Value | ConvertTo-Json -Depth 10)) } finally { $zacroWriter.Dispose() }
+}
+function Get-ZacroInstallerSpecifications($Manifest, [bool]$OnlySdk) {
+  if ($Manifest.schemaVersion -ne 1 -or $Manifest.installers.Count -ne 2 -or
+      @($Manifest.installers | Where-Object id -eq 'visual-studio').Count -ne 1 -or
+      @($Manifest.installers | Where-Object id -eq 'windows-sdk').Count -ne 1) { throw 'Unsupported installer manifest.' }
+  if ($OnlySdk) { return @($Manifest.installers | Where-Object id -eq 'windows-sdk') }
+  return @($Manifest.installers)
+}
+function Get-ZacroVisualStudio([switch]$Qualified) {
+  if (-not (Test-Path -LiteralPath $zacroVswhere)) { return @() }
+  $zacroDiscoveryArguments = @('-all', '-products', '*', '-format', 'json', '-utf8')
+  if ($Qualified) {
+    $zacroDiscoveryArguments += @('-requires', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64', 'Microsoft.VisualStudio.Component.VC.ATLMFC')
+  }
+  $zacroDiscovery = & $zacroVswhere @zacroDiscoveryArguments
+  if ($LASTEXITCODE -ne 0) { throw 'Visual Studio discovery failed; no installer was started.' }
+  return @($zacroDiscovery | ConvertFrom-Json)
+}
+function Select-ZacroQualifiedCompiler($Instances) {
+  # The caller supplies the result of vswhere's C++ and ATL/MFC component filter.
+  $zacroCandidates = @($Instances | Where-Object {
+    $zacroVersion = [Version]'0.0'
+    $_.installationPath -and $_.instanceId -and
+      [Version]::TryParse([string]$_.installationVersion, [ref]$zacroVersion) -and $zacroVersion.Major -ge 18 -and
+      (-not ($_.PSObject.Properties.Name -contains 'isComplete') -or $_.isComplete) -and
+      (-not ($_.PSObject.Properties.Name -contains 'isLaunchable') -or $_.isLaunchable)
+  } | Sort-Object -Property { [Version]$_.installationVersion } -Descending)
+  if ($zacroCandidates.Count -eq 0) { throw 'SdkOnly requires an existing VS 18+ instance with x64 C++ and ATL/MFC components. No installer was started.' }
+  return $zacroCandidates[0]
+}
+function Assert-ZacroPreservedInstances($Before, $After) {
+  foreach ($zacroPriorInstance in $Before) {
+    $zacroCurrentInstance = @($After | Where-Object { $_.instanceId -eq $zacroPriorInstance.instanceId })
+    if ($zacroCurrentInstance.Count -ne 1 -or
+        $zacroCurrentInstance[0].installationVersion -ne $zacroPriorInstance.installationVersion -or
+        $zacroCurrentInstance[0].installationPath -ne $zacroPriorInstance.installationPath) {
+      throw 'An existing product instance changed unexpectedly. Review official installer logs before further work.'
+    }
+  }
 }
 if ($ExternalRoot -notmatch '^[A-Za-z]:\\') { throw 'ExternalRoot must be an absolute dedicated directory on a local Windows drive.' }
 if ($ExternalRoot.Contains('"')) { throw 'ExternalRoot cannot contain quotation marks.' }
@@ -49,7 +90,9 @@ if ($zacroToolchainRoot -eq [IO.Path]::GetPathRoot($zacroToolchainRoot).TrimEnd(
 $zacroAncestor = $zacroToolchainRoot
 while ($zacroAncestor) {
   if (Test-Path -LiteralPath $zacroAncestor) {
-    $zacroAncestorItem = Get-Item -LiteralPath $zacroAncestor
+    # Hosted runners commonly use hidden ancestors such as AppData. -Force
+    # includes those entries; the reparse-point check still rejects redirects.
+    $zacroAncestorItem = Get-Item -LiteralPath $zacroAncestor -Force
     if ($zacroAncestorItem.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'ExternalRoot cannot traverse a junction or symbolic link.' }
   }
   $zacroAncestor = Split-Path -Path $zacroAncestor -Parent
@@ -62,7 +105,7 @@ if ($zacroToolchainRoot -eq 'C:\zacro-google-prototype\toolchains') {
     if (@(Get-ChildItem -LiteralPath $zacroDefaultParent -Force).Count -ne 0) { throw 'Default experiment parent is nonempty and unowned.' }
     Write-ZacroJson -Path $zacroParentOwnerPath -Value ([ordered]@{schemaVersion=1;kind='zacro-google-browser-compat';root=$zacroDefaultParent}) -Exclusive
   }
-  if ((Get-Item -LiteralPath $zacroParentOwnerPath).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Parent owner marker must be an ordinary file.' }
+  if ((Get-Item -LiteralPath $zacroParentOwnerPath -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Parent owner marker must be an ordinary file.' }
   $zacroParentOwner = Get-Content -LiteralPath $zacroParentOwnerPath -Raw | ConvertFrom-Json
   if ($zacroParentOwner.schemaVersion -ne 1 -or $zacroParentOwner.kind -ne 'zacro-google-browser-compat' -or $zacroParentOwner.root -ne $zacroDefaultParent) { throw 'Default parent owner marker does not match.' }
 }
@@ -72,18 +115,23 @@ if (-not (Test-Path -LiteralPath $zacroOwnerPath)) {
   if (@(Get-ChildItem -LiteralPath $zacroToolchainRoot -Force).Count -ne 0) { throw 'Refusing to adopt a nonempty toolchain directory without its owner marker.' }
   Write-ZacroJson -Path $zacroOwnerPath -Value ([ordered]@{schemaVersion=1;kind='zacro-native-toolchain';root=$zacroToolchainRoot}) -Exclusive
 }
-if ((Get-Item -LiteralPath $zacroOwnerPath).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Owner marker must be an ordinary file.' }
+if ((Get-Item -LiteralPath $zacroOwnerPath -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Owner marker must be an ordinary file.' }
 $zacroOwner = Get-Content -LiteralPath $zacroOwnerPath -Raw | ConvertFrom-Json
 if ($zacroOwner.schemaVersion -ne 1 -or $zacroOwner.kind -ne 'zacro-native-toolchain' -or $zacroOwner.root -ne $zacroToolchainRoot) { throw 'Toolchain owner marker does not match.' }
 $zacroInstallerRoot = Join-Path $zacroToolchainRoot 'installers'
 if (-not (Test-Path -LiteralPath $zacroInstallerRoot)) { New-Item -ItemType Directory -Path $zacroInstallerRoot | Out-Null }
-if ((Get-Item -LiteralPath $zacroInstallerRoot).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Installer cache cannot be a junction or symbolic link.' }
+if ((Get-Item -LiteralPath $zacroInstallerRoot -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Installer cache cannot be a junction or symbolic link.' }
 $zacroVisualStudioPath = Join-Path $zacroToolchainRoot 'VS2026'
 $zacroVswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
 $zacroManifest = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'windows-installers.lock.json') -Raw | ConvertFrom-Json
-if ($zacroManifest.schemaVersion -ne 1 -or $zacroManifest.installers.Count -ne 2) { throw 'Unsupported installer manifest.' }
-$zacroSpecifications = @($zacroManifest.installers)
-$zacroVsSpec = $zacroSpecifications | Where-Object id -eq 'visual-studio'
+$zacroSpecifications = @(Get-ZacroInstallerSpecifications $zacroManifest ([bool]$SdkOnly))
+$zacroVsSpec = $zacroManifest.installers | Where-Object id -eq 'visual-studio'
+$zacroBefore = @(Get-ZacroVisualStudio)
+$zacroExistingCompiler = $null
+if ($SdkOnly) {
+  $zacroExistingCompiler = Select-ZacroQualifiedCompiler @(Get-ZacroVisualStudio -Qualified)
+  $zacroVisualStudioPath = $zacroExistingCompiler.installationPath
+}
 foreach ($zacroSpecification in $zacroSpecifications) {
   if ($zacroSpecification.id -eq 'visual-studio') {
     $zacroArguments = @('--quiet', '--wait', '--norestart', '--installPath', $zacroVisualStudioPath)
@@ -93,7 +141,7 @@ foreach ($zacroSpecification in $zacroSpecifications) {
 }
 
 function Assert-ZacroInstaller($zacroSpecification, [string]$zacroInstallerPath) {
-  $zacroInstallerItem = Get-Item -LiteralPath $zacroInstallerPath
+  $zacroInstallerItem = Get-Item -LiteralPath $zacroInstallerPath -Force
   if ($zacroInstallerItem.LinkType) { throw 'Installer must not be a symbolic link.' }
   if ($zacroInstallerItem.Length -ne $zacroSpecification.Bytes -or
       (Get-FileHash -LiteralPath $zacroInstallerPath -Algorithm SHA256).Hash -ne $zacroSpecification.SHA256) {
@@ -146,10 +194,11 @@ foreach ($zacroSpecification in $zacroSpecifications) {
   }
   Assert-ZacroInstaller $zacroSpecification $zacroInstallerPath
 }
-$zacroBefore = if (Test-Path -LiteralPath $zacroVswhere) { @(& $zacroVswhere -all -products '*' -format json -utf8 | ConvertFrom-Json) } else { @() }
 $zacroPlan = [ordered]@{
   schemaVersion = 1; verifiedAt = [DateTime]::UtcNow.ToString('o'); installRequested = [bool]$Install;
+  mode = $(if ($SdkOnly) { 'sdk-only' } else { 'full' });
   elevated = $zacroElevated; installPath = $zacroVisualStudioPath;
+  existingCompiler = $zacroExistingCompiler;
   externalRoot = $zacroToolchainRoot;
   currentFreeGiB = [Math]::Round((Get-Volume -DriveLetter ([IO.Path]::GetPathRoot($zacroToolchainRoot).Substring(0,1))).SizeRemaining / 1GB, 2);
   systemFreeGiB = [Math]::Round((Get-Volume -DriveLetter $env:SystemDrive.Substring(0,1)).SizeRemaining / 1GB, 2);
@@ -158,7 +207,7 @@ $zacroPlan = [ordered]@{
     [ordered]@{name=$_.Name; path=(Join-Path $zacroInstallerRoot $_.File); sha256=$_.SHA256; arguments=$_.Arguments}
   });
   notes = @(
-    'A new VS2026 BuildTools instance is selected; neither existing VS2022 instance is an installation target.',
+    $(if ($SdkOnly) { 'Only the pinned Windows SDK is selected. The qualified existing Visual Studio instance is retained.' } else { 'A new VS2026 BuildTools instance is selected; neither existing VS2022 instance is an installation target.' }),
     'Official setup may service the shared Visual Studio Installer and shared runtime prerequisites.',
     'Package cache policy and existing software are not removed or changed by this script.',
     'SDK files use their normal Windows Kits location, with the x64 debugging tools selected.',
@@ -169,19 +218,19 @@ if (-not $Install) { $zacroPlan | ConvertTo-Json -Depth 8; return }
 if ($zacroPlan.currentFreeGiB -lt 30 -or $zacroPlan.systemFreeGiB -lt 15) { throw 'The provisioning reserve is below 30 GiB on the toolchain volume or 15 GiB on the system volume. No installer was started.' }
 
 $zacroExistingTarget = @($zacroBefore | Where-Object { $_.installationPath -eq $zacroVisualStudioPath })
-if ((Test-Path -LiteralPath $zacroVisualStudioPath) -and
-    ((Get-Item -LiteralPath $zacroVisualStudioPath).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+if (-not $SdkOnly -and (Test-Path -LiteralPath $zacroVisualStudioPath) -and
+    ((Get-Item -LiteralPath $zacroVisualStudioPath -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
   throw 'The dedicated VS2026 destination cannot be a junction or symbolic link.'
 }
-if ((Test-Path -LiteralPath $zacroVisualStudioPath) -and $zacroExistingTarget.Count -eq 0) {
+if (-not $SdkOnly -and (Test-Path -LiteralPath $zacroVisualStudioPath) -and $zacroExistingTarget.Count -eq 0) {
   throw 'The dedicated VS2026 destination already exists without a matching installed product. It was left intact.'
 }
-if ($zacroExistingTarget.Count -gt 0 -and $zacroExistingTarget[0].installationVersion -ne $zacroVsSpec.installedVersion) {
+if (-not $SdkOnly -and $zacroExistingTarget.Count -gt 0 -and $zacroExistingTarget[0].installationVersion -ne $zacroVsSpec.installedVersion) {
   throw 'The dedicated destination contains a different Visual Studio version. It was left intact.'
 }
 $zacroReceiptDirectory = Join-Path $zacroToolchainRoot 'receipts'
 if ((Test-Path -LiteralPath $zacroReceiptDirectory) -and
-    ((Get-Item -LiteralPath $zacroReceiptDirectory).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+    ((Get-Item -LiteralPath $zacroReceiptDirectory -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
   throw 'The receipt directory cannot be a junction or symbolic link.'
 }
 New-Item -ItemType Directory -Path $zacroReceiptDirectory -Force | Out-Null
@@ -205,19 +254,20 @@ foreach ($zacroSpecification in $zacroSpecifications) {
   if ($zacroProcess.ExitCode -notin @(0,3010)) { throw "Official installer failed with exit code $($zacroProcess.ExitCode); see $zacroReceiptPath. No retry or bypass was attempted." }
   if ($zacroProcess.ExitCode -eq 3010) { throw "Official installer requires a restart. No restart was initiated. After a human-controlled restart, review and rerun this script; receipt: $zacroReceiptPath" }
 }
-$zacroAfter = @(& $zacroVswhere -all -products '*' -format json -utf8 | ConvertFrom-Json)
-foreach ($zacroPrior in $zacroBefore) {
-  $zacroCurrent = @($zacroAfter | Where-Object { $_.instanceId -eq $zacroPrior.instanceId })
-  if ($zacroCurrent.Count -ne 1 -or $zacroCurrent[0].installationVersion -ne $zacroPrior.installationVersion) {
-    throw 'An existing product instance changed unexpectedly. Review official installer logs before further work.'
-  }
+$zacroAfter = @(Get-ZacroVisualStudio)
+Assert-ZacroPreservedInstances $zacroBefore $zacroAfter
+if ($SdkOnly) {
+  $zacroStillQualified = @(Get-ZacroVisualStudio -Qualified | Where-Object { $_.instanceId -eq $zacroExistingCompiler.instanceId })
+  if ($zacroStillQualified.Count -ne 1) { throw 'The existing compiler component qualification changed unexpectedly.' }
+  Select-ZacroQualifiedCompiler $zacroStillQualified | Out-Null
+} else {
+  $zacroInstalled = @($zacroAfter | Where-Object { $_.installationPath -eq $zacroVisualStudioPath -and $_.installationVersion -eq $zacroVsSpec.installedVersion })
+  if ($zacroInstalled.Count -ne 1) { throw 'Expected pinned Build Tools installation was not verified.' }
 }
-$zacroInstalled = @($zacroAfter | Where-Object { $_.installationPath -eq $zacroVisualStudioPath -and $_.installationVersion -eq $zacroVsSpec.installedVersion })
-if ($zacroInstalled.Count -ne 1) { throw 'Expected pinned Build Tools installation was not verified.' }
 $zacroKit = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10'
 foreach ($zacroRequired in @('Include\10.0.28000.0\um\Windows.h','Lib\10.0.28000.0\um\x64\kernel32.lib','Debuggers\x64\dbghelp.dll')) {
   if (-not (Test-Path -LiteralPath (Join-Path $zacroKit $zacroRequired))) { throw "Required SDK file missing: $zacroRequired" }
 }
-$zacroDebuggerVersion = (Get-Item -LiteralPath (Join-Path $zacroKit 'Debuggers\x64\dbghelp.dll')).VersionInfo.FileVersionRaw
+$zacroDebuggerVersion = (Get-Item -LiteralPath (Join-Path $zacroKit 'Debuggers\x64\dbghelp.dll') -Force).VersionInfo.FileVersionRaw
 if ($zacroDebuggerVersion -lt [Version]'10.0.26100.3323') { throw 'Installed x64 debugging tools are below the source requirement.' }
 Write-Output "Prerequisites verified. Task-local build environment: DEPOT_TOOLS_WIN_TOOLCHAIN=0; vs2026_install=$zacroVisualStudioPath"

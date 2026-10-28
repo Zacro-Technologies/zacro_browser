@@ -22,6 +22,8 @@ Existing VS2022 product instances are not installation targets, and the script c
 
 After successful provisioning, set these variables only in the build session:
 
+For a machine that already has VS 2026 with C++ and ATL/MFC, add `-SdkOnly` to verification, `-Download` or `-Install`. This selects only the pinned SDK bootstrapper and validates the existing compiler through `vswhere`; it neither installs nor updates Visual Studio. SDK installation still requires an already elevated process and verifies that existing Visual Studio instances remain unchanged. The dedicated hosted Windows build workflow uses this mode on its disposable runner.
+
 ```powershell
 $env:DEPOT_TOOLS_WIN_TOOLCHAIN = '0'
 $env:vs2026_install = 'C:\zacro-google-prototype\toolchains\VS2026'

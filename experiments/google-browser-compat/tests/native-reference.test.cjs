@@ -45,12 +45,14 @@ function fixture() {
   };
 }
 function load(data, fetchOverride) {
-  const calls = [];
+  const calls = [],
+    waits = [];
   const module = { exports: {} };
   vm.runInNewContext(syncFs.readFileSync(filename, 'utf8'), {
     module,
     exports: module.exports,
     require(id) {
+      if (id === 'node:timers/promises') return { setTimeout: async (delay) => waits.push(delay) };
       return id === './manifest.json' ? data.manifest : nativeRequire(id);
     },
     Buffer,
@@ -63,8 +65,49 @@ function load(data, fetchOverride) {
       return new Response(data.payloads[index]);
     },
   });
-  return { ...module.exports, calls };
+  return { ...module.exports, calls, waits };
 }
+
+test('reference retries honor Retry-After and use only the canonical pinned fallback', async (t) => {
+  const root = path.join(await scratch(t), 'owned'),
+    data = fixture();
+  const first = data.manifest.files[0];
+  const h = load(data, async (url) => {
+    if (url === first.sourceUrl) return new Response('', { status: 429, headers: { 'retry-after': '15' } });
+    if (url.startsWith('https://chromium.googlesource.com/')) {
+      assert.equal(
+        url,
+        `https://chromium.googlesource.com/chromium/src/+/${data.manifest.revision}/${first.path}?format=TEXT`,
+      );
+      return new Response(data.payloads[0].toString('base64'));
+    }
+    return new Response(data.payloads[data.manifest.files.findIndex((file) => file.sourceUrl === url)]);
+  });
+  const result = await h.fetchReferences(root);
+  assert.equal(result.verifiedFiles, 9);
+  assert.equal(h.calls.length, 11);
+  assert.deepEqual(h.waits, [15000]);
+  assert.equal(api.retryDelay('120'), null);
+  assert.equal(api.retryDelay('Thu, 29 Oct 2026 00:00:30 GMT', Date.parse('2026-10-29T00:00:00Z')), 30000);
+});
+
+test('exhausted rate limits fail and neither 404s nor bad hashes trigger a fallback', async (t) => {
+  const directory = await scratch(t),
+    data = fixture();
+  const limited = load(data, async () => new Response('', { status: 429 }));
+  await assert.rejects(limited.fetchReferences(path.join(directory, 'limited')), /bounded retries.*429/);
+  assert.equal(limited.calls.length, 4);
+  assert.deepEqual(limited.waits, [10000, 10000]);
+  for (const [name, response, message] of [
+    ['missing', () => new Response('', { status: 404 }), /404/],
+    ['tampered', () => new Response('wrong bytes'), /pinned SHA-256/],
+  ]) {
+    const h = load(data, async () => response());
+    await assert.rejects(h.fetchReferences(path.join(directory, name)), message);
+    assert.equal(h.calls.length, 1);
+    assert.deepEqual(h.waits, []);
+  }
+});
 
 test('reference CLI accepts only an absolute external root and the checked-in manifest is valid', () => {
   api.verifyManifest();

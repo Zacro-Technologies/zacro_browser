@@ -179,47 +179,53 @@ test(
   },
 );
 
-test('Mac framework symlinks remain links with contained relative targets', async (t) => {
-  const root = await scratch(t);
-  const bundle = await bundleFixture(root);
-  try {
+test(
+  'Mac framework symlinks remain links with contained relative targets',
+  {
+    skip:
+      process.platform === 'win32'
+        ? 'Mac symlink targets require POSIX path semantics, not Windows readlink normalization.'
+        : false,
+  },
+  async (t) => {
+    const root = await scratch(t);
+    const bundle = await bundleFixture(root);
     await frameworkLinks(bundle);
-  } catch (error) {
-    if (process.platform === 'win32' && ['EPERM', 'EACCES'].includes(error.code))
-      return t.skip('This Windows host cannot create relative symbolic links.');
-    throw error;
-  }
-  const inventory = await macInventory(bundle);
-  const links = inventory.filter((entry) => entry.type === 'symlink');
-  assert.equal(links.length, 2);
-  assert.deepEqual(links.map((entry) => entry.link).sort(), ['156', 'Versions/Current/Zacro Framework']);
-  assert.ok(links.every((entry) => Number.isInteger(entry.mode) && entry.sha256 === undefined));
-  assert.equal(inventory.filter((entry) => entry.sha256 === hash('fixture engine')).length, 1);
-});
+    const inventory = await macInventory(bundle);
+    const links = inventory.filter((entry) => entry.type === 'symlink');
+    assert.equal(links.length, 2);
+    assert.deepEqual(links.map((entry) => entry.link).sort(), ['156', 'Versions/Current/Zacro Framework']);
+    assert.ok(links.every((entry) => Number.isInteger(entry.mode) && entry.sha256 === undefined));
+    assert.equal(inventory.filter((entry) => entry.sha256 === hash('fixture engine')).length, 1);
+  },
+);
 
-test('Mac inventory rejects absolute, escaping, dangling and cyclic framework links', async (t) => {
-  const root = await scratch(t);
-  const bundle = await bundleFixture(root);
-  const outside = await put(root, 'outside', 'outside');
-  const link = path.join(bundle, 'Contents', 'escape');
-  try {
+test(
+  'Mac inventory rejects absolute, escaping, dangling and cyclic framework links',
+  {
+    skip:
+      process.platform === 'win32'
+        ? 'Mac symlink targets require POSIX path semantics, not Windows readlink normalization.'
+        : false,
+  },
+  async (t) => {
+    const root = await scratch(t);
+    const bundle = await bundleFixture(root);
+    const outside = await put(root, 'outside', 'outside');
+    const link = path.join(bundle, 'Contents', 'escape');
     await fs.symlink(outside, link, 'file');
-  } catch (error) {
-    if (process.platform === 'win32' && ['EPERM', 'EACCES'].includes(error.code))
-      return t.skip('This Windows host cannot create relative symbolic links.');
-    throw error;
-  }
-  await assert.rejects(macInventory(bundle), /relative targets/u);
-  await fs.unlink(link);
-  await fs.symlink('../../outside', link, 'file');
-  await assert.rejects(macInventory(bundle), /escapes/u);
-  await fs.unlink(link);
-  await fs.symlink('missing', link, 'file');
-  await assert.rejects(macInventory(bundle));
-  await fs.unlink(link);
-  await fs.symlink('escape', link, 'file');
-  await assert.rejects(macInventory(bundle));
-});
+    await assert.rejects(macInventory(bundle), /relative targets/u);
+    await fs.unlink(link);
+    await fs.symlink('../../outside', link, 'file');
+    await assert.rejects(macInventory(bundle), /escapes/u);
+    await fs.unlink(link);
+    await fs.symlink('missing', link, 'file');
+    await assert.rejects(macInventory(bundle));
+    await fs.unlink(link);
+    await fs.symlink('escape', link, 'file');
+    await assert.rejects(macInventory(bundle));
+  },
+);
 
 test(
   'native Mac ditto ZIP roundtrip preserves the complete runtime inventory',

@@ -1,0 +1,204 @@
+name: Zacro native Windows prototype build
+
+on:
+  push:
+    branches: [codex/google-browser-compat]
+    paths:
+      - '.github/workflows/zacro-native-windows-build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zacro-native-hosted-windows-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  compile:
+    name: Compile Chromium 156 with Zacro branding (Windows x64)
+    runs-on: windows-latest
+    timeout-minutes: 350
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      ZACRO_NATIVE_PLATFORM: win32-x64
+      ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          architecture: x64
+
+      - name: Choose dedicated external paths on the available native volume
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $volume = Get-Volume | Where-Object { $_.DriveLetter -and $_.DriveType -eq 'Fixed' -and $_.FileSystem -eq 'NTFS' } |
+            Sort-Object -Property SizeRemaining -Descending | Select-Object -First 1
+          if (-not $volume) { throw 'No native NTFS build volume is available.' }
+          $root = "$($volume.DriveLetter):\zacro-native-windows-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          if ($root -match '\s') { throw 'The Chromium source root cannot contain whitespace.' }
+          $evidence = Join-Path $env:RUNNER_TEMP "zacro-native-windows-evidence-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          New-Item -ItemType Directory -Path $evidence | Out-Null
+          "ZACRO_NATIVE_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "ZACRO_BUILD_EVIDENCE=$evidence" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "ZACRO_TOOLCHAIN_ROOT=$(Join-Path $root 'toolchains')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "ZACRO_BUILD_STARTED_AT=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Check native resources and existing Visual Studio before downloads
+        id: initial-preflight
+        run: |
+          node experiments/google-browser-compat/build/native-build.cjs preflight --root $env:ZACRO_NATIVE_ROOT --platform $env:ZACRO_NATIVE_PLATFORM |
+            Tee-Object -FilePath (Join-Path $env:ZACRO_BUILD_EVIDENCE 'preflight-before-sdk.json')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $report = Get-Content -LiteralPath (Join-Path $env:ZACRO_BUILD_EVIDENCE 'preflight-before-sdk.json') -Raw | ConvertFrom-Json
+          if ($report.host -ne 'win32-x64' -or $report.fileSystem -ne 'NTFS') { throw 'A native Windows x64 NTFS host is required.' }
+          if ($report.freeGiB -lt 100 -or $report.ramGiB -lt 8) { throw 'At least 100 GiB free disk and 8 GiB RAM are required before source preparation.' }
+          $compilers = @($report.tools.visualStudio | Where-Object { [Version]$_.version -ge [Version]'18.0.0' })
+          if ($compilers.Count -eq 0) { throw 'Existing VS18+ with x64 C++ and ATL/MFC is required; this lane never installs Visual Studio.' }
+          $unresolved = @($report.sourceBuild.blockers | Where-Object {
+            $_ -notlike 'Windows SDK headers for 10.0.28000.0 or newer*' -and
+            $_ -ne 'Required x64 Windows SDK Debugging Tools were not verified.'
+          })
+          if ($unresolved.Count) { throw ($unresolved -join ' ') }
+          $identity = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
+          if (-not $identity.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'SDK installation requires the hosted runner already to be Administrator. No elevation is attempted.' }
+          node -e 'require("./experiments/google-browser-compat/lib/paths.cjs").ensureRoot(process.env.ZACRO_NATIVE_ROOT).catch(error => { console.error(error.message); process.exitCode = 1; });'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Test provisioning and native build guards without installers
+        run: |
+          node --test experiments/google-browser-compat/tests/provisioning.test.cjs experiments/google-browser-compat/tests/native-source.test.cjs experiments/google-browser-compat/tests/managed-tools.test.cjs experiments/google-browser-compat/tests/native-sync.test.cjs experiments/google-browser-compat/tests/native-build.test.cjs experiments/google-browser-compat/tests/native-runtime.test.cjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Download and verify only the pinned Windows SDK bootstrapper
+        timeout-minutes: 10
+        run: |
+          & powershell.exe -NoLogo -NoProfile -NonInteractive -File experiments/google-browser-compat/build/provision-windows.ps1 -ExternalRoot $env:ZACRO_TOOLCHAIN_ROOT -SdkOnly -Download |
+            Tee-Object -FilePath (Join-Path $env:ZACRO_BUILD_EVIDENCE 'sdk-plan.json')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Install the verified SDK while preserving existing Visual Studio
+        timeout-minutes: 30
+        run: |
+          & powershell.exe -NoLogo -NoProfile -NonInteractive -File experiments/google-browser-compat/build/provision-windows.ps1 -ExternalRoot $env:ZACRO_TOOLCHAIN_ROOT -SdkOnly -Install
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Require a fully ready native toolchain after SDK setup
+        run: |
+          node experiments/google-browser-compat/build/native-build.cjs preflight --root $env:ZACRO_NATIVE_ROOT --platform $env:ZACRO_NATIVE_PLATFORM |
+            Tee-Object -FilePath (Join-Path $env:ZACRO_BUILD_EVIDENCE 'preflight-ready.json')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $report = Get-Content -LiteralPath (Join-Path $env:ZACRO_BUILD_EVIDENCE 'preflight-ready.json') -Raw | ConvertFrom-Json
+          if (-not $report.sourceBuild.ready) { throw ($report.sourceBuild.blockers -join ' ') }
+
+      - name: Install only the fixture tooling dependencies
+        run: |
+          npm ci --ignore-scripts
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Prepare the exact Chromium and depot revisions
+        timeout-minutes: 60
+        run: |
+          node experiments/google-browser-compat/build/native-source.cjs prepare --root $env:ZACRO_NATIVE_ROOT --platform $env:ZACRO_NATIVE_PLATFORM
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Synchronize pinned native dependencies and record actual revisions
+        timeout-minutes: 90
+        run: |
+          node experiments/google-browser-compat/build/native-source.cjs sync --root $env:ZACRO_NATIVE_ROOT --platform $env:ZACRO_NATIVE_PLATFORM
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Apply verified Zacro branding and generate the native build
+        timeout-minutes: 30
+        run: |
+          node experiments/google-browser-compat/build/native-build.cjs configure --root $env:ZACRO_NATIVE_ROOT --platform $env:ZACRO_NATIVE_PLATFORM
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # Source/build commands retain the existing 15 GiB runtime disk reserve.
+      # Four jobs match this lane's observed CPU count; no remote build service.
+      - name: Reserve time for fixtures, packaging and evidence upload
+        id: compile-budget
+        run: |
+          $elapsed = [Math]::Ceiling(([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [long]$env:ZACRO_BUILD_STARTED_AT) / 60)
+          $minutes = [Math]::Min(240, 300 - $elapsed)
+          if ($minutes -lt 5) { throw 'Source preparation used the compilation budget; stopping while evidence can still be uploaded.' }
+          "minutes=$minutes" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Compile the full native browser with four local jobs
+        id: build
+        timeout-minutes: ${{ fromJSON(steps.compile-budget.outputs.minutes) }}
+        run: |
+          node experiments/google-browser-compat/build/native-build.cjs build --root $env:ZACRO_NATIVE_ROOT --platform $env:ZACRO_NATIVE_PLATFORM --jobs 4
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $lock = Get-Content -LiteralPath experiments/google-browser-compat/build/native-build.lock.json -Raw | ConvertFrom-Json
+          $buildReceipt = Join-Path $env:ZACRO_NATIVE_ROOT "native-builds/$($lock.sourceVersion)/win32-x64/build.json"
+          Copy-Item -LiteralPath $buildReceipt -Destination (Join-Path $env:ZACRO_BUILD_EVIDENCE 'build.json')
+
+      - name: Test only isolated local fixtures in the compiled Zacro browser
+        id: mechanics
+        timeout-minutes: 10
+        run: |
+          node experiments/google-browser-compat/mechanics.cjs --root $env:ZACRO_NATIVE_ROOT --engine zacro-native |
+            Tee-Object -FilePath (Join-Path $env:ZACRO_BUILD_EVIDENCE 'mechanics-summary.json')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Package only verified runtime dependencies from this build
+        id: package
+        timeout-minutes: 15
+        run: |
+          node experiments/google-browser-compat/build/native-build.cjs package --root $env:ZACRO_NATIVE_ROOT --platform $env:ZACRO_NATIVE_PLATFORM |
+            Tee-Object -FilePath (Join-Path $env:ZACRO_BUILD_EVIDENCE 'package.json')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $result = Get-Content -LiteralPath (Join-Path $env:ZACRO_BUILD_EVIDENCE 'package.json') -Raw | ConvertFrom-Json
+          if ($result.compiled -ne $true) { throw 'No compiled browser archive was produced.' }
+          "archive=$($result.destination)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "receipt=$($result.destination).json" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Upload the exact archive produced by this run
+        uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() && steps.package.outcome == 'success' }}
+        timeout-minutes: 10
+        with:
+          name: zacro-native-windows-prototype-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.receipt }}
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Record the observed build boundary
+        if: always()
+        env:
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          MECHANICS_OUTCOME: ${{ steps.mechanics.outcome }}
+          PACKAGE_OUTCOME: ${{ steps.package.outcome }}
+        run: |
+          @(
+            "Native compilation: $env:BUILD_OUTCOME",
+            "Local fixture mechanics: $env:MECHANICS_OUTCOME",
+            "Verified archive: $env:PACKAGE_OUTCOME",
+            'This lane uses an ordinary hosted Windows runner and its existing qualified Visual Studio installation.',
+            'Compilation can fail or time out within the 350-minute job limit; source/tooling checks alone are not a browser build.',
+            'Any produced prototype is unsigned. Google account acceptance remains untested; no live Google authentication is automated.'
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Upload only build evidence and SDK receipts
+        uses: actions/upload-artifact@v4
+        if: ${{ always() && env.ZACRO_BUILD_EVIDENCE != '' }}
+        timeout-minutes: 10
+        with:
+          name: zacro-native-windows-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.ZACRO_BUILD_EVIDENCE }}/*.json
+            ${{ env.ZACRO_TOOLCHAIN_ROOT }}/receipts/*.json
+            ${{ env.ZACRO_NATIVE_ROOT }}/results/mechanics-zacro-native-win32-x64-native-branded.json
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 0

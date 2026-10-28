@@ -30,6 +30,8 @@ jobs:
     name: Source and tooling (${{ matrix.platform }})
     strategy:
       fail-fast: false
+      # Avoid three simultaneous bursts against the same pinned source origins.
+      max-parallel: 1
       matrix:
         include:
           - runner: windows-latest
@@ -75,6 +77,13 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           # These unit/patch checks use Node built-ins and native Git/archive tools.
           # No npm install, compiler installation or full Chromium checkout occurs.
+      - name: Record native source-build prerequisites before network-dependent checks
+        run: |
+          node -e 'require("./experiments/google-browser-compat/lib/paths.cjs").ensureRoot(process.env.ZACRO_NATIVE_ROOT).catch(error => { console.error(error.message); process.exitCode = 1; });'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node experiments/google-browser-compat/build/native-build.cjs preflight --root $env:ZACRO_NATIVE_ROOT --platform $env:ZACRO_NATIVE_PLATFORM |
+            Tee-Object -FilePath (Join-Path $env:ZACRO_NATIVE_ROOT 'preflight.json')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Fetch only the nine pinned source files for patch verification
         id: references
         run: |
@@ -92,12 +101,6 @@ jobs:
         run: |
           node experiments/google-browser-compat/native-branding/validate-sparse.cjs $env:ZACRO_BRANDING_REFERENCES |
             Tee-Object -FilePath (Join-Path $env:ZACRO_NATIVE_ROOT 'branding-validation.json')
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Record native source-build prerequisites
-        if: ${{ !cancelled() && steps.references.outcome == 'success' }}
-        run: |
-          node experiments/google-browser-compat/build/native-build.cjs preflight --root $env:ZACRO_NATIVE_ROOT --platform $env:ZACRO_NATIVE_PLATFORM |
-            Tee-Object -FilePath (Join-Path $env:ZACRO_NATIVE_ROOT 'preflight.json')
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Explain the verification boundary
         if: always()

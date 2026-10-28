@@ -65,6 +65,33 @@ async function existingDirectory(input) {
     }
   }
 }
+
+function macContainingVolume(output) {
+  if (typeof output !== 'string') return null;
+  const rows = output.trim().split(/\r?\n/u);
+  // df -P -I emits one header and one row for the single requested path.
+  // The mount point is the remaining field, so volume names may contain spaces.
+  if (rows.length !== 2) return null;
+  const match = rows[1].match(/^(\/dev\/disk\d+(?:s\d+)*)\s+-?\d+\s+-?\d+\s+-?\d+\s+\d+%\s+(\/.*)$/u);
+  if (!match || /[\0\r\n]/u.test(match[2])) return null;
+  return { device: match[1], mountPoint: match[2] };
+}
+
+async function macFileSystem(directory, run = command) {
+  // diskutil accepts a device or mount point, not an arbitrary descendant.
+  // df uses statfs on the requested path, which also preserves external volumes
+  // and APFS Data-volume/firmlink resolution instead of assuming the root volume.
+  const discovered = await run('/bin/df', ['-P', '-I', directory]);
+  const volume = discovered.ok ? macContainingVolume(discovered.output) : null;
+  if (!volume) return { fileSystem: null, mountPoint: null };
+  const detail = await run('/usr/sbin/diskutil', ['info', '-plist', volume.mountPoint]);
+  return {
+    fileSystem: detail.ok
+      ? detail.output.match(/<key>FilesystemType<\/key>\s*<string>([A-Za-z0-9_-]+)<\/string>/u)?.[1] || null
+      : null,
+    mountPoint: volume.mountPoint,
+  };
+}
 async function preflight({ root: input, platform = `${process.platform}-${process.arch}` } = {}) {
   const root = resolveRoot(input),
     nearest = await existingDirectory(root),
@@ -193,14 +220,13 @@ async function preflight({ root: input, platform = `${process.platform}-${proces
       warnings.push(
         'Installed SDK differs from upstream official SDK 27.0; this is not the source minimum, but the exact build is not yet validated.',
       );
-    const volume = await command('/usr/sbin/diskutil', ['info', '-plist', nearest]);
-    report.fileSystem = volume.ok
-      ? volume.output.match(/<key>FilesystemType<\/key>\s*<string>([^<]+)<\/string>/)?.[1] || null
-      : null;
+    const volume = await macFileSystem(nearest);
+    report.fileSystem = volume.fileSystem;
+    report.fileSystemMountPoint = volume.mountPoint;
     if (report.fileSystem?.toLowerCase() !== 'apfs')
       blockers.push('Source-checkout volume was not confirmed as APFS.');
   } else blockers.push('Source compilation needs a supported native Windows or Mac environment.');
   report.sourceBuild.ready = blockers.length === 0;
   return report;
 }
-module.exports = { preflight, sourceRequirements, versionAtLeast };
+module.exports = { preflight, sourceRequirements, versionAtLeast, macContainingVolume, macFileSystem };
