@@ -1,0 +1,11 @@
+# Full native Chromium browser. This is not an Electron/content_shell build.
+target_os = "win"
+target_cpu = "x64"
+is_debug = false
+is_component_build = false
+is_chrome_branded = false
+is_official_build = false
+use_remoteexec = false
+symbol_level = 1
+blink_symbol_level = 0
+v8_symbol_level = 0

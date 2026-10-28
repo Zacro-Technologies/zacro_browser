@@ -1,0 +1,62 @@
+{
+  "schemaVersion": 1,
+  "time": "2026-10-28T17:48:30.584Z",
+  "platform": "win32-x64",
+  "osRelease": "10.0.26200",
+  "engine": "brave",
+  "configuration": "reference",
+  "sourceRevision": "52db4b25c0aa3038e9a1c6021428b136cc3cb5fc",
+  "archiveSha256": "2c937c91f5061fb1034097c932112b06f429d5bdd08bc5e32921b88609d011e7",
+  "observedBrowserProduct": "Chrome/156.0.8078.48",
+  "purpose": "automated local browser mechanics, with CDP; never a live Google test",
+  "googleAcceptance": "untested",
+  "credentialsUsed": false,
+  "nativeStartup": {
+    "documentRequested": true,
+    "scriptReady": true
+  },
+  "fixtureRendering": {
+    "visibility": "visible",
+    "focused": true,
+    "animationFrame": true
+  },
+  "passed": true,
+  "checks": [
+    {
+      "name": "native-full-browser-launch",
+      "result": "passed"
+    },
+    {
+      "name": "local-http-only-session",
+      "result": "passed"
+    },
+    {
+      "name": "native-tab-navigation",
+      "result": "passed"
+    },
+    {
+      "name": "cross-origin-popup-post-and-opener",
+      "result": "passed"
+    },
+    {
+      "name": "native-download-to-owned-fixture-directory",
+      "result": "passed"
+    },
+    {
+      "name": "regular-profile-session-restart",
+      "result": "passed"
+    },
+    {
+      "name": "local-signout-persists-after-restart",
+      "result": "passed"
+    },
+    {
+      "name": "two-regular-profile-isolation",
+      "result": "passed"
+    },
+    {
+      "name": "native-incognito-session-cleanup",
+      "result": "passed"
+    }
+  ]
+}

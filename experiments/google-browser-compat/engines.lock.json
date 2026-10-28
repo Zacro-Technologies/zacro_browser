@@ -1,0 +1,72 @@
+{
+  "schemaVersion": 1,
+  "retrievedOn": "2026-10-29",
+  "timeZone": "Asia/Tokyo",
+  "depotToolsRevision": "76ffeb6f3ebc96c7a6ca0c4ca4e25c254952aa55",
+  "engines": {
+    "chromium": {
+      "name": "Chromium",
+      "classification": "upstream full-browser engine candidate; not a compiled Zacro fork",
+      "version": "159.0.8130.0",
+      "position": "1729109",
+      "sourceRevision": "0c75ec0efee23f664c9a3380217ae4650bed97e6",
+      "sourceRepository": "https://chromium.googlesource.com/chromium/src.git",
+      "artifacts": {
+        "win32-x64": {
+          "cacheName": "chrome-win-1729109.zip",
+          "url": "https://storage.googleapis.com/download/storage/v1/b/chromium-browser-snapshots/o/Win_x64%2F1729109%2Fchrome-win.zip?generation=1793201450092364&alt=media",
+          "metadataUrl": "https://storage.googleapis.com/storage/v1/b/chromium-browser-snapshots/o/Win_x64%2F1729109%2Fchrome-win.zip",
+          "revisionsUrl": "https://commondatastorage.googleapis.com/chromium-browser-snapshots/Win_x64/1729109/REVISIONS",
+          "generation": "1793201450092364",
+          "size": 370025512,
+          "md5Base64": "VRl87vvQVLVp+bYZF6iftA==",
+          "crc32cBase64": "NFveUw==",
+          "sha256": "813787fddee9b276cde1aa550ac01a571fae9c887565c6c010600bfddc7bc985",
+          "sha256Provenance": "Locally recorded on first retrieval, after verification against official size, published MD5 and immutable object generation; not a publisher-provided SHA-256",
+          "executable": "chrome-win/chrome.exe"
+        },
+        "darwin-arm64": {
+          "cacheName": "chrome-mac-1729109.zip",
+          "url": "https://storage.googleapis.com/download/storage/v1/b/chromium-browser-snapshots/o/Mac_Arm%2F1729109%2Fchrome-mac.zip?generation=1793198059445823&alt=media",
+          "metadataUrl": "https://storage.googleapis.com/storage/v1/b/chromium-browser-snapshots/o/Mac_Arm%2F1729109%2Fchrome-mac.zip",
+          "revisionsUrl": "https://commondatastorage.googleapis.com/chromium-browser-snapshots/Mac_Arm/1729109/REVISIONS",
+          "generation": "1793198059445823",
+          "size": 184500606,
+          "md5Base64": "k8yjijXtDjCg83Jnnu7a6A==",
+          "crc32cBase64": "um8+Sw==",
+          "sha256": "8bf10dcb011ad7b1d5f25d3af25957c7b43b92100858609840c81b3e3266f707",
+          "sha256Provenance": "Locally recorded on first retrieval, after verification against official size, published MD5 and immutable object generation; not a publisher-provided SHA-256",
+          "executable": "chrome-mac/Chromium.app/Contents/MacOS/Chromium"
+        }
+      }
+    },
+    "brave": {
+      "name": "Brave Browser",
+      "classification": "unmodified upstream reference browser",
+      "version": "1.98.60",
+      "chromiumVersion": "156.0.8078.48",
+      "sourceRevision": "52db4b25c0aa3038e9a1c6021428b136cc3cb5fc",
+      "annotatedTagObject": "3c6e94fbe39a02e1a32af22f096be100300d0245",
+      "sourceRepository": "https://github.com/brave/brave-core.git",
+      "releaseUrl": "https://github.com/brave/brave-browser/releases/tag/v1.98.60",
+      "artifacts": {
+        "win32-x64": {
+          "cacheName": "brave-v1.98.60-win32-x64.zip",
+          "url": "https://github.com/brave/brave-browser/releases/download/v1.98.60/brave-v1.98.60-win32-x64.zip",
+          "size": 254190053,
+          "sha256": "2c937c91f5061fb1034097c932112b06f429d5bdd08bc5e32921b88609d011e7",
+          "sha256Provenance": "Published GitHub release asset digest",
+          "executable": "brave.exe"
+        },
+        "darwin-arm64": {
+          "cacheName": "brave-v1.98.60-darwin-arm64.zip",
+          "url": "https://github.com/brave/brave-browser/releases/download/v1.98.60/brave-v1.98.60-darwin-arm64.zip",
+          "size": 298125601,
+          "sha256": "05e28cbc3c5b5056ab15141cfdc797c8a458914f41b8fbb07a0831c90cb7bf1f",
+          "sha256Provenance": "Published GitHub release asset digest",
+          "executable": "Brave Browser.app/Contents/MacOS/Brave Browser"
+        }
+      }
+    }
+  }
+}

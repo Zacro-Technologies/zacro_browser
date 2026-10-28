@@ -1,0 +1,137 @@
+{
+  "schemaVersion": 1,
+  "observedAt": "2026-10-28T17:42:36.808Z",
+  "platform": "win32-x64",
+  "sourceVersion": "156.0.8078.48",
+  "depotToolsRevision": "76ffeb6f3ebc96c7a6ca0c4ca4e25c254952aa55",
+  "branding": {
+    "schemaVersion": 1,
+    "expectedRevision": "d0c02bfad08ec92a6ffcf989e53cd995e6381a4c",
+    "observedRevision": "d0c02bfad08ec92a6ffcf989e53cd995e6381a4c",
+    "revisionVerified": true,
+    "state": "patched",
+    "patchSha256": "96b0e95da0b7ed44e728299a0926d5e34f6f06a4ad4158d4547817718126c005",
+    "files": [
+      {
+        "path": "chrome/app/theme/chromium/BRANDING",
+        "sha256": "b640ce6d977e9a68af7fdc3957575a7d995354b1119215067f0550d468e3652a",
+        "state": "patched"
+      },
+      {
+        "path": "chrome/install_static/chromium_install_modes.h",
+        "sha256": "a368d76a16b8f7a2529f208bada886df7e3c140a410d84c5ff80f06b5d84fce3",
+        "state": "patched"
+      },
+      {
+        "path": "chrome/common/chrome_paths_mac.mm",
+        "sha256": "a21541c800c046028dfefb776d84b34ad60150c58d63d1e84efef3191343cf5e",
+        "state": "patched"
+      },
+      {
+        "path": "chrome/app/app-Info.plist",
+        "sha256": "2839d643404446986fad203db35ecf5b45973d6ab331c83cf4df64560efea95f",
+        "state": "patched"
+      },
+      {
+        "path": "chrome/common/chrome_paths.cc",
+        "sha256": "e31dce3542ad1213a97535a9c4e9911666d8c9e7aaaa4468b414937ff6fe2af7",
+        "state": "patched"
+      },
+      {
+        "path": "components/os_crypt/common/keychain_password_mac.mm",
+        "sha256": "d5973367e91ff2c343c8fde91d3d3c1454d2a777237f2fb0a806dd0f47a7fe52",
+        "state": "patched"
+      },
+      {
+        "path": "components/version_info/version_info_with_user_agent.cc",
+        "sha256": "687f7be7fe38c3df388e1df5bb0d827c4484e400e79b39171c7a5183399f3d30",
+        "state": "patched"
+      },
+      {
+        "path": "components/embedder_support/user_agent_utils.cc",
+        "sha256": "b8e7700e6baad822237d5668c83162bfb21ab55141cfac90011264e8e20a69d0",
+        "state": "patched"
+      },
+      {
+        "path": "chrome/app/chromium_strings.grd",
+        "sha256": "a7808ebc2e01967e2b68b5cfee7e701e0e0508a77f013cb2a0d1cc90593bc4b1",
+        "state": "patched"
+      }
+    ],
+    "compiled": false,
+    "googleAcceptance": "untested"
+  },
+  "preflight": {
+    "schemaVersion": 1,
+    "observedAt": "2026-10-28T17:42:34.927Z",
+    "host": "win32-x64",
+    "requestedPlatform": "win32-x64",
+    "node": "24.19.0",
+    "osRelease": "10.0.26200",
+    "logicalCpus": 16,
+    "ramGiB": 31.93,
+    "freeGiB": 152.6,
+    "requirements": {
+      "windows": {
+        "visualStudioMinimum": "18.0.0",
+        "sdkRelease": "10.0.28000.2270",
+        "sdkIncludeDirectory": "10.0.28000.0",
+        "debuggerMinimum": "10.0.26100.3323",
+        "fileSystem": "NTFS"
+      },
+      "macOS": {
+        "minimumSdk": "15",
+        "upstreamOfficialSdk": "26.5",
+        "upstreamOfficialSdkBuild": "25F70",
+        "minimumDeploymentTarget": "13.0",
+        "fileSystem": "APFS"
+      },
+      "sourceResourcePolicy": {
+        "minimumFreeGiB": 100,
+        "minimumRamGiB": 8,
+        "recommendedFreeGiB": 200,
+        "recommendedRamGiB": 32,
+        "basis": "100 GB/8 GB are documented Windows floors; this experiment conservatively applies equivalent storage/RAM preflight guards on Mac. They are not claims of official Mac minima or sufficient build capacity."
+      }
+    },
+    "tools": {
+      "git": {
+        "ok": true,
+        "output": "git version 2.46.0.windows.1"
+      },
+      "visualStudio": [],
+      "sdkIncludeDirectories": [],
+      "debuggingTools": null
+    },
+    "sourceBuild": {
+      "ready": false,
+      "blockers": [
+        "VS 2026 (18.0+) with x64 C++ and ATL/MFC components is not installed.",
+        "Windows SDK headers for 10.0.28000.0 or newer were not found. Required SDK release is 10.0.28000.2270.",
+        "Required x64 Windows SDK Debugging Tools were not verified."
+      ],
+      "warnings": [
+        "Less than 200 GiB free: toolchain installation, dependencies and outputs may exceed the remaining headroom.",
+        "Less than 32 GiB RAM: linking and local compile throughput may be constrained."
+      ]
+    },
+    "runtimeExperiment": {
+      "nativeExecutionAvailable": true,
+      "liveGoogleAcceptance": "untested",
+      "customBrowserCompiled": false
+    },
+    "fileSystem": "NTFS",
+    "sourceVersion": "156.0.8078.48",
+    "sourceRevision": "d0c02bfad08ec92a6ffcf989e53cd995e6381a4c",
+    "phase": "source",
+    "diskReserveGiB": 15
+  },
+  "dependencySync": "not-run",
+  "compilation": "not-run",
+  "nativeExecution": "not-run",
+  "googleAcceptance": "untested",
+  "blockers": [
+    "Administrator toolchain installation has not completed; the elevation request was canceled.",
+    "Mac native execution requires access to the available Mac."
+  ]
+}

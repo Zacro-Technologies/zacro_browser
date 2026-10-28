@@ -1,0 +1,829 @@
+{
+  "schemaVersion": 1,
+  "updatedAt": "2026-10-28T15:00:00.000Z",
+  "scope": "human-operated Google website checks; never inferred from fixtures",
+  "enginePins": {
+    "chromium": {
+      "version": "159.0.8130.0",
+      "snapshot": "1729109",
+      "sourceRevision": "0c75ec0efee23f664c9a3380217ae4650bed97e6"
+    },
+    "brave": {
+      "version": "1.98.60",
+      "sourceRevision": "52db4b25c0aa3038e9a1c6021428b136cc3cb5fc",
+      "chromiumVersion": "156.0.8078.48"
+    }
+  },
+  "observations": [
+    {
+      "platform": "win32-x64",
+      "configuration": "brave-reference",
+      "check": "google-password-step",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "win32-x64",
+      "configuration": "brave-reference",
+      "check": "direct-google-login",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "win32-x64",
+      "configuration": "brave-reference",
+      "check": "gmail",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "win32-x64",
+      "configuration": "brave-reference",
+      "check": "drive",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "win32-x64",
+      "configuration": "brave-reference",
+      "check": "restart-persistence",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "win32-x64",
+      "configuration": "brave-reference",
+      "check": "sign-out",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "win32-x64",
+      "configuration": "brave-reference",
+      "check": "regular-profile-isolation",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "win32-x64",
+      "configuration": "brave-reference",
+      "check": "private-session-cleanup",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "win32-x64",
+      "configuration": "brave-reference",
+      "check": "platform-passkey",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "win32-x64",
+      "configuration": "brave-reference",
+      "check": "security-key",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "win32-x64",
+      "configuration": "chromium-engine",
+      "check": "google-password-step",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "win32-x64",
+      "configuration": "chromium-engine",
+      "check": "direct-google-login",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "win32-x64",
+      "configuration": "chromium-engine",
+      "check": "gmail",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "win32-x64",
+      "configuration": "chromium-engine",
+      "check": "drive",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "win32-x64",
+      "configuration": "chromium-engine",
+      "check": "restart-persistence",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "win32-x64",
+      "configuration": "chromium-engine",
+      "check": "sign-out",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "win32-x64",
+      "configuration": "chromium-engine",
+      "check": "regular-profile-isolation",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "win32-x64",
+      "configuration": "chromium-engine",
+      "check": "private-session-cleanup",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "win32-x64",
+      "configuration": "chromium-engine",
+      "check": "platform-passkey",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "win32-x64",
+      "configuration": "chromium-engine",
+      "check": "security-key",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "win32-x64",
+      "configuration": "chromium-workspace",
+      "check": "google-password-step",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "win32-x64",
+      "configuration": "chromium-workspace",
+      "check": "direct-google-login",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "win32-x64",
+      "configuration": "chromium-workspace",
+      "check": "gmail",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "win32-x64",
+      "configuration": "chromium-workspace",
+      "check": "drive",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "win32-x64",
+      "configuration": "chromium-workspace",
+      "check": "restart-persistence",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "win32-x64",
+      "configuration": "chromium-workspace",
+      "check": "sign-out",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "win32-x64",
+      "configuration": "chromium-workspace",
+      "check": "regular-profile-isolation",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "win32-x64",
+      "configuration": "chromium-workspace",
+      "check": "private-session-cleanup",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "win32-x64",
+      "configuration": "chromium-workspace",
+      "check": "platform-passkey",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "win32-x64",
+      "configuration": "chromium-workspace",
+      "check": "security-key",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-arm64",
+      "configuration": "brave-reference",
+      "check": "google-password-step",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-arm64",
+      "configuration": "brave-reference",
+      "check": "direct-google-login",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-arm64",
+      "configuration": "brave-reference",
+      "check": "gmail",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-arm64",
+      "configuration": "brave-reference",
+      "check": "drive",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-arm64",
+      "configuration": "brave-reference",
+      "check": "restart-persistence",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-arm64",
+      "configuration": "brave-reference",
+      "check": "sign-out",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-arm64",
+      "configuration": "brave-reference",
+      "check": "regular-profile-isolation",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-arm64",
+      "configuration": "brave-reference",
+      "check": "private-session-cleanup",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-arm64",
+      "configuration": "brave-reference",
+      "check": "platform-passkey",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-arm64",
+      "configuration": "brave-reference",
+      "check": "security-key",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-arm64",
+      "configuration": "chromium-engine",
+      "check": "google-password-step",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-arm64",
+      "configuration": "chromium-engine",
+      "check": "direct-google-login",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-arm64",
+      "configuration": "chromium-engine",
+      "check": "gmail",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-arm64",
+      "configuration": "chromium-engine",
+      "check": "drive",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-arm64",
+      "configuration": "chromium-engine",
+      "check": "restart-persistence",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-arm64",
+      "configuration": "chromium-engine",
+      "check": "sign-out",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-arm64",
+      "configuration": "chromium-engine",
+      "check": "regular-profile-isolation",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-arm64",
+      "configuration": "chromium-engine",
+      "check": "private-session-cleanup",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-arm64",
+      "configuration": "chromium-engine",
+      "check": "platform-passkey",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-arm64",
+      "configuration": "chromium-engine",
+      "check": "security-key",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-arm64",
+      "configuration": "chromium-workspace",
+      "check": "google-password-step",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-arm64",
+      "configuration": "chromium-workspace",
+      "check": "direct-google-login",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-arm64",
+      "configuration": "chromium-workspace",
+      "check": "gmail",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-arm64",
+      "configuration": "chromium-workspace",
+      "check": "drive",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-arm64",
+      "configuration": "chromium-workspace",
+      "check": "restart-persistence",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-arm64",
+      "configuration": "chromium-workspace",
+      "check": "sign-out",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-arm64",
+      "configuration": "chromium-workspace",
+      "check": "regular-profile-isolation",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-arm64",
+      "configuration": "chromium-workspace",
+      "check": "private-session-cleanup",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-arm64",
+      "configuration": "chromium-workspace",
+      "check": "platform-passkey",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-arm64",
+      "configuration": "chromium-workspace",
+      "check": "security-key",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "awaiting-human",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-x64",
+      "configuration": "brave-reference",
+      "check": "google-password-step",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "artifact-unavailable",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-x64",
+      "configuration": "brave-reference",
+      "check": "direct-google-login",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "artifact-unavailable",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-x64",
+      "configuration": "brave-reference",
+      "check": "gmail",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "artifact-unavailable",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-x64",
+      "configuration": "brave-reference",
+      "check": "drive",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "artifact-unavailable",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-x64",
+      "configuration": "brave-reference",
+      "check": "restart-persistence",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "artifact-unavailable",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-x64",
+      "configuration": "brave-reference",
+      "check": "sign-out",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "artifact-unavailable",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-x64",
+      "configuration": "brave-reference",
+      "check": "regular-profile-isolation",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "artifact-unavailable",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-x64",
+      "configuration": "brave-reference",
+      "check": "private-session-cleanup",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "artifact-unavailable",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-x64",
+      "configuration": "brave-reference",
+      "check": "platform-passkey",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "artifact-unavailable",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-x64",
+      "configuration": "brave-reference",
+      "check": "security-key",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "artifact-unavailable",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-x64",
+      "configuration": "chromium-engine",
+      "check": "google-password-step",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "artifact-unavailable",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-x64",
+      "configuration": "chromium-engine",
+      "check": "direct-google-login",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "artifact-unavailable",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-x64",
+      "configuration": "chromium-engine",
+      "check": "gmail",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "artifact-unavailable",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-x64",
+      "configuration": "chromium-engine",
+      "check": "drive",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "artifact-unavailable",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-x64",
+      "configuration": "chromium-engine",
+      "check": "restart-persistence",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "artifact-unavailable",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-x64",
+      "configuration": "chromium-engine",
+      "check": "sign-out",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "artifact-unavailable",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-x64",
+      "configuration": "chromium-engine",
+      "check": "regular-profile-isolation",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "artifact-unavailable",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-x64",
+      "configuration": "chromium-engine",
+      "check": "private-session-cleanup",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "artifact-unavailable",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-x64",
+      "configuration": "chromium-engine",
+      "check": "platform-passkey",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "artifact-unavailable",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-x64",
+      "configuration": "chromium-engine",
+      "check": "security-key",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "artifact-unavailable",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-x64",
+      "configuration": "chromium-workspace",
+      "check": "google-password-step",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "artifact-unavailable",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-x64",
+      "configuration": "chromium-workspace",
+      "check": "direct-google-login",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "artifact-unavailable",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-x64",
+      "configuration": "chromium-workspace",
+      "check": "gmail",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "artifact-unavailable",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-x64",
+      "configuration": "chromium-workspace",
+      "check": "drive",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "artifact-unavailable",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-x64",
+      "configuration": "chromium-workspace",
+      "check": "restart-persistence",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "artifact-unavailable",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-x64",
+      "configuration": "chromium-workspace",
+      "check": "sign-out",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "artifact-unavailable",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-x64",
+      "configuration": "chromium-workspace",
+      "check": "regular-profile-isolation",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "artifact-unavailable",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-x64",
+      "configuration": "chromium-workspace",
+      "check": "private-session-cleanup",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "artifact-unavailable",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-x64",
+      "configuration": "chromium-workspace",
+      "check": "platform-passkey",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "artifact-unavailable",
+      "observedAt": null
+    },
+    {
+      "platform": "darwin-x64",
+      "configuration": "chromium-workspace",
+      "check": "security-key",
+      "result": "untested",
+      "source": "awaiting-human",
+      "reason": "artifact-unavailable",
+      "observedAt": null
+    }
+  ]
+}

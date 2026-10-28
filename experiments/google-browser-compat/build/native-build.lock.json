@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "productName": "Zacro Prototype",
+  "sourceVersion": "156.0.8078.48",
+  "sourceRevision": "d0c02bfad08ec92a6ffcf989e53cd995e6381a4c",
+  "sourceRepository": "https://chromium.googlesource.com/chromium/src.git",
+  "depotToolsRevision": "76ffeb6f3ebc96c7a6ca0c4ca4e25c254952aa55",
+  "platforms": ["win32-x64", "darwin-arm64", "darwin-x64"],
+  "basis": "Full Chromium browser source at the same engine revision as the Brave reference; independent from the unmodified Chromium 159 snapshot experiment. No branded browser acceptance is inferred."
+}

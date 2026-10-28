@@ -1,0 +1,14 @@
+target_os = "mac"
+target_cpu = "arm64"
+is_debug = false
+is_component_build = false
+is_chrome_branded = false
+is_chrome_for_testing = false
+is_official_build = false
+use_remoteexec = false
+use_system_xcode = true
+use_thin_lto = false
+chrome_pgo_phase = 0
+symbol_level = 0
+blink_symbol_level = 0
+v8_symbol_level = 0

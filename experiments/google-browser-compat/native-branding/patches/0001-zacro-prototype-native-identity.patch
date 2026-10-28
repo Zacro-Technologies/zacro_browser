@@ -1,0 +1,392 @@
+diff --git a/chrome/app/theme/chromium/BRANDING b/chrome/app/theme/chromium/BRANDING
+index f8363d5..94ac5b8 100644
+--- a/chrome/app/theme/chromium/BRANDING
++++ b/chrome/app/theme/chromium/BRANDING
+@@ -1,10 +1,10 @@
+-COMPANY_FULLNAME=The Chromium Authors
+-COMPANY_SHORTNAME=The Chromium Authors
+-PRODUCT_FULLNAME=Chromium
+-PRODUCT_SHORTNAME=Chromium
+-PRODUCT_INSTALLER_FULLNAME=Chromium Installer
+-PRODUCT_INSTALLER_SHORTNAME=Chromium Installer
++COMPANY_FULLNAME=Zacro Technologies
++COMPANY_SHORTNAME=Zacro
++PRODUCT_FULLNAME=Zacro Prototype
++PRODUCT_SHORTNAME=Zacro Prototype
++PRODUCT_INSTALLER_FULLNAME=Zacro Prototype Installer
++PRODUCT_INSTALLER_SHORTNAME=Zacro Prototype Installer
+ COPYRIGHT=Copyright @LASTCHANGE_YEAR@ The Chromium Authors. All rights reserved.
+-MAC_BUNDLE_ID=org.chromium.Chromium
+-MAC_CREATOR_CODE=Cr24
++MAC_BUNDLE_ID=com.zacro.prototype
++MAC_CREATOR_CODE=ZcPr
+ MAC_TEAM_ID=
+diff --git a/chrome/install_static/chromium_install_modes.h b/chrome/install_static/chromium_install_modes.h
+index a6d969d..b12c4fd 100644
+--- a/chrome/install_static/chromium_install_modes.h
++++ b/chrome/install_static/chromium_install_modes.h
+@@ -21,7 +21,7 @@ inline constexpr wchar_t kCompanyPathName[] = L"";
+ 
+ // The brand-specific product name to be included as a component of the install
+ // and user data directory paths.
+-inline constexpr wchar_t kProductPathName[] = L"Chromium";
++inline constexpr wchar_t kProductPathName[] = L"ZacroPrototype";
+ 
+ // The brand-specific safe browsing client name.
+ inline constexpr char kSafeBrowsingName[] = "chromium";
+@@ -54,28 +54,28 @@ inline constexpr auto kInstallModes = std::to_array<InstallConstants>({
+         .logo_suffix = L"",  // No logo suffix for the primary install mode.
+         .app_guid =
+             L"",  // Empty app_guid since no integration with Google Update.
+-        .base_app_name = L"Chromium",              // A distinct base_app_name.
+-        .base_app_id = L"Chromium",                // A distinct base_app_id.
+-        .browser_prog_id_prefix = L"ChromiumHTM",  // Browser ProgID prefix.
++        .base_app_name = L"Zacro Prototype",              // A distinct base_app_name.
++        .base_app_id = L"ZacroPrototype",                // A distinct base_app_id.
++        .browser_prog_id_prefix = L"ZacroPrototypeHTM",  // Browser ProgID prefix.
+         .browser_prog_id_description =
+-            L"Chromium HTML Document",  // Browser ProgID description.
+-        .direct_launch_url_scheme = "chromium",
+-        .pdf_prog_id_prefix = L"ChromiumPDF",  // PDF ProgID prefix.
++            L"Zacro Prototype HTML Document",  // Browser ProgID description.
++        .direct_launch_url_scheme = "zacro-prototype",
++        .pdf_prog_id_prefix = L"ZacroPrototypePDF",  // PDF ProgID prefix.
+         .pdf_prog_id_description =
+-            L"Chromium PDF Document",  // PDF ProgID description.
++            L"Zacro Prototype PDF Document",  // PDF ProgID description.
+         .active_setup_guid =
+-            L"{7D2B3E1D-D096-4594-9D8F-A6667F12E0AC}",  // Active Setup
++            L"{A967A707-D048-4D51-9F8C-9E57864CD0C1}",  // Active Setup
+                                                         // GUID.
+-        .toast_activator_clsid = {0x635EFA6F,
+-                                  0x08D6,
+-                                  0x4EC9,
+-                                  {0xBD, 0x14, 0x8A, 0x0F, 0xDE, 0x97, 0x51,
+-                                   0x59}},  // Toast Activator CLSID.
+-        .elevator_clsid = {0xD133B120,
+-                           0x6DB4,
+-                           0x4D6B,
+-                           {0x8B, 0xFE, 0x83, 0xBF, 0x8C, 0xA1, 0xB1,
+-                            0xB0}},  // Elevator CLSID.
++        .toast_activator_clsid = {0xE14F2796,
++                                  0x3358,
++                                  0x4382,
++                                  {0x86, 0xED, 0x01, 0xCA, 0x25, 0x6D, 0xB1,
++                                   0xC2}},  // Toast Activator CLSID.
++        .elevator_clsid = {0x08B480A7,
++                                  0xDB52,
++                                  0x4490,
++                                  {0x98, 0xD3, 0x53, 0xCE, 0xAE, 0x55, 0xC6,
++                                   0xEA}},  // Elevator CLSID.
+         .elevator_iid = {0xbb19a0e5,
+                          0xc6,
+                          0x4966,
+@@ -83,11 +83,11 @@ inline constexpr auto kInstallModes = std::to_array<InstallConstants>({
+                           0x3a}},  // IElevator IID and TypeLib
+         // {BB19A0E5-00C6-4966-94B2-5AFEC6FED93A}.
+         .old_elevator_iids = {},
+-        .tracing_service_clsid = {0x83f69367,
+-                                  0x442d,
+-                                  0x447f,
+-                                  {0x8b, 0xcc, 0x0e, 0x3f, 0x97, 0xbe, 0x9c,
+-                                   0xf2}},  // SystemTraceSession CLSID.
++        .tracing_service_clsid = {0x3905F73B,
++                                  0x97D1,
++                                  0x4CD2,
++                                  {0xB2, 0x1D, 0x17, 0xA7, 0x3C, 0x99, 0xFE,
++                                   0x6F}},  // SystemTraceSession CLSID.
+         .tracing_service_iid = {0xe0b03e2d,
+                                 0x7682,
+                                 0x4d83,
+@@ -109,9 +109,9 @@ inline constexpr auto kInstallModes = std::to_array<InstallConstants>({
+         .pdf_doc_icon_resource_index =
+             icon_resources::kPDFDocIndex,  // PDF doc icon resource index.
+         .sandbox_sid_prefix =
+-            L"S-1-15-2-3251537155-1984446955-2931258699-841473695-"
+-            L"1938553385-"
+-            L"924012148-",  // App container sid prefix for sandbox.
++            L"S-1-15-2-3045172681-2460473198-1102504830-3674811205-"
++            L"1967338402-"
++            L"2827945061-",  // App container sid prefix for sandbox.
+     },
+ });
+ 
+diff --git a/chrome/common/chrome_paths_mac.mm b/chrome/common/chrome_paths_mac.mm
+index 6829c9c..75a6c33 100644
+--- a/chrome/common/chrome_paths_mac.mm
++++ b/chrome/common/chrome_paths_mac.mm
+@@ -37,7 +37,7 @@ char* ProductDirNameForBundle(NSBundle* chrome_bundle) {
+ #elif BUILDFLAG(GOOGLE_CHROME_BRANDING)
+       product_dir_name = "Google/Chrome";
+ #else
+-      product_dir_name = "Chromium";
++      product_dir_name = "Zacro Prototype";
+ #endif
+     }
+ 
+diff --git a/chrome/app/app-Info.plist b/chrome/app/app-Info.plist
+index 6fada0a..be00c56 100644
+--- a/chrome/app/app-Info.plist
++++ b/chrome/app/app-Info.plist
+@@ -6,6 +6,8 @@
+ 	<string>en</string>
+ 	<key>CFBundleDisplayName</key>
+ 	<string>${EXECUTABLE_NAME}</string>
++	<key>CrProductDirName</key>
++	<string>Zacro Prototype</string>
+ 	<key>CFBundleDocumentTypes</key>
+ 	<array>
+ 		<dict>
+diff --git a/chrome/common/chrome_paths.cc b/chrome/common/chrome_paths.cc
+index 32d01c0..414234c 100644
+--- a/chrome/common/chrome_paths.cc
++++ b/chrome/common/chrome_paths.cc
+@@ -460,7 +460,7 @@ bool PathProvider(int key, base::FilePath* result) {
+           "/Library/Google/ChromeForTesting/NativeMessagingHosts"));
+ #else
+       cur = base::FilePath(FILE_PATH_LITERAL(
+-          "/Library/Application Support/Chromium/NativeMessagingHosts"));
++          "/Library/Application Support/Zacro Prototype/NativeMessagingHosts"));
+ #endif
+ #else  // BUILDFLAG(IS_MAC)
+ #if BUILDFLAG(GOOGLE_CHROME_BRANDING)
+diff --git a/components/os_crypt/common/keychain_password_mac.mm b/components/os_crypt/common/keychain_password_mac.mm
+index 212b930..b20baf3 100644
+--- a/components/os_crypt/common/keychain_password_mac.mm
++++ b/components/os_crypt/common/keychain_password_mac.mm
+@@ -35,8 +35,8 @@ namespace {
+ const char kDefaultServiceName[] = "Chrome Safe Storage";
+ const char kDefaultAccountName[] = "Chrome";
+ #else
+-const char kDefaultServiceName[] = "Chromium Safe Storage";
+-const char kDefaultAccountName[] = "Chromium";
++const char kDefaultServiceName[] = "Zacro Prototype Safe Storage";
++const char kDefaultAccountName[] = "Zacro Prototype";
+ #endif
+ 
+ // These values are persisted to logs. Entries should not be renumbered and
+diff --git a/components/version_info/version_info_with_user_agent.cc b/components/version_info/version_info_with_user_agent.cc
+index 49bdf4a..11d2bcb 100644
+--- a/components/version_info/version_info_with_user_agent.cc
++++ b/components/version_info/version_info_with_user_agent.cc
+@@ -10,11 +10,15 @@
+ namespace version_info {
+ 
+ std::string GetProductNameAndVersionForReducedUserAgent() {
+-  return base::StrCat({"Chrome/", GetMajorVersionNumber(), ".0.0.0"});
++  // Preserve the engine compatibility token and disclose this product.
++  return base::StrCat({"Chrome/", GetMajorVersionNumber(),
++                       ".0.0.0 ZacroPrototype/", GetMajorVersionNumber(),
++                       ".0.0.0"});
+ }
+ 
+ std::string GetProductNameAndVersionForUserAgent() {
+-  return base::StrCat({"Chrome/", GetVersionNumber()});
++  return base::StrCat({"Chrome/", GetVersionNumber(),
++                       " ZacroPrototype/", GetVersionNumber()});
+ }
+ 
+ }  // namespace version_info
+diff --git a/components/embedder_support/user_agent_utils.cc b/components/embedder_support/user_agent_utils.cc
+index e699a6a..f70c962 100644
+--- a/components/embedder_support/user_agent_utils.cc
++++ b/components/embedder_support/user_agent_utils.cc
+@@ -162,10 +162,9 @@ const blink::UserAgentBrandList GetUserAgentBrandList(
+   int major_version_number;
+   bool parse_result = base::StringToInt(major_version, &major_version_number);
+   DCHECK(parse_result);
+-  std::optional<std::string> brand;
+-#if !BUILDFLAG(CHROMIUM_BRANDING)
+-  brand = version_info::GetProductName();
+-#endif
++  // The prototype has its own product identity even with Chromium branding
++  // assets. Keep the Chromium engine brand and upstream GREASE ordering.
++  std::optional<std::string> brand = version_info::GetProductName();
+ 
+   std::string brand_version =
+       output_version_type == blink::UserAgentBrandVersionType::kFullVersion
+diff --git a/chrome/app/chromium_strings.grd b/chrome/app/chromium_strings.grd
+index 3de8ca6..4f0adaf 100644
+--- a/chrome/app/chromium_strings.grd
++++ b/chrome/app/chromium_strings.grd
+@@ -294,15 +294,15 @@ If you update this file, be sure also to update google_chrome_strings.grd. -->
+         </then>
+         <else>
+           <message name="IDS_PRODUCT_NAME" desc="The Chrome application name" translateable="false">
+-            Chromium
++            Zacro Prototype
+           </message>
+           <message name="IDS_SHORT_PRODUCT_NAME" desc="The Chrome application short name." translateable="false">
+-            Chromium
++            Zacro Prototype
+           </message>
+         </else>
+       </if>
+       <message name="IDS_APP_MENU_YOUR_CHROME_HEADER" desc="Header title for the Your Chromium section in the main App Menu">
+-        Your Chromium
++        Your Zacro Prototype
+       </message>
+       <if expr="is_win">
+         <message name="IDS_SXS_SHORTCUT_NAME" desc="Unused in Chromium builds" translateable="false">
+@@ -312,15 +312,15 @@ If you update this file, be sure also to update google_chrome_strings.grd. -->
+         <message name="IDS_SHORTCUT_NAME_DEV" desc="Unused in Chromium builds" translateable="false">
+         </message>
+         <message name="IDS_PRODUCT_DESCRIPTION" desc="Browser description">
+-          Chromium is a web browser that runs webpages and applications with lightning speed. It's fast, stable, and easy to use. Browse the web more safely with malware and phishing protection built into Chromium.
++          Zacro Prototype is an experimental browser built on Chromium.
+         </message>
+         <message name="IDS_WELCOME_TO_CHROME" desc="Welcoming text announced via screen readers the first time Chrome is launched at the conclusion of installation.">
+-          Welcome to Chromium; new browser window opened
++          Welcome to Zacro Prototype; new browser window opened
+         </message>
+       </if>
+       <if expr="is_macosx or is_linux">
+         <message name="IDS_FIRST_RUN_DIALOG_WINDOW_TITLE" desc="Window title of First Run dialog on Mac and Linux, displayed in title bar">
+-          Welcome to Chromium
++          Welcome to Zacro Prototype
+         </message>
+       </if>
+       <if expr="is_linux">
+@@ -364,7 +364,7 @@ If you update this file, be sure also to update google_chrome_strings.grd. -->
+       </if>
+       <if expr="not is_macosx and not is_chromeos">
+         <message name="IDS_TASK_MANAGER_TITLE" desc="The title of the Task Manager window">
+-          Task Manager - Chromium
++          Task Manager - Zacro Prototype
+         </message>
+       </if>
+       <message name="IDS_TASK_MANAGER_SEARCH_PLACEHOLDER" desc="The placeholder text for the Search bar in the Task Manager window">
+@@ -452,7 +452,7 @@ New bookmarks can’t be saved in your account until you delete some. If you sig
+           </then>
+           <else>
+             <message name="IDS_BROWSER_WINDOW_TITLE_FORMAT" desc="The format for titles displayed in tabs and popup windows">
+-              <ph name="PAGE_TITLE">$1<ex>Google</ex></ph> - Chromium
++              <ph name="PAGE_TITLE">$1<ex>Google</ex></ph> - Zacro Prototype
+             </message>
+           </else>
+         </if>
+@@ -460,19 +460,19 @@ New bookmarks can’t be saved in your account until you delete some. If you sig
+       <if expr="is_chromeos">
+         <!-- Browser Window Title Format -->
+         <message name="IDS_BROWSER_WINDOW_TITLE_FORMAT" desc="The format for titles displayed in tabbed browser windows">
+-          Chromium - <ph name="PAGE_TITLE">$1<ex>Google</ex></ph>
++          Zacro Prototype - <ph name="PAGE_TITLE">$1<ex>Google</ex></ph>
+         </message>
+       </if>
+       <if expr="not is_chromeos and not is_macosx">
+         <!-- Captive Portal Browser Window Title Format -->
+         <message name="IDS_CAPTIVE_PORTAL_BROWSER_WINDOW_TITLE_FORMAT" desc="The format for titles displayed in captive portal popup windows">
+-          <ph name="PAGE_TITLE">$1<ex>Google</ex></ph> - Network Sign-in - Chromium
++          <ph name="PAGE_TITLE">$1<ex>Google</ex></ph> - Network Sign-in - Zacro Prototype
+         </message>
+       </if>
+       <if expr="is_chromeos">
+         <!-- Captive Portal Browser Window Title Format -->
+         <message name="IDS_CAPTIVE_PORTAL_BROWSER_WINDOW_TITLE_FORMAT" desc="The format for titles displayed in captive portal popup windows">
+-          Chromium - Network Sign-in - <ph name="PAGE_TITLE">$1<ex>Google</ex></ph>
++          Zacro Prototype - Network Sign-in - <ph name="PAGE_TITLE">$1<ex>Google</ex></ph>
+         </message>
+       </if>
+       <if expr="is_macosx">
+@@ -491,7 +491,7 @@ New bookmarks can’t be saved in your account until you delete some. If you sig
+         </then>
+         <else>
+           <message name="IDS_ACCESSIBLE_BROWSER_WINDOW_TITLE_FORMAT" desc="The format for the accessible name of a tabbed browser window">
+-            <ph name="PAGE_TITLE">$1<ex>Google</ex></ph> - Chromium
++            <ph name="PAGE_TITLE">$1<ex>Google</ex></ph> - Zacro Prototype
+           </message>
+         </else>
+       </if>
+@@ -576,18 +576,18 @@ New bookmarks can’t be saved in your account until you delete some. If you sig
+         </message>
+       </if>
+       <message name="IDS_ACCNAME_APP" desc="The accessible name for the app menu." translateable="false">
+-        Chromium
++        Zacro Prototype
+       </message>
+       <!-- Hung Browser Detector -->
+       <if expr="is_win">
+         <message name="IDS_BROWSER_HUNGBROWSER_MESSAGE" desc="Content of the dialog box shown when the browser is hung">
+-          Chromium is unresponsive. Relaunch now?
++          Zacro Prototype is unresponsive. Relaunch now?
+         </message>
+       </if>
+       <!-- General app failure messages -->
+       <if expr="not is_chromeos and not is_android">
+         <message name="IDS_COULDNT_STARTUP_PROFILE_ERROR" desc="Error displayed when Chrome cannot start because profiles were not opened correctly.">
+-          Cannot start Chromium because something went wrong when opening your profile. Try to restart Chromium.
++          Cannot start Zacro Prototype because something went wrong when opening your profile. Try to restart Zacro Prototype.
+         </message>
+       </if>
+       <!-- Sharing messages -->
+@@ -597,21 +597,21 @@ New bookmarks can’t be saved in your account until you delete some. If you sig
+       <!-- Uninstall messages -->
+       <if expr="is_win">
+         <message name="IDS_UNINSTALL_CLOSE_APP" desc="Message to user when uninstall detects other app instance running">
+-          Please close all Chromium windows and try again.
++          Please close all Zacro Prototype windows and try again.
+         </message>
+         <message name="IDS_UNINSTALL_VERIFY" desc="Message to confirm user wants to uninstall">
+-          Are you sure you want to uninstall Chromium?
++          Are you sure you want to uninstall Zacro Prototype?
+         </message>
+         <message name="IDS_UNINSTALL_CHROME" desc="The title of the Chromium uninstall dialog.">
+-          Uninstall Chromium
++          Uninstall Zacro Prototype
+         </message>
+       </if>
+       <!-- Default Browser messages -->
+       <message name="IDS_FR_CUSTOMIZE_DEFAULT_BROWSER" desc="Default browser checkbox label">
+-        Make Chromium the default browser
++        Make Zacro Prototype the default browser
+       </message>
+       <message name="IDS_DEFAULT_BROWSER_CHANGED_MESSAGE" desc="Body of the notification shown when Chrome is no longer the default browser.">
+-        Chromium is no longer your default browser. Make Chromium the default browser?
++        Zacro Prototype is no longer your default browser. Make Zacro Prototype the default browser?
+       </message>
+       <if expr="is_win">
+         <message name="IDS_DEFAULT_BROWSER_VISUAL_GUIDED_SETTER_PAGE_TITLE" desc="Title of the default browser visual guided setter page.">
+@@ -1147,7 +1147,7 @@ Chromium is unable to recover your settings.
+           </then>
+           <else>
+             <message name="IDS_ABOUT" desc="In Title Case: The text label of the About Chrome menu item">
+-              About &amp;Chromium
++              About &amp;Zacro Prototype
+             </message>
+           </else>
+         </if>
+@@ -1164,7 +1164,7 @@ Chromium is unable to recover your settings.
+           </then>
+           <else>
+             <message name="IDS_ABOUT" desc="The text label of the About Chrome menu item">
+-              About &amp;Chromium
++              About &amp;Zacro Prototype
+             </message>
+           </else>
+         </if>
+@@ -1174,7 +1174,7 @@ Chromium is unable to recover your settings.
+       </if>
+       <if expr="is_chromeos">
+         <message name="IDS_ABOUT" desc="The text label of the About Chrome menu item">
+-          About &amp;Chromium
++          About &amp;Zacro Prototype
+         </message>
+         <message name="IDS_RELAUNCH_TO_UPDATE" desc="The text label of the relaunch to update ChromeOS menu item">
+           Relaunch to update &amp;ChromiumOS
+@@ -1183,13 +1183,13 @@ Chromium is unable to recover your settings.
+ 
+       <if expr="is_macosx">
+         <message name="IDS_APP_MENU_PRODUCT_NAME" desc="The application's short name, used for the Mac's application menu, activity monitor, etc. This should be less than 16 characters. Example: Chrome, not Google Chrome." translateable="false">
+-          Chromium
++          Zacro Prototype
+         </message>
+         <message name="IDS_HELPER_NAME" desc="The helper application's name.  Should contain the Chrome application name (IDS_PRODUCT_NAME). Example: Google Chrome Helper.">
+-          Chromium Helper
++          Zacro Prototype Helper
+         </message>
+         <message name="IDS_SHORT_HELPER_NAME" desc="The helper application's short name, used for the Mac's application menu, activity monitor, etc. Example: Chrome Helper, not Google Chrome Helper.">
+-          Chromium Helper
++          Zacro Prototype Helper
+         </message>
+       </if>
+ 

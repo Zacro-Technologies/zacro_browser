@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "Zacro Workspace Lab",
+  "version": "0.1.0",
+  "description": "An engine integration lab: a local workspace for native browser tabs and groups. No account-compatibility claim.",
+  "minimum_chrome_version": "116",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAo6KV0lVLqhqYiwHfm4SlNKSYl29ZMpNLbYtgwbdz8JhT/G6CneyYwsihyRApOYlLFfOfF0Kz4F/bepWzOqaHNL0fR2tVYOmvlKb6Q9p/AjNR2cOgaxt9jhigWeAUu9SjiSOmjGxnQfP32xiFb4Q27OY3qgs1oYwKB2lHO7CeuiW8hushIpj39lwTCNTuJcVRRPAqe8jLl21hBzB127AjBgwg51NSxMNIMQKzA/dgNUL+yUuJByIujUalRgCI11GqBLdXW0S87/dPR+C4hq01bhQemTGoRIH3UAwwAqrEh4Can5AVo+xknwhzQPayMOlGW6XRImTFTPmQAZ92Rw5+4wIDAQAB",
+  "permissions": ["sidePanel", "tabs", "tabGroups", "storage"],
+  "incognito": "not_allowed",
+  "action": { "default_title": "Open Zacro workspace" },
+  "side_panel": { "default_path": "panel.html" },
+  "background": { "service_worker": "background.js", "type": "module" },
+  "content_security_policy": {
+    "extension_pages": "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+  }
+}

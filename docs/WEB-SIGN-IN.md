@@ -41,6 +41,8 @@ A credible path requires moving the browsing runtime to a maintained full Chromi
 
 The migration must preserve isolated profiles, popup/opener behavior, form POSTs, session recovery, unsaved-work decisions, accessibility, platform input and signed security updates before replacing the current engine. Both direct account sign-in and real third-party Google callbacks remain release gates. No engine migration or Google approval is claimed by the 0.9 interface update.
 
+The [isolated engine experiment](../experiments/google-browser-compat/README.md) implements the next evaluation step: a full Chromium 156 browser with a reviewed Zacro identity patch and native Windows/macOS build pipelines. Source preparation and branding checks passed on Windows; compilation is still blocked on toolchain installation and Mac access. The user reported a visible Google password field in the separate Brave reference. That preliminary result does not establish authenticated access or compatibility for the branded candidate. Its [native acceptance recorder](../experiments/google-browser-compat/build/NATIVE-BUILD.md#check-google-manually) keeps each platform and compiled runtime separate.
+
 ## Local manual check
 
 Run `npm run test:interactive`, navigate to the printed local origin plus `/popup-check`, and use the link menu to open that check in Peek. Select **Open test popup**, then **Return test result**. The original page should return with a passed result. This fixture uses only loopback pages and a fixed test message; it never requests credentials or contacts an identity provider.

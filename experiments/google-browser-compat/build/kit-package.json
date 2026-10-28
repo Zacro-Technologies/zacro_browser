@@ -1,0 +1,9 @@
+{
+  "name": "zacro-google-browser-compat-kit",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Optional local fixture dependencies; manual browser launching needs only Node.js.",
+  "engines": { "node": ">=24" },
+  "scripts": { "test": "node --test tests/*.test.cjs" },
+  "devDependencies": { "@playwright/test": "1.64.1" }
+}

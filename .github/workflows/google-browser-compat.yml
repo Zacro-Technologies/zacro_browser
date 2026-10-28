@@ -1,0 +1,162 @@
+name: Google browser compatibility experiment
+
+on:
+  push:
+    branches: [codex/google-browser-compat]
+    paths:
+      - 'experiments/google-browser-compat/**'
+      - '.github/workflows/google-browser-compat.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: google-browser-compat-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-kit:
+    name: Native prebuilt kit (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            architecture: x64
+            platform: win32-x64
+          - runner: macos-15
+            architecture: arm64
+            platform: darwin-arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      ZACRO_PLATFORM: ${{ matrix.platform }}
+      ZACRO_PROTOTYPE_ROOT: ${{ runner.temp }}/zacro-google-prototype
+      ZACRO_EVIDENCE_ROOT: ${{ runner.temp }}/zacro-google-evidence
+      ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          architecture: ${{ matrix.architecture }}
+          cache: npm
+
+      - name: Verify native architecture and record preflight
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $actualPlatform = node -p "process.platform + '-' + process.arch"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($actualPlatform -ne $env:ZACRO_PLATFORM) {
+            throw "Expected native $env:ZACRO_PLATFORM, got $actualPlatform."
+          }
+          New-Item -ItemType Directory -Force -Path $env:ZACRO_EVIDENCE_ROOT | Out-Null
+          node experiments/google-browser-compat/cli.cjs preflight --platform $env:ZACRO_PLATFORM --root $env:ZACRO_PROTOTYPE_ROOT |
+            Tee-Object -FilePath (Join-Path $env:ZACRO_EVIDENCE_ROOT 'preflight.json')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # Source-build blockers are recorded, not treated as binary-kit failure.
+          # This workflow never checks out or compiles Chromium source.
+
+      - name: Install existing test dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Test experiment tooling and workspace component
+        id: tests
+        run: node --test experiments/google-browser-compat/tests/*.test.cjs
+
+      - name: Fetch pinned Chromium archive
+        id: fetch-chromium
+        run: |
+          node experiments/google-browser-compat/cli.cjs fetch --engine chromium --platform $env:ZACRO_PLATFORM --root $env:ZACRO_PROTOTYPE_ROOT |
+            Tee-Object -FilePath (Join-Path $env:ZACRO_EVIDENCE_ROOT 'chromium-fetch.json')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Fetch pinned Brave reference archive
+        id: fetch-brave
+        if: ${{ !cancelled() && steps.tests.outcome == 'success' }}
+        run: |
+          node experiments/google-browser-compat/cli.cjs fetch --engine brave --platform $env:ZACRO_PLATFORM --root $env:ZACRO_PROTOTYPE_ROOT |
+            Tee-Object -FilePath (Join-Path $env:ZACRO_EVIDENCE_ROOT 'brave-fetch.json')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # CDP is attached only to separate signed-out loopback fixtures. Neither
+      # this job nor its reports establish Google account acceptance.
+      # Chromium 159 failed startup on the initial Windows host before requesting
+      # a fixture document. Retest honestly: no continue-on-error or inferred login result.
+      - name: Check bare Chromium browser mechanics
+        id: chromium-engine
+        if: ${{ !cancelled() && steps.fetch-chromium.outcome == 'success' }}
+        run: |
+          node experiments/google-browser-compat/mechanics.cjs --root $env:ZACRO_PROTOTYPE_ROOT --engine chromium |
+            Tee-Object -FilePath (Join-Path $env:ZACRO_EVIDENCE_ROOT 'chromium-engine-mechanics-summary.json')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Check Chromium workspace browser mechanics
+        id: chromium-workspace
+        if: ${{ !cancelled() && steps.fetch-chromium.outcome == 'success' }}
+        run: |
+          node experiments/google-browser-compat/mechanics.cjs --root $env:ZACRO_PROTOTYPE_ROOT --engine chromium --workspace |
+            Tee-Object -FilePath (Join-Path $env:ZACRO_EVIDENCE_ROOT 'chromium-mechanics-summary.json')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Check Brave reference browser mechanics
+        id: brave-reference
+        if: ${{ !cancelled() && steps.fetch-brave.outcome == 'success' }}
+        run: |
+          node experiments/google-browser-compat/mechanics.cjs --root $env:ZACRO_PROTOTYPE_ROOT --engine brave |
+            Tee-Object -FilePath (Join-Path $env:ZACRO_EVIDENCE_ROOT 'brave-mechanics-summary.json')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # Assemblies retain the original upstream ZIP bytes and product identity.
+      # A mechanics failure remains a failed job even if a kit can be assembled.
+      - name: Assemble Chromium experiment kit
+        if: ${{ !cancelled() && steps.fetch-chromium.outcome == 'success' }}
+        run: |
+          node experiments/google-browser-compat/cli.cjs assemble --engine chromium --platform $env:ZACRO_PLATFORM --root $env:ZACRO_PROTOTYPE_ROOT |
+            Tee-Object -FilePath (Join-Path $env:ZACRO_EVIDENCE_ROOT 'chromium-assembly.json')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Assemble Brave reference kit
+        if: ${{ !cancelled() && steps.fetch-brave.outcome == 'success' }}
+        run: |
+          node experiments/google-browser-compat/cli.cjs assemble --engine brave --platform $env:ZACRO_PLATFORM --root $env:ZACRO_PROTOTYPE_ROOT |
+            Tee-Object -FilePath (Join-Path $env:ZACRO_EVIDENCE_ROOT 'brave-assembly.json')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Summarize observed mechanics without implying account acceptance
+        if: always()
+        env:
+          CHROMIUM_ENGINE_OUTCOME: ${{ steps.chromium-engine.outcome }}
+          CHROMIUM_WORKSPACE_OUTCOME: ${{ steps.chromium-workspace.outcome }}
+          BRAVE_REFERENCE_OUTCOME: ${{ steps.brave-reference.outcome }}
+        run: |
+          @(
+            "Bare Chromium mechanics: $env:CHROMIUM_ENGINE_OUTCOME",
+            "Chromium workspace mechanics: $env:CHROMIUM_WORKSPACE_OUTCOME",
+            "Brave reference mechanics: $env:BRAVE_REFERENCE_OUTCOME",
+            'The pinned Chromium159 Windows artifact previously failed startup before requesting a fixture page; that observation is not a Google rejection.',
+            'This job packages upstream binaries and tests only local fixtures. It does not compile Zacro or test a Google account.',
+            'Kit availability does not turn a failed mechanics step into a passing result.'
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Upload only kits and non-sensitive evidence
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: google-browser-compat-${{ matrix.platform }}
+          path: |
+            ${{ env.ZACRO_PROTOTYPE_ROOT }}/output/*.zip
+            ${{ env.ZACRO_EVIDENCE_ROOT }}/*.json
+            ${{ env.ZACRO_PROTOTYPE_ROOT }}/results/mechanics-chromium-${{ matrix.platform }}-engine-only.json
+            ${{ env.ZACRO_PROTOTYPE_ROOT }}/results/mechanics-chromium-${{ matrix.platform }}-workspace.json
+            ${{ env.ZACRO_PROTOTYPE_ROOT }}/results/mechanics-brave-${{ matrix.platform }}-reference.json
+          if-no-files-found: warn
+          compression-level: 0
+          retention-days: 7

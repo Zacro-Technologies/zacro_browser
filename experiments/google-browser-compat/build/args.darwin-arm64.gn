@@ -1,0 +1,12 @@
+# Build on an Apple silicon Mac with the pinned source's SDK requirements.
+target_os = "mac"
+target_cpu = "arm64"
+is_debug = false
+is_component_build = false
+is_chrome_branded = false
+is_official_build = false
+use_remoteexec = false
+use_system_xcode = true
+symbol_level = 1
+blink_symbol_level = 0
+v8_symbol_level = 0

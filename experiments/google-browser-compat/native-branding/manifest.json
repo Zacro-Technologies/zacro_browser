@@ -1,0 +1,73 @@
+{
+  "schemaVersion": 1,
+  "revision": "d0c02bfad08ec92a6ffcf989e53cd995e6381a4c",
+  "version": "156.0.8078.48",
+  "product": "Zacro Prototype",
+  "macBundleId": "com.zacro.prototype",
+  "windowsAppId": "ZacroPrototype",
+  "outputs": {
+    "win32-x64": "chrome.exe",
+    "darwin-arm64": "Zacro Prototype.app/Contents/MacOS/Zacro Prototype",
+    "darwin-x64": "Zacro Prototype.app/Contents/MacOS/Zacro Prototype"
+  },
+  "patch": {
+    "path": "patches/0001-zacro-prototype-native-identity.patch",
+    "sha256": "96b0e95da0b7ed44e728299a0926d5e34f6f06a4ad4158d4547817718126c005"
+  },
+  "files": [
+    {
+      "path": "chrome/app/theme/chromium/BRANDING",
+      "beforeSha256": "15ac20cb8744ebac0815961059231baefa71fd4ed3023cb2094aaf8a34ae423b",
+      "afterSha256": "b640ce6d977e9a68af7fdc3957575a7d995354b1119215067f0550d468e3652a",
+      "sourceUrl": "https://raw.githubusercontent.com/chromium/chromium/d0c02bfad08ec92a6ffcf989e53cd995e6381a4c/chrome/app/theme/chromium/BRANDING"
+    },
+    {
+      "path": "chrome/install_static/chromium_install_modes.h",
+      "beforeSha256": "f1e173ce85627969b995e1844a9260d31aef8f4b27ccdca9ac728b60c4f23cd1",
+      "afterSha256": "a368d76a16b8f7a2529f208bada886df7e3c140a410d84c5ff80f06b5d84fce3",
+      "sourceUrl": "https://raw.githubusercontent.com/chromium/chromium/d0c02bfad08ec92a6ffcf989e53cd995e6381a4c/chrome/install_static/chromium_install_modes.h"
+    },
+    {
+      "path": "chrome/common/chrome_paths_mac.mm",
+      "beforeSha256": "d1dfa65cbd46600c6340aa51fa3ebdc5559aa91d20f78a375364a0af6ab3e588",
+      "afterSha256": "a21541c800c046028dfefb776d84b34ad60150c58d63d1e84efef3191343cf5e",
+      "sourceUrl": "https://raw.githubusercontent.com/chromium/chromium/d0c02bfad08ec92a6ffcf989e53cd995e6381a4c/chrome/common/chrome_paths_mac.mm"
+    },
+    {
+      "path": "chrome/app/app-Info.plist",
+      "beforeSha256": "b9086affccae0673758bbf886e836ad637e4bc9b37849498498a06f69c8edba5",
+      "afterSha256": "2839d643404446986fad203db35ecf5b45973d6ab331c83cf4df64560efea95f",
+      "sourceUrl": "https://raw.githubusercontent.com/chromium/chromium/d0c02bfad08ec92a6ffcf989e53cd995e6381a4c/chrome/app/app-Info.plist"
+    },
+    {
+      "path": "chrome/common/chrome_paths.cc",
+      "beforeSha256": "fc7e97434d4c9e592fe859b69ba9a83945d836e0a1c3f2b0e52701850952c0df",
+      "afterSha256": "e31dce3542ad1213a97535a9c4e9911666d8c9e7aaaa4468b414937ff6fe2af7",
+      "sourceUrl": "https://raw.githubusercontent.com/chromium/chromium/d0c02bfad08ec92a6ffcf989e53cd995e6381a4c/chrome/common/chrome_paths.cc"
+    },
+    {
+      "path": "components/os_crypt/common/keychain_password_mac.mm",
+      "beforeSha256": "dcf606d11c33974f57370e491b408232646f8ea8a55e2b5c513abf0dbc7a2214",
+      "afterSha256": "d5973367e91ff2c343c8fde91d3d3c1454d2a777237f2fb0a806dd0f47a7fe52",
+      "sourceUrl": "https://raw.githubusercontent.com/chromium/chromium/d0c02bfad08ec92a6ffcf989e53cd995e6381a4c/components/os_crypt/common/keychain_password_mac.mm"
+    },
+    {
+      "path": "components/version_info/version_info_with_user_agent.cc",
+      "beforeSha256": "9fe12f30af74af362641558df311bc713cfb2694d9553d28f164fc3be9ad0188",
+      "afterSha256": "687f7be7fe38c3df388e1df5bb0d827c4484e400e79b39171c7a5183399f3d30",
+      "sourceUrl": "https://raw.githubusercontent.com/chromium/chromium/d0c02bfad08ec92a6ffcf989e53cd995e6381a4c/components/version_info/version_info_with_user_agent.cc"
+    },
+    {
+      "path": "components/embedder_support/user_agent_utils.cc",
+      "beforeSha256": "0e3acc91465a072ec95505443a641ae60666d84beabe35107ccd3e084313a094",
+      "afterSha256": "b8e7700e6baad822237d5668c83162bfb21ab55141cfac90011264e8e20a69d0",
+      "sourceUrl": "https://raw.githubusercontent.com/chromium/chromium/d0c02bfad08ec92a6ffcf989e53cd995e6381a4c/components/embedder_support/user_agent_utils.cc"
+    },
+    {
+      "path": "chrome/app/chromium_strings.grd",
+      "beforeSha256": "2744123fbc7d9a99b5d08ae3669c605f77550501c5d4275311f25312c405af26",
+      "afterSha256": "a7808ebc2e01967e2b68b5cfee7e701e0e0508a77f013cb2a0d1cc90593bc4b1",
+      "sourceUrl": "https://raw.githubusercontent.com/chromium/chromium/d0c02bfad08ec92a6ffcf989e53cd995e6381a4c/chrome/app/chromium_strings.grd"
+    }
+  ]
+}

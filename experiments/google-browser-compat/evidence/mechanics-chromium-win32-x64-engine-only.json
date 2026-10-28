@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "time": "2026-10-28T17:07:19.339Z",
+  "platform": "win32-x64",
+  "osRelease": "10.0.26200",
+  "engine": "chromium",
+  "configuration": "engine-only",
+  "sourceRevision": "0c75ec0efee23f664c9a3380217ae4650bed97e6",
+  "archiveSha256": "813787fddee9b276cde1aa550ac01a571fae9c887565c6c010600bfddc7bc985",
+  "observedBrowserProduct": "Chrome/159.0.8130.0",
+  "purpose": "automated local browser mechanics, with CDP; never a live Google test",
+  "googleAcceptance": "untested",
+  "credentialsUsed": false,
+  "nativeStartup": {
+    "documentRequested": false,
+    "scriptReady": false
+  },
+  "passed": false,
+  "checks": [
+    {
+      "name": "native-fixture-document-ready",
+      "result": "failed",
+      "errorClass": "Error",
+      "code": "fixture-document-did-not-start"
+    }
+  ]
+}

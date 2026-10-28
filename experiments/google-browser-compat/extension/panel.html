@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Zacro Workspace Lab</title>
+    <link rel="stylesheet" href="panel.css" />
+    <script type="module" src="panel.js"></script>
+  </head>
+  <body>
+    <header class="masthead">
+      <span class="mark" aria-hidden="true"
+        ><svg viewBox="0 0 32 32"><path d="M10 10h12L10 22h12" /></svg
+      ></span>
+      <span class="brand">Zacro <small>Engine lab</small></span>
+      <button
+        class="icon-button"
+        id="appearance"
+        aria-label="Appearance: system"
+        title="Appearance: system"
+      ></button>
+      <button
+        class="icon-button"
+        id="about"
+        aria-label="About this prototype"
+        title="About this prototype"
+      ></button>
+    </header>
+    <main>
+      <form id="search-form" class="search-box" role="search">
+        <label class="visually-hidden" for="search">Find a tab or enter a complete HTTP or HTTPS URL</label>
+        <span id="search-icon" aria-hidden="true"></span>
+        <input
+          id="search"
+          type="text"
+          placeholder="Find a tab or enter a URL"
+          autocomplete="off"
+          autocapitalize="off"
+          spellcheck="false"
+          maxlength="4096"
+        />
+        <button
+          type="submit"
+          class="icon-button"
+          aria-label="Open address or matching tab"
+          title="Open address or matching tab"
+        ></button>
+      </form>
+      <div class="workspace-toolbar">
+        <label class="visually-hidden" for="workspace-filter">Workspace</label>
+        <select id="workspace-filter" aria-label="Workspace">
+          <option value="all">All tabs</option>
+        </select>
+        <button
+          class="icon-button"
+          id="new-workspace"
+          aria-label="Create workspace from a tab"
+          title="Create workspace from a tab"
+        ></button>
+      </div>
+      <div id="tab-list" class="tab-list" aria-label="Native browser tabs" aria-busy="true"></div>
+      <div id="empty" class="empty" hidden>
+        <span id="empty-icon" aria-hidden="true"></span>
+        <p id="empty-title">No matching tabs</p>
+        <span id="empty-detail">Try another title or website.</span>
+      </div>
+    </main>
+    <footer>
+      <span class="native-note">Native tabs · this window</span
+      ><button
+        id="refresh"
+        class="icon-button"
+        aria-label="Refresh workspace"
+        title="Refresh workspace"
+      ></button>
+    </footer>
+    <p id="status" class="status" role="status" aria-live="polite"></p>
+    <dialog id="workspace-dialog" aria-labelledby="workspace-dialog-title">
+      <form id="workspace-form">
+        <div class="dialog-heading">
+          <h1 id="workspace-dialog-title">New workspace</h1>
+          <button
+            id="cancel-workspace"
+            type="button"
+            class="icon-button"
+            aria-label="Cancel workspace editing"
+          ></button>
+        </div>
+        <label for="workspace-name">Name</label
+        ><input
+          id="workspace-name"
+          name="title"
+          maxlength="48"
+          placeholder="A little room to focus"
+          required
+          autocomplete="off"
+        />
+        <div id="starting-tab-field">
+          <label for="starting-tab">Start with</label
+          ><select id="starting-tab" name="tabId" required></select>
+        </div>
+        <fieldset>
+          <legend>Color</legend>
+          <div id="group-colors" class="color-options"></div>
+        </fieldset>
+        <p id="workspace-error" class="form-error" role="alert"></p>
+        <button type="submit" class="primary" id="save-workspace">Create workspace</button>
+      </form>
+    </dialog>
+    <dialog id="about-dialog" aria-labelledby="about-title">
+      <div class="dialog-heading">
+        <h1 id="about-title">An engine integration lab</h1>
+        <button
+          id="close-about"
+          type="button"
+          class="icon-button"
+          aria-label="Close prototype information"
+        ></button>
+      </div>
+      <p>
+        A small Zacro workspace using the browser’s own tabs and groups. Its address bar, connection details,
+        permissions and sign-in interfaces stay native.
+      </p>
+      <p>
+        This panel reads tab titles and addresses to organize this window. It stores only your appearance
+        preference; it has no page-content, cookie or network access.
+      </p>
+      <p>
+        Private windows use the native browser without this extension. This prototype does not establish
+        Google compatibility or production readiness.
+      </p>
+      <p class="keyboard-hint">
+        ↓ from search enters the list. ↑ ↓ and Home / End move between tabs. Tab reaches each tab’s actions.
+        Enter activates. / returns to search.
+      </p>
+    </dialog>
+  </body>
+</html>

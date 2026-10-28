@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "checkedAt": "2026-10-28T17:08:23.096Z",
+  "sourceRevision": "d0c02bfad08ec92a6ffcf989e53cd995e6381a4c",
+  "patchSha256": "96b0e95da0b7ed44e728299a0926d5e34f6f06a4ad4158d4547817718126c005",
+  "selectedUpstreamFilesVerified": 9,
+  "forwardApply": "passed",
+  "reverseApplyCheck": "passed",
+  "outputHashes": "passed",
+  "fullCheckoutRevisionVerified": false,
+  "compiled": false,
+  "executed": false,
+  "googleAcceptance": "untested"
+}

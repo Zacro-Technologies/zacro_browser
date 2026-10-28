@@ -1,0 +1,135 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "Also run record.cjs validateMatrix: it enforces unique platform/configuration/check combinations and real calendar timestamps by ISO roundtrip. JSON Schema alone is not the acceptance authority.",
+  "title": "Manual Google website acceptance — no account data",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "updatedAt", "scope", "enginePins", "observations"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "updatedAt": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$"
+    },
+    "scope": { "const": "human-operated Google website checks; never inferred from fixtures" },
+    "enginePins": {
+      "const": {
+        "chromium": {
+          "version": "159.0.8130.0",
+          "snapshot": "1729109",
+          "sourceRevision": "0c75ec0efee23f664c9a3380217ae4650bed97e6"
+        },
+        "brave": {
+          "version": "1.98.60",
+          "sourceRevision": "52db4b25c0aa3038e9a1c6021428b136cc3cb5fc",
+          "chromiumVersion": "156.0.8078.48"
+        }
+      }
+    },
+    "observations": {
+      "type": "array",
+      "minItems": 90,
+      "maxItems": 90,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["platform", "configuration", "check", "result", "source", "reason", "observedAt"],
+        "allOf": [
+          {
+            "if": { "properties": { "result": { "const": "untested" } } },
+            "then": {
+              "properties": {
+                "source": { "const": "awaiting-human" },
+                "reason": {
+                  "enum": [
+                    "awaiting-human",
+                    "artifact-unavailable",
+                    "hardware-unavailable",
+                    "platform-unavailable"
+                  ]
+                },
+                "observedAt": { "type": "null" }
+              }
+            },
+            "else": {
+              "properties": {
+                "source": { "const": "human-reported" },
+                "observedAt": { "type": "string" }
+              }
+            }
+          },
+          {
+            "if": { "properties": { "result": { "const": "passed" } } },
+            "then": { "properties": { "reason": { "const": "completed" } } }
+          },
+          {
+            "if": { "properties": { "result": { "const": "failed" } } },
+            "then": {
+              "properties": {
+                "reason": {
+                  "enum": [
+                    "browser-rejected",
+                    "persistence-failed",
+                    "isolation-failed",
+                    "cleanup-failed",
+                    "flow-unavailable",
+                    "other-failure"
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "if": { "properties": { "result": { "const": "not-applicable" } } },
+            "then": {
+              "properties": {
+                "reason": { "enum": ["hardware-unavailable", "flow-unavailable", "platform-unavailable"] }
+              }
+            }
+          }
+        ],
+        "properties": {
+          "platform": { "enum": ["win32-x64", "darwin-arm64", "darwin-x64"] },
+          "configuration": { "enum": ["brave-reference", "chromium-engine", "chromium-workspace"] },
+          "check": {
+            "enum": [
+              "google-password-step",
+              "direct-google-login",
+              "gmail",
+              "drive",
+              "restart-persistence",
+              "sign-out",
+              "regular-profile-isolation",
+              "private-session-cleanup",
+              "platform-passkey",
+              "security-key"
+            ]
+          },
+          "result": { "enum": ["untested", "passed", "failed", "not-applicable"] },
+          "source": { "enum": ["awaiting-human", "human-reported"] },
+          "reason": {
+            "enum": [
+              "awaiting-human",
+              "artifact-unavailable",
+              "completed",
+              "browser-rejected",
+              "persistence-failed",
+              "isolation-failed",
+              "cleanup-failed",
+              "flow-unavailable",
+              "hardware-unavailable",
+              "platform-unavailable",
+              "other-failure"
+            ]
+          },
+          "observedAt": {
+            "type": ["string", "null"],
+            "format": "date-time",
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$"
+          }
+        }
+      }
+    }
+  }
+}

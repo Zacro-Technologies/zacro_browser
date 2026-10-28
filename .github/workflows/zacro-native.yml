@@ -1,0 +1,215 @@
+name: Zacro native browser source
+
+on:
+  push:
+    branches: [codex/google-browser-compat]
+    paths:
+      - 'experiments/google-browser-compat/**'
+      - '.github/workflows/zacro-native.yml'
+  workflow_dispatch:
+    inputs:
+      compile:
+        description: Compile on an already provisioned native self-hosted runner
+        type: boolean
+        default: false
+      platform:
+        description: Matching custom runner label
+        type: choice
+        options: [win32-x64, darwin-arm64, darwin-x64]
+        default: win32-x64
+      root:
+        description: Dedicated absolute external build root without spaces
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Source and tooling (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            platform: win32-x64
+            architecture: x64
+          - runner: macos-15
+            platform: darwin-arm64
+            architecture: arm64
+          - runner: macos-15-intel
+            platform: darwin-x64
+            architecture: x64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      ZACRO_NATIVE_PLATFORM: ${{ matrix.platform }}
+      ZACRO_NATIVE_ROOT: ${{ runner.temp }}/zacro-native-validation
+      ZACRO_REQUEST_COMPILE: ${{ github.event_name == 'workflow_dispatch' && inputs.compile }}
+      ZACRO_REQUEST_ROOT: ${{ inputs.root }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          architecture: ${{ matrix.architecture }}
+      - name: Verify the actual native host
+        run: |
+          $actualPlatform = node -p "process.platform + '-' + process.arch"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($actualPlatform -ne $env:ZACRO_NATIVE_PLATFORM) {
+            throw 'Native host architecture differs from this verification lane.'
+          }
+          if ($env:ZACRO_REQUEST_COMPILE -eq 'true' -and [string]::IsNullOrWhiteSpace($env:ZACRO_REQUEST_ROOT)) {
+            throw 'Compilation was requested without a dedicated absolute external root.'
+          }
+          git --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # These unit/patch checks use Node built-ins and native Git/archive tools.
+          # No npm install, compiler installation or full Chromium checkout occurs.
+      - name: Fetch only the nine pinned source files for patch verification
+        id: references
+        run: |
+          $reference = node experiments/google-browser-compat/native-branding/fetch-references.cjs --root $env:ZACRO_NATIVE_ROOT | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "ZACRO_BRANDING_REFERENCES=$($reference.referenceDirectory)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Test tooling and rejection of modified source
+        id: tests
+        run: |
+          node --test experiments/google-browser-compat/tests/*.test.cjs experiments/google-browser-compat/native-branding/tests/*.test.cjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify actual patch application to the nine original files
+        id: patch
+        if: ${{ !cancelled() && steps.references.outcome == 'success' }}
+        run: |
+          node experiments/google-browser-compat/native-branding/validate-sparse.cjs $env:ZACRO_BRANDING_REFERENCES |
+            Tee-Object -FilePath (Join-Path $env:ZACRO_NATIVE_ROOT 'branding-validation.json')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Record native source-build prerequisites
+        if: ${{ !cancelled() && steps.references.outcome == 'success' }}
+        run: |
+          node experiments/google-browser-compat/build/native-build.cjs preflight --root $env:ZACRO_NATIVE_ROOT --platform $env:ZACRO_NATIVE_PLATFORM |
+            Tee-Object -FilePath (Join-Path $env:ZACRO_NATIVE_ROOT 'preflight.json')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Explain the verification boundary
+        if: always()
+        env:
+          TEST_OUTCOME: ${{ steps.tests.outcome }}
+          PATCH_OUTCOME: ${{ steps.patch.outcome }}
+        run: |
+          @(
+            "Source/tooling tests: $env:TEST_OUTCOME",
+            "Nine-file patch validation: $env:PATCH_OUTCOME",
+            'This hosted job did not compile or launch a Zacro browser. Google acceptance remains untested.',
+            'Preflight reports full-build blockers as data; a successful report command does not mean the runner can compile Chromium.'
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-source-checks-${{ matrix.platform }}
+          path: |
+            ${{ env.ZACRO_NATIVE_ROOT }}/preflight.json
+            ${{ env.ZACRO_NATIVE_ROOT }}/branding-validation.json
+          if-no-files-found: warn
+          retention-days: 7
+
+  # No source build is attempted on undersized standard hosted runners.
+  # These custom labels must be provisioned before an explicit dispatch.
+  compile:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.compile && inputs.root != '' }}
+    needs: verify
+    runs-on:
+      - self-hosted
+      - zacro-chromium
+      - ${{ inputs.platform }}
+      - ${{ inputs.platform == 'win32-x64' && 'Windows' || 'macOS' }}
+      - ${{ inputs.platform == 'darwin-arm64' && 'ARM64' || 'X64' }}
+    # Leave time for evidence upload before the 24-hour GITHUB_TOKEN lifetime.
+    timeout-minutes: 1380
+    concurrency:
+      group: zacro-native-build-${{ inputs.platform }}
+      cancel-in-progress: false
+    defaults:
+      run:
+        shell: bash
+    env:
+      ZACRO_NATIVE_ROOT: ${{ inputs.root }}
+      ZACRO_NATIVE_PLATFORM: ${{ inputs.platform }}
+      ZACRO_BUILD_EVIDENCE: ${{ runner.temp }}/zacro-native-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+      ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          architecture: ${{ inputs.platform == 'darwin-arm64' && 'arm64' || 'x64' }}
+          cache: npm
+      - name: Verify host, root and provisioned toolchain before source preparation
+        run: |
+          node - <<'NODE'
+          const fs = require('node:fs');
+          const { resolveRoot } = require('./experiments/google-browser-compat/lib/paths.cjs');
+          if (`${process.platform}-${process.arch}` !== process.env.ZACRO_NATIVE_PLATFORM) throw new Error('Runner architecture does not match the requested native target.');
+          const root = resolveRoot(process.env.ZACRO_NATIVE_ROOT);
+          if (/\s/.test(root)) throw new Error('Native source root must not contain whitespace.');
+          fs.mkdirSync(process.env.ZACRO_BUILD_EVIDENCE, { recursive: true });
+          NODE
+          node experiments/google-browser-compat/build/native-build.cjs preflight --root "$ZACRO_NATIVE_ROOT" --platform "$ZACRO_NATIVE_PLATFORM" > "$ZACRO_BUILD_EVIDENCE/preflight.json"
+          node -e 'const r=require(process.env.ZACRO_BUILD_EVIDENCE+"/preflight.json");if(!r.sourceBuild.ready)throw new Error(r.sourceBuild.blockers.join(" "));'
+      - run: npm ci --ignore-scripts
+      - name: Prepare exact native sources and dependencies
+        run: |
+          node experiments/google-browser-compat/build/native-source.cjs prepare --root "$ZACRO_NATIVE_ROOT" --platform "$ZACRO_NATIVE_PLATFORM"
+          node experiments/google-browser-compat/build/native-source.cjs sync --root "$ZACRO_NATIVE_ROOT" --platform "$ZACRO_NATIVE_PLATFORM"
+      - name: Configure and compile the full Zacro browser
+        id: build
+        run: |
+          node experiments/google-browser-compat/build/native-build.cjs configure --root "$ZACRO_NATIVE_ROOT" --platform "$ZACRO_NATIVE_PLATFORM"
+          node experiments/google-browser-compat/build/native-build.cjs build --root "$ZACRO_NATIVE_ROOT" --platform "$ZACRO_NATIVE_PLATFORM" --jobs 8
+          node - <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const lock = require('./experiments/google-browser-compat/build/native-build.lock.json');
+          const source = path.join(process.env.ZACRO_NATIVE_ROOT, 'native-builds', lock.sourceVersion, process.env.ZACRO_NATIVE_PLATFORM, 'build.json');
+          fs.copyFileSync(source, path.join(process.env.ZACRO_BUILD_EVIDENCE, 'build.json'));
+          NODE
+      - name: Test only isolated local fixtures in the compiled browser
+        id: mechanics
+        run: node experiments/google-browser-compat/mechanics.cjs --root "$ZACRO_NATIVE_ROOT" --engine zacro-native > "$ZACRO_BUILD_EVIDENCE/mechanics.json"
+      - name: Package verified native runtime dependencies
+        id: package
+        run: |
+          node experiments/google-browser-compat/build/native-build.cjs package --root "$ZACRO_NATIVE_ROOT" --platform "$ZACRO_NATIVE_PLATFORM" > "$ZACRO_BUILD_EVIDENCE/package.json"
+          node - <<'NODE'
+          const fs = require('node:fs');
+          const result = JSON.parse(fs.readFileSync(process.env.ZACRO_BUILD_EVIDENCE + '/package.json', 'utf8'));
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `archive=${result.destination}\nreceipt=${result.destination}.json\n`);
+          NODE
+      - name: Upload only the package produced in this run
+        uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() && steps.package.outcome == 'success' }}
+        with:
+          name: zacro-native-${{ inputs.platform }}
+          path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.receipt }}
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zacro-native-evidence-${{ inputs.platform }}
+          path: ${{ env.ZACRO_BUILD_EVIDENCE }}/*.json
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 0

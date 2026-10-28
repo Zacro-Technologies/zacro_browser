@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 1,
+  "observedOn": "2026-10-29",
+  "timeZone": "Asia/Tokyo",
+  "installers": [
+    {
+      "id": "visual-studio",
+      "name": "Build Tools 18.11.2",
+      "file": "vs_BuildTools-18.11.2.exe",
+      "version": "18.11.2",
+      "installedVersion": "18.11.12324.101",
+      "productVersion": "18.11.2",
+      "bytes": 5687920,
+      "sha256": "c217be69e6547c77c62d870394cd649a7a85ab86fcaa526a6ff629d1ec043e77",
+      "sha256Provenance": "Recorded after HTTPS retrieval and successful Microsoft Authenticode verification; also matches the digest segment in Microsoft's fixed-release URL",
+      "url": "https://download.visualstudio.microsoft.com/download/pr/9a3f23c2-cc94-49a0-88c0-f9f19f2ac9df/c217be69e6547c77c62d870394cd649a7a85ab86fcaa526a6ff629d1ec043e77/vs_BuildTools.exe",
+      "sourcePage": "https://learn.microsoft.com/en-us/visualstudio/releases/2026/release-history",
+      "components": [
+        "Microsoft.VisualStudio.Workload.VCTools",
+        "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+        "Microsoft.VisualStudio.Component.VC.ATLMFC"
+      ]
+    },
+    {
+      "id": "windows-sdk",
+      "name": "Windows SDK 10.0.28000.2270",
+      "file": "winsdksetup-10.0.28000.2270.exe",
+      "version": "10.0.28000.2270",
+      "productVersion": "10.1.28000.2270",
+      "bytes": 1451984,
+      "sha256": "e9f1bde566381355e594e2f90daf4f714eb5c7ef2c45c501ce236afe2abea300",
+      "sha256Provenance": "Recorded after HTTPS retrieval and successful Microsoft Authenticode verification; not a separately published checksum",
+      "url": "https://download.microsoft.com/download/78b533c3-6724-4e28-a984-b9fa93265781/KIT_BUNDLE_WINDOWSSDK_MEDIACREATION/winsdksetup.exe",
+      "sourcePage": "https://learn.microsoft.com/en-us/windows/apps/windows-sdk/downloads",
+      "features": [
+        "OptionId.DesktopCPPx86",
+        "OptionId.DesktopCPPx64",
+        "OptionId.UWPCPP",
+        "OptionId.SigningTools",
+        "OptionId.WindowsDesktopDebuggers"
+      ]
+    }
+  ]
+}

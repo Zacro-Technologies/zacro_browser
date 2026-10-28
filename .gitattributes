@@ -5,3 +5,5 @@
 *.ico binary
 *.icns binary
 *.pdf binary
+# Unified diff context intentionally contains leading spaces and blank lines.
+experiments/google-browser-compat/native-branding/patches/*.patch -whitespace
