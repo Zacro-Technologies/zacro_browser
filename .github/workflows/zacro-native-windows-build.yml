@@ -17,6 +17,7 @@ concurrency:
 jobs:
   compile:
     name: Compile Chromium 156 with Zacro branding (Windows x64)
+    if: ${{ github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[native-build]') }}
     runs-on: windows-latest
     timeout-minutes: 350
     defaults:
@@ -49,6 +50,8 @@ jobs:
           "ZACRO_BUILD_EVIDENCE=$evidence" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "ZACRO_TOOLCHAIN_ROOT=$(Join-Path $root 'toolchains')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "ZACRO_BUILD_STARTED_AT=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "ZACRO_COMPILE_LOG=$(Join-Path $env:RUNNER_TEMP "zacro-compile-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT.log")" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "ZACRO_COMPILE_STATUS=$(Join-Path $env:RUNNER_TEMP "zacro-compile-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT.status.json")" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Check native resources and existing Visual Studio before downloads
         id: initial-preflight
@@ -134,11 +137,113 @@ jobs:
         id: build
         timeout-minutes: ${{ fromJSON(steps.compile-budget.outputs.minutes) }}
         run: |
-          node experiments/google-browser-compat/build/native-build.cjs build --root $env:ZACRO_NATIVE_ROOT --platform $env:ZACRO_NATIVE_PLATFORM --jobs 4
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          @'
+          const fs = require('node:fs');
+          const { spawn, spawnSync } = require('node:child_process');
+          const started = Date.now();
+          const status = { schemaVersion: 1, startedAt: new Date(started).toISOString(), completedAt: null, nodeExitCode: null, signal: null, interruptedBy: null, cleanupError: null, elapsedSeconds: null, logWriteError: null, spawnError: null };
+          const saveStatus = () => { try { fs.writeFileSync(process.env.ZACRO_COMPILE_STATUS, JSON.stringify(status)); } catch { process.stderr.write('Compiler diagnostic status could not be saved.\n'); } };
+          saveStatus();
+          let log;
+          try { log = fs.openSync(process.env.ZACRO_COMPILE_LOG, 'wx'); } catch (error) { status.logWriteError = error.code || 'open-failed'; saveStatus(); }
+          // Direct OS file handles keep compiler output out of the Node heap.
+          const child = spawn(process.execPath, ['experiments/google-browser-compat/build/native-build.cjs', 'build', '--root', process.env.ZACRO_NATIVE_ROOT, '--platform', process.env.ZACRO_NATIVE_PLATFORM, '--jobs', '4'], { windowsHide: true, stdio: ['ignore', log ?? 'inherit', log ?? 'inherit'] });
+          let exited = false;
+          const stop = signal => {
+            if (exited || status.interruptedBy || !child.pid) return;
+            status.interruptedBy = signal;
+            // Address only this spawned child's tree; never an executable name.
+            const cleanup = spawnSync('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore', timeout: 5000 });
+            if (cleanup.error || cleanup.status !== 0) { status.cleanupError = cleanup.error?.code || `taskkill-${cleanup.status}`; child.kill('SIGKILL'); }
+            saveStatus();
+          };
+          const interrupt = () => stop('SIGINT');
+          const terminate = () => stop('SIGTERM');
+          process.on('SIGINT', interrupt);
+          process.on('SIGTERM', terminate);
+          child.on('exit', () => { exited = true; });
+          child.on('error', error => { status.spawnError = error.code || 'spawn-failed'; });
+          child.on('close', (code, signal) => {
+            status.nodeExitCode = Number.isInteger(code) && code >= 0 ? code : null;
+            status.signal = signal;
+            status.completedAt = new Date().toISOString();
+            status.elapsedSeconds = Math.round((Date.now() - started) / 1000);
+            process.removeListener('SIGINT', interrupt);
+            process.removeListener('SIGTERM', terminate);
+            if (log !== undefined) { try { fs.closeSync(log); } catch (error) { status.logWriteError = error.code || 'close-failed'; } }
+            saveStatus();
+            process.exitCode = status.nodeExitCode ?? 1;
+          });
+          '@ | node
+          $compilerExit = $LASTEXITCODE
+          if ($compilerExit -ne 0) { exit $compilerExit }
           $lock = Get-Content -LiteralPath experiments/google-browser-compat/build/native-build.lock.json -Raw | ConvertFrom-Json
           $buildReceipt = Join-Path $env:ZACRO_NATIVE_ROOT "native-builds/$($lock.sourceVersion)/win32-x64/build.json"
           Copy-Item -LiteralPath $buildReceipt -Destination (Join-Path $env:ZACRO_BUILD_EVIDENCE 'build.json')
+
+      - name: Preserve bounded compiler failure diagnostics and exact source receipts
+        if: ${{ always() && env.ZACRO_BUILD_EVIDENCE != '' }}
+        continue-on-error: true
+        timeout-minutes: 5
+        env:
+          ZACRO_COMPILE_OUTCOME: ${{ steps.build.outcome }}
+        run: |
+          @'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const os = require('node:os');
+          const crypto = require('node:crypto');
+          const readline = require('node:readline');
+          const { assertContained } = require('./experiments/google-browser-compat/lib/paths.cjs');
+          const lock = require('./experiments/google-browser-compat/build/native-build.lock.json');
+          const suffix = `${process.env.GITHUB_RUN_ID}-${process.env.GITHUB_RUN_ATTEMPT}`;
+          const report = { schemaVersion: 1, capturedAt: new Date().toISOString(), stepOutcome: process.env.ZACRO_COMPILE_OUTCOME || 'unavailable', nodeExitCode: null, compiler: null, compileElapsedSeconds: null, nativeVolumeFreeGiB: null, systemMemoryGiB: { free: os.freemem() / 1024 ** 3, total: os.totalmem() / 1024 ** 3 }, tailLimit: { lines: 400, charactersPerLine: 2048 }, tail: [], receiptSnapshots: [], diagnosticErrors: [] };
+          const errorCode = error => typeof error.code === 'string' ? error.code : 'unavailable';
+          const ordinary = filename => { const item = fs.lstatSync(filename); if (!item.isFile() || item.isSymbolicLink()) throw Object.assign(new Error(), { code: 'not-regular' }); return item; };
+          (async () => {
+            try {
+              if (ordinary(process.env.ZACRO_COMPILE_STATUS).size > 65536) throw Object.assign(new Error(), { code: 'status-too-large' });
+              report.compiler = JSON.parse(fs.readFileSync(process.env.ZACRO_COMPILE_STATUS, 'utf8'));
+              report.nodeExitCode = report.compiler.nodeExitCode;
+              report.compileElapsedSeconds = report.compiler.elapsedSeconds ?? Math.round((Date.now() - Date.parse(report.compiler.startedAt)) / 1000);
+            } catch (error) { report.diagnosticErrors.push(`status:${errorCode(error)}`); }
+            try { const disk = fs.statfsSync(process.env.ZACRO_NATIVE_ROOT); report.nativeVolumeFreeGiB = disk.bavail * disk.bsize / 1024 ** 3; } catch (error) { report.diagnosticErrors.push(`disk:${errorCode(error)}`); }
+            try {
+              ordinary(process.env.ZACRO_COMPILE_LOG);
+              const lines = readline.createInterface({ input: fs.createReadStream(process.env.ZACRO_COMPILE_LOG), crlfDelay: Infinity });
+              for await (const line of lines) { report.tail.push(line.slice(0, 2048)); if (report.tail.length > 400) report.tail.shift(); }
+            } catch (error) { report.diagnosticErrors.push(`log:${errorCode(error)}`); }
+            const receipts = [
+              ['configure', path.join(process.env.ZACRO_NATIVE_ROOT, 'native-builds', lock.sourceVersion, 'win32-x64', 'configure.json')],
+              ['sync', path.join(process.env.ZACRO_NATIVE_ROOT, 'native-source', lock.sourceVersion, 'win32-x64', 'sync.json')],
+            ];
+            for (const [kind, source] of receipts) {
+              try {
+                await assertContained(process.env.ZACRO_NATIVE_ROOT, source);
+                if (ordinary(source).size > 16 * 1024 ** 2) throw Object.assign(new Error(), { code: 'receipt-too-large' });
+                const bytes = fs.readFileSync(source);
+                const filename = `${kind}-receipt-${suffix}.json`;
+                fs.writeFileSync(path.join(process.env.ZACRO_BUILD_EVIDENCE, filename), bytes, { flag: 'wx' });
+                report.receiptSnapshots.push({ kind, filename, size: bytes.length, sha256: crypto.createHash('sha256').update(bytes).digest('hex') });
+              } catch (error) { report.diagnosticErrors.push(`${kind}:${errorCode(error)}`); }
+            }
+            fs.writeFileSync(path.join(process.env.ZACRO_BUILD_EVIDENCE, `compiler-tail-${suffix}.json`), JSON.stringify(report, null, 2) + '\n', { flag: 'wx' });
+          })().catch(() => { process.stderr.write('Bounded compiler diagnostics could not be saved; the compiler outcome is unchanged.\n'); });
+          '@ | node
+
+      - name: Upload the compiler log as a downloadable file
+        uses: actions/upload-artifact@v4
+        if: ${{ always() && env.ZACRO_COMPILE_LOG != '' }}
+        continue-on-error: true
+        timeout-minutes: 10
+        with:
+          name: zacro-native-windows-compiler-log-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.ZACRO_COMPILE_LOG }}
+            ${{ env.ZACRO_COMPILE_STATUS }}
+          if-no-files-found: ignore
+          retention-days: 7
+          compression-level: 6
 
       - name: Test only isolated local fixtures in the compiled Zacro browser
         id: mechanics

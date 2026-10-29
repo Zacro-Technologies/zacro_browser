@@ -1,0 +1,87 @@
+{
+  "schemaVersion": 1,
+  "kind": "completed-hosted-native-build-failure",
+  "recordedAt": "2026-10-29T08:10:29Z",
+  "platform": "win32-x64",
+  "sourceVersion": "156.0.8078.48",
+  "sourceRevision": "d0c02bfad08ec92a6ffcf989e53cd995e6381a4c",
+  "run": {
+    "id": 40742047125,
+    "url": "https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40742047125",
+    "apiUrl": "https://api.github.com/repos/Zacro-Technologies/zacro_browser/actions/runs/40742047125",
+    "headRevision": "b47b74e742f9d1385c8222436d66295bbf67a13b",
+    "status": "completed",
+    "conclusion": "failure"
+  },
+  "job": {
+    "id": 123005931432,
+    "url": "https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40742047125/job/123005931432",
+    "apiUrl": "https://api.github.com/repos/Zacro-Technologies/zacro_browser/actions/jobs/123005931432",
+    "startedAt": "2026-10-28T18:06:46Z",
+    "completedAt": "2026-10-28T22:15:31Z",
+    "durationSeconds": 14925,
+    "configuredTimeoutMinutes": 350,
+    "conclusion": "failure"
+  },
+  "failedStep": {
+    "number": 15,
+    "name": "Compile the full native browser with four local jobs",
+    "startedAt": "2026-10-28T18:24:10Z",
+    "completedAt": "2026-10-28T22:15:25Z",
+    "durationSeconds": 13875,
+    "configuredTimeoutMinutes": 240,
+    "conclusion": "failure",
+    "reportedExitCode": 1,
+    "scope": "This step includes compiler execution and subsequent build/runtime receipt validation. The annotation does not identify which operation failed."
+  },
+  "failureAnnotation": {
+    "apiUrl": "https://api.github.com/repos/Zacro-Technologies/zacro_browser/check-runs/123005931432/annotations",
+    "path": ".github",
+    "startLine": 64935,
+    "endLine": 64935,
+    "level": "failure",
+    "message": "Process completed with exit code 1."
+  },
+  "completedBeforeFailure": [
+    "SDK installation",
+    "Full native toolchain preflight",
+    "Pinned source preparation",
+    "Pinned dependency synchronization",
+    "Reviewed branding and GN configuration",
+    "Compile time-budget check"
+  ],
+  "followingSteps": {
+    "nativeBrowserMechanics": "skipped",
+    "runtimePackaging": "skipped",
+    "browserArchiveUpload": "skipped",
+    "failureEvidenceUpload": "success"
+  },
+  "evidenceArtifact": {
+    "id": 12856495555,
+    "url": "https://github.com/Zacro-Technologies/zacro_browser/actions/runs/40742047125/artifacts/12856495555",
+    "createdAt": "2026-10-28T22:15:28Z",
+    "sha256": "d27cd420e130fb2164085295bfad9cedda934a207fc6bf45a6a233113f4b698d",
+    "digestSource": "GitHub artifact metadata, independently matched against the downloaded archive",
+    "files": [
+      "preflight-before-sdk.json",
+      "preflight-ready.json",
+      "sdk-plan.json",
+      "sdk-40742047125-1-provision-c661e436-319b-4608-b62d-caff2531ad0b.json"
+    ],
+    "purpose": "Build evidence only; not a browser executable"
+  },
+  "assessment": {
+    "exactFailureCause": "unknown",
+    "configuredStepOrJobTimeoutReached": false,
+    "timeoutBasis": "The step ended after 231m15s, below its 240-minute cap; the job ended after 248m45s, below its 350-minute cap. GitHub reports process exit code 1.",
+    "compilerErrorEstablished": false,
+    "postBuildValidationErrorEstablished": false,
+    "fullDiagnosticLogAvailable": false,
+    "missingEvidence": "Final diagnostic log lines around the first failure and log line 64935",
+    "verifiedExecutableProduced": false,
+    "partialBuildOutputs": "unknown",
+    "browserArchiveProduced": false,
+    "nativeBrowserVerified": false,
+    "googleAcceptance": "untested"
+  }
+}

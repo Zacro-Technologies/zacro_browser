@@ -146,7 +146,7 @@ test(
   async (t) => {
     const session = await fixture(t);
     let browser = await session.launch();
-    await browser.windowSize(1320, 850);
+    const wideSize = await browser.windowSize(1320, 850);
     await browser.navigate();
     await browser.guest(
       'window.resizeMarker="live-document";document.getElementById("draft").value="Keep my draft";undefined',
@@ -198,17 +198,29 @@ test(
     await drag('sidebar', [250, 286, 318]);
     await browser.openLibrary();
     await retained();
-    await drag('panel', [370, 412, 452]);
+    // Cocoa may clamp the requested window to a smaller CI display. Keep
+    // these persistence drags inside that window's usable panel range.
+    const panelMaximum = Math.min(560, wideSize[0] - 318 - 240 - 16);
+    await expect(browser.shell.locator('#panel-resizer')).toHaveAttribute(
+      'aria-valuemax',
+      String(panelMaximum),
+    );
+    const panelWidths = [370, 412, 452].map((width) => Math.min(width, panelMaximum));
+    const savedPanelWidth = panelWidths.at(-1);
+    await drag('panel', panelWidths);
     await session.close();
     browser = await session.launch();
     const restarted = await browser.state();
     assert.equal(restarted.settings.sidebarWidth, 318);
-    assert.equal(restarted.settings.panelWidth, 452);
+    assert.equal(restarted.settings.panelWidth, savedPanelWidth);
     await browser.windowSize(1320, 850);
     await browser.navigate();
     await expect(browser.shell.locator('#sidebar-resizer')).toHaveAttribute('aria-valuenow', '318');
     await browser.openLibrary();
-    await expect(browser.shell.locator('#panel-resizer')).toHaveAttribute('aria-valuenow', '452');
+    await expect(browser.shell.locator('#panel-resizer')).toHaveAttribute(
+      'aria-valuenow',
+      String(savedPanelWidth),
+    );
   },
 );
 
