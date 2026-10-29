@@ -14,7 +14,12 @@ test('native glass is available only on supported native compositors', () => {
     reason: null,
     blur: 'system',
   });
-  assert.equal(windowMaterial({ platform: 'darwin', release: '24.0.0', opacity: 65 }).type, 'vibrancy');
+  for (const opacity of [0, 1, 25, 50, 75, 99]) {
+    const material = windowMaterial({ platform: 'darwin', release: '24.0.0', opacity });
+    assert.equal(material.type, 'transparent');
+    assert.equal(material.opacity, opacity);
+    assert.equal(material.blur, 'none', 'macOS does not add a fixed-opacity vibrancy layer');
+  }
   for (const release of ['10.0.19045', '10.0.22000', 'not-a-version', '']) {
     const material = windowMaterial({ platform: 'win32', release, opacity: 40 });
     assert.equal(material.enabled, false);

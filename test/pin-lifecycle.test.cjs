@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const { cleanNavigationHistory } = require('../src/core/navigation-history.cjs');
 
 // Exercise the actual host lifecycle functions with deferred native work.
 // This makes otherwise millisecond-sized races deterministic without a
@@ -19,7 +20,7 @@ function harness() {
   let resolveInspection;
   const state = {
     settings: { pinnedSleepMinutes: 20 },
-    tabs: [{ id: 'pin', pinned: true, profileId: 'default' }],
+    tabs: [{ id: 'pin', pinned: true, profileId: 'default', url: 'https://example.test/' }],
     downloads: [],
     activeTabId: null,
   };
@@ -48,7 +49,11 @@ function harness() {
       });
     },
     getURL: () => entry.documentURL,
-    navigationHistory: { clear: () => entry.clearedHistory++ },
+    navigationHistory: {
+      clear: () => entry.clearedHistory++,
+      getAllEntries: () => [{ url: 'https://example.test/' }],
+      getActiveIndex: () => 0,
+    },
     loadURL: async (url) => {
       entry.discardCount++;
       entry.documentURL = url;
@@ -60,6 +65,7 @@ function harness() {
   };
   const host = vm.createContext({
     store: { state },
+    cleanNavigationHistory,
     views: new Map([['pin', entry]]),
     sleepingPins: false,
     quitting: false,
@@ -75,6 +81,12 @@ function harness() {
     publish: () => {},
     reconcile: () => {},
   });
+  new vm.Script(
+    main.slice(
+      main.indexOf('function rememberNavigationHistory('),
+      main.indexOf('function restoreTabNavigation('),
+    ),
+  ).runInContext(host);
   lifecycle.runInContext(host);
   return { host, state, entry, now, finishInspection: () => resolveInspection(true) };
 }
@@ -128,6 +140,7 @@ test('manual Sleep remains available with Never while valid automatic sleep unlo
     assert.equal(b.entry.dormant, true);
     assert.equal(b.entry.clearedHistory, 1);
     assert.equal(b.entry.documentURL, 'about:blank');
+    assert.equal(b.state.tabs[0].navigationHistory.entries[0].url, 'https://example.test/');
     assert.equal(b.entry.contents.id, 17);
     assert.equal(b.host.views.get('pin'), b.entry);
     assert.equal(b.entry.sleepRequest, false);

@@ -1,5 +1,18 @@
 # Zacro 0.10 development preview
 
+## 0.10.1 browser experience update
+
+- Arc-inspired sidebar and action icons, a show/hide sidebar button, joined split tabs, live Favorite drag placement and Space-colored folders.
+- Stronger theme colors, visible grain, accurate previews and continuous Mac window opacity, including the empty content pane.
+- Persistent splits and Peeks, with live tinted pages under Peek, source favicon badges and animated expansion.
+- Quick Space swipes move one page; sustained swipes travel farther without momentum.
+- Offline site icons for pins and Favorites; restored tab back/forward history.
+- Content-only ⌘S, ⌘←/⌘→ navigation, ⌃⌘V paste/search and website search in the command palette.
+
+The local Mac build remains an ad hoc signed development preview.
+
+## 0.10.0
+
 Version 0.10.0 incorporates the extensions and sync work merged into `main` in PR #4 (`d1e50c6`). It retains the 0.9 sidebar, tab lifecycle, command workflow and optional AI connections. This is a development version, not a signed public release.
 
 ## Extensions

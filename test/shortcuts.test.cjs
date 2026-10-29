@@ -36,7 +36,7 @@ test('numbered and sequential tab shortcuts follow rendered sidebar order withou
   const before = structuredClone(state);
   assert.deepEqual(
     sidebarTabs(state).map((item) => item.id),
-    ['pin', 'pin-blank', 'f2-a', 'folder-blank', 'f1-a', 'loose-a', 'home', 'loose-b'],
+    ['f2-a', 'folder-blank', 'f1-a', 'pin', 'pin-blank', 'loose-a', 'home', 'loose-b'],
   );
   assert.deepEqual(
     sidebarTabs(state, 'other').map((item) => item.id),
@@ -64,7 +64,7 @@ test('sidebar shortcuts include profile favorites once before local pins and pin
   };
   assert.deepEqual(
     sidebarTabs(state).map((tab) => tab.id),
-    ['shared', 'local-pin', 'folder-pin', 'today'],
+    ['shared', 'folder-pin', 'local-pin', 'today'],
   );
   assert.deepEqual(
     sidebarTabs(state, 'reading').map((tab) => tab.id),
@@ -96,6 +96,10 @@ test('essential shortcuts share exact modifiers on Mac and Windows without takin
     assert.deepEqual(sanitizeOverrides({ [platform]: {} }), { [platform]: {} });
   }
   assert.equal(matchShortcut(key('h', { meta: true }), 'darwin'), null);
+  assert.equal(matchShortcut(key('ArrowLeft', { meta: true }), 'darwin'), 'history-back');
+  assert.equal(matchShortcut(key('ArrowRight', { meta: true }), 'darwin'), 'history-forward');
+  assert.equal(matchShortcut(key('[', { meta: true }), 'darwin'), 'history-back');
+  assert.equal(matchShortcut(key(']', { meta: true }), 'darwin'), 'history-forward');
   assert.equal(matchShortcut(key('tab', { meta: true }), 'darwin'), null);
   assert.equal(matchShortcut(key('Tab', { control: true }), 'darwin'), 'recent-tab');
   assert.equal(matchShortcut(key('+', { meta: true, shift: true }), 'darwin'), 'zoom-in');
@@ -239,4 +243,40 @@ test('fresh browser is empty; explicit home pages and drag pin transitions persi
   store.dispatch('tab:move', { id: home.id, pinned: false, folderId: folder.id });
   assert.equal(store.state.tabs[0].pinned, false);
   assert.equal(store.state.tabs[0].folderId, null);
+});
+
+test('paste and search uses exact modifiers while ordinary paste stays with the editor', () => {
+  assert.equal(matchShortcut(key('v', { meta: true, control: true }), 'darwin'), 'paste-search');
+  assert.equal(matchShortcut(key('v', { code: 'KeyV', control: true, alt: true }), 'win32'), 'paste-search');
+  assert.equal(matchShortcut(key('v', { meta: true }), 'darwin'), null);
+  assert.equal(matchShortcut(key('v', { control: true }), 'win32'), null);
+});
+
+test('split groups occupy their rendered Today positions once, including grouped Favorites', () => {
+  const store = new BrowserStore();
+  const tab = (name) => store.dispatch('tab:create', { url: `https://example.com/${name}` });
+  const loose = tab('loose');
+  const favorite = tab('favorite');
+  store.dispatch('tab:favorite', { id: favorite.id });
+  const folder = store.dispatch('folder:create', { name: 'Folder' });
+  const folderTab = tab('folder-tab');
+  store.dispatch('tab:move', { id: folderTab.id, folderId: folder.id });
+  const pinned = tab('pinned');
+  store.dispatch('tab:pin', { id: pinned.id });
+  const first = tab('first');
+  const second = tab('second');
+  const third = tab('third');
+  store.dispatch('split:create', { firstId: first.id, secondId: second.id });
+  store.dispatch('split:create', { firstId: favorite.id, secondId: third.id });
+  const before = store.snapshot();
+  assert.deepEqual(
+    sidebarTabs(store.state).map((tab) => tab.id),
+    [folderTab.id, pinned.id, first.id, second.id, favorite.id, third.id, loose.id],
+  );
+  assert.deepEqual(store.snapshot(), before, 'Computing shortcut order must not change session order');
+  const other = store.dispatch('space:create', { name: 'Other' });
+  assert.deepEqual(
+    sidebarTabs(store.state, other.id).map((tab) => tab.id),
+    [favorite.id],
+  );
 });

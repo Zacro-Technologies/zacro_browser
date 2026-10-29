@@ -8,10 +8,22 @@ const path = require('node:path');
 const http = require('node:http');
 const { _electron: electron, expect } = require('@playwright/test');
 
-let server, base;
+let server,
+  base,
+  fixtureOffline = false;
 before(async () => {
   server = http.createServer((req, res) => {
+    if (fixtureOffline) {
+      res.writeHead(503);
+      res.end('Offline fixture');
+      return;
+    }
     const requestURL = new URL(req.url, 'http://fixture.local');
+    if (requestURL.pathname === '/peek-icon.png') {
+      res.writeHead(200, { 'Content-Type': 'image/png' });
+      res.end(fs.readFileSync(path.resolve(__dirname, '../../assets/icon-256.png')));
+      return;
+    }
     if (requestURL.pathname === '/login-fixture/set') {
       const identity = requestURL.searchParams.get('identity');
       if (!['personal', 'work', 'private'].includes(identity)) {
@@ -47,7 +59,7 @@ before(async () => {
     const name = req.url.startsWith('/b') ? 'Page B' : req.url.startsWith('/peek') ? 'Peek page' : 'Page A';
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
     res.end(
-      `<!doctype html><html><head><title>${name}</title><style>body{font:20px system-ui;padding:48px;background:#f5f7fa;color:#243344}h1{font-size:46px}a{display:block;margin:24px 0}section{height:1800px}</style></head><body><h1>${name}</h1><p id="evidence">The fixture has a verified local source.</p><a id="next" href="/b">Read Page B</a><a id="preview" href="/peek">Peek at another page</a><a id="download" href="/download">Download fixture</a><a id="popup" href="/b" target="_blank">Open a new tab</a><input id="password" type="password" value="must-not-share"><section></section></body></html>`,
+      `<!doctype html><html><head><title>${name}</title>${requestURL.pathname === '/peek' ? '<link rel="icon" href="/peek-icon.png">' : ''}<style>body{font:20px system-ui;padding:48px;background:#f5f7fa;color:#243344}h1{font-size:46px}a{display:block;margin:24px 0}section{height:1800px}</style></head><body><h1>${name}</h1><p id="evidence">The fixture has a verified local source.</p><a id="next" href="/b">Read Page B</a><a id="preview" href="/peek">Peek at another page</a><a id="download" href="/download">Download fixture</a><a id="popup" href="/b" target="_blank">Open a new tab</a><input id="password" type="password" value="must-not-share"><section></section></body></html>`,
     );
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -125,7 +137,41 @@ async function launch(t, directory) {
       .toBe(url);
     await expect.poll(() => guest('document.readyState', url), { timeout: 15000 }).toBe('complete');
   };
-  return { app, page, dir, state, invoke, guest, navigate, close };
+  const overlay = (expression) =>
+    app.evaluate(({ webContents }, expression) => {
+      const contents = webContents
+        .getAllWebContents()
+        .find((item) => item.getURL().endsWith('/peek-overlay.html'));
+      return contents?.executeJavaScript(expression);
+    }, expression);
+  const clickPeekOverlay = async (action = null) => {
+    await expect
+      .poll(() =>
+        app.evaluate(({ BrowserWindow }) =>
+          BrowserWindow.getAllWindows()[0].contentView.children.some(
+            (view) => view.webContents?.getURL().endsWith('/peek-overlay.html') && view.getVisible(),
+          ),
+        ),
+      )
+      .toBe(true);
+    return app.evaluate(async ({ webContents }, action) => {
+      const contents = webContents
+        .getAllWebContents()
+        .find((item) => item.getURL().endsWith('/peek-overlay.html'));
+      if (!contents) throw new Error('The native Peek overlay must exist');
+      const point = action
+        ? await contents.executeJavaScript(`(() => {
+      const button = document.querySelector('button[data-action="${action}"]');
+      const r = button.getBoundingClientRect();
+      return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) };
+    })()`)
+        : { x: 4, y: 4 };
+      contents.focus();
+      for (const type of ['mouseDown', 'mouseUp'])
+        contents.sendInputEvent({ type, ...point, button: 'left', clickCount: 1 });
+    }, action);
+  };
+  return { app, page, dir, state, invoke, guest, navigate, close, overlay, clickPeekOverlay };
 }
 
 test(
@@ -197,7 +243,12 @@ test(
     await expect.poll(() => b.guest('document.title', `${base}/peek`)).toBe('Peek page');
     await b.guest('window.peekMarker = "retained-preview"', `${base}/peek`);
     assert((await b.state()).runtime.peek);
-    await b.invoke('peek:close');
+    await expect.poll(async () => (await b.state()).runtime.peek?.phase).toBe('open');
+    await expect(b.page.locator('.peek-site')).toHaveCount(0);
+    await expect(b.page.locator(`[data-tab-id="${original}"] .peek-tab-badge`)).toBeVisible();
+    await expect(b.page.locator('.peek-url')).toHaveCount(0);
+    await b.clickPeekOverlay();
+    await expect.poll(async () => (await b.state()).runtime.peek).toBe(null);
     assert.equal((await b.state()).activeTabId, original);
     assert.equal(await b.guest('window.savedMarker', `${base}/a`), 'retained');
     assert.equal(await b.guest('window.scrollY', `${base}/a`), 600);
@@ -211,6 +262,7 @@ test(
       b.app.evaluate(({ webContents }) =>
         webContents
           .getAllWebContents()
+          .filter((w) => !w.getURL().endsWith('/peek-overlay.html'))
           .map((w) => w.id)
           .sort((a, b) => a - b),
       );
@@ -230,6 +282,8 @@ test(
     );
     await b.invoke('split:toggle', { id: original });
     assert.equal((await b.state()).runtime.splitTabId, original);
+    await expect(b.page.locator('.split-tab-group')).toHaveCount(1);
+    await expect(b.page.locator('.split-tab-group .tab-main')).toHaveCount(2);
     const bounds = await b.app.evaluate(({ BrowserWindow }) =>
       BrowserWindow.getAllWindows()[0]
         .contentView.children.filter((v) => v.webContents?.getURL().startsWith('http'))
@@ -580,7 +634,7 @@ test(
     assert.equal(await b.guest('window.menuMarker', `${base}/a`), 'retained while menus open');
 
     menu = await menuAtControl(pageActions, 'Page actions', 'below');
-    await menu.getByRole('button', { name: 'Close split view', exact: true }).click();
+    await menu.getByRole('button', { name: 'Unsplit tabs', exact: true }).click();
     await expect.poll(async () => (await b.state()).runtime.splitTabId).toBe(null);
 
     await b.page.locator('[data-key="library"]').click();
@@ -590,5 +644,380 @@ test(
     await expect(b.page.getByRole('dialog')).toHaveCount(0);
     await b.page.keyboard.press('Escape');
     await expect(b.page.locator('[data-key="library"]')).toBeFocused();
+  },
+);
+
+test(
+  'restored tabs retain both back and forward history after close and browser restart',
+  { timeout: 60000 },
+  async (t) => {
+    const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'zacro-nav-restore-'));
+    t.after(() => fsp.rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
+    const b = await launch(t, dir);
+    await b.navigate(`${base}/a`);
+    const id = (await b.state()).activeTabId;
+    await b.navigate(`${base}/b`);
+    await b.navigate(`${base}/c`);
+    await b.invoke('back');
+    await expect.poll(async () => (await b.state()).tabs.find((tab) => tab.id === id)?.url).toBe(`${base}/b`);
+    await expect.poll(async () => (await b.state()).runtime.page.canGoForward).toBe(true);
+    await b.invoke('tab:close', { id });
+    await b.invoke('tab:restore', { id });
+    await expect
+      .poll(async () => {
+        const s = await b.state();
+        return !s.runtime.page.loading && s.runtime.page.canGoBack && s.runtime.page.canGoForward;
+      })
+      .toBe(true);
+    await b.close();
+    const restarted = await launch(t, dir);
+    await expect
+      .poll(async () => {
+        const s = await restarted.state();
+        return !s.runtime.page.loading && s.runtime.page.canGoBack && s.runtime.page.canGoForward;
+      })
+      .toBe(true);
+    await restarted.invoke('forward');
+    await expect
+      .poll(async () => (await restarted.state()).tabs.find((tab) => tab.id === id)?.url)
+      .toBe(`${base}/c`);
+    await restarted.invoke('back');
+    await expect
+      .poll(async () => (await restarted.state()).tabs.find((tab) => tab.id === id)?.url)
+      .toBe(`${base}/b`);
+    await restarted.invoke('back');
+    await expect
+      .poll(async () => (await restarted.state()).tabs.find((tab) => tab.id === id)?.url)
+      .toBe(`${base}/a`);
+    await restarted.close();
+  },
+);
+
+test(
+  'trusted link Peek grows from the click and promotion animates to the full page',
+  { timeout: 30000 },
+  async (t) => {
+    const b = await launch(t);
+    await b.navigate(`${base}/a`);
+    await b.page.evaluate(() => {
+      window.peekFrames = [];
+      window.zacro.onEvent((event) => {
+        if (event.type === 'peek:motion') window.peekFrames.push(event);
+      });
+    });
+    await b.app.evaluate(async ({ webContents }, url) => {
+      const contents = webContents.getAllWebContents().find((item) => item.getURL() === url);
+      const point = await contents.executeJavaScript(`(() => {
+      const rect = document.querySelector('#preview').getBoundingClientRect();
+      return { x: Math.round(rect.x + 15), y: Math.round(rect.y + 15) };
+    })()`);
+      for (const type of ['mouseDown', 'mouseUp'])
+        contents.sendInputEvent({ type, ...point, button: 'left', clickCount: 1, modifiers: ['shift'] });
+    }, `${base}/a`);
+    await expect.poll(async () => (await b.state()).runtime.peek?.phase).toBe('open');
+    const opening = await b.page.evaluate(() => window.peekFrames);
+    assert(opening[0].bounds.width < opening.at(-1).bounds.width);
+    assert(opening[0].bounds.height < opening.at(-1).bounds.height);
+    await expect.poll(() => b.guest('document.readyState', `${base}/peek`)).toBe('complete');
+    await b.guest('window.keptDocument = 42', `${base}/peek`);
+    await b.invoke('peek:promote');
+    const expanding = await b.page.evaluate(() =>
+      window.peekFrames.filter((event) => event.phase === 'expanding'),
+    );
+    assert(expanding.length >= 2);
+    assert(expanding.at(-1).bounds.width > expanding[0].bounds.width);
+    assert.equal(await b.guest('window.keptDocument', `${base}/peek`), 42);
+  },
+);
+
+test(
+  'Peek marks its source tab with the preview favicon and places round controls beside the card',
+  { timeout: 60000 },
+  async (t) => {
+    const b = await launch(t);
+    await b.navigate(`${base}/a`);
+    const original = (await b.state()).activeTabId;
+    await b.invoke('tab:favorite', { id: original });
+    await b.invoke('peek:open', { url: `${base}/peek` });
+    await expect.poll(async () => (await b.state()).runtime.peek?.phase).toBe('open');
+    await expect.poll(async () => (await b.state()).runtime.peek?.favicon).toMatch(/^data:image\//);
+    const previewIcon = (await b.state()).runtime.peek.favicon;
+    const badge = b.page.locator(`.favorite[data-tab-id="${original}"] .peek-tab-badge`);
+    await expect(badge).toBeVisible();
+    await expect(badge.locator('img')).toHaveAttribute('src', previewIcon);
+    await expect(badge).toHaveAttribute('aria-label', 'Previewing 127.0.0.1');
+    await expect(b.page.locator('.peek-site,.peek-url')).toHaveCount(0);
+    const geometry = await b.page.evaluate(() => {
+      const rect = (element) => {
+        const b = element.getBoundingClientRect();
+        return { x: b.x, y: b.y, right: b.right, bottom: b.bottom, width: b.width, height: b.height };
+      };
+      return {
+        card: rect(document.querySelector('.peek-surface')),
+        buttons: [...document.querySelectorAll('.peek-controls button')].map(rect),
+        workspace: rect(document.querySelector('#workspace')),
+      };
+    });
+    assert.equal(geometry.buttons.length, 2);
+    assert(
+      geometry.buttons.every(
+        (button) => button.x >= geometry.card.right + 4 && button.right <= geometry.workspace.right,
+      ),
+    );
+    assert.equal(geometry.buttons[0].x, geometry.buttons[1].x);
+    assert(geometry.buttons[1].y >= geometry.buttons[0].bottom + 4);
+    assert(geometry.buttons.every((button) => button.width === button.height));
+    const nativeGeometry = await b.overlay(`(() => {
+      const rect = element => { const r = element.getBoundingClientRect(); return { x:r.x, y:r.y, right:r.right, bottom:r.bottom, width:r.width, height:r.height }; };
+      return { card:rect(document.querySelector('#surface')), buttons:[...document.querySelectorAll('#controls button')].map(rect), width:innerWidth };
+    })()`);
+    assert.equal(nativeGeometry.buttons.length, 2);
+    assert(
+      nativeGeometry.buttons.every(
+        (button) =>
+          button.x >= nativeGeometry.card.right + 4 &&
+          button.right <= nativeGeometry.width &&
+          button.width === button.height,
+      ),
+    );
+    assert.equal(nativeGeometry.buttons[0].x, nativeGeometry.buttons[1].x);
+    assert(nativeGeometry.buttons[1].y >= nativeGeometry.buttons[0].bottom + 4);
+    await b.clickPeekOverlay('close');
+    await expect.poll(async () => (await b.state()).runtime.peek).toBe(null);
+    await expect(b.page.locator('.peek-tab-badge')).toHaveCount(0);
+    await b.invoke('tab:pin', { id: original });
+    await b.invoke('peek:open', { url: `${base}/peek` });
+    await expect(b.page.locator(`.tab-row[data-tab-id="${original}"] .peek-tab-badge`)).toBeVisible();
+    await expect.poll(async () => (await b.state()).runtime.peek?.phase).toBe('open');
+    await b.clickPeekOverlay('promote');
+    await expect.poll(async () => (await b.state()).runtime.peek).toBe(null);
+    await expect(b.page.locator('.peek-tab-badge')).toHaveCount(0);
+  },
+);
+
+test(
+  'Peek keeps the source view live under a native tinted overlay and blocks source clicks',
+  { timeout: 60000 },
+  async (t) => {
+    const b = await launch(t);
+    await b.navigate(`${base}/a`);
+    await b.guest(
+      'window.underlayFrames=0; window.underlayClicks=0; document.body.addEventListener("click",()=>window.underlayClicks++); function tick(){window.underlayFrames++;requestAnimationFrame(tick)} tick();',
+      `${base}/a`,
+    );
+    await b.invoke('peek:open', { url: `${base}/peek` });
+    await expect.poll(async () => (await b.state()).runtime.peek?.phase).toBe('open');
+    const stack = await b.app.evaluate(({ BrowserWindow }) =>
+      BrowserWindow.getAllWindows()[0].contentView.children.map((view) => ({
+        url: view.webContents?.getURL(),
+        visible: view.getVisible(),
+      })),
+    );
+    const sourceIndex = stack.findIndex((view) => view.url === `${base}/a`);
+    const overlayIndex = stack.findIndex((view) => view.url?.endsWith('/peek-overlay.html'));
+    const peekIndex = stack.findIndex((view) => view.url === `${base}/peek`);
+    assert(sourceIndex >= 0 && sourceIndex < overlayIndex && overlayIndex < peekIndex, JSON.stringify(stack));
+    assert.equal(stack[sourceIndex].visible, true);
+    assert.equal(stack[overlayIndex].visible, true);
+    const before = await b.guest('window.underlayFrames', `${base}/a`);
+    await expect.poll(() => b.guest('window.underlayFrames', `${base}/a`)).toBeGreaterThan(before);
+    const surfaces = await b.overlay(`({
+      root: getComputedStyle(document.documentElement).backgroundColor,
+      body: getComputedStyle(document.body).backgroundColor,
+      tint: getComputedStyle(document.querySelector('#veil')).backgroundColor,
+      opacity: getComputedStyle(document.querySelector('#veil')).opacity,
+    })`);
+    assert.equal(surfaces.root, 'rgba(0, 0, 0, 0)');
+    assert.equal(surfaces.body, 'rgba(0, 0, 0, 0)');
+    assert.notEqual(surfaces.tint, 'rgba(0, 0, 0, 0)');
+    assert.equal(surfaces.opacity, '1');
+    const previewId = (await b.state()).runtime.peek.id;
+    await b.page.locator('[data-key="sidebar-toggle"]').click();
+    await expect(b.page.locator('#sidebar')).toBeHidden();
+    await expect.poll(() => b.overlay(`!document.querySelector('#sidebar-toggle').hidden`)).toBe(true);
+    await b.clickPeekOverlay('sidebar-toggle');
+    await expect(b.page.locator('#sidebar')).toBeVisible();
+    assert.equal(
+      (await b.state()).runtime.peek.id,
+      previewId,
+      'The reveal control keeps the same live preview',
+    );
+    await b.app.evaluate(({ webContents }, url) => {
+      const wc = webContents.getAllWebContents().find((item) => item.getURL() === url);
+      wc.focus();
+      const modifiers = [process.platform === 'darwin' ? 'meta' : 'control'];
+      wc.sendInputEvent({ type: 'keyDown', keyCode: 'L', modifiers });
+      wc.sendInputEvent({ type: 'keyUp', keyCode: 'L', modifiers });
+    }, `${base}/peek`);
+    await expect(b.page.locator('#command-input')).toBeFocused();
+    await expect(b.page.locator('#page-backdrop img')).toHaveCount(3);
+    await expect
+      .poll(() =>
+        b.app.evaluate(({ BrowserWindow }, base) => {
+          const children = BrowserWindow.getAllWindows()[0].contentView.children;
+          return children.every(
+            (view) =>
+              !view.webContents ||
+              !view.getVisible() ||
+              (!view.webContents.getURL().startsWith(base) &&
+                !view.webContents.getURL().endsWith('/peek-overlay.html')),
+          );
+        }, base),
+      )
+      .toBe(true);
+    assert.equal(typeof (await b.guest('window.underlayFrames', `${base}/a`)), 'number');
+    await b.page.keyboard.press('Escape');
+    await expect(b.page.locator('#command-input')).toHaveCount(0);
+    await b.clickPeekOverlay();
+    await expect.poll(async () => (await b.state()).runtime.peek).toBe(null);
+    assert.equal(await b.guest('window.underlayClicks', `${base}/a`), 0);
+    const after = await b.app.evaluate(({ BrowserWindow }) =>
+      BrowserWindow.getAllWindows()[0].contentView.children.map((view) => view.webContents?.getURL()),
+    );
+    assert.equal(after[0], undefined);
+    await b.guest('document.getElementById("next").click()', `${base}/a`);
+    await expect.poll(async () => (await b.state()).runtime.page.url).toBe(`${base}/b`);
+  },
+);
+
+test(
+  'Command arrows navigate page history and Command S leaves content-only chrome',
+  { timeout: 30000, skip: process.platform !== 'darwin' },
+  async (t) => {
+    const b = await launch(t);
+    await b.navigate(`${base}/a`);
+    await b.navigate(`${base}/b`);
+    const press = (keyCode) =>
+      b.app.evaluate(
+        ({ webContents }, { base, keyCode }) => {
+          const page = webContents.getAllWebContents().find((wc) => wc.getURL().startsWith(base));
+          page.focus();
+          page.sendInputEvent({ type: 'keyDown', keyCode, modifiers: ['meta'] });
+          page.sendInputEvent({ type: 'keyUp', keyCode, modifiers: ['meta'] });
+        },
+        { base, keyCode },
+      );
+    const activeURL = async () => {
+      const state = await b.state();
+      return state.tabs.find((tab) => tab.id === state.activeTabId)?.url;
+    };
+    await press('Left');
+    await expect.poll(activeURL).toBe(`${base}/a`);
+    await press('Right');
+    await expect.poll(activeURL).toBe(`${base}/b`);
+    await press('S');
+    await expect(b.page.locator('#sidebar')).toBeHidden();
+    await expect(b.page.locator('#toolbar')).toBeHidden();
+    await expect
+      .poll(() =>
+        b.app.evaluate(({ BrowserWindow }, base) => {
+          const win = BrowserWindow.getAllWindows()[0];
+          const page = win.contentView.children.find((v) => v.webContents?.getURL().startsWith(base));
+          return { x: page?.getBounds().x, y: page?.getBounds().y };
+        }, base),
+      )
+      .toEqual({ x: 8, y: 8 });
+    await press('L');
+    await expect(b.page.locator('#command-input')).toBeFocused();
+    await expect(b.page.locator('#command-input')).toHaveValue(`${base}/b`);
+    await b.page.keyboard.press('Escape');
+    await press('S');
+    await expect(b.page.locator('#sidebar')).toBeVisible();
+    await expect(b.page.locator('#toolbar')).toBeVisible();
+    const sidebarToggle = b.page.locator('[data-key="sidebar-toggle"]');
+    await expect(sidebarToggle).toHaveAccessibleName('Hide sidebar (⌘S)');
+    await sidebarToggle.click();
+    await expect(b.page.locator('#sidebar')).toBeHidden();
+    await expect(b.page.locator('#toolbar')).toBeHidden();
+    await expect.poll(() => b.overlay(`document.documentElement.dataset.mode`)).toBe('sidebar');
+    assert.deepEqual(
+      await b.overlay(
+        `({label:document.querySelector('#sidebar-toggle').getAttribute('aria-label'),modal:document.body.getAttribute('aria-modal'),peekControls:!document.querySelector('#controls').hidden})`,
+      ),
+      { label: 'Show sidebar', modal: null, peekControls: false },
+    );
+    const reveal = await b.app.evaluate(({ BrowserWindow }, base) => {
+      const children = BrowserWindow.getAllWindows()[0].contentView.children;
+      const page = children.find((view) => view.webContents?.getURL().startsWith(base));
+      const button = children.find((view) => view.webContents?.getURL().endsWith('/peek-overlay.html'));
+      return { page: page.getBounds(), button: button.getBounds() };
+    }, base);
+    assert.equal(reveal.page.y, 8, 'The reveal button does not add an address or caption strip');
+    assert.deepEqual(reveal.button, { x: 12, y: 12, width: 32, height: 32 });
+    await b.clickPeekOverlay('sidebar-toggle');
+    await expect(b.page.locator('#sidebar')).toBeVisible();
+    await expect(sidebarToggle).toBeVisible();
+  },
+);
+
+test(
+  'saved Favorite, pin and parked Peek icons survive an offline restart',
+  { timeout: 60000 },
+  async (t) => {
+    const b = await launch(t);
+    const favoriteURL = `${base}/peek?favorite`;
+    await b.navigate(favoriteURL);
+    const favoriteId = (await b.state()).activeTabId;
+    await b.invoke('tab:favorite', { id: favoriteId });
+    await expect
+      .poll(async () => (await b.state()).runtime.pages[favoriteId].favicon)
+      .toMatch(/^data:image\//);
+    const icon = (await b.state()).runtime.pages[favoriteId].favicon;
+    await b.invoke('tab:close', { id: favoriteId });
+
+    await b.navigate(`${base}/peek?pin`);
+    const pinId = (await b.state()).activeTabId;
+    await b.invoke('tab:pin', { id: pinId });
+    await expect.poll(async () => (await b.state()).runtime.pages[pinId].savedFavicon).toBe(icon);
+    await b.invoke('tab:close', { id: pinId });
+
+    await b.navigate(`${base}/a`);
+    const sourceId = (await b.state()).activeTabId;
+    await b.invoke('peek:open', { url: `${base}/peek?parked` });
+    await expect.poll(async () => (await b.state()).runtime.peek?.favicon).toBe(icon);
+    await b.invoke('tab:create', { url: `${base}/b` });
+    await expect(b.page.locator(`.tab-row[data-tab-id="${sourceId}"] .peek-tab-badge img`)).toHaveAttribute(
+      'src',
+      icon,
+    );
+    await b.close();
+    assert.equal(
+      fs.readFileSync(path.join(b.dir, 'browser-state.json'), 'utf8').includes('data:image'),
+      false,
+    );
+    fixtureOffline = true;
+    t.after(() => {
+      fixtureOffline = false;
+    });
+    const resumed = await launch(t, b.dir);
+    const restored = await resumed.state();
+    assert.equal(restored.runtime.pages[favoriteId].loaded, false);
+    assert.equal(restored.runtime.pages[pinId].loaded, false);
+    assert.equal(restored.runtime.pages[favoriteId].savedFavicon, icon);
+    assert.equal(restored.runtime.pages[pinId].savedFavicon, icon);
+    assert.equal(restored.runtime.savedPeeks[sourceId].favicon, icon);
+    await expect(
+      resumed.page.locator(`.favorite[data-tab-id="${favoriteId}"] > .favicon img`),
+    ).toHaveAttribute('src', icon);
+    await expect(resumed.page.locator(`.tab-row[data-tab-id="${pinId}"] .favicon img`)).toHaveAttribute(
+      'src',
+      icon,
+    );
+    await expect(
+      resumed.page.locator(`.tab-row[data-tab-id="${sourceId}"] .peek-tab-badge img`),
+    ).toHaveAttribute('src', icon);
+    await resumed.invoke('tab:activate', { id: favoriteId });
+    await expect.poll(async () => (await resumed.state()).runtime.pages[favoriteId].loading).toBe(false);
+    assert.equal(
+      (await resumed.state()).runtime.pages[favoriteId].savedFavicon,
+      icon,
+      'A failed online refresh retains the saved icon',
+    );
+    await resumed.invoke('tab:activate', { id: sourceId });
+    await expect.poll(async () => (await resumed.state()).runtime.peek?.sourceTabId).toBe(sourceId);
+    await expect(
+      resumed.page.locator(`.tab-row[data-tab-id="${sourceId}"] .peek-tab-badge img`),
+    ).toHaveAttribute('src', icon);
+    await resumed.close();
   },
 );

@@ -8,13 +8,13 @@ Zacro is an open-source, Arc-inspired browser by Zacro Technologies. Keep your e
 
 ## A place for everything
 
-Your sidebar brings Favorites, folders and tabs together. Keep the sites you use every day in Favorites, pin useful pages to a Space, and let temporary tabs clear away with automatic archiving. Closing a Favorite or pin keeps its saved destination ready for next time.
+Your sidebar brings Favorites, folders and tabs together. Keep the sites you use every day in Favorites, pin useful pages to a Space, and let temporary tabs clear away with automatic archiving. Closing a Favorite or pin keeps its saved destination ready for next time. Their site icons remain available offline.
 
 Create **Spaces** for work, personal projects or whatever you're exploring. Give each one its own colors and icon. Use separate **profiles** when you want to keep accounts and browsing data apart.
 
 ## Follow a link without losing your place
 
-**Peek** opens a link over the page you're reading. Shift-click to take a look, press Escape to return, or turn the preview into a full tab when you want to keep it. **Split view** puts two pages side by side for comparing, researching or following along.
+**Peek** opens a link over the page you're reading. Shift-click to take a look, press Escape to return, or turn the preview into a full tab when you want to keep it. **Split view** puts two pages side by side. Your splits and Peeks stay with their tabs until you close or separate them.
 
 | Peek | Make each Space yours |
 | --- | --- |
@@ -26,7 +26,7 @@ Screenshots show version 0.9. See the [gallery and capture notes](docs/screensho
 
 Press **⌘T / Ctrl+T** to find a tab, open a site or search the web. The command bar also finds bookmarks, history, Spaces and browser actions. Shortcuts are yours to customize.
 
-Hide the sidebar with **⌘S / Ctrl+S** when you want more room for the page. Your bookmarks, history and downloads are always within reach in Library.
+Press **⌘S / Ctrl+S** for a content-only view, or **⌘L / Ctrl+L** to edit the address. Your bookmarks, history and downloads are always within reach in Library.
 
 ## Bring your tools along
 
@@ -36,7 +36,7 @@ Optional **Ask Zacro** brings questions, summaries and comparisons into your bro
 
 ## Try Zacro
 
-**0.10.0 is an early desktop preview for Windows and macOS.** It is still being refined before a signed public release. Some extensions are unsupported, direct Google sign-in is currently reported blocked, and live AI-provider acceptance remains in progress. Read the [release notes](docs/RELEASE-NOTES-0.10.md) and [website sign-in notes](docs/WEB-SIGN-IN.md) before relying on it as your everyday browser.
+**0.10.1 is an early desktop preview for Windows and macOS.** It is still being refined before a signed public release. Some extensions are unsupported, direct Google sign-in is currently reported blocked, and live AI-provider acceptance remains in progress. Read the [release notes](docs/RELEASE-NOTES-0.10.md) and [website sign-in notes](docs/WEB-SIGN-IN.md) before relying on it as your everyday browser.
 
 To run from source, install Node.js 24 or later:
 

@@ -25,9 +25,17 @@ const { pathToFileURL } = require('node:url');
 const { randomUUID } = require('node:crypto');
 const { BrowserStore, normalizeAddress } = require('../core/store.cjs');
 const { archiveCandidate } = require('../core/archive.cjs');
+const { cleanNavigationHistory } = require('../core/navigation-history.cjs');
 const { webURL, safeFilename, unusedPath, renameWithoutOverwrite } = require('./security.cjs');
-const { browserLayout, presentView, resolveSplit, restoreWindowPlacement } = require('./layout.cjs');
+const {
+  browserLayout,
+  peekMotionBounds,
+  presentView,
+  resolveSplit,
+  restoreWindowPlacement,
+} = require('./layout.cjs');
 const { FaviconLoader } = require('./favicon.cjs');
+const { SavedFaviconCache } = require('./favicon-cache.cjs');
 const { windowChrome, macMenuTemplate } = require('./mac.cjs');
 const { windowMaterial } = require('./window-material.cjs');
 const { shortcutCatalog, matchShortcut, updateShortcut, sidebarTabs } = require('../core/shortcuts.cjs');
@@ -48,13 +56,14 @@ const UI_FILE = path.join(__dirname, '../renderer/index.html');
 const UI_URL = pathToFileURL(UI_FILE).href;
 const NEW_TAB = 'zacro://newtab';
 const views = new Map();
-// Retain only validated raster data for this process, never in browser exports
-// or on disk. Keys are tab identities; each record is also bound to its exact
-// profile and page URL. Approximate UTF-16 storage is capped at 4 MiB / 128 tabs.
+// Live icons remain bounded in memory. Saved pins and Peek destinations also
+// use a separate local raster cache, excluded from exports and private profiles.
+// Each live record is bound to its exact tab, profile and page URL.
 const retainedFavicons = new Map();
 const MAX_RETAINED_FAVICONS = 128;
 const MAX_RETAINED_FAVICON_BYTES = 4 * 1024 * 1024;
 let retainedFaviconBytes = 0;
+let savedFavicons;
 const sessions = new Map();
 const liveDownloads = new Map();
 const downloadReservations = new Set();
@@ -76,6 +85,8 @@ let splitTabId = null;
 let splitPair = null;
 let normalWindowBounds = null;
 let peek = null;
+// Each source tab keeps one live preview, even while another tab is selected.
+const peeks = new Map();
 let peekRequestSerial = 0;
 let layout = {
   sidebarWidth: 224,
@@ -90,6 +101,7 @@ let allowWindowClose = false;
 let popupTimes = [];
 let pendingAuth = null;
 let backdropGeneration = 0;
+let backdropHandoff = null;
 let backdropContext = null;
 let backdropGeometry = null;
 const MAX_BACKDROP_PIXELS = 16 * 1024 * 1024;
@@ -104,6 +116,7 @@ let recentTabModifiers = null;
 const externalURLs = [];
 let defaultBrowser = { supported: process.platform === 'darwin' && app.isPackaged, configured: false };
 let shellSurface = null;
+let peekOverlay = null;
 let windowMaterialState = null;
 let materialPreview = null;
 let spaceMaterialTransition = null;
@@ -194,10 +207,10 @@ function syncWindowMaterial() {
     try {
       if (process.platform === 'win32' && next.supported)
         win.setBackgroundMaterial(next.enabled ? 'acrylic' : 'none');
-      else if (process.platform === 'darwin') win.setVibrancy(next.enabled ? 'under-window' : null);
+      else if (process.platform === 'darwin') win.setVibrancy(null);
       win.setBackgroundColor(next.enabled ? '#00000000' : background);
       // These are the shell and its neutral native parent, never a website view.
-      // A single opaque native ancestor would otherwise hide the system blur.
+      // A single opaque native ancestor would hide the desktop/material.
       win.contentView.setBackgroundColor('#00000000');
       shellSurface.setBackgroundColor('#00000000');
       materialSignature = signature;
@@ -237,6 +250,8 @@ function report(error) {
   toast(error?.message || 'The action could not be completed.');
 }
 function clearBackdrop() {
+  clearTimeout(backdropHandoff?.timer);
+  backdropHandoff = null;
   backdropGeneration++;
   backdropContext = null;
   backdropGeometry = null;
@@ -255,22 +270,37 @@ function backdropLayoutKey() {
     peek && [peek.id, Math.round(peek.offset || 0)],
   ]);
 }
-async function captureBackdrop() {
+async function captureBackdrop({ seamless = false } = {}) {
   const generation = ++backdropGeneration;
   if (activeProfile()?.private) {
     clearBackdrop();
     return;
   }
-  const entries = [...views.values(), ...(peek ? [peek.entry] : [])]
+  const entries = [
+    ...views.values(),
+    ...(peek && peekOverlay ? [peekOverlay] : []),
+    ...(peek ? [peek.entry] : []),
+  ]
     .filter(
       (entry) => entry.presentation.visible && entry.presentation.bounds && !entry.contents.isDestroyed(),
     )
-    .slice(0, 2);
+    .slice(0, 4);
   const context = {
     profileId: activeSpace()?.profileId,
     tabId: store.state.activeTabId,
     contentIds: new Set(entries.map((entry) => entry.contents.id)),
   };
+  if (seamless && entries.length) {
+    backdropHandoff = {
+      generation,
+      entries: new Set(entries),
+      timer: setTimeout(() => {
+        if (backdropHandoff?.generation !== generation) return;
+        backdropHandoff = null;
+        arrangeViews();
+      }, 1000),
+    };
+  }
   backdropContext = context;
   backdropGeometry = backdropLayoutKey();
   for (const entry of entries) entry.backdropCaptureGeneration = generation;
@@ -323,7 +353,11 @@ async function captureBackdrop() {
         const pixelWidth = bytes.readUInt32BE(16),
           pixelHeight = bytes.readUInt32BE(20);
         if (!pixelWidth || !pixelHeight || pixelWidth * pixelHeight > MAX_BACKDROP_PIXELS) return null;
-        return { bounds, dataUrl: `data:image/png;base64,${bytes.toString('base64')}` };
+        return {
+          bounds,
+          transparent: entry === peekOverlay,
+          dataUrl: `data:image/png;base64,${bytes.toString('base64')}`,
+        };
       } catch {
         return null;
       } finally {
@@ -340,7 +374,7 @@ async function captureBackdrop() {
     context.tabId !== store.state.activeTabId
   )
     return;
-  emit({ type: 'page:backdrop', frames: frames.filter(Boolean) });
+  emit({ type: 'page:backdrop', generation, frames: frames.filter(Boolean) });
 }
 function finishAuth(credentials = null, reason = 'cancelled') {
   const request = pendingAuth;
@@ -386,20 +420,24 @@ function forgetRetainedFavicon(id) {
   retainedFavicons.delete(id);
 }
 function forgetProfileFavicons(profileId) {
+  savedFavicons?.clearProfile(profileId);
   for (const [id, record] of retainedFavicons) if (record.profileId === profileId) forgetRetainedFavicon(id);
 }
 function retainedFavicon(tab) {
   if (!tab) return null;
+  const cached = tab.pinned ? savedFavicons?.get(tab.profileId, tab.url) || null : null;
   const record = retainedFavicons.get(tab.id);
-  if (!record) return null;
+  if (!record) return cached;
   if (record.profileId !== tab.profileId || record.url !== tab.url) {
     forgetRetainedFavicon(tab.id);
-    return null;
+    return cached;
   }
   return record.dataUrl;
 }
 function rememberFavicon(entry, pageURL, favicon) {
-  if (!favicon || entry.disposing || !entry.tabId) return;
+  if (!favicon || entry.disposing) return;
+  savedFavicons?.remember(entry.profileId, pageURL, favicon);
+  if (!entry.tabId) return;
   const tab = store.state.tabs.find((item) => item.id === entry.tabId);
   if (!tab || tab.profileId !== entry.profileId || tab.url !== pageURL) return;
   if (!store.state.profiles.some((profile) => profile.id === tab.profileId)) return;
@@ -415,6 +453,9 @@ function rememberFavicon(entry, pageURL, favicon) {
   retainedFaviconBytes += bytes;
 }
 function pruneRetainedFavicons() {
+  savedFavicons?.retain(store.state);
+  for (const record of retainedFavicons.values())
+    savedFavicons?.remember(record.profileId, record.url, record.dataUrl);
   const tabs = new Map(store.state.tabs.map((tab) => [tab.id, tab]));
   const profiles = new Set(store.state.profiles.map((profile) => profile.id));
   for (const [id, record] of retainedFavicons) {
@@ -429,6 +470,7 @@ function pruneRetainedFavicons() {
   }
 }
 function pageState(entry, tab = null) {
+  const savedFavicon = tab?.pinned ? savedFavicons?.get(tab.profileId, tab.pinnedUrl) || null : null;
   if (!entry || entry.dormant || entry.contents.isDestroyed())
     return {
       loading: false,
@@ -439,6 +481,7 @@ function pageState(entry, tab = null) {
       sleeping: Boolean(tab?.pinned),
       closed: Boolean(tab?.closed),
       favicon: retainedFavicon(tab),
+      savedFavicon,
     };
   const wc = entry.contents;
   const boundTab = entry.tabId === tab?.id ? tab : null;
@@ -455,6 +498,7 @@ function pageState(entry, tab = null) {
     audible: wc.isCurrentlyAudible(),
     muted: wc.isAudioMuted(),
     favicon: currentFavicon || retainedFavicon(boundTab),
+    savedFavicon,
     url: wc.getURL(),
     loaded: true,
     sleeping: false,
@@ -470,12 +514,32 @@ function snapshot() {
     pages: Object.fromEntries(result.tabs.map((tab) => [tab.id, pageState(views.get(tab.id), tab)])),
     extensionPanel: extensionHost?.sidePanel?.snapshot() || null,
     splitTabId,
+    splitPair,
+    savedPeeks: Object.fromEntries(
+      result.tabs
+        .filter((tab) => tab.savedPeek)
+        .map((tab) => {
+          const entry = peeks.get(tab.id)?.entry;
+          const favicon = entry?.faviconURL === tab.savedPeek.url ? entry.favicon : null;
+          return [
+            tab.id,
+            {
+              url: tab.savedPeek.url,
+              favicon: favicon || savedFavicons?.get(tab.profileId, tab.savedPeek.url) || null,
+            },
+          ];
+        }),
+    ),
     peek: preview
       ? {
           id: preview.id,
+          sourceTabId: preview.sourceTabId,
           phase: preview.phase || 'open',
           offset: preview.offset || 0,
           progress: preview.progress ?? 1,
+          bounds: peekPresentationBounds(preview),
+          nativeOverlay: true,
+          favicon: preview.entry.favicon || savedFavicons?.get(preview.entry.profileId, preview.url) || null,
           url: preview.entry.contents.getURL() || preview.url,
           title: preview.entry.contents.getTitle() || 'Peek',
           loading: preview.entry.contents.isLoading(),
@@ -819,6 +883,7 @@ function createEntry(profileId, tabId = null, suppliedOptions = {}) {
     syncPinNavigation(entry);
   });
   wc.on('did-stop-loading', () => {
+    if (rememberNavigationHistory(entry)) store.changed();
     if (entry.tabId) publishExtensionTab(entry, { status: 'complete' });
     // A beforeunload veto keeps the old document without another dom-ready.
     // Give that retained document a fresh nonce after its attempted navigation.
@@ -843,6 +908,7 @@ function createEntry(profileId, tabId = null, suppliedOptions = {}) {
       store.state.tabs.some((tab) => tab.id === entry.tabId)
     )
       store.dispatch('tab:update', { id: entry.tabId, title: title.slice(0, 300) });
+    rememberPeekDestination(entry);
     const visit = store.state.history.find(
       (item) => item.profileId === entry.profileId && item.url === wc.getURL(),
     );
@@ -971,15 +1037,19 @@ function createEntry(profileId, tabId = null, suppliedOptions = {}) {
     entry.closeRequest = null;
     request?.resolve(true);
     if (pendingAuth?.contentsId === entry.contentsId) finishAuth();
-    if (peek?.entry === entry) {
-      cancelPeekMotion(peek);
-      peek = null;
+    const preview = [...peeks.values()].find((item) => item.entry === entry);
+    if (preview) {
+      const wasVisible = peek === preview;
+      cancelPeekMotion(preview);
+      peeks.delete(preview.sourceTabId);
+      if (wasVisible) peek = null;
+      if (!entry.disposing && !quitting && !closingWindow) forgetPeekDestination(preview);
       try {
         if (validWindow()) win.contentView.removeChildView(entry.view);
       } catch {}
       arrangeViews();
       publish();
-      focusContentOrChrome();
+      if (wasVisible && !closingWindow) focusContentOrChrome();
     }
     if (entry.disposing || quitting || !entry.tabId || views.get(entry.tabId) !== entry) return;
     views.delete(entry.tabId);
@@ -1027,6 +1097,45 @@ function publishExtensionTab(entry, changes) {
       extensionBrowser.tabData(tab),
     ]);
 }
+function rememberNavigationHistory(entry) {
+  const tab = store.state.tabs.find((item) => item.id === entry.tabId);
+  if (!tab || tab.closed || entry.dormant || entry.restoringHistory || entry.contents.isDestroyed()) return;
+  const history = entry.contents.navigationHistory;
+  const saved = cleanNavigationHistory(
+    { entries: history.getAllEntries(), index: history.getActiveIndex() },
+    tab.url,
+  );
+  if (!saved || JSON.stringify(saved) === JSON.stringify(tab.navigationHistory)) return false;
+  tab.navigationHistory = saved;
+  return true;
+}
+
+function restoreTabNavigation(entry, tab) {
+  const saved = cleanNavigationHistory(tab.navigationHistory, tab.url);
+  if (!saved) return safeNavigate(entry, tab.url);
+  entry.requestedURL = tab.url;
+  entry.error = null;
+  entry.restoringHistory = true;
+  const historyEpoch = entry.historyEpoch || 0;
+  entry.contents.navigationHistory
+    .restore(saved)
+    .catch((error) => {
+      if (error.code !== 'ERR_ABORTED' && !entry.contents.isDestroyed()) {
+        entry.error = { code: error.code, description: 'This page could not be reached.', url: tab.url };
+      }
+    })
+    .finally(() => {
+      entry.restoringHistory = false;
+      if (!entry.contents.isDestroyed()) {
+        if ((entry.historyEpoch || 0) !== historyEpoch) entry.contents.navigationHistory.clear();
+        else rememberNavigationHistory(entry);
+        store.changed();
+        arrangeViews();
+        publish();
+      }
+    });
+}
+
 function navigated(entry, url, addHistory) {
   if (!webURL(url) && !extensionPageURL(entry.profileId, url)) return;
   // Hash and history-state navigation keep the same document and validated
@@ -1050,9 +1159,12 @@ function navigated(entry, url, addHistory) {
       url,
       title,
     });
+    rememberNavigationHistory(entry);
     if (sameDocumentIcon) rememberFavicon(entry, url, sameDocumentIcon);
     if (addHistory && webURL(url)) store.dispatch('history:add', { profileId: entry.profileId, url, title });
   }
+  rememberPeekDestination(entry);
+  if (!entry.tabId && sameDocumentIcon) rememberFavicon(entry, url, sameDocumentIcon);
   publish();
 }
 function destroyEntry(entry) {
@@ -1073,6 +1185,7 @@ function requestCloseEntry(entry, { sleep = false } = {}) {
     if (!sleep) entry.sleepRequest = false;
     return entry.closeRequest.promise;
   }
+  rememberNavigationHistory(entry);
   const request = {};
   request.promise = new Promise((resolve) => {
     request.resolve = resolve;
@@ -1127,6 +1240,9 @@ async function discardEntryDocument(entry, request) {
 async function requestCloseTab(id) {
   const tab = store.state.tabs.find((item) => item.id === id);
   if (!tab) return null;
+  const preview = peeks.get(id);
+  if (preview && !(await (peek === preview ? requestClosePeek() : requestCloseEntry(preview.entry))))
+    return false;
   const entry = views.get(id);
   if (!entry) {
     store.dispatch('tab:close', { id });
@@ -1138,7 +1254,6 @@ async function requestCloseTab(id) {
 async function resetPinnedTab(id, { activate = true } = {}) {
   const tab = store.state.tabs.find((item) => item.id === id);
   if (!tab?.pinned) throw new Error('Choose a Pinned Tab or Favorite first.');
-  if (activate && peek && !(await requestClosePeek())) return null;
   const prior = views.get(id);
   store.dispatch('tab:reset-pin', { id });
   if (activate) store.dispatch('tab:activate', { id });
@@ -1171,8 +1286,7 @@ function pageProtected(entry) {
   )
     return true;
   if (quitting || closingWindow || !validWindow()) return true;
-  if (tab.id === store.state.activeTabId || splitPair?.includes(tab.id) || peek?.sourceTabId === tab.id)
-    return true;
+  if (tab.id === store.state.activeTabId || splitPair?.includes(tab.id) || tab.savedPeek) return true;
   const wc = entry.contents;
   if (
     wc.isLoading() ||
@@ -1208,7 +1322,9 @@ function pinProtected(entry) {
 }
 
 function markMediaPermission(contents) {
-  const entry = [...views.values(), ...(peek ? [peek.entry] : [])].find((item) => item.contents === contents);
+  const entry = [...views.values(), ...[...peeks.values()].map((current) => current.entry)].find(
+    (item) => item.contents === contents,
+  );
   if (entry) entry.mediaPermissionGranted = true;
 }
 
@@ -1332,6 +1448,39 @@ function prefersReducedPeekMotion() {
     return false;
   }
 }
+function peekUnderlayBounds() {
+  if (!validWindow()) return null;
+  const [width, height] = win.getContentSize();
+  return browserLayout({
+    width,
+    height,
+    ...layout,
+    split: false,
+    pageGutter: store.state.settings.pageGutter,
+  }).primary;
+}
+
+function peekPresentationBounds(current, rectangles = null) {
+  if (!validWindow()) return null;
+  const [width, height] = win.getContentSize();
+  rectangles ||= browserLayout({ width, height, ...layout, pageGutter: store.state.settings.pageGutter });
+  const full = browserLayout({
+    width,
+    height,
+    ...layout,
+    pageGutter: store.state.settings.pageGutter,
+  }).primary;
+  return peekMotionBounds(rectangles.peek, current.originBounds, current.progress ?? 1, current.phase, full);
+}
+async function expandPeek() {
+  const current = peek;
+  if (!current || current.closePromise || current.phase === 'expanding') return;
+  cancelPeekMotion(current);
+  current.progress = 0;
+  if (await animatePeek(current, 'expanding')) {
+    if (peek === current) promotePeek();
+  }
+}
 function cancelPeekMotion(current) {
   if (!current) return;
   clearTimeout(current.motionTimer);
@@ -1346,7 +1495,14 @@ function applyPeekMotion(current, offset, progress, phase) {
   current.progress = progress;
   current.phase = phase;
   arrangeViews();
-  emit({ type: 'peek:motion', id: current.id, phase, offset, progress });
+  emit({
+    type: 'peek:motion',
+    id: current.id,
+    phase,
+    offset,
+    progress,
+    bounds: peekPresentationBounds(current),
+  });
   return true;
 }
 function finishPeekMotion(current) {
@@ -1360,7 +1516,7 @@ function finishPeekMotion(current) {
     current,
     closing && !prefersReducedPeekMotion() ? 10 : 0,
     closing ? 0 : 1,
-    closing ? 'closing' : 'open',
+    closing ? 'closing' : current.phase === 'expanding' ? 'expanding' : 'open',
   );
   publish();
   resolve(true);
@@ -1374,7 +1530,9 @@ function animatePeek(current, phase) {
   const targetOffset = closing ? 10 : 0;
   const targetProgress = closing ? 0 : 1;
   const duration =
-    (closing ? 120 : 180) * (store.state.settings.motionScale || 1) * Math.abs(targetProgress - fromProgress);
+    (closing ? 120 : phase === 'expanding' ? 240 : 220) *
+    (store.state.settings.motionScale || 1) *
+    Math.abs(targetProgress - fromProgress);
   current.phase = phase;
   publish();
   return new Promise((resolve) => {
@@ -1417,7 +1575,7 @@ async function requestClosePeek({ supersede = true } = {}) {
   const current = peek;
   if (current.closePromise) return current.closePromise;
   current.closePromise = (async () => {
-    await animatePeek(current, 'closing');
+    if (!(await animatePeek(current, 'closing'))) return false;
     if (current.closeInterrupted) return false;
     if (peek !== current) return true;
     const closed = await requestCloseEntry(current.entry);
@@ -1451,7 +1609,7 @@ function ensureView(tabId) {
     // A newly created renderer must inherit the page's actual presentation.
     entry.dormant = false;
     arrangeViews();
-    safeNavigate(entry, tab.url);
+    restoreTabNavigation(entry, tab);
   }
   return entry;
 }
@@ -1483,15 +1641,14 @@ function reconcile() {
   for (const tab of store.state.tabs) if (!tab.closed) reserveView(tab);
   extensionHost?.sidePanel?.reconcile();
   publishExtensionTabChanges();
+  const activeSplit = store.state.splitGroups.find(
+    (group) => group.spaceId === store.state.activeSpaceId && group.tabIds.includes(store.state.activeTabId),
+  );
+  splitPair = activeSplit?.tabIds || null;
   const split = resolveSplit(splitPair, store.state.tabs, store.state.activeTabId, store.state.activeSpaceId);
   splitTabId = split?.otherId || null;
   if (!split) splitPair = null;
-  if (
-    peek &&
-    (peek.spaceId !== store.state.activeSpaceId ||
-      !store.state.profiles.some((profile) => profile.id === peek.profileId))
-  )
-    closePeek(false);
+  reconcilePeeks();
   ensureView(store.state.activeTabId);
   if (splitTabId) ensureView(splitTabId);
   const theme = ['dark', 'light'].includes(store.state.settings.theme)
@@ -1537,8 +1694,94 @@ function publishExtensionTabChanges() {
       ]);
   extensionTabSnapshot = next;
 }
+function ensurePeekOverlay() {
+  if (peekOverlay || !validWindow()) return peekOverlay;
+  const view = new WebContentsView({
+    webPreferences: {
+      preload: path.join(__dirname, 'peek-overlay-preload.cjs'),
+      sandbox: true,
+      contextIsolation: true,
+      nodeIntegration: false,
+      webSecurity: true,
+      navigateOnDragDrop: false,
+      spellcheck: false,
+    },
+  });
+  view.setBackgroundColor('#00000000');
+  const overlay = {
+    view,
+    contents: view.webContents,
+    presentation: { attached: false, visible: false },
+    ready: false,
+  };
+  peekOverlay = overlay;
+  overlay.contents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  overlay.contents.on('will-navigate', (event) => event.preventDefault());
+  overlay.contents.on('will-redirect', (event) => event.preventDefault());
+  overlay.contents.on('will-attach-webview', (event) => event.preventDefault());
+  overlay.contents.on('before-input-event', (event, input) => handleShortcut(event, input, overlay.contents));
+  overlay.contents.on('did-finish-load', () => {
+    if (peekOverlay !== overlay || !validWindow()) return;
+    overlay.ready = true;
+    arrangeViews();
+  });
+  overlay.contents.on('render-process-gone', () => {
+    if (peekOverlay !== overlay || !validWindow() || closingWindow || quitting) return;
+    overlay.ready = false;
+    arrangeViews();
+    overlay.contents.reload();
+  });
+  overlay.contents.on('destroyed', () => {
+    if (peekOverlay !== overlay) return;
+    peekOverlay = null;
+    if (validWindow() && !closingWindow && !quitting) ensurePeekOverlay();
+  });
+  overlay.loading = overlay.contents
+    .loadFile(path.join(__dirname, '../renderer/peek-overlay.html'))
+    .catch(report);
+  return overlay;
+}
+function arrangePeekOverlay(visible) {
+  const overlay = peekOverlay;
+  if (!overlay || overlay.contents.isDestroyed()) return;
+  const reveal = !peek && layout.sidebarHidden && !layout.overlay;
+  const gutter = store.state.settings.pageGutter ?? 8;
+  const bounds = reveal ? { x: gutter + 4, y: gutter + 4, width: 32, height: 32 } : peekUnderlayBounds();
+  const shown = Boolean((visible || reveal) && overlay.ready);
+  overlay.presentation = presentView(
+    overlay.view,
+    overlay.presentation,
+    {
+      visible: shown,
+      bounds,
+      retainAttachment: layout.overlay && overlay.backdropCaptureGeneration === backdropGeneration,
+    },
+    win.contentView,
+  );
+  if (!overlay.ready || (!peek && !reveal)) return;
+  const card = peek ? peekPresentationBounds(peek) : null;
+  overlay.contents.send('zacro:peek-overlay-state', {
+    mode: reveal ? 'sidebar' : 'peek',
+    id: reveal ? 'sidebar-reveal' : peek.id,
+    sidebarHidden: Boolean(layout.sidebarHidden),
+    bounds: card
+      ? { x: card.x - bounds.x, y: card.y - bounds.y, width: card.width, height: card.height }
+      : null,
+    phase: peek?.phase || 'open',
+    progress: peek?.progress ?? 1,
+    error: peek?.entry.error?.description || null,
+    appearance: {
+      chrome: '#e5d7e1',
+      card: '#ffffff',
+      ink: '#302f2d',
+      ...layout.peekAppearance,
+      radius: store.state.settings.pageRadius,
+    },
+  });
+}
 function arrangeViews() {
   if (!validWindow()) return;
+  if ((peek || layout.sidebarHidden) && !peekOverlay) ensurePeekOverlay();
   if (layout.overlay && backdropGeometry && backdropGeometry !== backdropLayoutKey())
     // Hidden native surfaces defer viewport resizing on some platforms. Omit
     // stale pixels until the next opening rather than stretch the old bitmap
@@ -1553,29 +1796,27 @@ function arrangeViews() {
     split: Boolean(splitPair),
   });
   const desired = new Map();
-  if (!layout.overlay) {
-    if (peek)
+  if (!layout.overlay || backdropHandoff?.generation === backdropGeneration) {
+    const first = views.get(splitPair?.[0] || store.state.activeTabId);
+    const second = splitPair ? views.get(splitPair[1]) : null;
+    if (
+      first &&
+      !first.dormant &&
+      (first.blankPopup || store.state.tabs.find((t) => t.id === first.tabId)?.url !== NEW_TAB)
+    )
+      desired.set(first, { bounds: rectangles.primary, visible: !first.error });
+    if (
+      second &&
+      !second.dormant &&
+      rectangles.secondary &&
+      store.state.tabs.find((t) => t.id === second.tabId)?.url !== NEW_TAB
+    )
+      desired.set(second, { bounds: rectangles.secondary, visible: !second.error });
+    if (peek && peekOverlay?.ready)
       desired.set(peek.entry, {
-        bounds: { ...rectangles.peek, y: rectangles.peek.y + Math.round(peek.offset || 0) },
+        bounds: peekPresentationBounds(peek, rectangles),
         visible: !peek.entry.error,
       });
-    else {
-      const first = views.get(splitPair?.[0] || store.state.activeTabId);
-      const second = splitPair ? views.get(splitPair[1]) : null;
-      if (
-        first &&
-        !first.dormant &&
-        (first.blankPopup || store.state.tabs.find((t) => t.id === first.tabId)?.url !== NEW_TAB)
-      )
-        desired.set(first, { bounds: rectangles.primary, visible: !first.error });
-      if (
-        second &&
-        !second.dormant &&
-        rectangles.secondary &&
-        store.state.tabs.find((t) => t.id === second.tabId)?.url !== NEW_TAB
-      )
-        desired.set(second, { bounds: rectangles.secondary, visible: !second.error });
-    }
   }
   for (const entry of [...views.values(), ...(peek ? [peek.entry] : [])]) {
     if (!entry.contents.isDestroyed()) {
@@ -1606,41 +1847,162 @@ function arrangeViews() {
       );
     }
   }
+  // BrowserWindow's primary renderer always paints below native child views.
+  // Use a transparent sibling renderer for Peek tint/controls above live pages.
+  arrangePeekOverlay(
+    Boolean(peek && (!layout.overlay || backdropHandoff?.generation === backdropGeneration)),
+  );
+  if (peekOverlay?.presentation.visible) {
+    const top = desired.get(peek?.entry)?.visible ? peek.entry.view : null;
+    const children = win.contentView.children;
+    if (
+      top
+        ? children.at(-1) !== top || children.at(-2) !== peekOverlay.view
+        : children.at(-1) !== peekOverlay.view
+    ) {
+      win.contentView.addChildView(peekOverlay.view);
+      if (top) win.contentView.addChildView(top);
+    }
+  }
   extensionHost?.sidePanel?.arrange({ ...layout, pageGutter: store.state.settings.pageGutter });
 }
-async function openPeek(url, source = activeTab()) {
+function forgetPeekDestination(current) {
+  const source = store.state.tabs.find((tab) => tab.id === current.sourceTabId);
+  if (source?.savedPeek) store.dispatch('peek:set', { sourceTabId: source.id, url: null });
+}
+function rememberPeekDestination(entry) {
+  const current = [...peeks.values()].find((item) => item.entry === entry);
+  if (!current || entry.contents.isDestroyed()) return;
+  const source = store.state.tabs.find((tab) => tab.id === current.sourceTabId && !tab.closed);
+  const url = webURL(entry.contents.getURL()) || current.url;
+  if (!source || !url) return;
+  const title = entry.contents.getTitle() || source.savedPeek?.title || new URL(url).hostname;
+  current.url = url;
+  if (source.savedPeek?.url !== url || source.savedPeek?.title !== title)
+    store.dispatch('peek:set', { sourceTabId: source.id, url, title });
+}
+function parkPeek() {
+  const current = peek;
+  if (!current) return;
+  peekRequestSerial++;
+  cancelPeekMotion(current);
+  current.closePromise = null;
+  current.phase = 'open';
+  current.progress = 1;
+  current.offset = 0;
+  peek = null;
+  if (!current.entry.contents.isDestroyed() && validWindow())
+    current.entry.presentation = presentView(
+      current.entry.view,
+      current.entry.presentation,
+      { visible: false },
+      win.contentView,
+    );
+}
+function reconcilePeeks() {
+  for (const current of peeks.values()) {
+    const source = store.state.tabs.find((tab) => tab.id === current.sourceTabId);
+    if (!source || source.closed || !source.savedPeek) {
+      if (peek === current) parkPeek();
+      peeks.delete(current.sourceTabId);
+      destroyEntry(current.entry);
+    }
+  }
+  if (peek && peek.sourceTabId !== store.state.activeTabId) parkPeek();
+  const source = activeTab();
+  if (!source?.savedPeek || source.closed) return;
+  let current = peeks.get(source.id);
+  if (!current) {
+    const entry = createEntry(source.profileId);
+    current = {
+      id: randomUUID(),
+      phase: 'open',
+      originBounds: null,
+      offset: 0,
+      progress: 1,
+      entry,
+      url: source.savedPeek.url,
+      profileId: source.profileId,
+      spaceId: source.spaceId,
+      sourceTabId: source.id,
+    };
+    peeks.set(source.id, current);
+    peek = current;
+    safeNavigate(entry, current.url);
+  } else peek = current;
+  current.spaceId = store.state.activeSpaceId;
+}
+function disposeProfilePeeks(profileId, { forget = false } = {}) {
+  for (const current of [...peeks.values()]) {
+    if (current.profileId !== profileId) continue;
+    if (peek === current) parkPeek();
+    peeks.delete(current.sourceTabId);
+    // Clear metadata before emitting change, so reconciliation cannot recreate it.
+    if (forget) {
+      const source = store.state.tabs.find((tab) => tab.id === current.sourceTabId);
+      if (source) delete source.savedPeek;
+    }
+    destroyEntry(current.entry);
+  }
+}
+async function openPeek(url, source = activeTab(), origin = null) {
   url = webURL(url);
   if (!url || !source) throw new Error('Choose a web link to preview.');
+  const sourceEntry = source.id === 'peek' ? peek?.entry : views.get(source.id);
+  const sourceBounds = sourceEntry?.view.getBounds();
+  const zoom = sourceEntry?.contents.getZoomFactor() || 1;
   const request = ++peekRequestSerial;
   if (!(await requestClosePeek({ supersede: false })) || request !== peekRequestSerial) return null;
+  const sourceTabId = source.sourceTabId || source.id;
+  const overlay = ensurePeekOverlay();
+  await overlay.loading;
+  if (!overlay.ready) throw new Error('The preview controls could not be loaded. Try again.');
+  const previous = peeks.get(sourceTabId);
+  if (previous && !(await requestCloseEntry(previous.entry))) return null;
+  if (request !== peekRequestSerial || !store.state.tabs.some((tab) => tab.id === sourceTabId && !tab.closed))
+    return null;
   const entry = createEntry(source.profileId);
-  peek = {
+  const [windowWidth, windowHeight] = win.getContentSize();
+  const defaultPeek = browserLayout({
+    width: windowWidth,
+    height: windowHeight,
+    ...layout,
+    pageGutter: store.state.settings.pageGutter,
+  }).peek;
+  const originBounds =
+    sourceBounds && Number.isFinite(origin?.x) && Number.isFinite(origin?.y)
+      ? {
+          x: Math.round(Math.max(0, Math.min(windowWidth - 40, sourceBounds.x + origin.x * zoom - 20))),
+          y: Math.round(Math.max(0, Math.min(windowHeight - 30, sourceBounds.y + origin.y * zoom - 15))),
+          width: 40,
+          height: 30,
+        }
+      : {
+          x: defaultPeek.x + 12,
+          y: defaultPeek.y + 12,
+          width: Math.max(1, defaultPeek.width - 24),
+          height: Math.max(1, defaultPeek.height - 24),
+        };
+  const current = {
     id: randomUUID(),
     phase: 'opening',
+    originBounds,
     offset: 10,
     progress: 0,
     entry,
     url,
     profileId: source.profileId,
     spaceId: source.spaceId,
-    sourceTabId: source.sourceTabId || source.id,
+    sourceTabId,
   };
+  peek = current;
+  peeks.set(current.sourceTabId, current);
+  store.dispatch('peek:set', { sourceTabId: current.sourceTabId, url, title: new URL(url).hostname });
   arrangeViews();
   safeNavigate(entry, url);
-  void animatePeek(peek, 'opening');
+  if (peek === current) void animatePeek(current, 'opening');
   publish();
-  focusContentOrChrome(entry.contents);
-}
-function closePeek(focus = true) {
-  peekRequestSerial++;
-  if (!peek) return;
-  cancelPeekMotion(peek);
-  const entry = peek.entry;
-  peek = null;
-  destroyEntry(entry);
-  arrangeViews();
-  publish();
-  if (focus) focusContentOrChrome();
+  if (peek === current) focusContentOrChrome(entry.contents);
 }
 function promotePeek({ interruptClose = false } = {}) {
   if (!peek) return;
@@ -1656,8 +2018,10 @@ function promotePeek({ interruptClose = false } = {}) {
   const url = current.entry.contents.getURL() || current.url;
   // Adopt before activation so reconciliation cannot start a duplicate request
   // for a page whose current document (or POST response) is already alive.
-  const tab = store.dispatch('tab:create', { url, spaceId: current.spaceId, active: false });
+  peeks.delete(current.sourceTabId);
   peek = null;
+  forgetPeekDestination(current);
+  const tab = store.dispatch('tab:create', { url, spaceId: current.spaceId, active: false });
   // Reuse the living page, including its scroll position and back stack.
   adoptView(tab, current.entry);
   store.dispatch('tab:activate', { id: tab.id });
@@ -2069,7 +2433,7 @@ async function clearProfileData(profileId) {
   });
   if (answer.response !== 1) return;
   if (activeSpace()?.profileId === profileId) await ai?.handle('ai:reset', {});
-  if (peek?.profileId === profileId) closePeek(false);
+  disposeProfilePeeks(profileId, { forget: true });
   for (const [id, entry] of views)
     if (entry.profileId === profileId) {
       destroyEntry(entry);
@@ -2261,16 +2625,6 @@ async function invoke(action, payload = {}) {
   if (action.startsWith('sync:')) return syncAccount.handle(action, payload);
   if (action.startsWith('extension:')) return extensionHost.handle(action, payload);
   if (CORE_ACTIONS.has(action)) {
-    const leavesPreview =
-      ['tab:activate', 'tab:restore', 'space:activate', 'space:create', 'profile:create'].includes(action) ||
-      (action === 'space:delete' && payload.id === peek?.spaceId) ||
-      (action === 'tab:create' && payload.active !== false) ||
-      (action === 'tab:move' &&
-        payload.id === store.state.activeTabId &&
-        payload.spaceId &&
-        payload.spaceId !== store.state.activeSpaceId) ||
-      (action === 'tab:close' && (!payload.id || payload.id === peek?.sourceTabId));
-    if (peek && leavesPreview && !(await requestClosePeek())) return null;
     if (action === 'tab:close') return requestCloseTab(payload.id || store.state.activeTabId);
     if (action === 'profile:delete') {
       const profile = store.state.profiles.find((item) => item.id === payload.id);
@@ -2290,7 +2644,7 @@ async function invoke(action, payload = {}) {
       if (answer.response !== 1) return null;
       if (!profile.private) await syncAccount?.client.deleteLocalProfile(profile.id);
       await ai?.forgetProfile(profile.id);
-      if (peek?.profileId === profile.id) closePeek(false);
+      disposeProfilePeeks(profile.id, { forget: true });
       if (activeSpace()?.profileId === profile.id) await ai?.handle('ai:reset', {});
       for (const record of store.state.downloads.filter((item) => item.profileId === profile.id))
         liveDownloads.get(record.id)?.cancel();
@@ -2308,6 +2662,14 @@ async function invoke(action, payload = {}) {
       await ses.clearAuthCache();
       await ses.closeAllConnections();
       sessions.delete(profile.id);
+    }
+    if (action === 'history:clear') {
+      const profileId = payload.profileId || activeSpace()?.profileId;
+      for (const entry of views.values())
+        if (entry.profileId === profileId && !entry.contents.isDestroyed()) {
+          entry.historyEpoch = (entry.historyEpoch || 0) + 1;
+          entry.contents.navigationHistory.clear();
+        }
     }
     const result = store.dispatch(action, payload);
     if (action === 'profile:delete') {
@@ -2509,8 +2871,22 @@ async function invoke(action, payload = {}) {
     case 'window:fullscreen':
       win.setFullScreen(!win.isFullScreen());
       break;
+    case 'page:backdrop-ready':
+      if (backdropHandoff?.generation === payload.generation) {
+        clearTimeout(backdropHandoff.timer);
+        backdropHandoff = null;
+        arrangeViews();
+      }
+      return null;
     case 'layout': {
       const previousOverlay = layout.overlay;
+      if (payload.peekAppearance && typeof payload.peekAppearance === 'object') {
+        layout.peekAppearance = Object.fromEntries(
+          ['chrome', 'card', 'ink']
+            .filter((key) => /^#[\da-f]{3,8}$/i.test(payload.peekAppearance[key] || ''))
+            .map((key) => [key, payload.peekAppearance[key]]),
+        );
+      }
       if (typeof payload.reducedMotion === 'boolean') {
         layout.reducedMotion = payload.reducedMotion;
         if (layout.reducedMotion && peek) finishPeekMotion(peek);
@@ -2518,18 +2894,21 @@ async function invoke(action, payload = {}) {
       const previousSidebarWidth = layout.sidebarWidth;
       if (Number.isFinite(payload.sidebarWidth))
         layout.sidebarWidth = Math.max(0, Math.min(380, payload.sidebarWidth));
+      if (typeof payload.sidebarHidden === 'boolean') {
+        layout.sidebarHidden = payload.sidebarHidden;
+        if (process.platform === 'darwin') win.setWindowButtonVisibility(!payload.sidebarHidden);
+      }
       if (Number.isFinite(payload.panelWidth))
         layout.panelWidth = Math.max(0, Math.min(650, payload.panelWidth));
       if (Number.isFinite(payload.contentTop) && payload.contentTop >= 4 && payload.contentTop <= 40)
         layout.contentTop = Math.round(payload.contentTop);
-      else if (payload.contentTop !== undefined || layout.sidebarWidth === 0) layout.contentTop = 40;
-      else if (previousSidebarWidth === 0)
+      else if (payload.contentTop !== undefined || previousSidebarWidth === 0 || layout.sidebarWidth === 0)
         layout.contentTop = process.platform === 'darwin' || win.isFullScreen() ? 8 : 36;
       const nextOverlay = typeof payload.overlay === 'boolean' ? payload.overlay : previousOverlay;
       // A dialog may interrupt a width animation. Present the final visible
       // geometry before capturing it; otherwise both the bitmap and its bounds
-      // describe the previous animation sample. Capture still starts with the
-      // overlay flag set, so its bounded hidden-attachment lifecycle is intact.
+      // describe the previous animation sample. The command palette keeps the
+      // live surface until the renderer acknowledges its decoded replacement.
       if (nextOverlay && !previousOverlay) arrangeViews();
       layout.overlay = nextOverlay;
       if (typeof payload.extensionPanel === 'boolean') layout.extensionPanel = payload.extensionPanel;
@@ -2538,7 +2917,7 @@ async function invoke(action, payload = {}) {
         ['x', 'y', 'width', 'height'].every((key) => Number.isFinite(payload.extensionPanelBounds[key]))
           ? payload.extensionPanelBounds
           : null;
-      if (layout.overlay && !previousOverlay) void captureBackdrop();
+      if (layout.overlay && !previousOverlay) void captureBackdrop({ seamless: payload.command === true });
       else if (!layout.overlay && previousOverlay) clearBackdrop();
       arrangeViews();
       if (layout.overlay) win.webContents.focus();
@@ -2566,10 +2945,14 @@ async function invoke(action, payload = {}) {
       contents?.openDevTools({ mode: 'detach' });
       break;
     case 'split:toggle': {
-      if (!(await requestClosePeek())) return null;
-      if (splitTabId && !payload.id) {
-        splitTabId = null;
-        splitPair = null;
+      if (
+        !payload.id &&
+        store.state.splitGroups.some(
+          (group) =>
+            group.spaceId === store.state.activeSpaceId && group.tabIds.includes(store.state.activeTabId),
+        )
+      ) {
+        store.dispatch('split:remove', { tabId: store.state.activeTabId });
         break;
       }
       if (!activeTab() || activeTab().url === NEW_TAB)
@@ -2586,22 +2969,25 @@ async function invoke(action, payload = {}) {
           (tab) =>
             tab.spaceId === store.state.activeSpaceId &&
             tab.id !== store.state.activeTabId &&
-            tab.url !== NEW_TAB,
+            tab.url !== NEW_TAB &&
+            !store.state.splitGroups.some((group) => group.tabIds.includes(tab.id)),
         );
       if (!selected) throw new Error('Open a second web page in this Space to use split view.');
       if (selected.closed) store.dispatch('tab:wake', { id: selected.id });
-      splitTabId = selected.id;
-      splitPair = [store.state.activeTabId, selected.id];
-      ensureView(splitTabId);
+      store.dispatch('split:create', { firstId: store.state.activeTabId, secondId: selected.id });
+      ensureView(selected.id);
       break;
     }
+    case 'split:unsplit':
+      store.dispatch('split:remove', { tabId: payload.id || store.state.activeTabId });
+      break;
     case 'peek:open':
       await openPeek(payload.url);
       break;
     case 'peek:close':
       return requestClosePeek();
     case 'peek:promote':
-      promotePeek();
+      await expandPeek();
       break;
     case 'download:show': {
       const record = downloadRecord(payload.id);
@@ -2698,6 +3084,23 @@ async function invoke(action, payload = {}) {
 }
 
 function registerIPC() {
+  ipcMain.on('zacro:peek-overlay-action', (event, payload) => {
+    if (
+      !validWindow() ||
+      layout.overlay ||
+      !peekOverlay?.presentation.visible ||
+      event.sender !== peekOverlay.contents ||
+      event.senderFrame !== peekOverlay.contents.mainFrame ||
+      payload?.id !== (peek?.id || 'sidebar-reveal')
+    )
+      return;
+    if (payload.action === 'sidebar-toggle' && layout.sidebarHidden)
+      void runMacAction('sidebar-toggle', true).catch(report);
+    else if (!peek) return;
+    else if (payload.action === 'close') requestClosePeek().catch(report);
+    else if (payload.action === 'promote') expandPeek().catch(report);
+    else if (payload.action === 'reload') peek.entry.contents.reload();
+  });
   ipcMain.handle('zacro:invoke', async (event, action, payload) => {
     if (
       !validWindow() ||
@@ -2727,7 +3130,7 @@ function registerIPC() {
       (tab.id !== 'peek' && ![store.state.activeTabId, splitTabId].includes(tab.id))
     )
       return;
-    openPeek(details.url, tab).catch(report);
+    openPeek(details.url, tab, details.origin).catch(report);
   });
   ipcMain.on('zacro:pin-peek-link', (event, details) => {
     const tab = tabForContents(event.sender);
@@ -2746,7 +3149,7 @@ function registerIPC() {
     const targetHost = new URL(details.url).hostname.replace(/^www\./, '');
     const pinHost = new URL(tab.pinnedUrl || tab.url).hostname.replace(/^www\./, '');
     if (targetHost === pinHost) return;
-    openPeek(details.url, tab).catch(report);
+    openPeek(details.url, tab, details.origin).catch(report);
   });
   ipcMain.on('zacro:page-dirty', (event) => {
     if (
@@ -2754,7 +3157,7 @@ function registerIPC() {
       (event.senderFrame !== event.sender.mainFrame && event.senderFrame.top !== event.sender.mainFrame)
     )
       return;
-    const entry = [...views.values(), ...(peek ? [peek.entry] : [])].find(
+    const entry = [...views.values(), ...[...peeks.values()].map((current) => current.entry)].find(
       (item) => item.contents === event.sender,
     );
     if (entry && !entry.contents.isDestroyed()) entry.userEdited = true;
@@ -2916,6 +3319,14 @@ async function runMacAction(action, fromPage = false) {
     }
     case 'command-palette':
       return showChrome({ type: 'command', mode: 'newtab' });
+    case 'paste-search': {
+      const text = (await clipboard.readText()).trim();
+      if (!text) return;
+      if (text.length > 8000) throw new Error('Paste up to 8,000 characters.');
+      const tab = await invoke('tab:create', { url: text });
+      emit({ type: 'newtab:show', id: tab?.id });
+      return;
+    }
     case 'new-private-space':
       await invoke('profile:create', { name: 'Private', private: true });
       return;
@@ -2975,7 +3386,7 @@ async function runMacAction(action, fromPage = false) {
     case 'peek-close':
       return requestClosePeek();
     case 'peek-promote':
-      return peek && promotePeek();
+      return peek && expandPeek();
     case 'pin-tab':
       return activeTab() && invoke('tab:pin', {});
     case 'duplicate-tab':
@@ -3134,6 +3545,8 @@ async function createWindow() {
     minHeight: Math.min(420, bounds.height),
     title: 'Zacro',
     backgroundColor: '#f4f2ef',
+    // macOS needs an alpha-capable NSWindow for continuous background opacity.
+    ...(process.platform === 'darwin' ? { transparent: true } : {}),
     ...windowChrome(process.platform),
     useContentSize,
     icon: path.join(__dirname, '../../assets/icon.png'),
@@ -3164,10 +3577,10 @@ async function createWindow() {
       win.setBounds(requested);
     }
   }
-  // Website views and the shell must be native siblings. Nesting websites
-  // inside BrowserWindow's original content view can leave their renderer
-  // hidden on first navigation even when the native child reports visible.
-  // A debugger masks that failure by keeping pages rendering.
+  // Keep website surfaces in a separate native host. BrowserWindow's primary
+  // renderer paints below this host; its contentView is only a container, not
+  // the renderer itself. Peek therefore uses its own transparent sibling view
+  // for tint and controls above live website surfaces.
   const shellView = win.contentView;
   const pageHost = new View();
   win.setContentView(pageHost);
@@ -3184,6 +3597,19 @@ async function createWindow() {
   win.webContents.on('will-redirect', (event) => event.preventDefault());
   win.webContents.on('will-attach-webview', (event) => event.preventDefault());
   win.webContents.on('before-input-event', (event, input) => handleShortcut(event, input, win.webContents));
+  // Electron exposes native trackpad contact phases here; ordinary DOM wheel
+  // events omit them. Only the trusted shell receives this narrow phase bridge.
+  const shellContents = win.webContents;
+  shellContents.on('input-event', (_event, input) => {
+    const phase = {
+      gestureScrollBegin: 'began',
+      gestureScrollEnd: 'ended',
+      gestureFlingStart: 'momentum',
+      gestureFlingCancel: 'momentum-ended',
+    }[input?.type];
+    if (phase && !shellContents.isDestroyed())
+      shellContents.send('zacro:event', { type: 'space:gesture-phase', phase });
+  });
   win.webContents.on('render-process-gone', () => {
     setShortcutRecording(false);
     if (validWindow()) win.webContents.reload();
@@ -3242,12 +3668,12 @@ async function createWindow() {
   win.on('close', (event) => {
     const hasPrivateSession =
       process.platform === 'darwin' && store.state.profiles.some((item) => item.private);
-    if (!allowWindowClose && (views.size || peek || hasPrivateSession)) {
+    if (!allowWindowClose && (views.size || peeks.size || hasPrivateSession)) {
       event.preventDefault();
       if (closingWindow) return;
       closingWindow = true;
       (async () => {
-        const candidates = [...views.values(), ...(peek ? [peek.entry] : [])];
+        const candidates = [...views.values(), ...[...peeks.values()].map((current) => current.entry)];
         for (const entry of candidates) {
           if (!(await requestCloseEntry(entry))) {
             closingWindow = false;
@@ -3288,11 +3714,14 @@ async function createWindow() {
     clearBackdrop();
     for (const entry of views.values()) destroyEntry(entry);
     views.clear();
-    if (peek) {
-      cancelPeekMotion(peek);
-      destroyEntry(peek.entry);
-      peek = null;
+    for (const current of peeks.values()) {
+      cancelPeekMotion(current);
+      destroyEntry(current.entry);
     }
+    peeks.clear();
+    peek = null;
+    if (peekOverlay && !peekOverlay.contents.isDestroyed()) peekOverlay.contents.close();
+    peekOverlay = null;
     win = null;
     shellSurface = null;
     windowMaterialState = null;
@@ -3355,6 +3784,7 @@ app.on('will-quit', () => {
   extensionHost?.close().catch(console.error);
   try {
     store?.flush();
+    savedFavicons?.flush();
   } catch (error) {
     console.error('Session save failed:', error.message);
   }
@@ -3369,6 +3799,8 @@ if (singleInstance)
     .whenReady()
     .then(async () => {
       store = new BrowserStore(app.getPath('userData'));
+      savedFavicons = new SavedFaviconCache(app.getPath('userData'));
+      savedFavicons.retain(store.state);
       syncAccount = new SyncController({
         directory: path.join(app.getPath('userData'), 'sync'),
         getProfile: (id) => store.state.profiles.find((profile) => profile.id === id),

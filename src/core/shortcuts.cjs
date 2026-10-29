@@ -3,12 +3,25 @@
 // One catalog drives native input, menus, command search, and the shortcut editor.
 const entries = [
   ['command-palette', 'Command palette', 'Navigation', 'Mod+T', ['Mod+K']],
+  ['paste-search', 'Paste and search', 'Navigation', { darwin: 'Ctrl+Mod+V', other: 'Mod+Alt+V' }],
   ['open-location', 'Edit current address', 'Navigation', 'Mod+L'],
   ['sidebar-toggle', 'Toggle sidebar', 'Navigation', 'Mod+S'],
   ['focus-sidebar', 'Focus sidebar', 'Navigation', 'Mod+Alt+S'],
   ['reveal-tab', 'Reveal tab in sidebar', 'Navigation', ''],
-  ['history-back', 'Back', 'Navigation', { darwin: 'Mod+[', other: 'Alt+Left' }],
-  ['history-forward', 'Forward', 'Navigation', { darwin: 'Mod+]', other: 'Alt+Right' }],
+  [
+    'history-back',
+    'Back',
+    'Navigation',
+    { darwin: 'Mod+Left', other: 'Alt+Left' },
+    { darwin: ['Mod+['], other: [] },
+  ],
+  [
+    'history-forward',
+    'Forward',
+    'Navigation',
+    { darwin: 'Mod+Right', other: 'Alt+Right' },
+    { darwin: ['Mod+]'], other: [] },
+  ],
   ['focus-chrome', 'Focus page / browser controls', 'Navigation', 'F6'],
   ['copy-url', 'Copy page address', 'Navigation', 'Mod+Shift+C'],
   ['next-space', 'Next Space', 'Spaces', 'Mod+Alt+Right'],
@@ -293,11 +306,17 @@ function matchShortcut(input, platform, overrides) {
 }
 function sidebarTabs(state, spaceId = state.activeSpaceId) {
   const space = state.spaces?.find((item) => item.id === spaceId);
+  const groups = (state.splitGroups || []).filter((group) => group.spaceId === spaceId);
+  const groupedIds = new Set(groups.flatMap((group) => group.tabIds));
   const favorites = state.tabs.filter(
-    (tab) => tab.favorite && (space?.profileId ? tab.profileId === space.profileId : tab.spaceId === spaceId),
+    (tab) =>
+      !groupedIds.has(tab.id) &&
+      tab.favorite &&
+      (space?.profileId ? tab.profileId === space.profileId : tab.spaceId === spaceId),
   );
   const tabs = state.tabs.filter(
     (tab) =>
+      !groupedIds.has(tab.id) &&
       !tab.favorite &&
       tab.spaceId === spaceId &&
       (tab.pinned || tab.folderId || tab.url !== 'zacro://newtab' || tab.homePage),
@@ -306,8 +325,11 @@ function sidebarTabs(state, spaceId = state.activeSpaceId) {
   const folders = state.folders.filter((folder) => folder.spaceId === spaceId);
   return [
     ...favorites,
-    ...pins,
     ...folders.flatMap((folder) => tabs.filter((tab) => tab.folderId === folder.id)),
+    ...pins,
+    ...groups.flatMap((group) =>
+      group.tabIds.map((id) => state.tabs.find((tab) => tab.id === id)).filter(Boolean),
+    ),
     ...tabs.filter((tab) => !tab.pinned && !tab.folderId),
   ];
 }

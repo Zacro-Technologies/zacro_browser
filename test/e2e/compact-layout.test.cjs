@@ -130,7 +130,9 @@ test(
                   },
                 ]
               : [box];
-            const actual = (await native()).map((item) => item.bounds);
+            const actual = (await native())
+              .filter((item) => !peek || item.url.endsWith('/peek'))
+              .map((item) => item.bounds);
             lastGeometry = { expected, actual };
             return (
               actual.length === expected.length &&
@@ -172,7 +174,8 @@ test(
     await expect(shell.locator('#sidebar')).toBeHidden();
     const hidden = await aligned();
     assert.equal(hidden.x, 8);
-    assert.equal(hidden.y, 40);
+    assert.equal(hidden.y, baselineTop);
+    await expect(shell.locator('#toolbar')).toBeHidden();
     await emit({ type: 'sidebar:toggle' });
     await expect(shell.locator('#sidebar')).toBeVisible();
     assert.equal((await aligned()).y, baselineTop);
@@ -235,14 +238,14 @@ test(
     const compactPage = await aligned();
     assert.equal(compactPage.width, 240);
     assert.equal(compactPage.x, 8);
-    assert.equal(compactPage.y, 40);
+    assert.equal(compactPage.y, baselineTop);
     await expect
       .poll(() => rectangle('#side-panel'))
       .toEqual({
         x: 256,
-        y: 40,
+        y: baselineTop,
         width: compactSize[0] - 256,
-        height: compactSize[1] - 40,
+        height: compactSize[1] - baselineTop,
       });
     assert.equal((await state()).settings.sidebarWidth, 380);
     for (const panel of ['bookmarks', 'history', 'downloads', 'archive', 'ai', 'settings']) {
@@ -262,14 +265,14 @@ test(
     await expect(shell.locator('#command-input')).toBeFocused();
     const compactCommand = await shell.locator('.command-dialog').evaluate((dialog) => {
       const rect = dialog.getBoundingClientRect();
-      const footer = dialog.querySelector('.command-footer').getBoundingClientRect();
+      const results = dialog.querySelector('.command-results').getBoundingClientRect();
       return {
         readable: rect.width >= 400,
-        footerVisible: Math.round(footer.bottom) <= Math.round(rect.bottom),
+        resultsVisible: Math.round(results.bottom) <= Math.round(rect.bottom),
         withinWindow: rect.top >= 0 && Math.round(rect.bottom) <= innerHeight,
       };
     });
-    assert.deepEqual(compactCommand, { readable: true, footerVisible: true, withinWindow: true });
+    assert.deepEqual(compactCommand, { readable: true, resultsVisible: true, withinWindow: true });
     await shell.keyboard.press('Escape');
     await shell.locator('[data-key="panel-close"]').click();
     await expect(shell.locator('#sidebar')).toBeVisible();

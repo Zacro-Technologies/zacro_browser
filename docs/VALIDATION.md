@@ -1,5 +1,19 @@
 # Validation record
 
+## 0.10.1 browser experience · October 29, 2026
+
+Local checks use macOS 27.0 (26A428), Apple silicon, Node.js 26.7.0 and Electron 45.0.0. Formatting and JavaScript syntax checks pass, and the final full Node suite passes **564/564** tests.
+
+Native browser checks cover persisted split groups and Peek sessions, restored back/forward history, offline Favorite/pin/Peek icons, live tinted content beneath Peek, native outside-click dismissal and expansion, palette capture handoff, current-site search, direct paste/search, Favorite drag placement/cancellation, multi-Space gestures, and theme preview/save behavior. The browser and command-workflow suites passed after correcting an obsolete split-menu label. The broader 78-case native run passed 76 cases initially; its two failures were obsolete expectations for hidden chrome geometry and Peek switching. Both corrected cases pass separately, including the final Mac keyboard/chrome regression. Repeated targeted runs are not additional distinct cases.
+
+The final sidebar-button checks pass: native clicks hide and restore the sidebar, content-only pages retain their top gutter, and restoring the sidebar during Peek keeps the same preview document. Mac platform-shell checks pass. All six final compact-layout, onboarding, hidden-sidebar and F6 regression cases pass. Native screenshots were inspected for Arc-style sidebar spacing, joined split tabs, theme-colored folders, Peek controls and the live underlay. Theme-editor and window previews use the same appearance tokens. Controlled desktop captures at 0/25/50/75/100 opacity confirm distinct tint levels; at zero, background pixels match the desktop backdrop. Grain and saturated light/dark colors were also inspected.
+
+Short Space swipes select one neighbor; sustained movement can cross multiple Spaces, snaps on release, and ignores momentum. Native contact-phase delivery and synthetic movement are tested. Physical trackpad feel still needs hands-on acceptance on target hardware. Navigation restoration saves URLs, titles and index, not opaque form/POST state; private persistence and portable export exclusions are tested.
+
+The Apple silicon **0.10.1 development DMG and ZIP** are built locally. All 59 source files match the packaged ASAR, version metadata is 0.10.1, all six security fuse settings match, the deep/strict code-signature check passes, and both DMG and ZIP integrity checks pass. Checksums are saved beside the artifacts. A preceding 0.10.1 package smoke run reached shell startup and the isolated bundled Codex handshake, but browsing stalled before the first fixture request because macOS presented a **“Zacro Safe Storage” Keychain password prompt**. A native screenshot confirms that OS prompt; the page reports loading with no runtime error. The packaged browser acceptance test therefore remains **blocked/failed**, not passed; full runtime acceptance of the final rebuilt bundle is unconfirmed. No password, credential permission or Keychain setting was changed. This ad hoc signed build is not notarized. No new Windows/Intel or live-provider acceptance is claimed.
+
+## Earlier platform baseline
+
 Validated locally on Windows 11 x64 (OS build 26200), Node.js 24.19.0, Electron 45.0.0 and Chromium 156.0.8078.48. This record describes engineering verification of the development build, not commercial certification or a security audit.
 
 ## 0.9 tab behavior, sharp overlays and Peek motion

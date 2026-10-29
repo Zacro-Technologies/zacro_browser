@@ -36,6 +36,8 @@ function archiveCandidate(state, tab, now = Date.now()) {
     !tab.pinned &&
     !tab.favorite &&
     !tab.folderId &&
+    !tab.savedPeek &&
+    !state.splitGroups?.some((group) => group.tabIds.includes(tab.id)) &&
     tab.id !== state.activeTabId &&
     Number.isFinite(tab.lastActiveAt) &&
     tab.lastActiveAt <= now - hours * 3600000,

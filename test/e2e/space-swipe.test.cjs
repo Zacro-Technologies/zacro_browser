@@ -71,7 +71,7 @@ async function launch(t) {
         if (tails) {
           // Schedule the fallback inertia stream on the same clock as release.
           // Round trips to the main process may exceed the stream's quiet gap.
-          await new Promise((resolve) => setTimeout(resolve, 150));
+          await new Promise((resolve) => setTimeout(resolve, 200));
           for (let i = 0; i < 5; i++) {
             dispatch([{ deltaX: 100 }]);
             await new Promise((resolve) => setTimeout(resolve, 70));
@@ -86,7 +86,7 @@ async function launch(t) {
       // Drain pending state-paint/automatic-palette work before starting the quiet
       // period, so a late UI update cannot interrupt the next synthetic gesture.
       await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-      await new Promise((resolve) => setTimeout(resolve, 260));
+      await new Promise((resolve) => setTimeout(resolve, 360));
     });
   const changedTo = async (id) => {
     await expect.poll(current).toBe(id);
@@ -938,5 +938,145 @@ test(
     });
     assert.equal(reduced.color, first.color);
     assert.equal(reduced.animations, 0);
+  },
+);
+
+test(
+  'a held swipe spans multiple pages without compressing Favorites or timing out',
+  { timeout: 45000 },
+  async (t) => {
+    const b = await launch(t);
+    for (let i = 0; i < 6; i++) {
+      const tab = await b.invoke('tab:create', { homePage: true });
+      await b.invoke('tab:favorite', { id: tab.id });
+    }
+    await b.idle();
+    const sample = await b.shell.evaluate(async () => {
+      const list = document.querySelector('.space-page');
+      const dispatch = (dx, phase) => {
+        const event = new WheelEvent('wheel', { deltaX: dx, bubbles: true, cancelable: true });
+        Object.defineProperty(event, 'phase', { value: phase });
+        list.dispatchEvent(event);
+      };
+      const width = document.querySelector('#sidebar').clientWidth;
+      const original = [...list.querySelectorAll('.favorite')].map(
+        (node) => node.getBoundingClientRect().width,
+      );
+      dispatch(width * 0.3, 'began');
+      const preview = [
+        ...document.querySelector('#space-gesture-preview').firstElementChild.querySelectorAll('.favorite'),
+      ].map((node) => node.getBoundingClientRect().width);
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      const held = list.classList.contains('gesture-tracking');
+      dispatch(width * 2, 'changed');
+      const farEdgeVisible = !document.querySelector('#space-gesture-preview').hidden;
+      const offset = new DOMMatrix(list.style.transform).m41;
+      dispatch(0, 'ended');
+      return { original, preview, held, offset, width, farEdgeVisible };
+    });
+    assert.equal(sample.preview.length, sample.original.length);
+    assert(sample.preview.every((width, index) => Math.abs(width - sample.original[index]) < 0.01));
+    assert(sample.original.every((width) => width > 50));
+    assert.equal(sample.held, true);
+    assert.equal(sample.farEdgeVisible, true);
+    assert(sample.offset < -sample.width * 2 && sample.offset > -sample.width * 2 - 24);
+    await b.changedTo(b.third);
+  },
+);
+
+test(
+  'native shell contact phases hold ordinary wheels through pauses and release once',
+  { timeout: 45000 },
+  async (t) => {
+    const b = await launch(t);
+    await b.invoke('tab:create', { homePage: true });
+    await b.idle();
+    await b.shell.evaluate(() => {
+      window.__nativeSpacePhase = null;
+      window.zacro.onEvent((event) => {
+        if (event.type === 'space:gesture-phase') window.__nativeSpacePhase = event.phase;
+      });
+    });
+    const native = async (type, expected) => {
+      await b.shell.evaluate(() => {
+        window.__nativeSpacePhase = null;
+      });
+      await b.app.evaluate(({ BrowserWindow }, type) => {
+        BrowserWindow.getAllWindows()[0].webContents.emit('input-event', {}, { type });
+      }, type);
+      await expect.poll(() => b.shell.evaluate(() => window.__nativeSpacePhase)).toBe(expected);
+    };
+    await native('gestureScrollBegin', 'began');
+    // These WheelEvents deliberately have no nonstandard phase/momentum fields.
+    await b.wheel([{ deltaX: 100 }]);
+    await b.shell.evaluate(() => new Promise((resolve) => setTimeout(resolve, 1000)));
+    assert.equal(await b.current(), b.first);
+    await expect(b.shell.locator('.space-page')).toHaveClass(/gesture-tracking/);
+    await b.wheel([{ deltaX: 310 }]);
+    await native('gestureScrollEnd', 'ended');
+    await b.changedTo(b.third);
+    await b.idle();
+
+    await native('gestureScrollBegin', 'began');
+    await b.wheel([{ deltaX: -120 }]);
+    await native('gestureFlingStart', 'momentum');
+    await b.changedTo(b.second);
+    await b.wheel([{ deltaX: -500 }, { deltaX: -300 }]);
+    assert.equal(await b.current(), b.second, 'Inertia after native release cannot cross another Space');
+    await native('gestureFlingCancel', 'momentum-ended');
+    await b.idle();
+    assert.equal(await b.current(), b.second);
+
+    await b.wheel([{ deltaX: -100 }]);
+    await native('gestureScrollBegin', 'began');
+    await b.shell.evaluate(() => new Promise((resolve) => setTimeout(resolve, 900)));
+    await expect(b.shell.locator('.space-page')).toHaveClass(/gesture-tracking/);
+    assert.equal(await b.current(), b.second);
+    await native('gestureScrollEnd', 'ended');
+    await b.changedTo(b.first);
+    await b.invoke('space:activate', { id: b.second });
+    await b.changedTo(b.second);
+    await b.idle();
+
+    await native('gestureScrollBegin', 'began');
+    await b.wheel([{ deltaX: 140 }], '#toolbar');
+    await native('gestureScrollEnd', 'ended');
+    assert.equal(
+      await b.current(),
+      b.second,
+      'A shell gesture outside the sidebar navigation region is not claimed',
+    );
+  },
+);
+
+test(
+  'a quick swipe selects one neighbor and ignores all momentum while a long swipe crosses pages',
+  { timeout: 30000 },
+  async (t) => {
+    const b = await launch(t);
+    await b.idle();
+    await b.wheel([
+      { deltaX: 650, phase: 'began' },
+      { deltaX: 0, phase: 'ended' },
+    ]);
+    await b.changedTo(b.second);
+    await b.wheel([
+      { deltaX: 900, momentum: true },
+      { deltaX: 400, momentum: true },
+    ]);
+    assert.equal(await b.current(), b.second);
+    await b.idle();
+    await b.invoke('space:activate', { id: b.first });
+    await b.changedTo(b.first);
+    await b.idle();
+    await b.wheel([{ deltaX: 100, phase: 'began' }]);
+    await b.shell.evaluate(() => new Promise((resolve) => setTimeout(resolve, 280)));
+    await b.wheel([
+      { deltaX: 310, phase: 'changed' },
+      { deltaX: 0, phase: 'ended' },
+    ]);
+    await b.changedTo(b.third);
+    await b.wheel([{ deltaX: -900, momentum: true }]);
+    assert.equal(await b.current(), b.third);
   },
 );

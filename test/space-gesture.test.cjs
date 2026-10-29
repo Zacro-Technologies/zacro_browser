@@ -219,3 +219,55 @@ test('zero and malformed events cannot poison feedback or extend release indefin
   assert.equal(g.settle(10 + g.release).commit, 1);
   assert.equal(g.wheel(500, 100, { index: NaN }).preventDefault, false);
 });
+
+test('one continuous contact traverses multiple Spaces and snaps only at release', async () => {
+  const g = await fixture();
+  g.wheel(0, 100, { index: 0, count: 6, phase: 'began' });
+  assert.equal(g.settle(2000).phase, 'tracking', 'Held contacts have no arbitrary timeout');
+  assert.equal(g.wheel(2100, 300, { index: 0, count: 6, phase: 'changed' }).offset, -400);
+  assert.equal(g.wheel(2200, 240, { index: 0, count: 6, phase: 'changed' }).position, 640 / 224);
+  const result = g.wheel(2300, 0, { index: 0, count: 6, phase: 'ended' });
+  assert.equal(result.commit, 3);
+  assert.equal(result.targetIndex, 3);
+  assert.equal(result.offset, -672);
+});
+
+test('reversing a multi-page drag settles at the page now under the fingers', async () => {
+  const g = await fixture();
+  g.wheel(0, 100, { index: 0, count: 6, phase: 'began' });
+  g.wheel(300, 560, { index: 0, count: 6, phase: 'changed' });
+  g.wheel(380, -100, { index: 0, count: 6, phase: 'changed' });
+  const result = g.wheel(420, 0, { index: 0, count: 6, phase: 'ended' });
+  assert.equal(result.commit, 2);
+  assert.equal(result.targetIndex, 2);
+});
+
+test('a delayed native contact phase retains wheel distance and owns the release deadline', async () => {
+  const g = await fixture();
+  assert.equal(g.wheel(0, 120).offset, -120);
+  assert.equal(g.wheel(20, 0, { phase: 'changed' }).offset, -120);
+  assert.equal(g.settle(2000).phase, 'tracking');
+  assert.equal(g.wheel(2100, 0, { phase: 'ended' }).commit, 1);
+});
+
+test('quick high-distance flicks select exactly one Space and ignore the momentum tail', async () => {
+  for (const direction of [-1, 1]) {
+    const g = await fixture();
+    g.wheel(0, direction * 150, { index: 3, count: 7, phase: 'began' });
+    const drag = g.wheel(35, direction * 600, { index: 3, count: 7, phase: 'changed' });
+    assert(Math.abs(drag.offset) <= 224 * 1.05);
+    const result = g.wheel(55, 0, { index: 3, count: 7, phase: 'ended' });
+    assert.equal(result.commit, direction);
+    assert.equal(result.targetIndex, 3 + direction);
+    assert.equal(g.wheel(65, direction * 900, { index: 3 + direction, count: 7, momentum: true }).commit, 0);
+  }
+});
+
+test('sustained fast release snaps to distance without velocity projection', async () => {
+  const g = await fixture();
+  g.wheel(0, 30, { index: 0, count: 7, phase: 'began' });
+  g.wheel(500, 300, { index: 0, count: 7, phase: 'changed' });
+  g.wheel(520, 190, { index: 0, count: 7, phase: 'changed' });
+  const result = g.wheel(525, 0, { index: 0, count: 7, phase: 'ended' });
+  assert.equal(result.commit, 2, '520px reaches2.32 pages, with no projected third page');
+});

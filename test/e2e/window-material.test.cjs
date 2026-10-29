@@ -40,6 +40,47 @@ test(
     const invoke = (action, payload = {}) =>
       shell.evaluate(([action, payload]) => window.zacro.invoke(action, payload), [action, payload]);
     const state = () => invoke('state:get');
+    if (process.platform === 'darwin') {
+      // capturePage preserves compositor alpha. Test painted pixels, including
+      // the empty content pane, so an opaque CSS/native shell cannot silently
+      // turn this into a slider that changes state but not the window.
+      if (await shell.locator('#command-input').count()) await shell.keyboard.press('Escape');
+      const homeId = (await state()).activeSpaceId;
+      const points = await shell.evaluate(() => {
+        const page = document.querySelector('.workspace').getBoundingClientRect();
+        return [
+          { x: 16, y: 300 },
+          { x: page.x + page.width / 2, y: page.y + page.height / 2 },
+        ];
+      });
+      for (const opacity of [0, 25, 50, 75, 100]) {
+        await invoke('space:update', { id: homeId, theme: { opacity, grain: 0 } });
+        if (!(await state()).runtime.windowMaterial.enabled && opacity < 100) continue;
+        await expect
+          .poll(() =>
+            shell.evaluate(() => getComputedStyle(document.querySelector('.app'), '::after').opacity),
+          )
+          .toBe(String(opacity / 100));
+        await shell.evaluate(
+          () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))),
+        );
+        const alpha = await app.evaluate(async ({ BrowserWindow }, points) => {
+          const window = BrowserWindow.getAllWindows()[0];
+          const image = await window.webContents.capturePage();
+          const bitmap = image.toBitmap();
+          const { width } = image.getSize();
+          const scale = width / window.getContentSize()[0];
+          return points.map(
+            ({ x, y }) => bitmap[(Math.floor(y * scale) * width + Math.floor(x * scale)) * 4 + 3],
+          );
+        }, points);
+        for (const value of alpha)
+          assert(
+            Math.abs(value - Math.round(opacity * 2.55)) <= 2,
+            `${opacity}% should paint alpha ${Math.round(opacity * 2.55)}, saw ${alpha}`,
+          );
+      }
+    }
     await shell.evaluate(() => {
       window.zacro.onState((state) => {
         window.__materialPublishedSpace = {
@@ -117,10 +158,10 @@ test(
     assert.equal(preview.requestedOpacity, 40);
     assert.equal(afterPreview.spaces.find((space) => space.id === spaceId).theme.opacity, 100);
     if (preview.enabled) {
-      assert.equal(preview.type, process.platform === 'darwin' ? 'vibrancy' : 'acrylic');
+      assert.equal(preview.type, process.platform === 'darwin' ? 'transparent' : 'acrylic');
       assert.equal(preview.opacity, 40);
       assert.deepEqual(await app.evaluate(() => globalThis.materialCalls), [
-        process.platform === 'darwin' ? 'under-window' : 'acrylic',
+        process.platform === 'darwin' ? null : 'acrylic',
       ]);
     } else t.diagnostic(`Native material stayed opaque: ${preview.reason}`);
     assert.equal(

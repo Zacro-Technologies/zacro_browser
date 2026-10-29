@@ -1,7 +1,8 @@
 'use strict';
 
-// Native materials blur the desktop behind the window. They do not change the
-// opacity of text or the independent Chromium surfaces that render websites.
+// Background transparency never fades text or the independent website views.
+// macOS vibrancy has a fixed opacity floor, so use an alpha-capable window and
+// let the renderer control its tint continuously. Windows retains native blur.
 function windowMaterial({
   platform,
   release = '',
@@ -28,11 +29,11 @@ function windowMaterial({
   return {
     supported,
     enabled,
-    type: enabled ? (platform === 'darwin' ? 'vibrancy' : 'acrylic') : 'opaque',
+    type: enabled ? (platform === 'darwin' ? 'transparent' : 'acrylic') : 'opaque',
     opacity: enabled ? requestedOpacity : 100,
     requestedOpacity,
     reason,
-    blur: 'system',
+    blur: platform === 'darwin' ? 'none' : 'system',
   };
 }
 

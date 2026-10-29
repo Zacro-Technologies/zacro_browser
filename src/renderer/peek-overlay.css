@@ -1,0 +1,142 @@
+:root {
+  --chrome: #e8e2e6;
+  --card: #fff;
+  --ink: #302f2d;
+  --radius: 12px;
+  --fade: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  background: transparent;
+  color: var(--ink);
+}
+* {
+  box-sizing: border-box;
+}
+html,
+body {
+  margin: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+body {
+  background: transparent;
+}
+[hidden] {
+  display: none !important;
+}
+#veil {
+  position: absolute;
+  inset: 0;
+  background: color-mix(in srgb, var(--chrome) 52%, transparent);
+  opacity: var(--fade);
+  pointer-events: none;
+}
+#surface {
+  position: absolute;
+  border-radius: var(--radius);
+  box-shadow:
+    0 12px 40px #15101930,
+    0 2px 8px #15101920,
+    0 0 0 1px #15101914;
+  opacity: var(--fade);
+  pointer-events: none;
+}
+#surface.failed {
+  background: var(--card);
+}
+#error {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  padding: 32px;
+  text-align: center;
+  pointer-events: auto;
+  font-size: 13px;
+  line-height: 1.5;
+}
+#error h2 {
+  font-size: 18px;
+  margin: 0;
+}
+#error p {
+  max-width: 400px;
+  margin: 12px 0 20px;
+  overflow-wrap: anywhere;
+}
+#error button {
+  width: auto;
+  padding: 0 14px;
+  border-radius: 8px;
+  font: inherit;
+  border: 1px solid currentColor;
+}
+#controls {
+  position: absolute;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  opacity: var(--fade);
+}
+button {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: var(--card);
+  color: var(--ink);
+  box-shadow: 0 1px 4px #15101920;
+  cursor: pointer;
+}
+button:hover {
+  background: color-mix(in srgb, var(--card) 92%, var(--ink));
+}
+button:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 3px;
+}
+button:disabled {
+  pointer-events: none;
+}
+svg {
+  width: 18px;
+  height: 18px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+@media (forced-colors: active) {
+  button {
+    background: ButtonFace;
+    color: ButtonText;
+    border: 1px solid ButtonBorder;
+  }
+  #surface {
+    outline: 1px solid CanvasText;
+  }
+}
+
+#sidebar-toggle {
+  position: absolute;
+  z-index: 2;
+  inset: 0;
+  border-radius: 8px;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ink) 10%, transparent);
+}
+#sidebar-toggle > svg {
+  width: 18px;
+  height: 18px;
+}
+#sidebar-toggle:focus-visible {
+  outline-offset: -3px;
+}
+
+:root[data-mode='peek'] #sidebar-toggle {
+  inset: 4px auto auto 4px;
+}

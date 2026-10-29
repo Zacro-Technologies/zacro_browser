@@ -4,6 +4,8 @@ const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const { EventEmitter } = require('node:events');
 const { sanitizeOverrides } = require('./shortcuts.cjs');
+const { cleanNavigationHistory } = require('./navigation-history.cjs');
+const { cleanSplitGroups } = require('./split-groups.cjs');
 const { normalizeSiteSearches } = require('./site-search.js');
 const {
   DEFAULT_ARCHIVE_HOURS,
@@ -67,6 +69,7 @@ const SPACE_ICONS = new Set([
 const DEFAULT_SPACE_THEME = Object.freeze({
   secondaryColor: '#b695b8',
   gradient: 50,
+  vibrancy: 0,
   grain: 0,
   opacity: 100,
   blur: 0,
@@ -91,6 +94,7 @@ function spaceTheme(value, base = DEFAULT_SPACE_THEME) {
   if (/^#[\da-f]{6}$/i.test(value.secondaryColor || '')) next.secondaryColor = value.secondaryColor;
   for (const [key, minimum, maximum] of [
     ['gradient', 0, 100],
+    ['vibrancy', 0, 100],
     ['grain', 0, 200],
     ['opacity', 0, 100],
     ['blur', 0, 32],
@@ -182,6 +186,7 @@ function createInitialState() {
     activeSpaceId: 'home',
     activeTabId: null,
     tabs: [],
+    splitGroups: [],
     folders: [],
     history: [],
     bookmarks: [],
@@ -324,6 +329,12 @@ function hydrate(raw) {
           }
         : {}),
       ...(pinned && t.closed === true ? { closed: true } : {}),
+      ...(!(pinned && t.closed) && webUrl(t.savedPeek?.url)
+        ? { savedPeek: { url: webUrl(t.savedPeek.url), title: str(t.savedPeek.title, 500) } }
+        : {}),
+      ...(!(pinned && t.closed) && cleanNavigationHistory(t.navigationHistory, t.url)
+        ? { navigationHistory: cleanNavigationHistory(t.navigationHistory, t.url) }
+        : {}),
       folderId: favorite ? null : folderId,
       createdAt: time(t.createdAt),
       lastActiveAt: time(t.lastActiveAt),
@@ -333,10 +344,14 @@ function hydrate(raw) {
     .filter((t) => unique(t) && spaces.has(t.spaceId))
     .slice(0, MAX_TABS)
     .map(cleanTab);
+  result.splitGroups = cleanSplitGroups(raw.splitGroups, result.tabs, result.spaces);
   result.archive = array(raw.archive)
     .filter((t) => unique(t) && spaces.has(t.spaceId))
     .slice(0, MAX_ARCHIVE)
-    .map((t) => ({ ...cleanTab(t), archivedAt: time(t.archivedAt) }));
+    .map((t) => {
+      const { savedPeek, ...tab } = cleanTab(t);
+      return { ...tab, archivedAt: time(t.archivedAt) };
+    });
   result.history = array(raw.history)
     .filter((h) => unique(h) && profiles.has(h.profileId) && webUrl(h.url))
     .slice(0, MAX_HISTORY)
@@ -452,18 +467,23 @@ class BrowserStore extends EventEmitter {
       }
     }
     if (!this.state.settings.restoreSession) {
+      const grouped = new Set(this.state.splitGroups.flatMap((group) => group.tabIds));
       this.state.archive = [
         ...this.state.tabs
-          .filter((t) => !t.pinned && t.url !== 'zacro://newtab')
+          .filter((t) => !t.pinned && !t.savedPeek && !grouped.has(t.id) && t.url !== 'zacro://newtab')
           .map((t) => ({ ...t, archivedAt: Date.now() })),
         ...this.state.archive,
       ].slice(0, MAX_ARCHIVE);
-      this.state.tabs = this.state.tabs.filter((t) => t.pinned);
+      this.state.tabs = this.state.tabs.filter((t) => t.pinned || t.savedPeek || grouped.has(t.id));
       this.state.activeTabId = null;
     }
     // Favorites are destinations, not a request to start every saved renderer.
     // Even a favorite selected at shutdown stays dormant until selected again.
-    if (this.state.tabs.find((tab) => tab.id === this.state.activeTabId)?.pinned)
+    if (
+      this.state.tabs.find((tab) => tab.id === this.state.activeTabId)?.pinned &&
+      !this.state.tabs.find((tab) => tab.id === this.state.activeTabId)?.savedPeek &&
+      !this.state.splitGroups.some((group) => group.tabIds.includes(this.state.activeTabId))
+    )
       this.state.activeTabId =
         this.state.tabs.find((tab) => tab.spaceId === this.state.activeSpaceId && !tab.pinned)?.id || null;
   }
@@ -497,6 +517,7 @@ class BrowserStore extends EventEmitter {
     s.folders = s.folders.filter((f) => spaces.has(f.spaceId));
     for (const key of ['tabs', 'history', 'archive', 'bookmarks', 'downloads', 'extensions', 'permissions'])
       s[key] = s[key].filter((r) => allowed.has(r.profileId));
+    s.splitGroups = cleanSplitGroups(s.splitGroups, s.tabs, s.spaces);
     if (!spaces.has(s.activeSpaceId)) s.activeSpaceId = s.spaces[0]?.id;
     if (!s.tabs.some((t) => t.id === s.activeTabId && t.spaceId === s.activeSpaceId && !t.closed))
       s.activeTabId = s.tabs.find((t) => t.spaceId === s.activeSpaceId && !t.pinned)?.id || null;
@@ -605,9 +626,11 @@ class BrowserStore extends EventEmitter {
     }
   }
   closeTab(tab, archive = true) {
+    delete tab.savedPeek;
     const position = this.state.tabs.indexOf(tab);
     if (tab.pinned) {
       tab.closed = true;
+      delete tab.navigationHistory;
       tab.url = tab.pinnedUrl || tab.url;
       if (this.state.activeTabId === tab.id)
         this.state.activeTabId =
@@ -641,6 +664,57 @@ class BrowserStore extends EventEmitter {
     const previousActiveId = s.activeTabId;
     let result = null;
     switch (action) {
+      case 'peek:set': {
+        const tab = this.require('tabs', p.sourceTabId, 'Tab');
+        if (p.url == null) delete tab.savedPeek;
+        else {
+          const url = webUrl(p.url);
+          if (!url || tab.closed) throw new Error('Choose an open tab and a web link to preview.');
+          tab.savedPeek = { url, title: str(p.title, 500) };
+        }
+        result = tab.savedPeek || null;
+        break;
+      }
+      case 'split:create': {
+        const first = this.require('tabs', p.firstId || s.activeTabId, 'Tab');
+        const second = this.require('tabs', p.secondId, 'Tab');
+        const space = this.require('spaces', p.spaceId || s.activeSpaceId, 'Space');
+        if (
+          first.id === second.id ||
+          [first, second].some(
+            (tab) =>
+              tab.closed ||
+              tab.url === 'zacro://newtab' ||
+              tab.profileId !== space.profileId ||
+              (!tab.favorite && tab.spaceId !== space.id),
+          )
+        )
+          throw new Error('Choose two open web pages in the same Space.');
+        const existing = s.splitGroups.find(
+          (group) => group.tabIds.includes(first.id) || group.tabIds.includes(second.id),
+        );
+        if (existing) {
+          if (
+            existing.spaceId === space.id &&
+            existing.tabIds.includes(first.id) &&
+            existing.tabIds.includes(second.id)
+          ) {
+            result = existing;
+            break;
+          }
+          throw new Error('Unsplit these tabs before adding them to another split view.');
+        }
+        result = { id: id('split'), spaceId: space.id, tabIds: [first.id, second.id] };
+        s.splitGroups.push(result);
+        break;
+      }
+      case 'split:remove': {
+        const group = s.splitGroups.find(
+          (item) => item.id === p.id || item.tabIds.includes(p.tabId || s.activeTabId),
+        );
+        if (group) s.splitGroups = s.splitGroups.filter((item) => item !== group);
+        break;
+      }
       case 'tab:create': {
         if (s.tabs.length >= MAX_TABS) throw new Error('Close some tabs before opening more.');
         const space = this.require('spaces', p.spaceId || s.activeSpaceId, 'Space');
@@ -749,6 +823,15 @@ class BrowserStore extends EventEmitter {
           if (folder.spaceId !== space.id) throw new Error('That folder belongs to another Space.');
         }
         const oldSpace = tab.spaceId;
+        const group = s.splitGroups.find((item) => item.tabIds.includes(tab.id));
+        const movingGroup = group && p.spaceId && group.spaceId !== space.id;
+        if (movingGroup) {
+          group.spaceId = space.id;
+          for (const member of s.tabs.filter((item) => group.tabIds.includes(item.id))) {
+            member.spaceId = space.id;
+            member.folderId = null;
+          }
+        }
         tab.spaceId = space.id;
         if (p.folderId !== undefined || oldSpace !== space.id) tab.folderId = p.folderId || null;
         const favorite =
@@ -766,9 +849,9 @@ class BrowserStore extends EventEmitter {
           s.tabs.splice(s.tabs.indexOf(tab), 1);
           s.tabs.splice(Math.min(s.tabs.length, Math.max(0, p.index)), 0, tab);
         }
-        if (s.activeTabId === tab.id) {
+        if (s.activeTabId === tab.id || (movingGroup && group.tabIds.includes(s.activeTabId))) {
           s.activeSpaceId = tab.spaceId;
-          space.lastActiveTabId = tab.id;
+          space.lastActiveTabId = s.activeTabId;
         }
         result = tab;
         break;
@@ -841,6 +924,7 @@ class BrowserStore extends EventEmitter {
         const others = s.spaces.filter((r) => r.profileId === space.profileId && r.id !== space.id);
         if (!others.length) throw new Error('Keep at least one Space in each profile.');
         const destination = others[0];
+        for (const group of s.splitGroups) if (group.spaceId === space.id) group.spaceId = destination.id;
         for (const tab of [...s.tabs, ...s.archive].filter((t) => t.spaceId === space.id)) {
           tab.spaceId = destination.id;
           tab.folderId = null;
@@ -974,6 +1058,8 @@ class BrowserStore extends EventEmitter {
         break;
       }
       case 'history:clear':
+        for (const tab of [...s.tabs, ...s.archive])
+          if (tab.profileId === (p.profileId || this.activeSpace().profileId)) delete tab.navigationHistory;
         s.history = s.history.filter((h) => h.profileId !== (p.profileId || this.activeSpace().profileId));
         break;
       case 'archive:clear':
@@ -1004,6 +1090,7 @@ class BrowserStore extends EventEmitter {
       default:
         throw new Error(`Unknown action: ${str(action, 80)}`);
     }
+    s.splitGroups = cleanSplitGroups(s.splitGroups, s.tabs, s.spaces);
     const tabsById = new Map(s.tabs.map((tab) => [tab.id, tab]));
     for (const space of s.spaces) {
       const remembered = tabsById.get(space.lastActiveTabId);
@@ -1037,8 +1124,9 @@ class BrowserStore extends EventEmitter {
       exportedAt: new Date().toISOString(),
       profiles: s.profiles,
       spaces: s.spaces,
-      tabs: s.tabs,
+      tabs: s.tabs.map(({ navigationHistory, ...tab }) => tab),
       folders: s.folders,
+      splitGroups: s.splitGroups,
       bookmarks: s.bookmarks,
       settings: s.settings,
     };
@@ -1048,6 +1136,11 @@ class BrowserStore extends EventEmitter {
       throw new Error('Choose a Zacro JSON export or a browser bookmarks HTML file.');
     const data = hydrate({
       ...raw,
+      tabs: array(raw.tabs).map((item) => {
+        if (!item || typeof item !== 'object') return item;
+        const { navigationHistory, ...tab } = item;
+        return tab;
+      }),
       history: [],
       downloads: [],
       extensions: [],
@@ -1061,11 +1154,12 @@ class BrowserStore extends EventEmitter {
     )
       throw new Error('This import would exceed the browser’s collection limits.');
     const mappings = new Map();
-    for (const key of ['profiles', 'spaces', 'folders', 'tabs', 'bookmarks'])
+    for (const key of ['profiles', 'spaces', 'folders', 'tabs', 'splitGroups', 'bookmarks'])
       for (const row of data[key]) mappings.set(row.id, id(key.slice(0, -1)));
-    for (const key of ['profiles', 'spaces', 'folders', 'tabs', 'bookmarks']) {
+    for (const key of ['profiles', 'spaces', 'folders', 'tabs', 'splitGroups', 'bookmarks']) {
       for (const row of data[key]) {
         const next = { ...row, id: mappings.get(row.id) };
+        if (key === 'splitGroups') next.tabIds = row.tabIds.map((id) => mappings.get(id));
         for (const field of ['profileId', 'spaceId', 'folderId', 'lastActiveTabId'])
           if (next[field]) next[field] = mappings.get(next[field]) || null;
         if (key === 'profiles') {

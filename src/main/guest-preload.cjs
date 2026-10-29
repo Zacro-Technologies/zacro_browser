@@ -45,6 +45,7 @@ window.addEventListener(
         documentId: documentIdentity,
         sourceURL: location.href,
         url: url.href,
+        origin: { x: event.clientX, y: event.clientY },
       });
     } catch {
       /* malformed web content is ignored */
@@ -92,6 +93,7 @@ window.addEventListener('click', (event) => {
       documentId: pinNavigation.documentId,
       sourceURL: location.href,
       url: target.href,
+      origin: { x: event.clientX, y: event.clientY },
     });
   } catch {
     /* malformed web content is ignored */

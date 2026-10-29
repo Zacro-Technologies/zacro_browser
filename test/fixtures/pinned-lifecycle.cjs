@@ -336,8 +336,8 @@ test(
     await b.invoke('tab:close', { id: favorite.id });
     assert.equal(
       (await b.state()).runtime.pages[favorite.id].favicon,
-      null,
-      'Closing the newly navigated page must not retain its previous URL icon',
+      favicon,
+      'Closing the navigated Favorite restores the saved destination icon from its cache',
     );
     const unvisited = await b.invoke('tab:create', { url: favorite.url, active: false });
     assert.equal(
@@ -347,7 +347,7 @@ test(
     );
 
     // Closing a Favorite discards its navigated page and reopens the saved
-    // destination. That new document must obtain its own validated icon.
+    // destination, whose previously validated icon is available before it loads.
     await b.invoke('tab:activate', { id: favorite.id });
     assert.equal((await b.state()).tabs.find((tab) => tab.id === favorite.id).pinnedUrl, favorite.url);
     await expect.poll(() => b.guest(favorite.url, 'document.readyState')).toBe('complete');

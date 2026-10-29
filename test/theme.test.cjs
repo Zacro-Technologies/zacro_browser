@@ -40,42 +40,43 @@ test('Space tones keep opaque tint surfaces readable across saturated colors, bl
     '#4f9485',
   ];
   for (const dark of [false, true]) {
-    const text = THEME_TEXT_COLORS[dark ? 'dark' : 'light'];
+    const accentInk = THEME_TEXT_COLORS[dark ? 'dark' : 'light'].accentInk;
     for (const color of colors)
       for (const secondaryColor of colors)
-        for (const grain of [0, 50, 100, 150, 200]) {
-          const tokens = deriveSpaceTheme({ color, secondaryColor, dark, grain });
-          const primary = channels(tokens.tintPrimary),
-            secondary = channels(tokens.tintSecondary),
-            chrome = channels(tokens.chrome);
-          const normal = [channels(text.ink), channels(text.muted), channels(tokens.accent)];
-          const noiseOpacity = tokens.grainOpacity * 0.7;
-          const context = `${dark ? 'dark' : 'light'} ${color}/${secondaryColor} grain ${grain}`;
-          for (const blend of [0, 0.25, 0.5, 0.75, 1]) {
-            const gradient = overlay(primary, secondary, blend);
-            for (const noise of [
-              [0, 0, 0],
-              [255, 255, 255],
-            ]) {
-              // One global grain layer covers the shared window tint.
-              const painted = overlay(overlay(gradient, chrome, blend), noise, noiseOpacity);
-              for (const foreground of normal)
-                assert(
-                  ratio(foreground, painted) >= 4.5,
-                  `${context}: text contrast ${ratio(foreground, painted)}`,
-                );
+        for (const grain of [0, 100, 200])
+          for (const vibrancy of [0, 50, 100]) {
+            const tokens = deriveSpaceTheme({ color, secondaryColor, dark, grain, vibrancy });
+            const primary = channels(tokens.tintPrimary),
+              secondary = channels(tokens.tintSecondary),
+              chrome = channels(tokens.chrome);
+            const normal = [channels(tokens.ink), channels(tokens.muted), channels(tokens.accent)];
+            const noiseOpacity = tokens.grainOpacity * 0.7;
+            const context = `${dark ? 'dark' : 'light'} ${color}/${secondaryColor} grain ${grain}, intensity ${vibrancy}`;
+            for (const blend of [0, 0.25, 0.5, 0.75, 1]) {
+              const gradient = overlay(primary, secondary, blend);
+              for (const noise of [
+                [0, 0, 0],
+                [255, 255, 255],
+              ]) {
+                // One global grain layer covers the shared window tint.
+                const painted = overlay(overlay(gradient, chrome, blend), noise, noiseOpacity);
+                for (const foreground of normal)
+                  assert(
+                    ratio(foreground, painted) >= 4.5,
+                    `${context}: text contrast ${ratio(foreground, painted)}`,
+                  );
+              }
             }
-          }
-          for (const background of ['chrome', 'tintPrimary', 'tintSecondary', 'hover', 'accentSoft'])
+            for (const background of ['chrome', 'tintPrimary', 'tintSecondary', 'hover', 'accentSoft'])
+              assert(
+                ratio(channels(tokens.accent), channels(tokens[background])) >= 4.5,
+                `${context}: accent on ${background}`,
+              );
             assert(
-              ratio(channels(tokens.accent), channels(tokens[background])) >= 4.5,
-              `${context}: accent on ${background}`,
+              ratio(channels(accentInk), channels(tokens.accent)) >= 4.5,
+              `${context}: primary button text`,
             );
-          assert(
-            ratio(channels(text.accentInk), channels(tokens.accent)) >= 4.5,
-            `${context}: primary button text`,
-          );
-        }
+          }
   }
 });
 
@@ -122,7 +123,7 @@ test('Space tone defaults are deterministic and malformed colors or grain cannot
       else assert.match(value, /^#[\da-f]{6}$/);
     }
   }
-  assert.equal(deriveSpaceTheme({ grain: 100 }).grainOpacity, 0.045);
+  assert.equal(deriveSpaceTheme({ grain: 100 }).grainOpacity, 0.09);
   assert.equal(deriveSpaceTheme({ grain: 200 }).grainOpacity, THEME_GRAIN_MAX_OPACITY);
   assert.equal(deriveSpaceTheme({ grain: 0 }).grainOpacity, 0);
   assert.equal(deriveSpaceTheme({ grain: 10000 }).grainOpacity, THEME_GRAIN_MAX_OPACITY);
@@ -132,11 +133,11 @@ test('Space appearance follows reversible perceptual progress without changing s
   const { blendSpaceAppearance } = await modulePromise;
   const from = {
     color: '#000000',
-    theme: { secondaryColor: '#ff0000', gradient: 10, grain: 0, opacity: 100 },
+    theme: { secondaryColor: '#ff0000', gradient: 10, vibrancy: 0, grain: 0, opacity: 100 },
   };
   const to = {
     color: '#ffffff',
-    theme: { secondaryColor: '#0000ff', gradient: 90, grain: 200, opacity: 0 },
+    theme: { secondaryColor: '#0000ff', gradient: 90, vibrancy: 100, grain: 200, opacity: 0 },
   };
   const original = structuredClone({ from, to });
   assert.deepEqual(blendSpaceAppearance(from, to, 0), from);
@@ -145,7 +146,7 @@ test('Space appearance follows reversible perceptual progress without changing s
   assert.equal(middle.color, '#636363', 'Half perceptual lightness is not half the encoded RGB value');
   assert.deepEqual(
     { ...middle.theme, secondaryColor: undefined },
-    { secondaryColor: undefined, gradient: 50, grain: 100, opacity: 50 },
+    { secondaryColor: undefined, gradient: 50, vibrancy: 50, grain: 100, opacity: 50 },
   );
   assert.notEqual(middle.theme.secondaryColor, from.theme.secondaryColor);
   assert.notEqual(middle.theme.secondaryColor, to.theme.secondaryColor);
@@ -191,7 +192,27 @@ test('The contrast budget tracks the actual shell text and texture source colors
     for (const [name, color] of Object.entries(palette)) {
       const property = name === 'accentInk' ? 'accent-ink' : name;
       const equivalent = color === '#ffffff' ? '#(?:fff|ffffff)' : color;
-      assert.match(css, new RegExp(`--${property}:\\s*${equivalent}\\s*;`));
+      assert.match(
+        css,
+        new RegExp(`--${property}:\\s*(?:var\\(--theme-${property},\\s*)?${equivalent}\\)?\\s*;`),
+      );
     }
   assert.match(grain, /opacity="\.7"/);
+});
+
+test('color intensity preserves visibly stronger chroma while grain has a useful maximum', async () => {
+  const { deriveSpaceTheme } = await modulePromise;
+  for (const dark of [false, true])
+    for (const color of ['#ee3388', '#5733ff', '#ff5500', '#00a45a']) {
+      const subtle = deriveSpaceTheme({ color, dark, vibrancy: 0 });
+      const vivid = deriveSpaceTheme({ color, dark, vibrancy: 100 });
+      const chroma = (value) => Math.max(...channels(value)) - Math.min(...channels(value));
+      assert(chroma(vivid.tintPrimary) > chroma(subtle.tintPrimary) * 2.4);
+      assert(
+        chroma(vivid.tintPrimary) >= 100,
+        'Maximum color intensity must reach rich colors, not pale pastels',
+      );
+      assert.notEqual(vivid.muted, subtle.muted, 'Foregrounds adapt to preserve readable strong colors');
+    }
+  assert.equal(deriveSpaceTheme({ grain: 200 }).grainOpacity, 0.18);
 });

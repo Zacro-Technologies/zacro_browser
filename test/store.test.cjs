@@ -134,6 +134,7 @@ test('Space appearance and layout preferences round-trip with bounded untrusted 
   assert.deepEqual(reopened.state.spaces[0].theme, {
     secondaryColor: '#abcdef',
     gradient: 82,
+    vibrancy: 0,
     grain: 9,
     opacity: 62,
     blur: 18,
@@ -163,6 +164,7 @@ test('Space appearance and layout preferences round-trip with bounded untrusted 
   assert.deepEqual(clean.spaces[0].theme, {
     secondaryColor: '#b695b8',
     gradient: 0,
+    vibrancy: 0,
     grain: 200,
     opacity: 2,
     blur: 32,

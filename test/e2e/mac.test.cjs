@@ -277,7 +277,8 @@ test('macOS uses native window chrome, menu conventions and keyboard navigation'
     await expect(b.shell.locator('#app')).toHaveAttribute('data-sidebar-hidden', 'true');
     await expect(b.shell.locator('#app')).toHaveAttribute('data-sidebar-animating', 'false');
     await expect(b.shell.locator('#sidebar')).toBeHidden();
-    await expectTrafficLightClearance();
+    await expect(b.shell.locator('#toolbar')).toBeHidden();
+    await expect.poll(async () => (await b.shell.locator('#workspace').boundingBox())?.y).toBe(8);
     await captureShell('sidebar-hidden');
     await nativeShortcut('S', ['meta']);
     await expect(b.shell.locator('#app')).toHaveAttribute('data-sidebar-hidden', 'false');

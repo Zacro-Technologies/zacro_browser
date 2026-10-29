@@ -360,7 +360,13 @@ test(
           id: frame.id,
           channel,
           offset: frame.offset,
-          paintedOffset: parseFloat(element.style.getPropertyValue('--peek-offset')),
+          bounds: frame.bounds,
+          paintedBounds: Object.fromEntries(
+            ['x', 'y', 'width', 'height'].map((key) => [
+              key,
+              Math.round(element.querySelector('.peek-body').getBoundingClientRect()[key]),
+            ]),
+          ),
           progress: frame.progress,
           paintedProgress: Number(element.style.getPropertyValue('--peek-progress')),
         });
@@ -427,7 +433,7 @@ test(
     assert(shellFrames.some((frame) => frame.channel === 'state'));
     assert(shellFrames.some((frame) => frame.channel === 'motion' && frame.offset > 0));
     for (const [index, frame] of shellFrames.entries()) {
-      assert.equal(frame.paintedOffset, Math.round(frame.offset), 'chrome uses the same native offset');
+      assert.deepEqual(frame.paintedBounds, frame.bounds, 'chrome uses the same native rectangle');
       assert.equal(frame.paintedProgress, frame.progress);
       if (index) {
         assert.equal(frame.id, shellFrames[index - 1].id);
@@ -441,9 +447,9 @@ test(
     );
     assert.equal(new Set(samples.map((sample) => sample.id)).size, 1);
     assert.equal(
-      new Set(samples.map((sample) => `${sample.bounds.width}:${sample.bounds.height}:${sample.zoom}`)).size,
+      new Set(samples.map((sample) => sample.zoom)).size,
       1,
-      'translation must not scale or resize the document',
+      'the native viewport animates without changing document zoom',
     );
     const resting = samples.at(-1);
     // A late title publication can replace the Peek node after the host has

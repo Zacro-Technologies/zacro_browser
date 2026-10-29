@@ -1,13 +1,13 @@
-// Keep custom colors decorative while text remains readable on every material
-// blend. These foregrounds match styles.css; high-contrast mode strengthens them.
+// Subtle themes use the usual foregrounds. Strong color intensity moves the
+// foreground toward black/white, leaving room for much richer surface colors.
 export const THEME_TEXT_COLORS = Object.freeze({
   light: Object.freeze({ ink: '#302f2d', muted: '#574c59', accentInk: '#ffffff' }),
   dark: Object.freeze({ ink: '#eeedeb', muted: '#bfb7c4', accentInk: '#2b1720' }),
 });
 
 // grain.svg has its own .7 opacity and the window paints it exactly once.
-// Existing 0–100 choices keep their strength; 100–200 adds stronger texture.
-export const THEME_GRAIN_MAX_OPACITY = 0.09;
+// A contrast-expanded noise source makes the full 0–200 range visible.
+export const THEME_GRAIN_MAX_OPACITY = 0.18;
 const GRAIN_SOURCE_OPACITY = 0.7;
 
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
@@ -78,6 +78,7 @@ export function blendSpaceAppearance(from = {}, to = {}, progress = 0) {
     theme: {
       secondaryColor: blendColor(true),
       gradient: number('gradient', 50, 0, 100),
+      vibrancy: number('vibrancy', 0, 0, 100),
       grain: number('grain', 0, 0, 200),
       opacity: number('opacity', 100, 0, 100),
     },
@@ -111,7 +112,7 @@ function boundTone(value, dark) {
 function readableAccent(value, backgrounds, accentInk, dark) {
   const valid = (candidate) =>
     contrast(candidate, accentInk) >= 4.5 &&
-    backgrounds.every((background) => contrast(candidate, background) >= 4.5);
+    backgrounds.every((background) => contrast(candidate, background) >= 4.65);
   value = value.map(Math.round);
   if (valid(value)) return value;
   const endpoint = dark ? [255, 255, 255] : [0, 0, 0];
@@ -133,24 +134,52 @@ function readableAccent(value, backgrounds, accentInk, dark) {
  * The guarantee covers opaque tint surfaces, arbitrary gradient interpolation
  * and the shell's single grain layer, not arbitrary desktop content under glass.
  */
-export function deriveSpaceTheme({ color, secondaryColor, dark = false, grain = 0 } = {}) {
+export function deriveSpaceTheme({ color, secondaryColor, dark = false, grain = 0, vibrancy = 0 } = {}) {
   const primary = parseColor(color);
   const secondary = parseColor(secondaryColor, hex(primary));
   const surface = parseColor(dark ? '#222425' : '#f8f7f4');
   const card = parseColor(dark ? '#363839' : '#ffffff');
-  const chrome = boundTone(mix(parseColor(dark ? '#28262d' : '#e9e5e9'), primary, dark ? 0.18 : 0.19), dark);
-  const tintPrimary = boundTone(mix(surface, primary, 0.3), dark);
-  const tintSecondary = boundTone(mix(surface, secondary, 0.28), dark);
-  const hover = boundTone(mix(parseColor(dark ? '#343637' : '#deddd8'), primary, dark ? 0.06 : 0.05), dark);
-  const accentSoft = boundTone(
-    dark ? primary.map((channel) => channel * 0.35 + 25) : mix([255, 255, 255], primary, 0.15),
-    dark,
-  );
+  const intensity = clamp(Number.isFinite(vibrancy) ? vibrancy : 0, 0, 100) / 100;
+  const defaults = THEME_TEXT_COLORS[dark ? 'dark' : 'light'];
+  const ink = mix(parseColor(defaults.ink), parseColor(dark ? '#ffffff' : '#151219'), intensity);
+  const muted = mix(parseColor(defaults.muted), parseColor(dark ? '#f5f0fa' : '#211c23'), intensity);
   const grainOpacity = (clamp(Number.isFinite(grain) ? grain : 0, 0, 200) / 200) * THEME_GRAIN_MAX_OPACITY;
   const noiseAlpha = grainOpacity * GRAIN_SOURCE_OPACITY;
-  const backgrounds = [chrome, tintPrimary, tintSecondary, hover, accentSoft, surface, card].flatMap(
-    (background) => [mix(background, [0, 0, 0], noiseAlpha), mix(background, [255, 255, 255], noiseAlpha)],
+  const readableTone = (value) => {
+    const text = parseColor(hex(muted));
+    const noise = dark ? [255, 255, 255] : [0, 0, 0];
+    const endpoint = dark ? [0, 0, 0] : [255, 255, 255];
+    // Preserve chroma where contrast allows it, instead of flattening every
+    // channel into the same narrow range. Reserve headroom for the grain.
+    let low = 0,
+      high = 1;
+    for (let step = 0; step < 24; step++) {
+      const middle = (low + high) / 2;
+      if (contrast(text, mix(mix(value, endpoint, middle), noise, noiseAlpha)) >= 5.1 + intensity * 0.9)
+        high = middle;
+      else low = middle;
+    }
+    return mix(value, endpoint, high).map((v) => (dark ? Math.floor(v) : Math.ceil(v)));
+  };
+  const tone = (value) => readableTone(mix(boundTone(value, dark), value, intensity));
+  const chrome = tone(
+    mix(parseColor(dark ? '#28262d' : '#e9e5e9'), primary, (dark ? 0.18 : 0.19) + intensity * 0.78),
   );
+  const tintPrimary = tone(mix(surface, primary, 0.3 + intensity * 0.7));
+  const tintSecondary = tone(mix(surface, secondary, 0.28 + intensity * 0.72));
+  const hover = tone(mix(parseColor(dark ? '#343637' : '#deddd8'), primary, dark ? 0.06 : 0.05));
+  const accentSoft = tone(
+    dark ? primary.map((channel) => channel * 0.35 + 25) : mix([255, 255, 255], primary, 0.15),
+  );
+  const surfaces = [chrome, tintPrimary, tintSecondary, hover, accentSoft, surface, card];
+  const blends = [];
+  for (const first of [chrome, tintPrimary, tintSecondary])
+    for (const second of [chrome, tintPrimary, tintSecondary])
+      for (const amount of [0.25, 0.5, 0.75]) blends.push(mix(first, second, amount));
+  const backgrounds = [...surfaces, ...blends].flatMap((background) => [
+    mix(background, [0, 0, 0], noiseAlpha),
+    mix(background, [255, 255, 255], noiseAlpha),
+  ]);
   const accent = readableAccent(
     dark ? mix(primary, [255, 255, 255], 0.48) : primary,
     backgrounds,
@@ -158,6 +187,8 @@ export function deriveSpaceTheme({ color, secondaryColor, dark = false, grain = 
     dark,
   );
   return {
+    ink: hex(ink),
+    muted: hex(muted),
     chrome: hex(chrome),
     tintPrimary: hex(tintPrimary),
     tintSecondary: hex(tintSecondary),

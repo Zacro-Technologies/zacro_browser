@@ -1,8 +1,8 @@
 // WheelEvent has no portable contact-end phase. End/momentum hints are used
 // when supplied; other devices use a short release pause and conservative tail
-// detection. The longer quiet period prevents one stream crossing two Spaces.
-export const SPACE_GESTURE_IDLE_MS = 240;
-export const SPACE_GESTURE_RELEASE_MS = 110;
+// detection. Distance can span the whole strip; a release snaps once to a page.
+export const SPACE_GESTURE_IDLE_MS = 320;
+export const SPACE_GESTURE_RELEASE_MS = 180;
 
 const finite = (value, fallback = 0) => (Number.isFinite(value) ? value : fallback);
 const clamp = (value, minimum, maximum) => Math.min(maximum, Math.max(minimum, value));
@@ -10,11 +10,12 @@ const clamp = (value, minimum, maximum) => Math.min(maximum, Math.max(minimum, v
 /** Clock-injected recognizer: update tracks; settle decides after release.
  * Input includes wheel fields, optional momentum/contact phase, time, width,
  * index/count, contextKey and blocked. No DOM or navigation happens here.
- * A release result has one commit (-1/0/1), fromOffset, destination offset,
+ * A release result has one commit (signed number of Spaces), fromOffset, destination offset,
  * duration and travel. Subsequent tail events cannot produce another commit.
  */
 export function createSpaceGesture() {
   let lastTime = -Infinity;
+  let startedAt = 0;
   let context,
     origin = -1,
     count = 0,
@@ -59,21 +60,26 @@ export function createSpaceGesture() {
   };
   const feedback = (preventDefault = false) => {
     if (phase !== 'tracking') return neutral({ preventDefault });
+    const position = origin + distance / travel;
+    const bounded = clamp(position, 0, count - 1);
+    const over = (position - bounded) * travel;
+    const offset = over
+      ? -(bounded - origin) * travel - (Math.sign(over) * (24 * Math.abs(over))) / (40 + Math.abs(over))
+      : distance
+        ? -distance
+        : 0;
     const direction = Math.sign(distance);
-    const next = origin + direction;
-    const atEdge = Boolean(direction && (next < 0 || next >= count));
-    const amount = Math.abs(distance);
-    const resisted = atEdge
-      ? (24 * amount) / (40 + amount)
-      : amount <= travel
-        ? amount
-        : travel + (24 * (amount - travel)) / (48 + amount - travel);
+    const atEdge = Boolean(over);
     return neutral({
       preventDefault,
-      offset: direction ? -direction * resisted : 0,
-      progress: Math.min(1, amount / travel),
+      offset,
+      position: bounded,
+      progress: Math.abs(distance) / travel,
       direction,
-      targetIndex: direction && !atEdge ? next : null,
+      targetIndex:
+        direction && !atEdge
+          ? clamp(origin + Math.ceil(Math.abs(distance) / travel) * direction, 0, count - 1)
+          : null,
       atEdge,
       phase: atEdge ? 'edge' : 'tracking',
       idleDelay: SPACE_GESTURE_RELEASE_MS,
@@ -94,16 +100,27 @@ export function createSpaceGesture() {
       Math.sign(speed) === view.direction &&
       Math.abs(speed) >= 0.55 &&
       amount + Math.abs(speed) * 110 >= travel * 0.5;
-    const commit =
-      !cancelled && !reversing && view.targetIndex !== null && (amount >= travel * 0.42 || flick)
-        ? view.direction
-        : 0;
+    // A short, deliberate flick selects one neighbor. Sustained movement is
+    // direct manipulation: its release destination never includes inertia.
+    const quick = lastTime - startedAt <= 220 && !reversing && (flick || amount >= travel * 0.42);
+    const projected = distance / travel;
+    let target = clamp(origin + Math.sign(projected) * Math.floor(Math.abs(projected) + 0.5), 0, count - 1);
+    // A clear reversal returns toward the page under the fingers, rather than
+    // allowing old forward velocity to carry it across another boundary.
+    if (reversing)
+      target = clamp(
+        origin + (lastDx < 0 ? Math.floor(distance / travel) : Math.ceil(distance / travel)),
+        0,
+        count - 1,
+      );
+    if (!flick && Math.abs(distance) >= travel * 0.42 && Math.abs(distance) < travel * 0.5 && !reversing)
+      target = clamp(origin + Math.sign(distance), 0, count - 1);
+    if (quick) target = clamp(origin + Math.sign(distance), 0, count - 1);
+    const commit = cancelled ? 0 : target - origin;
     const destination = commit ? -commit * travel : 0;
     const remaining = Math.abs(destination - view.offset) / travel;
     const duration = Math.round(
-      commit
-        ? clamp(140 + remaining * 100 - Math.abs(speed) * 24, 140, 240)
-        : clamp(100 + remaining * 100, 100, 200),
+      commit ? clamp(140 + remaining * 100, 140, 240) : clamp(100 + remaining * 100, 100, 200),
     );
     phase = 'locked';
     samples = [];
@@ -111,7 +128,7 @@ export function createSpaceGesture() {
       ...view,
       phase: commit ? 'committed' : 'settling',
       commit,
-      targetIndex: commit ? view.targetIndex : null,
+      targetIndex: commit ? origin + commit : null,
       fromOffset: view.offset,
       offset: destination,
       duration,
@@ -154,7 +171,6 @@ export function createSpaceGesture() {
     const elapsed = time - lastTime;
     if (
       (!phaseKnown && elapsed >= SPACE_GESTURE_IDLE_MS) ||
-      elapsed >= 750 ||
       began ||
       (momentumSeen && input.momentum === false)
     )
@@ -181,12 +197,20 @@ export function createSpaceGesture() {
       phase = 'locked';
       return neutral({ preventDefault: Math.abs(dx) > Math.abs(dy) * 1.5 });
     }
-    if (!dx && !dy) return feedback();
+    if (!dx && !dy) {
+      // The native phase IPC can arrive just after the corresponding wheel.
+      // Upgrade the existing contact without resetting its accumulated travel.
+      if (input.phase === 'changed' && ['tracking', 'pending'].includes(phase)) {
+        contactKnown = phaseKnown = true;
+      }
+      return feedback();
+    }
     lastTime = time;
     if (phase === 'blocked' || phase === 'vertical') return neutral();
     if (phase === 'locked')
       return neutral({ preventDefault: dx !== 0 && Math.abs(dx) >= Math.abs(dy) * 1.5 });
     if (phase === 'idle') {
+      startedAt = time;
       origin = nextIndex;
       count = nextCount;
       travel = width;
@@ -197,6 +221,9 @@ export function createSpaceGesture() {
     horizontal += Math.abs(dx);
     vertical += Math.abs(dy);
     distance += dx;
+    // During the flick window the strip can expose only the adjacent page.
+    // Continued contact unlocks the full strip without a release or restart.
+    if (time - startedAt <= 220) distance = clamp(distance, -travel * 1.05, travel * 1.05);
     if (phase === 'pending') {
       if (vertical >= 8 && horizontal < vertical * 1.5) {
         phase = 'vertical';
@@ -224,12 +251,7 @@ export function createSpaceGesture() {
     } else if (magnitude >= 1 && magnitude < previous * 0.95 && elapsed >= 8 && elapsed <= 45) declining++;
     else declining = 0;
     lastDx = dx || lastDx;
-    const target = origin + Math.sign(distance);
-    distance = clamp(
-      distance,
-      -travel * (target < 0 || target >= count ? 0.35 : 1.5),
-      travel * (target < 0 || target >= count ? 0.35 : 1.5),
-    );
+    distance = clamp(distance, -travel * (origin + 0.35), travel * (count - 1 - origin + 0.35));
     const view = feedback(true);
     // Without native phases, only a sustained, sharply diminishing same-axis
     // sequence is treated as a likely tail. Ordinary slow/stable drags stay live.
@@ -248,8 +270,9 @@ export function createSpaceGesture() {
   function settle(time) {
     const elapsed = finite(time, finite(lastTime)) - lastTime;
     if (phase === 'tracking' && phaseKnown) {
-      if (elapsed < 750) return { ...feedback(), idleDelay: Math.max(1, Math.ceil(750 - elapsed)) };
-      return release('missing-phase-end', false, true);
+      // Native contact ownership outranks elapsed time. A slow held gesture
+      // must never snap itself back while the fingers are still down.
+      return { ...feedback(), idleDelay: SPACE_GESTURE_IDLE_MS };
     }
     if (phase === 'tracking' && elapsed >= SPACE_GESTURE_RELEASE_MS) {
       const result = release('quiet');

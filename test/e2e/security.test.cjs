@@ -656,7 +656,7 @@ test(
 );
 
 test(
-  'unsaved Peek previews survive cancelled tab, Space, and preview transitions',
+  'unsaved Peek previews park through tab and Space changes and honor explicit close and replacement decisions',
   { timeout: 60000 },
   async (t) => {
     const browser = await launch(t);
@@ -672,62 +672,91 @@ test(
         return globalThis.__zacroPeekDecision;
       };
     });
-
-    const transitions = [
-      ['tab:create', { url: `${base}/peek-created-tab` }],
-      ['space:activate', { id: otherSpace.id }],
-      ['peek:open', { url: `${base}/peek-replacement` }],
-    ];
-    for (const [index, [action, payload]] of transitions.entries()) {
-      await browser.invoke('tab:activate', { id: parentTab });
-      const previewURL = `${base}/unsaved-preview-${index}`;
-      await browser.invoke('peek:open', { url: previewURL });
-      await expect.poll(() => browser.guest('document.readyState', previewURL)).toBe('complete');
+    const prompts = () => browser.app.evaluate(() => globalThis.__zacroPeekPrompts);
+    const openUnsavedPreview = async (url) => {
+      await browser.invoke('peek:open', { url });
+      await expect.poll(() => browser.guest('document.readyState', url)).toBe('complete');
+      await expect.poll(async () => (await browser.state()).runtime.peek?.phase).toBe('open');
       await browser.app.evaluate(({ webContents }, url) => {
         globalThis.__zacroPeekDecision = 0;
         const contents = webContents.getAllWebContents().find((item) => item.getURL() === url);
         contents.sendInputEvent({ type: 'mouseDown', x: 30, y: 15, button: 'left', clickCount: 1 });
         contents.sendInputEvent({ type: 'mouseUp', x: 30, y: 15, button: 'left', clickCount: 1 });
-      }, previewURL);
+      }, url);
       await browser.guest(
         'window.unsavedPreviewMarker = "draft-preserved"; window.addEventListener("beforeunload", event => { event.preventDefault(); event.returnValue = "Unsaved preview work"; }); undefined',
-        previewURL,
+        url,
       );
+      return (await browser.state()).runtime.peek.id;
+    };
+    const previewURL = `${base}/unsaved-preview-parked`;
+    const previewId = await openUnsavedPreview(previewURL);
+    for (const [action, payload] of [
+      ['tab:create', { url: `${base}/peek-created-tab` }],
+      ['space:activate', { id: otherSpace.id }],
+    ]) {
       const before = await browser.state();
       await browser.invoke(action, payload);
-      const stayed = await browser.state();
-      assert.equal(stayed.runtime.peek?.url, previewURL, `${action}: Stay preserves the preview`);
-      assert.equal(stayed.activeSpaceId, before.activeSpaceId, `${action}: Stay preserves the Space`);
-      assert.equal(stayed.activeTabId, before.activeTabId, `${action}: Stay preserves the tab`);
-      assert.deepEqual(
-        stayed.tabs.map((tab) => tab.id),
-        before.tabs.map((tab) => tab.id),
-      );
+      const parked = await browser.state();
+      assert.equal(parked.runtime.peek, null, `${action}: selecting another page hides the preview`);
+      assert.equal(parked.tabs.find((tab) => tab.id === parentTab).savedPeek.url, previewURL);
+      assert.equal(await prompts(), 0, `${action}: parking never asks to discard work`);
       assert.equal(await browser.guest('window.unsavedPreviewMarker', previewURL), 'draft-preserved');
-      assert.equal(await browser.app.evaluate(() => globalThis.__zacroPeekPrompts), index * 2 + 1);
-
-      await browser.app.evaluate(() => {
-        globalThis.__zacroPeekDecision = 1;
-      });
-      await browser.invoke(action, payload);
-      const left = await browser.state();
-      assert.equal(await browser.app.evaluate(() => globalThis.__zacroPeekPrompts), index * 2 + 2);
-      assert.equal(await browser.guest('window.unsavedPreviewMarker', previewURL), null);
       if (action === 'tab:create') {
-        assert.equal(left.runtime.peek, null);
-        assert.equal(left.tabs.length, before.tabs.length + 1);
-        assert.equal(left.tabs.find((tab) => tab.id === left.activeTabId)?.url, payload.url);
-      } else if (action === 'space:activate') {
-        assert.equal(left.runtime.peek, null);
-        assert.equal(left.activeSpaceId, otherSpace.id);
-      } else {
-        await expect.poll(async () => (await browser.state()).runtime.peek?.url).toBe(payload.url);
-        assert.deepEqual(
-          left.tabs.map((tab) => tab.id),
-          before.tabs.map((tab) => tab.id),
-        );
-      }
+        assert.equal(parked.tabs.length, before.tabs.length + 1);
+        assert.equal(parked.tabs.find((tab) => tab.id === parked.activeTabId)?.url, payload.url);
+      } else assert.equal(parked.activeSpaceId, otherSpace.id);
+      await browser.invoke('tab:activate', { id: parentTab });
+      await expect.poll(async () => (await browser.state()).runtime.peek?.id).toBe(previewId);
+      assert.equal((await browser.state()).activeSpaceId, before.activeSpaceId);
+      assert.equal(await browser.guest('window.unsavedPreviewMarker', previewURL), 'draft-preserved');
+      assert.equal(await prompts(), 0, 'Returning resumes the living document without an unload decision');
     }
+
+    assert.equal(await browser.invoke('peek:close'), false);
+    assert.equal(await prompts(), 1);
+    assert.equal((await browser.state()).runtime.peek?.id, previewId);
+    assert.equal((await browser.state()).tabs.find((tab) => tab.id === parentTab).savedPeek.url, previewURL);
+    assert.equal(await browser.guest('window.unsavedPreviewMarker', previewURL), 'draft-preserved');
+    await browser.app.evaluate(() => {
+      globalThis.__zacroPeekDecision = 1;
+    });
+    assert.equal(await browser.invoke('peek:close'), true);
+    assert.equal(await prompts(), 2);
+    assert.equal((await browser.state()).runtime.peek, null);
+    assert.equal((await browser.state()).tabs.find((tab) => tab.id === parentTab).savedPeek, undefined);
+    assert.equal(await browser.guest('window.unsavedPreviewMarker', previewURL), null);
+
+    const replacedURL = `${base}/unsaved-preview-replaced`;
+    const replacedId = await openUnsavedPreview(replacedURL);
+    const replacementURL = `${base}/peek-replacement`;
+    const before = await browser.state();
+    await browser.invoke('peek:open', { url: replacementURL });
+    const stayed = await browser.state();
+    assert.equal(await prompts(), 3);
+    assert.equal(stayed.runtime.peek?.id, replacedId, 'Stay preserves the original preview');
+    assert.equal(stayed.activeSpaceId, before.activeSpaceId);
+    assert.equal(stayed.activeTabId, parentTab);
+    assert.deepEqual(
+      stayed.tabs.map((tab) => tab.id),
+      before.tabs.map((tab) => tab.id),
+    );
+    assert.equal(await browser.guest('window.unsavedPreviewMarker', replacedURL), 'draft-preserved');
+    await browser.app.evaluate(() => {
+      globalThis.__zacroPeekDecision = 1;
+    });
+    await browser.invoke('peek:open', { url: replacementURL });
+    await expect.poll(async () => (await browser.state()).runtime.peek?.url).toBe(replacementURL);
+    assert.equal(await prompts(), 4);
+    assert.equal(await browser.guest('window.unsavedPreviewMarker', replacedURL), null);
+    assert.deepEqual(
+      (await browser.state()).tabs.map((tab) => tab.id),
+      before.tabs.map((tab) => tab.id),
+    );
+    assert.equal(
+      (await browser.state()).tabs.find((tab) => tab.id === parentTab).savedPeek.url,
+      replacementURL,
+    );
   },
 );
 

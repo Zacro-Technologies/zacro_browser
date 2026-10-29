@@ -66,7 +66,38 @@
     if (!text || text.length > 8000) throw new Error('Enter a search of 1–8,000 characters.');
     return engine.url.trim().replace('%s', encodeURIComponent(text.toWellFormed()));
   }
-  const api = Object.freeze({ DEFAULT_SITE_SEARCHES, normalizeSiteSearches, siteSearchError, siteSearchURL });
+  function currentWebsiteSearch(pageURL, engines, searchEngine = 'duckduckgo') {
+    let page;
+    try {
+      page = new URL(pageURL);
+      if (!['https:', 'http:'].includes(page.protocol) || !page.hostname) return null;
+    } catch {
+      return null;
+    }
+    const saved = normalizeSiteSearches(engines).find((engine) => new URL(engine.url).origin === page.origin);
+    if (saved) return { ...saved, currentWebsite: true };
+    const endpoint =
+      {
+        duckduckgo: 'https://duckduckgo.com/?q=',
+        google: 'https://www.google.com/search?q=',
+        bing: 'https://www.bing.com/search?q=',
+        brave: 'https://search.brave.com/search?q=',
+      }[searchEngine] || 'https://duckduckgo.com/?q=';
+    return {
+      id: 'current-website',
+      name: page.hostname.slice(0, 40),
+      keyword: 'site',
+      currentWebsite: true,
+      url: `${endpoint}${encodeURIComponent(`site:${page.hostname} `)}%s`,
+    };
+  }
+  const api = Object.freeze({
+    DEFAULT_SITE_SEARCHES,
+    normalizeSiteSearches,
+    siteSearchError,
+    siteSearchURL,
+    currentWebsiteSearch,
+  });
   if (typeof module === 'object' && module.exports) module.exports = api;
   else root.ZacroSiteSearch = api;
 })(globalThis);

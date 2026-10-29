@@ -69,7 +69,8 @@ test(
     await launch();
     await expect(shell.locator('.onboarding-dialog')).toBeVisible();
     await expect(shell.locator('#command-input')).toHaveCount(0);
-    await expect(shell.locator('[data-key="sidebar-toggle"], .brand-button')).toHaveCount(0);
+    await expect(shell.locator('[data-key="sidebar-toggle"]')).toBeVisible();
+    await expect(shell.locator('.brand-button')).toHaveCount(0);
     await shell.locator('[data-action="ui:onboarding-step"][data-id="1"]').click();
     const sidebarBinding = shell.locator('[data-shortcut-record="sidebar-toggle"]');
     await sidebarBinding.click();

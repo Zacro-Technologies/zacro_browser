@@ -179,10 +179,10 @@ test(
     assert.equal(geometry.sidebarWidth, 224);
     assert(
       // macOS reserves four additional pixels for its native title controls.
-      geometry.rows[0].top <= (process.platform === 'darwin' ? 194 : 190),
+      geometry.rows[0].top <= (process.platform === 'darwin' ? 208 : 204),
       'Navigation, favorites and a folder must leave the working tabs near the top',
     );
-    assert(geometry.rows.every((row) => row.height === 32 && row.bottom < geometry.footerTop));
+    assert(geometry.rows.every((row) => row.height === 36 && row.bottom < geometry.footerTop));
     for (const favorite of geometry.favorites) {
       assert.match(favorite.name, /^Favorite [1-4] — Sleeping$/);
       assert(favorite.title.includes(base), 'Icon-only favorites retain a full destination tooltip');
@@ -231,10 +231,11 @@ test(
       }, url);
     await toggleFromPage();
     await expect(shell.locator('#sidebar')).toBeHidden();
-    await expect(shell.locator('[data-key="sidebar-toggle"]')).toHaveCount(0);
+    await expect(shell.locator('[data-key="sidebar-toggle"]')).toBeHidden();
     await expect.poll(async () => (await surface())?.x).toBe(8);
     const expanded = await surface();
-    assert.equal(expanded.y, 40);
+    assert.equal(expanded.y, before.y);
+    await expect(shell.locator('#toolbar')).toBeHidden();
     assert.equal(expanded.width, before.width + 224);
     assert.equal(expanded.id, before.id);
     await expect
@@ -301,7 +302,7 @@ test(
     await expect(home.locator(`.home-link[data-url="${url}"]`)).toHaveCount(0);
     await expect(home.locator('.home-link')).toHaveCount(1);
     await shell.locator('#home-query').fill('Keep this search draft');
-    await expect(shell.locator('[data-key="sidebar-toggle"]')).toHaveCount(0);
+    await expect(shell.locator('[data-key="sidebar-toggle"]')).toBeVisible();
     // CDP keyboard events do not reach Electron's native shortcut interceptor
     // from this shell field. Exercise the real window input path instead.
     const toggleFromShell = () =>
@@ -991,8 +992,8 @@ test(
       globalThis.__backdropCaptures = [];
       contents.capturePage = async (...args) => {
         const start = Date.now();
-        // Submit the real native copy on the next event-loop turn, after the
-        // modal's synchronous hide. This reproduces deferred GPU submission.
+        // Submit the real native copy on the next event-loop turn, reproducing
+        // deferred GPU submission during the command palette handoff.
         await new Promise(setImmediate);
         const view = BrowserWindow.getAllWindows()[0].contentView.children.find(
           (view) => view.webContents === contents,
@@ -1026,7 +1027,11 @@ test(
     }
     const capture = await browser.app.evaluate(() => globalThis.__backdropCaptures[0]);
     assert.equal(capture.attached, true, 'The native surface stays attached until the compositor copies it');
-    assert.equal(capture.visible, false, 'The modal must hide the native page immediately');
+    assert.equal(
+      capture.visible,
+      true,
+      'The command palette retains the page until replacement pixels are ready',
+    );
     assert.equal(capture.empty, false);
     await expect(browser.shell.locator('#page-backdrop img')).toHaveCount(1);
     await browser.shell.locator('#page-backdrop img').evaluate((image) => image.decode());

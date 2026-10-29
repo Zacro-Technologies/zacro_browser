@@ -20,30 +20,34 @@ const icons = {
   music: 'M9 18V5l12-3v13M9 8l12-3M9 18a3 3 0 1 1-6 0 3 3 0 0 1 6 0M21 15a3 3 0 1 1-6 0 3 3 0 0 1 6 0',
   plus: 'M12 5v14M5 12h14',
   layers: 'm12 3 10 6-10 6L2 9zM2 13l10 6 10-6M2 17l10 6 10-6',
-  sidebar: 'M3 4h18v16H3zM9 4v16',
-  library: 'M4 4v16M9 4v16M14 4v16M18 4l3 16',
+  sidebar: 'M5 4h14a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2zM9 4v16',
+  library: 'M4 4h16v4H4zM6 8v11a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V8M9 12h6',
   volume: 'M4 9h4l5-5v16l-5-5H4zM16 8a6 6 0 0 1 0 8M19 5a10 10 0 0 1 0 14',
   muted: 'M4 9h4l5-5v16l-5-5H4zM17 9l5 6M22 9l-5 6',
-  close: 'm6 6 12 12M18 6 6 18',
-  back: 'm14 5-7 7 7 7',
-  forward: 'm10 5 7 7-7 7',
+  close: 'm7 7 10 10M17 7 7 17',
+  back: 'M19 12H5m6-6-6 6 6 6',
+  forward: 'M5 12h14m-6-6 6 6-6 6',
   down: 'm7 10 5 5 5-5',
   up: 'm7 14 5-5 5 5',
-  reload: 'M20 4v6h-6M19.1 9a7.5 7.5 0 1 0 .4 5',
+  reload: 'M19 3v5h-5M19 8a7.5 7.5 0 1 0 .5 7',
   search: 'M21 21l-5-5M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0',
   star: 'm12 3 2.8 5.7 6.3.9-4.6 4.5 1.1 6.3L12 17.4l-5.6 3 1.1-6.3L3 9.6l6.2-.9z',
   split: 'M3 4h18v16H3zM12 4v16',
+  expand: 'M14 5h5v5M19 5l-6 6M10 19H5v-5M5 19l6-6',
   sparkle: 'm12 3 2.4 6.6L21 12l-6.6 2.4L12 21l-2.4-6.6L3 12l6.6-2.4zM20 2v4M18 4h4',
   globe: 'M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0M3 12h18M12 3c5 5 5 13 0 18-5-5-5-13 0-18',
   lock: 'M6 10h12v11H6zM8 10V6a4 4 0 0 1 8 0v4',
   unlock: 'M6 10h12v11H6zM8 10V6a4 4 0 0 1 7.4-2',
   more: 'M4 12h.01M12 12h.01M20 12h.01',
+  pageControls:
+    'M5 3h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2zM7 8h4m3 0h3M7 16h3m3 0h4M11 6v4M13 14v4',
   history: 'M3 11a9 9 0 1 1 2.5 7M3 4v7h7M12 7v5l3 2',
   bookmark: 'M6 3h12v18l-6-4-6 4z',
   download: 'M12 3v12m-5-5 5 5 5-5M4 16v5h16v-5',
   settings: 'm9 3-1 3-3 1-2 4 2 3 1 4 3 1 3 2 3-2 3-1 1-4 2-3-2-4-3-1-1-3zM16 12a4 4 0 1 1-8 0 4 4 0 0 1 8 0',
   archive: 'M3 4h18v4H3zM5 8v12h14V8M9 12h6',
-  folder: 'M3 5h7l2 3h9v12H3z',
+  folder:
+    'M3 7V5.5A1.5 1.5 0 0 1 4.5 4H9l3 3h7.5A1.5 1.5 0 0 1 21 8.5v11a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 19.5zM3 9h18',
   folderPlus: 'M3 5h7l2 3h9v12H3zM12 11v6M9 14h6',
   pin: 'm16 3 5 5-5 1-3 5 1 3-2 2-7-7 2-2 3 1 5-3zM5 19l-2 2',
   external: 'M14 3h7v7M21 3 10 14M10 3H3v18h18v-7',
@@ -287,6 +291,9 @@ const spaceGesture = createSpaceGesture();
 let spaceGestureTimer;
 let spaceGesturePending = false;
 let spaceGestureFeedback = null;
+let nativeSpaceContact = null;
+// Keep native inertia latched across the state change caused by its own swipe.
+let nativeSpaceMomentum = false;
 let spaceTransition = null;
 let spacePreview = null;
 let spaceAppearance = null;
@@ -389,7 +396,7 @@ function settleSpaceAppearance(record, animation, destination) {
 const visibleSpacePage = () => $('#sidebar-content > .space-page');
 function clearSpacePreview() {
   const preview = $('#space-gesture-preview');
-  if (spacePreview?.page) elementMotions.get(spacePreview.page)?.cancel();
+  if (spacePreview?.pages) for (const { page } of spacePreview.pages) elementMotions.get(page)?.cancel();
   spacePreview = null;
   if (preview) {
     preview.hidden = true;
@@ -401,7 +408,11 @@ function inertSpacePage(page) {
   page.classList.add('space-preview-page');
   for (const node of [page, ...page.querySelectorAll('*')]) {
     for (const attribute of [...node.attributes])
-      if (attribute.name === 'id' || attribute.name.startsWith('data-')) node.removeAttribute(attribute.name);
+      if (
+        attribute.name === 'id' ||
+        (attribute.name.startsWith('data-') && attribute.name !== 'data-columns')
+      )
+        node.removeAttribute(attribute.name);
     node.removeAttribute('draggable');
     node.removeAttribute('aria-current');
     if (node.matches('button, input, select, textarea, a, [tabindex]')) node.tabIndex = -1;
@@ -441,17 +452,22 @@ function resetSpaceFeedback({ animate = false, preserveTransition = false, durat
   }
   const preview = spacePreview;
   if (animate && offset && preview && !reducedMotion.matches) {
-    const destination = feedback.direction * feedback.travel;
-    const animation = motion(
-      preview.page,
-      [{ transform: `translateX(${destination + offset}px)` }, { transform: `translateX(${destination}px)` }],
-      duration,
-    );
-    animation?.finished
-      .then(() => {
-        if (spacePreview === preview) clearSpacePreview();
-      })
-      .catch(() => {});
+    for (const { page, index } of preview.pages) {
+      const destination = (index - feedback.originIndex) * feedback.travel;
+      const animation = motion(
+        page,
+        [
+          { transform: `translateX(${destination + offset}px)` },
+          { transform: `translateX(${destination}px)` },
+        ],
+        duration,
+      );
+      animation?.finished
+        .then(() => {
+          if (spacePreview === preview) clearSpacePreview();
+        })
+        .catch(() => {});
+    }
   } else clearSpacePreview();
   if (!preserveTransition) {
     clearSpaceTransition();
@@ -460,6 +476,7 @@ function resetSpaceFeedback({ animate = false, preserveTransition = false, durat
   }
 }
 function interruptSpaceScroll({ preserveTransition = false } = {}) {
+  if (!preserveTransition) nativeSpaceContact = null;
   clearTimeout(spaceGestureTimer);
   spaceGesture.interrupt(performance.now());
   resetSpaceFeedback({ preserveTransition });
@@ -477,40 +494,56 @@ function paintSpaceFeedback(result) {
     list.style.transform = `translateX(${result.offset}px)`;
   }
   const spaces = state.spaces.filter((space) => space.profileId === activeProfile()?.id);
-  const next = spaces[result.targetIndex];
-  if (next) {
-    if (
-      !spaceAppearance?.tracking ||
-      spaceAppearance.fromId !== state.activeSpaceId ||
-      spaceAppearance.toId !== next.id
-    )
-      beginSpaceAppearance(activeSpace(), next, { tracking: true });
+  const position = Math.max(
+    0,
+    Math.min(spaces.length - 1, result.position ?? result.originIndex - result.offset / result.travel),
+  );
+  const left = Math.floor(position),
+    right = Math.min(spaces.length - 1, left + 1);
+  const from = spaces[left],
+    next = spaces[right];
+  if (from && next) {
+    if (!spaceAppearance?.tracking || spaceAppearance.from.id !== from.id || spaceAppearance.toId !== next.id)
+      beginSpaceAppearance(from, next, { fromId: state.activeSpaceId, tracking: true });
     holdSpaceAppearanceMaterial(spaceAppearance);
-    paintSpaceAppearance(spaceAppearance, Math.min(1, Math.abs(result.offset) / result.travel));
-  } else clearSpaceAppearance();
+    paintSpaceAppearance(spaceAppearance, position - left);
+  }
   const preview = $('#space-gesture-preview');
   if (!preview || !list) return;
-  if (!next) return clearSpacePreview();
-  if (spacePreview?.spaceId !== next.id || spacePreview.state !== state) {
+  if (!result.offset || (result.atEdge && position === result.originIndex)) {
+    list.style.removeProperty('visibility');
     clearSpacePreview();
-    const page = document.createElement('div');
-    page.innerHTML = renderSpacePage(next);
-    inertSpacePage(page);
-    preview.append(page);
-    spacePreview = { spaceId: next.id, state, page };
+    return;
   }
-  const bounds = list.getBoundingClientRect();
-  const sidebar = $('#sidebar').getBoundingClientRect();
+  // All pages share the same fixed-width strip. Crossing a page boundary
+  // changes neither its geometry nor the gesture's accumulated distance.
+  if (!spacePreview || spacePreview.state !== state) {
+    clearSpacePreview();
+    const pages = spaces.map((space, index) => {
+      const page = document.createElement('div');
+      page.innerHTML = renderSpacePage(space);
+      inertSpacePage(page);
+      Object.assign(page.style, { position: 'absolute', top: '0', left: '0' });
+      preview.append(page);
+      return { page, space, index };
+    });
+    spacePreview = { state, pages };
+  }
   Object.assign(preview.style, {
-    left: `${bounds.left - sidebar.left - result.offset}px`,
-    top: `${bounds.top - sidebar.top}px`,
+    left: `${list.getBoundingClientRect().left - $('#sidebar').getBoundingClientRect().left - result.offset}px`,
+    top: `${list.getBoundingClientRect().top - $('#sidebar').getBoundingClientRect().top}px`,
     width: `${list.clientWidth}px`,
     height: `${list.clientHeight}px`,
   });
+  const neighbor = spacePreview.pages.find(({ index }) => index === result.targetIndex);
+  if (neighbor) preview.prepend(neighbor.page);
   preview.hidden = false;
-  spacePreview.page.style.transform = `translateX(${result.direction * result.travel + result.offset}px)`;
-  $('.space-preview-scroll', spacePreview.page).scrollTop = sidebarScroll.get(next.id) || 0;
-  $('.favorites', spacePreview.page).scrollTop = favoriteScroll.get(next.id) || 0;
+  list.style.visibility = 'hidden';
+  for (const { page, space, index } of spacePreview.pages) {
+    page.style.transform = `translateX(${(index - result.originIndex) * result.travel + result.offset}px)`;
+    $('.space-preview-scroll', page).scrollTop = sidebarScroll.get(space.id) || 0;
+    $('.favorites', page).scrollTop = favoriteScroll.get(space.id) || 0;
+  }
 }
 function prepareSpaceTransition(nextId, result, gesture = false) {
   clearSpaceTransition();
@@ -540,7 +573,17 @@ function prepareSpaceTransition(nextId, result, gesture = false) {
     pointerEvents: 'none',
     zIndex: '40',
   });
-  const snapshot = inertSpacePage(list.cloneNode(true));
+  const position = result.originIndex - result.fromOffset / result.travel;
+  const outgoingIndex = result.targetIndex > position ? Math.floor(position) : Math.ceil(position);
+  const outgoingPage = gesture && spacePreview?.pages?.find(({ index }) => index === outgoingIndex);
+  const source = outgoingPage?.page || list;
+  record.outgoingOffset = outgoingPage
+    ? (outgoingIndex - result.originIndex) * result.travel + result.fromOffset
+    : result.fromOffset;
+  record.outgoingDestination = outgoingPage
+    ? (outgoingIndex - result.targetIndex) * result.travel
+    : -(result.commit || result.direction) * result.travel;
+  const snapshot = inertSpacePage(source.cloneNode(true));
   Object.assign(snapshot.style, {
     width: '100%',
     height: '100%',
@@ -548,12 +591,12 @@ function prepareSpaceTransition(nextId, result, gesture = false) {
     opacity: '1',
     visibility: 'visible',
     padding: getComputedStyle(list).padding,
-    transform: `translateX(${result.fromOffset}px)`,
+    transform: `translateX(${record.outgoingOffset}px)`,
   });
   wrapper.append(snapshot);
   document.body.append(wrapper);
-  $('.space-preview-scroll', snapshot).scrollTop = $('.tabs-scroll', list).scrollTop;
-  $('.favorites', snapshot).scrollTop = $('.favorites', list).scrollTop;
+  $('.space-preview-scroll', snapshot).scrollTop = $('.space-preview-scroll, .tabs-scroll', source).scrollTop;
+  $('.favorites', snapshot).scrollTop = $('.favorites', source).scrollTop;
   record.wrapper = wrapper;
   record.snapshot = snapshot;
   list.style.visibility = 'hidden';
@@ -564,7 +607,7 @@ function finishSpaceTransition(record, animation) {
 }
 function animateSpaceTransition(
   record,
-  offset = record.direction * record.travel + record.fromOffset,
+  offset = (record.commit || record.direction) * record.travel + record.fromOffset,
   duration = record.duration,
 ) {
   const list = visibleSpacePage();
@@ -580,8 +623,8 @@ function animateSpaceTransition(
     record.outgoing = motion(
       record.snapshot,
       [
-        { transform: `translateX(${record.fromOffset}px)` },
-        { transform: `translateX(${-record.direction * record.travel}px)` },
+        { transform: `translateX(${record.outgoingOffset}px)` },
+        { transform: `translateX(${record.outgoingDestination}px)` },
       ],
       record.duration,
     );
@@ -631,6 +674,8 @@ function handleSpaceGesture(result) {
     interruptSpaceScroll();
     return;
   }
+  const shown = presentedSpaceAppearance();
+  beginSpaceAppearance(shown, next, { fromId: state.activeSpaceId });
   prepareSpaceTransition(next.id, result, true);
   spaceGesturePending = true;
   $('#live-region').textContent = `Switching to ${next.name}`;
@@ -648,6 +693,49 @@ function handleSpaceGesture(result) {
 function settleSpaceGesture() {
   handleSpaceGesture(spaceGesture.settle(performance.now()));
 }
+function nativeSpaceGesturePhase(phase) {
+  if (phase === 'began') {
+    nativeSpaceMomentum = false;
+    // A native begin can race the first DOM wheel over IPC. Preserve that
+    // already-tracking sample, then let the native end own release timing.
+    nativeSpaceContact = {
+      claimed: Boolean(spaceGestureFeedback),
+      beginning: !spaceGestureFeedback,
+      momentum: false,
+    };
+    if (!spaceGestureFeedback) return;
+    phase = 'changed';
+  } else if (phase === 'momentum') {
+    nativeSpaceMomentum = true;
+    if (!nativeSpaceContact) nativeSpaceContact = { claimed: false, momentum: true };
+    nativeSpaceContact.momentum = true;
+  } else if (phase === 'momentum-ended') {
+    nativeSpaceMomentum = false;
+    nativeSpaceContact = null;
+    return;
+  } else if (phase !== 'ended') return;
+  const contact = nativeSpaceContact;
+  if (phase === 'ended' && contact?.momentum) return;
+  // Native events have no hit-test coordinates. Only a DOM wheel accepted by
+  // the sidebar may claim them; vertical scrolling and editors never do.
+  if (contact?.claimed && spaceGestureFeedback) {
+    const spaces = state.spaces.filter((space) => space.profileId === activeProfile()?.id);
+    handleSpaceGesture(
+      spaceGesture.update({
+        deltaX: 0,
+        deltaY: 0,
+        phase: phase === 'momentum' ? undefined : phase,
+        momentum: phase === 'momentum' ? true : false,
+        time: performance.now(),
+        width: $('#sidebar').clientWidth,
+        index: spaces.findIndex((space) => space.id === state.activeSpaceId),
+        count: spaces.length,
+        contextKey: activeProfile()?.id,
+      }),
+    );
+  }
+  if (phase === 'ended') nativeSpaceContact = null;
+}
 function onSpaceScroll(event) {
   const sidebar = $('#sidebar');
   const spaces = state?.spaces.filter((space) => space.profileId === activeProfile()?.id) || [];
@@ -661,10 +749,20 @@ function onSpaceScroll(event) {
     altKey: event.altKey,
     buttons: event.buttons,
     defaultPrevented: event.defaultPrevented,
-    momentum: typeof event.momentum === 'boolean' ? event.momentum : undefined,
+    momentum: nativeSpaceMomentum
+      ? true
+      : nativeSpaceContact
+        ? false
+        : typeof event.momentum === 'boolean'
+          ? event.momentum
+          : undefined,
     phase: ['began', 'begin', 'changed', 'ended', 'end', 'cancelled'].includes(event.phase)
       ? event.phase
-      : undefined,
+      : nativeSpaceContact && !nativeSpaceContact.momentum
+        ? nativeSpaceContact.beginning
+          ? 'began'
+          : 'changed'
+        : undefined,
     time: performance.now(),
     width: sidebar.clientWidth,
     index: spaces.findIndex((space) => space.id === state?.activeSpaceId),
@@ -681,6 +779,10 @@ function onSpaceScroll(event) {
         event.target.closest('#toolbar, .space-dots, input, textarea, select, [contenteditable="true"]'),
       ),
   });
+  if (nativeSpaceContact) {
+    nativeSpaceContact.beginning = false;
+    if (['tracking', 'edge'].includes(result.phase)) nativeSpaceContact.claimed = true;
+  }
   if (result.preventDefault) event.preventDefault();
   if (['blocked', 'vertical'].includes(result.phase) && spaceGestureFeedback && !spaceGesturePending)
     resetSpaceFeedback();
@@ -706,10 +808,16 @@ function favicon(url, tabId) {
   if (url === 'zacro://newtab') return `<span class="favicon" aria-hidden="true">${icon('sparkle')}</span>`;
   const profileId = activeProfile()?.id;
   const tabs = (state?.tabs || []).filter(
-    (tab) => tab.profileId === profileId && tab.url === url && (!tabId || tab.id === tabId),
+    (tab) =>
+      tab.profileId === profileId &&
+      (tab.url === url || tab.pinnedUrl === url) &&
+      (!tabId || tab.id === tabId),
   );
   const data = tabs
-    .map((tab) => state.runtime?.pages?.[tab.id]?.favicon)
+    .map((tab) => {
+      const page = state.runtime?.pages?.[tab.id];
+      return (tab.pinnedUrl === url ? page?.savedFavicon : null) || (tab.url === url ? page?.favicon : null);
+    })
     .find(
       (value) =>
         typeof value === 'string' && /^data:image\/(?:png|x-icon);base64,[A-Za-z0-9+/=]+$/.test(value),
@@ -774,11 +882,13 @@ function clearPageBackdrop() {
     backdrop.hidden = true;
   }
 }
-function showPageBackdrop(frames) {
+async function showPageBackdrop(frames, generation) {
   clearPageBackdrop();
   if (!ui.dialog || activeProfile()?.private || !Array.isArray(frames)) return;
   const root = $('#page-backdrop');
-  for (const frame of frames.slice(0, 2)) {
+  const token = ui.dialogToken;
+  const decoded = [];
+  for (const frame of frames.slice(0, 4)) {
     const bounds = frame?.bounds;
     if (
       !bounds ||
@@ -797,8 +907,13 @@ function showPageBackdrop(frames) {
     picture.alt = '';
     picture.draggable = false;
     picture.src = frame.dataUrl;
+    decoded.push(picture.decode().catch(() => {}));
     const clip = document.createElement('div');
     clip.className = 'page-backdrop-frame';
+    if (frame.transparent === true) {
+      clip.style.background = 'transparent';
+      clip.style.borderRadius = '0';
+    }
     Object.assign(clip.style, {
       left: `${bounds.x}px`,
       top: `${bounds.y}px`,
@@ -810,6 +925,12 @@ function showPageBackdrop(frames) {
     root.append(clip);
   }
   root.hidden = !root.children.length;
+  await Promise.all(decoded);
+  // Keep the native page until its replacement pixels are decoded and painted.
+  // A generation token prevents an old dialog from hiding a newly opened page.
+  await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  if (ui.dialog && token === ui.dialogToken && Number.isSafeInteger(generation))
+    safely(invoke('page:backdrop-ready', { generation }));
 }
 const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
 const activeMotions = new Set();
@@ -917,8 +1038,11 @@ function setTheme() {
     secondaryColor: material.secondaryColor,
     dark,
     grain: material.grain,
+    vibrancy: material.vibrancy,
   });
   for (const [token, key] of [
+    ['--theme-ink', 'ink'],
+    ['--theme-muted', 'muted'],
     ['--chrome', 'chrome'],
     ['--space-tint-primary', 'tintPrimary'],
     ['--space-tint-secondary', 'tintSecondary'],
@@ -1189,9 +1313,24 @@ function tabLabel(tab) {
     tab.customTitle || (tab.pinned && tab.pinnedTitle) || tab.title || hostname(tab.pinnedUrl || tab.url)
   );
 }
+function peekSourceBadge(tab) {
+  const live = state.runtime?.peek;
+  const preview = live?.sourceTabId === tab.id ? live : state.runtime?.savedPeeks?.[tab.id] || tab.savedPeek;
+  if (!preview?.url) return '';
+  const label = `Previewing ${hostname(preview.url)}`;
+  const image =
+    preview.favicon && /^data:image\/(?:png|x-icon|vnd\.microsoft\.icon);base64,/.test(preview.favicon)
+      ? `<img src="${esc(preview.favicon)}" alt="">`
+      : icon('globe');
+  return `<span class="peek-tab-badge" role="img" aria-label="${esc(label)}" title="${esc(label)}">${image}</span>`;
+}
 function renderSpacePage(space) {
   const profile = state.profiles.find((item) => item.id === space?.profileId);
-  const favorites = state.tabs.filter((tab) => tab.favorite && tab.profileId === space?.profileId);
+  const groups = (state.splitGroups || []).filter((group) => group.spaceId === space?.id);
+  const groupedIds = new Set(groups.flatMap((group) => group.tabIds));
+  const favorites = state.tabs.filter(
+    (tab) => tab.favorite && tab.profileId === space?.profileId && !groupedIds.has(tab.id),
+  );
   const tabs = state.tabs.filter((tab) => tab.spaceId === space?.id && !tab.favorite);
   const selectedTabId = space?.id === state.activeSpaceId ? state.activeTabId : space?.lastActiveTabId;
   const pins = tabs.filter((tab) => tab.pinned && !tab.folderId);
@@ -1200,13 +1339,20 @@ function renderSpacePage(space) {
   );
   const folders = state.folders.filter((folder) => folder.spaceId === space?.id);
   const tabRow = (tab) => {
+    if (groupedIds.has(tab.id)) return '';
     const page = state.runtime?.pages?.[tab.id];
     const label = tabLabel(tab);
     const status = tab.closed ? 'Closed' : page?.loaded ? 'Loaded' : 'Sleeping';
     const away = tab.pinned && !tab.closed && tab.pinnedUrl && tab.url !== tab.pinnedUrl;
-    const glyph = page?.loading ? '<span class="spinner"></span>' : favicon(tab.pinnedUrl || tab.url, tab.id);
+    const glyph = `<span class="tab-site-icon">${page?.loading ? '<span class="spinner"></span>' : favicon(tab.pinnedUrl || tab.url, tab.id)}${peekSourceBadge(tab)}</span>`;
     return `<div class="tab-row ${tab.pinned ? 'pinned-row' : ''} ${away ? 'pin-navigated' : ''} ${tab.id === selectedTabId && !tab.closed ? 'active' : ''}" draggable="true" data-tab-id="${esc(tab.id)}" data-drop-tab="${esc(tab.id)}">${tab.pinned ? `<button type="button" class="tab-pin-reset" data-action="tab:reset-pin" data-id="${esc(tab.id)}" tabindex="-1" aria-label="Reset ${esc(label)} to saved page" title="Reset to ${esc(tab.pinnedUrl || tab.url)}">${glyph}<span class="pin-reset-symbol">${icon('back')}</span></button>` : ''}<button type="button" class="tab-main" data-action="tab:activate" data-id="${esc(tab.id)}" data-key="tab-${esc(tab.id)}" ${tab.id === selectedTabId && !tab.closed ? 'aria-current="page"' : ''} title="${esc(label)} — ${esc(tab.url)}${tab.pinned ? ' · ' + status + (away ? ' · Away from saved page' : '') : ''}">${tab.pinned ? '' : glyph}${away ? '<span class="pin-away" aria-hidden="true">/</span>' : ''}<span class="title">${esc(label || 'New tab')}</span>${state.runtime?.splitTabId === tab.id ? icon('split') : ''}</button>${page?.audible || page?.muted ? button('tab:mute', page.muted ? 'Unmute tab' : 'Mute tab', page.muted ? 'muted' : 'volume', `data-id="${esc(tab.id)}"`, 'tab-audio') : ''}${button('tab:close', `Close ${label || 'tab'}${tab.pinned ? ' · keep pin' : ''}`, 'close', `data-id="${esc(tab.id)}" data-key="close-${esc(tab.id)}"`, 'tab-close')}</div>`;
   };
+  const splitGroup = groups
+    .map((group) => {
+      const paired = group.tabIds.map((id) => state.tabs.find((tab) => tab.id === id)).filter(Boolean);
+      return `<div class="split-tab-group" role="group" aria-label="Split view" data-split-id="${esc(group.id)}">${paired.map((tab) => `<div class="split-tab-part ${tab.id === selectedTabId ? 'active' : ''}" data-tab-id="${esc(tab.id)}"><button type="button" class="tab-main" data-action="tab:activate" data-id="${esc(tab.id)}" data-key="tab-${esc(tab.id)}" title="${esc(tabLabel(tab))}" ${tab.id === selectedTabId ? 'aria-current="page"' : ''}><span class="tab-site-icon">${favicon(tab.pinnedUrl || tab.url, tab.id)}${peekSourceBadge(tab)}</span><span class="title">${esc(tabLabel(tab))}</span></button>${button('tab:close', `Close ${tabLabel(tab)}`, 'close', `data-id="${esc(tab.id)}"`, 'tab-close')}</div>`).join('')}</div>`;
+    })
+    .join('');
   // Balance every row, rather than leaving unused favorite slots. Twelve grid
   // tracks divide evenly into one, two, three or four tiles.
   const favoriteRows = Math.max(1, Math.ceil(favorites.length / 4));
@@ -1218,7 +1364,7 @@ function renderSpacePage(space) {
       const page = state.runtime?.pages?.[tab.id];
       const status = tab.closed ? 'Closed' : page?.loaded ? 'Loaded' : 'Sleeping';
       const label = tabLabel(tab);
-      return `<button type="button" data-columns="${columns}" class="favorite ${tab.id === selectedTabId && !tab.closed ? 'active' : ''} ${status.toLowerCase()}" draggable="true" data-tab-id="${esc(tab.id)}" data-drop-tab="${esc(tab.id)}" data-action="tab:activate" data-id="${esc(tab.id)}" data-key="pin-${esc(tab.id)}" ${tab.id === selectedTabId && !tab.closed ? 'aria-current="page"' : ''} aria-label="${esc(label)} — ${status}" title="${esc(label)} — ${status}\n${esc(tab.pinnedUrl || tab.url)}">${favicon(tab.pinnedUrl || tab.url, tab.id)}</button>`;
+      return `<button type="button" data-columns="${columns}" class="favorite ${tab.id === selectedTabId && !tab.closed ? 'active' : ''} ${status.toLowerCase()}" draggable="true" data-tab-id="${esc(tab.id)}" data-drop-tab="${esc(tab.id)}" data-action="tab:activate" data-id="${esc(tab.id)}" data-key="pin-${esc(tab.id)}" ${tab.id === selectedTabId && !tab.closed ? 'aria-current="page"' : ''} aria-label="${esc(label)} — ${status}" title="${esc(label)} — ${status}\n${esc(tab.pinnedUrl || tab.url)}">${favicon(tab.pinnedUrl || tab.url, tab.id)}${peekSourceBadge(tab)}</button>`;
     })
     .join('');
   return `<div class="favorites ${favorites.length ? '' : 'favorites-empty'}" aria-label="Favorites" data-drop-favorites>${favoriteTiles || '<span class="pin-drop-hint">Drop to favorite</span>'}</div><div class="tabs-scroll">
@@ -1238,11 +1384,27 @@ function renderSpacePage(space) {
           }</div>`,
       )
       .join('')}${pins.map(tabRow).join('')}<span class="pin-drop-hint">Drop to pin in this Space</span></div>
-    <div class="today-divider" aria-hidden="true"></div><button type="button" class="new-tab today-new-tab" data-action="ui:new-tab" data-key="today-new-tab">${icon('plus')}<span>New tab</span><kbd>${shortcutFor('command-palette', 'Mod+T')}</kbd></button><div class="loose-tabs" data-drop-folder="" aria-label="Today tabs">${loose.map(tabRow).join('')}</div></div>`;
+    <div class="today-divider" aria-hidden="true"></div><button type="button" class="new-tab today-new-tab" data-action="ui:new-tab" data-key="today-new-tab">${icon('plus')}<span>New tab</span><kbd>${shortcutFor('command-palette', 'Mod+T')}</kbd></button><div class="loose-tabs" data-drop-folder="" aria-label="Today tabs">${splitGroup}${loose.map(tabRow).join('')}</div></div>`;
 }
 function renderSidebar() {
   const space = activeSpace();
   const profile = activeProfile();
+  if (ui.dragTab) {
+    const source = state.tabs.find((tab) => tab.id === ui.dragTab);
+    if (
+      source &&
+      source.profileId === profile?.id &&
+      ui.dragProfileId === profile?.id &&
+      ui.dragSpaceId === space?.id &&
+      (source.favorite || source.spaceId === space?.id)
+    ) {
+      // Native drag sessions own their DOM source and drop targets until release.
+      // Page loading/history/title updates still enter state, but must not replace
+      // these nodes midway through a drag. Leave the signature stale for dragend.
+      return;
+    }
+    endTabDrag({ refresh: false });
+  }
   const tabs = state.tabs.filter(
     (tab) => tab.spaceId === space?.id || (tab.favorite && tab.profileId === profile?.id),
   );
@@ -1255,6 +1417,7 @@ function renderSidebar() {
     folders,
     spaces,
     state.activeTabId,
+    state.splitGroups,
     ui.panel,
     [...ui.closedFolders],
     tabs.map((tab) => [
@@ -1263,11 +1426,18 @@ function renderSidebar() {
       state.runtime?.pages?.[tab.id]?.audible,
       state.runtime?.pages?.[tab.id]?.muted,
       state.runtime?.pages?.[tab.id]?.favicon,
+      state.runtime?.pages?.[tab.id]?.savedFavicon,
+      state.runtime?.savedPeeks?.[tab.id],
       state.runtime?.pages?.[tab.id]?.loaded,
       state.runtime?.pages?.[tab.id]?.sleeping,
       state.runtime?.pages?.[tab.id]?.closed,
     ]),
     state.runtime?.splitTabId,
+    state.runtime?.peek && [
+      state.runtime.peek.sourceTabId,
+      state.runtime.peek.url,
+      state.runtime.peek.favicon,
+    ],
   ]);
   if (signature === ui.sidebarSignature) return;
   ui.sidebarSignature = signature;
@@ -1364,16 +1534,17 @@ function renderToolbar() {
     ? `<div class="provider-note" role="status">Extension scripts may still run on this page. <button type="button" class="text-button" data-action="extension:reload-pages" data-document-id="${warning.documentId}" data-document-epoch="${warning.documentEpoch}">Reload page</button></div>`
     : '';
   const toolbar = $('#toolbar');
-  const parent = sidebarHidden ? $('.main') : $('#sidebar');
+  const parent = $('#sidebar');
   if (toolbar.parentElement !== parent) parent.prepend(toolbar);
+  toolbar.hidden = sidebarHidden;
   const controls =
     !isMac && !state.runtime?.fullScreen
       ? `<div class="window-controls">${button('window:minimize', 'Minimize', 'minimize')}${button('window:maximize', 'Maximize or restore', state.runtime?.maximized ? 'restore' : 'maximize')}${button('window:close', 'Close window', 'close', '', 'close-window')}</div>`
       : '';
-  $('#captionbar').innerHTML = sidebarHidden ? '' : controls;
-  $('#captionbar').hidden = sidebarHidden || !controls;
+  $('#captionbar').innerHTML = controls;
+  $('#captionbar').hidden = !controls;
   $('#toolbar').innerHTML =
-    `<div class="navigation"><span class="navigation-spacer"></span>${button('back', shortcutLabel('Back', 'history-back', isMac ? 'Mod+[' : 'Alt+Left'), 'back', `data-key="back" ${page.canGoBack ? '' : 'disabled'}`)}${button('forward', shortcutLabel('Forward', 'history-forward', isMac ? 'Mod+]' : 'Alt+Right'), 'forward', `data-key="forward" ${page.canGoForward ? '' : 'disabled'}`)}${button(page.loading ? 'stop' : 'reload', page.loading ? 'Stop loading' : shortcutLabel('Reload', 'reload', 'Mod+R'), page.loading ? 'close' : 'reload', `data-key="reload" ${blank ? 'disabled' : ''}`)}</div><div class="address-row"><button type="button" class="address-button" data-action="ui:address" data-key="address" title="${esc(tab?.url || 'Search or enter a URL')}" aria-label="Address bar: ${esc(tab?.url || 'New tab')}">${icon(blank ? 'search' : secure ? 'lock' : 'globe')}<span class="address-text">${esc(blank ? 'Search or enter URL' : sidebarHidden ? displayURL(tab.url) : hostname(tab.url))}</span></button>${button('ui:page-menu', 'Page actions', 'more', 'data-key="page-menu" aria-haspopup="dialog"')}</div>${sidebarHidden ? controls : ''}${reloadWarning}`;
+    `<div class="navigation">${button('ui:sidebar-toggle', shortcutLabel(sidebarHidden ? 'Show sidebar' : 'Hide sidebar', 'sidebar-toggle', 'Mod+S'), 'sidebar', `data-key="sidebar-toggle" aria-controls="sidebar" aria-expanded="${!sidebarHidden}"`)}<span class="navigation-spacer"></span>${button('back', shortcutLabel('Back', 'history-back', isMac ? 'Mod+[' : 'Alt+Left'), 'back', `data-key="back" ${page.canGoBack ? '' : 'disabled'}`)}${button('forward', shortcutLabel('Forward', 'history-forward', isMac ? 'Mod+]' : 'Alt+Right'), 'forward', `data-key="forward" ${page.canGoForward ? '' : 'disabled'}`)}${button(page.loading ? 'stop' : 'reload', page.loading ? 'Stop loading' : shortcutLabel('Reload', 'reload', 'Mod+R'), page.loading ? 'close' : 'reload', `data-key="reload" ${blank ? 'disabled' : ''}`)}</div><div class="address-row"><button type="button" class="address-button" data-action="ui:address" data-key="address" title="${esc(tab?.url || 'Search or enter a URL')}" aria-label="Address bar: ${esc(tab?.url || 'New tab')}">${icon(blank ? 'search' : secure ? 'lock' : 'globe')}<span class="address-text">${esc(blank ? 'Search or enter URL' : sidebarHidden ? displayURL(tab.url) : hostname(tab.url))}</span></button>${button('ui:page-menu', 'Page actions', 'pageControls', 'data-key="page-menu" aria-haspopup="dialog"')}</div>${reloadWarning}`;
 }
 function renderWorkspace() {
   const tab = activeTab();
@@ -1417,10 +1588,13 @@ function renderWorkspace() {
   } else bar?.remove();
   const peek = state.runtime?.peek;
   $('#peek').hidden = !peek;
-  const peekSignature = JSON.stringify(peek && [peek.id, peek.url, peek.title, peek.error]);
+  $('#peek').toggleAttribute('data-native-overlay', Boolean(peek?.nativeOverlay));
+  $('#peek').inert = Boolean(peek?.nativeOverlay);
+  $('#peek').setAttribute('aria-hidden', String(Boolean(peek?.nativeOverlay)));
+  const peekSignature = JSON.stringify(peek && [peek.id, peek.url, peek.title, peek.error, peek.favicon]);
   if (peek && peekSignature !== ui.peekSignature) {
     $('#peek').innerHTML =
-      `<div class="peek-bar"><span class="peek-label">Peek</span><span class="peek-url">${esc(peek.title || peek.url)}</span>${button('peek:promote', 'Open preview as a tab', 'external')}${button('peek:close', 'Close preview (Escape)', 'close', 'data-key="peek-close"')}</div><div class="peek-body">${peek.error ? `<div class="error-card"><div class="error-symbol">${icon('globe')}</div><h2>This preview couldn’t be loaded.</h2><p>${esc(peek.error.description || peek.error.message || 'Check the address and your connection.')}</p>${primary('reload', 'Try again', 'reload')}</div>` : ''}</div>`;
+      `<div class="peek-surface"><div class="peek-bar"><div class="peek-controls">${button('peek:close', 'Close preview (Escape)', 'close', 'data-key="peek-close"')}${button('peek:promote', 'Expand preview into a tab', 'expand')}</div></div><div class="peek-body">${peek.error ? `<div class="error-card"><div class="error-symbol">${icon('globe')}</div><h2>This preview couldn’t be loaded.</h2><p>${esc(peek.error.description || peek.error.message || 'Check the address and your connection.')}</p>${primary('reload', 'Try again', 'reload')}</div>` : ''}</div></div>`;
   }
   if (peek) paintPeekMotion(peek);
   ui.peekSignature = peekSignature;
@@ -1428,11 +1602,21 @@ function renderWorkspace() {
 function paintPeekMotion(frame) {
   const peek = state.runtime?.peek;
   if (!peek || !frame || frame.id !== peek.id) return;
-  const offset = reducedMotion.matches ? 0 : Math.round(Math.max(0, Math.min(16, Number(frame.offset) || 0)));
   const progress = reducedMotion.matches ? 1 : Math.max(0, Math.min(1, frame.progress ?? 1));
-  $('#peek').style.setProperty('--peek-offset', `${offset}px`);
-  $('#peek').style.setProperty('--peek-progress', String(progress));
-  $('#peek').dataset.phase = frame.phase || 'open';
+  const region = $('#peek');
+  const surface = $('.peek-surface', region);
+  const bounds = frame.bounds || peek.bounds;
+  if (surface && bounds) {
+    const parent = region.getBoundingClientRect();
+    Object.assign(surface.style, {
+      left: `${bounds.x - parent.x}px`,
+      top: `${bounds.y - parent.y}px`,
+      width: `${bounds.width}px`,
+      height: `${bounds.height}px`,
+    });
+  }
+  region.style.setProperty('--peek-progress', String(frame.phase === 'expanding' ? 1 - progress : progress));
+  region.dataset.phase = frame.phase || 'open';
 }
 function renderHome() {
   const draft = $('#home-query')?.value || '';
@@ -1549,7 +1733,7 @@ function syncLayout() {
   const gutter = state.settings.pageGutter ?? 8;
   const hidden = effectiveSidebarHidden();
   if (ui.panel) ui.panelExpandedWidth = chromeTargets().panel;
-  const contentTop = hidden || !$('#findbar').hidden ? 40 : isMac || state.runtime?.fullScreen ? gutter : 36;
+  const contentTop = !$('#findbar').hidden ? 40 : isMac || state.runtime?.fullScreen ? gutter : 36;
   $('#app').dataset.panelOpen = String(Boolean(ui.panel));
   $('#app').dataset.sidebarHidden = String(hidden);
   $('#app').dataset.sidebarAnimating = String(ui.sidebarAnimationWidth != null);
@@ -1580,6 +1764,13 @@ function syncLayout() {
   }
   const layout = {
     sidebarWidth: width,
+    sidebarHidden: hidden,
+    peekAppearance: (() => {
+      const style = getComputedStyle(document.documentElement);
+      return Object.fromEntries(
+        ['chrome', 'card', 'ink'].map((key) => [key, style.getPropertyValue(`--${key}`).trim()]),
+      );
+    })(),
     panelWidth: panel,
     extensionPanel: ui.panel === 'extension' && !(ui.libraryMenuOpen && ui.libraryMenuRail === 'panel'),
     extensionPanelBounds:
@@ -1591,6 +1782,7 @@ function syncLayout() {
         : null,
     contentTop,
     overlay: Boolean(ui.dialog),
+    command: ui.dialog === 'command',
     peek: Boolean(state.runtime?.peek),
     reducedMotion: reducedMotion.matches,
   };
@@ -2652,7 +2844,15 @@ function showSpaces() {
 function showSpaceForm(id) {
   const space = id ? state.spaces.find((s) => s.id === id) : null;
   ui.selectedColor = space?.color || colors[0][1];
-  const theme = { secondaryColor: '#b695b8', gradient: 50, grain: 0, opacity: 100, blur: 0, ...space?.theme };
+  const theme = {
+    secondaryColor: '#b695b8',
+    gradient: 50,
+    grain: 0,
+    opacity: 100,
+    vibrancy: 0,
+    blur: 0,
+    ...space?.theme,
+  };
   const range = (key, label, min, max, suffix = '%') =>
     `<label class="theme-range"><span>${label}<output data-theme-output="${key}">${theme[key]}${suffix}</output></span><input type="range" name="theme-${key}" min="${min}" max="${max}" value="${theme[key]}" aria-label="${label}"></label>`;
   formDialog(
@@ -2671,11 +2871,11 @@ function showSpaceForm(id) {
             activeProfile()?.id,
           )}</select></label>`
         : '') +
-      `<input type="hidden" name="space-icon" value="${esc(space?.icon || 'circle')}"><input id="space-icon-search" type="search" placeholder="Find an icon" aria-label="Find a Space icon" autocomplete="off"><div class="space-icon-options" role="group" aria-label="Space icon">${spaceIcons.map((name) => `<button type="button" data-action="ui:space-icon" data-icon="${name}" aria-label="${name} icon" title="${name}" aria-pressed="${(space?.icon || 'circle') === name}">${icon(name)}</button>`).join('')}</div><div class="theme-preview-tile" aria-hidden="true"><div class="theme-preview-sidebar">${icon(space?.icon || 'circle')}<i></i><i></i><i></i></div><div class="theme-preview-page"></div><span>Preview</span></div><div class="field"><span>Space color</span><div class="color-options" role="group" aria-label="Space color">${colors.map(([name, color]) => `<button type="button" class="color-option swatch-${name} ${ui.selectedColor === color ? 'selected' : ''}" data-action="ui:color" data-color="${color}" aria-label="${name}" aria-pressed="${ui.selectedColor === color}"></button>`).join('')}</div></div><div class="theme-colors"><label>Primary<input type="color" name="theme-color" value="${ui.selectedColor}" aria-label="Primary color"></label><label>Secondary<input type="color" name="theme-secondaryColor" value="${theme.secondaryColor}" aria-label="Secondary color"></label></div><details class="theme-material"><summary>Gradient & texture</summary>${range('gradient', 'Color blend', 0, 100)}${range('grain', 'Grain', 0, 200)}</details><details class="theme-material"><summary>Glass & transparency</summary>${range('opacity', 'Window tint opacity', 0, 100)}<input type="hidden" name="theme-blur" value="${theme.blur}"></details>`,
+      `<input type="hidden" name="space-icon" value="${esc(space?.icon || 'circle')}"><input id="space-icon-search" type="search" placeholder="Find an icon" aria-label="Find a Space icon" autocomplete="off"><div class="space-icon-options" role="group" aria-label="Space icon">${spaceIcons.map((name) => `<button type="button" data-action="ui:space-icon" data-icon="${name}" aria-label="${name} icon" title="${name}" aria-pressed="${(space?.icon || 'circle') === name}">${icon(name)}</button>`).join('')}</div><div class="theme-preview-tile" aria-hidden="true"><div class="theme-preview-sidebar">${icon(space?.icon || 'circle')}<i></i><i></i><i></i></div><div class="theme-preview-page"></div><span>Preview</span></div><div class="field"><span>Space color</span><div class="color-options" role="group" aria-label="Space color">${colors.map(([name, color]) => `<button type="button" class="color-option swatch-${name} ${ui.selectedColor === color ? 'selected' : ''}" data-action="ui:color" data-color="${color}" aria-label="${name}" aria-pressed="${ui.selectedColor === color}"></button>`).join('')}</div></div><div class="theme-colors"><label>Primary<input type="color" name="theme-color" value="${ui.selectedColor}" aria-label="Primary color"></label><label>Secondary<input type="color" name="theme-secondaryColor" value="${theme.secondaryColor}" aria-label="Secondary color"></label></div><details class="theme-material"><summary>Gradient & texture</summary>${range('vibrancy', 'Color intensity', 0, 100)}${range('gradient', 'Color blend', 0, 100)}${range('grain', 'Grain', 0, 200)}</details><details class="theme-material"><summary>Glass & transparency</summary>${range('opacity', 'Window tint opacity', 0, 100)}<input type="hidden" name="theme-blur" value="${theme.blur}"></details>`,
     space ? 'Save changes' : 'Create Space',
     async (data, context) => {
       if (!context.isCurrent()) return;
-      await invoke(space ? 'space:update' : 'space:create', {
+      const saved = await invoke(space ? 'space:update' : 'space:create', {
         ...(space ? { id: space.id } : {}),
         name: data.get('name'),
         color: ui.selectedColor,
@@ -2684,6 +2884,8 @@ function showSpaceForm(id) {
         ...(!space ? { profileId: data.get('profileId') } : {}),
       });
       if (!context.isCurrent()) return;
+      const current = state.spaces.find((item) => item.id === saved?.id);
+      if (current) Object.assign(current, saved);
       if (!context.close()) return;
     },
   );
@@ -2696,7 +2898,7 @@ function readSpaceTheme() {
   return {
     secondaryColor: form.elements['theme-secondaryColor'].value,
     ...Object.fromEntries(
-      ['gradient', 'grain', 'opacity', 'blur'].map((key) => [
+      ['gradient', 'grain', 'opacity', 'vibrancy', 'blur'].map((key) => [
         key,
         Number(form.elements[`theme-${key}`].value),
       ]),
@@ -2766,7 +2968,7 @@ function showPageMenu() {
     `<button type="button" class="context-action" data-action="${name}" ${attrs}>${icon(symbol)}<span>${label}</span>${key ? `<kbd>${key}</kbd>` : ''}</button>`;
   openPopover(
     'page-actions',
-    `<div class="dialog-body">${action('ui:bookmark', saved ? 'Remove bookmark' : 'Bookmark this page', 'star', `data-key="bookmark" aria-pressed="${saved}" ${blank ? 'disabled' : ''}`, shortcutFor('bookmark', 'Mod+D'))}${action('ui:split', state.runtime?.splitTabId ? 'Close split view' : 'Split view', 'split', 'data-key="split"')}${action('ui:find', 'Find on page', 'search', blank ? 'disabled' : '', shortcutFor('find', 'Mod+F'))}${action('ui:print', 'Print page', 'print', blank ? 'disabled' : '', shortcutFor('print', 'Mod+P'))}<hr class="context-separator"><div class="menu-zoom" aria-label="Page zoom">${button('ui:zoom-out', 'Zoom out', 'minimize')}${action('ui:zoom-reset', `${Math.round((state.runtime?.page?.zoom || 1) * 100)}%`, 'monitor')}${button('ui:zoom-in', 'Zoom in', 'plus')}</div><hr class="context-separator">${action('external:open', 'Open in default browser', 'external', `data-key="external-page" data-url="${esc(blank ? '' : tab.url)}" ${blank ? 'disabled' : ''}`)}${action('ui:menu', 'Browser menu', 'more', '', shortcutFor('browser-menu', 'F10'))}</div>`,
+    `<div class="dialog-body">${action('ui:bookmark', saved ? 'Remove bookmark' : 'Bookmark this page', 'star', `data-key="bookmark" aria-pressed="${saved}" ${blank ? 'disabled' : ''}`, shortcutFor('bookmark', 'Mod+D'))}${action('ui:split', state.runtime?.splitTabId ? 'Unsplit tabs' : 'Split view', 'split', 'data-key="split"')}${action('ui:find', 'Find on page', 'search', blank ? 'disabled' : '', shortcutFor('find', 'Mod+F'))}${action('ui:print', 'Print page', 'print', blank ? 'disabled' : '', shortcutFor('print', 'Mod+P'))}<hr class="context-separator"><div class="menu-zoom" aria-label="Page zoom">${button('ui:zoom-out', 'Zoom out', 'minimize')}${action('ui:zoom-reset', `${Math.round((state.runtime?.page?.zoom || 1) * 100)}%`, 'monitor')}${button('ui:zoom-in', 'Zoom in', 'plus')}</div><hr class="context-separator">${action('external:open', 'Open in default browser', 'external', `data-key="external-page" data-url="${esc(blank ? '' : tab.url)}" ${blank ? 'disabled' : ''}`)}${action('ui:menu', 'Browser menu', 'more', '', shortcutFor('browser-menu', 'F10'))}</div>`,
     { title: 'Page actions', anchor: $('[data-key="page-menu"]') },
   );
 }
@@ -2781,9 +2983,7 @@ function renderPageMenu() {
   bookmark.disabled = blank;
   bookmark.setAttribute('aria-pressed', String(saved));
   $('span', bookmark).textContent = saved ? 'Remove bookmark' : 'Bookmark this page';
-  $('[data-key="split"] span', root).textContent = state.runtime?.splitTabId
-    ? 'Close split view'
-    : 'Split view';
+  $('[data-key="split"] span', root).textContent = state.runtime?.splitTabId ? 'Unsplit tabs' : 'Split view';
   for (const action of ['ui:find', 'ui:print']) $(`[data-action="${action}"]`, root).disabled = blank;
   const external = $('[data-key="external-page"]', root);
   external.disabled = blank;
@@ -3026,7 +3226,7 @@ function toggleSidebar(fromPage = false) {
   const start = currentChromeWidths();
   ui.sidebarHidden = !ui.sidebarHidden;
   animateChrome(start);
-  if (fromPage) safely(invoke('page:focus'));
+  if (fromPage || ui.sidebarHidden) safely(invoke('page:focus'));
   else $('[data-key="address"]')?.focus({ preventScroll: true });
 }
 function showSpaceMenu(id) {
@@ -3063,7 +3263,7 @@ function showTabMenu(id) {
     `<button type="button" class="context-action" data-action="${name}" data-id="${esc(id)}">${icon(symbol)}${esc(label)}</button>`;
   openPopover(
     'menu',
-    `<div class="dialog-body"><div class="section-label truncate">${esc(tabLabel(tab))}</div>${action('ui:tab-pin', tab.pinned ? 'Unpin tab' : 'Pin tab', 'pin')}${action('ui:tab-favorite', tab.favorite ? 'Move to pinned tabs' : 'Add to Favorites', 'star')}${tab.pinned ? action('ui:tab-reset-pin', 'Reset to saved page', 'undo') + (!tab.closed && tab.url !== tab.pinnedUrl ? action('ui:tab-replace-pin', 'Replace pin with current page', 'edit') : '') : ''}<hr class="context-separator">${action('ui:tab-duplicate', 'Duplicate tab', 'copy')}${action('ui:tab-split', 'Open in split view', 'split')}${action('ui:tab-move', 'Move to Space or folder', 'folder')}${action('ui:tab-rename', 'Rename tab', 'edit')}${tab.pinned && state.runtime?.pages?.[id]?.loaded && id !== state.activeTabId ? action('ui:tab-sleep', 'Put to sleep', 'moon') : ''}<hr class="context-separator">${action('ui:tab-close', tab.pinned ? 'Close page · keep pin' : 'Close tab', 'close')}</div>`,
+    `<div class="dialog-body"><div class="section-label truncate">${esc(tabLabel(tab))}</div>${action('ui:tab-pin', tab.pinned ? 'Unpin tab' : 'Pin tab', 'pin')}${action('ui:tab-favorite', tab.favorite ? 'Move to pinned tabs' : 'Add to Favorites', 'star')}${tab.pinned ? action('ui:tab-reset-pin', 'Reset to saved page', 'undo') + (!tab.closed && tab.url !== tab.pinnedUrl ? action('ui:tab-replace-pin', 'Replace pin with current page', 'edit') : '') : ''}<hr class="context-separator">${action('ui:tab-duplicate', 'Duplicate tab', 'copy')}${(state.splitGroups || []).some((group) => group.tabIds.includes(id)) ? action('ui:tab-unsplit', 'Unsplit tabs', 'split') : action('ui:tab-split', 'Open in split view', 'split')}${action('ui:tab-move', 'Move to Space or folder', 'folder')}${action('ui:tab-rename', 'Rename tab', 'edit')}${tab.pinned && state.runtime?.pages?.[id]?.loaded && id !== state.activeTabId ? action('ui:tab-sleep', 'Put to sleep', 'moon') : ''}<hr class="context-separator">${action('ui:tab-close', tab.pinned ? 'Close page · keep pin' : 'Close tab', 'close')}</div>`,
     { title: 'Tab actions', anchor: $(`[data-tab-id="${CSS.escape(id)}"]`) },
   );
 }
@@ -3105,11 +3305,20 @@ function showMoveTab(id) {
   );
 }
 function showSplitPicker() {
-  if (state.runtime?.splitTabId) {
+  if (
+    (state.splitGroups || []).some(
+      (group) => group.spaceId === state.activeSpaceId && group.tabIds.includes(state.activeTabId),
+    )
+  ) {
     safely(invoke('split:toggle'));
     return;
   }
-  const tabs = currentTabs().filter((t) => t.id !== state.activeTabId && t.url !== 'zacro://newtab');
+  const tabs = currentTabs().filter(
+    (t) =>
+      t.id !== state.activeTabId &&
+      t.url !== 'zacro://newtab' &&
+      !(state.splitGroups || []).some((group) => group.tabIds.includes(t.id)),
+  );
   if (!tabs.length) {
     toast('Open a second page in this Space to use split view.');
     return;
@@ -3831,7 +4040,9 @@ function fuzzyScore(query, value) {
 function commandOptions(query) {
   const raw = query.trim();
   if (ui.commandSiteSearch) {
-    const engine = siteSearches().find((item) => item.id === ui.commandSiteSearch.id);
+    const engine = ui.commandSiteSearch.currentWebsite
+      ? ui.commandSiteSearch
+      : siteSearches().find((item) => item.id === ui.commandSiteSearch.id);
     if (!engine || !raw || raw.length > 8000) return [];
     const url = globalThis.ZacroSiteSearch.siteSearchURL(engine, raw);
     return [
@@ -3989,6 +4200,27 @@ function commandOptions(query) {
       continue;
     add({ ...option, priority: q ? option.priority : 20 });
   }
+  if (filter === 'all') {
+    const website = globalThis.ZacroSiteSearch.currentWebsiteSearch(
+      state.runtime?.peek?.url || activeTab()?.url,
+      siteSearches(),
+      state.settings.searchEngine,
+    );
+    if (website)
+      options.push({
+        id: 'search-current-website',
+        kind: 'action',
+        label: `Search ${website.name}`,
+        description: q || '',
+        symbol: 'search',
+        type: 'This website',
+        score: q ? 40 : 90,
+        run: () =>
+          q
+            ? commitNavigation(globalThis.ZacroSiteSearch.siteSearchURL(website, q))
+            : enterSiteSearch(website),
+      });
+  }
   if (q && filter === 'all') {
     const site = siteSearches().find((item) => item.keyword === q.toLowerCase());
     if (site)
@@ -4056,7 +4288,7 @@ function openCommand(mode = 'newtab', query, { automatic = false } = {}) {
   ui.commandIndex = 0;
   openDialog(
     'command',
-    `<div class="command-input-wrap">${icon('search')}<input id="command-input" type="text" role="combobox" aria-autocomplete="list" aria-expanded="true" aria-controls="command-results" aria-label="Search tabs, history, Spaces and actions, or enter a URL" placeholder="Search or enter a URL" value="${esc(ui.commandQuery)}" autocomplete="off" spellcheck="false"><button type="button" class="command-mode" data-action="ui:command-mode" aria-label="Change navigation destination"></button></div><div id="command-results" class="command-results" role="listbox" aria-label="Suggestions"></div><footer class="command-footer"><span><kbd>↑↓</kbd> Select <kbd>↵</kbd> Open</span><span class="command-context-hint"></span></footer>`,
+    `<div class="command-input-wrap">${icon('search')}<input id="command-input" type="text" role="combobox" aria-autocomplete="list" aria-expanded="true" aria-controls="command-results" aria-label="Search tabs, history, Spaces and actions, or enter a URL" placeholder="Search or enter a URL" value="${esc(ui.commandQuery)}" autocomplete="off" spellcheck="false"><button type="button" class="command-mode" data-action="ui:command-mode" aria-label="Change navigation destination"></button></div><div id="command-results" class="command-results" role="listbox" aria-label="Suggestions"></div>`,
     { title: 'Command bar', focus: '#command-input' },
   );
   renderCommands();
@@ -4141,19 +4373,6 @@ function renderCommands({ preserve = false } = {}) {
       ? 'Back to previous command step'
       : `Destination: ${ui.commandMode === 'address' ? 'current tab' : 'new tab'}. Change destination`,
   );
-  const selectedItem = ui.commandItems[ui.commandIndex];
-  $('.command-context-hint').innerHTML = nested
-    ? '<kbd>Esc</kbd> Back'
-    : ui.commandFilter === 'all' &&
-        siteSearches().some((engine) => engine.keyword === ui.commandQuery.trim().toLowerCase())
-      ? '<kbd>Tab</kbd> Search site'
-      : ['tab', 'bookmark', 'history'].includes(selectedItem?.kind)
-        ? '<kbd>Tab</kbd> Actions <kbd>Alt ↵</kbd> New tab'
-        : ['', '/', '>'].includes(ui.commandQuery.trim())
-          ? '<kbd>Tab</kbd> Actions <kbd>/</kbd> Commands'
-          : selectedItem?.kind === 'navigation'
-            ? '<kbd>Alt ↵</kbd> New tab <kbd>/</kbd> Commands'
-            : '<kbd>/</kbd> Commands';
 }
 function selectCommand(index, { separate = false } = {}) {
   const item = ui.commandItems[index];
@@ -4343,6 +4562,9 @@ function handleEvent(event) {
   )
     return;
   switch (event.type) {
+    case 'space:gesture-phase':
+      nativeSpaceGesturePhase(event.phase);
+      break;
     case 'newtab:show':
       closeDialog({ restore: false });
       safely(invoke('state:get').then(applyState));
@@ -4373,7 +4595,7 @@ function handleEvent(event) {
       toggleSidebar(event.fromPage === true);
       break;
     case 'page:backdrop':
-      showPageBackdrop(event.frames);
+      safely(showPageBackdrop(event.frames, event.generation));
       break;
     case 'peek:motion':
       paintPeekMotion(event);
@@ -4383,6 +4605,7 @@ function handleEvent(event) {
       break;
     case 'focus:chrome':
       if (ui.dialog) ($('#command-input') || $('#dialog-root button:not(:disabled)'))?.focus();
+      else if (effectiveSidebarHidden()) openCommand('address');
       else $('[data-key="address"]')?.focus();
       break;
     case 'auth:request':
@@ -4547,6 +4770,10 @@ function handleEvent(event) {
   }
 }
 document.addEventListener('click', (event) => {
+  if (event.target === $('#peek') && state?.runtime?.peek) {
+    safely(invoke('peek:close'));
+    return;
+  }
   const target = event.target.closest('[data-action]');
   if (!target || target.disabled) return;
   if (target.dataset.action === 'ui:backdrop' && event.target !== target) return;
@@ -4894,6 +5121,9 @@ async function handleAction(action, data = {}, target) {
       closeDialog();
       return invoke('tab:create', { url: tab.url, spaceId: tab.spaceId });
     }
+    case 'ui:tab-unsplit':
+      closeDialog();
+      return invoke('split:unsplit', { id });
     case 'ui:tab-split':
       closeDialog();
       return invoke('split:toggle', { id });
@@ -5635,6 +5865,120 @@ function clearDragFeedback() {
     element.classList.remove('drag-over', 'drop-before', 'drop-after'),
   );
 }
+function clearFavoriteReflow() {
+  const preview = ui.favoriteReflow;
+  if (!preview) return;
+  for (const item of preview.items) {
+    elementMotions.get(item.node)?.cancel();
+    item.node.style.order = item.order;
+    item.node.dataset.columns = item.columns;
+    item.node.classList.remove('favorite-drag-origin');
+  }
+  preview.placeholder.remove();
+  delete preview.container.dataset.reflow;
+  ui.favoriteReflow = null;
+}
+function favoriteInsertion(event, container, source) {
+  const tiles = $$('.favorite[data-tab-id]', container).filter((node) => node.dataset.tabId !== source.id);
+  const count = tiles.length + 1;
+  const rows = Math.ceil(count / 4);
+  const small = Math.floor(count / rows),
+    larger = count % rows;
+  const bounds = container.getBoundingClientRect();
+  const style = getComputedStyle(container);
+  const gap = parseFloat(style.columnGap) || 5;
+  const rowGap = parseFloat(style.rowGap) || 5;
+  const top = parseFloat(style.paddingTop) || 0;
+  const height = 46;
+  const row = Math.max(
+    0,
+    Math.min(
+      rows - 1,
+      Math.floor((event.clientY - bounds.top + container.scrollTop - top) / (height + rowGap)),
+    ),
+  );
+  const columns = small + (row < larger ? 1 : 0);
+  const before = row * small + Math.min(row, larger);
+  const column = Math.max(
+    0,
+    Math.min(
+      columns - 1,
+      Math.floor((event.clientX - bounds.left) / ((container.clientWidth + gap) / columns)),
+    ),
+  );
+  const slot = before + column;
+  const remaining = state.tabs.filter((tab) => tab.id !== source.id);
+  const nextId = tiles[slot]?.dataset.tabId;
+  const previousId = tiles.at(-1)?.dataset.tabId;
+  const index = nextId
+    ? remaining.findIndex((tab) => tab.id === nextId)
+    : previousId
+      ? remaining.findIndex((tab) => tab.id === previousId) + 1
+      : remaining.length;
+  return {
+    drop: container,
+    favoriteSlot: slot,
+    payload: {
+      id: source.id,
+      spaceId: state.activeSpaceId,
+      favorite: true,
+      pinned: true,
+      folderId: null,
+      index,
+    },
+  };
+}
+function paintFavoriteReflow(destination) {
+  const container = destination.drop;
+  let preview = ui.favoriteReflow;
+  if (!preview || preview.container !== container) {
+    clearFavoriteReflow();
+    const items = $$('.favorite[data-tab-id]', container).map((node) => ({
+      node,
+      order: node.style.order,
+      columns: node.dataset.columns,
+    }));
+    const placeholder = document.createElement('div');
+    placeholder.className = 'favorite favorite-insertion-slot';
+    placeholder.setAttribute('aria-hidden', 'true');
+    const tab = state.tabs.find((tab) => tab.id === ui.dragTab);
+    placeholder.innerHTML = tab ? favicon(tab.pinnedUrl || tab.url, tab.id) : icon('plus');
+    container.append(placeholder);
+    container.dataset.reflow = 'true';
+    preview = ui.favoriteReflow = { container, items, placeholder, slot: -1 };
+  }
+  if (preview.slot === destination.favoriteSlot) return;
+  const before = new Map(preview.items.map(({ node }) => [node, node.getBoundingClientRect()]));
+  const ordered = preview.items
+    .filter(({ node }) => node.dataset.tabId !== ui.dragTab)
+    .map(({ node }) => node);
+  ordered.splice(destination.favoriteSlot, 0, preview.placeholder);
+  const rows = Math.ceil(ordered.length / 4);
+  const small = Math.floor(ordered.length / rows),
+    larger = ordered.length % rows;
+  for (const { node } of preview.items)
+    node.classList.toggle('favorite-drag-origin', node.dataset.tabId === ui.dragTab);
+  ordered.forEach((node, index) => {
+    node.style.order = String(index);
+    node.dataset.columns = String(index < larger * (small + 1) ? small + 1 : small);
+  });
+  preview.slot = destination.favoriteSlot;
+  preview.placeholder.dataset.insertionIndex = String(destination.favoriteSlot);
+  for (const { node } of preview.items) {
+    if (node.dataset.tabId === ui.dragTab) continue;
+    const first = before.get(node),
+      last = node.getBoundingClientRect();
+    if (first && (Math.abs(first.x - last.x) > 1 || Math.abs(first.y - last.y) > 1))
+      motion(
+        node,
+        [
+          { transform: `translate(${first.x - last.x}px, ${first.y - last.y}px)` },
+          { transform: 'translate(0, 0)' },
+        ],
+        140,
+      );
+  }
+}
 function dragDestination(event) {
   const drop = event.target.closest(
     '[data-drop-tab],[data-drop-favorites],[data-drop-pinned],[data-drop-folder]',
@@ -5642,8 +5986,10 @@ function dragDestination(event) {
   const source = state?.tabs.find((tab) => tab.id === ui.dragTab);
   if (!drop || !source || source.profileId !== activeProfile()?.id) return null;
   const target = drop.dataset.dropTab ? state.tabs.find((tab) => tab.id === drop.dataset.dropTab) : null;
+  const favoriteContainer = drop.closest('[data-drop-favorites]');
+  if (favoriteContainer) return favoriteInsertion(event, favoriteContainer, source);
   if (target?.id === source.id) return null;
-  const favorite = Boolean(drop.closest('[data-drop-favorites]'));
+  const favorite = false;
   const pinned = favorite || Boolean(drop.closest('[data-drop-pinned]'));
   const folderId = favorite ? null : target ? target.folderId : drop.dataset.dropFolder || null;
   const rectangle = drop.getBoundingClientRect();
@@ -5677,33 +6023,59 @@ document.addEventListener('dragstart', (event) => {
   if (!tab || !event.dataTransfer) return;
   interruptSpaceScroll();
   ui.dragTab = tab.dataset.tabId;
+  ui.dragProfileId = activeProfile()?.id;
+  ui.dragSpaceId = state.activeSpaceId;
   $('#app').dataset.dragging = 'true';
   event.dataTransfer.effectAllowed = 'move';
   event.dataTransfer.setData('text/plain', ui.dragTab);
 });
 document.addEventListener('dragover', (event) => {
   const destination = dragDestination(event);
-  if (!destination) return;
+  if (!destination) {
+    clearFavoriteReflow();
+    return;
+  }
   event.preventDefault();
   event.dataTransfer.dropEffect = 'move';
   clearDragFeedback();
+  if (destination.favoriteSlot !== undefined) paintFavoriteReflow(destination);
+  else clearFavoriteReflow();
   destination.drop.classList.add(
     destination.drop.dataset.dropTab ? (destination.after ? 'drop-after' : 'drop-before') : 'drag-over',
   );
 });
 document.addEventListener('dragleave', (event) => {
+  const preview = ui.favoriteReflow;
+  if (preview) {
+    const bounds = preview.container.getBoundingClientRect();
+    if (
+      event.clientX < bounds.left ||
+      event.clientX > bounds.right ||
+      event.clientY < bounds.top ||
+      event.clientY > bounds.bottom
+    )
+      clearFavoriteReflow();
+  }
   const drop = event.target.closest(
     '[data-drop-tab],[data-drop-favorites],[data-drop-pinned],[data-drop-folder]',
   );
   if (drop && !drop.contains(event.relatedTarget))
     drop.classList.remove('drag-over', 'drop-before', 'drop-after');
 });
-function endTabDrag() {
+function endTabDrag({ refresh = true } = {}) {
+  const hadDrag = Boolean(ui.dragTab);
+  clearFavoriteReflow();
+  ui.dragCommitPending = false;
   ui.dragTab = null;
+  ui.dragProfileId = null;
+  ui.dragSpaceId = null;
   delete $('#app').dataset.dragging;
   clearDragFeedback();
+  if (hadDrag && refresh) restoreFocusAround(renderSidebar);
 }
-document.addEventListener('dragend', endTabDrag);
+document.addEventListener('dragend', () => {
+  if (!ui.dragCommitPending) endTabDrag();
+});
 document.addEventListener('drop', (event) => {
   const destination = dragDestination(event);
   if (!destination) {
@@ -5711,8 +6083,16 @@ document.addEventListener('drop', (event) => {
     return;
   }
   event.preventDefault();
-  endTabDrag();
-  safely(invoke('tab:move', destination.payload));
+  const dragged = ui.dragTab;
+  ui.dragCommitPending = true;
+  safely(
+    invoke('tab:move', destination.payload)
+      .then(() => invoke('state:get'))
+      .then(applyState)
+      .finally(() => {
+        if (ui.dragTab === dragged) endTabDrag();
+      }),
+  );
 });
 function showAuth(event) {
   if (event.profileId && event.profileId !== activeProfile()?.id) {

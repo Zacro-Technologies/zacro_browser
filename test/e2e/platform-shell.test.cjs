@@ -34,25 +34,29 @@ test(
     assert.equal(await shell.locator('.window-controls').count(), 0);
     assert((await shell.locator('[data-key="back"]').boundingBox()).x >= 88);
     assert((await shell.locator('.space-picker').boundingBox()).x < 30);
-    await expect(shell.locator('[data-key="sidebar-toggle"]')).toHaveCount(0);
-    await expect(shell.locator('[data-key="back"]')).toHaveAttribute('title', 'Back (⌘[)');
-    await emit({ type: 'sidebar:toggle' });
+    const sidebarToggle = shell.locator('[data-key="sidebar-toggle"]');
+    await expect(sidebarToggle).toBeVisible();
+    await expect(sidebarToggle).toHaveAccessibleName('Hide sidebar (⌘S)');
+    assert((await sidebarToggle.boundingBox()).x >= 88);
+    assert(
+      (await sidebarToggle.boundingBox()).x < (await shell.locator('[data-key="back"]').boundingBox()).x,
+    );
+    await expect(shell.locator('[data-key="back"]')).toHaveAttribute('title', 'Back (⌘←)');
+    await sidebarToggle.click();
     await expect(shell.locator('#app')).toHaveAttribute('data-sidebar-hidden', 'true');
     await expect(shell.locator('#app')).toHaveAttribute('data-sidebar-animating', 'false');
-    assert((await shell.locator('[data-key="back"]').boundingBox()).x >= 88);
+    await expect(shell.locator('#toolbar')).toBeHidden();
     await app.evaluate(({ app }) => app.emit('fixture:runtime', null, { fullScreen: true }));
     await expect(shell.locator('html')).toHaveAttribute('data-fullscreen', 'true');
-    await expect
-      .poll(async () => (await shell.locator('[data-key="back"]').boundingBox()).x)
-      .toBeLessThan(30);
+    await expect(shell.locator('#toolbar')).toBeHidden();
     await emit({ type: 'sidebar:toggle' });
-    // Padding is already zero in full screen while the toolbar is still in
-    // the main pane. Wait for the toggle and its width animation, not just CSS.
+    // Wait for the sidebar animation before measuring full-screen placement.
     await expect(shell.locator('#app')).toHaveAttribute('data-sidebar-hidden', 'false');
     await expect(shell.locator('#app')).toHaveAttribute('data-sidebar-animating', 'false');
     await expect
       .poll(() => shell.locator('.navigation').evaluate((element) => getComputedStyle(element).paddingLeft))
       .toBe('0px');
+    assert((await sidebarToggle.boundingBox()).x < 30);
     await app.evaluate(({ app }) => app.emit('fixture:runtime', null, { fullScreen: false }));
     await expect(shell.locator('html')).toHaveAttribute('data-fullscreen', 'false');
     await expect

@@ -8,7 +8,8 @@ const PNG_SIGNATURE = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
 
 // Only bounded raster bytes reach the sandboxed shell's image decoder. In
 // particular, never parse SVG, run an image decoder in the privileged process,
-// write an icon to disk, or give the shell an external image URL.
+// give the shell an external image URL. SavedFaviconCache may persist only
+// these validated pixels for saved tabs in non-private profiles.
 function pngBytes(bytes) {
   if (bytes.length < 45 || !bytes.subarray(0, 8).equals(PNG_SIGNATURE)) return null;
   let offset = 8;

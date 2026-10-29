@@ -78,7 +78,9 @@ test(
       assert.equal(fuses[FuseV1Options[fuse]], 49, fuse);
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'zacro-package-'));
     let child, browser, harness, harnessProcess;
-    const server = http.createServer((_req, res) => {
+    const fixtureRequests = [];
+    const server = http.createServer((req, res) => {
+      fixtureRequests.push({ method: req.method, path: req.url, at: Date.now() });
       res.setHeader('Content-Type', 'text/html');
       res.end(
         '<!doctype html><title>Packaged browser acceptance</title><h1>This page is rendered by the packaged Chromium browser.</h1>',
@@ -201,16 +203,39 @@ test(
     await stage(
       'Native page navigation',
       async () => {
-        await shell.evaluate((url) => window.zacro.invoke('navigate', { url }), url);
-        await expect
-          .poll(
-            async () => {
-              const state = await shell.evaluate(() => window.zacro.invoke('state:get'));
-              return state.tabs.find((tab) => tab.id === state.activeTabId)?.title;
-            },
-            { timeout: 5000 + keychainApprovalWait },
-          )
-          .toBe('Packaged browser acceptance');
+        try {
+          await shell.evaluate((url) => window.zacro.invoke('navigate', { url }), url);
+          await expect
+            .poll(
+              async () => {
+                const state = await shell.evaluate(() => window.zacro.invoke('state:get'));
+                return state.tabs.find((tab) => tab.id === state.activeTabId)?.title;
+              },
+              { timeout: 5000 + keychainApprovalWait },
+            )
+            .toBe('Packaged browser acceptance');
+        } catch (error) {
+          const state = await bounded(
+            shell.evaluate(() => window.zacro.invoke('state:get')),
+            1000,
+            'Reading failed navigation state',
+          ).catch((failure) => ({ diagnosticError: failure.message }));
+          console.error(
+            '[package] Failed navigation evidence:',
+            JSON.stringify(
+              {
+                requests: fixtureRequests,
+                tab: state.tabs?.find((tab) => tab.id === state.activeTabId),
+                page: state.runtime?.pages?.[state.activeTabId],
+                diagnosticError: state.diagnosticError,
+                stderr: diagnostics,
+              },
+              null,
+              2,
+            ),
+          );
+          throw error;
+        }
       },
       15000 + keychainApprovalWait,
     );

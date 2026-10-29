@@ -156,7 +156,7 @@ test(
     await b.shell.locator('summary').filter({ hasText: 'Gradient & texture' }).click();
     await b.shell.locator('summary').filter({ hasText: 'Gradient & texture' }).focus();
     await b.shell.keyboard.press('Tab');
-    await expect(b.shell.locator('input[name="theme-gradient"]')).toBeFocused();
+    await expect(b.shell.locator('input[name="theme-vibrancy"]')).toBeFocused();
     await b.shell.locator('input[name="theme-grain"]').evaluate((input) => {
       input.value = '40';
       input.dispatchEvent(new Event('input', { bubbles: true }));
@@ -757,6 +757,7 @@ test(
     await b.emit({ type: 'command', mode: 'newtab', query: 'Keep this unfinished search' });
     await expect(b.shell.locator('#page-backdrop img')).toHaveCount(1);
     await b.shell.locator('#page-backdrop img').evaluate((image) => image.decode());
+    await expect.poll(() => b.app.evaluate(() => globalThis.__resizeBackdropView.getVisible())).toBe(false);
     const after = await b.app.evaluate(({ BrowserWindow, webContents, screen }) => ({
       id: globalThis.__resizeBackdropView.webContents.id,
       zoom: globalThis.__resizeBackdropView.webContents.getZoomFactor(),
@@ -919,5 +920,113 @@ test(
       await expect(browser.shell.locator('#command-input')).toHaveCount(0);
       assert.equal(await browser.guest('window.backdropDraft'), 'Keep this document');
     }
+  },
+);
+
+test(
+  'vivid opaque grain stays visible and saving transparency preserves the preview',
+  { timeout: 45000 },
+  async (t) => {
+    const b = await fixture(t);
+    await b.invoke('folder:create', { name: 'Color review' });
+    await b.emit({ type: 'panel', panel: 'settings' });
+    await b.shell.getByRole('button', { name: 'Customize Space', exact: true }).click();
+    const set = (name, value) =>
+      b.shell.locator(`[name="theme-${name}"]`).evaluate((input, value) => {
+        input.value = value;
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+      }, String(value));
+    await set('color', '#ee3388');
+    await set('secondaryColor', '#5733ff');
+    await set('vibrancy', 100);
+    await set('grain', 200);
+    await set('opacity', 100);
+    const readPreview = () =>
+      b.shell.evaluate(() => {
+        const app = document.querySelector('.app');
+        const tile = document.querySelector('.theme-preview-tile');
+        const properties = (element, pseudo) => {
+          const style = getComputedStyle(element, pseudo);
+          return { image: style.backgroundImage, opacity: style.opacity };
+        };
+        return {
+          window: properties(app, '::after'),
+          preview: properties(tile, '::before'),
+          windowGrain: properties(app, '::before'),
+          previewGrain: properties(tile, '::after'),
+          page: getComputedStyle(document.querySelector('.theme-preview-page')).backgroundColor,
+          workspace: getComputedStyle(document.querySelector('.workspace')).backgroundColor,
+          backdrop: getComputedStyle(document.querySelector('.dialog-backdrop')).backgroundColor,
+          backdropFilter: getComputedStyle(document.querySelector('.dialog-backdrop')).backdropFilter,
+        };
+      });
+    const opaquePreview = await readPreview();
+    assert.deepEqual(
+      opaquePreview.preview,
+      opaquePreview.window,
+      'Preview and live window use the same fitted gradient and opacity',
+    );
+    assert.deepEqual(opaquePreview.previewGrain, opaquePreview.windowGrain);
+    assert.equal(opaquePreview.page, 'rgba(0, 0, 0, 0)');
+    assert.equal(
+      opaquePreview.backdrop,
+      'rgba(0, 0, 0, 0)',
+      'Customization leaves the live theme visible without dimming it',
+    );
+    assert.equal(opaquePreview.backdropFilter, 'none');
+    assert.equal(
+      opaquePreview.workspace,
+      opaquePreview.page,
+      'The empty content pane carries the window color',
+    );
+    const directory = path.resolve(__dirname, '../../test-results/theme-review');
+    await fs.mkdir(directory, { recursive: true });
+    await b.shell.getByRole('button', { name: 'Save changes', exact: true }).click();
+    await expect(b.shell.locator('.space-theme-dialog')).toHaveCount(0);
+    await b.emit({ type: 'panel', panel: 'settings' });
+    const read = () =>
+      b.shell.evaluate(() => ({
+        grain: getComputedStyle(document.querySelector('.app'), '::before').opacity,
+        opacity: getComputedStyle(document.querySelector('.app'), '::after').opacity,
+        material: document.documentElement.dataset.windowMaterial,
+      }));
+    await expect.poll(async () => (await read()).grain).toBe('0.18');
+    assert.equal((await read()).opacity, '1');
+    for (const theme of ['light', 'dark']) {
+      await b.invoke('settings:update', { values: { theme } });
+      await expect(b.shell.locator('html')).toHaveAttribute('data-theme', theme);
+      const foreground = await b.shell.evaluate(() => ({
+        picker: getComputedStyle(document.querySelector('.space-picker')).color,
+        title: getComputedStyle(document.querySelector('#panel-title')).color,
+      }));
+      const accents = await b.shell.evaluate(() =>
+        ['.folder-icon', '.space-picker > svg:first-child'].map(
+          (selector) => getComputedStyle(document.querySelector(selector)).color,
+        ),
+      );
+      assert.equal(new Set(accents).size, 1, 'Folder outlines and Space icons share the chosen Space accent');
+      assert.deepEqual(
+        foreground,
+        theme === 'dark'
+          ? { picker: 'rgb(245, 240, 250)', title: 'rgb(255, 255, 255)' }
+          : { picker: 'rgb(33, 28, 35)', title: 'rgb(21, 18, 25)' },
+      );
+      await b.shell.screenshot({ path: path.join(directory, `${theme}-vivid-grain.png`) });
+    }
+    await b.shell.getByRole('button', { name: 'Customize Space', exact: true }).click();
+    await set('opacity', 35);
+    await expect
+      .poll(async () => (await b.invoke('state:get')).runtime.windowMaterial.requestedOpacity)
+      .toBe(35);
+    const translucentPreview = await readPreview();
+    assert.deepEqual(translucentPreview.preview, translucentPreview.window);
+    assert.deepEqual(translucentPreview.previewGrain, translucentPreview.windowGrain);
+    const before = await read();
+    await b.shell.getByRole('button', { name: 'Save changes', exact: true }).click();
+    await expect(b.shell.locator('.space-theme-dialog')).toHaveCount(0);
+    await expect.poll(read).toEqual(before);
+    const saved = await b.invoke('state:get');
+    assert.equal(saved.spaces.find((s) => s.id === saved.activeSpaceId).theme.vibrancy, 100);
+    assert.equal(saved.runtime.windowMaterial.requestedOpacity, 35);
   },
 );

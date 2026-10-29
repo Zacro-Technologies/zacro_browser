@@ -4,6 +4,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const {
   browserLayout,
+  peekMotionBounds,
   presentView,
   resolveSplit,
   restoreWindowPlacement,
@@ -15,14 +16,14 @@ test('native pages align with compact chrome, sidebar, and open panels without f
   assert.deepEqual(layout.secondary, { x: 653, y: 36, width: 380, height: 897 });
   assert.equal(layout.secondary.x + layout.secondary.width + 400 + 8, 1441);
   assert.equal(layout.secondary.x - layout.primary.x - layout.primary.width, 6);
-  assert.deepEqual(layout.peek, { x: 292, y: 92, width: 717, height: 817 });
+  assert.deepEqual(layout.peek, { x: 360, y: 72, width: 581, height: 825 });
 });
 
 test('hiding the sidebar reclaims its width while keeping the page, panel and split frame aligned', () => {
   const full = browserLayout({ width: 1000, height: 700, sidebarWidth: 0, contentTop: 40 });
   assert.deepEqual(full.primary, { x: 8, y: 40, width: 984, height: 652 });
   assert.equal(full.secondary, null);
-  assert.deepEqual(full.peek, { x: 32, y: 96, width: 936, height: 572 });
+  assert.deepEqual(full.peek, { x: 120, y: 66, width: 760, height: 600 });
 
   const split = browserLayout({
     width: 1000,
@@ -35,7 +36,7 @@ test('hiding the sidebar reclaims its width while keeping the page, panel and sp
   assert.deepEqual(split.primary, { x: 8, y: 40, width: 309, height: 652 });
   assert.deepEqual(split.secondary, { x: 323, y: 40, width: 309, height: 652 });
   assert.equal(split.secondary.x + split.secondary.width + 360 + 8, 1000);
-  assert.deepEqual(split.peek, { x: 32, y: 96, width: 576, height: 572 });
+  assert.deepEqual(split.peek, { x: 83, y: 66, width: 474, height: 600 });
 
   const restored = browserLayout({ width: 1000, height: 700, sidebarWidth: 300 });
   assert.equal(
@@ -51,8 +52,12 @@ test('sidebar navigation, caption rail and Find reserve only their supported con
     const layout = browserLayout({ width: 1001, height: 701, sidebarWidth: 224, contentTop });
     assert.equal(layout.primary.y, contentTop);
     assert.equal(layout.primary.y + layout.primary.height, 693, 'The page retains its 8px bottom frame');
-    assert.equal(layout.peek.y, contentTop + 56, 'Peek has a 24px inset and 32px header');
-    assert.equal(layout.peek.y + layout.peek.height, 669, 'Peek ends 24px inside the page frame');
+    assert(layout.peek.y >= contentTop + 20, 'Peek leaves a small vertical margin');
+    assert(layout.peek.y + layout.peek.height <= 673, 'Peek leaves the surrounding page exposed');
+    assert(
+      layout.peek.x + layout.peek.width + 40 <= layout.primary.x + layout.primary.width,
+      'Right-side controls stay inside the content pane',
+    );
   }
   for (const contentTop of [-1, 0, 8.5, 44, 10000, NaN, Infinity])
     assert.equal(browserLayout({ width: 1000, height: 700, contentTop }).primary.y, 36);
@@ -199,4 +204,16 @@ test('disconnected monitors and oversize windows restore completely on screen', 
   assert.deepEqual(placement, { x: 0, y: 0, width: 1366, height: 768, maximized: false });
   const missing = restoreWindowPlacement({}, [{ x: 100, y: 50, width: 1920, height: 1080 }]);
   assert.deepEqual(missing, { x: 340, y: 120, width: 1440, height: 940, maximized: false });
+});
+
+test('Peek grows from the link and expands to full size without changing page zoom', () => {
+  const target = { x: 300, y: 100, width: 700, height: 600 };
+  const origin = { x: 400, y: 300, width: 40, height: 30 };
+  const full = { x: 230, y: 8, width: 920, height: 800 };
+  assert.deepEqual(peekMotionBounds(target, origin, 0, 'opening', full), origin);
+  assert.deepEqual(peekMotionBounds(target, origin, 1, 'opening', full), target);
+  assert.deepEqual(peekMotionBounds(target, origin, 0, 'expanding', full), target);
+  assert.deepEqual(peekMotionBounds(target, origin, 1, 'expanding', full), full);
+  const middle = peekMotionBounds(target, origin, 0.5, 'expanding', full);
+  assert(middle.width > target.width && middle.width < full.width);
 });

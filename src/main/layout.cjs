@@ -46,13 +46,31 @@ function browserLayout({
           height: Math.max(1, height - top - gutter),
         }
       : null,
-    peek: {
-      x: left + 24,
-      y: Math.min(top + 24 + 32, height - 1),
-      width: Math.max(1, available - 48),
-      height: Math.max(1, height - top - gutter - 24 - 32 - 24),
-    },
+    peek: (() => {
+      const pageHeight = Math.max(1, height - top - gutter);
+      const insetX = Math.min(112, Math.max(32, Math.round(available * 0.12)));
+      const rightInset = Math.max(48, insetX);
+      const insetY = Math.min(40, Math.max(20, Math.round(pageHeight * 0.04)));
+      return {
+        x: left + insetX,
+        y: top + insetY,
+        width: Math.max(1, available - insetX - rightInset),
+        height: Math.max(1, pageHeight - insetY * 2),
+      };
+    })(),
   };
+}
+
+function peekMotionBounds(target, origin, progress, phase, full) {
+  const amount = clamp(finite(progress, 1), 0, 1);
+  const start = phase === 'expanding' ? target : origin || target;
+  const end = phase === 'expanding' ? full : target;
+  return Object.fromEntries(
+    ['x', 'y', 'width', 'height'].map((key) => [
+      key,
+      Math.round(start[key] + (end[key] - start[key]) * amount),
+    ]),
+  );
 }
 
 function sameBounds(left, right) {
@@ -79,10 +97,16 @@ function presentView(view, previous, next, parent = null) {
 
 function resolveSplit(pair, tabs, activeTabId, spaceId) {
   if (!pair || pair.length !== 2 || pair[0] === pair[1] || !pair.includes(activeTabId)) return null;
+  if (tabs.find((tab) => tab.id === pair[0])?.profileId !== tabs.find((tab) => tab.id === pair[1])?.profileId)
+    return null;
   if (
     !pair.every((id) =>
       tabs.some(
-        (tab) => tab.id === id && tab.spaceId === spaceId && tab.url !== 'zacro://newtab' && !tab.closed,
+        (tab) =>
+          tab.id === id &&
+          (tab.spaceId === spaceId || tab.favorite) &&
+          tab.url !== 'zacro://newtab' &&
+          !tab.closed,
       ),
     )
   )
@@ -123,4 +147,4 @@ function restoreWindowPlacement(saved = {}, workAreas = []) {
   };
 }
 
-module.exports = { browserLayout, presentView, resolveSplit, restoreWindowPlacement };
+module.exports = { peekMotionBounds, browserLayout, presentView, resolveSplit, restoreWindowPlacement };

@@ -216,6 +216,7 @@ test('Peek promotion adopts the live document and retires its synchronous reserv
   const main = fs.readFileSync(path.join(__dirname, '../src/main/main.cjs'), 'utf8');
   const store = new BrowserStore();
   const first = store.dispatch('tab:create', { url: 'https://example.test/parent' });
+  store.dispatch('peek:set', { sourceTabId: first.id, url: 'https://example.test/result', title: 'Result' });
   const allocated = [];
   let id = 100;
   const makeEntry = (_profile, tabId) => {
@@ -248,6 +249,8 @@ test('Peek promotion adopts the live document and retires its synchronous reserv
     closingWindow: false,
     pruneRetainedFavicons: () => {},
     activeSpace: () => store.state.spaces[0],
+    activeTab: () => store.state.tabs.find((tab) => tab.id === store.state.activeTabId),
+    peeks: new Map(),
     backdropContext: null,
     pendingAuth: null,
     lastProfileId: null,
@@ -265,12 +268,19 @@ test('Peek promotion adopts the live document and retires its synchronous reserv
     peekRequestSerial: 0,
     cancelPeekMotion: () => {},
     focusContentOrChrome: () => {},
-    peek: { entry: preview, spaceId: store.state.activeSpaceId, profileId: first.profileId },
+    peek: {
+      entry: preview,
+      sourceTabId: first.id,
+      spaceId: store.state.activeSpaceId,
+      profileId: first.profileId,
+    },
   });
+  host.peeks.set(first.id, host.peek);
   const extract = (from, to) => main.slice(main.indexOf(from), main.indexOf(to, main.indexOf(from)));
   new vm.Script(
     extract('function destroyEntry(', 'function requestCloseEntry(') +
       extract('function adoptView(', 'function publishExtensionTabChanges(') +
+      extract('function forgetPeekDestination(', 'function disposeProfilePeeks(') +
       extract('function promotePeek(', 'function showPageMenu('),
   ).runInContext(host);
   host.reconcile();
@@ -291,6 +301,8 @@ test('Peek promotion adopts the live document and retires its synchronous reserv
   );
   assert.equal(store.state.activeTabId, promoted.id);
   assert.equal(store.state.tabs.length, 2);
+  assert.equal(store.state.tabs.find((tab) => tab.id === first.id).savedPeek, undefined);
+  assert.equal(host.peeks.size, 0);
 });
 
 test('tabless profiles expose no active extension tab ID', () => {

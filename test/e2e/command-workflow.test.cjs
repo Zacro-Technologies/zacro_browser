@@ -158,6 +158,7 @@ test(
       b.shell
         .locator('.favorite[data-tab-id]')
         .evaluateAll((elements) => elements.map((element) => element.dataset.tabId));
+    let metadataUpdateChecked = false;
     const mouseDrag = async (source, target, { x = 0.5, y = 0.5, feedback = 'drag-over' } = {}) => {
       // Hover waits for a stable, attached row and retries if page metadata
       // replaces the sidebar while a newly restored tab finishes loading.
@@ -181,15 +182,57 @@ test(
       try {
         await b.shell.mouse.move(startX + 10, startY + 2, { steps: 3 });
         await expect(b.shell.locator('#app')).toHaveAttribute('data-dragging', 'true');
+        if (!metadataUpdateChecked) {
+          metadataUpdateChecked = true;
+          const draggingId = await source.getAttribute('data-tab-id');
+          await source.evaluate((node) => {
+            window.__dragSource = node;
+            window.__dragMetadataPublished = false;
+            const unsubscribe = window.zacro.onState((snapshot) => {
+              if (snapshot.tabs.some((tab) => tab.title === 'Updated during drag')) {
+                window.__dragMetadataPublished = true;
+                unsubscribe();
+              }
+            });
+          });
+          await b.invoke('tab:update', { id: draggingId, title: 'Updated during drag' });
+          await expect.poll(() => b.shell.evaluate(() => window.__dragMetadataPublished)).toBe(true);
+          assert.equal(
+            await source.evaluate((node) => node === window.__dragSource && node.isConnected),
+            true,
+            'Metadata updates retain the native drag source and target nodes',
+          );
+        }
         // The empty pinned area grows after dragstart. Measure the destination
         // afterwards, just as a pointer follows the visible drop target.
         const end = await target.boundingBox();
         assert(end, 'The drop destination must be visible');
         const endX = end.x + end.width * x;
         const endY = end.y + end.height * y;
+        const favoriteTarget = await target.evaluate((node) =>
+          Boolean(node.closest('[data-drop-favorites]')),
+        );
+        const originalOrder = (await b.state()).tabs.filter((tab) => tab.favorite).map((tab) => tab.id);
         await b.shell.mouse.move(endX, endY, { steps: 12 });
         await b.shell.mouse.move(endX + 1, endY, { steps: 2 });
-        await expect(target).toHaveClass(new RegExp(`\\b${feedback}\\b`));
+        if (favoriteTarget) {
+          const slot = b.shell.locator('.favorite-insertion-slot');
+          await expect(slot).toBeVisible();
+          assert.equal(
+            await source.evaluate((node) => node.isConnected),
+            true,
+            'Reflow keeps the native drag source attached',
+          );
+          assert.deepEqual(
+            (await b.state()).tabs.filter((tab) => tab.favorite).map((tab) => tab.id),
+            originalOrder,
+            'Preview does not persist before drop',
+          );
+          if (feedback === 'drop-before') {
+            await expect(slot).toHaveAttribute('data-insertion-index', '0');
+            await expect.poll(async () => (await target.boundingBox()).x).toBeGreaterThan(end.x + 10);
+          }
+        } else await expect(target).toHaveClass(new RegExp(`\\b${feedback}\\b`));
       } finally {
         await b.shell.mouse.up();
       }
@@ -348,7 +391,7 @@ test(
     const input = () => b.shell.locator('#command-input');
     await b.shell.getByRole('button', { name: 'Tabs', exact: true }).click();
     await input().fill('w');
-    await expect(b.shell.locator('.command-context-hint')).not.toContainText('Search site');
+    await expect(b.shell.locator('.command-footer')).toHaveCount(0);
     const scopedTab = await b.shell.locator('.command-result.selected .command-result-label').innerText();
     await input().press('Tab');
     await expect(input()).toHaveAttribute('aria-label', `Actions for ${scopedTab}`);
@@ -703,5 +746,116 @@ test(
       savedBytes,
       'Cancelling Save Page preserves the existing file',
     );
+  },
+);
+
+test(
+  'paste and search opens the clipboard directly and website search uses its saved engine without palette instructions',
+  { timeout: 45000 },
+  async (t) => {
+    const b = await fixture(t);
+    await b.submit(`${b.base}/start`);
+    await b.app.evaluate(({ clipboard }, url) => clipboard.writeText(url), `${b.base}/pasted`);
+    await b.key(
+      'V',
+      process.platform === 'darwin' ? ['control', 'meta'] : ['control', 'alt'],
+      `${b.base}/start`,
+    );
+    await expect.poll(() => b.guest(`${b.base}/pasted`, 'document.readyState')).toBe('complete');
+    assert.equal((await b.state()).tabs.length, 2);
+    await b.invoke('settings:update', {
+      values: {
+        siteSearches: [{ id: 'local', name: 'Local site', keyword: 'local', url: `${b.base}/search?q=%s` }],
+      },
+    });
+    await b.key('T', [b.mod]);
+    await expect(b.shell.locator('.command-footer')).toHaveCount(0);
+    await b.shell.locator('[data-command-id="search-current-website"]').click();
+    await expect(b.shell.locator('#command-input')).toHaveAttribute('placeholder', 'Search Local site');
+    await b.shell.locator('#command-input').fill('two words');
+    await b.shell.locator('#command-input').press('Enter');
+    await expect
+      .poll(() => b.guest(`${b.base}/search?q=two%20words`, 'document.readyState'))
+      .toBe('complete');
+  },
+);
+
+test(
+  'palette keeps the native page visible until a delayed snapshot has been decoded',
+  { timeout: 45000 },
+  async (t) => {
+    const b = await fixture(t);
+    const url = `${b.base}/handoff`;
+    await b.submit(url);
+    await b.app.evaluate(({ BrowserWindow, webContents }, url) => {
+      const contents = webContents.getAllWebContents().find((item) => item.getURL() === url);
+      const capture = contents.capturePage.bind(contents);
+      globalThis.paletteHandoff = {};
+      contents.capturePage = async (...args) => {
+        await new Promise((resolve) => setTimeout(resolve, 120));
+        const view = BrowserWindow.getAllWindows()[0].contentView.children.find(
+          (view) => view.webContents === contents,
+        );
+        globalThis.paletteHandoff.visibleDuringCapture = view?.getVisible();
+        return capture(...args);
+      };
+    }, url);
+    await b.key('T', [b.mod]);
+    await expect(b.shell.locator('#page-backdrop img')).toHaveCount(1);
+    await b.shell.locator('#page-backdrop img').evaluate((image) => image.decode());
+    assert.equal(await b.app.evaluate(() => globalThis.paletteHandoff.visibleDuringCapture), true);
+    await expect
+      .poll(() =>
+        b.app.evaluate(({ BrowserWindow, webContents }, url) => {
+          const contents = webContents.getAllWebContents().find((item) => item.getURL() === url);
+          return BrowserWindow.getAllWindows()[0].contentView.children.some(
+            (view) => view.webContents === contents && view.getVisible(),
+          );
+        }, url),
+      )
+      .toBe(false);
+    await b.shell.keyboard.press('Escape');
+    assert.equal(await b.guest(url, 'document.readyState'), 'complete');
+  },
+);
+
+test(
+  'canceling a Favorite drag restores the live grid without persisting the preview slot',
+  { timeout: 30000 },
+  async (t) => {
+    const b = await fixture(t);
+    const ids = [];
+    for (let i = 0; i < 4; i++) {
+      const tab = await b.invoke('tab:create', { url: `${b.base}/favorite-${i}`, active: false });
+      await b.invoke('tab:favorite', { id: tab.id });
+      ids.push(tab.id);
+    }
+    const tiles = b.shell.locator('.favorite[data-tab-id]');
+    await expect(tiles).toHaveCount(4);
+    const source = b.shell.locator(`.favorite[data-tab-id="${ids[3]}"]`);
+    const target = b.shell.locator(`.favorite[data-tab-id="${ids[0]}"]`);
+    await target.hover();
+    const initial = await target.boundingBox();
+    await source.hover();
+    const start = await source.boundingBox();
+    await b.shell.mouse.down();
+    try {
+      await b.shell.mouse.move(start.x + 5, start.y + 5, { steps: 3 });
+      await expect(b.shell.locator('#app')).toHaveAttribute('data-dragging', 'true');
+      await b.shell.mouse.move(initial.x + 3, initial.y + 20, { steps: 12 });
+      await b.shell.mouse.move(initial.x + 4, initial.y + 20, { steps: 2 });
+      await expect(b.shell.locator('.favorite-insertion-slot')).toHaveAttribute('data-insertion-index', '0');
+      await expect.poll(async () => (await target.boundingBox()).x).toBeGreaterThan(initial.x + 10);
+      await b.shell.keyboard.press('Escape');
+    } finally {
+      await b.shell.mouse.up();
+    }
+    await expect(b.shell.locator('.favorite-insertion-slot')).toHaveCount(0);
+    await expect(b.shell.locator('#app')).not.toHaveAttribute('data-dragging', 'true');
+    assert.deepEqual(
+      (await b.state()).tabs.filter((tab) => tab.favorite).map((tab) => tab.id),
+      ids,
+    );
+    await expect.poll(async () => (await target.boundingBox()).x).toBe(initial.x);
   },
 );

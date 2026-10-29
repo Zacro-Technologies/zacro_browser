@@ -1,6 +1,6 @@
 {
   "name": "zacro-browser",
-  "version": "0.10.0",
+  "version": "0.10.1",
   "description": "A sidebar-first Chromium browser with Spaces, profiles, Peek, and optional AI.",
   "main": "src/main/main.cjs",
   "private": true,
