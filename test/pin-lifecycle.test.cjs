@@ -29,6 +29,9 @@ function harness() {
     activityVersion: 0,
     navigationVersion: 1,
     closeCount: 0,
+    discardCount: 0,
+    clearedHistory: 0,
+    documentURL: 'https://example.test/',
     inspectCount: 0,
   };
   entry.contents = {
@@ -43,6 +46,12 @@ function harness() {
       return new Promise((resolve) => {
         resolveInspection = resolve;
       });
+    },
+    getURL: () => entry.documentURL,
+    navigationHistory: { clear: () => entry.clearedHistory++ },
+    loadURL: async (url) => {
+      entry.discardCount++;
+      entry.documentURL = url;
     },
     close: () => {
       entry.closeCount++;
@@ -79,6 +88,7 @@ for (const minutes of [0, 60])
     b.finishInspection();
     await pending;
     assert.equal(b.entry.closeCount, 0);
+    assert.equal(b.entry.discardCount, 0);
   });
 
 test('a completed inspection cannot sleep a pin that was activated and left again', async () => {
@@ -89,6 +99,7 @@ test('a completed inspection cannot sleep a pin that was activated and left agai
   b.finishInspection();
   assert.equal(await pending, false);
   assert.equal(b.entry.closeCount, 0);
+  assert.equal(b.entry.discardCount, 0);
 });
 
 for (const automatic of [false, true])
@@ -101,6 +112,7 @@ for (const automatic of [false, true])
       b.finishInspection();
       assert.equal(await pending, false);
       assert.equal(b.entry.closeCount, 0);
+      assert.equal(b.entry.discardCount, 0);
     }
   });
 
@@ -111,24 +123,64 @@ test('manual Sleep remains available with Never while valid automatic sleep unlo
     const pending = b.host.sleepPinnedEntry(b.entry, { automatic });
     b.finishInspection();
     assert.equal(await pending, true);
-    assert.equal(b.entry.closeCount, 1);
-    assert.equal(b.entry.sleepRequest, true);
+    assert.equal(b.entry.closeCount, 0);
+    assert.equal(b.entry.discardCount, 1);
+    assert.equal(b.entry.dormant, true);
+    assert.equal(b.entry.clearedHistory, 1);
+    assert.equal(b.entry.documentURL, 'about:blank');
+    assert.equal(b.entry.contents.id, 17);
+    assert.equal(b.host.views.get('pin'), b.entry);
+    assert.equal(b.entry.sleepRequest, false);
   }
 });
 
-test('explicit Close upgrades a pending sleep close without issuing a second native close', async () => {
+test('explicit Close upgrades pending discard and closes its retained native identity exactly once', async () => {
   const b = harness();
-  b.entry.contents.close = () => {
-    b.entry.closeCount++;
+  let finishDiscard;
+  b.entry.contents.loadURL = (url) => {
+    b.entry.discardCount++;
+    return new Promise((resolve) => {
+      finishDiscard = () => {
+        b.entry.documentURL = url;
+        resolve();
+      };
+    });
   };
   const asleep = b.host.requestCloseEntry(b.entry, { sleep: true });
   assert.equal(b.entry.sleepRequest, true);
   const explicit = b.host.requestCloseEntry(b.entry);
   assert.equal(explicit, asleep);
   assert.equal(b.entry.sleepRequest, false);
-  assert.equal(b.entry.closeCount, 1);
-  b.entry.closeRequest.resolve(true);
+  assert.equal(b.entry.closeCount, 0);
+  finishDiscard();
   assert.equal(await explicit, true);
+  assert.equal(b.entry.closeCount, 1);
+  assert.equal(b.entry.discardCount, 1);
+  assert.equal(b.entry.dormant, undefined);
+});
+
+test('a cancelled discard retains the document and allows a later explicit Close', async () => {
+  const b = harness();
+  b.entry.userEdited = true;
+  b.entry.contents.loadURL = async () => {
+    throw new Error('ERR_ABORTED');
+  };
+  assert.equal(await b.host.requestCloseEntry(b.entry, { sleep: true }), false);
+  assert.equal(b.entry.documentURL, 'https://example.test/');
+  assert.equal(b.entry.clearedHistory, 0);
+  assert.equal(b.entry.userEdited, true);
+  assert.equal(b.entry.dormant, undefined);
+  assert.equal(b.entry.closeRequest, null);
+  assert.equal(await b.host.requestCloseEntry(b.entry), true);
+  assert.equal(b.entry.closeCount, 1);
+});
+
+test('dormant reservations are not inspected or discarded again', async () => {
+  const b = harness();
+  b.entry.dormant = true;
+  assert.equal(await b.host.sleepPinnedEntry(b.entry), false);
+  assert.equal(b.entry.inspectCount, 0);
+  assert.equal(b.entry.discardCount, 0);
 });
 
 test('a page under DevTools inspection stays live without starting the automatic unload probe', async () => {
@@ -137,4 +189,32 @@ test('a page under DevTools inspection stays live without starting the automatic
   assert.equal(await b.host.sleepPinnedEntry(b.entry, { automatic: true }), false);
   assert.equal(b.entry.inspectCount, 0);
   assert.equal(b.entry.closeCount, 0);
+  assert.equal(b.entry.discardCount, 0);
+});
+
+test('startup auto-archive expires dormant reservations without treating them as loaded pages', async () => {
+  const { BrowserStore } = require('../src/core/store.cjs');
+  const { archiveCandidate } = require('../src/core/archive.cjs');
+  const b = harness();
+  const store = new BrowserStore();
+  const created = store.dispatch('tab:create', { url: 'https://stale.test/', active: false });
+  const stale = store.state.tabs.find((tab) => tab.id === created.id);
+  stale.lastActiveAt = Date.now() - 13 * 3600000;
+  b.entry.tabId = stale.id;
+  b.entry.dormant = true;
+  b.host.views = new Map([[stale.id, b.entry]]);
+  b.host.store = store;
+  b.host.archiveCandidate = archiveCandidate;
+  b.host.archivingTabs = false;
+  await b.host.archiveIdleTabs();
+  assert.equal(
+    store.state.tabs.some((tab) => tab.id === stale.id),
+    false,
+  );
+  assert.equal(
+    store.state.archive.some((tab) => tab.id === stale.id),
+    true,
+  );
+  assert.equal(b.entry.inspectCount, 0);
+  assert.equal(b.entry.discardCount, 0);
 });

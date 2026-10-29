@@ -3,6 +3,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+const { nativeBinary } = require('./helpers/native-binary.cjs');
 const {
   assertNativeTarget,
   binaryTarget,
@@ -19,22 +20,13 @@ test('packaging rejects cross-platform, cross-architecture and universal runtime
 });
 
 test('runtime headers identify actual architecture independently of package metadata', () => {
-  for (const [cpu, arch] of [
-    [0x01000007, 'x64'],
-    [0x0100000c, 'arm64'],
-  ]) {
-    const bytes = Buffer.alloc(256);
-    bytes.writeUInt32LE(0xfeedfacf, 0);
-    bytes.writeUInt32LE(cpu, 4);
+  for (const arch of ['x64', 'arm64']) {
+    const bytes = nativeBinary('darwin', arch, true);
     assert.deepEqual(binaryTarget(bytes), { platform: 'darwin', arch });
   }
-  const pe = Buffer.alloc(256);
-  pe.write('MZ');
-  pe.writeUInt32LE(128, 0x3c);
-  pe.write('PE\0\0', 128);
-  pe.writeUInt16LE(0x8664, 132);
+  const pe = nativeBinary('win32', 'x64', true);
   assert.deepEqual(binaryTarget(pe), { platform: 'win32', arch: 'x64' });
-  pe.writeUInt32LE(1024, 0x3c);
+  pe.writeUInt32LE(2048, 0x3c);
   assert.equal(binaryTarget(pe), null);
   assert.equal(binaryTarget(Buffer.alloc(3)), null);
   assert.equal(binaryTarget(Buffer.alloc(256)), null);

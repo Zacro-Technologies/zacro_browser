@@ -1,0 +1,26 @@
+name: Sync container acceptance
+on:
+  pull_request:
+    paths:
+      - services/sync/**
+      - test/container/**
+      - .github/workflows/sync-container.yml
+  push:
+    paths:
+      - services/sync/**
+      - test/container/**
+      - .github/workflows/sync-container.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  sync-container:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      # No deployment credentials, accounts, public endpoint or app runtime required.
+      - run: node --test test/container/sync-container.test.cjs

@@ -207,7 +207,16 @@ test(
     await expect.poll(() => b.guest('document.readyState', `${base}/b`)).toBe('complete');
     await b.guest('window.peekMarker = "promoted"', `${base}/b`);
     assert.equal((await b.state()).history.length, 1, 'Unpromoted previews do not add browsing history');
+    const nativeIds = () =>
+      b.app.evaluate(({ webContents }) =>
+        webContents
+          .getAllWebContents()
+          .map((w) => w.id)
+          .sort((a, b) => a - b),
+      );
+    const beforePromotion = await nativeIds();
     await b.invoke('peek:promote');
+    await expect.poll(nativeIds).toEqual(beforePromotion);
     const promoted = await b.state();
     assert.equal(promoted.runtime.peek, null);
     assert.equal(await b.guest('window.peekMarker', `${base}/b`), 'promoted');

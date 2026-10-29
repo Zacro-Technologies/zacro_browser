@@ -1,0 +1,103 @@
+# One instance. External key/data volumes survive even `down --volumes`.
+x-store-environment: &store-environment
+  ZACRO_SYNC_DATA: ${ZACRO_SYNC_ACTIVE_DATA_DIR:?Set the active data directory under /data}
+  ZACRO_SYNC_MASTER_KEY_FILE: /keys/master.key
+services:
+  proxy:
+    image: ${ZACRO_SYNC_PROXY_IMAGE:-zacro-sync-proxy:local}
+    build:
+      context: .
+      dockerfile: proxy.Dockerfile
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+    mem_limit: 256m
+    environment:
+      ZACRO_SYNC_DOMAIN: ${ZACRO_SYNC_DOMAIN:?Set an operator-owned DNS hostname}
+    ports:
+      - ${ZACRO_SYNC_HTTP_BIND:-80:80}
+      - ${ZACRO_SYNC_HTTPS_BIND:-443:443}
+    volumes:
+      - caddy-data:/data
+      - caddy-config:/config
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    logging:
+      driver: local
+      options:
+        max-size: 10m
+        max-file: '3'
+  sync:
+    image: ${ZACRO_SYNC_IMAGE:-zacro-sync:local}
+    build:
+      context: ../../..
+      dockerfile: services/sync/Dockerfile
+    # The plaintext listener remains loopback in this shared network namespace.
+    network_mode: service:proxy
+    depends_on:
+      proxy:
+        condition: service_started
+        restart: true
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+    mem_limit: 1g
+    environment:
+      <<: *store-environment
+      ZACRO_SYNC_HOST: 127.0.0.1
+      ZACRO_SYNC_PORT: '4040'
+      ZACRO_SYNC_TRUSTED_PROXY: '1'
+      ZACRO_SYNC_PUBLIC_URL: https://${ZACRO_SYNC_DOMAIN:?Set an operator-owned DNS hostname}
+    volumes:
+      - data:/data
+      - keys:/keys:ro
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:4040/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    logging:
+      driver: local
+      options:
+        max-size: 10m
+        max-file: '3'
+  # Explicit one-shot CLI only; shares the exact active volume/path with sync.
+  maintenance:
+    profiles: [maintenance]
+    image: ${ZACRO_SYNC_IMAGE:-zacro-sync:local}
+    network_mode: none
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    environment: *store-environment
+    volumes:
+      - data:/data
+      - keys:/keys:ro
+      - backups:/backups
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+volumes:
+  data:
+    external: true
+    name: ${ZACRO_SYNC_ACTIVE_VOLUME:?Set the active durable SQLite volume name}
+  keys:
+    external: true
+    name: ${ZACRO_SYNC_KEYS_VOLUME:?Set a separate external private-key volume name}
+  backups:
+    external: true
+    name: ${ZACRO_SYNC_BACKUPS_VOLUME:?Set the separate backup volume name}
+  caddy-data:
+    name: ${ZACRO_SYNC_CADDY_DATA_VOLUME:-zacro-sync-caddy-data}
+  caddy-config:
+    name: ${ZACRO_SYNC_CADDY_CONFIG_VOLUME:-zacro-sync-caddy-config}

@@ -94,6 +94,20 @@ async function launch(t, existingDirectory) {
   shell.on('pageerror', (error) => errors.push(error.message));
   await shell.waitForFunction(() => Boolean(window.zacro));
   await expect(shell.locator('[data-key="address"]')).toBeVisible();
+  if (process.platform === 'darwin') {
+    // The BrowserWindow starts hidden. Activate only after it has been shown;
+    // DOM focus alone does not establish macOS's native first responder.
+    await expect
+      .poll(() => app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].isVisible()))
+      .toBe(true);
+    await app.evaluate(({ app, BrowserWindow }) => {
+      app.focus({ steal: true });
+      BrowserWindow.getAllWindows()[0].focus();
+    });
+    await expect
+      .poll(() => app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].isFocused()))
+      .toBe(true);
+  }
   if (await shell.locator('#command-input').count()) await shell.keyboard.press('Escape');
   const invoke = (action, payload = {}) =>
     shell.evaluate(([action, payload]) => window.zacro.invoke(action, payload), [action, payload]);
@@ -164,7 +178,8 @@ test(
     });
     assert.equal(geometry.sidebarWidth, 224);
     assert(
-      geometry.rows[0].top <= 190,
+      // macOS reserves four additional pixels for its native title controls.
+      geometry.rows[0].top <= (process.platform === 'darwin' ? 194 : 190),
       'Navigation, favorites and a folder must leave the working tabs near the top',
     );
     assert(geometry.rows.every((row) => row.height === 32 && row.bottom < geometry.footerTop));
@@ -342,8 +357,16 @@ test(
     await openLibrarySection(shell, 'settings');
     await expect(shell.locator('select[data-setting="theme"]')).toBeVisible();
     const disclosures = shell.locator('#side-panel details');
-    await expect(disclosures).toHaveCount(5);
+    await expect(disclosures.locator('summary')).toHaveText([
+      'Layout & motion',
+      'Account & sync',
+      'AI providers',
+      'Your data',
+      'Extensions',
+      'About Zacro',
+    ]);
     assert.deepEqual(await disclosures.evaluateAll((items) => items.map((item) => item.open)), [
+      false,
       false,
       false,
       false,
@@ -361,7 +384,7 @@ test(
     await expect(connection).toHaveAttribute('open', '');
     await expect(shell.getByLabel('Model', { exact: true })).toHaveValue('fixture-two');
     await expect(shell.getByLabel('Model', { exact: true })).toBeFocused();
-    for (const heading of ['Layout & motion', 'Your data', 'Extensions', 'About Zacro']) {
+    for (const heading of ['Account & sync', 'Layout & motion', 'Your data', 'Extensions', 'About Zacro']) {
       const summary = shell.locator('#side-panel summary').filter({ hasText: heading });
       await summary.focus();
       await shell.keyboard.press('Enter');
@@ -588,7 +611,7 @@ test(
       .poll(async () => (await browser.state()).spaces.some((space) => space.name === 'Keyboard Space'))
       .toBe(true);
     await expect(picker).toBeFocused();
-    await shell.keyboard.press('Control+t');
+    await shell.keyboard.press('ControlOrMeta+t');
     await expect(shell.locator('#command-input')).toBeFocused();
     await shell.locator('#command-input').fill(`${base}/keyboard-rename`);
     await shell.keyboard.press('Enter');
@@ -816,6 +839,8 @@ test(
     const browser = await launch(t);
     await browser.navigate(`${base}/reload`);
     const initial = requests.get('/reload');
+    // F5 is an alias on Windows/Linux; macOS retains its Command+R default.
+    await browser.invoke('shortcut:set', { id: 'reload', accelerator: 'F5' });
     await browser.shell.evaluate(() => {
       document.documentElement.dataset.reloadSentinel = 'retained';
     });
@@ -857,8 +882,9 @@ test(
       .toBe('target');
     await browser.app.evaluate(({ webContents }, url) => {
       const contents = webContents.getAllWebContents().find((item) => item.getURL() === url);
-      contents.sendInputEvent({ type: 'keyDown', keyCode: 'F', modifiers: ['control'] });
-      contents.sendInputEvent({ type: 'keyUp', keyCode: 'F', modifiers: ['control'] });
+      const modifiers = [process.platform === 'darwin' ? 'meta' : 'control'];
+      contents.sendInputEvent({ type: 'keyDown', keyCode: 'F', modifiers });
+      contents.sendInputEvent({ type: 'keyUp', keyCode: 'F', modifiers });
     }, parentURL);
     const find = browser.shell.locator('#find-input');
     await expect(find).toBeFocused();
@@ -1509,6 +1535,10 @@ test(
     // A pending status reply must not submit against a newly selected page or
     // carry a question across a profile boundary.
     await browser.navigate(`${base}/ai-page-before`);
+    await expect(shell.locator('[data-key="address"]')).toHaveAttribute(
+      'aria-label',
+      `Address bar: ${base}/ai-page-before`,
+    );
     await shell.locator('#ai-context').selectOption('page');
     await browser.app.evaluate(() => {
       globalThis.__deferSubscriptionStatus = true;
@@ -1516,7 +1546,32 @@ test(
     await shell.locator('#ai-question').fill('Question for the original page');
     await shell.locator('#ai-question').press('Enter');
     await expect.poll(() => browser.app.evaluate(() => globalThis.__subscriptionStatusQueue.length)).toBe(1);
+    // Main state changes before its throttled renderer notification. Hold only
+    // that notification so the preflight cannot trust a stale shell snapshot.
+    await browser.app.evaluate(({ BrowserWindow }) => {
+      const contents = BrowserWindow.getAllWindows()[0].webContents;
+      const send = contents.send.bind(contents);
+      let pending;
+      contents.send = (channel, ...args) => {
+        if (channel === 'zacro:state') pending = args;
+        else send(channel, ...args);
+      };
+      globalThis.__releaseSubscriptionState = () => {
+        contents.send = send;
+        if (pending) send('zacro:state', ...pending);
+        delete globalThis.__releaseSubscriptionState;
+      };
+    });
     await browser.navigate(`${base}/ai-page-after`);
+    const navigatedState = await browser.state();
+    assert.equal(
+      navigatedState.tabs.find((tab) => tab.id === navigatedState.activeTabId).url,
+      `${base}/ai-page-after`,
+    );
+    await expect(shell.locator('[data-key="address"]')).toHaveAttribute(
+      'aria-label',
+      `Address bar: ${base}/ai-page-before`,
+    );
     await browser.app.evaluate(() => {
       globalThis.__deferSubscriptionStatus = false;
       globalThis.__subscriptionStatusQueue.shift()(globalThis.__subscriptionFixture);
@@ -1529,6 +1584,7 @@ test(
       ),
       1,
     );
+    await browser.app.evaluate(() => globalThis.__releaseSubscriptionState());
 
     await expect(shell.locator('#ai-submit')).toBeDisabled();
     await shell.getByRole('button', { name: 'Review pages again', exact: true }).click();

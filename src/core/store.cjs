@@ -147,6 +147,23 @@ function webUrl(value) {
     return null;
   }
 }
+function extensionUrl(value) {
+  try {
+    const url = new URL(value);
+    return typeof value === 'string' &&
+      value.length <= 8192 &&
+      url.protocol === 'chrome-extension:' &&
+      /^[a-p]{32}$/.test(url.hostname) &&
+      !url.username &&
+      !url.password &&
+      !url.port &&
+      !url.pathname.startsWith('/zacro-compat-')
+      ? url.href
+      : null;
+  } catch {
+    return null;
+  }
+}
 
 function createInitialState() {
   return {
@@ -289,15 +306,20 @@ function hydrate(raw) {
       profileId: spaces.get(t.spaceId).profileId,
       title: str(t.customTitle, 500) || str(t.title, 500) || 'New tab',
       ...(str(t.customTitle, 500) ? { customTitle: str(t.customTitle, 500) } : {}),
-      url: webUrl(t.url) || 'zacro://newtab',
-      ...(t.homePage === true && !webUrl(t.url) ? { homePage: true } : {}),
+      url: webUrl(t.url) || extensionUrl(t.url) || 'zacro://newtab',
+      ...(t.homePage === true && !webUrl(t.url) && !extensionUrl(t.url) ? { homePage: true } : {}),
       pinned,
       // Before favorites and Space pins were distinct, every pin was an icon tile.
       // Preserve that placement on upgrade rather than silently moving saved tabs.
       favorite,
       ...(pinned
         ? {
-            pinnedUrl: webUrl(t.pinnedUrl) || webUrl(t.url) || 'zacro://newtab',
+            pinnedUrl:
+              webUrl(t.pinnedUrl) ||
+              extensionUrl(t.pinnedUrl) ||
+              webUrl(t.url) ||
+              extensionUrl(t.url) ||
+              'zacro://newtab',
             pinnedTitle: str(t.pinnedTitle, 500) || str(t.title, 500) || 'New tab',
           }
         : {}),
@@ -649,6 +671,16 @@ class BrowserStore extends EventEmitter {
       case 'tab:wake': {
         const tab = this.require('tabs', p.id, 'Tab');
         this.activateTab(tab, action === 'tab:activate');
+        result = tab;
+        break;
+      }
+      case 'tab:extension-page': {
+        const tab = this.require('tabs', p.id, 'Tab');
+        const url = extensionUrl(p.url);
+        if (!url) throw new Error('Invalid extension page.');
+        tab.url = url;
+        delete tab.homePage;
+        if (p.title !== undefined && !tab.customTitle) tab.title = str(p.title, 500) || tab.url;
         result = tab;
         break;
       }

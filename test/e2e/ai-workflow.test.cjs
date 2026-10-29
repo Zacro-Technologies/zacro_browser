@@ -140,10 +140,13 @@ test(
     await b.app.evaluate(({ webContents }, url) => {
       const guest = webContents.getAllWebContents().find((contents) => contents.getURL() === url);
       if (!guest) throw new Error('Fixture page is missing');
-      global.aiWorkflowContextReads = 0;
+      global.aiWorkflowContextReads = { mime: 0, text: 0 };
       const original = guest.executeJavaScriptInIsolatedWorld.bind(guest);
       guest.executeJavaScriptInIsolatedWorld = (worldId, ...args) => {
-        if (worldId === 1001) global.aiWorkflowContextReads++;
+        if (worldId === 1001) {
+          const kind = args[0]?.[0]?.code === 'document.contentType' ? 'mime' : 'text';
+          global.aiWorkflowContextReads[kind]++;
+        }
         return original(worldId, ...args);
       };
     }, `${b.base}/page-one`);
@@ -268,15 +271,15 @@ test(
     await expect(shell.locator('.ai-context-chip')).toHaveAttribute('title', `${b.base}/page-one`);
     await expect(shell.locator('#ai-submit')).toBeEnabled();
     assert.equal(b.requests.length, 0, 'Preparation and connection must not send an AI request');
-    assert.equal(
+    assert.deepEqual(
       await b.app.evaluate(() => global.aiWorkflowContextReads),
-      0,
+      { mime: 0, text: 0 },
       'Preparation and connection must not extract page text',
     );
     await shell.locator('#ai-submit').click();
     await expect(shell.locator('.message.assistant .message-content')).toContainText('twenty dollars');
     assert.equal(b.requests.length, 1);
-    assert.equal(await b.app.evaluate(() => global.aiWorkflowContextReads), 1);
+    assert.deepEqual(await b.app.evaluate(() => global.aiWorkflowContextReads), { mime: 1, text: 1 });
   },
 );
 

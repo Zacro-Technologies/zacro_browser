@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "electron": {
+    "version": "45.0.0",
+    "commit": "54f961b44b83e4ece81065ab60a182fd0c38c01e"
+  },
+  "chromium": {
+    "version": "156.0.8078.48",
+    "originalFilesSha256": {
+      "extensions/browser/permissions/active_tab_permission_granter.cc": "2332e57e002de317bcd4372a3d3a9ae0a145c1bfd2e50210a5cde930cc0bf088",
+      "extensions/browser/permissions/active_tab_permission_granter.h": "869f829696c343fbe55320c4704aa9f77ce229f7b70621fd0c1603284f62eeea",
+      "extensions/browser/permissions/permissions_updater.cc": "e47c4896041f45ee1f06d1bc5ef88e61a665efd2fbf4c335935e7be15cc2bb83",
+      "extensions/browser/permissions/permissions_updater.h": "966b085a675198aacdc7294075d73b1110101550ab14986b9fa3109ff55e00ad",
+      "extensions/browser/user_script_manager.cc": "8a0c286b6aeaeffb73e1f5ce5fd2270f21269f6e62a89962367a8986c5b9007e",
+      "extensions/browser/user_script_manager.h": "503e44eed3fda306d2250455370d1db3c327c006c242aa77ca4284d0aa09d619"
+    }
+  },
+  "applicationPhase": "after Electron upstream Chromium patches; before GN generation or compilation",
+  "patches": [
+    {
+      "file": "0001-chromium-zacro-native-permissions.patch",
+      "target": "chromium",
+      "strip": 1,
+      "sha256": "5ea0510619525ee16de46d93ae00287592f7fd4d0f6cc4a9a7786f23be64cff0"
+    },
+    {
+      "file": "0002-electron-zacro-native-hooks.patch",
+      "target": "electron",
+      "strip": 1,
+      "sha256": "8c0fb1671a81d1c431e9dad5a4ca680dc28e1b06d582a6ff13e13a0c022d4299"
+    }
+  ]
+}

@@ -1,0 +1,1363 @@
+diff --git a/shell/browser/api/electron_api_extensions.cc b/shell/browser/api/electron_api_extensions.cc
+index 21b98c7..c66d1a7 100644
+--- a/shell/browser/api/electron_api_extensions.cc
++++ b/shell/browser/api/electron_api_extensions.cc
+@@ -4,11 +4,42 @@
+ 
+ #include "shell/browser/api/electron_api_extensions.h"
+ 
++#include <memory>
++#include <optional>
++#include <set>
++#include <string>
++#include <string_view>
++#include <utility>
++
++#include "base/containers/fixed_flat_set.h"
++#include "base/functional/bind.h"
++#include "base/functional/callback_helpers.h"
++#include "base/strings/utf_string_conversions.h"
+ #include "chrome/browser/browser_process.h"
++#include "components/prefs/pref_service.h"
++#include "content/public/browser/font_list_async.h"
++#include "content/public/browser/web_contents.h"
++#include "extensions/browser/extension_prefs.h"
++#include "extensions/browser/scripting_constants.h"
++#include "extensions/browser/scripting_utils.h"
++#include "extensions/browser/state_store.h"
++#include "extensions/browser/permissions/active_tab_permission_granter.h"
++#include "extensions/browser/permissions/permissions_updater.h"
++#include "extensions/browser/user_script_manager.h"
++#include "extensions/common/manifest_handlers/permissions_parser.h"
++#include "extensions/common/permissions/permission_set.h"
++#include "extensions/common/permissions/permissions_data.h"
++#include "shell/browser/api/electron_api_web_contents.h"
++#include "shell/browser/extensions/electron_extension_loader.h"
++#include "shell/browser/font_defaults.h"
++#include "third_party/blink/public/common/web_preferences/web_preferences.h"
++#include "third_party/icu/source/common/unicode/uscript.h"
++
+ #include "extensions/browser/extension_registry.h"
+ #include "gin/arguments.h"
+ #include "gin/converter.h"
+ #include "gin/object_template_builder.h"
++#include "gin/persistent.h"
+ #include "shell/browser/electron_browser_context.h"
+ #include "shell/browser/extensions/electron_extension_system.h"
+ #include "shell/browser/javascript_environment.h"
+@@ -17,6 +48,7 @@
+ #include "shell/common/gin_converters/gurl_converter.h"
+ #include "shell/common/gin_converters/value_converter.h"
+ #include "shell/common/gin_helper/dictionary.h"
++#include "shell/common/gin_helper/error_thrower.h"
+ #include "shell/common/gin_helper/promise.h"
+ #include "shell/common/gin_helper/wrappable_pointer_tags.h"
+ #include "shell/common/node_util.h"
+@@ -63,18 +95,38 @@ v8::Local<v8::Promise> Extensions::LoadExtension(
+   }
+ 
+   int load_flags = extensions::Extension::FOLLOW_SYMLINKS_ANYWHERE;
++  std::optional<base::DictValue> reviewed_permissions;
++  std::optional<bool> initial_user_scripts_enabled;
+   gin_helper::Dictionary options;
+   if (args->GetNext(&options)) {
+     bool allowFileAccess = false;
+     options.Get("allowFileAccess", &allowFileAccess);
+     if (allowFileAccess)
+       load_flags |= extensions::Extension::ALLOW_FILE_ACCESS;
++    if (options.Has("zacroReviewedPermissions")) {
++      base::DictValue reviewed;
++      if (!options.Get("zacroReviewedPermissions", &reviewed)) {
++        promise.RejectWithErrorMessage("Invalid zacroReviewedPermissions");
++        return handle;
++      }
++      reviewed_permissions = std::move(reviewed);
++      initial_user_scripts_enabled = false;
++    }
++    if (options.Has("zacroUserScriptsEnabled")) {
++      bool enabled;
++      if (!options.Get("zacroUserScriptsEnabled", &enabled)) {
++        promise.RejectWithErrorMessage("Invalid zacroUserScriptsEnabled");
++        return handle;
++      }
++      initial_user_scripts_enabled = enabled;
++    }
+   }
+ 
+   auto* extension_system = static_cast<extensions::ElectronExtensionSystem*>(
+       extensions::ExtensionSystem::Get(browser_context()));
+   extension_system->LoadExtension(
+-      extension_path, load_flags,
++      extension_path, load_flags, std::move(reviewed_permissions),
++      initial_user_scripts_enabled,
+       base::BindOnce(
+           [](gin_helper::Promise<const extensions::Extension*> promise,
+              const extensions::Extension* extension,
+@@ -93,6 +145,352 @@ v8::Local<v8::Promise> Extensions::LoadExtension(
+   return handle;
+ }
+ 
++namespace {
++
++// A discarded Chromium callback must reject, rather than leave a native grant
++// promise pending forever. The last owner is released on shutdown/cancellation.
++struct ZacroPermissionUpdate {
++  explicit ZacroPermissionUpdate(v8::Isolate* isolate) : promise(isolate) {}
++  ~ZacroPermissionUpdate() {
++    if (!finished)
++      promise.RejectWithErrorMessage("Permission update cancelled");
++  }
++  void Reject(const std::string& error) {
++    if (!finished) {
++      finished = true;
++      promise.RejectWithErrorMessage(error);
++    }
++  }
++  gin_helper::Promise<void> promise;
++  bool finished = false;
++};
++
++const extensions::Extension* EnabledExtension(content::BrowserContext* context,
++                                              const std::string& id) {
++  if (context->IsOffTheRecord())
++    return nullptr;
++  return extensions::ExtensionRegistry::Get(context)
++      ->enabled_extensions()
++      .GetByID(id);
++}
++
++}  // namespace
++
++base::DictValue Extensions::GetZacroCapabilities() {
++  return base::DictValue()
++      .Set("version", 1)
++      .Set("activeTab", true)
++      .Set("reviewedPermissions", true)
++      .Set("userScripts", true)
++      .Set("fontSettings", true);
++}
++
++v8::Local<v8::Promise> Extensions::GrantZacroActiveTab(
++    v8::Isolate* isolate,
++    const std::string& extension_id,
++    int web_contents_id) {
++  gin_helper::Promise<void> promise(isolate);
++  auto handle = promise.GetHandle();
++  auto* extension = EnabledExtension(browser_context(), extension_id);
++  auto* wrapper = WebContents::FromID(web_contents_id);
++  auto* contents = wrapper ? wrapper->GetWebContents() : nullptr;
++  if (!extension || !contents || contents->IsBeingDestroyed() ||
++      contents->GetBrowserContext() != browser_context() ||
++      !contents->GetLastCommittedURL().SchemeIsHTTPOrHTTPS() ||
++      !extension->permissions_data()->HasAPIPermission(
++          extensions::mojom::APIPermissionID::kActiveTab)) {
++    promise.RejectWithErrorMessage(
++        "Invalid activeTab extension, session or tab");
++    return handle;
++  }
++  extensions::ActiveTabPermissionGranter::CreateForWebContents(
++      contents, web_contents_id, browser_context());
++  auto* granter =
++      extensions::ActiveTabPermissionGranter::FromWebContents(contents);
++  granter->GrantIfRequestedWithCallback(
++      extension,
++      base::BindOnce(
++          [](gin_helper::Promise<void> promise, bool granted) {
++            if (granted)
++              promise.Resolve();
++            else
++              promise.RejectWithErrorMessage("activeTab grant cancelled");
++          },
++          std::move(promise)));
++  return handle;
++}
++
++v8::Local<v8::Promise> Extensions::SetZacroReviewedPermissions(
++    v8::Isolate* isolate,
++    const std::string& extension_id,
++    base::DictValue reviewed) {
++  auto operation = std::make_shared<ZacroPermissionUpdate>(isolate);
++  auto handle = operation->promise.GetHandle();
++  scoped_refptr<const extensions::Extension> extension =
++      EnabledExtension(browser_context(), extension_id);
++  if (!extension || pending_permission_updates_.contains(extension_id)) {
++    operation->Reject("Invalid extension or permission update already pending");
++    return handle;
++  }
++  std::string error;
++  auto desired =
++      extensions::ParseZacroReviewedPermissions(*extension, reviewed, &error);
++  if (!desired) {
++    operation->Reject(error);
++    return handle;
++  }
++  if (!desired->HasAPIPermission(
++          extensions::mojom::APIPermissionID::kUserScripts)) {
++    extensions::ExtensionSystem::Get(browser_context())
++        ->user_script_manager()
++        ->SetUserScriptPrefEnabled(extension_id, false);
++  }
++  // A reviewed revocation also invalidates temporary grants. The updater's
++  // forced network barrier below follows all these clear operations, including
++  // when only an API permission (such as optional activeTab) was removed.
++  auto revoked = extensions::PermissionSet::CreateDifference(
++      extension->permissions_data()->active_permissions(), *desired);
++  if (!revoked->IsEmpty()) {
++    for (auto* wrapper : WebContents::GetWebContentsList()) {
++      auto* contents = wrapper->GetWebContents();
++      if (contents && !contents->IsBeingDestroyed() &&
++          contents->GetBrowserContext() == browser_context()) {
++        if (auto* granter =
++                extensions::ActiveTabPermissionGranter::FromWebContents(
++                    contents))
++          granter->ClearActiveExtensionAndNotify(extension_id);
++      }
++    }
++  }
++  pending_permission_updates_.insert(extension_id);
++  auto context =
++      static_cast<ElectronBrowserContext*>(browser_context())->GetWeakPtr();
++  auto cleanup = std::make_shared<base::ScopedClosureRunner>(
++      base::BindOnce(&Extensions::ClearPendingPermissionUpdate,
++                     gin::WrapPersistent(weak_factory_.GetWeakCell(
++                         isolate->GetCppHeap()->GetAllocationHandle())),
++                     extension_id));
++  extensions::PermissionsUpdater(browser_context())
++      .SetZacroReviewedPermissions(
++          *extension, *desired,
++          base::BindOnce(
++              [](base::WeakPtr<ElectronBrowserContext> context,
++                 scoped_refptr<const extensions::Extension> extension,
++                 std::shared_ptr<ZacroPermissionUpdate> operation,
++                 std::shared_ptr<base::ScopedClosureRunner> cleanup) {
++                if (!context ||
++                    EnabledExtension(context.get(), extension->id()) !=
++                        extension.get()) {
++                  operation->Reject(
++                      "Extension unloaded during permission update");
++                  return;
++                }
++                context->prefs()->CommitPendingWrite(base::BindOnce(
++                    [](base::WeakPtr<ElectronBrowserContext> context,
++                       scoped_refptr<const extensions::Extension> extension,
++                       std::shared_ptr<ZacroPermissionUpdate> operation,
++                       std::shared_ptr<base::ScopedClosureRunner> cleanup) {
++                      if (!context ||
++                          EnabledExtension(context.get(), extension->id()) !=
++                              extension.get()) {
++                        operation->Reject(
++                            "Extension unloaded during permission persistence");
++                        return;
++                      }
++                      cleanup->RunAndReset();
++                      operation->finished = true;
++                      operation->promise.Resolve();
++                    },
++                    context, extension, operation, cleanup));
++              },
++              context, extension, operation, cleanup));
++  return handle;
++}
++
++void Extensions::ClearPendingPermissionUpdate(const std::string& extension_id) {
++  pending_permission_updates_.erase(extension_id);
++}
++
++v8::Local<v8::Promise> Extensions::ResetZacroExtensionState(
++    v8::Isolate* isolate,
++    const std::string& extension_id) {
++  gin_helper::Promise<void> promise(isolate);
++  auto handle = promise.GetHandle();
++  // Only the trusted host calls this after unloading a permanently removed
++  // installation. Ordinary disable/reload deliberately never calls this hook.
++  if (browser_context()->IsOffTheRecord() || extension_id.size() != 32 ||
++      extension_id.find_first_not_of("abcdefghijklmnop") != std::string::npos ||
++      extensions::ExtensionRegistry::Get(browser_context())
++          ->GetInstalledExtension(extension_id) ||
++      pending_permission_updates_.contains(extension_id)) {
++    promise.RejectWithErrorMessage("Extension must be unloaded before state reset");
++    return handle;
++  }
++  auto* store = extensions::ExtensionSystem::Get(browser_context())
++                    ->dynamic_user_scripts_store();
++  if (!store) {
++    promise.RejectWithErrorMessage("Native script store unavailable");
++    return handle;
++  }
++  extensions::scripting::ClearPersistentScriptURLPatterns(browser_context(),
++                                                         extension_id);
++  extensions::ExtensionPrefs::Get(browser_context())->SetBooleanPref(
++      extension_id, extensions::UserScriptManager::kUserScriptsAllowedPref, false);
++  store->RemoveExtensionValue(
++      extension_id, extensions::scripting::kRegisteredScriptsStorageKey);
++  // The store's sequenced backend completes this read after all preceding
++  // writes/removals, including writes queued by the former script loader.
++  auto context =
++      static_cast<ElectronBrowserContext*>(browser_context())->GetWeakPtr();
++  store->GetExtensionValue(
++      extension_id, extensions::scripting::kRegisteredScriptsStorageKey,
++      base::BindOnce(
++          [](base::WeakPtr<ElectronBrowserContext> context,
++             gin_helper::Promise<void> promise,
++             std::optional<base::Value> remaining) {
++            if (!context || remaining) {
++              promise.RejectWithErrorMessage("Native script state reset failed");
++              return;
++            }
++            context->prefs()->CommitPendingWrite(base::BindOnce(
++                [](base::WeakPtr<ElectronBrowserContext> context,
++                   gin_helper::Promise<void> promise) {
++                  if (context)
++                    promise.Resolve();
++                  else
++                    promise.RejectWithErrorMessage("Native state reset cancelled");
++                },
++                context, std::move(promise)));
++          },
++          context, std::move(promise)));
++  return handle;
++}
++
++void Extensions::SetZacroUserScriptsEnabled(gin::Arguments* args,
++                                            const std::string& extension_id,
++                                            bool enabled) {
++  auto* extension = EnabledExtension(browser_context(), extension_id);
++  if (!extension ||
++      (enabled && !extension->permissions_data()->HasAPIPermission(
++                      extensions::mojom::APIPermissionID::kUserScripts))) {
++    gin_helper::ErrorThrower(args->isolate())
++        .ThrowError("Invalid extension or userScripts not declared");
++    return;
++  }
++  extensions::ExtensionSystem::Get(browser_context())
++      ->user_script_manager()
++      ->SetUserScriptPrefEnabled(extension_id, enabled);
++}
++
++void Extensions::SetZacroFontPreferences(gin::Arguments* args,
++                                         base::DictValue overrides) {
++  static constexpr auto families = base::MakeFixedFlatSet<std::string_view>(
++      {"standard", "serif", "sansserif", "fixed", "cursive", "fantasy",
++       "math"});
++  static constexpr auto sizes = base::MakeFixedFlatSet<std::string_view>(
++      {"defaultFontSize", "defaultFixedFontSize", "minimumFontSize"});
++  bool valid = overrides.size() <= 4;
++  for (const auto item : overrides) {
++    if (item.first == "fonts") {
++      if (!item.second.is_list() || item.second.GetList().size() > 2048) {
++        valid = false;
++        break;
++      }
++      std::set<std::string> keys;
++      for (const auto& font : item.second.GetList()) {
++        if (!font.is_dict()) {
++          valid = false;
++          break;
++        }
++        const auto& dict = font.GetDict();
++        const auto* script = dict.FindString("script");
++        const auto* family = dict.FindString("genericFamily");
++        const auto* name = dict.FindString("fontId");
++        UScriptCode code;
++        UErrorCode status = U_ZERO_ERROR;
++        if (dict.size() != 3 || !script || script->size() != 4 || !family ||
++            !name || !families.contains(*family) || name->size() > 256 ||
++            name->find('\0') != std::string::npos ||
++            uscript_getCode(script->c_str(), &code, 1, &status) != 1 ||
++            U_FAILURE(status) || *script != uscript_getShortName(code) ||
++            !keys.insert(*script + ":" + *family).second) {
++          valid = false;
++          break;
++        }
++      }
++    } else if (!sizes.contains(item.first) || !item.second.is_int() ||
++               item.second.GetInt() <
++                   (item.first == "minimumFontSize" ? 0 : 1) ||
++               item.second.GetInt() > 512) {
++      valid = false;
++    }
++  }
++  if (!valid) {
++    gin_helper::ErrorThrower(args->isolate())
++        .ThrowError("Invalid native font preference map");
++    return;
++  }
++  static_cast<ElectronBrowserContext*>(browser_context())
++      ->SetZacroFontPreferences(std::move(overrides));
++  for (auto* wrapper : WebContents::GetWebContentsList()) {
++    auto* contents = wrapper->GetWebContents();
++    if (contents && !contents->IsBeingDestroyed() &&
++        contents->GetBrowserContext() == browser_context())
++      contents->OnWebPreferencesChanged();
++  }
++}
++
++base::DictValue Extensions::GetZacroFontPreferences() {
++  blink::web_pref::WebPreferences prefs;
++  SetFontDefaults(&prefs);
++  ApplyZacroFontPreferences(
++      &prefs, static_cast<ElectronBrowserContext*>(browser_context())
++                  ->zacro_font_preferences());
++  base::ListValue fonts;
++  auto append = [&fonts](const char* family,
++                         const blink::web_pref::ScriptFontFamilyMap& map) {
++    for (const auto& [script, name] : map) {
++      fonts.Append(base::DictValue()
++                       .Set("script", script)
++                       .Set("genericFamily", family)
++                       .Set("fontId", base::UTF16ToUTF8(name)));
++    }
++  };
++  append("standard", prefs.standard_font_family_map);
++  append("serif", prefs.serif_font_family_map);
++  append("sansserif", prefs.sans_serif_font_family_map);
++  append("fixed", prefs.fixed_font_family_map);
++  append("cursive", prefs.cursive_font_family_map);
++  append("fantasy", prefs.fantasy_font_family_map);
++  append("math", prefs.math_font_family_map);
++  return base::DictValue()
++      .Set("fonts", std::move(fonts))
++      .Set("defaultFontSize", prefs.default_font_size)
++      .Set("defaultFixedFontSize", prefs.default_fixed_font_size)
++      .Set("minimumFontSize", prefs.minimum_font_size);
++}
++
++v8::Local<v8::Promise> Extensions::GetZacroFontList(v8::Isolate* isolate) {
++  gin_helper::Promise<base::ListValue> promise(isolate);
++  auto handle = promise.GetHandle();
++  content::GetFontListAsync(base::BindOnce(
++      [](gin_helper::Promise<base::ListValue> promise, base::ListValue fonts) {
++        base::ListValue result;
++        for (const auto& font : fonts) {
++          if (font.is_list() && font.GetList().size() >= 2 &&
++              font.GetList()[0].is_string() && font.GetList()[1].is_string()) {
++            result.Append(
++                base::DictValue()
++                    .Set("fontId", font.GetList()[0].GetString())
++                    .Set("displayName", font.GetList()[1].GetString()));
++          }
++        }
++        promise.Resolve(std::move(result));
++      },
++      std::move(promise)));
++  return handle;
++}
++
+ void Extensions::RemoveExtension(const std::string& extension_id) {
+   auto* extension_system = static_cast<extensions::ElectronExtensionSystem*>(
+       extensions::ExtensionSystem::Get(browser_context()));
+@@ -146,12 +544,29 @@ gin::ObjectTemplateBuilder Extensions::GetObjectTemplateBuilder(
+     v8::Isolate* isolate) {
+   return gin_helper::EventEmitterMixin<Extensions>::GetObjectTemplateBuilder(
+              isolate)
++      .SetMethod("getZacroCapabilities", &Extensions::GetZacroCapabilities)
++      .SetMethod("grantZacroActiveTab", &Extensions::GrantZacroActiveTab)
++      .SetMethod("setZacroReviewedPermissions",
++                 &Extensions::SetZacroReviewedPermissions)
++      .SetMethod("resetZacroExtensionState", &Extensions::ResetZacroExtensionState)
++      .SetMethod("setZacroUserScriptsEnabled",
++                 &Extensions::SetZacroUserScriptsEnabled)
++      .SetMethod("setZacroFontPreferences",
++                 &Extensions::SetZacroFontPreferences)
++      .SetMethod("getZacroFontPreferences",
++                 &Extensions::GetZacroFontPreferences)
++      .SetMethod("getZacroFontList", &Extensions::GetZacroFontList)
+       .SetMethod("loadExtension", &Extensions::LoadExtension)
+       .SetMethod("removeExtension", &Extensions::RemoveExtension)
+       .SetMethod("getExtension", &Extensions::GetExtension)
+       .SetMethod("getAllExtensions", &Extensions::GetAllExtensions);
+ }
+ 
++void Extensions::Trace(cppgc::Visitor* visitor) const {
++  gin::Wrappable<Extensions>::Trace(visitor);
++  visitor->Trace(weak_factory_);
++}
++
+ const gin::WrapperInfo* Extensions::wrapper_info() const {
+   return &kWrapperInfo;
+ }
+diff --git a/shell/browser/api/electron_api_extensions.h b/shell/browser/api/electron_api_extensions.h
+index 67f5642..3850056 100644
+--- a/shell/browser/api/electron_api_extensions.h
++++ b/shell/browser/api/electron_api_extensions.h
+@@ -5,8 +5,12 @@
+ #ifndef ELECTRON_SHELL_BROWSER_API_ELECTRON_API_EXTENSIONS_H_
+ #define ELECTRON_SHELL_BROWSER_API_ELECTRON_API_EXTENSIONS_H_
+ 
++#include <set>
++
+ #include "base/memory/raw_ptr.h"
++#include "base/values.h"
+ #include "extensions/browser/extension_registry_observer.h"
++#include "gin/weak_cell.h"
+ #include "gin/wrappable.h"
+ #include "shell/browser/event_emitter_mixin.h"
+ 
+@@ -26,6 +30,7 @@ class Extensions final : public gin::Wrappable<Extensions>,
+   // gin::Wrappable
+   static const gin::WrapperInfo kWrapperInfo;
+   const gin::WrapperInfo* wrapper_info() const override;
++  void Trace(cppgc::Visitor* visitor) const override;
+   const char* GetHumanReadableName() const override;
+   gin::ObjectTemplateBuilder GetObjectTemplateBuilder(
+       v8::Isolate* isolate) override;
+@@ -43,6 +48,23 @@ class Extensions final : public gin::Wrappable<Extensions>,
+                                     const std::string& extension_id);
+   v8::Local<v8::Value> GetAllExtensions(v8::Isolate* isolate);
+ 
++  base::DictValue GetZacroCapabilities();
++  v8::Local<v8::Promise> GrantZacroActiveTab(v8::Isolate* isolate,
++                                             const std::string& extension_id,
++                                             int web_contents_id);
++  v8::Local<v8::Promise> SetZacroReviewedPermissions(
++      v8::Isolate* isolate,
++      const std::string& extension_id,
++      base::DictValue reviewed);
++  v8::Local<v8::Promise> ResetZacroExtensionState(
++      v8::Isolate* isolate, const std::string& extension_id);
++  void SetZacroUserScriptsEnabled(gin::Arguments* args,
++                                  const std::string& extension_id,
++                                  bool enabled);
++  void SetZacroFontPreferences(gin::Arguments* args, base::DictValue overrides);
++  base::DictValue GetZacroFontPreferences();
++  v8::Local<v8::Promise> GetZacroFontList(v8::Isolate* isolate);
++
+   // extensions::ExtensionRegistryObserver:
+   void OnExtensionLoaded(content::BrowserContext* browser_context,
+                          const extensions::Extension* extension) override;
+@@ -61,7 +83,11 @@ class Extensions final : public gin::Wrappable<Extensions>,
+     return browser_context_.get();
+   }
+ 
++  void ClearPendingPermissionUpdate(const std::string& extension_id);
++
+   const raw_ptr<content::BrowserContext> browser_context_;
++  std::set<std::string> pending_permission_updates_;
++  gin::WeakCellFactory<Extensions> weak_factory_{this};
+ };
+ 
+ }  // namespace api
+diff --git a/shell/browser/electron_browser_client.cc b/shell/browser/electron_browser_client.cc
+index 63130d3..eb2dde7 100644
+--- a/shell/browser/electron_browser_client.cc
++++ b/shell/browser/electron_browser_client.cc
+@@ -523,6 +523,10 @@ void ElectronBrowserClient::OverrideWebPreferences(
+   if (auto* web_preferences = WebContentsPreferences::From(web_contents)) {
+     web_preferences->OverrideWebkitPrefs(prefs, renderer_prefs);
+   }
++  const auto& overrides =
++      static_cast<ElectronBrowserContext*>(web_contents->GetBrowserContext())
++          ->zacro_font_preferences();
++  ApplyZacroFontPreferences(prefs, overrides);
+ }
+ 
+ bool ElectronBrowserClient::WebPreferencesNeedUpdateForColorRelatedStateChanges(
+diff --git a/shell/browser/electron_browser_context.h b/shell/browser/electron_browser_context.h
+index 64f4c28..46572e3 100644
+--- a/shell/browser/electron_browser_context.h
++++ b/shell/browser/electron_browser_context.h
+@@ -14,6 +14,7 @@
+ 
+ #include "base/files/file_path.h"
+ #include "base/memory/weak_ptr.h"
++#include "base/values.h"
+ #include "content/public/browser/browser_context.h"
+ #include "content/public/browser/media_stream_request.h"
+ #include "mojo/public/cpp/bindings/remote.h"
+@@ -89,6 +90,13 @@ class ElectronBrowserContext : public content::BrowserContext {
+ 
+   static void DestroyAllContexts();
+ 
++  void SetZacroFontPreferences(base::DictValue value) {
++    zacro_font_preferences_ = std::move(value);
++  }
++  const base::DictValue& zacro_font_preferences() const {
++    return zacro_font_preferences_;
++  }
++
+   void SetUserAgent(const std::string& user_agent);
+   std::string GetUserAgent() const;
+   bool can_use_http_cache() const { return use_cache_; }
+@@ -241,6 +249,7 @@ class ElectronBrowserContext : public content::BrowserContext {
+   // In-memory cache that holds objects that have been granted permissions.
+   DevicePermissionMap granted_devices_;
+ 
++  base::DictValue zacro_font_preferences_;
+   base::WeakPtrFactory<ElectronBrowserContext> weak_factory_{this};
+ };
+ 
+diff --git a/shell/browser/extensions/electron_extension_loader.cc b/shell/browser/extensions/electron_extension_loader.cc
+index 6d687b5..d840bb5 100644
+--- a/shell/browser/extensions/electron_extension_loader.cc
++++ b/shell/browser/extensions/electron_extension_loader.cc
+@@ -24,12 +24,19 @@
+ #include "extensions/browser/extension_pref_names.h"
+ #include "extensions/browser/extension_prefs.h"
+ #include "extensions/browser/extension_registry.h"
++#include "extensions/browser/extension_system.h"
++#include "extensions/browser/permissions/permissions_updater.h"
+ #include "extensions/browser/pref_names.h"
++#include "extensions/browser/user_script_manager.h"
+ #include "extensions/common/constants.h"
+ #include "extensions/common/error_utils.h"
+ #include "extensions/common/file_util.h"
+ #include "extensions/common/manifest_constants.h"
+ #include "extensions/common/manifest_handlers/background_info.h"
++#include "extensions/common/manifest_handlers/permissions_parser.h"
++#include "extensions/common/permissions/api_permission_set.h"
++#include "extensions/common/permissions/permission_set.h"
++#include "extensions/common/permissions/permissions_data.h"
+ 
+ namespace extensions {
+ 
+@@ -97,6 +104,75 @@ std::pair<scoped_refptr<const Extension>, std::string> LoadUnpacked(
+ 
+ }  // namespace
+ 
++std::unique_ptr<PermissionSet> ParseZacroReviewedPermissions(
++    const Extension& extension,
++    const base::DictValue& value,
++    std::string* error) {
++  const auto* names = value.FindList("permissions");
++  const auto* origins = value.FindList("origins");
++  if (!names || !origins || names->size() > 256 || origins->size() > 1024 ||
++      value.size() != 2) {
++    *error = "Expected bounded permissions and origins arrays";
++    return nullptr;
++  }
++  for (const auto& name : *names) {
++    if (!name.is_string() || name.GetString().size() > 128) {
++      *error = "Invalid API permission";
++      return nullptr;
++    }
++  }
++  APIPermissionSet apis;
++  std::u16string parse_error;
++  std::vector<std::string> unhandled;
++  if (!APIPermissionSet::ParseFromJSON(
++          *names, APIPermissionSet::kDisallowInternalPermissions, &apis,
++          &parse_error, &unhandled) ||
++      !unhandled.empty()) {
++    *error = "Unknown or internal API permission";
++    return nullptr;
++  }
++  URLPatternSet hosts;
++  for (const auto& origin : *origins) {
++    URLPattern pattern(Extension::kValidHostPermissionSchemes);
++    if (!origin.is_string() || origin.GetString().size() > 4096 ||
++        pattern.Parse(origin.GetString()) !=
++            URLPattern::ParseResult::kSuccess) {
++      *error = "Invalid host permission";
++      return nullptr;
++    }
++    hosts.AddPattern(pattern);
++  }
++  const auto& required = PermissionsParser::GetRequiredPermissions(&extension);
++  const auto& optional = PermissionsParser::GetOptionalPermissions(&extension);
++  auto requested = std::make_unique<PermissionSet>(
++      std::move(apis), required.manifest_permissions().Clone(),
++      std::move(hosts), required.scriptable_hosts().Clone());
++  auto declared = PermissionSet::CreateUnion(required, optional);
++  if (!declared->Contains(*requested) || !requested->Contains(required)) {
++    *error =
++        "Reviewed permissions must contain required and stay within declared "
++        "permissions";
++    return nullptr;
++  }
++  return requested;
++}
++
++void SeedZacroReviewedPermissions(content::BrowserContext* context,
++                                  const Extension& extension,
++                                  const PermissionSet& permissions) {
++  auto* prefs = ExtensionPrefs::Get(context);
++  if (auto old = prefs->GetGrantedPermissions(extension.id()))
++    prefs->RemoveGrantedPermissions(extension.id(), *old);
++  if (auto old = prefs->GetRuntimeGrantedPermissions(extension.id()))
++    prefs->RemoveRuntimeGrantedPermissions(extension.id(), *old);
++  prefs->SetDesiredActivePermissions(extension.id(), permissions);
++  prefs->AddGrantedPermissions(extension.id(), permissions);
++  prefs->AddRuntimeGrantedPermissions(extension.id(), permissions);
++  // Initialize before AddExtension can start a worker or inject a script.
++  PermissionsUpdater(context).InitializePermissionsWithoutManagement(
++      &extension);
++}
++
+ ElectronExtensionLoader::ElectronExtensionLoader(
+     content::BrowserContext* browser_context)
+     : browser_context_(browser_context),
+@@ -112,11 +188,15 @@ ElectronExtensionLoader::~ElectronExtensionLoader() = default;
+ void ElectronExtensionLoader::LoadExtension(
+     const base::FilePath& extension_dir,
+     int load_flags,
++    std::optional<base::DictValue> reviewed_permissions,
++    std::optional<bool> initial_user_scripts_enabled,
+     base::OnceCallback<void(const Extension*, const std::string&)> cb) {
+   GetExtensionFileTaskRunner()->PostTaskAndReplyWithResult(
+       FROM_HERE, base::BindOnce(&LoadUnpacked, extension_dir, load_flags),
+       base::BindOnce(&ElectronExtensionLoader::FinishExtensionLoad,
+-                     weak_factory_.GetWeakPtr(), std::move(cb)));
++                     weak_factory_.GetWeakPtr(),
++                     std::move(reviewed_permissions),
++                     initial_user_scripts_enabled, std::move(cb)));
+ }
+ 
+ void ElectronExtensionLoader::ReloadExtension(const ExtensionId& extension_id) {
+@@ -142,10 +222,46 @@ void ElectronExtensionLoader::UnloadExtension(
+ }
+ 
+ void ElectronExtensionLoader::FinishExtensionLoad(
++    std::optional<base::DictValue> reviewed_permissions,
++    std::optional<bool> initial_user_scripts_enabled,
+     base::OnceCallback<void(const Extension*, const std::string&)> cb,
+     std::pair<scoped_refptr<const Extension>, std::string> result) {
+   scoped_refptr<const Extension> extension = result.first;
+   if (extension) {
++    if (reviewed_permissions) {
++      if (ExtensionRegistry::Get(browser_context_)
++              ->GetInstalledExtension(extension->id())) {
++        std::move(cb).Run(
++            nullptr,
++            "Extension already loaded; use reviewed permission update");
++        return;
++      }
++      std::string error;
++      auto permissions = ParseZacroReviewedPermissions(
++          *extension, *reviewed_permissions, &error);
++      if (!permissions) {
++        std::move(cb).Run(nullptr, error);
++        return;
++      }
++      SeedZacroReviewedPermissions(browser_context_, *extension, *permissions);
++    } else {
++      PermissionsUpdater(browser_context_)
++          .InitializePermissionsWithoutManagement(extension.get());
++    }
++    if (initial_user_scripts_enabled) {
++      if (ExtensionRegistry::Get(browser_context_)
++              ->GetInstalledExtension(extension->id()) ||
++          (*initial_user_scripts_enabled &&
++           !extension->permissions_data()->HasAPIPermission(
++               mojom::APIPermissionID::kUserScripts))) {
++        std::move(cb).Run(nullptr, "Invalid initial userScripts consent");
++        return;
++      }
++      ExtensionSystem::Get(browser_context_)
++          ->user_script_manager()
++          ->InitializeUserScriptPrefEnabled(*extension,
++                                            *initial_user_scripts_enabled);
++    }
+     ExtensionPrefs* extension_prefs = ExtensionPrefs::Get(browser_context_);
+ 
+     if (BackgroundInfo::IsServiceWorkerBased(extension.get())) {
+@@ -187,6 +303,8 @@ void ElectronExtensionLoader::FinishExtensionReload(
+     std::pair<scoped_refptr<const Extension>, std::string> result) {
+   scoped_refptr<const Extension> extension = result.first;
+   if (extension) {
++    PermissionsUpdater(browser_context_)
++        .InitializePermissionsWithoutManagement(extension.get());
+     extension_registrar_->AddExtension(extension);
+   }
+ }
+diff --git a/shell/browser/extensions/electron_extension_loader.h b/shell/browser/extensions/electron_extension_loader.h
+index 9aa372c..59c0f3b 100644
+--- a/shell/browser/extensions/electron_extension_loader.h
++++ b/shell/browser/extensions/electron_extension_loader.h
+@@ -5,8 +5,12 @@
+ #ifndef ELECTRON_SHELL_BROWSER_EXTENSIONS_ELECTRON_EXTENSION_LOADER_H_
+ #define ELECTRON_SHELL_BROWSER_EXTENSIONS_ELECTRON_EXTENSION_LOADER_H_
+ 
++#include <memory>
++#include <optional>
+ #include <string>
++
+ #include <utility>
++#include "base/values.h"
+ 
+ #include "base/functional/callback_forward.h"
+ #include "base/memory/raw_ptr.h"
+@@ -25,6 +29,16 @@ class BrowserContext;
+ namespace extensions {
+ 
+ class Extension;
++class PermissionSet;
++
++// Host-only reviewed set. Never called from an ExtensionFunction.
++std::unique_ptr<PermissionSet> ParseZacroReviewedPermissions(
++    const Extension& extension,
++    const base::DictValue& value,
++    std::string* error);
++void SeedZacroReviewedPermissions(content::BrowserContext* context,
++                                  const Extension& extension,
++                                  const PermissionSet& permissions);
+ 
+ // Handles extension loading and reloading using ExtensionRegistrar.
+ class ElectronExtensionLoader : public ExtensionRegistrar::Delegate {
+@@ -47,6 +61,8 @@ class ElectronExtensionLoader : public ExtensionRegistrar::Delegate {
+   // extension on success, or nullptr otherwise.
+   void LoadExtension(const base::FilePath& extension_dir,
+                      int load_flags,
++                     std::optional<base::DictValue> reviewed_permissions,
++                     std::optional<bool> initial_user_scripts_enabled,
+                      base::OnceCallback<void(const Extension* extension,
+                                              const std::string&)> cb);
+ 
+@@ -70,6 +86,8 @@ class ElectronExtensionLoader : public ExtensionRegistrar::Delegate {
+       std::pair<scoped_refptr<const Extension>, std::string> result);
+ 
+   void FinishExtensionLoad(
++      std::optional<base::DictValue> reviewed_permissions,
++      std::optional<bool> initial_user_scripts_enabled,
+       base::OnceCallback<void(const Extension*, const std::string&)> cb,
+       std::pair<scoped_refptr<const Extension>, std::string> result);
+   void DoLoadExtensionForReload(const ExtensionId& extension_id,
+diff --git a/shell/browser/extensions/electron_extension_system.cc b/shell/browser/extensions/electron_extension_system.cc
+index 613f123..cf5fa73 100644
+--- a/shell/browser/extensions/electron_extension_system.cc
++++ b/shell/browser/extensions/electron_extension_system.cc
+@@ -26,6 +26,7 @@
+ #include "extensions/browser/null_app_sorting.h"
+ #include "extensions/browser/quota_service.h"
+ #include "extensions/browser/service_worker_manager.h"
++#include "extensions/browser/state_store.h"
+ #include "extensions/browser/user_script_manager.h"
+ #include "extensions/common/constants.h"
+ #include "shell/browser/extensions/electron_extension_loader.h"
+@@ -50,8 +51,12 @@ ElectronExtensionSystem::~ElectronExtensionSystem() = default;
+ void ElectronExtensionSystem::LoadExtension(
+     const base::FilePath& extension_dir,
+     int load_flags,
++    std::optional<base::DictValue> reviewed_permissions,
++    std::optional<bool> initial_user_scripts_enabled,
+     base::OnceCallback<void(const Extension*, const std::string&)> cb) {
+-  extension_loader_->LoadExtension(extension_dir, load_flags, std::move(cb));
++  extension_loader_->LoadExtension(extension_dir, load_flags,
++                                   std::move(reviewed_permissions),
++                                   initial_user_scripts_enabled, std::move(cb));
+ }
+ 
+ void ElectronExtensionSystem::FinishInitialization() {
+@@ -76,6 +81,9 @@ void ElectronExtensionSystem::InitForRegularProfile(bool extensions_enabled) {
+   service_worker_manager_ =
+       std::make_unique<ServiceWorkerManager>(browser_context_);
+   quota_service_ = std::make_unique<QuotaService>();
++  dynamic_user_scripts_store_ =
++      std::make_unique<StateStore>(browser_context_, store_factory_,
++                                   StateStore::BackendType::SCRIPTS, false);
+   user_script_manager_ = std::make_unique<UserScriptManager>(browser_context_);
+   app_sorting_ = std::make_unique<NullAppSorting>();
+   extension_loader_ =
+@@ -150,7 +158,7 @@ StateStore* ElectronExtensionSystem::rules_store() {
+ }
+ 
+ StateStore* ElectronExtensionSystem::dynamic_user_scripts_store() {
+-  return nullptr;
++  return dynamic_user_scripts_store_.get();
+ }
+ 
+ scoped_refptr<value_store::ValueStoreFactory>
+diff --git a/shell/browser/extensions/electron_extension_system.h b/shell/browser/extensions/electron_extension_system.h
+index 6e8b569..028ac8c 100644
+--- a/shell/browser/extensions/electron_extension_system.h
++++ b/shell/browser/extensions/electron_extension_system.h
+@@ -6,7 +6,10 @@
+ #define ELECTRON_SHELL_BROWSER_EXTENSIONS_ELECTRON_EXTENSION_SYSTEM_H_
+ 
+ #include <memory>
++#include <optional>
++
+ #include <string>
++#include "base/values.h"
+ 
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/weak_ptr.h"
+@@ -44,6 +47,8 @@ class ElectronExtensionSystem : public ExtensionSystem {
+   void LoadExtension(
+       const base::FilePath& extension_dir,
+       int load_flags,
++      std::optional<base::DictValue> reviewed_permissions,
++      std::optional<bool> initial_user_scripts_enabled,
+       base::OnceCallback<void(const Extension*, const std::string&)> cb);
+ 
+   // Finish initialization for the shell extension system.
+@@ -90,6 +95,7 @@ class ElectronExtensionSystem : public ExtensionSystem {
+ 
+   std::unique_ptr<ServiceWorkerManager> service_worker_manager_;
+   std::unique_ptr<QuotaService> quota_service_;
++  std::unique_ptr<StateStore> dynamic_user_scripts_store_;
+   std::unique_ptr<UserScriptManager> user_script_manager_;
+   std::unique_ptr<AppSorting> app_sorting_;
+   std::unique_ptr<ManagementPolicy> management_policy_;
+diff --git a/shell/browser/extensions/electron_extensions_browser_api_provider.cc b/shell/browser/extensions/electron_extensions_browser_api_provider.cc
+index 70b8fe5..ec4f8ec 100644
+--- a/shell/browser/extensions/electron_extensions_browser_api_provider.cc
++++ b/shell/browser/extensions/electron_extensions_browser_api_provider.cc
+@@ -64,6 +64,14 @@ constexpr const char* kUnsupportedWebstorePrivateFunctions[] = {
+ };
+ 
+ void OverrideUnsupportedFunctions(ExtensionFunctionRegistry* registry) {
++  // Zacro review is host-only. Retaining optional declarations must not create
++  // an unreviewed native mutation path, including direct extension IPC
++  // dispatch. Removal must also use the authenticated host path so temporary
++  // grants, userScripts consent and exact update sequencing cannot be bypassed.
++  for (const char* name : {"permissions.request", "permissions.remove"}) {
++    registry->Register(ExtensionFunctionRegistry::FactoryEntry(
++        &NewExtensionFunction<UnsupportedFunction>, name, functions::UNKNOWN));
++  }
+   for (const char* name : kUnsupportedWebstorePrivateFunctions) {
+     registry->Register(ExtensionFunctionRegistry::FactoryEntry(
+         &NewExtensionFunction<UnsupportedFunction>, name, functions::UNKNOWN));
+diff --git a/shell/browser/font_defaults.cc b/shell/browser/font_defaults.cc
+index 5432caf..5c328c8 100644
+--- a/shell/browser/font_defaults.cc
++++ b/shell/browser/font_defaults.cc
+@@ -312,4 +312,36 @@ void SetFontDefaults(blink::web_pref::WebPreferences* prefs) {
+   copy_default_fonts_to_web_prefs(prefs);
+ }
+ 
++void ApplyZacroFontPreferences(blink::web_pref::WebPreferences* prefs,
++                               const base::DictValue& overrides) {
++  if (const auto* fonts = overrides.FindList("fonts")) {
++    for (const auto& font : *fonts) {
++      const auto& value = font.GetDict();
++      const auto& script = *value.FindString("script");
++      const auto& family = *value.FindString("genericFamily");
++      const auto name = base::UTF8ToUTF16(*value.FindString("fontId"));
++      if (family == "standard")
++        prefs->standard_font_family_map[script] = name;
++      else if (family == "serif")
++        prefs->serif_font_family_map[script] = name;
++      else if (family == "sansserif")
++        prefs->sans_serif_font_family_map[script] = name;
++      else if (family == "fixed")
++        prefs->fixed_font_family_map[script] = name;
++      else if (family == "cursive")
++        prefs->cursive_font_family_map[script] = name;
++      else if (family == "fantasy")
++        prefs->fantasy_font_family_map[script] = name;
++      else if (family == "math")
++        prefs->math_font_family_map[script] = name;
++    }
++  }
++  if (auto size = overrides.FindInt("defaultFontSize"))
++    prefs->default_font_size = *size;
++  if (auto size = overrides.FindInt("defaultFixedFontSize"))
++    prefs->default_fixed_font_size = *size;
++  if (auto size = overrides.FindInt("minimumFontSize"))
++    prefs->minimum_font_size = *size;
++}
++
+ }  // namespace electron
+diff --git a/shell/browser/font_defaults.h b/shell/browser/font_defaults.h
+index efe4507..da7c42d 100644
+--- a/shell/browser/font_defaults.h
++++ b/shell/browser/font_defaults.h
+@@ -5,6 +5,8 @@
+ #ifndef ELECTRON_SHELL_BROWSER_FONT_DEFAULTS_H_
+ #define ELECTRON_SHELL_BROWSER_FONT_DEFAULTS_H_
+ 
++#include "base/values.h"
++
+ namespace blink::web_pref {
+ struct WebPreferences;
+ }  // namespace blink::web_pref
+@@ -18,6 +20,8 @@ namespace electron {
+ // Keep the core logic in sync to avoid performance regressions
+ // Refs https://issues.chromium.org/issues/400473071
+ void SetFontDefaults(blink::web_pref::WebPreferences* prefs);
++void ApplyZacroFontPreferences(blink::web_pref::WebPreferences* prefs,
++                               const base::DictValue& overrides);
+ 
+ }  // namespace electron
+ 
+diff --git a/spec/fixtures/api/zacro-native-restart.cjs b/spec/fixtures/api/zacro-native-restart.cjs
+new file mode 100644
+index 0000000..59c29f9
+--- /dev/null
++++ b/spec/fixtures/api/zacro-native-restart.cjs
+@@ -0,0 +1,42 @@
++const { app, BrowserWindow, session } = require('electron');
++const [userData, extensionPath, target, phase] = process.argv.slice(2);
++app.setPath('userData', userData);
++const timeout = setTimeout(() => { console.error('Restart test timed out'); app.exit(1); }, 30000);
++app.whenReady().then(async () => {
++  const profile = session.fromPartition('persist:restart');
++  const extension = await profile.extensions.loadExtension(extensionPath, {
++    zacroReviewedPermissions: { permissions: ['userScripts'], origins: ['http://127.0.0.1/*'] },
++    zacroUserScriptsEnabled: phase !== 'disabled'
++  });
++  const caller = new BrowserWindow({ show: false, webPreferences: { session: profile, sandbox: true } });
++  await caller.loadURL(`chrome-extension://${extension.id}/page.html`);
++  if (phase === 'register') {
++    profile.extensions.setZacroUserScriptsEnabled(extension.id, true);
++    await caller.webContents.executeJavaScript(`chrome.userScripts.register([{id:'restart',matches:['http://127.0.0.1/*'],js:[{code:"document.documentElement.dataset.restart = 'persisted'"}],runAt:'document_end',world:'USER_SCRIPT'}])`);
++  } else if (phase === 'uninstall') {
++    profile.extensions.removeExtension(extension.id);
++    await profile.extensions.resetZacroExtensionState(extension.id);
++  } else if (phase === 'clean') {
++    const registered = await caller.webContents.executeJavaScript('chrome.userScripts.getScripts()');
++    if (registered.length) throw new Error('Uninstalled scripts resurrected after restart');
++    const targetWindow = new BrowserWindow({ show: false, webPreferences: { session: profile, sandbox: true } });
++    await targetWindow.loadURL(target);
++    if (await targetWindow.webContents.executeJavaScript('document.documentElement.dataset.restart') !== undefined) throw new Error('Uninstalled script executed');
++  } else {
++    if (phase === 'disabled') {
++      const disabledWindow = new BrowserWindow({ show: false, webPreferences: { session: profile, sandbox: true } });
++      await disabledWindow.loadURL(target);
++      if (await disabledWindow.webContents.executeJavaScript('document.documentElement.dataset.restart') !== undefined) throw new Error('Stale consent executed a user script before initialization');
++      profile.extensions.setZacroUserScriptsEnabled(extension.id, true);
++    }
++    const registered = await caller.webContents.executeJavaScript('chrome.userScripts.getScripts()');
++    if (!registered.some(script => script.id === 'restart')) throw new Error('Registration lost on restart');
++    const targetWindow = new BrowserWindow({ show: false, webPreferences: { session: profile, sandbox: true } });
++    await targetWindow.loadURL(target);
++    if (await targetWindow.webContents.executeJavaScript('document.documentElement.dataset.restart') !== 'persisted') throw new Error('Persisted user script did not execute');
++  }
++  console.log(`ZACRO_RESTART_${phase}_OK`);
++  clearTimeout(timeout);
++  // Normal shutdown flushes profile prefs and the dynamic script state store.
++  app.quit();
++}).catch(error => { console.error(error); app.exit(1); });
+diff --git a/spec/zacro-native-capabilities.spec.ts b/spec/zacro-native-capabilities.spec.ts
+new file mode 100644
+index 0000000..785008e
+--- /dev/null
++++ b/spec/zacro-native-capabilities.spec.ts
+@@ -0,0 +1,337 @@
++// These acceptance tests require the patched binary. Stock Electron must fail.
++import { BrowserWindow, session, type Session } from 'electron/main';
++import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
++import { spawn } from 'node:child_process';
++import { once } from 'node:events';
++import * as fs from 'node:fs/promises';
++import * as http from 'node:http';
++import * as os from 'node:os';
++import * as path from 'node:path';
++import { closeAllWindows } from './lib/window-helpers.ts';
++
++interface NativeHooks {
++  getZacroCapabilities(): Record<string, number | boolean>;
++  grantZacroActiveTab(id: string, tab: number): Promise<void>;
++  setZacroReviewedPermissions(id: string, value: { permissions: string[]; origins: string[] }): Promise<void>;
++  resetZacroExtensionState(id: string): Promise<void>;
++  setZacroUserScriptsEnabled(id: string, enabled: boolean): void;
++  setZacroFontPreferences(value: Record<string, unknown>): void;
++  getZacroFontPreferences(): { fonts: Array<{script: string; genericFamily: string; fontId: string}>; defaultFontSize: number; defaultFixedFontSize: number; minimumFontSize: number };
++  getZacroFontList(): Promise<Array<{ fontId: string; displayName: string }>>;
++}
++const native = (s: Session) => s.extensions as unknown as NativeHooks;
++
++describe('Zacro privileged native capabilities v1', () => {
++  let directory: string;
++  let profile: Session;
++  let server: http.Server;
++  let url: string;
++  let sequence = 0;
++  const loaded: Array<{ profile: Session; id: string }> = [];
++
++  beforeAll(async () => {
++    directory = await fs.mkdtemp(path.join(os.tmpdir(), 'zacro-native-'));
++    server = http.createServer((_req, res) => {
++      res.setHeader('Content-Type', 'text/html');
++      res.end('<html><body><span id="generic" style="font-family:serif">WWWWiiii</span><span id="explicit" style="font:31px monospace">WWWWiiii</span></body></html>');
++    });
++    server.listen(0, '127.0.0.1');
++    await once(server, 'listening');
++    url = `http://127.0.0.1:${(server.address() as { port: number }).port}/`;
++  });
++  beforeEach(() => {
++    profile = session.fromPartition(`persist:zacro-native-${Date.now()}-${sequence++}`);
++    expect(native(profile).getZacroCapabilities()).toEqual({
++      version: 1, activeTab: true, reviewedPermissions: true, userScripts: true, fontSettings: true
++    });
++  });
++  afterEach(async () => {
++    await closeAllWindows();
++    for (const item of loaded.splice(0)) item.profile.extensions.removeExtension(item.id);
++  });
++  afterAll(async () => {
++    server.close();
++    await fs.rm(directory, { recursive: true, force: true });
++  });
++
++  async function extension(permissions = ['activeTab', 'scripting'], origins: string[] = [], optionalPermissions = ['storage']) {
++    const extensionPath = path.join(directory, `extension-${sequence++}`);
++    await fs.mkdir(extensionPath);
++    await fs.writeFile(path.join(extensionPath, 'manifest.json'), JSON.stringify({
++      manifest_version: 3, name: 'Native capability acceptance', version: '1.0',
++      permissions, host_permissions: origins, optional_permissions: optionalPermissions,
++      optional_host_permissions: ['http://*/*']
++    }));
++    await fs.writeFile(path.join(extensionPath, 'page.html'), '<!doctype html><body>Native caller</body>');
++    const ext = await profile.extensions.loadExtension(extensionPath, {
++      allowFileAccess: false,
++      zacroReviewedPermissions: { permissions, origins }
++    } as Electron.LoadExtensionOptions);
++    loaded.push({ profile, id: ext.id });
++    const caller = new BrowserWindow({ show: false, webPreferences: { session: profile, sandbox: true } });
++    await caller.loadURL(`chrome-extension://${ext.id}/page.html`);
++    return { ext, caller, extensionPath };
++  }
++  async function tab(s = profile, target = url) {
++    const w = new BrowserWindow({ show: false, webPreferences: { session: s, sandbox: true } });
++    await w.loadURL(target);
++    return w;
++  }
++  function inject(caller: BrowserWindow, id: number) {
++    return caller.webContents.executeJavaScript(`chrome.scripting.executeScript({target:{tabId:${id}},func:()=>location.href})`);
++  }
++
++  it('initializes managed, ordinary and runtime-reloaded extensions before activation', async () => {
++    const { ext, caller, extensionPath } = await extension();
++    expect(await caller.webContents.executeJavaScript('chrome.permissions.contains({permissions:["activeTab","scripting"]})')).toBe(true);
++    await native(profile).setZacroReviewedPermissions(ext.id, { permissions: ['activeTab', 'scripting', 'storage'], origins: [] });
++    profile.extensions.removeExtension(ext.id);
++    const ordinaryReady = once(profile.extensions, 'extension-ready');
++    await profile.extensions.loadExtension(extensionPath);
++    await ordinaryReady;
++    const ordinaryCaller = await tab(profile, `chrome-extension://${ext.id}/page.html`);
++    expect(await ordinaryCaller.webContents.executeJavaScript('chrome.permissions.contains({permissions:["storage"]})')).toBe(true);
++    const runtimeReady = once(profile.extensions, 'extension-ready');
++    await ordinaryCaller.webContents.executeJavaScript('setTimeout(() => chrome.runtime.reload(), 0); true');
++    await runtimeReady;
++    const reloadedCaller = await tab(profile, `chrome-extension://${ext.id}/page.html`);
++    expect(await reloadedCaller.webContents.executeJavaScript('chrome.permissions.contains({permissions:["activeTab","scripting","storage"]})')).toBe(true);
++  });
++
++  it('grants only the invoked native tab and rejects cross-profile/private targets', async () => {
++    const { ext, caller } = await extension();
++    const first = await tab();
++    const sameOrigin = await tab();
++    const other = await tab(session.fromPartition(`persist:other-${Date.now()}`));
++    const privateTab = await tab(session.fromPartition(`private-${Date.now()}`));
++    await expect(inject(caller, first.webContents.id)).rejects.toThrow();
++    await expect(native(profile).grantZacroActiveTab(ext.id, other.webContents.id)).rejects.toThrow();
++    await expect(native(profile).grantZacroActiveTab(ext.id, privateTab.webContents.id)).rejects.toThrow();
++    await native(profile).grantZacroActiveTab(ext.id, first.webContents.id);
++    expect((await inject(caller, first.webContents.id))[0].result).toBe(url);
++    await expect(inject(caller, sameOrigin.webContents.id)).rejects.toThrow();
++    await expect(first.webContents.executeJavaScript('typeof require')).resolves.toBe('undefined');
++    await expect(caller.webContents.executeJavaScript('typeof require')).resolves.toBe('undefined');
++  });
++
++  it('revokes on cross-origin navigation, destruction and unload', async () => {
++    const { ext, caller, extensionPath } = await extension();
++    const first = await tab();
++    await native(profile).grantZacroActiveTab(ext.id, first.webContents.id);
++    await first.loadURL('about:blank');
++    await expect(inject(caller, first.webContents.id)).rejects.toThrow();
++    await first.loadURL(url);
++    await expect(inject(caller, first.webContents.id)).rejects.toThrow();
++    await native(profile).grantZacroActiveTab(ext.id, first.webContents.id);
++    const oldId = first.webContents.id;
++    first.destroy();
++    await expect(native(profile).grantZacroActiveTab(ext.id, oldId)).rejects.toThrow();
++    const second = await tab();
++    await native(profile).grantZacroActiveTab(ext.id, second.webContents.id);
++    profile.extensions.removeExtension(ext.id);
++    await expect(native(profile).grantZacroActiveTab(ext.id, second.webContents.id)).rejects.toThrow();
++    const reloaded = await profile.extensions.loadExtension(extensionPath);
++    const freshCaller = await tab(profile, `chrome-extension://${reloaded.id}/page.html`);
++    await expect(inject(freshCaller, second.webContents.id)).rejects.toThrow();
++  });
++
++  it('cancels an in-flight native grant when the target is destroyed', async () => {
++    const { ext } = await extension();
++    const first = await tab();
++    const granting = native(profile).grantZacroActiveTab(ext.id, first.webContents.id);
++    first.destroy();
++    await expect(granting).rejects.toThrow(/cancelled/);
++  });
++
++  it('keeps A pending grants alive when unrelated B unloads or loses rights', async () => {
++    const { ext: a, caller: callerA } = await extension();
++    const { ext: b } = await extension();
++    const first = await tab();
++    const pendingA = native(profile).grantZacroActiveTab(a.id, first.webContents.id);
++    profile.extensions.removeExtension(b.id);
++    await pendingA;
++    expect((await inject(callerA, first.webContents.id))[0].result).toBe(url);
++
++    const { ext: c, caller: callerC } = await extension();
++    await native(profile).setZacroReviewedPermissions(c.id, { permissions: ['activeTab', 'scripting', 'storage'], origins: [] });
++    const second = await tab();
++    await native(profile).grantZacroActiveTab(c.id, second.webContents.id);
++    const nextA = native(profile).grantZacroActiveTab(a.id, second.webContents.id);
++    const revokingC = native(profile).setZacroReviewedPermissions(c.id, { permissions: ['activeTab', 'scripting'], origins: [] });
++    await nextA;
++    await revokingC;
++    expect((await inject(callerA, second.webContents.id))[0].result).toBe(url);
++    await expect(inject(callerC, second.webContents.id)).rejects.toThrow();
++  });
++
++  it('rejects an extension that did not declare activeTab and internal pages', async () => {
++    const { ext } = await extension(['scripting']);
++    const first = await tab();
++    await expect(native(profile).grantZacroActiveTab(ext.id, first.webContents.id)).rejects.toThrow();
++    const { ext: allowed } = await extension();
++    const blank = await tab(profile, 'about:blank');
++    await expect(native(profile).grantZacroActiveTab(allowed.id, blank.webContents.id)).rejects.toThrow();
++  });
++
++  it('updates reviewed rights in the living caller and blocks native review bypass', async () => {
++    const { ext, caller } = await extension();
++    const id = caller.webContents.id;
++    await expect(caller.webContents.executeJavaScript('chrome.permissions.request({permissions:["storage"]})', true)).rejects.toThrow(/not supported/);
++    const before = await caller.webContents.executeJavaScript('chrome.permissions.contains({permissions:["storage"]})');
++    expect(before).toBe(false);
++    await caller.webContents.executeJavaScript('window.aliveMarker = 1701');
++    await native(profile).setZacroReviewedPermissions(ext.id, {
++      permissions: ['activeTab', 'scripting', 'storage'], origins: ['http://127.0.0.1/*']
++    });
++    expect(caller.webContents.id).toBe(id);
++    expect(await caller.webContents.executeJavaScript('window.aliveMarker')).toBe(1701);
++    expect(await caller.webContents.executeJavaScript('chrome.permissions.contains({permissions:["storage"]})')).toBe(true);
++    const first = await tab();
++    expect((await inject(caller, first.webContents.id))[0].result).toBe(url);
++    await native(profile).setZacroReviewedPermissions(ext.id, { permissions: ['activeTab', 'scripting'], origins: [] });
++    await expect(inject(caller, first.webContents.id)).rejects.toThrow();
++    expect(await caller.webContents.executeJavaScript('chrome.permissions.contains({permissions:["storage"]})')).toBe(false);
++    await expect(native(profile).setZacroReviewedPermissions(ext.id, { permissions: ['debugger'], origins: [] })).rejects.toThrow();
++  });
++
++  it('denies native optional permission removal and routes cleanup through the host', async () => {
++    const { ext, caller } = await extension(['scripting'], ['http://127.0.0.1/*'], ['activeTab', 'userScripts']);
++    await native(profile).setZacroReviewedPermissions(ext.id, { permissions: ['scripting', 'activeTab', 'userScripts'], origins: ['http://127.0.0.1/*'] });
++    native(profile).setZacroUserScriptsEnabled(ext.id, true);
++    await caller.webContents.executeJavaScript(`chrome.userScripts.register([{id:'native-removal',matches:['http://127.0.0.1/*'],js:[{code:"document.documentElement.dataset.nativeRemoval = 'ran'"}],runAt:'document_end',world:'USER_SCRIPT'}])`);
++    const first = await tab();
++    await native(profile).grantZacroActiveTab(ext.id, first.webContents.id);
++    expect(await first.webContents.executeJavaScript('document.documentElement.dataset.nativeRemoval')).toBe('ran');
++    await expect(caller.webContents.executeJavaScript('chrome.permissions.remove({permissions:["activeTab","userScripts"]})')).rejects.toThrow(/not supported/);
++    expect(await caller.webContents.executeJavaScript('chrome.permissions.contains({permissions:["activeTab","userScripts"]})')).toBe(true);
++    await native(profile).setZacroReviewedPermissions(ext.id, { permissions: ['scripting'], origins: ['http://127.0.0.1/*'] });
++    expect(await caller.webContents.executeJavaScript('chrome.permissions.contains({permissions:["activeTab","userScripts"]})')).toBe(false);
++    const reloaded = once(first.webContents, 'did-finish-load');
++    first.reload();
++    await reloaded;
++    expect(await first.webContents.executeJavaScript('document.documentElement.dataset.nativeRemoval')).toBeUndefined();
++    await expect(native(profile).grantZacroActiveTab(ext.id, first.webContents.id)).rejects.toThrow();
++  });
++
++  it('retains required hosts when revoking a broader optional origin', async () => {
++    const { ext, caller } = await extension(['scripting'], ['http://127.0.0.1/*']);
++    await native(profile).setZacroReviewedPermissions(ext.id, { permissions: ['scripting'], origins: ['http://*/*'] });
++    await native(profile).setZacroReviewedPermissions(ext.id, { permissions: ['scripting'], origins: ['http://127.0.0.1/*'] });
++    const first = await tab();
++    expect((await inject(caller, first.webContents.id))[0].result).toBe(url);
++  });
++
++  it('replaces persisted optional grants before the next load activates', async () => {
++    const { ext, extensionPath } = await extension();
++    await native(profile).setZacroReviewedPermissions(ext.id, { permissions: ['activeTab', 'scripting', 'storage'], origins: [] });
++    profile.extensions.removeExtension(ext.id);
++    await profile.extensions.loadExtension(extensionPath, {
++      allowFileAccess: false,
++      zacroReviewedPermissions: { permissions: ['activeTab', 'scripting'], origins: [] }
++    } as Electron.LoadExtensionOptions);
++    const caller = await tab(profile, `chrome-extension://${ext.id}/page.html`);
++    expect(await caller.webContents.executeJavaScript('chrome.permissions.contains({permissions:["storage"]})')).toBe(false);
++  });
++
++  it('runs user scripts in an isolated world and disables future execution', async () => {
++    const { ext, caller } = await extension(['userScripts'], ['http://127.0.0.1/*']);
++    native(profile).setZacroUserScriptsEnabled(ext.id, true);
++    await caller.webContents.executeJavaScript(`chrome.userScripts.register([{id:'isolation',matches:['http://127.0.0.1/*'],js:[{code:
++      "globalThis.userOnly = 42; document.documentElement.dataset.zacroUser = JSON.stringify({node:typeof require,extensionId:globalThis.chrome?.runtime?.id || null});"
++    }],runAt:'document_end',world:'USER_SCRIPT'}])`);
++    const first = await tab();
++    expect(await first.webContents.executeJavaScript('JSON.parse(document.documentElement.dataset.zacroUser)')).toEqual({ node: 'undefined', extensionId: null });
++    expect(await first.webContents.executeJavaScript('typeof globalThis.userOnly')).toBe('undefined');
++    native(profile).setZacroUserScriptsEnabled(ext.id, false);
++    const reloaded = once(first.webContents, 'did-finish-load');
++    first.reload();
++    await reloaded;
++    expect(await first.webContents.executeJavaScript('document.documentElement.dataset.zacroUser')).toBeUndefined();
++    native(profile).setZacroUserScriptsEnabled(ext.id, true);
++    profile.extensions.removeExtension(ext.id);
++    const afterRemoval = once(first.webContents, 'did-finish-load');
++    first.reload();
++    await afterRemoval;
++    expect(await first.webContents.executeJavaScript('document.documentElement.dataset.zacroUser')).toBeUndefined();
++  });
++
++  it('clears only permanently uninstalled scripts before same-ID reinstall', async () => {
++    const { ext, caller, extensionPath } = await extension(['userScripts'], ['http://127.0.0.1/*']);
++    native(profile).setZacroUserScriptsEnabled(ext.id, true);
++    await caller.webContents.executeJavaScript(`chrome.userScripts.register([{id:'deleted',matches:['http://127.0.0.1/*'],js:[{code:"document.documentElement.dataset.deleted = 'ran'"}],runAt:'document_end'}])`);
++    await expect(native(profile).resetZacroExtensionState(ext.id)).rejects.toThrow(/unloaded/);
++    profile.extensions.removeExtension(ext.id);
++    await profile.extensions.loadExtension(extensionPath, {
++      zacroReviewedPermissions: { permissions: ['userScripts'], origins: ['http://127.0.0.1/*'] }, zacroUserScriptsEnabled: true
++    } as Electron.LoadExtensionOptions);
++    const preserved = await tab(profile, `chrome-extension://${ext.id}/page.html`);
++    expect((await preserved.webContents.executeJavaScript('chrome.userScripts.getScripts()')).map((script: {id: string}) => script.id)).toEqual(['deleted']);
++    profile.extensions.removeExtension(ext.id);
++    await native(profile).resetZacroExtensionState(ext.id);
++    await profile.extensions.loadExtension(extensionPath, {
++      zacroReviewedPermissions: { permissions: ['userScripts'], origins: ['http://127.0.0.1/*'] }, zacroUserScriptsEnabled: true
++    } as Electron.LoadExtensionOptions);
++    const clean = await tab(profile, `chrome-extension://${ext.id}/page.html`);
++    expect(await clean.webContents.executeJavaScript('chrome.userScripts.getScripts()')).toEqual([]);
++    const first = await tab();
++    expect(await first.webContents.executeJavaScript('document.documentElement.dataset.deleted')).toBeUndefined();
++  });
++
++  it('persists registered user scripts through an actual process restart', async () => {
++    const extensionPath = path.join(directory, 'restart-extension');
++    await fs.mkdir(extensionPath);
++    await fs.writeFile(path.join(extensionPath, 'manifest.json'), JSON.stringify({
++      manifest_version: 3, name: 'Restart native scripts', version: '1.0',
++      permissions: ['userScripts'], host_permissions: ['http://127.0.0.1/*']
++    }));
++    await fs.writeFile(path.join(extensionPath, 'page.html'), '<!doctype html><body>restart</body>');
++    const fixture = path.join(import.meta.dirname, 'fixtures', 'api', 'zacro-native-restart.cjs');
++    const userData = path.join(directory, 'restart-profile');
++    await fs.mkdir(userData, { recursive: true });
++    for (const phase of ['register', 'verify', 'disabled', 'uninstall', 'clean']) {
++      const env = { ...process.env };
++      delete env.ELECTRON_RUN_AS_NODE;
++      const child = spawn(process.execPath, [fixture, userData, extensionPath, url, phase], { env });
++      let output = '';
++      child.stdout.on('data', chunk => { output += chunk; });
++      child.stderr.on('data', chunk => { output += chunk; });
++      const [code] = await once(child, 'exit');
++      expect(code, output).toBe(0);
++      expect(output).toContain(`ZACRO_RESTART_${phase}_OK`);
++    }
++  }, 120000);
++
++  it('applies native generic font preferences per profile and restores defaults', async () => {
++    const defaultPreferences = native(profile).getZacroFontPreferences();
++    const fonts = await native(profile).getZacroFontList();
++    expect(fonts.length).toBeGreaterThan(0);
++    expect(fonts[0].fontId).toBeTypeOf('string');
++    const first = await tab();
++    const other = await tab(session.fromPartition(`persist:font-other-${Date.now()}`));
++    const measure = `( { size:getComputedStyle(document.querySelector('#generic')).fontSize,
++      explicit:document.querySelector('#explicit').getBoundingClientRect().width } )`;
++    const baseline = await first.webContents.executeJavaScript(measure);
++    native(profile).setZacroFontPreferences({ defaultFontSize: 31, fonts: [
++      { script: 'Zyyy', genericFamily: 'serif', fontId: fonts[0].fontId },
++      { script: 'Latn', genericFamily: 'serif', fontId: fonts[0].fontId }
++    ] });
++    const changed = await first.webContents.executeJavaScript(measure);
++    expect(changed.size).toBe('31px');
++    expect(native(profile).getZacroFontPreferences().defaultFontSize).toBe(31);
++    expect(changed.explicit).toBe(baseline.explicit);
++    expect(await other.webContents.executeJavaScript(measure)).toEqual(baseline);
++    const next = await tab();
++    expect((await next.webContents.executeJavaScript(measure)).size).toBe('31px');
++    const width = await first.webContents.executeJavaScript(`(() => {
++      const generic = document.querySelector('#generic');
++      const clone = generic.cloneNode(true); clone.style.fontFamily = ${JSON.stringify(JSON.stringify(fonts[0].fontId))};
++      document.body.appendChild(clone);
++      return [generic.getBoundingClientRect().width, clone.getBoundingClientRect().width];
++    })()`);
++    expect(width[0]).toBe(width[1]);
++    native(profile).setZacroFontPreferences({});
++    expect(native(profile).getZacroFontPreferences()).toEqual(defaultPreferences);
++    expect(await first.webContents.executeJavaScript(measure)).toEqual(baseline);
++    expect(() => native(profile).setZacroFontPreferences({ fonts: [{ script: 'fake', genericFamily: 'serif', fontId: 'x' }] })).toThrow();
++  });
++});

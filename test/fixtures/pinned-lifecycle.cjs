@@ -167,6 +167,8 @@ test(
   async (t) => {
     const b = await launch(t);
     const clean = await b.open('clean', true);
+    const cleanNativeId = await b.pageId(clean.url);
+    await b.guest(clean.url, "window.sleepMarker = 'discard this document'; undefined");
     const favicon = await until(
       async () => (await b.state()).runtime.pages[clean.id].favicon,
       'validated clean favorite icon',
@@ -185,6 +187,11 @@ test(
     await expect.poll(async () => (await b.state()).runtime.pages[clean.id].sleeping).toBe(true);
     const slept = await b.state();
     assert.equal(
+      await b.app.evaluate(({ webContents }, id) => webContents.fromId(id)?.getURL(), cleanNativeId),
+      'about:blank',
+      'Sleep releases the document while retaining its native extension tab ID',
+    );
+    assert.equal(
       slept.runtime.pages[clean.id].favicon,
       favicon,
       'Sleeping must retain the validated icon without a live page',
@@ -202,6 +209,12 @@ test(
     });
     await b.activate(clean);
     assert.equal((await b.state()).runtime.pages[clean.id].loaded, true);
+    assert.equal(await b.pageId(clean.url), cleanNativeId, 'Waking keeps the native extension tab ID');
+    assert.equal(
+      await b.guest(clean.url, 'typeof window.sleepMarker'),
+      'undefined',
+      'Wake must load a fresh document',
+    );
   },
 );
 

@@ -7,7 +7,7 @@ const { executablePath } = require('../src/main/codex.cjs');
 // Electron's official installer downloads and checksum-verifies the pinned
 // runtime on first use. Reuse that distribution for packaging instead of
 // downloading its checksum and archive again on every incremental build.
-function validateRuntime(platform = process.platform, arch = process.arch) {
+async function validateRuntime(platform = process.platform, arch = process.arch) {
   assertNativeTarget(platform, arch);
   const executable = require('electron');
   const electronRoot = path.dirname(require.resolve('electron/package.json'));
@@ -39,7 +39,19 @@ function validateRuntime(platform = process.platform, arch = process.arch) {
     if (target?.platform !== platform || target?.arch !== arch)
       throw new Error(`${name} has the wrong binary architecture. Run npm ci with native ${arch} Node.js.`);
   }
-  console.log(`Using pinned Electron ${runtime} and Codex for ${platform}/${arch}.`);
+  const distribution = path.join(electronRoot, 'dist');
+  if (fs.existsSync(path.join(distribution, 'zacro-runtime.json'))) {
+    await require('./electron-runtime-artifact.cjs').verifyRuntime(distribution, { platform, arch });
+    console.log(`Using verified Zacro Electron ${runtime} and Codex for ${platform}/${arch}.`);
+  } else {
+    if (process.env.ZACRO_REQUIRE_CUSTOM_ELECTRON === '1')
+      throw new Error('This build requires the verified custom Zacro Electron runtime.');
+    console.log(`Using pinned stock Electron ${runtime} and Codex for ${platform}/${arch}.`);
+  }
 }
-if (require.main === module) validateRuntime();
+if (require.main === module)
+  validateRuntime().catch((error) => {
+    console.error(error.message);
+    process.exitCode = 1;
+  });
 module.exports = { validateRuntime };

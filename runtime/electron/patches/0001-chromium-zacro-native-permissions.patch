@@ -1,0 +1,413 @@
+diff --git a/extensions/browser/permissions/active_tab_permission_granter.cc b/extensions/browser/permissions/active_tab_permission_granter.cc
+index 37bd0fc..42119cc 100644
+--- a/extensions/browser/permissions/active_tab_permission_granter.cc
++++ b/extensions/browser/permissions/active_tab_permission_granter.cc
+@@ -5,6 +5,7 @@
+ #include "extensions/browser/permissions/active_tab_permission_granter.h"
+ 
+ #include <set>
++#include <tuple>
+ #include <vector>
+ 
+ #include "base/feature_list.h"
+@@ -133,9 +134,24 @@ ActiveTabPermissionGranter::ActiveTabPermissionGranter(
+ ActiveTabPermissionGranter::~ActiveTabPermissionGranter() = default;
+ 
+ void ActiveTabPermissionGranter::GrantIfRequested(const Extension* extension) {
+-  if (IsGranted(extension)) {
+-    return;
+-  }
++  GrantIfRequestedWithCallback(extension, base::DoNothing());
++}
++
++void ActiveTabPermissionGranter::GrantIfRequestedWithCallback(
++    const Extension* extension,
++    base::OnceCallback<void(bool)> callback) {
++  auto callbacks = base::SplitOnceCallback(std::move(callback));
++  base::ScopedClosureRunner cancelled(
++      base::BindOnce(std::move(callbacks.first), false));
++  // The released closure succeeds only when explicitly Run() at dispatch.
++  // Destroying it instead destroys `cancelled`, delivering false.
++  auto completion = base::BindOnce(
++      [](base::OnceCallback<void(bool)> callback,
++         base::ScopedClosureRunner cancelled) {
++        std::ignore = cancelled.Release();
++        std::move(callback).Run(true);
++      },
++      std::move(callbacks.second), std::move(cancelled));
+ 
+   APIPermissionSet new_apis;
+   URLPatternSet new_hosts;
+@@ -184,6 +200,10 @@ void ActiveTabPermissionGranter::GrantIfRequested(const Extension* extension) {
+ 
+   if (!new_apis.empty() || !new_hosts.is_empty()) {
+     granted_extensions_.Insert(extension);
++    const auto grant_generation =
++        grant_generations_
++            .try_emplace(extension->id(), base::UnguessableToken::Create())
++            .first->second;
+     PermissionSet new_permissions(std::move(new_apis), ManifestPermissionSet(),
+                                   new_hosts.Clone(), new_hosts.Clone());
+     permissions_data->UpdateTabSpecificPermissions(tab_id_, new_permissions);
+@@ -192,7 +212,8 @@ void ActiveTabPermissionGranter::GrantIfRequested(const Extension* extension) {
+         browser_context, *extension,
+         base::BindOnce(&ActiveTabPermissionGranter::NotifyGranted,
+                        weak_factory_.GetWeakPtr(),
+-                       base::WrapRefCounted(extension), new_hosts.Clone()));
++                       base::WrapRefCounted(extension), new_hosts.Clone(),
++                       grant_generation, std::move(completion)));
+   }
+ }
+ 
+@@ -202,10 +223,14 @@ bool ActiveTabPermissionGranter::IsGranted(const Extension* extension) const {
+ 
+ void ActiveTabPermissionGranter::NotifyGranted(
+     scoped_refptr<const Extension> extension,
+-    URLPatternSet new_hosts) {
++    URLPatternSet new_hosts,
++    base::UnguessableToken grant_generation,
++    base::OnceClosure completion) {
+   // If the grant was revoked (e.g. via navigation, explicit revocation, or
+   // unload) while the network service round-trip was in flight, do nothing.
+-  if (!IsGranted(extension.get())) {
++  auto generation = grant_generations_.find(extension->id());
++  if (!IsGranted(extension.get()) || generation == grant_generations_.end() ||
++      generation->second != grant_generation) {
+     return;
+   }
+ 
+@@ -246,6 +271,7 @@ void ActiveTabPermissionGranter::NotifyGranted(
+       PermissionsManager::Get(web_contents()->GetBrowserContext());
+   permissions_manager->NotifyActiveTabPermisssionGranted(web_contents(),
+                                                          tab_id_, *extension);
++  std::move(completion).Run();
+ }
+ 
+ void ActiveTabPermissionGranter::RevokeForTesting() {
+@@ -294,6 +320,7 @@ void ActiveTabPermissionGranter::OnExtensionUnloaded(
+     UnloadedExtensionReason reason) {
+   // Note: don't need to clear the permissions (nor tell the renderer about it)
+   // because it's being unloaded anyway.
++  grant_generations_.erase(extension->id());
+   granted_extensions_.Remove(extension->id());
+ }
+ 
+@@ -301,6 +328,7 @@ void ActiveTabPermissionGranter::ClearGrantedExtensionsAndNotify() {
+   // Invalidate any in-flight NotifyGranted() callbacks so that stale
+   // permissions from the previous document are not delivered to the new page.
+   weak_factory_.InvalidateWeakPtrs();
++  grant_generations_.clear();
+   ClearGrantedExtensionsAndNotify(granted_extensions_);
+ }
+ 
+@@ -310,6 +338,9 @@ void ActiveTabPermissionGranter::ClearActiveExtensionAndNotify(
+     return;
+   }
+ 
++  // Cancel only this extension's pending grants; other extensions' network
++  // replies still need to dispatch permissions and complete successfully.
++  grant_generations_.erase(id);
+   ExtensionSet granted_to_remove{};
+   granted_to_remove.Insert(granted_extensions_.GetByID(id));
+   ClearGrantedExtensionsAndNotify(granted_to_remove);
+diff --git a/extensions/browser/permissions/active_tab_permission_granter.h b/extensions/browser/permissions/active_tab_permission_granter.h
+index 2faa481..d40c88c 100644
+--- a/extensions/browser/permissions/active_tab_permission_granter.h
++++ b/extensions/browser/permissions/active_tab_permission_granter.h
+@@ -5,8 +5,12 @@
+ #ifndef EXTENSIONS_BROWSER_PERMISSIONS_ACTIVE_TAB_PERMISSION_GRANTER_H_
+ #define EXTENSIONS_BROWSER_PERMISSIONS_ACTIVE_TAB_PERMISSION_GRANTER_H_
+ 
++#include <map>
++
++#include "base/functional/callback_helpers.h"
+ #include "base/gtest_prod_util.h"
+ #include "base/scoped_observation.h"
++#include "base/unguessable_token.h"
+ #include "content/public/browser/web_contents_observer.h"
+ #include "content/public/browser/web_contents_user_data.h"
+ #include "extensions/browser/extension_registry.h"
+@@ -42,6 +46,11 @@ class ActiveTabPermissionGranter
+   // tab-specific permissions to it until the next page navigation or refresh.
+   void GrantIfRequested(const Extension* extension);
+ 
++  // Host completion follows network update and renderer dispatch. Cancellation
++  // (navigation, unload, destruction) returns false, never silent success.
++  void GrantIfRequestedWithCallback(const Extension* extension,
++                                    base::OnceCallback<void(bool)> callback);
++
+   // Returns true if `extension` has been granted tab-specific permissions.
+   bool IsGranted(const Extension* extension) const;
+ 
+@@ -84,7 +93,9 @@ class ActiveTabPermissionGranter
+   // Notifies the renderer and other observers that the permission has been
+   // granted.
+   void NotifyGranted(scoped_refptr<const Extension> extension,
+-                     URLPatternSet new_hosts);
++                     URLPatternSet new_hosts,
++                     base::UnguessableToken grant_generation,
++                     base::OnceClosure completion);
+ 
+   // The tab ID for this tab.
+   const int tab_id_;
+@@ -93,6 +104,10 @@ class ActiveTabPermissionGranter
+   // tab-specific permissions until the next navigation/refresh.
+   ExtensionSet granted_extensions_;
+ 
++  // Per-extension operation epochs. Erasing B cancels only B's outstanding
++  // callbacks; navigation/destruction still invalidates the tab's weak refs.
++  std::map<ExtensionId, base::UnguessableToken> grant_generations_;
++
+   // Listen to extension unloaded notifications.
+   base::ScopedObservation<ExtensionRegistry, ExtensionRegistryObserver>
+       extension_registry_observation_{this};
+diff --git a/extensions/browser/permissions/permissions_updater.cc b/extensions/browser/permissions/permissions_updater.cc
+index b64b285..4422386 100644
+--- a/extensions/browser/permissions/permissions_updater.cc
++++ b/extensions/browser/permissions/permissions_updater.cc
+@@ -122,7 +122,8 @@ class PermissionsUpdater::NetworkPermissionsUpdateHelper {
+                                 EventType event_type,
+                                 scoped_refptr<const Extension> extension,
+                                 const PermissionSet& changed,
+-                                base::OnceClosure completion_callback);
++                                base::OnceClosure completion_callback,
++                                bool force_network_update = false);
+ 
+   static void UpdateDefaultPolicyHostRestrictions(
+       content::BrowserContext* browser_context,
+@@ -149,12 +150,13 @@ void PermissionsUpdater::NetworkPermissionsUpdateHelper::UpdatePermissions(
+     EventType event_type,
+     scoped_refptr<const Extension> extension,
+     const PermissionSet& changed,
+-    base::OnceClosure completion_callback) {
++    base::OnceClosure completion_callback,
++    bool force_network_update) {
+   // If there is no difference in allowlist/blocklist for the extension, we can
+   // synchronously finish it without updating the CORS access list.
+   // We do not apply this optimization for kPolicy event_type, since callers do
+   // not pass effective |changed| argument.
+-  if (event_type != EventType::kPolicy &&
++  if (!force_network_update && event_type != EventType::kPolicy &&
+       changed.effective_hosts().is_empty()) {
+     PermissionsUpdater::NotifyPermissionsUpdated(
+         browser_context, event_type, std::move(extension), changed.Clone(),
+@@ -233,6 +235,56 @@ PermissionsUpdater::PermissionsUpdater(content::BrowserContext* browser_context,
+ 
+ PermissionsUpdater::~PermissionsUpdater() = default;
+ 
++void PermissionsUpdater::SetZacroReviewedPermissions(
++    const Extension& extension,
++    const PermissionSet& permissions,
++    base::OnceClosure completion_callback) {
++  const auto& required = PermissionsParser::GetRequiredPermissions(&extension);
++  auto declared = PermissionSet::CreateUnion(
++      required, PermissionsParser::GetOptionalPermissions(&extension));
++  CHECK(permissions.Contains(required));
++  CHECK(declared->Contains(permissions));
++  auto removed = PermissionSet::CreateDifference(
++      extension.permissions_data()->active_permissions(), permissions);
++  auto added = PermissionSet::CreateDifference(
++      permissions, extension.permissions_data()->active_permissions());
++
++  auto* prefs = ExtensionPrefs::Get(browser_context_);
++  if (auto old = prefs->GetGrantedPermissions(extension.id()))
++    prefs->RemoveGrantedPermissions(extension.id(), *old);
++  if (auto old = prefs->GetRuntimeGrantedPermissions(extension.id()))
++    prefs->RemoveRuntimeGrantedPermissions(extension.id(), *old);
++  prefs->SetDesiredActivePermissions(extension.id(), permissions);
++  prefs->AddGrantedPermissions(extension.id(), permissions);
++  prefs->AddRuntimeGrantedPermissions(extension.id(), permissions);
++  SetPermissions(&extension, permissions.Clone(), true);
++
++  // Both notifications observe the same final permission state. In particular,
++  // broad optional origins minus narrower grants must never be applied as a
++  // destructive set subtraction to required hosts. The network and renderer
++  // barrier is completed for each event before replying to the host.
++  NetworkPermissionsUpdateHelper::UpdatePermissions(
++      browser_context_, EventType::kRemoved, &extension, *removed,
++      base::BindOnce(
++          [](content::BrowserContext* context,
++             scoped_refptr<const Extension> extension,
++             std::unique_ptr<PermissionSet> added,
++             base::OnceClosure completion_callback) {
++            // NetworkPermissionsUpdateHelper only invokes callbacks while the
++            // context is alive. Never notify for an unloaded/replaced object.
++            if (ExtensionRegistry::Get(context)->enabled_extensions().GetByID(
++                    extension->id()) != extension.get()) {
++              return;
++            }
++            NetworkPermissionsUpdateHelper::UpdatePermissions(
++                context, EventType::kAdded, extension, *added,
++                std::move(completion_callback));
++          },
++          browser_context_, base::WrapRefCounted(&extension), std::move(added),
++          std::move(completion_callback)),
++      /*force_network_update=*/true);
++}
++
+ void PermissionsUpdater::GrantOptionalPermissions(
+     const Extension& extension,
+     const PermissionSet& permissions,
+@@ -556,6 +608,21 @@ void PermissionsUpdater::GrantActivePermissions(const Extension* extension) {
+ }
+ 
+ void PermissionsUpdater::InitializePermissions(const Extension* extension) {
++  InitializePermissionsImpl(extension, true);
++}
++
++void PermissionsUpdater::InitializePermissionsWithoutManagement(
++    const Extension* extension) {
++  // This is an explicit embedder contract, not a silent policy bypass. If an
++  // embedder adds management support it must use the normal initialization.
++  CHECK(!ExtensionsBrowserClient::Get()->GetExtensionManagementClient(
++      browser_context_));
++  InitializePermissionsImpl(extension, false);
++}
++
++void PermissionsUpdater::InitializePermissionsImpl(
++    const Extension* extension,
++    bool apply_management_policy) {
+   std::unique_ptr<const PermissionSet> desired_permissions_wrapper;
+   const PermissionSet* desired_permissions = nullptr;
+ 
+@@ -593,8 +660,13 @@ void PermissionsUpdater::InitializePermissions(const Extension* extension) {
+     extension->permissions_data()->SetContextId(
+         util::GetBrowserContextId(browser_context_));
+ 
+-    // Apply per-extension policy if set.
+-    ApplyPolicyHostRestrictions(*extension);
++    if (apply_management_policy) {
++      ApplyPolicyHostRestrictions(*extension);
++    } else {
++      // Preserve native context-wide policy defaults without assuming that an
++      // absent embedder management service can supply per-extension policy.
++      extension->permissions_data()->SetUsesDefaultHostRestrictions();
++    }
+   }
+ 
+   SetPermissions(extension, std::move(granted_permissions),
+@@ -667,7 +739,11 @@ void PermissionsUpdater::NotifyPermissionsUpdated(
+     scoped_refptr<const Extension> extension,
+     std::unique_ptr<const PermissionSet> changed,
+     base::OnceClosure completion_callback) {
+-  if ((changed->IsEmpty() && event_type != EventType::kPolicy) ||
++  // An old network callback must never send its permissions to a replacement
++  // extension with the same ID after unload/reload.
++  if (ExtensionRegistry::Get(browser_context)
++              ->GetInstalledExtension(extension->id()) != extension.get() ||
++      (changed->IsEmpty() && event_type != EventType::kPolicy) ||
+       browser_context->ShutdownStarted()) {
+     std::move(completion_callback).Run();
+     return;
+diff --git a/extensions/browser/permissions/permissions_updater.h b/extensions/browser/permissions/permissions_updater.h
+index aa77545..be1339f 100644
+--- a/extensions/browser/permissions/permissions_updater.h
++++ b/extensions/browser/permissions/permissions_updater.h
+@@ -77,6 +77,13 @@ class PermissionsUpdater {
+ 
+   ~PermissionsUpdater();
+ 
++  // Privileged embedder operation. The host has reviewed the complete set.
++  // Keeps the Extension object alive and replaces exact active/stored rights;
++  // does not enable permissions.request or change manifest declarations.
++  void SetZacroReviewedPermissions(const Extension& extension,
++                                   const PermissionSet& permissions,
++                                   base::OnceClosure completion_callback);
++
+   // Grants `permissions` that were defined as optional in the manifest to
+   // `extension`, updating the active permission set and notifying any
+   // observers. This method assumes the user has already been prompted, if
+@@ -158,6 +165,11 @@ class PermissionsUpdater {
+   // required by the extension.
+   void InitializePermissions(const Extension* extension);
+ 
++  // Explicit initialization for an embedder with no ExtensionManagementClient.
++  // Initializes bounded/effective rights, context identity and native prefs
++  // before activation, using the native default host policy restrictions.
++  void InitializePermissionsWithoutManagement(const Extension* extension);
++
+   // Adds `permissions` to `extension` without doing any validation or
+   // persisting values in prefs.
+   // TODO(devlin): We shouldn't need this, even for tests. Tests shouldn't be
+@@ -170,6 +182,9 @@ class PermissionsUpdater {
+  private:
+   class NetworkPermissionsUpdateHelper;
+ 
++  void InitializePermissionsImpl(const Extension* extension,
++                                 bool apply_management_policy);
++
+   enum class EventType {
+     kAdded,
+     kRemoved,
+diff --git a/extensions/browser/user_script_manager.cc b/extensions/browser/user_script_manager.cc
+index 29188e1..9087cbe 100644
+--- a/extensions/browser/user_script_manager.cc
++++ b/extensions/browser/user_script_manager.cc
+@@ -42,7 +42,6 @@ UserScriptManager::UserScriptManager(content::BrowserContext* browser_context)
+   if (store) {
+     store->RegisterKey(scripting::kRegisteredScriptsStorageKey);
+   }
+-
+ }
+ 
+ UserScriptManager::~UserScriptManager() = default;
+@@ -97,7 +96,6 @@ void UserScriptManager::SetUserScriptSourceEnabledForExtensions(
+ }
+ 
+ void UserScriptManager::InitializeUserScriptState(const Extension& extension) {
+-
+   SetCurrentUserScriptAllowedState(util::GetBrowserContextId(browser_context_),
+                                    extension.id(),
+                                    IsUserScriptPrefEnabled(extension.id()));
+@@ -127,6 +125,19 @@ bool UserScriptManager::IsUserScriptsAPIPermissionAvailable(
+              .HasAPIPermission(mojom::APIPermissionID::kUserScripts);
+ }
+ 
++void UserScriptManager::InitializeUserScriptPrefEnabled(
++    const Extension& extension,
++    bool enabled) {
++  CHECK(!ExtensionRegistry::Get(browser_context_)
++             ->GetInstalledExtension(extension.id()));
++  CHECK(!enabled || extension.permissions_data()->HasAPIPermission(
++                        mojom::APIPermissionID::kUserScripts));
++  ExtensionPrefs::Get(browser_context_)
++      ->SetBooleanPref(extension.id(), kUserScriptsAllowedPref, enabled);
++  SetCurrentUserScriptAllowedState(util::GetBrowserContextId(browser_context_),
++                                   extension.id(), enabled);
++}
++
+ void UserScriptManager::SetUserScriptPrefEnabled(
+     const ExtensionId& extension_id,
+     bool enabled) {
+@@ -256,6 +267,4 @@ bool UserScriptManager::IsUserScriptPrefEnabled(
+   return user_scripts_pref_allowed;
+ }
+ 
+-
+-
+ }  // namespace extensions
+diff --git a/extensions/browser/user_script_manager.h b/extensions/browser/user_script_manager.h
+index 49758fe..5a8ef31 100644
+--- a/extensions/browser/user_script_manager.h
++++ b/extensions/browser/user_script_manager.h
+@@ -77,6 +77,11 @@ class UserScriptManager : public ExtensionRegistryObserver {
+   // Set extension preference for userScripts API being allowed.
+   void SetUserScriptPrefEnabled(const ExtensionId& extension_id, bool enabled);
+ 
++  // Privileged embedder initialization before registration can start scripts.
++  // Unlike the public toggle this only accepts an as-yet-unregistered object.
++  void InitializeUserScriptPrefEnabled(const Extension& extension,
++                                       bool enabled);
++
+  private:
+   // ExtensionRegistryObserver implementation.
+   void OnExtensionWillBeInstalled(content::BrowserContext* browser_context,
+@@ -114,8 +119,6 @@ class UserScriptManager : public ExtensionRegistryObserver {
+   // Get extension preference for userScripts API being allowed.
+   bool IsUserScriptPrefEnabled(const ExtensionId& extension_id) const;
+ 
+-
+-
+   // A map of ExtensionUserScriptLoader for each extension host, with one loader
+   // per extension. Currently, each loader is lazily initialized and contains
+   // scripts from APIs webview tags.

@@ -1,0 +1,77 @@
+# Desktop extension synchronization implementation plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox syntax for tracking.
+
+**Goal:** Connect the real extension API and browser interface to the authenticated sync service and validate two independent clients.
+**Architecture:** Main-process credential vault and transactional client state isolate each service/account/profile. A persistent outbox reconciles remote library intent and settings while local permission decisions control installation.
+**Tech Stack:** Electron 45, Node.js 24, native SQLite where available in the pinned runtime, CommonJS/plain renderer JavaScript, node:test and Playwright.
+**Spec:** `docs/superpowers/specs/2026-10-25-extensions-and-sync-design.md`
+
+## Global Constraints
+
+- Preserve `extensions-and-sync`, the sandbox, shell-only IPC and current browser/AI behavior.
+- Never export or snapshot tokens, passwords, recovery codes except the explicit one-time recovery display, or local extension paths.
+- Settings synchronization requires separate informed opt-in; local and sync storage are distinct.
+- Resolve every async result against its originating service/account/profile/lifecycle generation.
+- Use actual service and extension API calls for final two-client acceptance; no mock may substitute for convergence.
+- Keep unsupported native APIs and unverified platform/provider acceptance visible.
+
+## Review Focus
+
+- Account/profile/service changes during an in-flight operation must not publish stale data.
+- Worker/content-script changes and remote changes must emit correct API events without feedback loops.
+- Offline queue survival, rejected mutations and atomic cursor acknowledgements must survive crashes.
+- Sync intent cannot auto-approve permissions or reinstall a deleted generation.
+- Packages must include new adapters without bundling the service or weakening Electron fuses.
+
+### Task 1: Vault, local sync storage and client
+
+**Files:** create `src/main/sync/{vault,client,storage}.cjs`, `src/core/sync/model.cjs`; tests `test/sync-client.test.cjs`, `test/sync-storage.test.cjs`.
+**Interfaces:** `SyncClient({directory,protect,unprotect,onLibraryChange,onStorageChange})`; `configure({endpoint})`, `register`, `login`, `logout`, `status`, `devices`, `revokeDevice`, `datasets`, `linkProfile({profileId,datasetId,settingsSync,settingsChoice})`, `unlinkProfile`, `syncNow`, `queueExtension`, `callStorage(context,method,args)`, `close`. `status()` contains safe UI state only. The protected credential backend is passed by the host using Electron safeStorage and fails closed if unavailable. HTTP follows the service plan and its recorded refinements.
+
+- [x] Write failing tests for secret exclusion, real account linkage, offline setting writes, atomic outbox persistence and namespace separation.
+- [x] Implement the vault and distinct local sync storage with complete storage API serialization/quotas/events; connect the real HTTP protocol with cancellation, paging and jittered backoff.
+- [x] Test deletion, reinstall generations, quota conflicts, account switches and service URL changes using two actual clients and the service.
+- [x] Run `node --test test/sync-client.test.cjs test/sync-storage.test.cjs` and `npm test`; expected: all pass with no secret leakage.
+- [x] Commit.
+
+### Task 2: Browser integration and UI
+
+**Files:** modify `src/main/main.cjs`, `src/core/store.cjs`, `src/renderer/app.js`, `styles.css`, `package.json`, `.github/workflows/ci.yml`; tests `test/e2e/extensions-sync.test.cjs` and extension fixtures.
+**Interfaces:** connect the extension manager/API/bridge and SyncClient through explicit profile callbacks; expose only narrow validated shell `extension:*` and `sync:*` actions. Snapshot includes nonsecret extension/sync status. Async operations cannot use a changed active profile implicitly.
+
+- [x] Write failing Electron flows for store installation review, action/options UI, registration/devices, dataset linking, sync consent, pending remote permissions and errors.
+- [x] Integrate lifecycle cleanup, account/profile actions, compact UI, cancellation and readable status; remove the native webRequest listener conflict without weakening page/PDF behavior.
+- [x] Run the two-browser fixture against the actual service, including writes from frame/worker/content contexts and remote change events.
+- [x] Run `npm run verify`, `npm run test:soak`, then `npm run pack:mac` and `npm run test:package`. Expected: baseline and new assertions pass; isolate any platform failures with evidence instead of weakening tests. Final package passed with explicit `ZACRO_INTERACTIVE_KEYCHAIN=1` after manual OS confirmation; ordinary deadlines and all assertions are unchanged.
+- [x] Update CI to include new suites for Windows and both Mac architectures. Remote CI and public provider checks are reported only if actually run.
+- [x] Commit.
+
+### Task 3: Acceptance record and whole-branch review
+
+**Files:** update README, roadmap, security and validation documentation; create extension compatibility and sync operator/user documentation.
+
+- [x] Record exact implemented APIs, tested extension versions, successful commands and any blocked/unverified contexts/providers/platforms. Do not label unsupported APIs complete.
+- [x] Obtain an independent whole-branch review of security, protocol, lifecycle and integration changes. Resolve material findings with reproducing tests.
+- [x] Run the appropriate final suites after fixes, inspect the diff and status, and commit reviewed work on the existing branch without merging/publishing.
+
+## Current acceptance status
+
+Implementation and review fixes are committed through `cae78db` on the requested
+branch. Independent whole-branch/scoped review has no remaining code findings.
+After user-confirmed unlock, final `npm run verify` exits0: formatting/syntax,
+Node240/240 and native96/96 pass, including all five two-browser variants and
+native focus/paint. Two stale test expectations were corrected with exact
+section/keyboard and permission-check timing assertions; narrow independent
+review approved those test-only changes. Production remains at `cae78db`.
+Soak40cycles, arm64 build and packaged-source/fuse checks also pass. After the
+user handled Keychain confirmation for the live process, the final interactive
+package run exited0 with1/1 passed on test commit `58026d1`. Earlier ordinary
+and interactive timeouts remain recorded; they are superseded by this passing
+interactive acceptance, not converted into ordinary-mode passes. No protection
+or behavior assertion was weakened.
+Windows/Intel Mac CI and the Docker image have not been run for this branch.
+Local implementation, review and Apple silicon acceptance are complete. This
+does not complete the unrun cross-platform or signed-release gates. See
+[the validation record](../../EXTENSIONS-SYNC-VALIDATION.md). No merge or
+publication was performed. Keep the requested branch and validation evidence.

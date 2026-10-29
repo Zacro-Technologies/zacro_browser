@@ -1,3 +1,4 @@
+import { createSyncUI } from './sync.js';
 import { createSpaceGesture } from './space-gesture.js';
 import { blendSpaceAppearance, deriveSpaceTheme } from './theme.js';
 import '../core/site-search.js';
@@ -238,6 +239,20 @@ const activeProfile = () => state?.profiles.find((p) => p.id === activeSpace()?.
 const activeTab = () => state?.tabs.find((t) => t.id === state.activeTabId);
 const currentTabs = () => state?.tabs.filter((t) => t.spaceId === state.activeSpaceId) || [];
 const profileItems = (key) => (state?.[key] || []).filter((item) => item.profileId === activeProfile()?.id);
+const syncUI = createSyncUI({
+  getState: () => state,
+  getProfile: activeProfile,
+  invoke,
+  esc,
+  field,
+  primary,
+  secondary,
+  button,
+  formDialog,
+  openDialog,
+  closeDialog,
+  toast,
+});
 const shortcutFor = (id, fallback = '') => {
   const entry = state?.runtime?.shortcuts?.find((item) => item.id === id);
   return shortcut(entry ? entry.accelerator : fallback);
@@ -947,7 +962,18 @@ function applyState(next) {
   const previousSpace = state?.activeSpaceId;
   const previousAppearance = presentedSpaceAppearance();
   const previousTab = state?.activeTabId;
+  const previousExtensionPanel = state?.runtime?.extensionPanel;
   state = next;
+  if (
+    state.runtime?.extensionPanel &&
+    state.runtime.extensionPanel.openId !== previousExtensionPanel?.openId
+  ) {
+    ui.panel = 'extension';
+    ui.panelSignature = '';
+  } else if (!state.runtime?.extensionPanel && ui.panel === 'extension') {
+    ui.panel = null;
+    ui.panelSignature = '';
+  }
   if (previousProfile && previousProfile !== activeProfile()?.id) clearSpaceAppearance({ paint: false });
   else if (
     previousSpace &&
@@ -969,6 +995,11 @@ function applyState(next) {
   setTheme();
   if (previousSpace !== state.activeSpaceId || previousTab !== state.activeTabId) clearPageBackdrop();
   if (previousProfile && previousProfile !== activeProfile()?.id) {
+    syncUI.profileChanged();
+    if (ui.extensionDialog) {
+      closeDialog();
+      ui.extensionDialog = false;
+    }
     if (ui.dialog === 'command') {
       ui.commandQuery = '';
       ui.commandIndex = 0;
@@ -1319,6 +1350,7 @@ function renderToolbar() {
     page.canGoForward,
     bookmarked,
     state.runtime?.splitTabId,
+    state.extensionPageWarnings,
     state.runtime?.maximized,
     state.runtime?.fullScreen,
     ui.panel,
@@ -1327,6 +1359,10 @@ function renderToolbar() {
   ]);
   if (signature === ui.toolbarSignature) return;
   ui.toolbarSignature = signature;
+  const warning = state.extensionPageWarnings?.find((item) => item.tabId === tab?.id);
+  const reloadWarning = warning
+    ? `<div class="provider-note" role="status">Extension scripts may still run on this page. <button type="button" class="text-button" data-action="extension:reload-pages" data-document-id="${warning.documentId}" data-document-epoch="${warning.documentEpoch}">Reload page</button></div>`
+    : '';
   const toolbar = $('#toolbar');
   const parent = sidebarHidden ? $('.main') : $('#sidebar');
   if (toolbar.parentElement !== parent) parent.prepend(toolbar);
@@ -1337,7 +1373,7 @@ function renderToolbar() {
   $('#captionbar').innerHTML = sidebarHidden ? '' : controls;
   $('#captionbar').hidden = sidebarHidden || !controls;
   $('#toolbar').innerHTML =
-    `<div class="navigation"><span class="navigation-spacer"></span>${button('back', shortcutLabel('Back', 'history-back', isMac ? 'Mod+[' : 'Alt+Left'), 'back', `data-key="back" ${page.canGoBack ? '' : 'disabled'}`)}${button('forward', shortcutLabel('Forward', 'history-forward', isMac ? 'Mod+]' : 'Alt+Right'), 'forward', `data-key="forward" ${page.canGoForward ? '' : 'disabled'}`)}${button(page.loading ? 'stop' : 'reload', page.loading ? 'Stop loading' : shortcutLabel('Reload', 'reload', 'Mod+R'), page.loading ? 'close' : 'reload', `data-key="reload" ${blank ? 'disabled' : ''}`)}</div><div class="address-row"><button type="button" class="address-button" data-action="ui:address" data-key="address" title="${esc(tab?.url || 'Search or enter a URL')}" aria-label="Address bar: ${esc(tab?.url || 'New tab')}">${icon(blank ? 'search' : secure ? 'lock' : 'globe')}<span class="address-text">${esc(blank ? 'Search or enter URL' : sidebarHidden ? displayURL(tab.url) : hostname(tab.url))}</span></button>${button('ui:page-menu', 'Page actions', 'more', 'data-key="page-menu" aria-haspopup="dialog"')}</div>${sidebarHidden ? controls : ''}`;
+    `<div class="navigation"><span class="navigation-spacer"></span>${button('back', shortcutLabel('Back', 'history-back', isMac ? 'Mod+[' : 'Alt+Left'), 'back', `data-key="back" ${page.canGoBack ? '' : 'disabled'}`)}${button('forward', shortcutLabel('Forward', 'history-forward', isMac ? 'Mod+]' : 'Alt+Right'), 'forward', `data-key="forward" ${page.canGoForward ? '' : 'disabled'}`)}${button(page.loading ? 'stop' : 'reload', page.loading ? 'Stop loading' : shortcutLabel('Reload', 'reload', 'Mod+R'), page.loading ? 'close' : 'reload', `data-key="reload" ${blank ? 'disabled' : ''}`)}</div><div class="address-row"><button type="button" class="address-button" data-action="ui:address" data-key="address" title="${esc(tab?.url || 'Search or enter a URL')}" aria-label="Address bar: ${esc(tab?.url || 'New tab')}">${icon(blank ? 'search' : secure ? 'lock' : 'globe')}<span class="address-text">${esc(blank ? 'Search or enter URL' : sidebarHidden ? displayURL(tab.url) : hostname(tab.url))}</span></button>${button('ui:page-menu', 'Page actions', 'more', 'data-key="page-menu" aria-haspopup="dialog"')}</div>${sidebarHidden ? controls : ''}${reloadWarning}`;
 }
 function renderWorkspace() {
   const tab = activeTab();
@@ -1545,6 +1581,14 @@ function syncLayout() {
   const layout = {
     sidebarWidth: width,
     panelWidth: panel,
+    extensionPanel: ui.panel === 'extension' && !(ui.libraryMenuOpen && ui.libraryMenuRail === 'panel'),
+    extensionPanelBounds:
+      ui.panel === 'extension'
+        ? (() => {
+            const box = $('.extension-panel-surface')?.getBoundingClientRect();
+            return box ? { x: box.x, y: box.y, width: box.width, height: box.height } : null;
+          })()
+        : null,
     contentTop,
     overlay: Boolean(ui.dialog),
     peek: Boolean(state.runtime?.peek),
@@ -1656,11 +1700,13 @@ const panelNames = {
   archive: ['archive', 'Archived tabs'],
   settings: ['settings', 'Settings'],
   extensions: ['extension', 'Extensions'],
+  extension: ['extension', 'Extension panel'],
   ai: ['sparkle', 'Ask Zacro'],
 };
 function panelHeader() {
-  const [symbol, title] = panelNames[ui.panel] || ['info', 'Library'];
-  return `<header class="panel-header"><button type="button" id="panel-chooser" class="panel-chooser" aria-label="${esc(title)} · Switch browser panel" aria-haspopup="menu" aria-expanded="false" data-library-chooser>${icon(symbol)}<span id="panel-title" tabindex="-1">${title}</span>${icon('down')}</button>${ui.panel === 'ai' ? button('ui:ai-reset', 'New conversation', 'plus') : ''}${button('ui:panel-close', 'Close panel', 'close', 'data-key="panel-close"')}</header>`;
+  const [symbol, label] = panelNames[ui.panel] || ['info', 'Library'];
+  const title = ui.panel === 'extension' ? state.runtime?.extensionPanel?.title || label : label;
+  return `<header class="panel-header"><button type="button" id="panel-chooser" class="panel-chooser" aria-label="${esc(title)} · Switch browser panel" aria-haspopup="menu" aria-expanded="false" data-library-chooser>${icon(symbol)}<span id="panel-title" tabindex="-1">${esc(title)}</span>${icon('down')}</button>${ui.panel === 'ai' ? button('ui:ai-reset', 'New conversation', 'plus') : ''}${button('ui:panel-close', 'Close panel', 'close', 'data-key="panel-close"')}</header>`;
 }
 function patchAIContent(current, incoming) {
   // Keep the composer, native select, focused controls, and unchanged messages
@@ -1711,7 +1757,7 @@ function renderPanel(force = false) {
   element.setAttribute('aria-label', panelNames[ui.panel][1]);
   const data =
     ui.panel === 'settings'
-      ? [state.profiles, state.spaces, activeProfile()?.id, state.runtime?.defaultBrowser]
+      ? [state.profiles, state.spaces, activeProfile()?.id, state.runtime?.defaultBrowser, state.sync]
       : ui.panel === 'ai'
         ? [
             ui.aiMessages,
@@ -1728,7 +1774,11 @@ function renderPanel(force = false) {
             activeProfile()?.id,
           ]
         : [state[ui.panel === 'archive' ? 'archive' : ui.panel], ui.panelQuery, activeProfile()?.id];
-  const signature = JSON.stringify([ui.panel, data]);
+  const signature = JSON.stringify([
+    ui.panel,
+    data,
+    ui.panel === 'extensions' ? state.extensionPageWarnings : null,
+  ]);
   if (!force && signature === ui.panelSignature) return;
   ui.panelSignature = signature;
   const scroll = $('.panel-body', element)?.scrollTop || 0;
@@ -1753,10 +1803,17 @@ function renderPanel(force = false) {
   const focusedId = element.contains(focused) ? focused.id : null;
   const selection =
     focusedId && 'selectionStart' in focused ? [focused.selectionStart, focused.selectionEnd] : null;
-  if (ui.panel === 'settings') {
+  if (ui.panel === 'extension') {
+    element.innerHTML =
+      panelHeader() + '<div class="extension-panel-surface" aria-label="Extension content"></div>';
+  } else if (ui.panel === 'settings') {
     element.innerHTML = panelHeader() + `<div class="panel-body">${renderSettings()}</div>`;
   } else if (ui.panel === 'extensions') {
     element.innerHTML = panelHeader() + `<div class="panel-body">${renderExtensions()}</div>`;
+    for (const badge of $$('.extension-badge', element)) {
+      badge.style.backgroundColor = badge.dataset.badgeBackground;
+      badge.style.color = badge.dataset.badgeForeground;
+    }
   } else if (ui.panel === 'ai') {
     const html = panelHeader() + renderAI();
     if (sameAIProfile && $('#conversation', element)) {
@@ -2087,7 +2144,7 @@ function renderSettings() {
     ...(![224, 260, 300].includes(settings.sidebarWidth)
       ? [[settings.sidebarWidth, `${settings.sidebarWidth}px`]]
       : []),
-  ])}<label class="setting-toggle"><span>Restore session</span><input type="checkbox" data-setting="restoreSession" ${settings.restoreSession ? 'checked' : ''}></label><div class="setting-actions">${secondary('ui:edit-space', 'Customize Space', 'edit')}${secondary('ui:profiles', 'Profiles', 'user')}${secondary('ui:shortcuts', 'Shortcuts', 'keyboard')}</div></section><details class="setting-section" id="ai-settings"><summary>AI providers</summary>${renderAIConnection()}${settingSelect(
+  ])}<label class="setting-toggle"><span>Restore session</span><input type="checkbox" data-setting="restoreSession" ${settings.restoreSession ? 'checked' : ''}></label><div class="setting-actions">${secondary('ui:edit-space', 'Customize Space', 'edit')}${secondary('ui:profiles', 'Profiles', 'user')}${secondary('ui:shortcuts', 'Shortcuts', 'keyboard')}</div></section>${syncUI.render()}<details class="setting-section" id="ai-settings"><summary>AI providers</summary>${renderAIConnection()}${settingSelect(
     'openSourcesLimit',
     'Pages to open from each answer',
     [
@@ -2096,11 +2153,44 @@ function renderSettings() {
       [3, '3 sources'],
       [5, '5 sources'],
     ],
-  )}<p class="provider-note">Page sharing is off by default. Choose “Current page” or select tabs in the conversation to share page or PDF text for a question. Password and form fields are excluded. Scanned and encrypted PDFs cannot be read.</p></details><details class="setting-section"><summary>Your data</summary><p class="panel-intro"><strong>${esc(profile?.name)}</strong> profile</p><div class="setting-actions">${secondary('data:export', 'Export data', 'external')}${secondary('data:import', 'Import data', 'download')}</div><p class="provider-note">Zacro backups and bookmark HTML. Private sessions and sign-in credentials are excluded.</p><div class="setting-actions">${secondary('ui:data-clear', 'Clear browsing data', 'trash')}${secondary('ui:permissions', 'Site permissions', 'shield')}</div></details><details class="setting-section"><summary>Extensions</summary><p class="panel-intro">Load compatible unpacked extensions into this profile. Supported APIs vary; Chrome Web Store installation and extension sync are not available.</p>${secondary('ui:panel', 'Manage extensions', 'extension', 'data-panel="extensions"')}</details><details class="setting-section"><summary>About Zacro</summary><p class="panel-intro">An independent, open-source browser.<br>Version ${esc(state.runtime?.version || '0.1.0')} · Built on Chromium</p><div class="setting-actions">${secondary('app:about', 'Version details', 'info')}${secondary('ui:shortcuts', 'Shortcuts', 'keyboard')}</div></details>`;
+  )}<p class="provider-note">Page sharing is off by default. Choose “Current page” or select tabs in the conversation to share page or PDF text for a question. Password and form fields are excluded. Scanned and encrypted PDFs cannot be read.</p></details><details class="setting-section"><summary>Your data</summary><p class="panel-intro"><strong>${esc(profile?.name)}</strong> profile</p><div class="setting-actions">${secondary('data:export', 'Export data', 'external')}${secondary('data:import', 'Import data', 'download')}</div><p class="provider-note">Zacro backups and bookmark HTML. Private sessions and sign-in credentials are excluded.</p><div class="setting-actions">${secondary('ui:data-clear', 'Clear browsing data', 'trash')}${secondary('ui:permissions', 'Site permissions', 'shield')}</div></details><details class="setting-section"><summary>Extensions</summary><p class="panel-intro">Install compatible extensions from the Chrome Web Store or a local folder. Review access and updates for this profile. Extension settings sync is a separate Account & sync choice.</p>${secondary('ui:panel', 'Manage extensions', 'extension', 'data-panel="extensions"')}</details><details class="setting-section"><summary>About Zacro</summary><p class="panel-intro">An independent, open-source browser.<br>Version ${esc(state.runtime?.version || '0.1.0')} · Built on Chromium</p><div class="setting-actions">${secondary('app:about', 'Version details', 'info')}${secondary('ui:shortcuts', 'Shortcuts', 'keyboard')}</div></details>`;
 }
 function renderExtensions() {
+  const badgeColor = (value, fallback) => {
+    if (typeof value === 'string' && /^(#[0-9a-f]{3,8}|[a-z]{1,30})$/i.test(value)) return value;
+    if (
+      Array.isArray(value) &&
+      value.length === 4 &&
+      value.every((n) => Number.isInteger(n) && n >= 0 && n <= 255)
+    )
+      return `rgba(${value[0]},${value[1]},${value[2]},${value[3] / 255})`;
+    return fallback;
+  };
+  if (activeProfile()?.private)
+    return empty(
+      'shield',
+      'Private profile',
+      'Extensions and synchronization are unavailable in private profiles.',
+    );
   const extensions = profileItems('extensions');
-  return `<p class="panel-intro">Extensions are isolated to <strong>${esc(activeProfile()?.name)}</strong>. Install only extensions you trust and review their requested access.</p>${primary('extension:install', 'Load unpacked extension', 'plus')}<p class="provider-note">Select a local folder containing manifest.json. Electron supports a subset of Chrome extension APIs; storage.sync and Web Store installation are unavailable.</p>${extensions.length ? extensions.map((ext) => `<article class="extension-card"><div class="row"><div class="extension-icon">${icon('extension')}</div><div class="grow"><h3>${esc(ext.name || ext.id)}</h3><span class="small muted">${esc(ext.version || '')} · ${ext.enabled === false ? 'Disabled' : 'Enabled'}</span></div></div>${ext.description ? `<p>${esc(ext.description)}</p>` : ''}${ext.error ? `<p class="danger">${esc(ext.error)}</p>` : ''}<div class="row between"><button type="button" class="text-button" data-action="extension:toggle" data-id="${esc(ext.id)}">${ext.enabled === false ? 'Enable' : 'Disable'}</button><button type="button" class="text-button danger" data-action="ui:extension-remove" data-id="${esc(ext.id)}">Remove</button></div></article>`).join('') : empty('extension', 'No extensions', 'Installed extensions appear here.')}`;
+  const warnings = (state.extensionPageWarnings || [])
+    .map(
+      (warning) =>
+        `<div class="provider-note" role="status">${esc(warning.title)} may still contain extension scripts. <button type="button" class="text-button" data-action="extension:reload-pages" data-document-id="${warning.documentId}" data-document-epoch="${warning.documentEpoch}">Reload page</button></div>`,
+    )
+    .join('');
+  const labels = {
+    enabled: 'Enabled',
+    disabled: 'Disabled',
+    'pending-approval': 'Needs permission on this device',
+    'pending-reload': 'Reload pages to finish',
+    incompatible: 'Unsupported requirements',
+    'load-failed': 'Could not load',
+    'remote-pending': 'Needs installation on this device',
+  };
+  const control = (ext, action, label, danger = false) =>
+    `<button type="button" class="text-button ${danger ? 'danger' : ''}" data-action="${action}" data-id="${esc(ext.id)}" data-generation="${esc(ext.generation || '')}" data-profile-id="${esc(ext.profileId)}" ${action === 'extension:action' && ext.action?.enabled === false ? 'disabled' : ''}>${esc(label)}</button>`;
+  return `<p class="panel-intro">Extensions belong to <strong>${esc(activeProfile()?.name)}</strong>. Review requested access before allowing an extension to run.</p><div class="setting-actions">${primary('ui:extension-store', 'Install from Chrome Web Store', 'plus')}${secondary('extension:install', 'Load unpacked extension', 'folder')}${secondary('extension:check-updates', 'Check for updates', 'reload')}</div><p class="provider-note">Compatibility depends on the APIs each extension uses. Local folders stay on this device. Settings sync requires a linked account and separate consent.</p>${warnings}${extensions.length ? extensions.map((ext) => `<article class="extension-card"><div class="row"><div class="extension-icon">${ext.iconData ? `<img src="${esc(ext.iconData)}" alt="">` : icon('extension')}</div><div class="grow"><h3>${esc(ext.name || ext.id)}</h3><span class="small muted">${esc(ext.version || '')} · ${esc(labels[ext.status] || ext.status)}</span></div>${ext.action?.badgeText ? `<span class="extension-badge" data-badge-background="${esc(badgeColor(ext.action.badgeBackgroundColor, '#000000'))}" data-badge-foreground="${esc(badgeColor(ext.action.badgeTextColor, '#ffffff'))}">${esc(ext.action.badgeText)}</span>` : ''}</div><p class="small muted">${ext.source === 'chrome-web-store' ? 'Chrome Web Store' : 'Local folder · only on this device'}${ext.publisherVerified ? ' · Publisher proof verified' : ''}</p>${ext.description ? `<p>${esc(ext.description)}</p>` : ''}${ext.error || ext.syncError || ext.notificationError ? `<p class="danger">${esc(ext.error || ext.syncError || ext.notificationError)}</p>` : ''}${ext.userScriptsAvailable ? `<p class="provider-note">User scripts: ${ext.userScriptsEnabled ? 'allowed' : 'off'}. This separate permission lets this extension run user-provided scripts on sites it can access. The choice is saved only in this profile on this device.</p>` : ''}${ext.requiresPageReload ? '<p class="provider-note">Open pages may still contain scripts from the previous version. Reload them to finish changing access.</p>' : ''}${ext.unsupported?.length ? `<ul class="extension-access">${ext.unsupported.map((item) => `<li>${esc(item.capability)}: ${esc(item.reason)}</li>`).join('')}</ul>` : ''}<div class="setting-actions">${ext.syncError ? control(ext, 'extension:retry-sync', 'Retry library change') : ''}${ext.status === 'remote-pending' ? control(ext, 'extension:review-remote', 'Review installation') : `${ext.pendingVersion && ext.compatible ? control(ext, 'extension:approve', 'Review permissions') : ''}${ext.status !== 'incompatible' && ext.status !== 'pending-approval' ? control(ext, 'extension:toggle', ext.enabled ? 'Disable' : 'Enable') : ''}${ext.enabled && ext.hasAction ? control(ext, 'extension:action', ext.action?.title || 'Open extension') : ''}${ext.enabled && ext.hasSidePanel ? control(ext, 'extension:panel-open', 'Open side panel') : ''}${ext.enabled && ext.hasOptions ? control(ext, 'extension:options', 'Options') : ''}${ext.userScriptsAvailable ? control(ext, 'extension:user-scripts-toggle', ext.userScriptsEnabled ? 'Turn off user scripts' : 'Allow user scripts on this device') : ''}${ext.source === 'chrome-web-store' ? control(ext, 'extension:update', 'Check update') : ''}${ext.canRollback ? control(ext, 'extension:rollback', 'Roll back') : ''}${control(ext, 'ui:extension-remove', 'Remove', true)}`}</div>${ext.status !== 'remote-pending' ? `<details><summary>Permissions and compatibility</summary><p class="small muted">${ext.adapted ? 'Runs a managed compatibility copy. The verified original is retained.' : 'Legacy local installation; reinstall to receive the compatibility adapter.'}</p><h4>Granted access</h4><ul class="extension-access">${[...(ext.grants?.permissions || []), ...(ext.grants?.origins || [])].map((value) => `<li>${esc(value)}</li>`).join('') || '<li>No permissions granted</li>'}</ul>${['permissions', 'origins'].flatMap((kind) => (ext.revocable?.[kind] || []).map((value) => `<button type="button" class="text-button" data-action="extension:revoke-permission" data-id="${esc(ext.id)}" data-profile-id="${esc(ext.profileId)}" data-generation="${esc(ext.generation)}" data-permission-kind="${kind}" data-permission="${esc(value)}">Revoke ${esc(value)}</button>`)).join('')}${ext.pendingVersion ? `<h4>Requested access · ${esc(ext.pendingVersion)}</h4><ul class="extension-access">${[...(ext.requested?.permissions || []), ...(ext.requested?.origins || [])].map((value) => `<li>${esc(value)}</li>`).join('')}</ul>` : ''}${ext.commands?.length ? `<h4>Keyboard shortcuts</h4><ul class="extension-access">${ext.commands.map((command) => `<li>${esc(command.description || command.name)}: ${esc(command.shortcut || command.status === 'conflict' ? command.shortcut || 'Conflicts with another shortcut' : 'Unassigned')}</li>`).join('')}</ul>` : ''}<p class="small muted">${ext.syncState === 'local-only' ? 'Only on this device' : ext.syncState === 'not-linked' ? 'Not linked to a sync profile' : `Library sync: ${esc(ext.syncState)}. Permission approval is local to this device.`}</p></details>` : ''}</article>`).join('') : empty('extension', 'No extensions', 'Installed extensions and requests from your other devices appear here.')}`;
 }
 const aiIntentPrompts = {
   summarize:
@@ -2367,6 +2457,7 @@ function renderAI() {
 }
 function openPanel(panel, { refreshStatus = true } = {}) {
   if (!panelNames[panel]) return;
+  if (ui.panel === 'extension' && panel !== 'extension') safely(invoke('extension:panel-close'));
   closeLibraryChooser();
   cancelRailResize();
   interruptSpaceScroll();
@@ -2403,6 +2494,7 @@ function closePanel() {
   closeLibraryChooser();
   cancelRailResize();
   if (!ui.panel) return;
+  if (ui.panel === 'extension') safely(invoke('extension:panel-close'));
   const start = currentChromeWidths();
   ui.panelMotion = (ui.panelMotion || 0) + 1;
   $('#side-panel')
@@ -2717,6 +2809,7 @@ function closeLibraryChooser({ restore = false } = {}) {
   const menu = $('#library-menu');
   const opener = ui.libraryMenuReturn;
   ui.libraryMenuOpen = false;
+  ui.libraryMenuRail = null;
   ui.libraryMenuReturn = null;
   if (menu) {
     if (menu.matches(':popover-open')) menu.hidePopover();
@@ -2725,6 +2818,7 @@ function closeLibraryChooser({ restore = false } = {}) {
   for (const control of $$('[data-library-chooser],[data-download-menu],[data-key="library"]'))
     control.setAttribute('aria-expanded', 'false');
   if (restore && opener) restoreFocus(opener);
+  syncLayout();
 }
 function openLibraryChooser(anchor, html, label = 'Library') {
   if (!anchor) return;
@@ -2733,11 +2827,13 @@ function openLibraryChooser(anchor, html, label = 'Library') {
     return;
   }
   closeLibraryChooser();
-  // This top-layer menu stays inside its chrome rail. Native web contents keep
-  // rendering at their original scale: no overlay IPC or page snapshot is used.
+  // Keep the ordinary page live; only a native extension surface sharing this
+  // rail must detach while the shell popover occupies its region.
   finishChromeMotion();
   interruptSpaceScroll();
   ui.libraryMenuOpen = true;
+  ui.libraryMenuRail = anchor.closest('#side-panel') ? 'panel' : 'sidebar';
+  syncLayout();
   if (ui.dialog) closeDialog({ restore: false });
   const menu = document.createElement('div');
   menu.id = 'library-menu';
@@ -4166,6 +4262,10 @@ async function askAI(question) {
   try {
     const status = await invoke('ai:status');
     if (!current()) return false;
+    // Navigation can finish before its throttled state notification arrives.
+    // Refresh the main-process snapshot before checking the captured context.
+    applyState(await invoke('state:get'));
+    if (!current()) return false;
     if (
       context.kind !== ui.aiContext ||
       JSON.stringify(context.pages) !== JSON.stringify(ui.aiGrantedPages) ||
@@ -4458,6 +4558,7 @@ document.addEventListener('click', (event) => {
   safely(handleAction(target.dataset.action, target.dataset, target));
 });
 async function handleAction(action, data = {}, target) {
+  if (action.startsWith('ui:sync-')) return syncUI.handle(action, data);
   const id = data.id;
   if (ui.dialog === 'command' && action === 'tab:activate') closeDialog({ restore: false });
   switch (action) {
@@ -4874,11 +4975,38 @@ async function handleAction(action, data = {}, target) {
       applyState(await invoke('state:get'));
       showPermissions();
       return;
+    case 'ui:extension-store': {
+      const profileId = activeProfile()?.id;
+      const current = state.tabs.find((tab) => tab.id === state.activeTabId)?.url || '';
+      const source =
+        /^https:\/\/(?:chromewebstore\.google\.com\/detail|chrome\.google\.com\/webstore\/detail)\/[^/]+\/[a-p]{32}(?:[?#]|$)/.test(
+          current,
+        )
+          ? current
+          : '';
+      formDialog(
+        'Install from Chrome Web Store',
+        'Paste an extension detail URL or ID. Zacro downloads and verifies the package, then asks you to review its permissions before it can run.',
+        field('url', 'Store URL or extension ID', source, 'text', 'required'),
+        'Review extension',
+        async (data, context) => {
+          await invoke('extension:install-store', { url: data.get('url'), profileId });
+          if (context.isCurrent()) context.close();
+        },
+      );
+      ui.extensionDialog = true;
+      return;
+    }
     case 'ui:extension-remove':
       confirmDialog(
         'Remove extension?',
         'The extension will be removed from this profile.',
-        () => invoke('extension:remove', { id }),
+        () =>
+          invoke('extension:remove', {
+            id,
+            profileId: data.profileId || activeProfile()?.id,
+            generation: data.generation,
+          }),
         'Remove extension',
       );
       return;
@@ -5155,6 +5283,14 @@ async function handleAction(action, data = {}, target) {
       if (id) payload.id = id;
       if (data.url) payload.url = data.url;
       if (data.title) payload.title = data.title;
+      if (action.startsWith('extension:')) {
+        payload.profileId = data.profileId || activeProfile()?.id;
+        if (data.generation) payload.generation = data.generation;
+        if (data.permissionKind) payload.permissionKind = data.permissionKind;
+        if (data.permission) payload.permission = data.permission;
+        if (data.documentId) payload.documentId = Number(data.documentId);
+        if (data.documentEpoch) payload.documentEpoch = Number(data.documentEpoch);
+      }
       return invoke(action, payload);
     }
   }
@@ -5163,6 +5299,7 @@ document.addEventListener('submit', (event) => {
   event.preventDefault();
   const form = event.target;
   const data = new FormData(form);
+  for (const input of form.querySelectorAll('input[type="password"]')) input.value = '';
   if (form.id === 'home-search') {
     const url = String(data.get('query') || '').trim();
     if (url) safely(invoke('navigate', { url }));
@@ -5334,6 +5471,19 @@ document.addEventListener('keydown', (event) => {
   if (event.isComposing || event.keyCode === 229) return;
   if (handleSidebarKeyboard(event)) return;
   const cmd = primaryModifier(event);
+  if (
+    !ui.dialog &&
+    (event.key === 'ContextMenu' || (event.key === 'F10' && event.shiftKey && !cmd && !event.altKey))
+  ) {
+    const tab = event.target.closest('[data-tab-id]');
+    const folder = event.target.closest('[data-folder-id]');
+    if (tab || folder) {
+      event.preventDefault();
+      if (tab) showTabMenu(tab.dataset.tabId);
+      else showFolderMenu(folder.dataset.folderId);
+      return;
+    }
+  }
   if (ui.dialog === 'command' && event.target.id === 'command-input') {
     if (
       (event.key === 'Escape' ||

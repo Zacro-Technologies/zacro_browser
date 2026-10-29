@@ -10,9 +10,11 @@ Zacro is an independent project, not an official continuation of Arc or an affil
 
 ## Project status
 
-**Desktop development preview · 0.9.** This repository contains a runnable Chromium browser built with Electron, with Windows 11 x64 and native macOS integration for Apple silicon and Intel. It includes real page rendering, sandboxed tabs, Spaces, separate profiles, Peek, split view, local session recovery, library panels, compatible unpacked extensions, and six optional AI connections: ChatGPT subscription, Claude subscription, OpenAI API, Claude API, OpenRouter, and OpenAI-compatible servers. Version 0.9 corrects the tab lifecycle and interaction details: balanced Favorite tiles, navigated-pin markers, a 12-hour Today archive default with profile controls, continuously blended Space colors, an unblurred command palette and coordinated Peek motion. The [Arc behavior study](docs/ARC-BEHAVIOR-STUDY.md) records the reference evidence and design decisions. See the [validation record](docs/VALIDATION.md) and [Mac support boundary](docs/MACOS.md) for exact test evidence and remaining release checks.
+**Desktop development preview · 0.9.** This repository contains a runnable Chromium browser built with Electron, with Windows 11 x64 and native macOS integration for Apple silicon and Intel. It includes real page rendering, sandboxed tabs, Spaces, separate profiles, Peek, split view, local session recovery, library panels, managed compatible extensions, and six optional AI connections: ChatGPT subscription, Claude subscription, OpenAI API, Claude API, OpenRouter, and OpenAI-compatible servers. Version 0.9 corrects the tab lifecycle and interaction details: balanced Favorite tiles, navigated-pin markers, a 12-hour Today archive default with profile controls, continuously blended Space colors, an unblurred command palette and coordinated Peek motion. The [Arc behavior study](docs/ARC-BEHAVIOR-STUDY.md) records the reference evidence and design decisions. See the [validation record](docs/VALIDATION.md) and [Mac support boundary](docs/MACOS.md) for exact test evidence and remaining release checks.
 
-This is **not yet a complete implementation of the vision or a commercial release**. Zacro account sync, full Chrome extension compatibility and `chrome.storage.sync`, consequential browser agents, signed automatic updates, and operational/security release gates remain open. AI connection code and controlled-transport tests are implemented; live subscription sign-in, API model access, billing/limits and inference acceptance remain pending with user-authorized accounts. The [implementation roadmap](docs/ROADMAP.md) separates working features from required release work; [AI documentation](docs/AI.md) describes the connection and data boundaries.
+This branch adds verified Web Store installation, action/options controls, a distinct `chrome.storage.sync` adapter, and an independently runnable account/sync service with explicit profile links, independent library/settings consent and device management. See [extension support](docs/EXTENSIONS.md), [how to try synchronization](docs/SYNC.md), and [feature validation](docs/EXTENSIONS-SYNC-VALIDATION.md). Engine-dependent APIs require a separately built and validated Zacro Electron runtime; stock Electron keeps those capabilities unavailable. Current integration checks and unresolved platform/runtime/release gates are recorded separately from historical results.
+
+This is **not yet a complete implementation of the vision or a commercial release**. Full Chrome extension compatibility and a publicly operated sync service, consequential browser agents, signed automatic updates, and operational/security release gates remain open. AI connection code and controlled-transport tests are implemented; live subscription sign-in, API model access, billing/limits and inference acceptance remain pending with user-authorized accounts. The [implementation roadmap](docs/ROADMAP.md) separates working features from required release work; [AI documentation](docs/AI.md) describes the connection and data boundaries.
 
 Navigation and the address field live in the sidebar. Profile-wide icon Favorites sit above the Space name, followed by folders, saved Space pins and ordinary tabs. Drag between those regions to organize the same live page. Library, Space icons and one creation menu share the footer; page actions live in compact menus. The default sidebar is 224px wide, with 32px Comfortable tab rows and footer; existing custom widths are preserved. See the historical [0.4 design study](docs/DESIGN-REVIEW-0.4.md) and current [interaction notes](docs/DESIGN.md).
 
@@ -252,12 +254,13 @@ npm run test:interactive -- --showcase # Populated design-review workspace
 npm run test:interactive -- --showcase --compact # Minimum-size workspace
 npm run test:interactive -- --onboarding # First-run tour with editable shortcuts
 npm run test:soak  # Repeated native tab/Peek/split lifecycle checks
+npm run test:provider # Explicit online Web Store acquisition and native sample check
 npm run pack       # Runnable application folder under dist/
 npm run test:package # Verify the packaged executable, security fuses and PDF worker
 npm run dist       # Unsigned Windows NSIS test installer
 ```
 
-Tests create temporary profiles and local fixture servers; they do not use your normal browsing data or make paid AI calls. `npm run dist:release` requires organization code-signing credentials, and macOS releases additionally require notarization. Development artifacts do not satisfy the [commercial release gates](docs/ROADMAP.md#5-commercial-distribution). Linux remains an unvalidated packaging target.
+Offline suites create temporary profiles and local fixture servers; the separate `test:provider` command downloads a reviewed public extension. Tests do not use your normal browsing data or make paid AI calls. `npm run dist:release` requires organization code-signing credentials, and macOS releases additionally require notarization. Development artifacts do not satisfy the [commercial release gates](docs/ROADMAP.md#5-commercial-distribution). Linux remains an unvalidated packaging target.
 
 On **macOS 13 or later**, install native Node.js 24 for your Mac's architecture and run `npm ci` followed by `npm start`. `npm run pack:mac` creates a local `.app`; `npm run dist:mac` creates separate development DMG and ZIP files for the current architecture. Use `npm run test:mac` for the Mac acceptance suite. Build Apple silicon (`arm64`) and Intel (`x64`) packages on matching hosts; cross-architecture packaging is rejected to keep Electron and the bundled Codex runtime aligned.
 
@@ -303,7 +306,7 @@ The sidebar footer opens the Library destination chooser or creates a tab, folde
 - **Peek.** Keep the Arc-inspired preview experience: open a link in an overlay, explore it without leaving the current page, then dismiss it or promote it to a full tab.
 - **Tab cleanup.** Automatically archive eligible unpinned tabs, retain closed favorites, and sleep safe idle favorites with timing controls and clear status.
 - **Personalization.** Make the browser feel like yours through themes and thoughtful interface details.
-- **Zacro account sync (planned).** Bring extensions and supported extension settings across compatible devices, with separate sync data for each linked browser profile. Account sync is not implemented in the development build.
+- **Zacro account sync.** Connect compatible desktop installations to a configured service. Explicit profile links share extension-library intent; settings require separate consent. The service is included as source, with no assumed public endpoint. See [setup and boundaries](docs/SYNC.md).
 - **AI where you browse.** Choose your ChatGPT or Claude subscription, OpenAI or Claude API, OpenRouter, or an OpenAI-compatible server. Prepare summaries, explanations and comparisons, review selected page/PDF context, then send. Edit or retry questions, retain unfinished drafts and copy answers with source links. A selected page that navigates must be reviewed again before sharing. Supported providers also offer hosted web research; browser-task delegation remains planned work.
 
 ## Peek is a core feature
@@ -322,16 +325,14 @@ Modifier-click Peek currently applies to links in the main page. Links inside em
 
 ## Your extensions, across devices
 
-An optional **Zacro account** will connect compatible Zacro installations through a Zacro-operated sync service. Browsing locally will remain available without an account.
+The Electron-based extension host installs verified Chrome Web Store packages and managed local folders. Action popups, options pages, tab operations, commands and context menus integrate with Zacro. Missing engine capabilities remain explicit compatibility limits: passing manifest inspection does not guarantee every extension works. See the [tested package matrix](docs/EXTENSIONS-SYNC-VALIDATION.md#representative-public-packages).
 
-The planned rollout has two parts:
+An optional **Zacro account** connects desktop installations to the separately run account service. Browsing and local extensions work without an account. Follow [Account & sync](docs/SYNC.md) to start a development service and two isolated browser instances.
 
-1. **Extension library sync.** Sync extension identifiers, supported installation sources, and intended enabled or disabled states between explicitly linked profiles. Each device will install compatible extensions from their supported sources, preserve local security restrictions, and request any required permissions. Uninstall changes must also propagate so removed extensions do not reappear.
-2. **Extension settings sync.** Integrate Zacro sync with the extension `chrome.storage.sync` API so extensions using that API can carry their preferences across devices. Local-only storage, cookies, and sign-in sessions are outside this scope; some extensions will still require separate sign-in or their own sync service.
+1. **Extension library sync.** Explicitly linked profiles share portable source IDs and enabled, disabled or removed intent. New installations and additional permissions require approval on each device. Local unpacked folders stay on that computer.
+2. **Extension settings sync.** A distinct `chrome.storage.sync` API persists values locally and synchronizes them after separate informed consent. Native `storage.local`, cookies, site sessions, browser passwords and AI credentials stay outside this mechanism. Extensions may save sensitive values in their own sync settings; the privacy notice explains this before consent.
 
-This requires browser integration and our own authentication and sync backend. Google's Chrome Sync service is restricted for third-party browsers, so a Zacro account will not depend on it. See Chromium's [private API availability notice](https://blog.chromium.org/2021/01/limiting-private-api-availability-in.html) and the [extension storage documentation](https://developer.chrome.com/docs/extensions/reference/api/storage).
-
-The design must cover encrypted transport and storage, device revocation, cloud-data deletion, offline changes, conflict resolution, and profile isolation before release. End-to-end encryption and account recovery need an explicit design before we make privacy guarantees. Initial scope is compatible desktop installations; mobile extension support is not assumed.
+The service implements accounts and one-use recovery codes, device revocation, encrypted transport/storage, cloud deletion, persistent offline changes, deterministic conflicts, quotas and replay protection. Encryption is server-side: the running service can decrypt settings. It is **not end-to-end encryption**, and it does not use Google Chrome Sync. Production hosting, key custody, retention, monitoring and operational acceptance remain deployment work; local tests do not establish an operated service. Mobile extensions are outside this scope.
 
 ## AI that fits the workflow
 
@@ -388,7 +389,7 @@ The technical goals are to:
 - Keep pace with upstream security and compatibility updates.
 - Build the sidebar, Spaces, tab management, and command bar as a cohesive browser experience.
 
-The initial integration uses Electron 45, a sandboxed HTML/CSS/JavaScript interface, isolated native WebContentsViews, Node.js 24 development tooling, and electron-builder packaging. Windows is the first validation target. Chromium compatibility is a foundation, not a promise that every Chrome feature or Google service is available. In particular, Electron's extension API subset cannot satisfy the full extension-sync vision without additional engine work.
+The initial integration uses Electron 45, a sandboxed HTML/CSS/JavaScript interface, isolated native WebContentsViews, Node.js 24 development tooling, and electron-builder packaging. Windows is the first validation target. Chromium compatibility is a foundation, not a promise that every Chrome feature or Google service is available. Zacro supplies a bounded host adapter for browser integration and sync storage, including managed native DNR, offscreen and alarms. Native activeTab, in-place permission changes, userScripts and fontSettings require the separate Zacro Electron build and its acceptance gates. Broad Chrome compatibility is not promised.
 
 ## Principles
 
@@ -422,11 +423,13 @@ The initial integration uses Electron 45, a sandboxed HTML/CSS/JavaScript interf
 - [x] Add split view and configurable tab archiving (live pages are protected from automatic archiving).
 - [x] Build downloads, history, bookmarks, and settings interfaces.
 - [x] Manage compatible unpacked extensions with profile isolation and enable/disable/remove controls.
-- [ ] Validate broader extension compatibility, action/options UI and required Chrome APIs.
-- [ ] Design Zacro accounts, device management, and profile-scoped sync.
-- [ ] Sync extension installation and removal across compatible desktop devices.
-- [ ] Integrate supported extension settings through `chrome.storage.sync`.
-- [ ] Validate sync permissions, offline conflicts, device revocation, and cloud-data deletion.
+- [x] Add verified Web Store acquisition and action/options browser integration.
+- [x] Validate the supported MV2/MV3 background contexts, including native suspend/wake.
+- [ ] Expand compatibility beyond the documented Electron API boundary.
+- [x] Design and implement Zacro accounts, device management, and explicit profile-scoped sync.
+- [x] Synchronize extension installation and removal between explicitly linked profiles.
+- [x] Integrate distinct extension settings through `chrome.storage.sync` with separate consent.
+- [x] Validate sync permissions, offline conflicts, device revocation, and cloud-data deletion with isolated desktop clients and the real service.
 - [x] Import/export Zacro data and standard bookmark HTML, including supported bookmark exports from other browsers.
 - [ ] Add and validate native Arc sidebar migration.
 - [x] Add local keyboard, contrast, reduced-motion, lifecycle and recovery regressions.

@@ -1,0 +1,65 @@
+name: Native Electron verification
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native:
+    # Dedicated owner-provisioned builders, with the platform SDK, ample disk
+    # and an interactive desktop for native acceptance. No public PR trigger.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - labels: [self-hosted, zacro-electron-build, macOS, ARM64]
+            target: darwin-arm64
+            arch: arm64
+          - labels: [self-hosted, zacro-electron-build, macOS, X64]
+            target: darwin-x64
+            arch: x64
+          - labels: [self-hosted, zacro-electron-build, Windows, X64]
+            target: win32-x64
+            arch: x64
+    runs-on: ${{ matrix.labels }}
+    timeout-minutes: 1440
+    env:
+      ZACRO_RUNTIME_ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          architecture: ${{ matrix.arch }}
+          cache: npm
+      - name: Select dedicated runtime directory
+        run: >-
+          node -e "require('node:fs').appendFileSync(process.env.GITHUB_ENV,
+          'ZACRO_RUNTIME_ROOT=' + require('node:path').join(process.env.RUNNER_TEMP, 'zacro-electron') + '\n')"
+      - run: npm ci
+      - name: Inspect build capacity
+        run: node scripts/build-electron-runtime.cjs doctor "${{ env.ZACRO_RUNTIME_ROOT }}" "${{ matrix.arch }}"
+      - name: Fetch pinned sources
+        run: node scripts/build-electron-runtime.cjs sync "${{ env.ZACRO_RUNTIME_ROOT }}" "${{ matrix.arch }}"
+      - name: Prepare upstream toolchain and patches
+        run: node scripts/build-electron-runtime.cjs hooks "${{ env.ZACRO_RUNTIME_ROOT }}" "${{ matrix.arch }}"
+      - name: Verify and apply Zacro patches
+        run: node scripts/build-electron-runtime.cjs patch "${{ env.ZACRO_RUNTIME_ROOT }}" "${{ matrix.arch }}"
+      - name: Compile and create development runtime archive
+        run: node scripts/build-electron-runtime.cjs build "${{ env.ZACRO_RUNTIME_ROOT }}" "${{ matrix.arch }}"
+      - name: Native Electron acceptance
+        run: node scripts/build-electron-runtime.cjs test "${{ env.ZACRO_RUNTIME_ROOT }}" "${{ matrix.arch }}"
+      - name: Zacro native capability acceptance
+        run: node scripts/build-electron-runtime.cjs test-app "${{ env.ZACRO_RUNTIME_ROOT }}" "${{ matrix.arch }}"
+      - name: Record archive digest
+        run: >-
+          node -e "const fs=require('node:fs'),p=require('node:path'),c=require('node:crypto');const f=p.join(process.env.ZACRO_RUNTIME_ROOT,'src','out','Zacro-'+process.env.ZACRO_RUNTIME_ARCH,'dist.zip');const h=c.createHash('sha256');const s=fs.createReadStream(f);s.on('data',x=>h.update(x));s.on('error',e=>{throw e});s.on('end',()=>fs.writeFileSync(f+'.sha256',h.digest('hex')+'  dist.zip\n'));"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zacro-electron-${{ matrix.target }}
+          path: |
+            ${{ env.ZACRO_RUNTIME_ROOT }}/src/out/Zacro-${{ matrix.arch }}/dist.zip
+            ${{ env.ZACRO_RUNTIME_ROOT }}/src/out/Zacro-${{ matrix.arch }}/dist.zip.sha256
+            runtime/electron/build.json
+            runtime/electron/patches/series.json
+          if-no-files-found: error
+          retention-days: 7
