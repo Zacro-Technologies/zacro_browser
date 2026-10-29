@@ -1,6 +1,6 @@
 # Extensions on Electron
 
-The `extensions-and-sync` branch adds verified Chrome Web Store acquisition,
+Zacro 0.10 includes verified Chrome Web Store acquisition,
 profile-scoped extension controls, and a Zacro compatibility adapter. The
 [validation record](EXTENSIONS-SYNC-VALIDATION.md) separates historical
 lifecycle/package results from current main-integration checks and open

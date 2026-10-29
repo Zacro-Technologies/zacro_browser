@@ -1,7 +1,7 @@
 # Accounts, profiles and extension synchronization
 
 The account service and desktop client implement profile-scoped extension
-synchronization on `extensions-and-sync`. Real HTTP/SQLite and two-browser
+synchronization in Zacro 0.10. Real HTTP/SQLite and two-browser
 tests cover extension APIs, offline restart and device revocation. The
 [validation record](EXTENSIONS-SYNC-VALIDATION.md) identifies the tested
 revisions, current main-integration checks and remaining platform, custom
