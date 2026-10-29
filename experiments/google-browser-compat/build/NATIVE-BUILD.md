@@ -20,6 +20,8 @@ Use Node 24+, Git and a dedicated external root without spaces. Initial preparat
 
 Windows x64 requires VS 2026 18+ C++/ATL/MFC, SDK release 10.0.28000.2270 and x64 debugging tools 10.0.26100.3323+. The [provisioning tool](PROVISION-WINDOWS.md) verifies signed Microsoft installers and creates a separate Build Tools instance only with `-Install` from an elevated shell. It cannot approve OS elevation.
 
+For an explicitly bounded attempt on a smaller disk, set `ZACRO_NATIVE_LOW_DISK=1` on each source/build command. This lowers the source and compilation starting floors to 20 GiB, while retaining the automatic stop below 15 GiB free and process-tree cleanup. It does not reduce Chromium's actual storage needs or guarantee completion; interrupted files remain available for inspection or resumption. All toolchain, source-integrity and runtime checks remain enabled. Leave the variable unset for the default 100/40 GiB floors.
+
 Mac builds require their native architecture, APFS and Xcode. The pinned source minimum SDK is 15; the upstream official SDK is 26.5 / 25F70. Deployment remains macOS 13. Intel Mac has a separate `darwin-x64` build/test gate.
 
 ## Build on Windows

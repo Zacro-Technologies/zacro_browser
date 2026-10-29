@@ -183,7 +183,9 @@ async function toolsPath(layout, tools, platform) {
   if (tools?.vpython !== expected)
     throw new Error('Dependency commands must use the managed depot vpython executable.');
   await assertContained(layout.depot, expected);
-  await assertRegularMarker(expected);
+  // macOS CIPD exposes vpython3 through its contained application bundle.
+  // Resolve only after containment validation; evidence markers still reject links.
+  await assertRegularMarker(await fs.realpath(expected));
   return expected;
 }
 

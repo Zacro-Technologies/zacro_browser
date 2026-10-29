@@ -1,6 +1,7 @@
 'use strict';
 const { preflight } = require('../lib/preflight.cjs');
 const lock = require('./native-build.lock.json');
+const { diskPolicy } = require('./disk-policy.cjs');
 
 async function nativePreflight({ root, platform, phase = 'source' } = {}) {
   if (!['source', 'build'].includes(phase)) throw new Error('Unknown native build phase.');
@@ -20,13 +21,22 @@ async function nativePreflight({ root, platform, phase = 'source' } = {}) {
     );
   // The 100 GiB initial checkout guard is separate from remaining headroom after
   // sources/dependencies have occupied disk. Compilation must retain a reserve.
-  if (phase === 'build') {
+  const policy = diskPolicy();
+  report.diskPolicy = policy;
+  if (phase === 'build' || policy.lowDisk) {
     report.sourceBuild.blockers = report.sourceBuild.blockers.filter(
       (message) => message !== 'Available disk is below the experiment source-checkout guard of 100 GiB.',
     );
-    if (report.freeGiB < 40)
-      report.sourceBuild.blockers.push('Compilation requires at least 40 GiB remaining before it starts.');
+    const minimum = phase === 'build' ? policy.buildMinimumGiB : policy.sourceMinimumGiB;
+    if (report.freeGiB < minimum)
+      report.sourceBuild.blockers.push(
+        `Native ${phase} requires at least ${minimum} GiB remaining before it starts.`,
+      );
   }
+  if (policy.lowDisk)
+    report.sourceBuild.warnings.push(
+      'Low-disk attempt enabled: 20 GiB starting floor; the 15 GiB runtime stop remains active. Completion is not guaranteed.',
+    );
   report.diskReserveGiB = 15;
   report.sourceBuild.ready = report.sourceBuild.blockers.length === 0;
   return report;

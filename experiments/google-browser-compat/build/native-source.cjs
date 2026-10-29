@@ -5,6 +5,7 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 const lock = require('./native-build.lock.json');
+const { diskPolicy } = require('./disk-policy.cjs');
 const { ensureRoot, assertContained } = require('../lib/paths.cjs');
 
 const DEPOT_URL = 'https://chromium.googlesource.com/chromium/tools/depot_tools.git';
@@ -334,8 +335,9 @@ async function main(argv) {
   const env = sourceEnvironment(layout.depot);
   if (args.command === 'prepare') {
     const disk = await fs.statfs(root);
-    if (disk.bavail * disk.bsize < 100 * 1024 ** 3)
-      throw new Error('At least 100 GiB free is required before source preparation.');
+    const { sourceMinimumGiB } = diskPolicy();
+    if (disk.bavail * disk.bsize < sourceMinimumGiB * 1024 ** 3)
+      throw new Error(`At least ${sourceMinimumGiB} GiB free is required before source preparation.`);
     await pinnedCheckout(layout.depot, DEPOT_URL, layout.depotRevision, env);
     await pinnedCheckout(layout.src, SOURCE_URL, layout.sourceRevision, env);
     const config = path.join(layout.checkout, '.gclient');

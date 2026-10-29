@@ -209,6 +209,25 @@ test('failed sync and failed revinfo never produce a successful receipt', async 
   await assert.rejects(fs.access(path.join(context.layout.directory, 'sync.json')), { code: 'ENOENT' });
 });
 
+test(
+  'managed interpreter links stay within the depot directory',
+  { skip: process.platform === 'win32' },
+  async (t) => {
+    const context = await fixture(t);
+    const target = path.join(context.layout.depot, 'managed-vpython');
+    await fs.rename(context.tools.vpython, target);
+    await fs.symlink(target, context.tools.vpython);
+    assert.equal((await syncNative(context)).compiled, false);
+    await fs.unlink(context.tools.vpython);
+    const outside = path.join(context.root, 'foreign-vpython');
+    await fs.writeFile(outside, 'never executed');
+    await fs.symlink(outside, context.tools.vpython);
+    const before = context.calls.filter((call) => call.program !== 'git').length;
+    await assert.rejects(syncNative(context), /outside/);
+    assert.equal(context.calls.filter((call) => call.program !== 'git').length, before);
+  },
+);
+
 test('receipt rejects dependency revision drift and preserves foreign dependency data', async (t) => {
   const context = await fixture(t);
   await syncNative(context);
