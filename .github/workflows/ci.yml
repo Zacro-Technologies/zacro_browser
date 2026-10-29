@@ -21,7 +21,7 @@ jobs:
       - run: npm run test:soak
       - run: npm run pack
       - run: npm run test:package
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: windows-validation
@@ -53,13 +53,13 @@ jobs:
       - run: npm run test:soak
       - run: npm run dist:mac
       - run: npm run test:package
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: macos-${{ matrix.arch }}-validation
           path: test-results/
           retention-days: 7
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: macos-${{ matrix.arch }}-development
           path: |
