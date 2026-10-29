@@ -53,7 +53,7 @@ jobs:
       - name: Record archive digest
         run: >-
           node -e "const fs=require('node:fs'),p=require('node:path'),c=require('node:crypto');const f=p.join(process.env.ZACRO_RUNTIME_ROOT,'src','out','Zacro-'+process.env.ZACRO_RUNTIME_ARCH,'dist.zip');const h=c.createHash('sha256');const s=fs.createReadStream(f);s.on('data',x=>h.update(x));s.on('error',e=>{throw e});s.on('end',()=>fs.writeFileSync(f+'.sha256',h.digest('hex')+'  dist.zip\n'));"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: zacro-electron-${{ matrix.target }}
           path: |
