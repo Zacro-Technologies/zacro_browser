@@ -47,6 +47,10 @@ async function extractPDF(buffer, options = {}) {
       workerData: { zacroPdfTextWorker: true, data: data.buffer, ...limits },
       transferList: [data.buffer],
       resourceLimits: { maxOldGenerationSizeMb: 192, stackSizeMb: 4 },
+      // PDF.js imports native canvas before getDocument(useSystemFonts: false)
+      // applies. Text extraction needs no OS fonts; skip canvas's startup scan
+      // in this worker without changing the browser process environment.
+      env: { ...process.env, DISABLE_SYSTEM_FONTS_LOAD: '1' },
     });
     let done = false;
     const finish = (error, value) => {

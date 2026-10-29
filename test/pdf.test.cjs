@@ -2,6 +2,12 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs/promises');
+const os = require('node:os');
+const path = require('node:path');
+const vm = require('node:vm');
+const { createRequire } = require('node:module');
+const workerThreads = require('node:worker_threads');
 const { extractPDF, MAX_PDF_BYTES } = require('../src/main/pdf.cjs');
 const { makePDF } = require('./fixtures/pdf.cjs');
 
@@ -16,6 +22,63 @@ test('extracts actual PDF text with page numbers and leaves source bytes unchang
   assert.equal(result.totalPages, 2);
   assert.equal(result.truncated, false);
   assert.deepEqual(bytes, original);
+});
+
+test('text extraction never initializes or scans operating-system fonts inside its worker', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'zacro-pdf-font-test-'));
+  t.after(async () => {
+    const real = await fs.realpath(directory);
+    assert.equal(path.dirname(real).toLowerCase(), (await fs.realpath(os.tmpdir())).toLowerCase());
+    assert.match(path.basename(real), /^zacro-pdf-font-test-/u);
+    await fs.rm(real, { recursive: true });
+  });
+  const guard = path.join(directory, 'font-guard.cjs');
+  const accessed = path.join(directory, 'system-font-access.txt');
+  const binding = path.join(path.dirname(require.resolve('@napi-rs/canvas')), 'js-binding.js');
+  // Keep the real native canvas bindings and PDF parser. Fail if either system
+  // font entry point runs during dependency import or text extraction.
+  await fs.writeFile(
+    guard,
+    `
+    const { GlobalFonts } = require(${JSON.stringify(binding)});
+    for (const name of ['enableSystemFonts', 'loadFontsFromDir']) {
+      GlobalFonts[name] = () => {
+        require('node:fs').appendFileSync(${JSON.stringify(accessed)}, name + '\\n');
+        throw new Error('PDF extraction requested operating-system fonts.');
+      };
+    }
+  `,
+  );
+  const filename = path.resolve(__dirname, '../src/main/pdf.cjs');
+  const nativeRequire = createRequire(filename);
+  const module = { exports: {} };
+  const parentFontSetting = process.env.DISABLE_SYSTEM_FONTS_LOAD;
+  class GuardedWorker extends workerThreads.Worker {
+    constructor(workerFile, options) {
+      super(workerFile, {
+        ...options,
+        env: { ...process.env, DISABLE_SYSTEM_FONTS_LOAD: '', ...options.env },
+        execArgv: ['--require', guard],
+      });
+    }
+  }
+  vm.runInNewContext(await fs.readFile(filename, 'utf8'), {
+    module,
+    __filename: filename,
+    Buffer,
+    Uint8Array,
+    process,
+    setTimeout,
+    clearTimeout,
+    require(id) {
+      return id === 'node:worker_threads' ? { ...workerThreads, Worker: GuardedWorker } : nativeRequire(id);
+    },
+  });
+  const result = await module.exports.extractPDF(makePDF(['Text without a system font scan.']));
+  assert.equal(result.text, 'Text without a system font scan.');
+  assert.equal(result.totalPages, 1);
+  await assert.rejects(fs.access(accessed), { code: 'ENOENT' });
+  assert.equal(process.env.DISABLE_SYSTEM_FONTS_LOAD, parentFontSetting);
 });
 
 test('page and character budgets disclose truncated PDF context', async () => {
