@@ -41,9 +41,8 @@ test(
       shell.evaluate(([action, payload]) => window.zacro.invoke(action, payload), [action, payload]);
     const state = () => invoke('state:get');
     if (process.platform === 'darwin') {
-      // capturePage preserves compositor alpha. Test painted pixels, including
-      // the empty content pane, so an opaque CSS/native shell cannot silently
-      // turn this into a slider that changes state but not the window.
+      // The sidebar tint stays continuously transparent; the empty canvas is
+      // deliberately opaque, using the same Space colors without a border.
       if (await shell.locator('#command-input').count()) await shell.keyboard.press('Escape');
       const homeId = (await state()).activeSpaceId;
       const points = await shell.evaluate(() => {
@@ -74,11 +73,11 @@ test(
             ({ x, y }) => bitmap[(Math.floor(y * scale) * width + Math.floor(x * scale)) * 4 + 3],
           );
         }, points);
-        for (const value of alpha)
-          assert(
-            Math.abs(value - Math.round(opacity * 2.55)) <= 2,
-            `${opacity}% should paint alpha ${Math.round(opacity * 2.55)}, saw ${alpha}`,
-          );
+        assert(
+          Math.abs(alpha[0] - Math.round(opacity * 2.55)) <= 2,
+          `${opacity}% sidebar should paint alpha ${Math.round(opacity * 2.55)}, saw ${alpha[0]}`,
+        );
+        assert.equal(alpha[1], 255, 'The blank content pane stays opaque');
       }
     }
     await shell.evaluate(() => {
@@ -175,6 +174,36 @@ test(
     assert.equal(transparent.requestedOpacity, 0);
     if (transparent.enabled) assert.equal(transparent.opacity, 0);
     assert.equal(await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].getOpacity()), 1);
+    if (process.platform === 'darwin') {
+      const helper = require('../fixtures/mac-scroll-input.cjs').buildMacScrollInput();
+      const effectAlphas = () =>
+        app.evaluate(
+          ({ BrowserWindow }, helper) =>
+            process
+              .getBuiltinModule('module')
+              .createRequire(helper)(helper)
+              .readEffectAlphas(BrowserWindow.getAllWindows()[0].getNativeWindowHandle()),
+          helper,
+        );
+      for (const blur of [8, 16, 32]) {
+        const material = await invoke('window:material-preview', { spaceId, opacity: 0, blur });
+        assert.equal(material.blurStrength, blur / 32);
+        assert.equal(material.type, 'vibrancy');
+        const alphas = await effectAlphas();
+        assert(alphas.length > 0, 'An actual native background effect must exist');
+        assert(alphas.every((alpha) => Math.abs(alpha - blur / 32) < 0.001));
+        assert.equal(
+          await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].getOpacity()),
+          1,
+        );
+      }
+      await invoke('window:material-preview', { spaceId, opacity: 0, blur: 0 });
+      assert.deepEqual(
+        await effectAlphas(),
+        [],
+        'Zero blur removes the native effect rather than leaving an opacity floor',
+      );
+    }
     await invoke('window:material-preview', { clear: true });
     await invoke('space:update', { id: spaceId, theme: { opacity: 55 } });
     assert.equal((await state()).runtime.windowMaterial.requestedOpacity, 55);
@@ -214,6 +243,14 @@ test(
       input.dispatchEvent(new Event('input', { bubbles: true }));
     });
     await expect.poll(async () => (await state()).runtime.windowMaterial.requestedOpacity).toBe(40);
+    if (process.platform === 'darwin') {
+      await shell.locator('input[name="theme-blur"]').evaluate((input) => {
+        input.value = '16';
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+      await expect.poll(async () => (await state()).runtime.windowMaterial.blurStrength).toBe(0.5);
+      await expect(shell.locator('[data-theme-output="blur"]')).toHaveText('50%');
+    }
     await shell.evaluate(
       () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))),
     );

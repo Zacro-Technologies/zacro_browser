@@ -1,6 +1,6 @@
 {
   "name": "zacro-browser",
-  "version": "0.10.1",
+  "version": "0.10.2",
   "description": "A sidebar-first Chromium browser with Spaces, profiles, Peek, and optional AI.",
   "main": "src/main/main.cjs",
   "private": true,
@@ -10,7 +10,10 @@
     "node": ">=24"
   },
   "scripts": {
+    "postinstall": "node scripts/build-native-mac.cjs",
+    "prestart": "node scripts/build-native-mac.cjs",
     "start": "electron .",
+    "predev": "node scripts/build-native-mac.cjs",
     "dev": "electron .",
     "icons": "electron scripts/generate-icons.cjs",
     "test": "node --test test/*.test.cjs",
@@ -24,7 +27,7 @@
     "prepack": "node scripts/prepare-runtime.cjs",
     "pack:mac": "node scripts/build-mac.cjs --dir",
     "dist:mac": "node scripts/build-mac.cjs",
-    "test:mac": "node --test --test-concurrency=1 test/e2e/mac.test.cjs test/e2e/ai-connections.test.cjs test/e2e/ai-workflow.test.cjs test/e2e/pinned-lifecycle.test.cjs test/e2e/personalization.test.cjs test/e2e/command-workflow.test.cjs test/e2e/browser.test.cjs test/e2e/compact-layout.test.cjs test/e2e/platform-shell.test.cjs test/e2e/motion.test.cjs test/e2e/space-swipe.test.cjs test/e2e/security.test.cjs test/e2e/startup.test.cjs test/e2e/onboarding.test.cjs test/e2e/window-material.test.cjs test/e2e/pin-model.test.cjs test/e2e/library.test.cjs test/e2e/chrome-resize.test.cjs test/e2e/auto-archive.test.cjs test/e2e/extension-*.test.cjs test/e2e/extensions-sync.test.cjs",
+    "test:mac": "node --test --test-concurrency=1 test/e2e/mac.test.cjs test/e2e/ai-connections.test.cjs test/e2e/ai-workflow.test.cjs test/e2e/pinned-lifecycle.test.cjs test/e2e/persistent-split.test.cjs test/e2e/split-interactions.test.cjs test/e2e/copy-image.test.cjs test/e2e/personalization.test.cjs test/e2e/command-workflow.test.cjs test/e2e/browser.test.cjs test/e2e/compact-layout.test.cjs test/e2e/platform-shell.test.cjs test/e2e/motion.test.cjs test/e2e/space-swipe.test.cjs test/e2e/security.test.cjs test/e2e/startup.test.cjs test/e2e/onboarding.test.cjs test/e2e/window-material.test.cjs test/e2e/pin-model.test.cjs test/e2e/library.test.cjs test/e2e/chrome-resize.test.cjs test/e2e/auto-archive.test.cjs test/e2e/extension-*.test.cjs test/e2e/extensions-sync.test.cjs",
     "dist": "electron-builder --win nsis --x64",
     "predist": "node scripts/prepare-runtime.cjs",
     "dist:release": "node scripts/release.cjs",
@@ -43,6 +46,7 @@
     "productName": "Zacro",
     "asar": true,
     "asarUnpack": [
+      "src/native/*.node",
       "node_modules/@openai/codex-*/vendor/**/*"
     ],
     "electronDist": "node_modules/electron/dist",

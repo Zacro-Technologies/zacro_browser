@@ -10,11 +10,11 @@ Zacro is an open-source, Arc-inspired browser by Zacro Technologies. Keep your e
 
 Your sidebar brings Favorites, folders and tabs together. Keep the sites you use every day in Favorites, pin useful pages to a Space, and let temporary tabs clear away with automatic archiving. Closing a Favorite or pin keeps its saved destination ready for next time. Their site icons remain available offline.
 
-Create **Spaces** for work, personal projects or whatever you're exploring. Give each one its own colors and icon. Use separate **profiles** when you want to keep accounts and browsing data apart.
+Create **Spaces** for work, personal projects or whatever you're exploring. Give each one its own colors, texture and icon. Shape the look with tactile theme controls and an instant preview. Use separate **profiles** when you want to keep accounts and browsing data apart.
 
 ## Follow a link without losing your place
 
-**Peek** opens a link over the page you're reading. Shift-click to take a look, press Escape to return, or turn the preview into a full tab when you want to keep it. **Split view** puts two pages side by side. Your splits and Peeks stay with their tabs until you close or separate them.
+**Peek** opens a link over the page you're reading. Shift-click to take a look, press Escape to return, or turn the preview into a full tab when you want to keep it. **Split view** puts two pages side by side; drag the divider to give either page more room. Your splits and Peeks stay with their tabs until you close or separate them.
 
 | Peek | Make each Space yours |
 | --- | --- |
@@ -30,13 +30,13 @@ Press **⌘S / Ctrl+S** for a content-only view, or **⌘L / Ctrl+L** to edit th
 
 ## Bring your tools along
 
-Install compatible extensions from the Chrome Web Store and manage them per profile. Optional account sync can share your extension library and, with separate consent, extension settings across linked desktop profiles. Sync currently requires a separately configured service; browsing works without an account. See [extension compatibility](docs/EXTENSIONS.md) and [sync setup](docs/SYNC.md).
+Install compatible extensions from the Chrome Web Store and pin your most-used tools beneath the address bar. Open Site controls for extensions and page actions. Optional account sync can share your extension library and, with separate consent, extension settings across linked desktop profiles. Sync currently requires a separately configured service; browsing works without an account. See [extension compatibility](docs/EXTENSIONS.md) and [sync setup](docs/SYNC.md).
 
 Optional **Ask Zacro** brings questions, summaries and comparisons into your browsing workflow. Choose a connection, review the page or PDF text you want to share, and ask follow-up questions. Supported connections can research the web and let you open the answer's sources when you're ready. See [AI connections and current limits](docs/AI.md).
 
 ## Try Zacro
 
-**0.10.1 is an early desktop preview for Windows and macOS.** It is still being refined before a signed public release. Some extensions are unsupported, direct Google sign-in is currently reported blocked, and live AI-provider acceptance remains in progress. Read the [release notes](docs/RELEASE-NOTES-0.10.md) and [website sign-in notes](docs/WEB-SIGN-IN.md) before relying on it as your everyday browser.
+**0.10.2 is an early desktop preview for Windows and macOS.** It is still being refined before a signed public release. Some extensions are unsupported, direct Google sign-in is currently reported blocked, and live AI-provider acceptance remains in progress. Read the [release notes](docs/RELEASE-NOTES-0.10.md) and [website sign-in notes](docs/WEB-SIGN-IN.md) before relying on it as your everyday browser.
 
 To run from source, install Node.js 24 or later:
 

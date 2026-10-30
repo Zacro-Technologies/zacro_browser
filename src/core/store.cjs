@@ -86,6 +86,11 @@ const str = (value, max = 200) => (typeof value === 'string' ? value.trim().slic
 const color = (value) => (/^#[\da-f]{6}$/i.test(value || '') ? value : '#9d4460');
 const array = (value) => (Array.isArray(value) ? value : []);
 const safeId = (value) => typeof value === 'string' && /^[a-zA-Z0-9_-]{1,100}$/.test(value);
+const extensionPins = (value) =>
+  [...new Set(array(value).filter((item) => typeof item === 'string' && /^[a-p]{32}$/.test(item)))].slice(
+    0,
+    256,
+  );
 const time = (value) => (Number.isFinite(value) && value > 0 ? value : Date.now());
 const spaceIcon = (value) => (SPACE_ICONS.has(value) ? value : 'circle');
 function spaceTheme(value, base = DEFAULT_SPACE_THEME) {
@@ -172,7 +177,9 @@ function extensionUrl(value) {
 function createInitialState() {
   return {
     version: 1,
-    profiles: [{ id: 'default', name: 'Personal', private: false, archiveAfterHours: null }],
+    profiles: [
+      { id: 'default', name: 'Personal', private: false, archiveAfterHours: null, pinnedExtensionIds: [] },
+    ],
     spaces: [
       {
         id: 'home',
@@ -270,6 +277,7 @@ function hydrate(raw) {
       name: str(p.name) || 'Profile',
       private: false,
       archiveAfterHours: validArchiveHours(p.archiveAfterHours) ? p.archiveAfterHours : null,
+      pinnedExtensionIds: extensionPins(p.pinnedExtensionIds),
     }));
   if (!result.profiles.length) throw new Error('No valid profile found.');
   const profiles = new Set(result.profiles.map((p) => p.id));
@@ -704,7 +712,7 @@ class BrowserStore extends EventEmitter {
           }
           throw new Error('Unsplit these tabs before adding them to another split view.');
         }
-        result = { id: id('split'), spaceId: space.id, tabIds: [first.id, second.id] };
+        result = { id: id('split'), spaceId: space.id, tabIds: [first.id, second.id], ratio: 0.5 };
         s.splitGroups.push(result);
         break;
       }
@@ -713,6 +721,14 @@ class BrowserStore extends EventEmitter {
           (item) => item.id === p.id || item.tabIds.includes(p.tabId || s.activeTabId),
         );
         if (group) s.splitGroups = s.splitGroups.filter((item) => item !== group);
+        break;
+      }
+      case 'split:resize': {
+        const group = s.splitGroups.find((item) => item.id === p.id);
+        if (!group || typeof p.ratio !== 'number' || !Number.isFinite(p.ratio))
+          throw new Error('Choose a split view and a valid divider position.');
+        group.ratio = Math.max(0.1, Math.min(0.9, p.ratio));
+        result = group;
         break;
       }
       case 'tab:create': {
@@ -942,6 +958,7 @@ class BrowserStore extends EventEmitter {
           name: str(p.name),
           private: p.private === true,
           archiveAfterHours: validArchiveHours(p.archiveAfterHours) ? p.archiveAfterHours : null,
+          pinnedExtensionIds: [],
         };
         const space = {
           id: id('space'),
@@ -954,6 +971,14 @@ class BrowserStore extends EventEmitter {
         s.profiles.push(profile);
         s.spaces.push(space);
         this.activateSpace(space);
+        result = profile;
+        break;
+      }
+      case 'profile:extension-pins': {
+        const profile = this.require('profiles', p.id, 'Profile');
+        if (profile.private) throw new Error('Extensions are unavailable in private profiles.');
+        if (!Array.isArray(p.ids)) throw new Error('Choose installed extensions to pin.');
+        profile.pinnedExtensionIds = extensionPins(p.ids);
         result = profile;
         break;
       }
@@ -1122,7 +1147,7 @@ class BrowserStore extends EventEmitter {
       format: 'zacro-export',
       version: 1,
       exportedAt: new Date().toISOString(),
-      profiles: s.profiles,
+      profiles: s.profiles.map(({ pinnedExtensionIds, ...profile }) => profile),
       spaces: s.spaces,
       tabs: s.tabs.map(({ navigationHistory, ...tab }) => tab),
       folders: s.folders,
@@ -1136,6 +1161,11 @@ class BrowserStore extends EventEmitter {
       throw new Error('Choose a Zacro JSON export or a browser bookmarks HTML file.');
     const data = hydrate({
       ...raw,
+      profiles: array(raw.profiles).map((profile) => {
+        if (!profile || typeof profile !== 'object') return profile;
+        const { pinnedExtensionIds, ...portable } = profile;
+        return portable;
+      }),
       tabs: array(raw.tabs).map((item) => {
         if (!item || typeof item !== 'object') return item;
         const { navigationHistory, ...tab } = item;

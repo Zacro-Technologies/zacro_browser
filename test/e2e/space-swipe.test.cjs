@@ -7,6 +7,25 @@ const os = require('node:os');
 const path = require('node:path');
 const http = require('node:http');
 const { _electron: electron, expect } = require('@playwright/test');
+const { buildMacScrollInput } = require('../fixtures/mac-scroll-input.cjs');
+
+async function nativeMacScroll(browser) {
+  const helper = buildMacScrollInput();
+  assert.equal((await browser.state()).runtime.nativeSpaceScroll, true);
+  return async (events, selector = '.tabs-scroll') => {
+    const bounds = await browser.shell.locator(selector).boundingBox();
+    assert(bounds, selector);
+    await browser.app.evaluate(
+      ({ BrowserWindow }, { helper, events, x, y }) => {
+        const load = process.getBuiltinModule('module').createRequire(helper);
+        const { postScroll } = load(helper);
+        const handle = BrowserWindow.getAllWindows()[0].getNativeWindowHandle();
+        for (const event of events) postScroll(handle, { x, y, ...event });
+      },
+      { helper, events, x: bounds.x + 20, y: bounds.y + 20 },
+    );
+  };
+}
 
 async function launch(t) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'zacro-space-swipe-'));
@@ -210,12 +229,15 @@ test(
     });
     const sidebar = await b.shell.locator('.tabs-scroll').boundingBox();
     const point = { x: sidebar.x + sidebar.width / 2, y: sidebar.y + 100 };
+    const native = (await b.state()).runtime.nativeSpaceScroll ? await nativeMacScroll(b) : null;
     await b.shell.mouse.move(point.x, point.y);
-    await b.shell.mouse.wheel(100, 0);
+    if (native) await native([{ phase: 1, deltaX: 100 }, { phase: 8 }]);
+    else await b.shell.mouse.wheel(100, 0);
     await b.changedTo(b.second);
     assert.equal(await b.shell.locator('.tabs-scroll').evaluate((element) => element.scrollTop), 0);
     await b.idle();
-    await b.shell.mouse.wheel(-100, 0);
+    if (native) await native([{ phase: 1, deltaX: -100 }, { phase: 8 }]);
+    else await b.shell.mouse.wheel(-100, 0);
     await b.changedTo(b.first);
     assert.equal(
       await b.shell.locator('.tabs-scroll').evaluate((element) => element.scrollTop),
@@ -338,7 +360,8 @@ test(
     await b.idle();
     await b.shell.emulateMedia({ reducedMotion: 'reduce' });
     await b.shell.mouse.move(point.x, point.y);
-    await b.shell.mouse.wheel(100, 0);
+    if (native) await native([{ phase: 1, deltaX: 100 }, { phase: 8 }]);
+    else await b.shell.mouse.wheel(100, 0);
     await b.changedTo(b.second);
     assert.equal(await b.shell.evaluate(() => window.spaceMotion.length), samples.length);
   },
@@ -453,7 +476,10 @@ test(
     // full-window shield over the sidebar's trackpad surface.
     const sidebar = await b.shell.locator('.tabs-scroll').boundingBox();
     await b.shell.mouse.move(sidebar.x + sidebar.width / 2, sidebar.y + 80);
-    await b.shell.mouse.wheel(100, 0);
+    if ((await b.state()).runtime.nativeSpaceScroll) {
+      const native = await nativeMacScroll(b);
+      await native([{ phase: 1, deltaX: 100 }, { phase: 8 }]);
+    } else await b.shell.mouse.wheel(100, 0);
     await b.changedTo(b.second);
     await b.invoke('space:activate', { id: b.first });
     await b.changedTo(b.first);
@@ -991,6 +1017,30 @@ test(
     const b = await launch(t);
     await b.invoke('tab:create', { homePage: true });
     await b.idle();
+    if ((await b.state()).runtime.nativeSpaceScroll) {
+      const native = await nativeMacScroll(b);
+      await native([{ phase: 1, deltaX: 100 }]);
+      await expect(b.shell.locator('.space-page')).toHaveClass(/gesture-tracking/);
+      await b.shell.evaluate(() => new Promise((resolve) => setTimeout(resolve, 1000)));
+      assert.equal(await b.current(), b.first);
+      await expect(b.shell.locator('.space-page')).toHaveClass(/gesture-tracking/);
+      await native([{ phase: 4, deltaX: 310 }, { phase: 8 }]);
+      await b.changedTo(b.third);
+      await b.idle();
+      await native([{ phase: 1, deltaX: -120 }, { phase: 8 }]);
+      await b.changedTo(b.second);
+      await native([
+        { momentumPhase: 1, deltaX: -500 },
+        { momentumPhase: 4, deltaX: -300 },
+        { momentumPhase: 8 },
+      ]);
+      await b.idle();
+      assert.equal(await b.current(), b.second, 'Cocoa inertia never changes the released Space');
+      await native([{ phase: 1, deltaX: 140 }, { phase: 8 }], '#toolbar');
+      await b.idle();
+      assert.equal(await b.current(), b.second, 'Toolbar scrolls do not claim Space navigation');
+      return;
+    }
     await b.shell.evaluate(() => {
       window.__nativeSpacePhase = null;
       window.zacro.onEvent((event) => {
@@ -1078,5 +1128,30 @@ test(
     await b.changedTo(b.third);
     await b.wheel([{ deltaX: -900, momentum: true }]);
     assert.equal(await b.current(), b.third);
+  },
+);
+
+test(
+  'Cocoa rapid flicks stop at one Space even when a long inertial tail follows',
+  { timeout: 45000, skip: process.platform !== 'darwin' },
+  async (t) => {
+    const b = await launch(t);
+    await b.invoke('space:create', { name: 'Fourth Space' });
+    await b.invoke('space:create', { name: 'Fifth Space' });
+    await b.invoke('space:activate', { id: b.first });
+    await b.invoke('tab:create', { homePage: true });
+    await b.idle();
+    const native = await nativeMacScroll(b);
+    await native([{ phase: 1, deltaX: 160 }, { phase: 4, deltaX: 540 }, { phase: 8 }]);
+    await b.changedTo(b.second);
+    for (let index = 0; index < 8; index++) {
+      await native([{ momentumPhase: index ? 4 : 1, deltaX: 800 - index * 60 }]);
+      await b.shell.evaluate(() => new Promise((resolve) => setTimeout(resolve, 90)));
+      assert.equal(await b.current(), b.second);
+    }
+    await native([{ momentumPhase: 8 }]);
+    await b.idle();
+    await native([{ phase: 1, deltaX: -140 }, { phase: 4, deltaX: -700 }, { phase: 8 }]);
+    await b.changedTo(b.first);
   },
 );

@@ -1,5 +1,8 @@
 'use strict';
 
+const cleanSplitRatio = (value) =>
+  typeof value === 'number' && Number.isFinite(value) ? Math.max(0.1, Math.min(0.9, value)) : 0.5;
+
 // Groups describe saved organization; visibility is derived from the selected
 // tab separately, so switching tabs or Spaces never tears a group down.
 function cleanSplitGroups(groups, tabs, spaces) {
@@ -37,11 +40,16 @@ function cleanSplitGroups(groups, tabs, spaces) {
       })
     )
       continue;
-    result.push({ id: group.id, spaceId: space.id, tabIds: [...group.tabIds] });
+    result.push({
+      id: group.id,
+      spaceId: space.id,
+      tabIds: [...group.tabIds],
+      ratio: cleanSplitRatio(group.ratio),
+    });
     usedIds.add(group.id);
     for (const id of group.tabIds) usedTabs.add(id);
   }
   return result;
 }
 
-module.exports = { cleanSplitGroups };
+module.exports = { cleanSplitGroups, cleanSplitRatio };

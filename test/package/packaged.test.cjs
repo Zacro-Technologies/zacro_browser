@@ -176,6 +176,10 @@ test(
       const about = await page.evaluate(() => window.zacro.invoke('app:about'));
       assert.equal(about.packaged, true);
       assert.equal(about.name, 'Zacro');
+      if (process.platform === 'darwin') {
+        const state = await page.evaluate(() => window.zacro.invoke('state:get'));
+        assert.equal(state.runtime.nativeSpaceScroll, true, 'The packaged native Mac bridge must load');
+      }
       return page;
     });
     const sync = await shell.evaluate(() => window.zacro.invoke('sync:status'));

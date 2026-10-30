@@ -37,6 +37,7 @@ const {
 const { FaviconLoader } = require('./favicon.cjs');
 const { SavedFaviconCache } = require('./favicon-cache.cjs');
 const { windowChrome, macMenuTemplate } = require('./mac.cjs');
+const { startMacScrollMonitor, setMacBlurStrength, performMacHaptic } = require('./native-mac.cjs');
 const { windowMaterial } = require('./window-material.cjs');
 const { shortcutCatalog, matchShortcut, updateShortcut, sidebarTabs } = require('../core/shortcuts.cjs');
 const { SyncController } = require('./sync/controller.cjs');
@@ -107,6 +108,7 @@ let backdropGeometry = null;
 const MAX_BACKDROP_PIXELS = 16 * 1024 * 1024;
 const MAX_BACKDROP_BYTES = 20 * 1024 * 1024;
 let windowReady = null;
+let nativeSpaceScrollCleanup = null;
 let startupReady = false;
 let quitRequested = false;
 let drainingExternalURLs = false;
@@ -117,8 +119,11 @@ const externalURLs = [];
 let defaultBrowser = { supported: process.platform === 'darwin' && app.isPackaged, configured: false };
 let shellSurface = null;
 let peekOverlay = null;
+let splitDrag = null;
+let splitDragTimer = null;
 let windowMaterialState = null;
 let materialPreview = null;
+let lastThemeHapticAt = -Infinity;
 let spaceMaterialTransition = null;
 let spaceMaterialTimer = null;
 let materialSignature = null;
@@ -196,10 +201,16 @@ function syncWindowMaterial() {
     platform: process.platform,
     release: os.release(),
     opacity: materialPreview?.opacity ?? transitionOpacity ?? space?.theme?.opacity ?? 100,
+    blur: materialPreview?.blur ?? space?.theme?.blur ?? 0,
     reducedTransparency: nativeTheme.prefersReducedTransparency,
     highContrast: nativeTheme.shouldUseHighContrastColors || nativeTheme.inForcedColorsMode,
   });
-  const signature = JSON.stringify([next.type, next.reason, nativeTheme.shouldUseDarkColors]);
+  const signature = JSON.stringify([
+    next.type,
+    next.reason,
+    next.blurStrength,
+    nativeTheme.shouldUseDarkColors,
+  ]);
   if (signature === failedMaterialSignature) {
     Object.assign(next, { enabled: false, type: 'opaque', opacity: 100, reason: 'native-error' });
   } else if (signature !== materialSignature) {
@@ -207,7 +218,15 @@ function syncWindowMaterial() {
     try {
       if (process.platform === 'win32' && next.supported)
         win.setBackgroundMaterial(next.enabled ? 'acrylic' : 'none');
-      else if (process.platform === 'darwin') win.setVibrancy(null);
+      else if (process.platform === 'darwin') {
+        win.setVibrancy(next.blurStrength > 0 ? 'under-window' : null);
+        if (next.blurStrength > 0 && !setMacBlurStrength(win, next.blurStrength)) {
+          win.setVibrancy(null);
+          next.blur = 'unavailable';
+          next.blurStrength = 0;
+          next.type = 'transparent';
+        }
+      }
       win.setBackgroundColor(next.enabled ? '#00000000' : background);
       // These are the shell and its neutral native parent, never a website view.
       // A single opaque native ancestor would hide the desktop/material.
@@ -230,6 +249,8 @@ function syncWindowMaterial() {
       materialSignature = null;
       failedMaterialSignature = signature;
     }
+  } else if (windowMaterialState?.blur === 'unavailable' && next.blurStrength > 0) {
+    Object.assign(next, { type: 'transparent', blur: 'unavailable', blurStrength: 0 });
   }
   windowMaterialState = next;
 }
@@ -257,6 +278,33 @@ function clearBackdrop() {
   backdropGeometry = null;
   emit({ type: 'page:backdrop', frames: [] });
 }
+async function retireBackdropAfterPaint(generation) {
+  const pages = [...views.values(), ...(peek ? [peek.entry] : [])].filter(
+    (entry) => entry.presentation.visible && !entry.contents.isDestroyed(),
+  );
+  let timer;
+  try {
+    await Promise.race([
+      Promise.all(
+        pages.map((entry) =>
+          entry.contents
+            .executeJavaScriptInIsolatedWorld(999, [
+              {
+                code: 'new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))',
+              },
+            ])
+            .catch(() => {}),
+        ),
+      ),
+      new Promise((resolve) => {
+        timer = setTimeout(resolve, 250);
+      }),
+    ]);
+    if (validWindow() && !layout.overlay && generation === backdropGeneration) clearBackdrop();
+  } finally {
+    clearTimeout(timer);
+  }
+}
 function backdropLayoutKey() {
   return JSON.stringify([
     ...win.getContentSize(),
@@ -267,6 +315,7 @@ function backdropLayoutKey() {
     store.state.settings.pageRadius,
     screen.getDisplayMatching(win.getBounds()).scaleFactor,
     Boolean(splitPair),
+    currentSplitRatio(),
     peek && [peek.id, Math.round(peek.offset || 0)],
   ]);
 }
@@ -515,6 +564,7 @@ function snapshot() {
     extensionPanel: extensionHost?.sidePanel?.snapshot() || null,
     splitTabId,
     splitPair,
+    splitRatio: currentSplitRatio(),
     savedPeeks: Object.fromEntries(
       result.tabs
         .filter((tab) => tab.savedPeek)
@@ -561,6 +611,7 @@ function snapshot() {
     defaultBrowser,
     dark: nativeTheme.shouldUseDarkColors,
     windowMaterial: windowMaterialState,
+    nativeSpaceScroll: Boolean(nativeSpaceScrollCleanup),
   };
   // Managed extension paths are operational details, not a renderer capability.
   result.extensions = extensionHost?.snapshot(activeProfile()?.id) || [];
@@ -875,7 +926,12 @@ function createEntry(profileId, tabId = null, suppliedOptions = {}) {
       entry.faviconURL = null;
       publish();
     }
-    if (isMainFrame && backdropContext?.contentIds.has(wc.id)) clearBackdrop();
+    if (isMainFrame && backdropContext?.contentIds.has(wc.id)) {
+      clearBackdrop();
+      // A navigation can invalidate the capture before its seamless handoff
+      // finishes. Retire the live surface immediately so it cannot cover a dialog.
+      arrangeViews();
+    }
     if (isMainFrame && pendingAuth?.contentsId === wc.id && url !== pendingAuth.url) finishAuth();
   });
   wc.on('dom-ready', () => {
@@ -1744,10 +1800,11 @@ function ensurePeekOverlay() {
 function arrangePeekOverlay(visible) {
   const overlay = peekOverlay;
   if (!overlay || overlay.contents.isDestroyed()) return;
-  const reveal = !peek && layout.sidebarHidden && !layout.overlay;
+  const dragging = Boolean(splitDrag && validSplitDrag(splitDrag) && !layout.overlay && !peek);
+  const reveal = !dragging && !peek && layout.sidebarHidden && !layout.overlay;
   const gutter = store.state.settings.pageGutter ?? 8;
   const bounds = reveal ? { x: gutter + 4, y: gutter + 4, width: 32, height: 32 } : peekUnderlayBounds();
-  const shown = Boolean((visible || reveal) && overlay.ready);
+  const shown = Boolean((visible || reveal || dragging) && overlay.ready);
   overlay.presentation = presentView(
     overlay.view,
     overlay.presentation,
@@ -1758,11 +1815,11 @@ function arrangePeekOverlay(visible) {
     },
     win.contentView,
   );
-  if (!overlay.ready || (!peek && !reveal)) return;
+  if (!overlay.ready || (!peek && !reveal && !dragging)) return;
   const card = peek ? peekPresentationBounds(peek) : null;
   overlay.contents.send('zacro:peek-overlay-state', {
-    mode: reveal ? 'sidebar' : 'peek',
-    id: reveal ? 'sidebar-reveal' : peek.id,
+    mode: dragging ? 'split-drop' : reveal ? 'sidebar' : 'peek',
+    id: dragging ? splitDrag.id : reveal ? 'sidebar-reveal' : peek.id,
     sidebarHidden: Boolean(layout.sidebarHidden),
     bounds: card
       ? { x: card.x - bounds.x, y: card.y - bounds.y, width: card.width, height: card.height }
@@ -1779,9 +1836,44 @@ function arrangePeekOverlay(visible) {
     },
   });
 }
+function currentSplitGroup() {
+  return store.state.splitGroups.find(
+    (group) => group.spaceId === store.state.activeSpaceId && group.tabIds.includes(store.state.activeTabId),
+  );
+}
+function validSplitDrag(drag) {
+  const source = drag && store.state.tabs.find((tab) => tab.id === drag.tabId);
+  const target = activeTab();
+  return Boolean(
+    source &&
+    target &&
+    source.id !== target.id &&
+    target.id === drag.targetId &&
+    source.url !== NEW_TAB &&
+    target.url !== NEW_TAB &&
+    !target.closed &&
+    !peek &&
+    source.profileId === target.profileId &&
+    !store.state.splitGroups.some(
+      (group) => group.tabIds.includes(source.id) || group.tabIds.includes(target.id),
+    ),
+  );
+}
+function clearSplitDrag() {
+  clearTimeout(splitDragTimer);
+  splitDragTimer = null;
+  splitDrag = null;
+  if (validWindow()) arrangeViews();
+}
+function currentSplitRatio() {
+  const group = currentSplitGroup();
+  return group && layout.splitGroupId === group.id && Number.isFinite(layout.splitRatio)
+    ? layout.splitRatio
+    : (group?.ratio ?? 0.5);
+}
 function arrangeViews() {
   if (!validWindow()) return;
-  if ((peek || layout.sidebarHidden) && !peekOverlay) ensurePeekOverlay();
+  if ((peek || layout.sidebarHidden || splitDrag) && !peekOverlay) ensurePeekOverlay();
   if (layout.overlay && backdropGeometry && backdropGeometry !== backdropLayoutKey())
     // Hidden native surfaces defer viewport resizing on some platforms. Omit
     // stale pixels until the next opening rather than stretch the old bitmap
@@ -1794,6 +1886,7 @@ function arrangeViews() {
     ...layout,
     pageGutter: store.state.settings.pageGutter,
     split: Boolean(splitPair),
+    splitRatio: currentSplitRatio(),
   });
   const desired = new Map();
   if (!layout.overlay || backdropHandoff?.generation === backdropGeneration) {
@@ -2092,6 +2185,13 @@ function showPageMenu(entry, params) {
           }).catch(report),
       },
     );
+  if (params.mediaType === 'image' && params.hasImageContents)
+    items.push({
+      label: 'Copy image',
+      click: () => {
+        if (!wc.isDestroyed()) wc.copyImageAt(params.x, params.y);
+      },
+    });
   if (webURL(params.srcURL))
     items.push(
       { label: 'Save image as…', click: () => wc.downloadURL(params.srcURL) },
@@ -2623,7 +2723,24 @@ async function invoke(action, payload = {}) {
   if (typeof action !== 'string' || !payload || typeof payload !== 'object' || Array.isArray(payload))
     throw new Error('Invalid browser action.');
   if (action.startsWith('sync:')) return syncAccount.handle(action, payload);
-  if (action.startsWith('extension:')) return extensionHost.handle(action, payload);
+  if (action.startsWith('extension:')) {
+    const profileId = activeProfile()?.id;
+    const result = await extensionHost.handle(action, payload);
+    if (action === 'extension:remove') {
+      const profile = store.state.profiles.find((item) => item.id === profileId);
+      const installed = new Set(
+        extensionHost
+          .snapshot(profileId)
+          .filter((item) => item.status !== 'remote-pending')
+          .map((item) => item.id),
+      );
+      const pins = profile?.pinnedExtensionIds || [];
+      const retained = pins.filter((id) => installed.has(id));
+      if (retained.length !== pins.length)
+        store.dispatch('profile:extension-pins', { id: profile.id, ids: retained });
+    }
+    return result;
+  }
   if (CORE_ACTIONS.has(action)) {
     if (action === 'tab:close') return requestCloseTab(payload.id || store.state.activeTabId);
     if (action === 'profile:delete') {
@@ -2689,6 +2806,25 @@ async function invoke(action, payload = {}) {
   }
   const contents = activeContents();
   switch (action) {
+    case 'extension-pin:toggle': {
+      const profile = activeProfile();
+      if (!profile || profile.private || (payload.profileId && payload.profileId !== profile.id))
+        throw new Error('Choose an extension in the current regular profile.');
+      const installed =
+        extensionHost?.snapshot(profile.id).filter((item) => item.status !== 'remote-pending') || [];
+      const extension = installed.find((item) => item.id === payload.id);
+      if (!extension?.hasAction) throw new Error('Choose an installed extension with a toolbar action.');
+      const pins = (profile.pinnedExtensionIds || []).filter((id) =>
+        installed.some((item) => item.id === id),
+      );
+      const pinned = pins.includes(extension.id);
+      if (!pinned && pins.length >= 256) throw new Error('Unpin an extension before adding another.');
+      store.dispatch('profile:extension-pins', {
+        id: profile.id,
+        ids: pinned ? pins.filter((id) => id !== extension.id) : [...pins, extension.id],
+      });
+      return { id: extension.id, pinned: !pinned };
+    }
     case 'clipboard:write-text':
       if (typeof payload.text !== 'string' || Buffer.byteLength(payload.text, 'utf8') > 2 * 1024 * 1024)
         throw new Error('Choose text of up to 2 MB to copy.');
@@ -2846,6 +2982,14 @@ async function invoke(action, payload = {}) {
       syncWindowMaterial();
       publish();
       return windowMaterialState;
+    case 'window:theme-haptic': {
+      const now = performance.now();
+      if (!layout.overlay || materialPreview?.spaceId !== activeSpace()?.id || now - lastThemeHapticAt < 35)
+        return false;
+      if (!['alignment', 'levelChange'].includes(payload.pattern)) return false;
+      lastThemeHapticAt = now;
+      return performMacHaptic(payload.pattern);
+    }
     case 'window:material-preview':
       clearSpaceMaterialTransition();
       if (payload.clear === true) materialPreview = null;
@@ -2854,7 +2998,16 @@ async function invoke(action, payload = {}) {
           throw new Error('The Space changed. Reopen its appearance settings.');
         if (!Number.isFinite(payload.opacity) || payload.opacity < 0 || payload.opacity > 100)
           throw new Error('Choose a window tint opacity from 0 to 100.');
-        materialPreview = { spaceId: payload.spaceId, opacity: Math.round(payload.opacity) };
+        if (
+          payload.blur !== undefined &&
+          (!Number.isFinite(payload.blur) || payload.blur < 0 || payload.blur > 32)
+        )
+          throw new Error('Choose a background blur strength from 0 to 32.');
+        materialPreview = {
+          spaceId: payload.spaceId,
+          opacity: Math.round(payload.opacity),
+          blur: payload.blur ?? activeSpace()?.theme?.blur ?? 0,
+        };
       }
       syncWindowMaterial();
       publish();
@@ -2900,6 +3053,14 @@ async function invoke(action, payload = {}) {
       }
       if (Number.isFinite(payload.panelWidth))
         layout.panelWidth = Math.max(0, Math.min(650, payload.panelWidth));
+      const group = currentSplitGroup();
+      if (group && payload.splitGroupId === group.id && Number.isFinite(payload.splitRatio)) {
+        layout.splitGroupId = group.id;
+        layout.splitRatio = Math.max(0.1, Math.min(0.9, payload.splitRatio));
+      } else {
+        layout.splitGroupId = null;
+        layout.splitRatio = null;
+      }
       if (Number.isFinite(payload.contentTop) && payload.contentTop >= 4 && payload.contentTop <= 40)
         layout.contentTop = Math.round(payload.contentTop);
       else if (payload.contentTop !== undefined || previousSidebarWidth === 0 || layout.sidebarWidth === 0)
@@ -2917,9 +3078,13 @@ async function invoke(action, payload = {}) {
         ['x', 'y', 'width', 'height'].every((key) => Number.isFinite(payload.extensionPanelBounds[key]))
           ? payload.extensionPanelBounds
           : null;
-      if (layout.overlay && !previousOverlay) void captureBackdrop({ seamless: payload.command === true });
-      else if (!layout.overlay && previousOverlay) clearBackdrop();
+      if (layout.overlay && !previousOverlay) void captureBackdrop({ seamless: true });
+      else if (!layout.overlay && previousOverlay) {
+        clearTimeout(backdropHandoff?.timer);
+        backdropHandoff = null;
+      }
       arrangeViews();
+      if (!layout.overlay && previousOverlay) void retireBackdropAfterPaint(backdropGeneration);
       if (layout.overlay) win.webContents.focus();
       return null;
     }
@@ -2978,8 +3143,57 @@ async function invoke(action, payload = {}) {
       ensureView(selected.id);
       break;
     }
+    case 'split:drag': {
+      clearTimeout(splitDragTimer);
+      if (!payload.id) {
+        // Native target drop and source dragend arrive from separate renderers.
+        // Keep the trusted drag identity briefly so either IPC ordering works.
+        splitDragTimer = setTimeout(clearSplitDrag, 150);
+        return null;
+      }
+      const drag = { id: randomUUID(), tabId: payload.id, targetId: store.state.activeTabId };
+      splitDrag = validSplitDrag(drag) ? drag : null;
+      if (splitDrag) await ensurePeekOverlay().loading;
+      arrangeViews();
+      return null;
+    }
+    case 'split:drop': {
+      const drag = splitDrag;
+      if (
+        !drag ||
+        payload.id !== drag.id ||
+        !validSplitDrag(drag) ||
+        !['left', 'right'].includes(payload.side)
+      )
+        return null;
+      clearSplitDrag();
+      const source = store.state.tabs.find((tab) => tab.id === drag.tabId);
+      const destinationSpaceId = store.state.activeSpaceId;
+      if (source.spaceId !== destinationSpaceId && !source.favorite)
+        store.dispatch('tab:move', {
+          id: source.id,
+          spaceId: destinationSpaceId,
+          pinned: source.pinned,
+          favorite: false,
+        });
+      if (source.closed) store.dispatch('tab:wake', { id: source.id });
+      store.dispatch('split:create', {
+        firstId: payload.side === 'left' ? source.id : drag.targetId,
+        secondId: payload.side === 'right' ? source.id : drag.targetId,
+        spaceId: destinationSpaceId,
+      });
+      store.dispatch('tab:activate', { id: source.id });
+      ensureView(source.id);
+      break;
+    }
     case 'split:unsplit':
       store.dispatch('split:remove', { tabId: payload.id || store.state.activeTabId });
+      break;
+    case 'split:resize':
+      if (currentSplitGroup()?.id !== payload.id) return null;
+      store.dispatch('split:resize', payload);
+      layout.splitGroupId = null;
+      layout.splitRatio = null;
       break;
     case 'peek:open':
       await openPeek(payload.url);
@@ -3090,10 +3304,14 @@ function registerIPC() {
       layout.overlay ||
       !peekOverlay?.presentation.visible ||
       event.sender !== peekOverlay.contents ||
-      event.senderFrame !== peekOverlay.contents.mainFrame ||
-      payload?.id !== (peek?.id || 'sidebar-reveal')
+      event.senderFrame !== peekOverlay.contents.mainFrame
     )
       return;
+    if (splitDrag && payload?.id === splitDrag.id && ['split-left', 'split-right'].includes(payload.action)) {
+      void invoke('split:drop', { id: splitDrag.id, side: payload.action.slice(6) }).catch(report);
+      return;
+    }
+    if (payload?.id !== (peek?.id || 'sidebar-reveal')) return;
     if (payload.action === 'sidebar-toggle' && layout.sidebarHidden)
       void runMacAction('sidebar-toggle', true).catch(report);
     else if (!peek) return;
@@ -3598,9 +3816,15 @@ async function createWindow() {
   win.webContents.on('will-attach-webview', (event) => event.preventDefault());
   win.webContents.on('before-input-event', (event, input) => handleShortcut(event, input, win.webContents));
   // Electron exposes native trackpad contact phases here; ordinary DOM wheel
-  // events omit them. Only the trusted shell receives this narrow phase bridge.
+  // events omit them. Mac uses complete Cocoa samples because Chromium's
+  // generic gestures combine finger contact and inertia into one scroll stream.
   const shellContents = win.webContents;
+  nativeSpaceScrollCleanup = startMacScrollMonitor(win, (sample) => {
+    if (!shellContents.isDestroyed())
+      shellContents.send('zacro:event', { type: 'space:native-wheel', sample });
+  });
   shellContents.on('input-event', (_event, input) => {
+    if (nativeSpaceScrollCleanup) return;
     const phase = {
       gestureScrollBegin: 'began',
       gestureScrollEnd: 'ended',
@@ -3707,6 +3931,11 @@ async function createWindow() {
     }
   });
   win.on('closed', () => {
+    nativeSpaceScrollCleanup?.();
+    nativeSpaceScrollCleanup = null;
+    clearTimeout(splitDragTimer);
+    splitDragTimer = null;
+    splitDrag = null;
     recordingShortcut = false;
     clearTimeout(publishTimer);
     publishTimer = null;

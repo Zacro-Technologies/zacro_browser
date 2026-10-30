@@ -1,5 +1,7 @@
 'use strict';
 
+const { cleanSplitRatio } = require('../core/split-groups.cjs');
+
 const clamp = (value, minimum, maximum) => Math.min(maximum, Math.max(minimum, value));
 const finite = (value, fallback) => (Number.isFinite(value) ? value : fallback);
 
@@ -11,6 +13,7 @@ function browserLayout({
   contentTop = 36,
   pageGutter = 8,
   split = false,
+  splitRatio = 0.5,
 }) {
   width = Math.max(1, Math.round(finite(width, 1440)));
   height = Math.max(1, Math.round(finite(height, 940)));
@@ -35,7 +38,11 @@ function browserLayout({
   );
   const gap = 6;
   const secondaryVisible = split && available >= gap + 2;
-  const firstWidth = secondaryVisible ? Math.floor((available - gap) / 2) : available;
+  const splitWidth = available - gap;
+  const minimumPane = Math.min(160, Math.floor(splitWidth / 2));
+  const firstWidth = secondaryVisible
+    ? clamp(Math.floor(splitWidth * cleanSplitRatio(splitRatio)), minimumPane, splitWidth - minimumPane)
+    : available;
   return {
     primary: { x: left, y: top, width: firstWidth, height: Math.max(1, height - top - gutter) },
     secondary: secondaryVisible

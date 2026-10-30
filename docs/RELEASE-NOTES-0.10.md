@@ -1,5 +1,17 @@
 # Zacro 0.10 development preview
 
+## 0.10.2 interaction and customization update
+
+- Pinned extensions sit beneath the address bar in an adaptive tile row. Site controls brings extensions and page actions together.
+- Drag Favorites, pins and tabs to reorder or move between sections and Spaces. Drop beside a page to split it; resize the divider or use Unsplit in the command palette.
+- The softly translucent theme editor has distinct color pucks, exact color fields, tactile sliders and dials, independent Mac blur control and trackpad haptics.
+- Space colors carry through folders, icons and controls. Selected Favorites take their tint from the website logo; empty panes use an opaque theme background with a soft shadow.
+- Command-palette selections match selected sidebar tabs, tabbar scrollbars are hidden, and menu transitions retain the page backdrop until native content returns.
+- Mac Space swipes use native contact phases to distinguish a quick single-Space flick from a sustained multi-Space gesture and ignore momentum.
+- Image context menus offer Copy Image, including in Split view and Peek.
+
+The local Mac build remains an ad hoc signed development preview. Physical trackpad feel and haptics still need hands-on review.
+
 ## 0.10.1 browser experience update
 
 - Arc-inspired sidebar and action icons, a show/hide sidebar button, joined split tabs, live Favorite drag placement and Space-colored folders.

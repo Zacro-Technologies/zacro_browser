@@ -19,6 +19,9 @@ before(async () => {
       return;
     }
     const requestURL = new URL(req.url, 'http://fixture.local');
+    // Keep navigation pending so the handoff regression cannot pass merely
+    // because did-stop-loading arranged the native views later.
+    if (requestURL.pathname === '/pending-overlay-navigation') return;
     if (requestURL.pathname === '/peek-icon.png') {
       res.writeHead(200, { 'Content-Type': 'image/png' });
       res.end(fs.readFileSync(path.resolve(__dirname, '../../assets/icon-256.png')));
@@ -71,6 +74,62 @@ after(async () => {
     await new Promise((resolve) => server.close(resolve));
   }
 });
+
+test(
+  'navigation during a seamless overlay handoff hides the native page and discards late pixels',
+  { timeout: 30000 },
+  async (t) => {
+    const b = await launch(t);
+    await b.navigate(`${base}/a`);
+    await b.app.evaluate(async ({ BrowserWindow }, url) => {
+      const view = BrowserWindow.getAllWindows()[0].contentView.children.find(
+        (item) => item.webContents?.getURL() === url,
+      );
+      const contents = view.webContents;
+      const pixels = await contents.capturePage();
+      const capture = contents.capturePage;
+      globalThis.handoffRegression = { view, contents, pixels, capture, pending: false };
+      contents.capturePage = () =>
+        new Promise((resolve) => {
+          globalThis.handoffRegression.pending = true;
+          globalThis.handoffRegression.release = () => resolve(pixels);
+        });
+    }, `${base}/a`);
+    try {
+      await b.invoke('shortcut:run', { id: 'command-palette' });
+      await expect(b.page.locator('#command-input')).toBeFocused();
+      await expect.poll(() => b.app.evaluate(() => globalThis.handoffRegression.pending)).toBe(true);
+      assert.equal(await b.app.evaluate(() => globalThis.handoffRegression.view.getVisible()), true);
+      const visibleAtNavigation = await b.app.evaluate(async (_, url) => {
+        const { contents, view } = globalThis.handoffRegression;
+        const started = new Promise((resolve) =>
+          contents.once('did-start-navigation', () => {
+            setImmediate(() => resolve(view.getVisible()));
+          }),
+        );
+        void contents.loadURL(url).catch(() => {});
+        return started;
+      }, `${base}/pending-overlay-navigation`);
+      assert.equal(visibleAtNavigation, false, 'Navigation must retire the live handoff immediately');
+      await b.app.evaluate(() => globalThis.handoffRegression.release());
+      await b.page.evaluate(
+        () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))),
+      );
+      await expect(b.page.locator('#page-backdrop img')).toHaveCount(0);
+      await expect(b.page.locator('#command-input')).toBeFocused();
+      assert.equal(await b.app.evaluate(() => globalThis.handoffRegression.contents.isLoading()), true);
+    } finally {
+      await b.app.evaluate(() => {
+        const test = globalThis.handoffRegression;
+        if (!test) return;
+        test.contents.capturePage = test.capture;
+        test.release?.();
+        test.contents.stop();
+        delete globalThis.handoffRegression;
+      });
+    }
+  },
+);
 
 async function launch(t, directory) {
   const dir = directory || (await fsp.mkdtemp(path.join(os.tmpdir(), 'zacro-e2e-')));
@@ -541,7 +600,7 @@ test(
   { timeout: 60000 },
   async (t) => {
     const b = await launch(t);
-    const pageActions = b.page.locator('[data-key="page-menu"]');
+    const pageActions = b.page.locator('[data-key="address"]');
     const menuAtControl = async (control, title, placement) => {
       let anchor;
       // Host state can arrive before the sidebar's replacement node is ready.
@@ -553,7 +612,7 @@ test(
         })
         .toBe(true);
       assert(anchor, `${title} must have a visible opener`);
-      await control.click();
+      await control.click({ button: title === 'Page actions' ? 'right' : 'left' });
       const dialog = b.page.getByRole('dialog', { name: title, exact: true });
       await expect(dialog).toBeVisible();
       await expect

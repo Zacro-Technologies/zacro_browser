@@ -18,9 +18,11 @@ contextBridge.exposeInMainWorld('peekOverlay', {
   },
   act(action) {
     const allowed =
-      current?.mode === 'sidebar'
-        ? ['sidebar-toggle']
-        : ['close', 'promote', 'reload', ...(current?.sidebarHidden ? ['sidebar-toggle'] : [])];
+      current?.mode === 'split-drop'
+        ? ['split-left', 'split-right']
+        : current?.mode === 'sidebar'
+          ? ['sidebar-toggle']
+          : ['close', 'promote', 'reload', ...(current?.sidebarHidden ? ['sidebar-toggle'] : [])];
     if (!current?.id || !allowed.includes(action)) return;
     ipcRenderer.send('zacro:peek-overlay-action', { id: current.id, action });
   },

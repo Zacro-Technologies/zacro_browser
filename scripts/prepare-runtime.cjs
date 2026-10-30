@@ -9,6 +9,7 @@ const { executablePath } = require('../src/main/codex.cjs');
 // downloading its checksum and archive again on every incremental build.
 async function validateRuntime(platform = process.platform, arch = process.arch) {
   assertNativeTarget(platform, arch);
+  if (platform === 'darwin') require('./build-native-mac.cjs').buildNativeMac();
   const executable = require('electron');
   const electronRoot = path.dirname(require.resolve('electron/package.json'));
   const installed = require('electron/package.json').version;

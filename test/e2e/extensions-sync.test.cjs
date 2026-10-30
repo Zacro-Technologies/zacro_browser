@@ -282,6 +282,17 @@ test(
         },
         { url: `chrome-extension://${extension.id}/${page}.html`, expression },
       );
+    await b.page.locator('[data-key="extensions-menu"]').click();
+    const installed = b.page.getByRole('dialog', { name: 'Site controls', exact: true });
+    await expect(installed).toBeVisible();
+    await installed.getByRole('button', { name: 'Browser adapter fixture', exact: true }).click();
+    await expect.poll(() => native('popup', 'typeof chrome.storage.sync?.get')).toBe('function');
+    await expect(installed).toHaveCount(0);
+    await b.app.evaluate(({ BrowserWindow }, id) => {
+      BrowserWindow.getAllWindows()
+        .find((window) => window.webContents.getURL() === `chrome-extension://${id}/popup.html`)
+        ?.close();
+    }, extension.id);
     await b.invoke('extension:options', { id: extension.id });
     await expect.poll(() => native('options', 'typeof chrome.storage.sync?.set')).toBe('function');
     assert.equal(await native('options', 'typeof window.zacro'), 'undefined');

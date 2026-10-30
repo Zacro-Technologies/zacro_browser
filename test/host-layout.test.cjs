@@ -105,6 +105,22 @@ test('resizing and malformed dimensions keep native bounds finite and positive',
   }
 });
 
+test('split ratios resize both pages without seams and retain usable pane widths', () => {
+  for (const width of [560, 1000, 1800]) {
+    for (const splitRatio of [0, 0.1, 0.25, 0.5, 0.7, 0.9, 1, NaN, Infinity]) {
+      const layout = browserLayout({ width, height: 700, sidebarWidth: 224, split: true, splitRatio });
+      assert.equal(layout.secondary.x - layout.primary.x - layout.primary.width, 6);
+      assert.equal(layout.secondary.x + layout.secondary.width, width - 8);
+      const minimum = Math.min(160, Math.floor((width - 224 - 16 - 6) / 2));
+      assert(layout.primary.width >= minimum);
+      assert(layout.secondary.width >= minimum);
+    }
+  }
+  const left = browserLayout({ width: 1400, height: 700, split: true, splitRatio: 0.7 });
+  assert.equal(left.primary.width, Math.floor((1400 - 224 - 16 - 6) * 0.7));
+  assert(left.primary.width > left.secondary.width);
+});
+
 test('small windows reserve a usable page and remember their actual size', () => {
   const expanded = browserLayout({ width: 560, height: 420, sidebarWidth: 380 });
   assert.deepEqual(expanded.primary, { x: 312, y: 36, width: 240, height: 376 });

@@ -134,6 +134,7 @@ test(
     await expect(b.shell.locator('input[name="theme-grain"]')).toHaveAttribute('max', '200');
     await expect(b.shell.locator('#window-material-hint')).toHaveCount(0);
 
+    await b.shell.locator('summary').filter({ hasText: 'Name & icon' }).click();
     await b.shell.locator('#space-icon-search').fill('rocket');
     await expect(b.shell.locator('.space-icon-options button:visible')).toHaveCount(1);
     await b.shell.getByRole('button', { name: 'rocket icon', exact: true }).click();
@@ -148,12 +149,12 @@ test(
       .toBe(original.color);
     assert.deepEqual((await b.invoke('state:get')).spaces[0], original);
     await b.shell.getByRole('button', { name: 'Customize Space', exact: true }).click();
+    await b.shell.locator('summary').filter({ hasText: 'Name & icon' }).click();
     await b.shell.locator('#space-icon-search').fill('rocket');
     await expect(b.shell.locator('.space-icon-options button:visible')).toHaveCount(1);
     await b.shell.getByRole('button', { name: 'rocket icon', exact: true }).click();
     await b.shell.locator('input[name="name"]').fill('Reading room');
     await b.shell.getByRole('button', { name: 'sky', exact: true }).click();
-    await b.shell.locator('summary').filter({ hasText: 'Gradient & texture' }).click();
     await b.shell.locator('summary').filter({ hasText: 'Gradient & texture' }).focus();
     await b.shell.keyboard.press('Tab');
     await expect(b.shell.locator('input[name="theme-vibrancy"]')).toBeFocused();
@@ -176,7 +177,7 @@ test(
     assert.equal(
       saved.theme.blur,
       original.theme.blur,
-      'Legacy blur is retained; native blur strength is system controlled',
+      'Changing other controls retains the chosen blur strength',
     );
     await expect
       .poll(async () => (await b.invoke('state:get')).runtime.windowMaterial.requestedOpacity)
@@ -198,6 +199,79 @@ test(
     await expect.poll(async () => (await b.invoke('state:get')).settings.pinnedSleepMinutes).toBe(10);
     await expect(b.shell.locator('html')).toHaveAttribute('data-tab-density', 'compact');
     await b.shell.screenshot({ path: path.resolve('test-results/personalization-settings.png') });
+  },
+);
+
+test(
+  'theme pucks, precise colors and tactile dials edit independently and cancel or save together',
+  { timeout: 45000 },
+  async (t) => {
+    const b = await fixture(t);
+    const original = (await b.invoke('state:get')).spaces[0];
+    await b.emit({ type: 'panel', panel: 'settings' });
+    const customize = () => b.shell.getByRole('button', { name: 'Customize Space', exact: true }).click();
+    await customize();
+    const primary = b.shell.locator('input[name="theme-color"]');
+    const secondary = b.shell.locator('input[name="theme-secondaryColor"]');
+    const secondaryBefore = await secondary.inputValue();
+    const puck = await b.shell.locator('[data-theme-puck="color"]').boundingBox();
+    await b.shell.mouse.move(puck.x + puck.width / 2, puck.y + puck.height / 2);
+    await b.shell.mouse.down();
+    await b.shell.mouse.move(puck.x + puck.width / 2 - 65, puck.y + puck.height / 2 - 30, { steps: 6 });
+    await b.shell.mouse.up();
+    const dragged = await primary.inputValue();
+    assert.notEqual(dragged, original.color, 'Dragging the primary puck changes its actual color');
+    assert.equal(await secondary.inputValue(), secondaryBefore, 'Dragging one color leaves the other intact');
+    await expect
+      .poll(() => b.shell.evaluate(() => document.documentElement.style.getPropertyValue('--space-color')))
+      .toBe(dragged);
+    await b.shell.locator('[data-theme-puck="color"]').focus();
+    await b.shell.keyboard.press('ArrowRight');
+    assert.notEqual(
+      await primary.inputValue(),
+      dragged,
+      'Puck hue adjustment is available from the keyboard',
+    );
+    const primaryBeforePreset = await primary.inputValue();
+    await b.shell.getByRole('button', { name: 'Secondary', exact: true }).click();
+    await b.shell.getByRole('button', { name: 'sky', exact: true }).click();
+    assert.equal(await secondary.inputValue(), '#6192bd');
+    assert.equal(await primary.inputValue(), primaryBeforePreset, 'Presets apply only to the selected color');
+    const grain = b.shell.locator('input[name="theme-grain"]');
+    await grain.focus();
+    await b.shell.keyboard.press('ArrowRight');
+    await expect(grain).toHaveValue('1');
+    const dial = await b.shell.locator('.theme-dial').first().boundingBox();
+    await b.shell.mouse.click(dial.x + dial.width - 12, dial.y + dial.height / 2);
+    await expect(b.shell.locator('input[name="theme-gradient"]')).toHaveValue('83');
+    assert.deepEqual(
+      (await b.invoke('state:get')).spaces[0],
+      original,
+      'Every control stays a preview until Save',
+    );
+    await b.shell.getByRole('button', { name: 'Cancel', exact: true }).click();
+    assert.deepEqual((await b.invoke('state:get')).spaces[0], original);
+    await customize();
+    const hex = b.shell.getByRole('textbox', { name: 'Secondary hex color', exact: true });
+    await hex.fill('24bc8e');
+    await hex.press('Tab');
+    await expect(hex).toHaveValue('#24BC8E');
+    await expect(secondary).toHaveValue('#24bc8e');
+    await b.shell.getByRole('textbox', { name: 'Primary hex color', exact: true }).fill('#7254e8');
+    const directory = path.resolve('output/playwright');
+    await fs.mkdir(directory, { recursive: true });
+    await b.shell.evaluate(() =>
+      Promise.all(
+        document
+          .getAnimations()
+          .filter((animation) => animation.effect?.target?.closest('.space-theme-dialog'))
+          .map((animation) => animation.finished.catch(() => {})),
+      ),
+    );
+    await b.shell.screenshot({ path: path.join(directory, 'theme-editor.png') });
+    await b.shell.getByRole('button', { name: 'Save changes', exact: true }).click();
+    await expect.poll(async () => (await b.invoke('state:get')).spaces[0].color).toBe('#7254e8');
+    assert.equal((await b.invoke('state:get')).spaces[0].theme.secondaryColor, '#24bc8e');
   },
 );
 
@@ -395,6 +469,11 @@ test(
     await b.shell.locator('[data-key="panel-close"]').click();
     await expect(b.shell.locator('#side-panel')).toBeHidden();
     await b.shell.evaluate(() => {
+      // A queued frame can report a timestamp older than the input that started
+      // the motion. Exercise that edge deterministically without relaxing the
+      // bounds or monotonicity checks on the actual sidebar and native page.
+      window.sidebarFrameClock = window.requestAnimationFrame.bind(window);
+      window.requestAnimationFrame = (callback) => window.sidebarFrameClock((time) => callback(time - 48));
       window.sidebarSamples = [];
       const start = performance.now();
       const sample = () => {
@@ -405,14 +484,18 @@ test(
     });
     await b.emit({ type: 'sidebar:toggle', fromPage: true });
     await expect(b.shell.locator('#sidebar')).toBeHidden();
-    const samples = await b.shell.evaluate(() => window.sidebarSamples);
+    const samples = await b.shell.evaluate(() => {
+      window.requestAnimationFrame = window.sidebarFrameClock;
+      delete window.sidebarFrameClock;
+      return window.sidebarSamples;
+    });
     assert(
       samples.some((width) => width > 0 && width < 220),
       'Closing must have real intermediate geometry',
     );
     assert(
       samples.every((width) => width >= 0 && width <= 224),
-      'Sidebar motion never overshoots',
+      `Sidebar motion never overshoots: ${JSON.stringify(samples)}`,
     );
     assert(
       samples.every((width, index) => !index || width <= samples[index - 1]),
@@ -459,7 +542,6 @@ test(
     await b.shell.locator('#setting-tabDensity').selectOption('compact');
     await expect(b.shell.locator('#setting-motionScale')).toHaveValue('1.1');
     await b.shell.getByRole('button', { name: 'Customize Space', exact: true }).click();
-    await b.shell.locator('summary').filter({ hasText: 'Gradient & texture' }).click();
     await b.shell.locator('summary').filter({ hasText: 'Glass & transparency' }).click();
     for (const [width, height] of [
       [560, 420],
@@ -534,6 +616,7 @@ test(
       const before = await b.invoke('state:get');
       await b.shell.getByRole('button', { name: 'Customize Space', exact: true }).click();
       await b.shell.getByRole('button', { name: 'sky', exact: true }).click();
+      await b.shell.locator('summary').filter({ hasText: 'Name & icon' }).click();
       await b.shell.getByRole('button', { name: 'book icon', exact: true }).click();
       await expect
         .poll(() => b.shell.evaluate(() => document.documentElement.style.getPropertyValue('--space-color')))
@@ -954,7 +1037,8 @@ test(
           preview: properties(tile, '::before'),
           windowGrain: properties(app, '::before'),
           previewGrain: properties(tile, '::after'),
-          page: getComputedStyle(document.querySelector('.theme-preview-page')).backgroundColor,
+          canvas: getComputedStyle(tile).backgroundColor,
+          blank: properties(document.querySelector('.workspace[data-empty="true"]')),
           workspace: getComputedStyle(document.querySelector('.workspace')).backgroundColor,
           backdrop: getComputedStyle(document.querySelector('.dialog-backdrop')).backgroundColor,
           backdropFilter: getComputedStyle(document.querySelector('.dialog-backdrop')).backdropFilter,
@@ -967,7 +1051,7 @@ test(
       'Preview and live window use the same fitted gradient and opacity',
     );
     assert.deepEqual(opaquePreview.previewGrain, opaquePreview.windowGrain);
-    assert.equal(opaquePreview.page, 'rgba(0, 0, 0, 0)');
+    assert.notEqual(opaquePreview.canvas, 'rgba(0, 0, 0, 0)');
     assert.equal(
       opaquePreview.backdrop,
       'rgba(0, 0, 0, 0)',
@@ -975,10 +1059,11 @@ test(
     );
     assert.equal(opaquePreview.backdropFilter, 'none');
     assert.equal(
-      opaquePreview.workspace,
-      opaquePreview.page,
-      'The empty content pane carries the window color',
+      opaquePreview.blank.image,
+      opaquePreview.window.image,
+      'The opaque empty pane uses the same Space gradient',
     );
+    assert.equal(opaquePreview.blank.opacity, '1');
     const directory = path.resolve(__dirname, '../../test-results/theme-review');
     await fs.mkdir(directory, { recursive: true });
     await b.shell.getByRole('button', { name: 'Save changes', exact: true }).click();

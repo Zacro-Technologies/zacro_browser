@@ -97,11 +97,13 @@ test('group boundaries reject duplicates, foreign profiles and closed members; p
 test('portable import remaps split group and member identities together', () => {
   const source = new BrowserStore();
   const { group } = pair(source);
+  source.dispatch('split:resize', { id: group.id, ratio: 0.68 });
   const exported = source.exportData();
   const destination = new BrowserStore();
   destination.importData(exported);
   const imported = destination.state.splitGroups[0];
   assert.notEqual(imported.id, group.id);
+  assert.equal(imported.ratio, 0.68);
   assert.notEqual(imported.spaceId, group.spaceId);
   assert(
     imported.tabIds.every((id) =>
@@ -109,6 +111,26 @@ test('portable import remaps split group and member identities together', () => 
     ),
   );
   assert(imported.tabIds.every((id) => !group.tabIds.includes(id)));
+});
+
+test('split divider positions persist, clamp extreme values and reject malformed updates', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zacro-split-ratio-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const store = new BrowserStore(dir);
+  const { group } = pair(store);
+  assert.equal(group.ratio, 0.5);
+  store.dispatch('split:resize', { id: group.id, ratio: 0.65 });
+  store.flush();
+  const reopened = new BrowserStore(dir);
+  assert.equal(reopened.state.splitGroups[0].ratio, 0.65);
+  assert.throws(() => reopened.dispatch('split:resize', { id: group.id, ratio: NaN }));
+  assert.throws(() => reopened.dispatch('split:resize', { id: 'missing', ratio: 0.4 }));
+  reopened.dispatch('split:resize', { id: group.id, ratio: 2 });
+  assert.equal(reopened.state.splitGroups[0].ratio, 0.9);
+  const raw = reopened.persistedState();
+  raw.splitGroups[0].ratio = 'invalid';
+  assert.equal(hydrate(raw).splitGroups[0].ratio, 0.5);
+  reopened.flush();
 });
 
 test('moving the inactive split partner keeps the selected tab in its new Space', () => {

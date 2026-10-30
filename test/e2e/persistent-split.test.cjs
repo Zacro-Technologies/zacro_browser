@@ -49,11 +49,87 @@ test(
     const groupId = (await b.state()).splitGroups[0].id;
     const group = () => b.shell.locator(`[data-split-id="${groupId}"]`);
     await expect(group()).toBeVisible();
+    const panes = () =>
+      app.evaluate(
+        ({ BrowserWindow }, urls) =>
+          BrowserWindow.getAllWindows()[0]
+            .contentView.children.filter((view) => urls.includes(view.webContents?.getURL()))
+            .map((view) => ({ id: view.webContents.id, url: view.webContents.getURL(), ...view.getBounds() }))
+            .sort((a, b) => a.x - b.x),
+        [`${base}/a`, `${base}/b`],
+      );
+    await expect.poll(async () => (await panes()).length).toBe(2);
+    const before = await panes();
+    await app.evaluate(
+      ({ webContents }, url) =>
+        webContents
+          .getAllWebContents()
+          .find((page) => page.getURL() === url)
+          .executeJavaScript('window.splitDraft = "kept"'),
+      `${base}/a`,
+    );
+    const divider = b.shell.getByRole('separator', { name: 'Resize split view', exact: true });
+    await expect(divider).toBeVisible();
+    await expect(b.shell.locator('#workspace')).toHaveCSS('outline-style', 'none');
+    await expect(b.shell.locator('#workspace')).toHaveCSS('border-top-width', '0px');
+    const handle = await divider.boundingBox();
+    await b.shell.mouse.move(handle.x + handle.width / 2, handle.y + handle.height / 2);
+    await b.shell.mouse.down();
+    await b.shell.mouse.move(handle.x + 123, handle.y + handle.height / 2, { steps: 12 });
+    await expect.poll(async () => (await panes())[0].width).toBeGreaterThan(before[0].width + 100);
+    await b.shell.mouse.up();
+    await expect.poll(async () => (await b.state()).splitGroups[0].ratio).toBeGreaterThan(0.55);
+    const savedRatio = (await b.state()).splitGroups[0].ratio;
+    const originalSize = await app.evaluate(({ BrowserWindow }) => {
+      const window = BrowserWindow.getAllWindows()[0];
+      const original = window.getContentSize();
+      window.setContentSize(800, original[1]);
+      return original;
+    });
+    await b.invoke('split:resize', { id: groupId, ratio: 0.1 });
+    await expect.poll(async () => (await panes())[0].width).toBe(160);
+    await expect.poll(async () => Number(await divider.getAttribute('aria-valuemin'))).toBeGreaterThan(10);
+    await expect
+      .poll(async () => {
+        const current = await divider.getAttribute('aria-valuenow');
+        return current === (await divider.getAttribute('aria-valuemin'));
+      })
+      .toBe(true);
+    const clamped = await panes();
+    const visibleRatio = clamped[0].width / (clamped[0].width + clamped[1].width);
+    await divider.press('ArrowRight');
+    await expect.poll(async () => (await panes())[0].width).toBeGreaterThan(160);
+    const keyboardRatio = (await b.state()).splitGroups[0].ratio;
+    assert(
+      Math.abs(keyboardRatio - visibleRatio - 0.02) < 0.004,
+      `ArrowRight moves from the visible minimum width, not the offscreen saved ratio (${visibleRatio} to ${keyboardRatio})`,
+    );
+    await app.evaluate(
+      ({ BrowserWindow }, size) => BrowserWindow.getAllWindows()[0].setContentSize(...size),
+      originalSize,
+    );
+    await b.invoke('split:resize', { id: groupId, ratio: savedRatio });
+    assert.deepEqual(
+      (await panes()).map((pane) => pane.id),
+      before.map((pane) => pane.id),
+    );
+    assert.equal(
+      await app.evaluate(
+        ({ webContents }, url) =>
+          webContents
+            .getAllWebContents()
+            .find((page) => page.getURL() === url)
+            .executeJavaScript('window.splitDraft'),
+        `${base}/a`,
+      ),
+      'kept',
+    );
     await b.invoke('tab:activate', { id: third.id });
     await expect.poll(async () => (await b.state()).runtime.splitPair).toBeNull();
     await expect(group()).toBeVisible();
     await group().locator(`[data-action="tab:activate"][data-id="${first.id}"]`).click();
     await expect.poll(async () => (await b.state()).runtime.splitPair).toEqual([first.id, second.id]);
+    assert.equal((await b.state()).splitGroups[0].ratio, savedRatio);
     const space = await b.invoke('space:create', { name: 'Away' });
     await expect.poll(async () => (await b.state()).activeSpaceId).toBe(space.id);
     await expect.poll(async () => (await b.state()).runtime.splitPair).toBeNull();
@@ -63,6 +139,7 @@ test(
     app = null;
     b = await launch();
     await expect.poll(async () => (await b.state()).runtime.splitPair).toEqual([first.id, second.id]);
+    assert.equal((await b.state()).splitGroups[0].ratio, savedRatio);
     await expect(group()).toBeVisible();
     await b.invoke('tab:activate', { id: third.id });
     await group().locator(`[data-action="tab:activate"][data-id="${first.id}"]`).click({ button: 'right' });

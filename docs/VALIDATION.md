@@ -1,5 +1,23 @@
 # Validation record
 
+## 0.10.2 interactions and glass controls · October 30, 2026
+
+Local checks use macOS 27.0 on Apple silicon, Node.js 26.7.0 and Electron 45.0.0. The full Node suite passes **571/571** tests, including extension pin persistence and isolation, split ratios, favicon color extraction and independent native blur strength.
+
+Focused native checks cover live tab reordering and cancellation, cross-Space hover dragging, adaptive pinned extension tiles and actual popup actions, persisted split resizing, Copy Image from normal/split/Peek pages, theme controls and preview/save behavior, and menu backdrop handoff. Pin geometry at a 208px rail is 47.5px for one/two actions, 36.8px for five, and two balanced rows for seven. Restarts, disabled actions, removal and regular/private profile isolation pass.
+
+The combined native run passed **64 of 66** cases. Its sidebar motion failure exposed a negative animation-progress edge; clamping progress to `[0, 1]` now passes the same strict bounds/monotonicity assertions with deliberately stale frame timestamps. The pin case initially timed out on restart; a subsequent diagnostic run reached removal and exposed an unanswered native reload confirmation in the restarted fixture. The fixture now chooses the shell by URL, bounds startup/cleanup, and validates and handles that expected confirmation. The corrected pin workflow passes with clean shutdown, and the final complete command-workflow file passes **13/13** cases; the initial startup timeout was not reproduced.
+
+The final visual review uses the attached Arc references and Arc's [theme](https://start.arc.net/paint-the-internet) and [focus](https://start.arc.net/find-focus) guidance. Materials use restrained translucency, 10px blur and soft shadows, without decorative shine or numbered color pucks. The three final theme/layout/motion cases pass, and reduced-transparency emulation restores opaque surfaces with no backdrop blur. Captures over a local webpage are in `output/playwright/*-arc-page.png`; these are source-renderer UI captures, not physical-trackpad evidence.
+
+Mac Space navigation consumes ordered Cocoa contact and momentum phases through a bundled Node-API bridge. Native injected phase tests distinguish a quick one-Space flick from a held multi-Space gesture and ignore a large momentum tail. Blur tests inspect actual native effect alpha independently of tint; zero blur removes the vibrancy effect. Haptics use the public Mac feedback API. Physical trackpad feel and haptic strength still require hands-on review.
+
+Split-drop handler tests use an actual source HTML5 drag payload and CDP delivery to the separate native overlay. An optional AppKit event probe produced successful left drops, but is not reliable end-to-end acceptance: the OS drag session consults the real cursor position, which can differ from locally posted events. The default suite keeps the deterministic handler checks; the optional probe is enabled with `ZACRO_TEST_APPKIT_DRAG=1`.
+
+The final Apple silicon **0.10.2 development DMG and ZIP** are built. All **61 source files** match the packaged ASAR; version, entry point and runtime dependencies match the checkout. The arm64 Mac bridge is unpacked, signed and loads in the packaged shell. All six security fuses, deep/strict application and bridge signature checks, and DMG/ZIP integrity checks pass. Checksums are in `dist/SHA256SUMS-0.10.2.txt`.
+
+Packaged startup, the shell/native-bridge handshake and the isolated Codex handshake pass, but the first browsing request is **blocked by the macOS “Zacro Safe Storage” Keychain password prompt**. The packaged browsing/PDF acceptance test therefore remains failed, not passed. A native capture and securityd's application path/PID confirm the prompt belongs to the disposable test bundle. After the test process exited, its leftover prompt was denied; no password, credential access or Keychain setting was changed. The build remains ad hoc signed, not notarized. No new Intel/Windows or live-provider acceptance is claimed.
+
 ## 0.10.1 browser experience · October 29, 2026
 
 Local checks use macOS 27.0 (26A428), Apple silicon, Node.js 26.7.0 and Electron 45.0.0. Formatting and JavaScript syntax checks pass, and the final full Node suite passes **564/564** tests.

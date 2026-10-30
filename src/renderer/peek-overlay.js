@@ -5,6 +5,7 @@ const sidebarToggle = document.getElementById('sidebar-toggle');
 const veil = document.getElementById('veil');
 const error = document.getElementById('error');
 const errorMessage = document.getElementById('error-message');
+const splitTargets = document.getElementById('split-drop-targets');
 let state = null;
 let outsidePress = null;
 const number = (value, fallback = 0) => (Number.isFinite(value) ? value : fallback);
@@ -14,20 +15,31 @@ window.peekOverlay.onState((next) => {
   if (state?.id !== next?.id || state?.mode !== next?.mode) outsidePress = null;
   state = next;
   const sidebarMode = next?.mode === 'sidebar';
-  root.dataset.mode = sidebarMode ? 'sidebar' : 'peek';
-  document.title = sidebarMode ? 'Show sidebar' : 'Link preview';
-  document.body.setAttribute('role', sidebarMode ? 'toolbar' : 'dialog');
-  document.body.setAttribute('aria-label', sidebarMode ? 'Browser controls' : 'Link preview');
-  if (sidebarMode) document.body.removeAttribute('aria-modal');
+  const splitMode = next?.mode === 'split-drop';
+  root.dataset.mode = splitMode ? 'split-drop' : sidebarMode ? 'sidebar' : 'peek';
+  document.title = splitMode ? 'Arrange split view' : sidebarMode ? 'Show sidebar' : 'Link preview';
+  document.body.setAttribute('role', sidebarMode || splitMode ? 'toolbar' : 'dialog');
+  document.body.setAttribute(
+    'aria-label',
+    splitMode ? 'Arrange split view' : sidebarMode ? 'Browser controls' : 'Link preview',
+  );
+  if (sidebarMode || splitMode) document.body.removeAttribute('aria-modal');
   else document.body.setAttribute('aria-modal', 'true');
-  sidebarToggle.hidden = !(sidebarMode || next?.sidebarHidden);
-  veil.hidden = surface.hidden = controls.hidden = sidebarMode;
+  sidebarToggle.hidden = splitMode || !(sidebarMode || next?.sidebarHidden);
+  veil.hidden = surface.hidden = controls.hidden = sidebarMode || splitMode;
+  splitTargets.hidden = !splitMode;
+  const card = next?.appearance?.card;
+  if (typeof card === 'string' && /^#(?:[\da-f]{3}|[\da-f]{6})$/i.test(card)) {
+    const hex = card.length === 4 ? `#${[...card.slice(1)].map((value) => value.repeat(2)).join('')}` : card;
+    const channels = [1, 3, 5].map((offset) => parseInt(hex.slice(offset, offset + 2), 16));
+    root.dataset.dark = String(channels.reduce((sum, value) => sum + value, 0) / 3 < 128);
+  }
   for (const key of ['chrome', 'card', 'ink']) {
     const value = next?.appearance?.[key];
     if (typeof value === 'string' && /^#(?:[\da-f]{3}|[\da-f]{6}|[\da-f]{8})$/i.test(value))
       root.style.setProperty(`--${key}`, value);
   }
-  if (sidebarMode) {
+  if (sidebarMode || splitMode) {
     root.style.setProperty('--fade', '1');
     return;
   }
@@ -58,7 +70,7 @@ window.peekOverlay.onState((next) => {
 });
 
 const outside = (event) => {
-  if (state?.mode === 'sidebar' || !state?.bounds || event.target.closest('button')) return false;
+  if (state?.mode !== 'peek' || !state?.bounds || event.target.closest('button')) return false;
   const { x, y, width, height } = state.bounds;
   return event.clientX < x || event.clientX > x + width || event.clientY < y || event.clientY > y + height;
 };
@@ -84,8 +96,27 @@ document.addEventListener('click', (event) => {
   if (button && !button.disabled) window.peekOverlay.act(button.dataset.action);
 });
 document.addEventListener('keydown', (event) => {
-  if (event.key !== 'Escape' || state?.mode === 'sidebar') return;
+  if (event.key !== 'Escape' || state?.mode !== 'peek') return;
   event.preventDefault();
   event.stopPropagation();
   window.peekOverlay.act('close');
+});
+document.addEventListener('dragover', (event) => {
+  if (state?.mode !== 'split-drop') return;
+  const target = event.target.closest('[data-split-side]');
+  if (!target) return;
+  event.preventDefault();
+  event.dataTransfer.dropEffect = 'move';
+  for (const edge of splitTargets.children) edge.classList.toggle('selected', edge === target);
+});
+document.addEventListener('dragleave', (event) => {
+  if (!event.relatedTarget || !splitTargets.contains(event.relatedTarget))
+    for (const edge of splitTargets.children) edge.classList.remove('selected');
+});
+document.addEventListener('drop', (event) => {
+  if (state?.mode !== 'split-drop') return;
+  const target = event.target.closest('[data-split-side]');
+  event.preventDefault();
+  if (target) window.peekOverlay.act(`split-${target.dataset.splitSide}`);
+  for (const edge of splitTargets.children) edge.classList.remove('selected');
 });

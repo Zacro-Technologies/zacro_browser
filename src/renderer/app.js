@@ -1,6 +1,7 @@
 import { createSyncUI } from './sync.js';
 import { createSpaceGesture } from './space-gesture.js';
 import { blendSpaceAppearance, deriveSpaceTheme } from './theme.js';
+import { faviconAccent } from './favicon-accent.js';
 import '../core/site-search.js';
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -27,6 +28,8 @@ const icons = {
   close: 'm7 7 10 10M17 7 7 17',
   back: 'M19 12H5m6-6-6 6 6 6',
   forward: 'M5 12h14m-6-6 6 6-6 6',
+  chevronLeft: 'm15 6-6 6 6 6',
+  chevronRight: 'm9 6 6 6-6 6',
   down: 'm7 10 5 5 5-5',
   up: 'm7 14 5-5 5 5',
   reload: 'M19 3v5h-5M19 8a7.5 7.5 0 1 0 .5 7',
@@ -292,6 +295,8 @@ let spaceGestureTimer;
 let spaceGesturePending = false;
 let spaceGestureFeedback = null;
 let nativeSpaceContact = null;
+let nativeSpaceTarget = null;
+let nativeSpaceTimeOffset = null;
 // Keep native inertia latched across the state change caused by its own swipe.
 let nativeSpaceMomentum = false;
 let spaceTransition = null;
@@ -736,9 +741,51 @@ function nativeSpaceGesturePhase(phase) {
   }
   if (phase === 'ended') nativeSpaceContact = null;
 }
+function nativeSpaceWheel(sample) {
+  if (!state?.runtime?.nativeSpaceScroll || !Number.isFinite(sample?.time)) return;
+  if (nativeSpaceTimeOffset === null) nativeSpaceTimeOffset = performance.now() - sample.time;
+  if (sample.phase === 'began' || (!nativeSpaceTarget && !sample.momentum))
+    nativeSpaceTarget = document.elementFromPoint(sample.x, sample.y);
+  const target = nativeSpaceTarget;
+  if (target?.closest('#sidebar'))
+    onSpaceScroll({
+      ...sample,
+      target,
+      nativeSpaceScroll: true,
+      time: sample.time + nativeSpaceTimeOffset,
+      preventDefault() {},
+    });
+  if (['ended', 'cancelled'].includes(sample.phase) || sample.momentumEnded) nativeSpaceTarget = null;
+}
 function onSpaceScroll(event) {
   const sidebar = $('#sidebar');
   const spaces = state?.spaces.filter((space) => space.profileId === activeProfile()?.id) || [];
+  const blocked =
+    !state ||
+    effectiveSidebarHidden() ||
+    sidebar.inert ||
+    (ui.dialog && ui.dialog !== 'command') ||
+    ui.dragTab ||
+    spaceGesturePending ||
+    Boolean(event.target.closest('#toolbar, .space-dots, input, textarea, select, [contenteditable="true"]'));
+  // The Cocoa stream contains the exact contact end and inertial phase. Its
+  // complete samples own navigation, so a delayed IPC cannot double-count a DOM
+  // wheel or accidentally turn an inertial tail into another finger movement.
+  if (state?.runtime?.nativeSpaceScroll && event.isTrusted && !event.nativeSpaceScroll) {
+    const dx = event.shiftKey && !event.deltaX ? event.deltaY : event.deltaX;
+    const dy = event.shiftKey && !event.deltaX ? 0 : event.deltaY;
+    if (
+      !blocked &&
+      !event.ctrlKey &&
+      !event.metaKey &&
+      !event.altKey &&
+      !event.buttons &&
+      dx &&
+      Math.abs(dx) >= Math.abs(dy) * 1.5
+    )
+      event.preventDefault();
+    return;
+  }
   const result = spaceGesture.update({
     deltaX: event.deltaX,
     deltaY: event.deltaY,
@@ -763,21 +810,12 @@ function onSpaceScroll(event) {
           ? 'began'
           : 'changed'
         : undefined,
-    time: performance.now(),
+    time: event.nativeSpaceScroll ? event.time : performance.now(),
     width: sidebar.clientWidth,
     index: spaces.findIndex((space) => space.id === state?.activeSpaceId),
     count: spaces.length,
     contextKey: activeProfile()?.id,
-    blocked:
-      !state ||
-      effectiveSidebarHidden() ||
-      sidebar.inert ||
-      (ui.dialog && ui.dialog !== 'command') ||
-      ui.dragTab ||
-      spaceGesturePending ||
-      Boolean(
-        event.target.closest('#toolbar, .space-dots, input, textarea, select, [contenteditable="true"]'),
-      ),
+    blocked,
   });
   if (nativeSpaceContact) {
     nativeSpaceContact.beginning = false;
@@ -824,6 +862,40 @@ function favicon(url, tabId) {
     );
   return `<span class="favicon ${data ? '' : 'favicon-placeholder'}" aria-hidden="true">${data ? `<img src="${data}" alt="" draggable="false">` : icon('globe')}</span>`;
 }
+const favoriteAccentCache = new Map();
+function tintFavorite(image) {
+  const tile = image.closest('.favorite.active');
+  const source = image.getAttribute('src');
+  if (
+    !tile ||
+    !image.complete ||
+    !image.naturalWidth ||
+    !/^data:image\/(?:png|x-icon);base64,/.test(source || '')
+  )
+    return;
+  let color = favoriteAccentCache.get(source);
+  if (!favoriteAccentCache.has(source)) {
+    try {
+      const canvas = document.createElement('canvas');
+      canvas.width = canvas.height = 32;
+      const context = canvas.getContext('2d', { willReadFrequently: true });
+      context.drawImage(image, 0, 0, 32, 32);
+      color = faviconAccent(context.getImageData(0, 0, 32, 32).data);
+    } catch {
+      color = null;
+    }
+    favoriteAccentCache.set(source, color);
+    while (favoriteAccentCache.size > 64) favoriteAccentCache.delete(favoriteAccentCache.keys().next().value);
+  }
+  if (color) tile.style.setProperty('--favorite-logo-color', color);
+}
+document.addEventListener(
+  'load',
+  (event) => {
+    if (event.target.matches?.('.favorite.active > .favicon img')) tintFavorite(event.target);
+  },
+  true,
+);
 function dateLabel(time) {
   const d = new Date(time);
   if (Number.isNaN(d.getTime())) return '';
@@ -1067,12 +1139,12 @@ function setTheme() {
     /^#[\da-f]{6}$/i.test(base || '') ? base : '#9d4460',
   );
 }
-function previewWindowMaterial(opacity) {
+function previewWindowMaterial(opacity, blur) {
   const serial = (ui.materialPreviewSerial = (ui.materialPreviewSerial || 0) + 1);
   safely(
     invoke(
       'window:material-preview',
-      opacity === null ? { clear: true } : { spaceId: state.activeSpaceId, opacity },
+      opacity === null ? { clear: true } : { spaceId: state.activeSpaceId, opacity, blur },
     ).then((material) => {
       if (serial !== ui.materialPreviewSerial || !state?.runtime) return;
       state.runtime.windowMaterial = material;
@@ -1210,11 +1282,12 @@ function render() {
     if (ui.dialog === 'onboarding') renderOnboardingShortcuts();
   });
   syncLayout();
+  for (const image of $$('.favorite.active > .favicon img')) tintFavorite(image);
 }
 function sidebarKeyboardItems() {
   return $$(
     '#sidebar-content .space-page .favorite, #sidebar-content .space-page .folder-heading, #sidebar-content .space-page .tab-main',
-  ).filter((item) => !item.closest('[inert]') && item.getClientRects().length);
+  ).filter((item) => !item.closest('[inert],.drag-origin-page') && item.getClientRects().length);
 }
 function prepareSidebarKeyboard() {
   const items = sidebarKeyboardItems();
@@ -1367,7 +1440,7 @@ function renderSpacePage(space) {
       return `<button type="button" data-columns="${columns}" class="favorite ${tab.id === selectedTabId && !tab.closed ? 'active' : ''} ${status.toLowerCase()}" draggable="true" data-tab-id="${esc(tab.id)}" data-drop-tab="${esc(tab.id)}" data-action="tab:activate" data-id="${esc(tab.id)}" data-key="pin-${esc(tab.id)}" ${tab.id === selectedTabId && !tab.closed ? 'aria-current="page"' : ''} aria-label="${esc(label)} — ${status}" title="${esc(label)} — ${status}\n${esc(tab.pinnedUrl || tab.url)}">${favicon(tab.pinnedUrl || tab.url, tab.id)}${peekSourceBadge(tab)}</button>`;
     })
     .join('');
-  return `<div class="favorites ${favorites.length ? '' : 'favorites-empty'}" aria-label="Favorites" data-drop-favorites>${favoriteTiles || '<span class="pin-drop-hint">Drop to favorite</span>'}</div><div class="tabs-scroll">
+  return `<div class="favorites ${favorites.length ? '' : 'favorites-empty'}" aria-label="Favorites" data-drop-favorites>${favoriteTiles}</div><div class="tabs-scroll">
     <div class="space-header"><button type="button" class="space-picker" data-action="ui:spaces" data-key="space-picker" aria-label="Switch Space or profile" title="${esc(space?.name)} · ${esc(profile?.name)}${profile?.private ? ' · Private session' : ''}">${icon(profile?.private ? 'shield' : space?.icon || 'circle')}<span class="space-title">${esc(space?.name || 'My Space')}</span>${profile?.private ? '<span class="private-indicator">Private</span>' : ''}${icon('down')}</button></div>
     <div class="pinned-tabs" data-drop-pinned aria-label="Pinned tabs">${folders
       .map(
@@ -1379,25 +1452,56 @@ function renderSpacePage(space) {
                   tabs
                     .filter((tab) => tab.folderId === folder.id)
                     .map(tabRow)
-                    .join('') || '<div class="empty-tabs">Drop tabs here</div>'
+                    .join('') || '<div class="empty-tabs" aria-hidden="true"></div>'
                 }</div>`
           }</div>`,
       )
-      .join('')}${pins.map(tabRow).join('')}<span class="pin-drop-hint">Drop to pin in this Space</span></div>
-    <div class="today-divider" aria-hidden="true"></div><button type="button" class="new-tab today-new-tab" data-action="ui:new-tab" data-key="today-new-tab">${icon('plus')}<span>New tab</span><kbd>${shortcutFor('command-palette', 'Mod+T')}</kbd></button><div class="loose-tabs" data-drop-folder="" aria-label="Today tabs">${splitGroup}${loose.map(tabRow).join('')}</div></div>`;
+      .join('')}${pins.map(tabRow).join('')}</div>
+    <div class="today-divider" aria-hidden="true"></div><button type="button" class="new-tab today-new-tab" data-action="ui:new-tab" data-key="today-new-tab" data-drop-today>${icon('plus')}<span>New tab</span><kbd>${shortcutFor('command-palette', 'Mod+T')}</kbd></button><div class="loose-tabs" data-drop-folder="" aria-label="Today tabs">${splitGroup}${loose.map(tabRow).join('')}</div></div>`;
+}
+function renderDraggedSpace(space) {
+  const content = $('#sidebar-content');
+  const sourcePage = ui.dragSourcePage;
+  const current = visibleSpacePage();
+  if (!sourcePage?.isConnected || !current || !content) return false;
+  clearFavoriteReflow();
+  clearRowReflow();
+  clearDragFeedback();
+  sidebarScroll.set(ui.sidebarSpaceId, $('.tabs-scroll', current)?.scrollTop || 0);
+  favoriteScroll.set(ui.sidebarSpaceId, $('.favorites', current)?.scrollTop || 0);
+  if (current !== sourcePage) current.remove();
+  if (space.id === ui.dragSpaceId) {
+    sourcePage.classList.remove('drag-origin-page');
+    sourcePage.removeAttribute('aria-hidden');
+  } else {
+    // Keep the native drag source and its ancestors attached. Replacing or
+    // reparenting them cancels a macOS HTML5 drag before its eventual drop.
+    sourcePage.classList.add('drag-origin-page');
+    sourcePage.setAttribute('aria-hidden', 'true');
+    const page = document.createElement('div');
+    page.className = 'space-page';
+    page.innerHTML = renderSpacePage(space);
+    content.insertBefore(page, sourcePage);
+    $('.tabs-scroll', page).scrollTop = sidebarScroll.get(space.id) || 0;
+    $('.favorites', page).scrollTop = favoriteScroll.get(space.id) || 0;
+  }
+  for (const dot of $$('.sidebar-footer .space-dot')) {
+    const selected = dot.dataset.id === space.id;
+    dot.classList.toggle('active', selected);
+    if (selected) dot.setAttribute('aria-current', 'true');
+    else dot.removeAttribute('aria-current');
+  }
+  ui.sidebarSpaceId = space.id;
+  ui.sidebarSignature = null;
+  return true;
 }
 function renderSidebar() {
   const space = activeSpace();
   const profile = activeProfile();
   if (ui.dragTab) {
     const source = state.tabs.find((tab) => tab.id === ui.dragTab);
-    if (
-      source &&
-      source.profileId === profile?.id &&
-      ui.dragProfileId === profile?.id &&
-      ui.dragSpaceId === space?.id &&
-      (source.favorite || source.spaceId === space?.id)
-    ) {
+    if (source && source.profileId === profile?.id && ui.dragProfileId === profile?.id) {
+      if (ui.sidebarSpaceId !== space?.id) renderDraggedSpace(space);
       // Native drag sessions own their DOM source and drop targets until release.
       // Page loading/history/title updates still enter state, but must not replace
       // these nodes midway through a drag. Leave the signature stale for dragend.
@@ -1503,6 +1607,37 @@ function renderSidebar() {
     }
   ui.sidebarSpaceId = space?.id;
 }
+function extensionBadgeColor(value, fallback) {
+  if (typeof value === 'string' && /^(#[0-9a-f]{3,8}|[a-z]{1,30})$/i.test(value)) return value;
+  if (
+    Array.isArray(value) &&
+    value.length === 4 &&
+    value.every((n) => Number.isInteger(n) && n >= 0 && n <= 255)
+  )
+    return `rgba(${value[0]},${value[1]},${value[2]},${value[3] / 255})`;
+  return fallback;
+}
+function pinnedExtensions() {
+  if (activeProfile()?.private) return [];
+  const installed = profileItems('extensions');
+  return (activeProfile()?.pinnedExtensionIds || [])
+    .map((id) =>
+      installed.find((item) => item.id === id && item.hasAction && item.status !== 'remote-pending'),
+    )
+    .filter(Boolean);
+}
+function renderPinnedExtensions(extensions) {
+  if (!extensions.length) return '';
+  const columns = Math.max(4, Math.ceil(extensions.length / Math.ceil(extensions.length / 6)));
+  return `<div class="pinned-extensions" role="toolbar" aria-label="Pinned extensions" data-columns="${columns}">${extensions
+    .map((extension) => {
+      const disabled = !extension.enabled || extension.action?.enabled === false;
+      const title = extension.action?.title || extension.name;
+      const badge = extension.action?.badgeText;
+      return `<button type="button" class="pinned-extension" data-action="extension:action" data-id="${esc(extension.id)}" data-profile-id="${esc(extension.profileId)}" data-generation="${esc(extension.generation || '')}" data-key="extension-${esc(extension.id)}" aria-label="${esc(title)}" title="${esc(title)}" ${disabled ? 'disabled' : ''}>${extension.iconData ? `<img src="${esc(extension.iconData)}" alt="" draggable="false">` : icon('extension')}${badge ? `<span class="extension-badge" data-badge-background="${esc(extensionBadgeColor(extension.action.badgeBackgroundColor, '#000000'))}" data-badge-foreground="${esc(extensionBadgeColor(extension.action.badgeTextColor, '#ffffff'))}">${esc(String(badge).slice(0, 4))}</span>` : ''}</button>`;
+    })
+    .join('')}</div>`;
+}
 function renderToolbar() {
   const sidebarHidden = effectiveSidebarHidden();
   const tab = state.runtime?.peek
@@ -1512,6 +1647,7 @@ function renderToolbar() {
   const blank = !tab || tab.url === 'zacro://newtab';
   const bookmarked = profileItems('bookmarks').some((b) => b.url === tab?.url);
   const secure = tab?.url?.startsWith('https:');
+  const extensionPins = pinnedExtensions();
   const signature = JSON.stringify([
     tab?.url,
     tab?.title,
@@ -1526,6 +1662,7 @@ function renderToolbar() {
     ui.panel,
     sidebarHidden,
     state.runtime?.shortcuts,
+    extensionPins,
   ]);
   if (signature === ui.toolbarSignature) return;
   ui.toolbarSignature = signature;
@@ -1544,11 +1681,18 @@ function renderToolbar() {
   $('#captionbar').innerHTML = controls;
   $('#captionbar').hidden = !controls;
   $('#toolbar').innerHTML =
-    `<div class="navigation">${button('ui:sidebar-toggle', shortcutLabel(sidebarHidden ? 'Show sidebar' : 'Hide sidebar', 'sidebar-toggle', 'Mod+S'), 'sidebar', `data-key="sidebar-toggle" aria-controls="sidebar" aria-expanded="${!sidebarHidden}"`)}<span class="navigation-spacer"></span>${button('back', shortcutLabel('Back', 'history-back', isMac ? 'Mod+[' : 'Alt+Left'), 'back', `data-key="back" ${page.canGoBack ? '' : 'disabled'}`)}${button('forward', shortcutLabel('Forward', 'history-forward', isMac ? 'Mod+]' : 'Alt+Right'), 'forward', `data-key="forward" ${page.canGoForward ? '' : 'disabled'}`)}${button(page.loading ? 'stop' : 'reload', page.loading ? 'Stop loading' : shortcutLabel('Reload', 'reload', 'Mod+R'), page.loading ? 'close' : 'reload', `data-key="reload" ${blank ? 'disabled' : ''}`)}</div><div class="address-row"><button type="button" class="address-button" data-action="ui:address" data-key="address" title="${esc(tab?.url || 'Search or enter a URL')}" aria-label="Address bar: ${esc(tab?.url || 'New tab')}">${icon(blank ? 'search' : secure ? 'lock' : 'globe')}<span class="address-text">${esc(blank ? 'Search or enter URL' : sidebarHidden ? displayURL(tab.url) : hostname(tab.url))}</span></button>${button('ui:page-menu', 'Page actions', 'pageControls', 'data-key="page-menu" aria-haspopup="dialog"')}</div>${reloadWarning}`;
+    `<div class="navigation">${button('ui:sidebar-toggle', shortcutLabel(sidebarHidden ? 'Show sidebar' : 'Hide sidebar', 'sidebar-toggle', 'Mod+S'), 'sidebar', `data-key="sidebar-toggle" aria-controls="sidebar" aria-expanded="${!sidebarHidden}"`)}<span class="navigation-spacer"></span>${button('back', shortcutLabel('Back', 'history-back', isMac ? 'Mod+[' : 'Alt+Left'), 'back', `data-key="back" ${page.canGoBack ? '' : 'disabled'}`)}${button('forward', shortcutLabel('Forward', 'history-forward', isMac ? 'Mod+]' : 'Alt+Right'), 'forward', `data-key="forward" ${page.canGoForward ? '' : 'disabled'}`)}${button(page.loading ? 'stop' : 'reload', page.loading ? 'Stop loading' : shortcutLabel('Reload', 'reload', 'Mod+R'), page.loading ? 'close' : 'reload', `data-key="reload" ${blank ? 'disabled' : ''}`)}</div><div class="address-row"><button type="button" class="address-button" data-action="ui:address" data-key="address" title="${esc(tab?.url || 'Search or enter a URL')}" aria-label="Address bar: ${esc(tab?.url || 'New tab')}">${icon(blank ? 'search' : secure ? 'lock' : 'globe')}<span class="address-text">${esc(blank ? 'Search or enter URL' : sidebarHidden ? displayURL(tab.url) : hostname(tab.url))}</span></button>${button('ui:extensions-menu', 'Site controls and extensions', 'pageControls', 'data-key="extensions-menu" aria-haspopup="dialog"')}</div>${renderPinnedExtensions(extensionPins)}${reloadWarning}`;
+  const pins = $('.pinned-extensions', toolbar);
+  if (pins) pins.style.setProperty('--extension-columns', pins.dataset.columns);
+  for (const badge of $$('.extension-badge', toolbar)) {
+    badge.style.backgroundColor = badge.dataset.badgeBackground;
+    badge.style.color = badge.dataset.badgeForeground;
+  }
 }
 function renderWorkspace() {
   const tab = activeTab();
   const blank = !tab || tab.url === 'zacro://newtab';
+  $('#workspace').dataset.empty = String(blank);
   const page = state.runtime?.page || {};
   $('#newtab').hidden = !(blank && tab?.homePage);
   const signature = JSON.stringify([
@@ -1711,7 +1855,8 @@ function animateChrome(start) {
   const started = performance.now();
   render();
   const tick = (now) => {
-    const progress = Math.min(1, (now - started) / duration);
+    // A queued frame's timestamp may precede the interaction's performance.now().
+    const progress = Math.max(0, Math.min(1, (now - started) / duration));
     if (progress === 1 || reducedMotion.matches) {
       finishChromeMotion();
       syncLayout();
@@ -1751,6 +1896,7 @@ function syncLayout() {
   document.documentElement.style.setProperty('--panel-expanded', `${ui.panelExpandedWidth || 336}px`);
   document.documentElement.style.setProperty('--page-top', `${contentTop}px`);
   document.documentElement.style.setProperty('--canvas-right', `${panel + gutter}px`);
+  const split = syncSplitDivider(contentTop, gutter);
   for (const [kind, value, hiddenResize] of [
     ['sidebar', width, hidden],
     ['panel', panel, !ui.panel],
@@ -1765,10 +1911,15 @@ function syncLayout() {
   const layout = {
     sidebarWidth: width,
     sidebarHidden: hidden,
+    splitGroupId: split?.group.id || null,
+    splitRatio: split?.ratio ?? null,
     peekAppearance: (() => {
       const style = getComputedStyle(document.documentElement);
       return Object.fromEntries(
-        ['chrome', 'card', 'ink'].map((key) => [key, style.getPropertyValue(`--${key}`).trim()]),
+        ['chrome', 'card', 'ink'].map((key) => [
+          key,
+          style.getPropertyValue(`--${key === 'card' ? 'card-solid' : key}`).trim(),
+        ]),
       );
     })(),
     panelWidth: panel,
@@ -1795,6 +1946,130 @@ function syncLayout() {
 function empty(symbol, title, description) {
   return `<div class="empty-state"><div class="empty-icon">${icon(symbol)}</div><h3>${esc(title)}</h3><p>${esc(description)}</p></div>`;
 }
+function visibleSplitGroup() {
+  return state?.runtime?.splitPair
+    ? state.splitGroups.find(
+        (group) => group.spaceId === state.activeSpaceId && group.tabIds.includes(state.activeTabId),
+      )
+    : null;
+}
+function splitGeometry(ratio) {
+  const box = $('#workspace').getBoundingClientRect();
+  const width = Math.max(2, Math.round(box.width) - 6);
+  const minimum = Math.min(160, Math.floor(width / 2));
+  const first = Math.max(
+    minimum,
+    Math.min(width - minimum, Math.floor(width * Math.max(0.1, Math.min(0.9, ratio)))),
+  );
+  return { x: Math.round(box.x), width, first, minimum, ratio: first / width };
+}
+function syncSplitDivider(top, gutter) {
+  const group = visibleSplitGroup();
+  const handle = $('#split-resizer');
+  if (ui.splitResize && (ui.splitResize.id !== group?.id || ui.dialog || state.runtime?.peek)) {
+    ui.splitResize = null;
+    delete $('#app').dataset.splitResizing;
+  }
+  $('#app').dataset.splitView = String(Boolean(group));
+  handle.hidden = !group || Boolean(ui.dialog) || Boolean(state.runtime?.peek);
+  if (!group) return null;
+  const ratio = ui.splitResize?.ratio ?? group.ratio ?? 0.5;
+  const geometry = splitGeometry(ratio);
+  Object.assign(handle.style, {
+    left: `${geometry.x + geometry.first}px`,
+    top: `${top}px`,
+    bottom: `${gutter}px`,
+  });
+  handle.setAttribute(
+    'aria-valuemin',
+    String(Math.round(Math.max(0.1, geometry.minimum / geometry.width) * 100)),
+  );
+  handle.setAttribute(
+    'aria-valuemax',
+    String(Math.round(Math.min(0.9, 1 - geometry.minimum / geometry.width) * 100)),
+  );
+  handle.setAttribute('aria-valuenow', String(Math.round(geometry.ratio * 100)));
+  handle.setAttribute(
+    'aria-valuetext',
+    `${Math.round(geometry.ratio * 100)}% left, ${Math.round((1 - geometry.ratio) * 100)}% right`,
+  );
+  return { group, ratio };
+}
+function cancelSplitResize() {
+  if (!ui.splitResize) return;
+  ui.splitResize = null;
+  delete $('#app').dataset.splitResizing;
+  syncLayout();
+}
+async function saveSplitRatio(id, ratio) {
+  try {
+    await invoke('split:resize', { id, ratio });
+  } finally {
+    cancelSplitResize();
+    syncLayout();
+  }
+}
+document.addEventListener('pointerdown', (event) => {
+  const handle = event.target.closest?.('#split-resizer');
+  const group = visibleSplitGroup();
+  if (!handle || !group || event.button !== 0 || ui.dialog || state.runtime?.peek) return;
+  event.preventDefault();
+  interruptSpaceScroll();
+  finishChromeMotion();
+  ui.splitResize = { id: group.id, ratio: group.ratio ?? 0.5, pointerId: event.pointerId };
+  $('#app').dataset.splitResizing = 'true';
+  handle.focus({ preventScroll: true });
+  handle.setPointerCapture(event.pointerId);
+});
+document.addEventListener('pointermove', (event) => {
+  const resize = ui.splitResize;
+  if (!resize || resize.pointerId !== event.pointerId) return;
+  const geometry = splitGeometry(resize.ratio);
+  resize.ratio = splitGeometry((event.clientX - geometry.x - 3) / geometry.width).ratio;
+  syncLayout();
+});
+document.addEventListener('pointerup', (event) => {
+  const resize = ui.splitResize;
+  if (!resize || resize.pointerId !== event.pointerId) return;
+  if (event.target.hasPointerCapture?.(event.pointerId)) event.target.releasePointerCapture(event.pointerId);
+  safely(saveSplitRatio(resize.id, resize.ratio));
+});
+document.addEventListener('pointercancel', cancelSplitResize);
+window.addEventListener('blur', cancelSplitResize);
+document.addEventListener('dblclick', (event) => {
+  if (!event.target.closest?.('#split-resizer')) return;
+  const group = visibleSplitGroup();
+  if (group) safely(saveSplitRatio(group.id, 0.5));
+});
+document.addEventListener(
+  'keydown',
+  (event) => {
+    if (ui.splitResize && event.key === 'Escape') {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      cancelSplitResize();
+      return;
+    }
+    if (
+      !event.target.closest?.('#split-resizer') ||
+      !['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)
+    )
+      return;
+    const group = visibleSplitGroup();
+    if (!group) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    const ratio =
+      event.key === 'Home'
+        ? 0.1
+        : event.key === 'End'
+          ? 0.9
+          : splitGeometry(group.ratio ?? 0.5).ratio +
+            (event.key === 'ArrowRight' ? 1 : -1) * (event.shiftKey ? 0.1 : 0.02);
+    safely(saveSplitRatio(group.id, splitGeometry(ratio).ratio));
+  },
+  true,
+);
 function clampRailWidth(kind, value) {
   const gutter = state.settings.pageGutter ?? 8;
   const minimum = kind === 'sidebar' ? 200 : 260;
@@ -2759,7 +3034,8 @@ function closeDialog({ restore = true } = {}) {
   }
   ui.dialogToken = (ui.dialogToken || 0) + 1;
   $('#dialog-root').replaceChildren();
-  clearPageBackdrop();
+  // The host clears the snapshot after the restored native document paints.
+  // Removing it here leaves an empty frame while the native view reattaches.
   isolateDialog(false);
   syncLayout();
   if (restore) restoreFocus(focus);
@@ -2844,6 +3120,7 @@ function showSpaces() {
 function showSpaceForm(id) {
   const space = id ? state.spaces.find((s) => s.id === id) : null;
   ui.selectedColor = space?.color || colors[0][1];
+  ui.themeColorTarget = 'color';
   const theme = {
     secondaryColor: '#b695b8',
     gradient: 50,
@@ -2853,25 +3130,22 @@ function showSpaceForm(id) {
     blur: 0,
     ...space?.theme,
   };
-  const range = (key, label, min, max, suffix = '%') =>
-    `<label class="theme-range"><span>${label}<output data-theme-output="${key}">${theme[key]}${suffix}</output></span><input type="range" name="theme-${key}" min="${min}" max="${max}" value="${theme[key]}" aria-label="${label}"></label>`;
+  const range = (key, label, min, max, dial = false) =>
+    `<label class="theme-range ${dial ? 'theme-dial-control' : ''}"><span>${label}<output data-theme-output="${key}">${key === 'blur' ? Math.round((theme[key] / 32) * 100) : theme[key]}%</output></span><span class="${dial ? 'theme-dial' : 'theme-slider'}" ${dial ? 'data-theme-dial' : ''}><input type="range" name="theme-${key}" min="${min}" max="${max}" value="${theme[key]}" aria-label="${label}">${dial ? '<i aria-hidden="true"></i>' : ''}</span></label>`;
+  const colorControl = (key, label, value) =>
+    `<div class="theme-color-control" data-color-control="${key}"><button type="button" class="theme-color-label" data-theme-select="${key}" aria-pressed="${key === 'color'}">${label}</button><label class="theme-color-well"><input type="color" name="theme-${key}" value="${value}" aria-label="${label} color"></label><input class="theme-color-hex" data-theme-hex="${key}" value="${value.toUpperCase()}" aria-label="${label} hex color" spellcheck="false" autocomplete="off" pattern="#?[0-9a-fA-F]{6}" maxlength="7" required></div>`;
+  const identity = `<details class="theme-material theme-identity" ${space ? '' : 'open'}><summary>Name & icon</summary>${field('name', 'Space name', space?.name || '', 'text', 'required maxlength="60" placeholder="e.g. Work, Weekend, Research"')}${
+    !space
+      ? `<label class="field">Profile<select name="profileId">${selectOptions(
+          state.profiles.map((p) => [p.id, p.name]),
+          activeProfile()?.id,
+        )}</select></label>`
+      : ''
+  }<input type="hidden" name="space-icon" value="${esc(space?.icon || 'circle')}"><input id="space-icon-search" type="search" placeholder="Find an icon" aria-label="Find a Space icon" autocomplete="off"><div class="space-icon-options" role="group" aria-label="Space icon">${spaceIcons.map((name) => `<button type="button" data-action="ui:space-icon" data-icon="${name}" aria-label="${name} icon" title="${name}" aria-pressed="${(space?.icon || 'circle') === name}">${icon(name)}</button>`).join('')}</div></details>`;
   formDialog(
     space ? 'Customize Space' : 'New Space',
     '',
-    field(
-      'name',
-      'Space name',
-      space?.name || '',
-      'text',
-      'required maxlength="60" placeholder="e.g. Work, Weekend, Research"',
-    ) +
-      (!space
-        ? `<label class="field">Profile<select name="profileId">${selectOptions(
-            state.profiles.map((p) => [p.id, p.name]),
-            activeProfile()?.id,
-          )}</select></label>`
-        : '') +
-      `<input type="hidden" name="space-icon" value="${esc(space?.icon || 'circle')}"><input id="space-icon-search" type="search" placeholder="Find an icon" aria-label="Find a Space icon" autocomplete="off"><div class="space-icon-options" role="group" aria-label="Space icon">${spaceIcons.map((name) => `<button type="button" data-action="ui:space-icon" data-icon="${name}" aria-label="${name} icon" title="${name}" aria-pressed="${(space?.icon || 'circle') === name}">${icon(name)}</button>`).join('')}</div><div class="theme-preview-tile" aria-hidden="true"><div class="theme-preview-sidebar">${icon(space?.icon || 'circle')}<i></i><i></i><i></i></div><div class="theme-preview-page"></div><span>Preview</span></div><div class="field"><span>Space color</span><div class="color-options" role="group" aria-label="Space color">${colors.map(([name, color]) => `<button type="button" class="color-option swatch-${name} ${ui.selectedColor === color ? 'selected' : ''}" data-action="ui:color" data-color="${color}" aria-label="${name}" aria-pressed="${ui.selectedColor === color}"></button>`).join('')}</div></div><div class="theme-colors"><label>Primary<input type="color" name="theme-color" value="${ui.selectedColor}" aria-label="Primary color"></label><label>Secondary<input type="color" name="theme-secondaryColor" value="${theme.secondaryColor}" aria-label="Secondary color"></label></div><details class="theme-material"><summary>Gradient & texture</summary>${range('vibrancy', 'Color intensity', 0, 100)}${range('gradient', 'Color blend', 0, 100)}${range('grain', 'Grain', 0, 200)}</details><details class="theme-material"><summary>Glass & transparency</summary>${range('opacity', 'Window tint opacity', 0, 100)}<input type="hidden" name="theme-blur" value="${theme.blur}"></details>`,
+    `${space ? '' : identity}<div class="theme-preview-tile theme-color-canvas" role="group" aria-label="Hue and saturation"><div class="theme-color-dots" aria-hidden="true"></div><button type="button" class="theme-color-puck" data-theme-puck="color" aria-label="Primary color, use arrow keys to adjust hue and saturation" aria-pressed="true"></button><button type="button" class="theme-color-puck" data-theme-puck="secondaryColor" aria-label="Secondary color, use arrow keys to adjust hue and saturation" aria-pressed="false"></button></div><div class="theme-colors">${colorControl('color', 'Primary', ui.selectedColor)}${colorControl('secondaryColor', 'Secondary', theme.secondaryColor)}</div><div class="theme-preset-strip"><button type="button" data-theme-presets="-1" aria-label="Previous colors">${icon('chevronLeft')}</button><div class="color-options" role="group" aria-label="Space color">${colors.map(([name, color]) => `<button type="button" class="color-option swatch-${name}" data-action="ui:color" data-color="${color}" aria-label="${name}" aria-pressed="false"></button>`).join('')}</div><button type="button" data-theme-presets="1" aria-label="More colors">${icon('chevronRight')}</button></div><details class="theme-material" open><summary>Gradient & texture</summary><div class="theme-material-controls">${range('vibrancy', 'Color intensity', 0, 100)}<div class="theme-dials">${range('gradient', 'Color blend', 0, 100, true)}${range('grain', 'Grain', 0, 200, true)}</div></div></details><details class="theme-material"><summary>Glass & transparency</summary>${range('opacity', 'Window tint opacity', 0, 100)}${isMac ? range('blur', 'Background blur', 0, 32) : `<input type="hidden" name="theme-blur" value="${theme.blur}">`}</details>${space ? identity : ''}`,
     space ? 'Save changes' : 'Create Space',
     async (data, context) => {
       if (!context.isCurrent()) return;
@@ -2891,7 +3165,9 @@ function showSpaceForm(id) {
   );
   $('.dialog').classList.add('space-theme-dialog');
   for (const swatch of $$('.color-option')) swatch.style.background = swatch.dataset.color;
+  installThemeControls($('#modal-form'));
   updateSpacePreview();
+  if (space) requestAnimationFrame(() => $('[data-theme-puck="color"]')?.focus({ preventScroll: true }));
 }
 function readSpaceTheme() {
   const form = $('#modal-form');
@@ -2905,26 +3181,232 @@ function readSpaceTheme() {
     ),
   };
 }
+function themeColorCoordinates(hex) {
+  const channels = [1, 3, 5].map((offset) => parseInt(hex.slice(offset, offset + 2), 16) / 255);
+  const [red, green, blue] = channels;
+  const value = Math.max(...channels),
+    delta = value - Math.min(...channels);
+  let hue = 0;
+  if (delta) {
+    hue =
+      value === red
+        ? (green - blue) / delta
+        : value === green
+          ? (blue - red) / delta + 2
+          : (red - green) / delta + 4;
+    hue = (hue * 60 + 360) % 360;
+  }
+  return { hue, saturation: value ? delta / value : 0, value };
+}
+function themeColorHex({ hue, saturation, value }) {
+  const channel = (offset) => {
+    const k = (offset + hue / 60) % 6;
+    return Math.round(255 * (value - value * saturation * Math.max(0, Math.min(k, 4 - k, 1))))
+      .toString(16)
+      .padStart(2, '0');
+  };
+  return `#${channel(5)}${channel(3)}${channel(1)}`;
+}
+function themeHaptic(pattern = 'alignment') {
+  if (isMac) invoke('window:theme-haptic', { pattern }).catch(() => {});
+}
+function installThemeControls(form) {
+  let drag = null;
+  const choose = (key) => {
+    ui.themeColorTarget = key;
+    updateSpacePreview();
+  };
+  const detent = (value) => {
+    const next = Math.round(value * 10);
+    if (drag && next !== drag.detent) {
+      drag.detent = next;
+      themeHaptic(next === 0 || next === 10 ? 'levelChange' : 'alignment');
+    }
+  };
+  const move = (event) => {
+    if (!drag || event.pointerId !== drag.pointerId) return;
+    if (drag.puck) {
+      const bounds = $('.theme-color-canvas', form).getBoundingClientRect();
+      const hue = Math.max(
+        0,
+        Math.min(359, drag.color.hue + ((event.clientX - drag.startX) / (bounds.width - 108)) * 359),
+      );
+      const saturation = Math.max(
+        0,
+        Math.min(1, drag.color.saturation - (event.clientY - drag.startY) / (bounds.height - 108)),
+      );
+      drag.input.value = themeColorHex({ hue, saturation, value: drag.value || 1 });
+      detent((hue / 359 + saturation) / 2);
+      updateSpacePreview();
+    } else if (drag.dial) {
+      const bounds = drag.dial.getBoundingClientRect();
+      let angle =
+        (Math.atan2(
+          event.clientX - bounds.left - bounds.width / 2,
+          -(event.clientY - bounds.top - bounds.height / 2),
+        ) *
+          180) /
+        Math.PI;
+      // Keep the current endpoint while crossing the short inactive arc below the dial.
+      if (Math.abs(angle) > 135) angle = Number(drag.input.value) > Number(drag.input.max) / 2 ? 135 : -135;
+      const progress = (angle + 135) / 270;
+      drag.input.value = Math.round(
+        Number(drag.input.min) + progress * (Number(drag.input.max) - Number(drag.input.min)),
+      );
+      detent(progress);
+      updateSpacePreview();
+    }
+  };
+  form.addEventListener('pointerdown', (event) => {
+    if (event.button !== 0) return;
+    const puck = event.target.closest('[data-theme-puck]');
+    const dial = matchMedia('(forced-colors: active)').matches
+      ? null
+      : event.target.closest('[data-theme-dial]');
+    const range = event.target.closest('input[type=range]');
+    const select = event.target.closest('[data-theme-select]');
+    if (select) {
+      choose(select.dataset.themeSelect);
+      themeHaptic();
+    }
+    if (event.target.closest('.color-option')) themeHaptic();
+    if (!puck && !dial && !range) return;
+    const input = puck
+      ? form.elements[`theme-${puck.dataset.themePuck}`]
+      : dial?.querySelector('input') || range;
+    const color = puck ? themeColorCoordinates(input.value) : null;
+    drag = {
+      pointerId: event.pointerId,
+      puck,
+      dial,
+      input,
+      color,
+      startX: event.clientX,
+      startY: event.clientY,
+      value: color?.value || 0,
+      detent: color
+        ? Math.round((color.hue / 359 + color.saturation) * 5)
+        : Math.round((Number(input.value) / Number(input.max)) * 10),
+    };
+    if (puck) {
+      choose(puck.dataset.themePuck);
+      themeHaptic();
+    }
+    if (puck || dial) {
+      event.preventDefault();
+      (puck || input).focus({ preventScroll: true });
+      (puck || dial).setPointerCapture(event.pointerId);
+      // A puck click selects its color; moving it starts the color adjustment.
+      if (dial) move(event);
+    } else range.setPointerCapture(event.pointerId);
+  });
+  form.addEventListener('pointermove', move);
+  for (const name of ['pointerup', 'pointercancel', 'lostpointercapture'])
+    form.addEventListener(name, () => {
+      drag = null;
+    });
+  form.addEventListener('click', (event) => {
+    const select = event.target.closest('[data-theme-select]');
+    if (select) choose(select.dataset.themeSelect);
+    const puck = event.target.closest('[data-theme-puck]');
+    if (puck) choose(puck.dataset.themePuck);
+    const presets = event.target.closest('[data-theme-presets]');
+    if (presets)
+      $('.color-options', form).scrollBy({
+        left: Number(presets.dataset.themePresets) * 168,
+        behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth',
+      });
+  });
+  form.addEventListener('input', (event) => {
+    const input = event.target;
+    if (input.dataset.themeHex) {
+      const value = input.value.startsWith('#') ? input.value : `#${input.value}`;
+      input.setCustomValidity(/^#[\da-f]{6}$/i.test(value) ? '' : 'Enter a six-digit hex color');
+      if (!input.validity.valid) return;
+      ui.themeColorTarget = input.dataset.themeHex;
+      form.elements[`theme-${input.dataset.themeHex}`].value = value;
+      updateSpacePreview();
+    } else if (input.type === 'color') choose(input.name.slice(6));
+    else if (input.type === 'range' && drag?.input === input) detent(Number(input.value) / Number(input.max));
+  });
+  form.addEventListener('change', (event) => {
+    if (event.target.dataset.themeHex && event.target.validity.valid) {
+      event.target.value = form.elements[`theme-${event.target.dataset.themeHex}`].value.toUpperCase();
+    }
+  });
+  form.addEventListener('keydown', (event) => {
+    const puck = event.target.closest('[data-theme-puck]');
+    if (!puck || !['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const input = form.elements[`theme-${puck.dataset.themePuck}`];
+    const color = themeColorCoordinates(input.value),
+      step = event.shiftKey ? 10 : 1;
+    if (event.key === 'ArrowLeft' || event.key === 'ArrowRight')
+      color.hue = (color.hue + (event.key === 'ArrowRight' ? step : -step) + 360) % 360;
+    else
+      color.saturation = Math.max(
+        0,
+        Math.min(1, color.saturation + (event.key === 'ArrowUp' ? step : -step) / 100),
+      );
+    input.value = themeColorHex(color);
+    choose(puck.dataset.themePuck);
+  });
+}
 function updateSpacePreview() {
   const form = $('#modal-form');
   if (!form?.elements['theme-color']) return;
   ui.selectedColor = form.elements['theme-color'].value;
   const previousOpacity = ui.themePreview?.theme.opacity;
+  const previousBlur = ui.themePreview?.theme.blur;
   ui.themePreview = { color: ui.selectedColor, theme: readSpaceTheme() };
-  if (previousOpacity !== ui.themePreview.theme.opacity) previewWindowMaterial(ui.themePreview.theme.opacity);
+  if (previousOpacity !== ui.themePreview.theme.opacity || previousBlur !== ui.themePreview.theme.blur)
+    previewWindowMaterial(ui.themePreview.theme.opacity, ui.themePreview.theme.blur);
   for (const output of $$('[data-theme-output]', form)) {
     const key = output.dataset.themeOutput;
-    output.value = `${ui.themePreview.theme[key]}${key === 'blur' ? 'px' : '%'}`;
+    output.value = `${key === 'blur' ? Math.round((ui.themePreview.theme[key] / 32) * 100) : ui.themePreview.theme[key]}%`;
+  }
+  for (const input of $$('input[type=range]', form)) {
+    const progress = (Number(input.value) - Number(input.min)) / (Number(input.max) - Number(input.min));
+    input.setAttribute(
+      'aria-valuetext',
+      `${input.name === 'theme-blur' ? Math.round(progress * 100) : input.value}%`,
+    );
+    input.parentElement.style.setProperty('--range-progress', `${progress * 100}%`);
+    input.parentElement.style.setProperty('--dial-angle', `${progress * 270 - 135}deg`);
+  }
+  for (const key of ['color', 'secondaryColor']) {
+    const value = form.elements[`theme-${key}`].value;
+    const color = themeColorCoordinates(value);
+    const puck = $(`[data-theme-puck="${key}"]`, form);
+    puck.style.setProperty('--puck-color', value);
+    puck.style.left = `calc(54px + (100% - 108px) * ${color.hue / 359})`;
+    puck.style.top = `calc(54px + (100% - 108px) * ${1 - color.saturation})`;
+    puck.setAttribute('aria-pressed', ui.themeColorTarget === key);
+    puck.title = `${key === 'color' ? 'Primary' : 'Secondary'} ${value.toUpperCase()}`;
+    const control = $(`[data-color-control="${key}"]`, form);
+    control.classList.toggle('selected', ui.themeColorTarget === key);
+    $('[data-theme-select]', control).setAttribute('aria-pressed', ui.themeColorTarget === key);
+    const hex = $('[data-theme-hex]', control);
+    if (document.activeElement !== hex) {
+      hex.value = value.toUpperCase();
+      hex.setCustomValidity('');
+    }
+  }
+  const pucks = $$('[data-theme-puck]', form);
+  const bounds = pucks.map((puck) => {
+    puck.style.translate = '';
+    return puck.getBoundingClientRect();
+  });
+  if (Math.hypot(bounds[0].left - bounds[1].left, bounds[0].top - bounds[1].top) < 64) {
+    pucks[0].style.translate = '-22px -16px';
+    pucks[1].style.translate = '22px 16px';
   }
   for (const swatch of $$('.color-option', form)) {
-    const selected = swatch.dataset.color === ui.selectedColor;
+    const selected = swatch.dataset.color === form.elements[`theme-${ui.themeColorTarget || 'color'}`].value;
     swatch.classList.toggle('selected', selected);
     swatch.setAttribute('aria-pressed', selected);
   }
-  const symbol = form.elements['space-icon'].value;
-  $('.theme-preview-sidebar > svg')?.replaceWith(
-    document.createRange().createContextualFragment(icon(symbol)),
-  );
   setTheme();
 }
 document.addEventListener('input', (event) => {
@@ -2947,8 +3429,8 @@ function showMenu() {
     `<button type="button" class="context-action" data-action="${name}">${icon(symbol)}${label}${key ? `<kbd>${key}</kbd>` : ''}</button>`;
   openPopover(
     'menu',
-    `<div class="dialog-body">${action('ui:new-tab', 'New tab', 'plus', shortcutFor('command-palette', 'Mod+T'))}${action('ui:new-private', 'New private session', 'shield')}${action('ui:spaces', 'Spaces & profiles', 'user')}<hr class="context-separator">${action('ui:find', 'Find on page', 'search', shortcutFor('find', 'Mod+F'))}${action('ui:zoom-in', 'Zoom in', 'plus', shortcut('Mod+='))}${action('ui:zoom-out', 'Zoom out', 'minimize', shortcut('Mod+−'))}${action('ui:zoom-reset', 'Reset zoom', 'monitor', shortcut('Mod+0'))}${action('ui:print', 'Print page', 'print', shortcutFor('print', 'Mod+P'))}${action('ui:devtools', 'Developer tools', 'terminal')}<hr class="context-separator">${action('ui:extensions', 'Extensions', 'extension')}${action('ui:settings', 'Settings', 'settings')}${action('ui:shortcuts', 'Keyboard shortcuts', 'keyboard')}${action('ui:onboarding', 'Welcome tour', 'sparkle')}${action('ui:home-page', 'Home page', 'monitor')}${action('ui:about', 'About Zacro', 'info')}</div>`,
-    { title: 'Browser menu', anchor: $('[data-key="page-menu"]') },
+    `<div class="dialog-body">${action('ui:new-tab', 'New tab', 'plus', shortcutFor('command-palette', 'Mod+T'))}${action('ui:new-private', 'New private session', 'shield')}${action('ui:spaces', 'Spaces & profiles', 'user')}${action('ui:page-menu', 'Page actions', 'pageControls')}<hr class="context-separator">${action('ui:find', 'Find on page', 'search', shortcutFor('find', 'Mod+F'))}${action('ui:zoom-in', 'Zoom in', 'plus', shortcut('Mod+='))}${action('ui:zoom-out', 'Zoom out', 'minimize', shortcut('Mod+−'))}${action('ui:zoom-reset', 'Reset zoom', 'monitor', shortcut('Mod+0'))}${action('ui:print', 'Print page', 'print', shortcutFor('print', 'Mod+P'))}${action('ui:devtools', 'Developer tools', 'terminal')}<hr class="context-separator">${action('ui:extensions', 'Extensions', 'extension')}${action('ui:settings', 'Settings', 'settings')}${action('ui:shortcuts', 'Keyboard shortcuts', 'keyboard')}${action('ui:onboarding', 'Welcome tour', 'sparkle')}${action('ui:home-page', 'Home page', 'monitor')}${action('ui:about', 'About Zacro', 'info')}</div>`,
+    { title: 'Browser menu', anchor: $('[data-key="extensions-menu"]') },
   );
 }
 function showAddMenu() {
@@ -2969,9 +3451,48 @@ function showPageMenu() {
   openPopover(
     'page-actions',
     `<div class="dialog-body">${action('ui:bookmark', saved ? 'Remove bookmark' : 'Bookmark this page', 'star', `data-key="bookmark" aria-pressed="${saved}" ${blank ? 'disabled' : ''}`, shortcutFor('bookmark', 'Mod+D'))}${action('ui:split', state.runtime?.splitTabId ? 'Unsplit tabs' : 'Split view', 'split', 'data-key="split"')}${action('ui:find', 'Find on page', 'search', blank ? 'disabled' : '', shortcutFor('find', 'Mod+F'))}${action('ui:print', 'Print page', 'print', blank ? 'disabled' : '', shortcutFor('print', 'Mod+P'))}<hr class="context-separator"><div class="menu-zoom" aria-label="Page zoom">${button('ui:zoom-out', 'Zoom out', 'minimize')}${action('ui:zoom-reset', `${Math.round((state.runtime?.page?.zoom || 1) * 100)}%`, 'monitor')}${button('ui:zoom-in', 'Zoom in', 'plus')}</div><hr class="context-separator">${action('external:open', 'Open in default browser', 'external', `data-key="external-page" data-url="${esc(blank ? '' : tab.url)}" ${blank ? 'disabled' : ''}`)}${action('ui:menu', 'Browser menu', 'more', '', shortcutFor('browser-menu', 'F10'))}</div>`,
-    { title: 'Page actions', anchor: $('[data-key="page-menu"]') },
+    { title: 'Page actions', anchor: $('[data-key="address"]') },
   );
 }
+function showExtensionsMenu() {
+  const tab = state.runtime?.peek || activeTab();
+  const blank = !tab || tab.url === 'zacro://newtab';
+  const secure = !blank && tab.url.startsWith('https:') && !state.runtime?.page?.error;
+  const extensions = activeProfile()?.private ? [] : profileItems('extensions');
+  const pinned = new Set(activeProfile()?.pinnedExtensionIds || []);
+  const tiles = extensions
+    .map((extension) => {
+      const usable = extension.enabled && extension.action?.enabled !== false;
+      const action =
+        usable && extension.hasAction
+          ? 'extension:action'
+          : extension.enabled && extension.hasSidePanel
+            ? 'extension:panel-open'
+            : extension.enabled && extension.hasOptions
+              ? 'extension:options'
+              : 'ui:extensions';
+      const attrs = `data-id="${esc(extension.id)}" data-generation="${esc(extension.generation || '')}" data-profile-id="${esc(extension.profileId)}"`;
+      return `<div class="site-extension-tile"><button type="button" class="site-extension-action" data-action="${action}" ${attrs} aria-label="${esc(extension.name)}" title="${esc(extension.name)}${extension.enabled ? '' : ' · Disabled'}">${extension.iconData ? `<img src="${esc(extension.iconData)}" alt="">` : icon('extension')}${extension.action?.badgeText ? `<span class="extension-menu-badge">${esc(extension.action.badgeText)}</span>` : ''}</button><button type="button" class="extension-pin-control ${pinned.has(extension.id) ? 'pinned' : ''}" data-action="ui:extension-pin" ${attrs} ${!extension.hasAction || extension.status === 'remote-pending' ? 'disabled' : ''} aria-label="${pinned.has(extension.id) ? 'Unpin' : 'Pin'} ${esc(extension.name)}" aria-pressed="${pinned.has(extension.id)}" title="${pinned.has(extension.id) ? 'Unpin' : 'Pin'} ${esc(extension.name)}">${icon('pin')}</button></div>`;
+    })
+    .join('');
+  const quick = (action, label, glyph, disabled = blank) =>
+    button(action, label, glyph, disabled ? 'disabled' : '', 'site-quick-action');
+  const setting = (action, label, caption, glyph, disabled = false) =>
+    `<button type="button" class="site-setting" data-action="${action}" ${disabled ? 'disabled' : ''}><span class="site-setting-icon">${icon(glyph)}</span><span><strong>${esc(label)}</strong><small>${esc(caption)}</small></span></button>`;
+  openPopover(
+    'site-controls',
+    `<div class="site-control-body"><div class="site-quick-actions">${quick('ui:site-copy', 'Copy link', 'copy')}${quick('ui:bookmark', 'Bookmark page', 'star')}${quick('ui:split', state.runtime?.splitTabId ? 'Unsplit tabs' : 'Split view', 'split')}${quick('ui:find', 'Find on page', 'search')}</div><div class="site-section-heading"><h3>Extensions</h3>${button('ui:extensions', 'Manage extensions', 'plus')}</div>${tiles ? `<div class="site-extension-grid">${tiles}</div>` : `<p class="site-control-empty">${activeProfile()?.private ? 'Unavailable in private profiles.' : 'No extensions installed.'}</p>`}<h3>Settings</h3>${setting('ui:edit-space', 'Space theme', activeSpace()?.name || 'Customize', 'palette')}${setting('ui:permissions', 'Site permissions', 'Manage access', 'shield', blank)}${setting('ui:devtools', 'Developer tools', 'Inspect page', 'terminal', blank)}<footer class="site-control-footer"><button type="button" class="site-security" data-action="ui:permissions" ${blank ? 'disabled' : ''}>${icon(secure ? 'lock' : 'globe')}<span>${blank ? 'No page open' : secure ? 'Secure' : 'Not secure'}</span></button>${button('ui:page-menu', 'More page actions', 'more')}</footer></div>`,
+    { title: 'Site controls', anchor: $('[data-key="extensions-menu"]') },
+  );
+  const panel = $('.popover-panel');
+  panel?.classList.add('site-control-center');
+  if (panel) {
+    const bounds = panel.getBoundingClientRect();
+    panel.style.left = `${Math.max(8, Math.min(bounds.left, innerWidth - bounds.width - 8))}px`;
+    panel.style.top = `${Math.max(8, Math.min(bounds.top, innerHeight - bounds.height - 8))}px`;
+  }
+}
+
 function renderPageMenu() {
   if (ui.dialog !== 'page-actions') return;
   const root = $('.popover-panel');
@@ -3015,7 +3536,9 @@ function closeLibraryChooser({ restore = false } = {}) {
     if (menu.matches(':popover-open')) menu.hidePopover();
     menu.remove();
   }
-  for (const control of $$('[data-library-chooser],[data-download-menu],[data-key="library"]'))
+  for (const control of $$(
+    '[data-library-chooser],[data-download-menu],[data-key="library"],[data-key="extensions-menu"]',
+  ))
     control.setAttribute('aria-expanded', 'false');
   if (restore && opener) restoreFocus(opener);
   syncLayout();
@@ -3664,6 +4187,7 @@ function commandActionOptions() {
     .filter((entry) => commandSymbols[entry.id])
     .filter((entry) => !needsPage.has(entry.id) || real)
     .filter((entry) => !entry.id.startsWith('peek-') || state.runtime?.peek)
+    .filter((entry) => entry.id !== 'split' || !visibleSplitGroup())
     .filter((entry) => entry.id !== 'stop' || state.runtime?.page?.loading)
     .filter((entry) => entry.id !== 'history-back' || state.runtime?.page?.canGoBack)
     .filter((entry) => entry.id !== 'history-forward' || state.runtime?.page?.canGoForward)
@@ -3695,6 +4219,10 @@ function commandActionOptions() {
         return run();
       },
     });
+  if (visibleSplitGroup())
+    extra('unsplit', 'Unsplit tabs', 'split', 'unsplit separate split panes restore single view', () =>
+      invoke('split:unsplit'),
+    );
   extra(
     'space-theme',
     'Customize this Space',
@@ -4562,6 +5090,9 @@ function handleEvent(event) {
   )
     return;
   switch (event.type) {
+    case 'space:native-wheel':
+      nativeSpaceWheel(event.sample);
+      break;
     case 'space:gesture-phase':
       nativeSpaceGesturePhase(event.phase);
       break;
@@ -4894,6 +5425,32 @@ async function handleAction(action, data = {}, target) {
     case 'ui:add-menu':
       showAddMenu();
       return;
+    case 'ui:site-copy': {
+      const url = state.runtime?.peek?.url || activeTab()?.url;
+      closeDialog();
+      if (url && url !== 'zacro://newtab') {
+        await invoke('clipboard:write-text', { text: url });
+        toast('Link copied.');
+      }
+      return;
+    }
+    case 'ui:extensions-menu':
+      showExtensionsMenu();
+      return;
+    case 'ui:extension-pin': {
+      const profileId = activeProfile()?.id;
+      const extension = profileItems('extensions').find((item) => item.id === id);
+      const result = await invoke('extension-pin:toggle', { id, profileId });
+      if (activeProfile()?.id !== profileId) return;
+      applyState(await invoke('state:get'));
+      if (target?.isConnected) {
+        target.classList.toggle('pinned', result.pinned);
+        target.setAttribute('aria-pressed', String(result.pinned));
+        target.setAttribute('aria-label', `${result.pinned ? 'Unpin' : 'Pin'} ${extension?.name || id}`);
+        target.title = target.getAttribute('aria-label');
+      }
+      return;
+    }
     case 'ui:page-menu':
       showPageMenu();
       return;
@@ -4974,13 +5531,8 @@ async function handleAction(action, data = {}, target) {
       return invoke('tab:move', { id: tab.id, spaceId: id, folderId: null });
     }
     case 'ui:color':
-      ui.selectedColor = data.color;
-      $$('.color-option').forEach((b) => {
-        b.classList.toggle('selected', b.dataset.color === data.color);
-        b.setAttribute('aria-pressed', b.dataset.color === data.color);
-      });
-      if ($('#modal-form')?.elements['theme-color'])
-        $('#modal-form').elements['theme-color'].value = data.color;
+      if ($('#modal-form')?.elements[`theme-${ui.themeColorTarget || 'color'}`])
+        $('#modal-form').elements[`theme-${ui.themeColorTarget || 'color'}`].value = data.color;
       updateSpacePreview();
       return;
     case 'ui:space-icon':
@@ -5514,6 +6066,7 @@ async function handleAction(action, data = {}, target) {
       if (data.url) payload.url = data.url;
       if (data.title) payload.title = data.title;
       if (action.startsWith('extension:')) {
+        if (ui.dialog === 'site-controls') closeDialog({ restore: false });
         payload.profileId = data.profileId || activeProfile()?.id;
         if (data.generation) payload.generation = data.generation;
         if (data.permissionKind) payload.permissionKind = data.permissionKind;
@@ -5838,6 +6391,11 @@ document.addEventListener('focusin', (event) => {
   prepareSidebarKeyboard();
 });
 document.addEventListener('contextmenu', (event) => {
+  if (event.target.closest('[data-key="address"]')) {
+    event.preventDefault();
+    showPageMenu();
+    return;
+  }
   const space = event.target.closest('.space-dot');
   const tab = event.target.closest('[data-tab-id]');
   const folder = event.target.closest('[data-folder-id]');
@@ -5979,44 +6537,172 @@ function paintFavoriteReflow(destination) {
       );
   }
 }
+function clearRowReflow() {
+  const preview = ui.rowReflow;
+  if (!preview) return;
+  for (const item of preview.items) {
+    elementMotions.get(item.node)?.cancel();
+    item.node.style.order = item.order;
+  }
+  preview.source?.classList.remove('tab-drag-origin');
+  preview.placeholder.remove();
+  preview.container.classList.remove('row-reflow');
+  ui.rowReflow = null;
+}
+function rowInsertion(event, drop, container, source) {
+  const preview = ui.rowReflow;
+  if (preview?.container === container) {
+    const slot = preview.placeholder.getBoundingClientRect();
+    if (event.clientY >= slot.top && event.clientY <= slot.bottom) return { ...preview.destination, drop };
+  }
+  const rows = [...container.children].filter(
+    (node) => node.matches('.tab-row[data-tab-id]') && node.dataset.tabId !== source.id,
+  );
+  const next = rows.find((node) => {
+    const bounds = node.getBoundingClientRect();
+    return event.clientY < bounds.top + bounds.height / 2;
+  });
+  const previous = next ? rows[rows.indexOf(next) - 1] : rows.at(-1);
+  const folderId = container.closest('[data-folder-id]')?.dataset.folderId || null;
+  const pinned = Boolean(container.closest('[data-drop-pinned]'));
+  const remaining = state.tabs.filter((tab) => tab.id !== source.id);
+  const nextIndex = next && remaining.findIndex((tab) => tab.id === next.dataset.tabId);
+  const previousIndex = previous && remaining.findIndex((tab) => tab.id === previous.dataset.tabId);
+  const index = nextIndex >= 0 ? nextIndex : previousIndex >= 0 ? previousIndex + 1 : remaining.length;
+  return {
+    drop,
+    rowContainer: container,
+    rowBefore: next || null,
+    after: Boolean(!next || (drop.dataset.dropTab && drop !== next)),
+    payload: {
+      id: source.id,
+      spaceId: state.activeSpaceId,
+      favorite: false,
+      pinned,
+      folderId,
+      index,
+    },
+  };
+}
+function paintRowReflow(destination) {
+  const container = destination.rowContainer;
+  let preview = ui.rowReflow;
+  if (!preview || preview.container !== container) {
+    clearRowReflow();
+    const items = [...container.children].map((node) => ({ node, order: node.style.order }));
+    const placeholder = document.createElement('div');
+    placeholder.className = 'tab-row tab-insertion-slot';
+    placeholder.setAttribute('aria-hidden', 'true');
+    const tab = state.tabs.find((item) => item.id === ui.dragTab);
+    placeholder.innerHTML = `<span class="tab-main">${favicon(tab?.pinnedUrl || tab?.url, tab?.id)}<span class="title">${esc(tab ? tabLabel(tab) : 'Tab')}</span></span>`;
+    const source = $(`.tab-row[data-tab-id="${ui.dragTab}"]`, container);
+    container.append(placeholder);
+    container.classList.add('row-reflow');
+    preview = ui.rowReflow = { container, items, placeholder, source, destination: null };
+  }
+  if (preview.destination?.rowBefore === destination.rowBefore) {
+    preview.destination = destination;
+    return;
+  }
+  const before = new Map(preview.items.map(({ node }) => [node, node.getBoundingClientRect()]));
+  const ordered = preview.items.filter(({ node }) => node !== preview.source).map(({ node }) => node);
+  const index = destination.rowBefore ? ordered.indexOf(destination.rowBefore) : ordered.length;
+  ordered.splice(Math.max(0, index), 0, preview.placeholder);
+  preview.source?.classList.add('tab-drag-origin');
+  ordered.forEach((node, order) => {
+    node.style.order = String(order);
+  });
+  preview.destination = destination;
+  preview.placeholder.dataset.insertionIndex = String(destination.payload.index);
+  for (const { node } of preview.items) {
+    if (node === preview.source) continue;
+    const first = before.get(node),
+      last = node.getBoundingClientRect();
+    if (Math.abs(first.y - last.y) > 1)
+      motion(node, [{ transform: `translateY(${first.y - last.y}px)` }, { transform: 'translateY(0)' }], 140);
+  }
+}
+function clearDragSpaceHover() {
+  clearTimeout(ui.dragSpaceHover?.timer);
+  ui.dragSpaceHover?.dot?.classList.remove('drag-space-pending');
+  ui.dragSpaceHover = null;
+}
+function dragSpaceTarget(event) {
+  if (!ui.dragTab || ui.dragCommitPending || ui.dragProfileId !== activeProfile()?.id) return null;
+  const spaces = state.spaces.filter((space) => space.profileId === ui.dragProfileId);
+  const dot = event.target.closest('.sidebar-footer .space-dot');
+  if (dot) {
+    const space = spaces.find((item) => item.id === dot.dataset.id);
+    return space && space.id !== state.activeSpaceId ? { space, dot, key: `dot:${space.id}` } : null;
+  }
+  const sidebar = $('#sidebar').getBoundingClientRect();
+  const page = visibleSpacePage()?.getBoundingClientRect();
+  if (!page || event.clientY < page.top || event.clientY > page.bottom) return null;
+  const direction =
+    event.clientX >= sidebar.left && event.clientX <= sidebar.left + 14
+      ? -1
+      : event.clientX <= sidebar.right && event.clientX >= sidebar.right - 14
+        ? 1
+        : 0;
+  const index = spaces.findIndex((item) => item.id === state.activeSpaceId);
+  const space = direction && spaces[index + direction];
+  return space ? { space, edge: direction, key: `edge:${direction}:${space.id}` } : null;
+}
+function hoverDragSpace(event) {
+  ui.dragPointer = { clientX: event.clientX, clientY: event.clientY, target: event.target };
+  const target = dragSpaceTarget(event);
+  if (!target) {
+    clearDragSpaceHover();
+    return false;
+  }
+  if (ui.dragSpaceHover?.key === target.key) return true;
+  clearDragSpaceHover();
+  const record = { ...target, tabId: ui.dragTab, profileId: ui.dragProfileId };
+  record.dot?.classList.add('drag-space-pending');
+  record.timer = setTimeout(() => {
+    if (
+      ui.dragSpaceHover !== record ||
+      ui.dragTab !== record.tabId ||
+      ui.dragCommitPending ||
+      ui.dragProfileId !== record.profileId ||
+      !state.spaces.some((space) => space.id === record.space.id && space.profileId === record.profileId)
+    )
+      return;
+    clearDragSpaceHover();
+    clearFavoriteReflow();
+    clearRowReflow();
+    safely(
+      invoke('space:activate', { id: record.space.id }).then(async () => {
+        if (ui.dragTab !== record.tabId || ui.dragProfileId !== record.profileId) return;
+        applyState(await invoke('state:get'));
+        if (ui.dragTab === record.tabId) await invoke('split:drag', { id: record.tabId });
+        if (record.edge && ui.dragTab === record.tabId && ui.dragPointer)
+          hoverDragSpace({
+            ...ui.dragPointer,
+            target:
+              document.elementFromPoint(ui.dragPointer.clientX, ui.dragPointer.clientY) ||
+              ui.dragPointer.target,
+          });
+      }),
+    );
+  }, 550);
+  ui.dragSpaceHover = record;
+  return true;
+}
 function dragDestination(event) {
   const drop = event.target.closest(
-    '[data-drop-tab],[data-drop-favorites],[data-drop-pinned],[data-drop-folder]',
+    '[data-drop-tab],[data-drop-favorites],[data-drop-pinned],[data-drop-folder],[data-drop-today]',
   );
   const source = state?.tabs.find((tab) => tab.id === ui.dragTab);
   if (!drop || !source || source.profileId !== activeProfile()?.id) return null;
-  const target = drop.dataset.dropTab ? state.tabs.find((tab) => tab.id === drop.dataset.dropTab) : null;
   const favoriteContainer = drop.closest('[data-drop-favorites]');
   if (favoriteContainer) return favoriteInsertion(event, favoriteContainer, source);
-  if (target?.id === source.id) return null;
-  const favorite = false;
-  const pinned = favorite || Boolean(drop.closest('[data-drop-pinned]'));
-  const folderId = favorite ? null : target ? target.folderId : drop.dataset.dropFolder || null;
-  const rectangle = drop.getBoundingClientRect();
-  const after =
-    target &&
-    (favorite
-      ? event.clientX > rectangle.left + rectangle.width / 2
-      : event.clientY > rectangle.top + rectangle.height / 2);
-  const remaining = state.tabs.filter((tab) => tab.id !== source.id);
-  let index;
-  if (target) index = remaining.findIndex((tab) => tab.id === target.id) + (after ? 1 : 0);
-  else {
-    const siblings = remaining.filter((tab) =>
-      favorite
-        ? tab.favorite && tab.profileId === activeProfile()?.id
-        : tab.spaceId === state.activeSpaceId &&
-          !tab.favorite &&
-          tab.pinned === pinned &&
-          (tab.folderId || null) === folderId,
-    );
-    index = siblings.length ? remaining.indexOf(siblings.at(-1)) + 1 : remaining.length;
-  }
-  return {
-    drop,
-    after,
-    payload: { id: source.id, spaceId: state.activeSpaceId, favorite, pinned, folderId, index },
-  };
+  const container = drop.hasAttribute('data-drop-today')
+    ? $('.loose-tabs', drop.parentElement)
+    : drop.matches('.folder')
+      ? $('.folder-tabs', drop) || drop
+      : drop.closest('.folder-tabs,.pinned-tabs,.loose-tabs');
+  return container ? rowInsertion(event, drop, container, source) : null;
 }
 document.addEventListener('dragstart', (event) => {
   const tab = event.target.closest('[data-tab-id]');
@@ -6025,26 +6711,67 @@ document.addEventListener('dragstart', (event) => {
   ui.dragTab = tab.dataset.tabId;
   ui.dragProfileId = activeProfile()?.id;
   ui.dragSpaceId = state.activeSpaceId;
+  ui.dragSourcePage = visibleSpacePage();
   $('#app').dataset.dragging = 'true';
   event.dataTransfer.effectAllowed = 'move';
   event.dataTransfer.setData('text/plain', ui.dragTab);
+  safely(invoke('split:drag', { id: ui.dragTab }));
 });
 document.addEventListener('dragover', (event) => {
+  const changingSpace = hoverDragSpace(event);
   const destination = dragDestination(event);
   if (!destination) {
     clearFavoriteReflow();
+    clearRowReflow();
+    clearDragFeedback();
+    if (changingSpace) {
+      event.preventDefault();
+      event.dataTransfer.dropEffect = 'move';
+    }
     return;
   }
   event.preventDefault();
   event.dataTransfer.dropEffect = 'move';
   clearDragFeedback();
-  if (destination.favoriteSlot !== undefined) paintFavoriteReflow(destination);
-  else clearFavoriteReflow();
+  if (destination.favoriteSlot !== undefined) {
+    clearRowReflow();
+    paintFavoriteReflow(destination);
+  } else {
+    clearFavoriteReflow();
+    paintRowReflow(destination);
+  }
   destination.drop.classList.add(
     destination.drop.dataset.dropTab ? (destination.after ? 'drop-after' : 'drop-before') : 'drag-over',
   );
 });
+document.addEventListener('dragenter', (event) => {
+  if (hoverDragSpace(event)) event.preventDefault();
+});
 document.addEventListener('dragleave', (event) => {
+  if (ui.dragSpaceHover) {
+    const sidebar = $('#sidebar').getBoundingClientRect();
+    if (
+      event.clientX < sidebar.left ||
+      event.clientX > sidebar.right ||
+      event.clientY < sidebar.top ||
+      event.clientY > sidebar.bottom
+    ) {
+      ui.dragPointer = null;
+      clearDragSpaceHover();
+    }
+  }
+  const rowPreview = ui.rowReflow;
+  if (rowPreview) {
+    const bounds = rowPreview.container.getBoundingClientRect();
+    const target = rowPreview.destination?.drop.getBoundingClientRect() || bounds;
+    if (
+      event.clientX < Math.min(bounds.left, target.left) ||
+      event.clientX > Math.max(bounds.right, target.right) ||
+      event.clientY < Math.min(bounds.top, target.top) ||
+      event.clientY > Math.max(bounds.bottom, target.bottom)
+    )
+      clearRowReflow();
+  }
   const preview = ui.favoriteReflow;
   if (preview) {
     const bounds = preview.container.getBoundingClientRect();
@@ -6057,26 +6784,34 @@ document.addEventListener('dragleave', (event) => {
       clearFavoriteReflow();
   }
   const drop = event.target.closest(
-    '[data-drop-tab],[data-drop-favorites],[data-drop-pinned],[data-drop-folder]',
+    '[data-drop-tab],[data-drop-favorites],[data-drop-pinned],[data-drop-folder],[data-drop-today]',
   );
   if (drop && !drop.contains(event.relatedTarget))
     drop.classList.remove('drag-over', 'drop-before', 'drop-after');
 });
 function endTabDrag({ refresh = true } = {}) {
   const hadDrag = Boolean(ui.dragTab);
+  clearDragSpaceHover();
+  ui.dragPointer = null;
   clearFavoriteReflow();
+  clearRowReflow();
   ui.dragCommitPending = false;
   ui.dragTab = null;
   ui.dragProfileId = null;
   ui.dragSpaceId = null;
+  if (ui.dragSourcePage?.classList.contains('drag-origin-page')) ui.dragSourcePage.remove();
+  ui.dragSourcePage = null;
+  if (hadDrag) ui.sidebarSignature = null;
   delete $('#app').dataset.dragging;
   clearDragFeedback();
+  if (hadDrag) safely(invoke('split:drag', { id: null }));
   if (hadDrag && refresh) restoreFocusAround(renderSidebar);
 }
 document.addEventListener('dragend', () => {
   if (!ui.dragCommitPending) endTabDrag();
 });
 document.addEventListener('drop', (event) => {
+  clearDragSpaceHover();
   const destination = dragDestination(event);
   if (!destination) {
     endTabDrag();

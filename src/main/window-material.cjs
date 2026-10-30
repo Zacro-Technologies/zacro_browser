@@ -1,12 +1,13 @@
 'use strict';
 
 // Background transparency never fades text or the independent website views.
-// macOS vibrancy has a fixed opacity floor, so use an alpha-capable window and
-// let the renderer control its tint continuously. Windows retains native blur.
+// Tint and the optional native blur are independent. At zero blur, macOS has
+// no vibrancy layer, preserving genuinely clear window backgrounds.
 function windowMaterial({
   platform,
   release = '',
   opacity = 100,
+  blur = 0,
   reducedTransparency = false,
   highContrast = false,
 } = {}) {
@@ -26,14 +27,25 @@ function windowMaterial({
           ? 'opaque'
           : null;
   const enabled = reason === null;
+  const requestedBlur =
+    typeof blur === 'number' && Number.isFinite(blur) ? Math.max(0, Math.min(32, blur)) : 0;
+  const blurStrength = enabled && platform === 'darwin' ? requestedBlur / 32 : 0;
   return {
     supported,
     enabled,
-    type: enabled ? (platform === 'darwin' ? 'transparent' : 'acrylic') : 'opaque',
+    type: enabled
+      ? platform === 'darwin'
+        ? blurStrength
+          ? 'vibrancy'
+          : 'transparent'
+        : 'acrylic'
+      : 'opaque',
     opacity: enabled ? requestedOpacity : 100,
     requestedOpacity,
+    requestedBlur,
+    blurStrength,
     reason,
-    blur: platform === 'darwin' ? 'none' : 'system',
+    blur: platform === 'darwin' ? (blurStrength ? 'system' : 'none') : 'system',
   };
 }
 

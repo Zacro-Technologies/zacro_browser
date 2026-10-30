@@ -11,6 +11,8 @@ test('native glass is available only on supported native compositors', () => {
     type: 'acrylic',
     opacity: 65,
     requestedOpacity: 65,
+    requestedBlur: 0,
+    blurStrength: 0,
     reason: null,
     blur: 'system',
   });
@@ -27,6 +29,25 @@ test('native glass is available only on supported native compositors', () => {
     assert.equal(material.reason, 'unsupported-platform');
   }
   assert.equal(windowMaterial({ platform: 'linux', opacity: 65 }).reason, 'unsupported-platform');
+});
+
+test('Mac blur strength is independent of tint and disabled by accessibility or opaque chrome', () => {
+  for (const opacity of [0, 25, 50, 99]) {
+    for (const blur of [0, 8, 16, 32]) {
+      const material = windowMaterial({ platform: 'darwin', opacity, blur });
+      assert.equal(material.opacity, opacity);
+      assert.equal(material.blurStrength, blur / 32);
+      assert.equal(material.type, blur ? 'vibrancy' : 'transparent');
+    }
+  }
+  for (const extra of [{ opacity: 100 }, { reducedTransparency: true }, { highContrast: true }]) {
+    const material = windowMaterial({ platform: 'darwin', opacity: 0, blur: 32, ...extra });
+    assert.equal(material.blurStrength, 0);
+    assert.equal(material.requestedBlur, 32);
+  }
+  for (const blur of [NaN, Infinity, '16', -1])
+    assert.equal(windowMaterial({ platform: 'darwin', opacity: 0, blur }).blurStrength, 0);
+  assert.equal(windowMaterial({ platform: 'darwin', opacity: 0, blur: 100 }).blurStrength, 1);
 });
 
 test('system accessibility overrides glass while retaining the requested preference', () => {

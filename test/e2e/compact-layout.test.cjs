@@ -467,11 +467,11 @@ test(
     await expect(shell.locator('#side-panel')).toBeHidden();
     let expectedCaptures = 0;
     for (const [key, title] of [
-      ['page-menu', 'Page actions'],
+      ['address', 'Page actions'],
       ['space-picker', 'Your Spaces'],
       ['add-menu', 'Add'],
     ]) {
-      await shell.locator(`[data-key="${key}"]`).click();
+      await shell.locator(`[data-key="${key}"]`).click({ button: key === 'address' ? 'right' : 'left' });
       await expect(shell.getByRole('dialog', { name: title, exact: true })).toBeVisible();
       await expectBackdrop(title);
       assert.equal(
@@ -530,7 +530,7 @@ test(
     await invoke('navigate', { url: privateURL });
     await expect.poll(() => guest(privateURL, 'document.readyState')).toBe('complete');
     await instrument(privateURL);
-    await shell.locator('[data-key="page-menu"]').click();
+    await shell.locator('[data-key="address"]').click({ button: 'right' });
     await expect(shell.getByRole('dialog', { name: 'Page actions', exact: true })).toBeVisible();
     await expect
       .poll(() =>

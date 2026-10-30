@@ -88,6 +88,12 @@ services still require provider support. `action.setIcon` accepts both packaged 
 bounded ImageData, including size dictionaries. Extension-invoked `openPopup`
 opens the active tab's configured popup and replaces any existing action popup.
 
+Open **Site controls** beside the address to use an extension or toggle its pin.
+Pinned extension actions appear below the address in an adaptive tile row, with
+their icons and badges. Pins retain their order across restarts, are separate for
+each regular profile, and stay local to this installation. Disabled actions
+remain visible but inactive; removing an extension removes its pin.
+
 Persistent MV2 script/HTML backgrounds, MV2 lazy event pages, and MV3
 classic/module workers pass real API tests. Tests stop genuine native workers
 or wait for an event page to suspend, then verify host events wake the original

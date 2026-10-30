@@ -16,7 +16,7 @@ The red, yellow and green window controls are native macOS controls. Their reser
 
 Zacro's menu bar exposes browser actions without adding another menu row inside the window. The application menu contains Settings, Services, Hide and Quit. Window actions use native Minimize, Zoom and Bring All to Front. Edit actions target the focused page or browser field, including Undo, Redo, Select All, and Paste and Match Style. Downloads offer **Show in Finder**. These choices follow [Apple's Mac design guidance](https://developer.apple.com/design/human-interface-guidelines/designing-for-macos) and [Electron's native menu behavior](https://www.electronjs.org/docs/latest/api/menu-item).
 
-Page context menus include spelling suggestions and macOS Look Up for selected text. Native pages use macOS scroll bounce. The Dock menu offers the browser window, command palette and a new private Space without requiring an existing window.
+Page context menus include Copy Image, spelling suggestions and macOS Look Up for selected text. Native pages use macOS scroll bounce. The Dock menu offers the browser window, command palette and a new private Space without requiring an existing window.
 
 | Action                               | Mac shortcut |
 | ------------------------------------ | ------------ |
@@ -64,7 +64,7 @@ The browser window can shrink to 560×420. Drag the sidebar's right edge or Libr
 
 The palette's static page backdrop preserves native-resolution PNG pixels, including HiDPI captures, within explicit pixel and byte limits. Resizing or otherwise changing page geometry while the palette is open clears that backdrop, preserving the query, focus and underlying document; dismissing and reopening captures the current page. It does not stretch an old image or display a blurred fallback. [Validation](VALIDATION.md) records the capture limits and this overlay-resize limitation.
 
-Customize Space offers searchable icons, two colors, gradient balance, color intensity, grain and **Window tint opacity**. The preview uses the same appearance layers as the window, and folders follow the Space accent. Opacity spans 0–100; on macOS it directly controls background transparency, including the empty content pane, while text and webpages remain opaque. There is no fixed native blur layer masking low opacity settings. Reduce Transparency and high contrast restore opaque chrome while preserving the saved preference. Cancel restores the saved appearance. Windows uses acrylic on Windows 11 22H2 or later; unsupported systems use opaque chrome.
+Customize Space uses a dotted live preview with two distinct color pucks, exact color fields, gradient balance, color intensity and grain controls. Folders, Space glyphs and browser controls follow the Space accent. **Window tint opacity** spans 0–100; on macOS it controls chrome transparency independently of **Background blur**, which blends the native blur effect from off to full strength. Text and webpages stay opaque. The empty content pane has an opaque theme background and a soft shadow. Reduce Transparency and high contrast restore opaque chrome while preserving saved preferences. Cancel restores the saved appearance. Compatible Mac trackpads receive haptic feedback at control detents. Windows uses acrylic on Windows 11 22H2 or later; unsupported systems use opaque chrome.
 
 **Settings → Layout & motion** adds tab spacing, a shared 4–20px page inset, corner radius, motion speed and idle-favorite timing. Mac page top/side/bottom gutters use the selected inset, including in content-only view. Find reserves space while open. Traffic-light clearance remains separate from page framing.
 
@@ -88,7 +88,7 @@ Website redirect and popup mechanics are tested, including POST login callbacks,
 
 ## Develop and package
 
-Use native Node.js 24 or later on the Mac where the build will run. Install dependencies separately for each architecture:
+Use a full native Node.js 24 or later installation (including headers) and Xcode Command Line Tools on the Mac where the build will run. Installation compiles a small Node-API bridge for native trackpad phases, blur and haptics. Install dependencies separately for each architecture:
 
 ```sh
 npm ci
@@ -102,7 +102,7 @@ npm run dist:mac
 
 The runnable bundle is `dist/mac-arm64/Zacro.app` on Apple silicon and `dist/mac/Zacro.app` on Intel. Development archives are named `Zacro-<version>-mac-<arch>-development.dmg` and `.zip`. The DMG includes an Applications shortcut. The icon contains native `.icns` sizes for Finder and Dock rendering.
 
-Both Electron and Codex are native executables. The build validates their binary architecture and rejects cross-platform, cross-architecture and universal targets rather than shipping a mismatched runtime. Build the two distributions on corresponding hosts; a universal bundle would require a separate native-dependency merge strategy. Browsing remains available without AI authentication. Optional Codex sign-in uses Zacro's isolated OS keyring credentials and never imports a developer's Codex credentials.
+Electron, Codex and the Mac bridge contain architecture-specific native code. The build validates their binary architecture and rejects cross-platform, cross-architecture and universal targets rather than shipping a mismatched runtime. Build the two distributions on corresponding hosts; a universal bundle would require a separate native-dependency merge strategy. Browsing remains available without AI authentication. Optional Codex sign-in uses Zacro's isolated OS keyring credentials and never imports a developer's Codex credentials.
 
 Development bundles are ad-hoc signed and omit Hardened Runtime. They are for local validation, not a trusted public release. Publisher release commands require a Developer ID identity and notarization configuration. No Apple credentials are included in this repository or requested by ordinary browsing/build-preview workflows.
 
