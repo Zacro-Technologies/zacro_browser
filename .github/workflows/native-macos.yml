@@ -1,0 +1,28 @@
+name: Native macOS
+on:
+  workflow_dispatch:
+  push:
+    branches: [swift-rewrite]
+    paths: ['macos/**', '.github/workflows/native-macos.yml']
+  pull_request:
+    paths: ['macos/**', '.github/workflows/native-macos.yml']
+permissions:
+  contents: read
+jobs:
+  swift:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Native state and application tests
+        run: swift test --package-path macos
+      - name: Bundle Chromium development application
+        run: bash macos/scripts/build-app.sh
+      - name: Verify application signatures
+        run: codesign --verify --deep --strict 'macos/dist/Zacro Native.app'
+      - name: Archive development bundle
+        run: ditto -c -k --keepParent 'macos/dist/Zacro Native.app' macos/dist/Zacro-Native-development.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Zacro-Native-development
+          path: macos/dist/Zacro-Native-development.zip
