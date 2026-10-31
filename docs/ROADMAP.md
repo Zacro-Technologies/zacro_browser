@@ -16,6 +16,13 @@ Required identity-engine work: evaluate a maintained full Chromium browser integ
 
 Implement vertical tabs, favorites, folders, drag and keyboard organization, Space themes, navigation/command bar, split pages and Peek with promotion and focus return. Deliver downloads with pause/cancel/reveal and reversible renaming, history, bookmark imports, archive recovery, printing, find, zoom, developer tools and readable errors. No inert feature buttons.
 
+### Navigation convenience tasks · October 31, 2026
+
+- **NAV-001 — Clipboard to a new tab: implemented.** The configurable Paste and search shortcut is Control+Command+V on macOS and Ctrl+Alt+V on Windows. Clipboard text opens in a new tab through the existing address/search resolver: addresses navigate directly and other text uses the selected search engine. No duplicate implementation is planned.
+- **NAV-002 — Copy button to the right of the URL: planned, unassigned.** Add a directly accessible address-row button using existing clipboard support. Existing copy shortcuts and the Site controls menu do not satisfy this placement requirement.
+
+See the [navigation convenience plan](superpowers/plans/2026-10-31-navigation-convenience.md) for source evidence, ownership, dependencies and acceptance criteria. Implemented status records source inspection and existing tests; it does not claim fresh platform acceptance.
+
 The current interface distinguishes profile-wide Favorites, saved Space pins and temporary Today tabs. Favorites use balanced rows and activate their existing page; saved pin reset is a separate action. The New tab row opens commands. Space colors and material settings follow swipe progress, including reversal and cancellation. The palette floats above a sharp, untinted page, Library shares the window material without a dividing line, and Peek coordinates native page and chrome motion. Window tint spans 0–100 and grain spans 0–200. These implementations still require the platform and accessibility acceptance below.
 
 Today auto-archive defaults to 12 hours, with an inherited default or per-profile choices including Never; existing choices remain intact. Clean loaded background tabs are eligible after draft/media/authentication/download checks and a silent beforeunload decision. Active and split pages, Favorites, pins and folder tabs remain protected. Archive recovery and race regressions must accompany this policy; safe unloading cannot promise to detect arbitrary website memory state.
