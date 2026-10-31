@@ -4,7 +4,7 @@
 
 Zacro is an open-source, Arc-inspired browser by Zacro Technologies. Keep your everyday sites close, give each project its own Space, and follow your curiosity without losing your place.
 
-![Zacro with Favorites, Spaces and vertical tabs beside a webpage](docs/screenshots/0.9/workspace.jpg)
+![Zacro with Favorites, Spaces and vertical tabs beside a webpage](docs/screenshots/0.10.2/workspace.png)
 
 ## A place for everything
 
@@ -18,9 +18,9 @@ Create **Spaces** for work, personal projects or whatever you're exploring. Give
 
 | Peek | Make each Space yours |
 | --- | --- |
-| ![A link preview over the current page](docs/screenshots/0.9/peek.jpg) | ![Space colors and appearance controls](docs/screenshots/0.9/space-theme.jpg) |
+| ![A link preview over the current page](docs/screenshots/0.10.2/peek.png) | ![Space colors and appearance controls](docs/screenshots/0.10.2/space-theme.png) |
 
-Screenshots show version 0.9. See the [gallery and capture notes](docs/screenshots/README.md) for more.
+Screenshots show version 0.10.2 on macOS. See the [gallery and capture notes](docs/screenshots/README.md) for more.
 
 ## Move at the speed of a thought
 

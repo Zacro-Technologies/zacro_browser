@@ -66,7 +66,7 @@
     if (!text || text.length > 8000) throw new Error('Enter a search of 1–8,000 characters.');
     return engine.url.trim().replace('%s', encodeURIComponent(text.toWellFormed()));
   }
-  function currentWebsiteSearch(pageURL, engines, searchEngine = 'duckduckgo') {
+  function currentWebsiteSearch(pageURL, engines, searchEngine = 'google') {
     let page;
     try {
       page = new URL(pageURL);
@@ -82,7 +82,7 @@
         google: 'https://www.google.com/search?q=',
         bing: 'https://www.bing.com/search?q=',
         brave: 'https://search.brave.com/search?q=',
-      }[searchEngine] || 'https://duckduckgo.com/?q=';
+      }[searchEngine] || 'https://www.google.com/search?q=';
     return {
       id: 'current-website',
       name: page.hostname.slice(0, 40),

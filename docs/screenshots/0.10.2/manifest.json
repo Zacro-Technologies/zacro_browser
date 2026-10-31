@@ -1,0 +1,28 @@
+{
+  "capturedAt": "2026-10-31T08:28:07.567994+00:00",
+  "version": "0.10.2",
+  "runtime": "source Electron on macOS",
+  "baseRevision": "efa25fc019d616002f0a12c310bc92c5c33bc1bc",
+  "workingChanges": "Google search defaults; no visual runtime changes",
+  "method": "Native macOS whole-window screencapture via screenshot skill",
+  "files": [
+    {
+      "file": "space-theme.png",
+      "width": 2784,
+      "height": 1824,
+      "sha256": "18dbd74c57fb69b49fde343118bff209191770503c3da1a11da8094415cd882a"
+    },
+    {
+      "file": "workspace.png",
+      "width": 2784,
+      "height": 1824,
+      "sha256": "427f95b0eb632fa6fab323ef3b8744623bc22bce20d7de9596c21094c9df19ce"
+    },
+    {
+      "file": "peek.png",
+      "width": 2784,
+      "height": 1824,
+      "sha256": "c6038c8d6bdc34e713b5faf4fd141d9b8e4edf483f0d726dff08f9727d66544a"
+    }
+  ]
+}

@@ -185,8 +185,14 @@ test('address parsing preserves web addresses, encodes queries and supports loca
   assert.equal(normalizeAddress('localhost:3300/test'), 'http://localhost:3300/test');
   assert.equal(normalizeAddress('127.0.0.1:8080'), 'http://127.0.0.1:8080/');
   assert.equal(normalizeAddress('[::1]:8080'), 'http://[::1]:8080/');
-  assert.equal(normalizeAddress('café with a view'), 'https://duckduckgo.com/?q=caf%C3%A9%20with%20a%20view');
+  assert.equal(
+    normalizeAddress('café with a view'),
+    'https://www.google.com/search?q=caf%C3%A9%20with%20a%20view',
+  );
   assert.equal(normalizeAddress('two words', 'google'), 'https://www.google.com/search?q=two%20words');
+  assert.equal(normalizeAddress('two words', 'duckduckgo'), 'https://duckduckgo.com/?q=two%20words');
+  assert.equal(memory().state.settings.searchEngine, 'google');
+  assert.equal(normalizeAddress('two words', 'unknown'), 'https://www.google.com/search?q=two%20words');
   assert.equal(normalizeAddress(''), 'zacro://newtab');
   assert.equal(normalizeAddress('https://例え.テスト'), 'https://xn--r8jz45g.xn--zckzah/');
 });

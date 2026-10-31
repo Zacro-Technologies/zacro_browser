@@ -46,7 +46,7 @@ test('typed local development addresses remain usable without opening non-web sc
   assert.equal(normalizeAddress('example.com'), 'https://example.com/');
   assert.equal(
     normalizeAddress('search terms & credential=none'),
-    'https://duckduckgo.com/?q=search%20terms%20%26%20credential%3Dnone',
+    'https://www.google.com/search?q=search%20terms%20%26%20credential%3Dnone',
   );
   assert.throws(() => normalizeAddress('https://example.com/\u0000evil'), /invalid characters/);
 });

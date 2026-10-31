@@ -43,6 +43,10 @@ test('site search queries are encoded once and cannot change the selected origin
 
 test('current website search prefers an exact-origin configured engine and otherwise scopes the selected search provider', () => {
   const { currentWebsiteSearch } = require('../src/core/site-search.js');
+  assert.equal(
+    new URL(siteSearchURL(currentWebsiteSearch('https://example.com', []), 'hello')).origin,
+    'https://www.google.com',
+  );
   const github = currentWebsiteSearch('https://github.com/openai/codex', undefined);
   assert.equal(siteSearchURL(github, 'native views'), 'https://github.com/search?q=native%20views');
   const fallback = currentWebsiteSearch('https://docs.example.com/private?q=secret', [], 'bing');

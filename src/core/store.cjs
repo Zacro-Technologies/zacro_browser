@@ -108,7 +108,7 @@ function spaceTheme(value, base = DEFAULT_SPACE_THEME) {
   return next;
 }
 
-function normalizeAddress(input, searchEngine = 'duckduckgo') {
+function normalizeAddress(input, searchEngine = 'google') {
   const value = str(input, 8192);
   if (!value || value === 'zacro://newtab' || value === 'about:blank') return 'zacro://newtab';
   if (/[\u0000-\u001f\u007f]/.test(value)) throw new Error('This address contains invalid characters.');
@@ -142,7 +142,7 @@ function normalizeAddress(input, searchEngine = 'duckduckgo') {
       throw new Error('This address is not valid.');
     }
   }
-  return (SEARCH[searchEngine] || SEARCH.duckduckgo) + encodeURIComponent(value);
+  return (SEARCH[searchEngine] || SEARCH.google) + encodeURIComponent(value);
 }
 
 function webUrl(value) {
@@ -203,7 +203,7 @@ function createInitialState() {
     permissions: [],
     settings: {
       theme: 'system',
-      searchEngine: 'duckduckgo',
+      searchEngine: 'google',
       archiveAfterHours: DEFAULT_ARCHIVE_HOURS,
       sidebarWidth: 224,
       panelWidth: 336,

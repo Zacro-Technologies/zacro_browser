@@ -1,5 +1,9 @@
 # Screenshot assets
 
+## 0.10.2 macOS captures
+
+The three PNGs in `0.10.2/` show the current workspace, Peek, and Space theme editor. They are intact native macOS window captures of the 0.10.2 source runtime, prepared with `scripts/review-captures.cjs --source` in a disposable profile using local demo pages. All three were visually inspected; no interface was composited or retouched. See the [capture manifest](0.10.2/manifest.json) for dimensions and hashes. These stills document appearance, not physical trackpad behavior or packaged-release acceptance.
+
 ## 0.9 Windows captures
 
 The eight JPEGs under `0.9/` are intact Computer captures of packaged runtime **`8069153e0b5fc43fb5a0bcfdf4f96b1ab32e452b`** on Windows 11, taken October 28, 2026 (JST). `scripts/review-captures.cjs --opaque` prepared an isolated local demo; Computer captured each whole window separately. Every image was inspected before saving. Six Favorites load their original fixture icons through actual navigation, and the Design handbook pin is deliberately away from its saved address. No interface was composited, retouched or generated for these images.
