@@ -133,7 +133,7 @@ test('attached panel uses bounded right region, hides for overlays and tears dow
   c.arrange({ sidebarWidth: 224, panelWidth: 336, contentTop: 8, extensionPanel: true, overlay: false });
   const v = f.created[0];
   assert.equal(f.attached.has(v), true);
-  assert.deepEqual(v.bounds, { x: 664, y: 50, width: 336, height: 650 });
+  assert.deepEqual(v.bounds, { x: 664, y: 46, width: 336, height: 654 });
   assert.deepEqual(v.options.webPreferences, {
     session: 'owned-session',
     sandbox: true,

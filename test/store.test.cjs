@@ -177,7 +177,7 @@ test('Space appearance and layout preferences round-trip with bounded untrusted 
   const imported = memory();
   imported.importData(exported);
   assert.deepEqual(imported.state.spaces[1].theme, clean.spaces[0].theme);
-  assert.equal(imported.state.settings.pageGutter, 8, 'Collection import never replaces local preferences');
+  assert.equal(imported.state.settings.pageGutter, 4, 'Collection import never replaces local preferences');
 });
 
 test('address parsing preserves web addresses, encodes queries and supports localhost', () => {

@@ -1802,7 +1802,7 @@ function arrangePeekOverlay(visible) {
   if (!overlay || overlay.contents.isDestroyed()) return;
   const dragging = Boolean(splitDrag && validSplitDrag(splitDrag) && !layout.overlay && !peek);
   const reveal = !dragging && !peek && layout.sidebarHidden && !layout.overlay;
-  const gutter = store.state.settings.pageGutter ?? 8;
+  const gutter = store.state.settings.pageGutter ?? 4;
   const bounds = reveal ? { x: gutter + 4, y: gutter + 4, width: 32, height: 32 } : peekUnderlayBounds();
   const shown = Boolean((visible || reveal || dragging) && overlay.ready);
   overlay.presentation = presentView(

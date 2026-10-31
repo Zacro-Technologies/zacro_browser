@@ -11,7 +11,14 @@ const {
 } = require('../src/main/layout.cjs');
 
 test('native pages align with compact chrome, sidebar, and open panels without fractional seams', () => {
-  const layout = browserLayout({ width: 1441, height: 941, sidebarWidth: 260, panelWidth: 400, split: true });
+  const layout = browserLayout({
+    pageGutter: 8,
+    width: 1441,
+    height: 941,
+    sidebarWidth: 260,
+    panelWidth: 400,
+    split: true,
+  });
   assert.deepEqual(layout.primary, { x: 268, y: 36, width: 379, height: 897 });
   assert.deepEqual(layout.secondary, { x: 653, y: 36, width: 380, height: 897 });
   assert.equal(layout.secondary.x + layout.secondary.width + 400 + 8, 1441);
@@ -20,12 +27,13 @@ test('native pages align with compact chrome, sidebar, and open panels without f
 });
 
 test('hiding the sidebar reclaims its width while keeping the page, panel and split frame aligned', () => {
-  const full = browserLayout({ width: 1000, height: 700, sidebarWidth: 0, contentTop: 40 });
+  const full = browserLayout({ pageGutter: 8, width: 1000, height: 700, sidebarWidth: 0, contentTop: 40 });
   assert.deepEqual(full.primary, { x: 8, y: 40, width: 984, height: 652 });
   assert.equal(full.secondary, null);
   assert.deepEqual(full.peek, { x: 120, y: 66, width: 760, height: 600 });
 
   const split = browserLayout({
+    pageGutter: 8,
     width: 1000,
     height: 700,
     sidebarWidth: 0,
@@ -38,18 +46,18 @@ test('hiding the sidebar reclaims its width while keeping the page, panel and sp
   assert.equal(split.secondary.x + split.secondary.width + 360 + 8, 1000);
   assert.deepEqual(split.peek, { x: 83, y: 66, width: 474, height: 600 });
 
-  const restored = browserLayout({ width: 1000, height: 700, sidebarWidth: 300 });
+  const restored = browserLayout({ pageGutter: 8, width: 1000, height: 700, sidebarWidth: 300 });
   assert.equal(
     restored.primary.x,
     308,
     'A custom sidebar width retains the same page inset after focus mode',
   );
-  assert.equal(browserLayout({ width: 1000, height: 700 }).primary.x, 232);
+  assert.equal(browserLayout({ pageGutter: 8, width: 1000, height: 700 }).primary.x, 232);
 });
 
 test('sidebar navigation, caption rail and Find reserve only their supported content insets', () => {
   for (const contentTop of [8, 36, 40]) {
-    const layout = browserLayout({ width: 1001, height: 701, sidebarWidth: 224, contentTop });
+    const layout = browserLayout({ pageGutter: 8, width: 1001, height: 701, sidebarWidth: 224, contentTop });
     assert.equal(layout.primary.y, contentTop);
     assert.equal(layout.primary.y + layout.primary.height, 693, 'The page retains its 8px bottom frame');
     assert(layout.peek.y >= contentTop + 20, 'Peek leaves a small vertical margin');
@@ -60,17 +68,22 @@ test('sidebar navigation, caption rail and Find reserve only their supported con
     );
   }
   for (const contentTop of [-1, 0, 8.5, 44, 10000, NaN, Infinity])
-    assert.equal(browserLayout({ width: 1000, height: 700, contentTop }).primary.y, 36);
+    assert.equal(browserLayout({ pageGutter: 8, width: 1000, height: 700, contentTop }).primary.y, 36);
   for (const [sidebarWidth, expected] of [
     [100, 108],
     [224, 232],
     [300, 308],
     [400, 388],
   ])
-    assert.equal(browserLayout({ width: 1000, height: 700, sidebarWidth }).primary.x, expected);
+    assert.equal(
+      browserLayout({ pageGutter: 8, width: 1000, height: 700, sidebarWidth }).primary.x,
+      expected,
+    );
 });
 
 test('custom gutters stay equal throughout the sidebar animation and split layouts', () => {
+  const defaults = browserLayout({ width: 1000, height: 700, contentTop: 4 });
+  assert.deepEqual(defaults.primary, { x: 228, y: 4, width: 768, height: 692 });
   for (const pageGutter of [4, 8, 12, 20])
     for (const sidebarWidth of [0, 7, 80, 160, 224, 236, 380]) {
       const result = browserLayout({
@@ -92,6 +105,7 @@ test('custom gutters stay equal throughout the sidebar animation and split layou
 test('resizing and malformed dimensions keep native bounds finite and positive', () => {
   for (const width of [560, 640, 800, 960, 1100, 1440, 3840, NaN]) {
     const layout = browserLayout({
+      pageGutter: 8,
       width,
       height: 420,
       sidebarWidth: Infinity,
@@ -108,7 +122,14 @@ test('resizing and malformed dimensions keep native bounds finite and positive',
 test('split ratios resize both pages without seams and retain usable pane widths', () => {
   for (const width of [560, 1000, 1800]) {
     for (const splitRatio of [0, 0.1, 0.25, 0.5, 0.7, 0.9, 1, NaN, Infinity]) {
-      const layout = browserLayout({ width, height: 700, sidebarWidth: 224, split: true, splitRatio });
+      const layout = browserLayout({
+        pageGutter: 8,
+        width,
+        height: 700,
+        sidebarWidth: 224,
+        split: true,
+        splitRatio,
+      });
       assert.equal(layout.secondary.x - layout.primary.x - layout.primary.width, 6);
       assert.equal(layout.secondary.x + layout.secondary.width, width - 8);
       const minimum = Math.min(160, Math.floor((width - 224 - 16 - 6) / 2));
@@ -116,15 +137,22 @@ test('split ratios resize both pages without seams and retain usable pane widths
       assert(layout.secondary.width >= minimum);
     }
   }
-  const left = browserLayout({ width: 1400, height: 700, split: true, splitRatio: 0.7 });
+  const left = browserLayout({ pageGutter: 8, width: 1400, height: 700, split: true, splitRatio: 0.7 });
   assert.equal(left.primary.width, Math.floor((1400 - 224 - 16 - 6) * 0.7));
   assert(left.primary.width > left.secondary.width);
 });
 
 test('small windows reserve a usable page and remember their actual size', () => {
-  const expanded = browserLayout({ width: 560, height: 420, sidebarWidth: 380 });
+  const expanded = browserLayout({ pageGutter: 8, width: 560, height: 420, sidebarWidth: 380 });
   assert.deepEqual(expanded.primary, { x: 312, y: 36, width: 240, height: 376 });
-  const panel = browserLayout({ width: 560, height: 420, sidebarWidth: 0, panelWidth: 304, contentTop: 40 });
+  const panel = browserLayout({
+    pageGutter: 8,
+    width: 560,
+    height: 420,
+    sidebarWidth: 0,
+    panelWidth: 304,
+    contentTop: 40,
+  });
   assert.deepEqual(panel.primary, { x: 8, y: 40, width: 240, height: 372 });
   assert.deepEqual(
     restoreWindowPlacement({ x: 50, y: 80, width: 560, height: 420 }, [

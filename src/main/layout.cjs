@@ -11,13 +11,13 @@ function browserLayout({
   sidebarWidth = 224,
   panelWidth = 0,
   contentTop = 36,
-  pageGutter = 8,
+  pageGutter = 4,
   split = false,
   splitRatio = 0.5,
 }) {
   width = Math.max(1, Math.round(finite(width, 1440)));
   height = Math.max(1, Math.round(finite(height, 940)));
-  const gutter = Math.round(clamp(finite(pageGutter, 8), 4, 20));
+  const gutter = Math.round(clamp(finite(pageGutter, 4), 4, 20));
   // Transient widths below 200 animate the sidebar; persisted widths retain
   // their separate 200px minimum. Every canvas edge keeps the same gutter.
   const sidebar = Math.round(

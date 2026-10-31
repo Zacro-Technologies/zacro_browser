@@ -1097,7 +1097,7 @@ function setTheme() {
   const material = space?.theme || {};
   const root = document.documentElement;
   root.dataset.tabDensity = state.settings.tabDensity || 'comfortable';
-  root.style.setProperty('--page-gutter', `${state.settings.pageGutter ?? 8}px`);
+  root.style.setProperty('--page-gutter', `${state.settings.pageGutter ?? 4}px`);
   root.style.setProperty('--page-radius', `${state.settings.pageRadius ?? 12}px`);
   root.style.setProperty('--sidebar-expanded', `${state.settings.sidebarWidth || 224}px`);
   root.style.setProperty(
@@ -1794,7 +1794,7 @@ function renderHome() {
 
 let lastLayout = '';
 function expandedSidebarWidth() {
-  const gutter = state?.settings.pageGutter ?? 8;
+  const gutter = state?.settings.pageGutter ?? 4;
   return Math.min(
     Math.max(
       200,
@@ -1809,14 +1809,14 @@ function expandedSidebarWidth() {
   );
 }
 function effectiveSidebarHidden() {
-  const gutter = state?.settings.pageGutter ?? 8;
+  const gutter = state?.settings.pageGutter ?? 4;
   return (
     ui.sidebarHidden || Boolean(ui.panel && innerWidth < expandedSidebarWidth() + 260 + 240 + gutter * 2)
   );
 }
 function chromeTargets() {
   const sidebar = effectiveSidebarHidden() ? 0 : expandedSidebarWidth();
-  const gutter = state?.settings.pageGutter ?? 8;
+  const gutter = state?.settings.pageGutter ?? 4;
   return {
     sidebar,
     panel: ui.panel
@@ -1875,7 +1875,7 @@ function animateChrome(start) {
 function syncLayout() {
   if (!state) return;
   const { sidebar: width, panel } = currentChromeWidths();
-  const gutter = state.settings.pageGutter ?? 8;
+  const gutter = state.settings.pageGutter ?? 4;
   const hidden = effectiveSidebarHidden();
   if (ui.panel) ui.panelExpandedWidth = chromeTargets().panel;
   const contentTop = !$('#findbar').hidden ? 40 : isMac || state.runtime?.fullScreen ? gutter : 36;
@@ -2071,7 +2071,7 @@ document.addEventListener(
   true,
 );
 function clampRailWidth(kind, value) {
-  const gutter = state.settings.pageGutter ?? 8;
+  const gutter = state.settings.pageGutter ?? 4;
   const minimum = kind === 'sidebar' ? 200 : 260;
   const maximum = kind === 'sidebar' ? 380 : 560;
   // A deliberate sidebar resize must leave the open panel usable; otherwise

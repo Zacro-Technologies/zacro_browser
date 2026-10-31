@@ -216,7 +216,7 @@ function createInitialState() {
       sharePageContext: false,
       shortcutOverrides: {},
       pinnedSleepMinutes: 20,
-      pageGutter: 8,
+      pageGutter: 4,
       pageRadius: 12,
       motionScale: 1,
       tabDensity: 'comfortable',
