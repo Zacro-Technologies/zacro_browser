@@ -40,3 +40,5 @@ After a force-terminated development run, pass `-ApplePersistenceIgnoreState YES
 Set `ZACRO_NATIVE_DATA`, `ZACRO_NATIVE_SMOKE_URL`, and `ZACRO_ACCEPTANCE_OUTPUT` for the packaged executable. A JSON `passed: false` or missing report is a failure, regardless of the process exit code.
 
 The same isolated mode accepts `--native-ui-review` to exercise the full Swift interface against the local fixture. Native input review confirmed command-palette opening, new-tab submission, retained tab results, and theme editor presentation/dismissal. It does not waive the remaining parity or production Keychain requirements.
+
+Run `python3 macos/scripts/check-app.py` after bundling to exercise the packaged engine with a disposable profile and local fixture. This check requires both a successful native report and a clean process exit, so a shutdown crash fails validation. Reports are saved under `macos/dist/acceptance`.

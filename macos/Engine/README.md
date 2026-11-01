@@ -1,7 +1,8 @@
 # Chromium engine dependency
 
 CefSwift is vendored from https://github.com/Rajaniraiyn/CefSwift at
-`b18cceef8afaf6686147e19a9239f31c2dd81541` under its BSD 3-Clause license.
+`b18cceef8afaf6686147e19a9239f31c2dd81541` under its MIT license. CEF is
+licensed separately under BSD 3-Clause.
 Its pinned CEF archive is declared in `CefSwift/CEF_VERSION.json`; native
 binaries and build caches are not tracked.
 

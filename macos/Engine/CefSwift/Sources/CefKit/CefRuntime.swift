@@ -107,11 +107,18 @@ public final class CefRuntime {
     /// call them via `window.cefSwift.invoke(name, params)`. See ``CefBridge``.
     public let bridge = CefBridge()
 
+    /// Hosts that own NSApplication.run() use this to stop their event loop.
+    /// It fires after all browsers and Views windows close. Release remaining
+    /// CEF objects and call shutdown() only after the event loop has returned.
+    public var onReadyToTerminate: (() -> Void)?
+    public var onTerminationChanged: ((Bool) -> Void)?
+
     var messagePump: CefMessagePump?
     private var appContext: CefAppContext?
     private var settings: MappedCefSettings?
     private var browsers: [Int32: CefBrowser] = [:]
     private var isTerminationRequested = false
+    private var isTerminationScheduled = false
 
     private init() {}
 
@@ -231,9 +238,13 @@ public final class CefRuntime {
     /// be closed. Call once, at process exit.
     public func shutdown() {
         guard isInitialized else { return }
+        precondition(browsers.isEmpty && !CefChromeBrowser.hasLiveWindows,
+                     "Close all Chromium browsers and windows before shutdown")
         messagePump?.stop()
         messagePump = nil
         CEFApplication.setTerminateHandler(nil)
+        onReadyToTerminate = nil
+        onTerminationChanged = nil
         cef_shutdown()
         ccef_unload_framework()
         appContext = nil
@@ -392,6 +403,15 @@ public final class CefRuntime {
     func registerBrowser(_ browser: CefBrowser) {
         guard browser.id >= 0 else { return }
         browsers[browser.id] = browser
+        if isTerminationRequested {
+            // A profile may finish initializing after Quit was requested.
+            // Wait until creation attaches the child to its parent, then apply
+            // the same child-before-root close ordering to the new browser.
+            DispatchQueue.main.async { [self] in
+                guard isInitialized, isTerminationRequested else { return }
+                _ = handleTerminationRequest()
+            }
+        }
     }
 
     /// All live browsers registered with the runtime. Used by ``CefBridge``
@@ -400,9 +420,45 @@ public final class CefRuntime {
 
     func unregisterBrowser(id: Int32) {
         browsers[id] = nil
-        if isTerminationRequested && browsers.isEmpty {
-            // Re-enter terminate:; with no browsers left it now proceeds.
-            NSApp.terminate(nil)
+        scheduleTerminationIfReady()
+    }
+
+    func chromeWindowDidClose() {
+        // Keep the native shell alive until every child document accepts its
+        // close. A beforeunload "Stay" must leave a usable parent window.
+        if isTerminationRequested && !CefChromeBrowser.hasHostedWindows {
+            DispatchQueue.main.async { [self] in
+                guard isTerminationRequested, !CefChromeBrowser.hasHostedWindows else { return }
+                let roots = CefChromeBrowser.rootBrowserIDs
+                for browser in Array(browsers.values)
+                    where roots.contains(browser.id) && !browser.closingForTermination {
+                    browser.closingForTermination = true
+                    browser.close(force: false)
+                }
+                scheduleTerminationIfReady()
+            }
+        }
+        scheduleTerminationIfReady()
+    }
+
+    private func scheduleTerminationIfReady() {
+        guard isTerminationRequested, browsers.isEmpty, !CefChromeBrowser.hasLiveWindows,
+              !isTerminationScheduled else { return }
+        // on_before_close is still on CEF's message-loop stack. Calling
+        // cef_shutdown synchronously here destroys objects that the enclosing
+        // close callback still needs. Let that callback and work slice return
+        // before re-entering AppKit termination.
+        isTerminationScheduled = true
+        DispatchQueue.main.async { [self] in
+            isTerminationScheduled = false
+            guard isInitialized, isTerminationRequested, browsers.isEmpty,
+                  !CefChromeBrowser.hasLiveWindows else { return }
+            if let onReadyToTerminate {
+                onReadyToTerminate()
+            } else {
+                shutdown()
+                NSApp.terminate(nil)
+            }
         }
     }
 
@@ -410,14 +466,25 @@ public final class CefRuntime {
     /// may terminate immediately.
     func handleTerminationRequest() -> Bool {
         guard isInitialized else { return true }
-        if browsers.isEmpty {
-            shutdown()
-            return true
+        if !isTerminationRequested {
+            isTerminationRequested = true
+            onTerminationChanged?(true)
         }
-        isTerminationRequested = true
-        for browser in browsers.values {
+        let roots = CefChromeBrowser.rootBrowserIDs
+        let hasChildren = CefChromeBrowser.hasHostedWindows
+        for browser in Array(browsers.values)
+            where !browser.closingForTermination && (!hasChildren || !roots.contains(browser.id)) {
+            browser.closingForTermination = true
             browser.close(force: false)
         }
+        scheduleTerminationIfReady()
         return false
+    }
+
+    func cancelTerminationRequest(for browser: CefBrowser) {
+        browser.closingForTermination = false
+        guard isTerminationRequested else { return }
+        isTerminationRequested = false
+        onTerminationChanged?(false)
     }
 }

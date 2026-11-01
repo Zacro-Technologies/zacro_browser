@@ -36,6 +36,8 @@ public final class CefBrowser: Identifiable {
 
     /// Event observer. Held weakly.
     public weak var delegate: CefBrowserDelegate?
+    /// Distinguishes application teardown from an individual tab close.
+    public internal(set) var closingForTermination = false
 
     /// Current main-frame URL.
     public private(set) var url: URL?

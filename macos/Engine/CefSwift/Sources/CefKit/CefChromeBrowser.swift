@@ -102,6 +102,11 @@ public final class CefChromeBrowser {
 
     /// Instances stay alive until their window is destroyed.
     private static var liveInstances: [ObjectIdentifier: CefChromeBrowser] = [:]
+    static var hasLiveWindows: Bool { !liveInstances.isEmpty }
+    static var hasHostedWindows: Bool { liveInstances.values.contains { $0.windowOwner != nil } }
+    static var rootBrowserIDs: Set<Int32> {
+        Set(liveInstances.values.filter { $0.windowOwner == nil }.map { $0.browser.id })
+    }
 
     private init(browser: CefBrowser, options: CefChromeBrowserOptions) {
         self.browser = browser
@@ -346,6 +351,7 @@ public final class CefChromeBrowser {
         windowDelegate = nil
         onWindowDestroyed?()
         Self.liveInstances[ObjectIdentifier(self)] = nil
+        CefRuntime.shared.chromeWindowDidClose()
     }
 
     // MARK: Helpers

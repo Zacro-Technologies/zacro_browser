@@ -46,6 +46,7 @@ public struct CefJSDialog: Sendable, Equatable {
 public final class CefJSDialogCallback: @unchecked Sendable {
     private let raw: UnsafeMutablePointer<cef_jsdialog_callback_t>
     private var consumed = false
+    var onDecision: (@Sendable (Bool) -> Void)?
 
     /// Takes ownership of a +1 `cef_jsdialog_callback_t` reference.
     init(raw: UnsafeMutablePointer<cef_jsdialog_callback_t>) {
@@ -63,6 +64,8 @@ public final class CefJSDialogCallback: @unchecked Sendable {
     public func `continue`(success: Bool, userInput: String? = nil) {
         guard !consumed else { return }
         consumed = true
+        onDecision?(success)
+        onDecision = nil
         CefStringUtil.withCefString(userInput ?? "") { input in
             raw.pointee.cont?(raw, success ? 1 : 0, input)
         }

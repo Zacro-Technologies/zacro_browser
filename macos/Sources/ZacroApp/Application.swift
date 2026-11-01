@@ -14,6 +14,7 @@ enum ZacroApplication {
     let engine = ChromiumEngine(dataDirectory: base)
     do {
       try engine.start()
+      defer { engine.shutdown() }
       if CommandLine.arguments.contains("--engine-acceptance"),
         !CommandLine.arguments.contains("--native-ui-review"),
         ProcessInfo.processInfo.environment["ZACRO_NATIVE_DATA"] != nil,
@@ -31,6 +32,7 @@ enum ZacroApplication {
       NSApplication.shared.setActivationPolicy(.regular)
       coordinator.install()
       withExtendedLifetime(coordinator) { NSApplication.shared.run() }
+      coordinator.store.save()
     } catch {
       // Initialization failures must never silently switch engine or remove sandboxing.
       fputs("Zacro Chromium initialization failed: \(error)\n", stderr)
@@ -119,6 +121,10 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
     }
     contentFrame = actions.contentFrame
     engine.onLayout = { [weak self] in self?.scheduleLayout() }
+    engine.onTerminationChanged = { [weak self] terminating in
+      guard let self else { return }
+      if terminating { self.store.save() } else { self.scheduleLayout() }
+    }
     store.$state.dropFirst().sink { [weak self] _ in self?.scheduleLayout() }.store(
       in: &observations)
     actions.$palette.dropFirst().sink { [weak self] _ in self?.scheduleLayout() }.store(
@@ -160,7 +166,7 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
     return contentFrame.contains(top)
   }
   private func scheduleLayout() {
-    guard !layoutQueued else { return }
+    guard !engine.isTerminating, !layoutQueued else { return }
     layoutQueued = true
     DispatchQueue.main.async { [weak self] in
       self?.layoutQueued = false
@@ -310,6 +316,10 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
       self.modelURLs.removeValue(forKey: page.id)
       self.pendingHistory.removeValue(forKey: page.id)
       self.restoredHistoryPages.remove(page.id)
+      if page.closedForTermination {
+        self.scheduleLayout()
+        return
+      }
       if peek {
         if self.store.tab(tabID)?.peek != nil { self.store.closePeek(tabID: tabID) }
       } else if let tab = self.store.tab(tabID), !tab.isClosed {
@@ -350,6 +360,7 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
     actions.loading = page?.isLoading ?? false
   }
   func layoutPages() {
+    guard !engine.isTerminating else { return }
     if let pending = pendingDeletion, pending.0.allSatisfy({ engine.pages[$0] == nil }) {
       pendingDeletion = nil
       pending.1()

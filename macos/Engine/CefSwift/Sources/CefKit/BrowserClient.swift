@@ -521,6 +521,13 @@ extension BrowserClient {
             let reload = isReload != 0
             let wrapper = CefJSDialogCallback(raw: callback)
             return BrowserClientCallbacks.run(handlerSelf, default: Int32(0)) { _, cefBrowser in
+                wrapper.onDecision = { [weak cefBrowser] leave in
+                    guard !leave, !reload else { return }
+                    DispatchQueue.main.async {
+                        guard let cefBrowser else { return }
+                        CefRuntime.shared.cancelTerminationRequest(for: cefBrowser)
+                    }
+                }
                 if cefBrowser.delegate?.browser(cefBrowser, runBeforeUnloadDialog: message, isReload: reload, callback: wrapper) == true {
                     return 1
                 }

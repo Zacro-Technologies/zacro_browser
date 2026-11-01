@@ -12,6 +12,8 @@ public final class ChromiumEngine {
   private var host: CefChromeBrowser?
   public var window: NSWindow? { host?.nsWindow }
   public var onLayout: (() -> Void)?
+  public private(set) var isTerminating = false
+  public var onTerminationChanged: ((Bool) -> Void)?
 
   public init(dataDirectory: URL) { self.dataDirectory = dataDirectory }
 
@@ -49,6 +51,20 @@ public final class ChromiumEngine {
     configuration.defaultRuntimeStyle = .chrome
     configuration.logFile = dataDirectory.appendingPathComponent("chromium.log")
     try CefRuntime.shared.initialize(configuration: configuration)
+    CefRuntime.shared.onTerminationChanged = { [weak self] terminating in
+      self?.isTerminating = terminating
+      self?.onTerminationChanged?(terminating)
+    }
+    CefRuntime.shared.onReadyToTerminate = {
+      // Chromium teardown must happen after the native application loop exits.
+      NSApp.stop(nil)
+      if let wake = NSEvent.otherEvent(
+        with: .applicationDefined, location: .zero, modifierFlags: [], timestamp: 0,
+        windowNumber: 0, context: nil, subtype: 0, data1: 0, data2: 0)
+      {
+        NSApp.postEvent(wake, atStart: true)
+      }
+    }
     CefRuntime.shared.bridge.autoInjectsShim = false
     var options = CefChromeBrowserOptions()
     options.initialBounds = CGRect(x: 80, y: 80, width: 1280, height: 820)
@@ -94,6 +110,16 @@ public final class ChromiumEngine {
   public func showWindow() { host?.show() }
   /// Chromium asks every document about unsaved changes before closing.
   public func closeWindow() { host?.close() }
+
+  /// Call after NSApplication.run() returns and all native pages have closed.
+  public func shutdown() {
+    onLayout = nil
+    onTerminationChanged = nil
+    pages.removeAll()
+    host = nil
+    profiles.removeAll()
+    CefRuntime.shared.shutdown()
+  }
 }
 
 /// One retained Chromium document, including its own back/forward and form state.
@@ -119,6 +145,7 @@ public final class ChromiumPage: CefBrowserDelegate, Identifiable {
   public var onPeek: ((URL) -> Void)?
   public var onDownload: ((CefDownload) -> Void)?
   public var onClosed: (() -> Void)?
+  public private(set) var closedForTermination = false
 
   fileprivate init(id: String, profileID: String, isPrivate: Bool) {
     self.id = id
@@ -199,6 +226,7 @@ public final class ChromiumPage: CefBrowserDelegate, Identifiable {
     return true
   }
   public func browserDidClose(_ b: CefBrowser) {
+    closedForTermination = b.closingForTermination
     chrome?.detachClosedPage()
     chrome = nil
     onClosedInternal?()

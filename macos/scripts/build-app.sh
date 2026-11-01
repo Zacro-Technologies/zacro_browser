@@ -9,8 +9,13 @@ swift package --package-path "$native_root" \
   "$@"
 
 native_app="$native_root/dist/Zacro Native.app"
-mkdir -p "$native_app/Contents/Resources"
+native_licenses="$native_app/Contents/Resources/Licenses"
+mkdir -p "$native_licenses"
 cp "$native_root/../assets/icon.icns" "$native_app/Contents/Resources/Zacro.icns"
+# Include the complete redistribution notices before signing the final bundle.
+cp "$native_root/../LICENSE" "$native_licenses/Zacro.txt"
+cp "$native_root/Engine/CefSwift/LICENSE" "$native_licenses/CefSwift.txt"
+cp "$native_root/Engine/CefSwift/Sources/CCef/LICENSE.CEF.txt" "$native_licenses/CEF.txt"
 /usr/libexec/PlistBuddy -c 'Set :CFBundleShortVersionString 0.11.0' "$native_app/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c 'Add :CFBundleIconFile string Zacro.icns' "$native_app/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c 'Add :NSCameraUsageDescription string Allow websites you approve in Zacro to use your camera.' "$native_app/Contents/Info.plist"
