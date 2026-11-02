@@ -15,49 +15,73 @@ public enum SearchEngine: String, Codable, CaseIterable, Sendable {
 public enum BrowserAddress {
   public static func resolve(_ input: String, engine: SearchEngine = .google) -> URL? {
     let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !text.isEmpty, text.count <= 8_000,
-      !text.unicodeScalars.contains(where: { $0.value < 32 })
+    if text.isEmpty { return URL(string: "about:blank") }
+    guard text.utf16.count <= 8_192,
+      !text.unicodeScalars.contains(where: { $0.value < 32 || $0.value == 127 })
     else { return nil }
     if text == "about:blank" || text == "zacro://newtab" { return URL(string: "about:blank") }
     let hostWithPort =
       text.range(
-        of: #"^(localhost|[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+):[0-9]+(?:/|$)"#,
+        of: #"^(?:localhost|[A-Za-z0-9_.-]+|\[[A-Fa-f0-9:]+\]):[0-9]+(?:[/?#]|$)"#,
         options: .regularExpression) != nil
     if let scheme = URLComponents(string: text)?.scheme, !hostWithPort {
       guard ["https", "http"].contains(scheme.lowercased()) else { return nil }
       return webURL(text)
     }
-    if !text.contains(where: \.isWhitespace),
-      text.contains(".") || text.hasPrefix("localhost") || text.hasPrefix("[")
+    let explicitHost = text.range(of: #"^(?:localhost|\[[A-Fa-f0-9:]+\])(?:[/?#]|$)"#, options: [.regularExpression, .caseInsensitive]) != nil
+      || text.range(of: #"^[^/]+\.[^/]+(?:[/?#]|$)"#, options: .regularExpression) != nil
+    if !text.contains(where: \.isWhitespace), hostWithPort || explicitHost
     {
-      let local = text.hasPrefix("localhost") || text.hasPrefix("127.") || text.hasPrefix("[::1]")
+      let local = text.range(of: #"^(?:localhost|127\.\d+\.\d+\.\d+|\[::1\])(?=[:/?#]|$)"#, options: [.regularExpression,.caseInsensitive]) != nil
       if let url = webURL((local ? "http://" : "https://") + text) { return url }
     }
-    var allowed = CharacterSet.urlQueryAllowed
-    allowed.remove(charactersIn: "&+=?#%")
+    let allowed = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.!~*'()")
     guard let query = text.addingPercentEncoding(withAllowedCharacters: allowed) else { return nil }
     return URL(string: engine.endpoint + query)
   }
   public static func webURL(_ value: String) -> URL? {
-    guard value.count <= 8_000,
+    guard value.utf16.count <= 8_192,
       !value.unicodeScalars.contains(where: { $0.value < 32 || $0.value == 127 })
     else { return nil }
-    guard let parts = URLComponents(string: value),
+    guard var parts = URLComponents(string: value),
       ["http", "https"].contains(parts.scheme?.lowercased() ?? ""), let host = parts.host,
-      !host.isEmpty, parts.user == nil, parts.password == nil
+      !host.isEmpty, parts.user == nil, parts.password == nil,
+      parts.port.map({ (0...65535).contains($0) }) ?? true
     else { return nil }
+    parts.scheme = parts.scheme?.lowercased()
+    parts.host = host.lowercased()
+    if (parts.scheme == "https" && parts.port == 443) || (parts.scheme == "http" && parts.port == 80) { parts.port = nil }
+    if parts.path.isEmpty { parts.path = "/" }
     return parts.url
+  }
+  public static func webOrigin(_ value: String) -> String? {
+    guard let url = webURL(value), var parts = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return nil }
+    parts.path = ""; parts.query = nil; parts.fragment = nil
+    return parts.string
+  }
+  /// Extension destinations are accepted only through the trusted extension action path.
+  /// Address entry/search continues to accept HTTP(S) exclusively.
+  public static func extensionURL(_ value: String) -> URL? {
+    guard value.utf16.count <= 8_192, !value.unicodeScalars.contains(where: { $0.value < 32 || $0.value == 127 }),
+      let parts = URLComponents(string: value), parts.scheme == "chrome-extension", let host = parts.host,
+      host.range(of: "^[a-p]{32}$", options: .regularExpression) != nil,
+      parts.user == nil, parts.password == nil, parts.port == nil,
+      !parts.path.hasPrefix("/zacro-compat-") else { return nil }
+    return parts.url
+  }
+  static func documentURL(_ value: String) -> URL? {
+    webURL(value) ?? extensionURL(value) ?? (value == "about:blank" ? URL(string: value) : nil)
   }
 }
 
 public struct SpaceTheme: Codable, Equatable, Sendable {
   public var primaryColor = "#9D4460"
   public var secondaryColor = "#B695B8"
-  public var intensity: Double = 0.45
+  public var intensity: Double = 0
   public var blend: Double = 0.5
-  public var opacity: Double = 0.85
-  public var blur: Double = 0.5
-  public var grain: Double = 0.08
+  public var opacity: Double = 1
+  public var blur: Double = 0
+  public var grain: Double = 0
   public var appearance = "system"
   public init() {}
 }
@@ -65,10 +89,21 @@ public struct BrowserProfile: Codable, Identifiable, Equatable, Sendable {
   public var id: String
   public var name: String
   public var isPrivate: Bool
+  public var archiveAfterHours: Double?
+  public var pinnedExtensionIDs: [String] = []
   public init(id: String = UUID().uuidString, name: String, isPrivate: Bool = false) {
     self.id = id
     self.name = name
     self.isPrivate = isPrivate
+  }
+  private enum CodingKeys: String, CodingKey { case id, name, isPrivate, archiveAfterHours, pinnedExtensionIDs }
+  public init(from decoder: Decoder) throws {
+    let values = try decoder.container(keyedBy: CodingKeys.self)
+    id = try values.decode(String.self, forKey: .id)
+    name = try values.decode(String.self, forKey: .name)
+    isPrivate = try values.decodeIfPresent(Bool.self, forKey: .isPrivate) ?? false
+    archiveAfterHours = try values.decodeIfPresent(Double.self, forKey: .archiveAfterHours)
+    pinnedExtensionIDs = try values.decodeIfPresent([String].self, forKey: .pinnedExtensionIDs) ?? []
   }
 }
 public struct BrowserSpace: Codable, Identifiable, Equatable, Sendable {
@@ -116,13 +151,21 @@ public struct BrowserTab: Codable, Identifiable, Equatable, Sendable {
   public var isPinned: Bool
   public var isClosed: Bool
   public var savedURL: String?
+  public var savedTitle: String?
+  public var muted: Bool?
+  public var homePage: Bool?
+  /// Missing in older snapshots; automatic memory discard is allowed by default.
+  public var autoDiscardable: Bool?
+  /// Logical Zacro identity, never a Chromium session tab ID.
+  public var openerTabID: String?
+  public var isMuted: Bool { get { muted ?? false } set { muted = newValue } }
   public var peek: SavedPeek?
   public var navigation: [NavigationEntry]
   public var navigationIndex: Int
   public var createdAt: Date
   public var lastAccessedAt: Date
   public var displayTitle: String {
-    customTitle ?? (title.isEmpty ? (URL(string: url)?.host ?? "New tab") : title)
+    customTitle ?? (isPinned ? savedTitle : nil) ?? (title.isEmpty ? (URL(string: url)?.host ?? "New tab") : title)
   }
   public init(
     id: String = UUID().uuidString, spaceID: String, url: String = "about:blank",
@@ -198,11 +241,22 @@ public struct Bookmark: Codable, Identifiable, Equatable, Sendable {
   public var profileID: String
   public var url: String
   public var title: String
-  public init(id: String = UUID().uuidString, profileID: String, url: String, title: String) {
+  public var createdAt: Date
+  public init(id: String = UUID().uuidString, profileID: String, url: String, title: String, createdAt: Date = Date()) {
     self.id = id
     self.profileID = profileID
     self.url = url
     self.title = title
+    self.createdAt = createdAt
+  }
+  private enum CodingKeys: String, CodingKey { case id, profileID, url, title, createdAt }
+  public init(from decoder: Decoder) throws {
+    let values = try decoder.container(keyedBy: CodingKeys.self)
+    id = try values.decode(String.self, forKey: .id)
+    profileID = try values.decode(String.self, forKey: .profileID)
+    url = try values.decode(String.self, forKey: .url)
+    title = try values.decode(String.self, forKey: .title)
+    createdAt = try values.decodeIfPresent(Date.self, forKey: .createdAt) ?? .distantPast
   }
 }
 public struct ArchivedTab: Codable, Identifiable, Equatable, Sendable {
@@ -220,6 +274,9 @@ public struct DownloadRecord: Codable, Identifiable, Equatable, Sendable {
   public var url: String
   public var filename: String
   public var path: String?
+  public var previousPath: String?
+  public var sourceURL: String?
+  public var sourceTitle: String?
   public var status: String
   public var receivedBytes: Int64
   public var totalBytes: Int64
@@ -249,10 +306,21 @@ public struct BrowserSettings: Codable, Equatable, Sendable {
   public var archiveAfterHours: Double = 12
   public var motionScale: Double = 1
   public var appearance: String = "system"
+  public var panelWidth: Double = 336
+  public var tabDensity = "comfortable"
+  public var pinnedSleepMinutes = 20
+  public var openSourcesLimit = 3
+  public var siteSearches = SiteSearchEngine.defaults
+  public var shortcutOverrides: [String: String] = [:]
+  public var onboardingCompleted = false
+  public var aiProvider = "codex"
+  public var aiModel = ""
+  public var sharePageContext = false
   public init() {}
   private enum CodingKeys: String, CodingKey {
     case searchEngine, pageGutter, pageRadius, sidebarWidth, sidebarVisible, restoreSession,
-      archiveAfterHours, motionScale, appearance
+      archiveAfterHours, motionScale, appearance, panelWidth, tabDensity, pinnedSleepMinutes,
+      openSourcesLimit, siteSearches, shortcutOverrides, onboardingCompleted, aiProvider, aiModel, sharePageContext
   }
   public init(from decoder: Decoder) throws {
     self.init()
@@ -269,6 +337,16 @@ public struct BrowserSettings: Codable, Equatable, Sendable {
       try c.decodeIfPresent(Double.self, forKey: .archiveAfterHours) ?? archiveAfterHours
     motionScale = try c.decodeIfPresent(Double.self, forKey: .motionScale) ?? motionScale
     appearance = try c.decodeIfPresent(String.self, forKey: .appearance) ?? appearance
+    panelWidth = try c.decodeIfPresent(Double.self, forKey: .panelWidth) ?? panelWidth
+    tabDensity = try c.decodeIfPresent(String.self, forKey: .tabDensity) ?? tabDensity
+    pinnedSleepMinutes = try c.decodeIfPresent(Int.self, forKey: .pinnedSleepMinutes) ?? pinnedSleepMinutes
+    openSourcesLimit = try c.decodeIfPresent(Int.self, forKey: .openSourcesLimit) ?? openSourcesLimit
+    siteSearches = try c.decodeIfPresent([SiteSearchEngine].self, forKey: .siteSearches) ?? siteSearches
+    shortcutOverrides = try c.decodeIfPresent([String: String].self, forKey: .shortcutOverrides) ?? [:]
+    onboardingCompleted = try c.decodeIfPresent(Bool.self, forKey: .onboardingCompleted) ?? false
+    aiProvider = try c.decodeIfPresent(String.self, forKey: .aiProvider) ?? aiProvider
+    aiModel = try c.decodeIfPresent(String.self, forKey: .aiModel) ?? ""
+    sharePageContext = try c.decodeIfPresent(Bool.self, forKey: .sharePageContext) ?? false
   }
 }
 public struct BrowserState: Codable, Equatable, Sendable {
@@ -282,7 +360,9 @@ public struct BrowserState: Codable, Equatable, Sendable {
   public var bookmarks: [Bookmark] = []
   public var archive: [ArchivedTab] = []
   public var downloads: [DownloadRecord] = []
+  public var permissions: [WebsitePermission] = []
   public var settings = BrowserSettings()
+  public var windowBounds = BrowserWindowBounds()
   public var activeSpaceID: String
   public var activeTabID: String?
   public var activeSpace: BrowserSpace? { spaces.first { $0.id == activeSpaceID } }
@@ -292,5 +372,50 @@ public struct BrowserState: Codable, Equatable, Sendable {
     profiles = [BrowserProfile(id: "default", name: "Personal")]
     spaces = [BrowserSpace(id: "home", profileID: "default", name: "Personal")]
     activeSpaceID = "home"
+  }
+  private enum CodingKeys: String, CodingKey {
+    case version, profiles, spaces, tabs, folders, splits, history, bookmarks, archive, downloads,
+      permissions, settings, windowBounds, activeSpaceID, activeTabID
+  }
+  public init(from decoder: Decoder) throws {
+    self.init()
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    version = try c.decodeIfPresent(Int.self, forKey: .version) ?? 1
+    guard version == 1 else { throw DecodingError.dataCorruptedError(forKey: .version, in: c, debugDescription: "Unsupported browser state version") }
+    profiles = try c.decodeIfPresent([BrowserProfile].self, forKey: .profiles) ?? profiles
+    spaces = try c.decodeIfPresent([BrowserSpace].self, forKey: .spaces) ?? spaces
+    tabs = try c.decodeIfPresent([BrowserTab].self, forKey: .tabs) ?? []
+    folders = try c.decodeIfPresent([BrowserFolder].self, forKey: .folders) ?? []
+    splits = try c.decodeIfPresent([SplitGroup].self, forKey: .splits) ?? []
+    history = try c.decodeIfPresent([HistoryEntry].self, forKey: .history) ?? []
+    bookmarks = try c.decodeIfPresent([Bookmark].self, forKey: .bookmarks) ?? []
+    archive = try c.decodeIfPresent([ArchivedTab].self, forKey: .archive) ?? []
+    downloads = try c.decodeIfPresent([DownloadRecord].self, forKey: .downloads) ?? []
+    permissions = try c.decodeIfPresent([WebsitePermission].self, forKey: .permissions) ?? []
+    settings = try c.decodeIfPresent(BrowserSettings.self, forKey: .settings) ?? settings
+    windowBounds = try c.decodeIfPresent(BrowserWindowBounds.self, forKey: .windowBounds) ?? windowBounds
+    activeSpaceID = try c.decodeIfPresent(String.self, forKey: .activeSpaceID) ?? activeSpaceID
+    activeTabID = try c.decodeIfPresent(String.self, forKey: .activeTabID)
+  }
+}
+
+public struct BrowserWindowBounds: Codable, Equatable, Sendable {
+  public var width: Double = 1440
+  public var height: Double = 940
+  public var x: Double?
+  public var y: Double?
+  public var maximized = false
+  public var sizeKind = "content"
+  public init() {}
+  private enum CodingKeys: String, CodingKey { case width, height, x, y, maximized, sizeKind }
+  public init(from decoder: Decoder) throws {
+    self.init()
+    let values = try decoder.container(keyedBy: CodingKeys.self)
+    width = try values.decodeIfPresent(Double.self, forKey: .width) ?? width
+    height = try values.decodeIfPresent(Double.self, forKey: .height) ?? height
+    x = try values.decodeIfPresent(Double.self, forKey: .x)
+    y = try values.decodeIfPresent(Double.self, forKey: .y)
+    maximized = try values.decodeIfPresent(Bool.self, forKey: .maximized) ?? false
+    sizeKind = try values.decodeIfPresent(String.self, forKey: .sizeKind) ?? "content"
   }
 }

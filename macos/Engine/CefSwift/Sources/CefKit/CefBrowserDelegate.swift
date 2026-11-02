@@ -115,11 +115,13 @@ public protocol CefBrowserDelegate: AnyObject {
     /// to block it (e.g. to route external schemes yourself). Defaults to
     /// ``CefNavigationDecision/allow``.
     func browser(_ b: CefBrowser, decidePolicyForNavigation url: URL?, isRedirect: Bool, userGesture: Bool) -> CefNavigationDecision
+    func browser(_ b: CefBrowser, decidePolicyForNavigation url: URL?, isMainFrame: Bool, isRedirect: Bool, userGesture: Bool) -> CefNavigationDecision
 
     /// The page tried to open `url` in a new tab/window (middle-click,
     /// ctrl-click, etc.). Returns whether you handled it; returning `true`
     /// cancels CEF's default new-window behavior.
     func browser(_ b: CefBrowser, didRequestNewTab url: URL?) -> Bool
+    func browser(_ b: CefBrowser, didRequestNewTab url: URL?, disposition: CefWindowOpenDisposition, userGesture: Bool) -> Bool
 
     /// A certificate error occurred for `url`. Return `true` to override and
     /// continue loading; `false` (default) to cancel.
@@ -199,7 +201,13 @@ extension CefBrowserDelegate {
     public func browser(_ b: CefBrowser, requestsPermission request: CefPermissionRequest) -> CefPermissionDecision { .deny }
 
     public func browser(_ b: CefBrowser, decidePolicyForNavigation url: URL?, isRedirect: Bool, userGesture: Bool) -> CefNavigationDecision { .allow }
+    public func browser(_ b: CefBrowser, decidePolicyForNavigation url: URL?, isMainFrame: Bool, isRedirect: Bool, userGesture: Bool) -> CefNavigationDecision {
+        browser(b, decidePolicyForNavigation: url, isRedirect: isRedirect, userGesture: userGesture)
+    }
     public func browser(_ b: CefBrowser, didRequestNewTab url: URL?) -> Bool { false }
+    public func browser(_ b: CefBrowser, didRequestNewTab url: URL?, disposition: CefWindowOpenDisposition, userGesture: Bool) -> Bool {
+        browser(b, didRequestNewTab: url)
+    }
     public func browser(_ b: CefBrowser, didEncounterCertificateError url: URL?, errorCode: Int) -> Bool { false }
     public func browser(_ b: CefBrowser, renderProcessDidTerminate reason: CefTerminationReason, errorCode: Int) {}
     public func browser(_ b: CefBrowser, didReceiveAuthChallenge challenge: CefAuthChallenge, callback: CefAuthCallback) -> Bool { false }

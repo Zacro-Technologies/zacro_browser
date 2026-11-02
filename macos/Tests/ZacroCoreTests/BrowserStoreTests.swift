@@ -17,14 +17,14 @@ final class BrowserStoreTests: XCTestCase {
       "https://www.google.com/search?q=hello%20%26%20world")
     XCTAssertEqual(
       BrowserAddress.resolve("localhost:8080/path")?.absoluteString, "http://localhost:8080/path")
-    XCTAssertEqual(BrowserAddress.resolve("example.com")?.absoluteString, "https://example.com")
+    XCTAssertEqual(BrowserAddress.resolve("example.com")?.absoluteString, "https://example.com/")
     for address in [
       "javascript:alert(1)", "file:///tmp/secret", "data:text/html,test",
       "https://user:password@example.com", "https://", "mailto:someone@example.com", "custom:thing",
-      "",
     ] {
       XCTAssertNil(BrowserAddress.resolve(address), address)
     }
+    XCTAssertEqual(BrowserAddress.resolve("")?.absoluteString, "about:blank")
     XCTAssertEqual(BrowserState().settings.pageGutter, 4)
     XCTAssertEqual(BrowserState().settings.searchEngine, .google)
   }
@@ -88,7 +88,7 @@ final class BrowserStoreTests: XCTestCase {
     store.togglePin(id: pinned.id)
     store.navigate(tabID: pinned.id, address: "https://example.com/away")
     store.closeTab(id: pinned.id)
-    XCTAssertEqual(store.tab(pinned.id)?.url, "https://example.com")
+    XCTAssertEqual(store.tab(pinned.id)?.url, "https://example.com/")
     XCTAssertEqual(store.tab(pinned.id)?.isClosed, true)
     XCTAssertTrue(store.state.archive.isEmpty)
     let normal = try XCTUnwrap(store.createTab(address: "https://example.net/a"))
@@ -124,9 +124,11 @@ final class BrowserStoreTests: XCTestCase {
     XCTAssertEqual(try Data(contentsOf: source), original)
     XCTAssertEqual(store.state.tabs.count, 1)
     XCTAssertEqual(store.state.tabs[0].isPinned, true)
-    XCTAssertEqual(store.state.activeTabID, "one")
-    XCTAssertEqual(store.tab("one")?.savedURL, "https://example.com/home")
-    XCTAssertEqual(store.forward(tabID: "one"), "https://example.com/after")
+    XCTAssertNil(store.state.activeTabID, "Import must preserve the current selection")
+    let imported = try XCTUnwrap(store.state.tabs.first)
+    XCTAssertNotEqual(imported.id, "one", "Imported identities must be remapped")
+    XCTAssertEqual(imported.savedURL, "https://example.com/home")
+    XCTAssertEqual(store.forward(tabID: imported.id), "https://example.com/after")
   }
   func testPartialSettingsAndDisabledRestoreKeepSavedDestinations() throws {
     let partial = try JSONDecoder().decode(

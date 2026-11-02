@@ -8,20 +8,29 @@ public enum LegacyImportError: LocalizedError {
 extension BrowserStore {
   /// Reads an Electron JSON snapshot into a new native collection. The source is never modified.
   public func importLegacy(from url: URL) throws {
+    guard (try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0) <= 32 * 1024 * 1024 else { throw LegacyImportError.invalidState }
     let data = try Data(contentsOf: url)
     guard data.count < 32 * 1024 * 1024,
       let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
       root["spaces"] is [[String: Any]], root["tabs"] is [[String: Any]]
     else { throw LegacyImportError.invalidState }
+    if (root["format"] as? String == "zacro-export" || root["version"] != nil), root["version"] as? Int != 1 { throw LegacyImportError.invalidState }
     var imported = BrowserState()
     let records = { (key: String) in root[key] as? [[String: Any]] ?? [] }
     imported.profiles = records("profiles").compactMap { item in
       guard let id = item["id"] as? String, item["private"] as? Bool != true else { return nil }
-      return BrowserProfile(id: id, name: item["name"] as? String ?? "Imported")
+      var profile = BrowserProfile(id: id, name: item["name"] as? String ?? "Imported")
+      profile.archiveAfterHours = item["archiveAfterHours"] as? Double
+      return profile
     }
-    if imported.profiles.isEmpty { imported.profiles = BrowserState().profiles }
+    if imported.profiles.isEmpty {
+      guard records("profiles").isEmpty else { throw LegacyImportError.invalidState }
+      imported.profiles = BrowserState().profiles
+    }
+    let allowedProfiles = Set(imported.profiles.map(\.id))
     imported.spaces = records("spaces").compactMap { item in
-      guard let id = item["id"] as? String else { return nil }
+      guard let id = item["id"] as? String,
+        allowedProfiles.contains(item["profileId"] as? String ?? imported.profiles[0].id) else { return nil }
       var theme = SpaceTheme()
       theme.primaryColor = item["color"] as? String ?? theme.primaryColor
       if let old = item["theme"] as? [String: Any] {
@@ -30,7 +39,8 @@ extension BrowserStore {
         theme.intensity = (old["vibrancy"] as? Double ?? 0) / 100
         theme.opacity = (old["opacity"] as? Double ?? 100) / 100
         theme.blur = (old["blur"] as? Double ?? 0) / 32
-        theme.grain = (old["grain"] as? Double ?? 0) / 100
+        theme.grain = (old["grain"] as? Double ?? 0) / 200
+        theme.appearance = old["appearance"] as? String ?? "system"
       }
       var space = BrowserSpace(
         id: id, profileID: item["profileId"] as? String ?? imported.profiles[0].id,
@@ -41,7 +51,7 @@ extension BrowserStore {
     }
     func convertTab(_ item: [String: Any]) -> BrowserTab? {
       guard let id = item["id"] as? String, let value = item["url"] as? String,
-        let url = BrowserAddress.resolve(value)
+        let url = BrowserAddress.extensionURL(value) ?? BrowserAddress.resolve(value)
       else { return nil }
       var tab = BrowserTab(
         id: id, spaceID: item["spaceId"] as? String ?? "home", url: url.absoluteString,
@@ -49,7 +59,12 @@ extension BrowserStore {
         isFavorite: item["favorite"] as? Bool ?? false, isPinned: item["pinned"] as? Bool ?? false)
       tab.folderID = item["folderId"] as? String
       tab.customTitle = item["customTitle"] as? String
+      tab.savedTitle = item["pinnedTitle"] as? String
       tab.isClosed = item["closed"] as? Bool ?? false
+      tab.homePage = item["homePage"] as? Bool
+      tab.autoDiscardable = item["autoDiscardable"] as? Bool
+      tab.openerTabID = item["openerTabId"] as? String
+      tab.muted = item["muted"] as? Bool
       tab.savedURL = item["pinnedUrl"] as? String ?? (tab.isPinned ? tab.url : nil)
       if let peek = item["savedPeek"] as? [String: Any], let peekURL = peek["url"] as? String,
         BrowserAddress.webURL(peekURL) != nil
@@ -59,11 +74,8 @@ extension BrowserStore {
       if let history = item["navigationHistory"] as? [String: Any],
         let entries = history["entries"] as? [[String: Any]]
       {
-        tab.navigation = entries.compactMap { entry in
-          guard let url = entry["url"] as? String, BrowserAddress.webURL(url) != nil else {
-            return nil
-          }
-          return NavigationEntry(url: url, title: entry["title"] as? String ?? "")
+        tab.navigation = entries.map { entry in
+          NavigationEntry(url: entry["url"] as? String ?? "", title: entry["title"] as? String ?? "")
         }
         tab.navigationIndex = history["index"] as? Int ?? tab.navigation.count - 1
       }
@@ -74,6 +86,7 @@ extension BrowserStore {
       if let date = item["lastActiveAt"] as? Double {
         tab.lastAccessedAt = Date(timeIntervalSince1970: date / 1000)
       }
+      if let date = item["createdAt"] as? Double, date.isFinite, date > 0 { tab.createdAt = Date(timeIntervalSince1970: date / 1000) }
       return tab
     }
     imported.tabs = records("tabs").compactMap(convertTab)
@@ -97,7 +110,8 @@ extension BrowserStore {
       guard let url = item["url"] as? String, BrowserAddress.webURL(url) != nil else { return nil }
       return Bookmark(
         profileID: item["profileId"] as? String ?? "default", url: url,
-        title: item["title"] as? String ?? url)
+        title: item["title"] as? String ?? url,
+        createdAt: (item["createdAt"] as? Double).flatMap { $0.isFinite && $0 > 0 ? Date(timeIntervalSince1970: $0 / 1000) : nil } ?? .distantPast)
     }
     imported.history = records("history").compactMap { item in
       guard let url = item["url"] as? String, BrowserAddress.webURL(url) != nil else { return nil }
@@ -123,8 +137,6 @@ extension BrowserStore {
       imported.settings.restoreSession = settings["restoreSession"] as? Bool ?? true
       imported.settings.archiveAfterHours = settings["archiveAfterHours"] as? Double ?? 12
     }
-    state = imported
-    repair()
-    save()
+    try mergeCollection(imported, includeHistory: root["format"] as? String != "zacro-export")
   }
 }

@@ -4,11 +4,29 @@ import SwiftUI
 import UniformTypeIdentifiers
 import ZacroCore
 
+/// One identity is shared by the native menu, key bindings, and command search.
+struct BrowserRuntimeCommand: Identifiable {
+  let id: String
+  let title: String
+  let icon: String
+  var shortcut: String?
+  var keywords: String
+  var available: Bool
+  let action: () -> Void
+  init(id: String, title: String, icon: String, shortcut: String? = nil,
+       keywords: String = "", available: Bool = true, action: @escaping () -> Void) {
+    self.id = id; self.title = title; self.icon = icon; self.shortcut = shortcut
+    self.keywords = keywords; self.available = available; self.action = action
+  }
+}
+
 @MainActor
 final class BrowserActions: ObservableObject {
   @Published var palette = false
+  @Published private(set) var paletteSession: UInt64 = 0
   @Published private(set) var paletteEditsAddress = false
   @Published var query = ""
+  @Published var homeQuery = ""
   @Published var library: String?
   @Published var themeEditor = false
   @Published var siteControls = SiteControlActions()
@@ -17,8 +35,32 @@ final class BrowserActions: ObservableObject {
   @Published var loading = false
   @Published var icons: [String: NSImage] = [:]
   @Published var iconColors: [String: Color] = [:]
+  @Published var peekIcons: [String: NSImage] = [:]
+  var iconForURL: (String) -> NSImage? = { _ in nil }
+  @Published var audibleTabIDs: Set<String> = []
+  @Published var loadedTabIDs: Set<String> = []
+  @Published var recordingShortcut = false
+  @Published var findVisible = false
+  @Published var findQuery = ""
+  @Published var findMatchCount = 0
+  @Published var findActiveMatch = 0
+  var findNext: () -> Void = {}
+  var findPrevious: () -> Void = {}
+  var closeFind: () -> Void = {}
+  var updateFind: (String) -> Void = { _ in }
   @Published var nativePageVisible = false
   @Published var contentFrame = CGRect.zero
+  @Published var paletteRequest: NativePaletteRequest?
+  @Published var runtimeCommands: [BrowserRuntimeCommand] = []
+  @Published var libraryCapabilities: Set<String> = []
+  @Published var defaultBrowser: Bool?
+  var performInterfaceCommand: (String) -> Bool = { _ in false }
+  var handlePaletteEscape: () -> Bool = { false }
+  var handleInterfaceEscape: () -> Bool = { false }
+  var libraryContent: (String) -> AnyView? = { _ in nil }
+  var settingsContent: () -> AnyView? = { nil }
+  var pinnedExtensionsContent: () -> AnyView? = { nil }
+  var performLibraryAction: ((String, [String: String]) async throws -> Void)?
   var openExtensions: () -> Void = {}
   var openExtensionStore: () -> Void = {}
   var onLayout: (CGRect, Double) -> Void = { _, _ in }
@@ -35,14 +77,17 @@ final class BrowserActions: ObservableObject {
   var deleteSpace: (String) -> Void = { _ in }
   var deleteProfile: (String) -> Void = { _ in }
   func openPalette(address: String = "") {
+    paletteRequest = nil
     paletteEditsAddress = !address.isEmpty
     query = address
+    paletteSession &+= 1
     palette = true
   }
   func submit(_ value: String) {
     palette = false
     if paletteEditsAddress { navigate(value) } else { newTab(value) }
   }
+  func setPaletteDestination(editsAddress: Bool) { paletteEditsAddress = editsAddress }
 }
 
 struct BrowserShell<Content: View>: View {
@@ -51,16 +96,55 @@ struct BrowserShell<Content: View>: View {
   @ViewBuilder var content: () -> Content
   @StateObject private var drag = SidebarDragSession()
   @State private var gestureProgress: Double = 0
+  @State private var gestureTracking = false
+  @State private var gestureSettleDuration = 0.18
   @State private var name = ""
   @State private var creation: String?
   @State private var renameTarget: SidebarNamedItem?
   @State private var showSiteControls = false
+  @State private var showBrowserMenu = false
+  @State private var showPageActions = false
+  @State private var contextMenuRequest: String?
+  @State private var editor: NativeInterfaceEditor?
+  @State private var hoveredTab: String?
+  @State private var hoveredFolder: String?
+  @State private var hoveredPin: String?
+  @State private var operationError: String?
+  @State private var nameError: String?
+  @FocusState private var sidebarFocus: String?
   @Environment(\.accessibilityReduceMotion) private var reduceMotion
-  @State private var paletteSelection = 0
-  @State private var themeSaveTask: Task<Void, Never>?
-  private var theme: SpaceTheme { store.state.activeSpace?.theme ?? SpaceTheme() }
+  @Environment(\.colorScheme) private var colorScheme
+  @State private var themeDraft: BrowserSpace?
+  @State private var themeError: String?
+  @State private var creatingSpace = false
+  @State private var availableWindowWidth: CGFloat = 1280
+  @State private var sidebarWidthDraft: Double?
+  @State private var libraryWidthDraft: Double?
+  @State private var offeredOnboarding = false
+  @State private var blankPaletteContext: String?
+  private var savedTheme: SpaceTheme {
+    var value = store.state.activeSpace?.theme ?? SpaceTheme()
+    value.appearance = store.state.settings.appearance
+    return value
+  }
+  private var editingTheme: SpaceTheme {
+    creatingSpace || themeDraft?.id == store.state.activeSpaceID ? (themeDraft?.theme ?? savedTheme) : savedTheme
+  }
+  private var theme: SpaceTheme {
+    guard gestureProgress != 0, let current = spaces.firstIndex(where: { $0.id == store.state.activeSpaceID }) else { return editingTheme }
+    let position = min(Double(spaces.count - 1), max(0, Double(current) + gestureProgress))
+    let first = Int(floor(position)), last = Int(ceil(position))
+    var value = NativeSpaceAppearance.blend(spaces[first].theme, spaces[last].theme, progress: position - Double(first))
+    value.appearance = editingTheme.appearance
+    return value
+  }
   private var effectiveMotion: Double { reduceMotion ? 0 : store.state.settings.motionScale }
-  private var accent: Color { Color(nsColor: NSColor(hex: theme.primaryColor)) }
+  private var colors: NativeSpacePalette {
+    NativeSpacePalette(theme: theme, dark: theme.appearance == "dark"
+      || (theme.appearance == "system" && colorScheme == .dark))
+  }
+  private var accent: Color { colors.accent }
+  private var tabHeight: CGFloat { store.state.settings.tabDensity == "compact" ? 28 : 36 }
   private var spaces: [BrowserSpace] {
     store.state.spaces.filter { $0.profileID == store.activeProfileID }
   }
@@ -71,30 +155,46 @@ struct BrowserShell<Content: View>: View {
     }
   }
   private var hasPage: Bool {
-    store.state.activeTab.map { !$0.isClosed && $0.url != "about:blank" } ?? false
+    store.state.activeTab.map { !$0.isClosed && currentAddress != "about:blank" } ?? false
   }
+  private var currentAddress: String { store.state.activeTab?.peek?.url ?? store.state.activeTab?.url ?? "" }
   private var sidebarWidth: Double {
-    store.state.settings.sidebarVisible ? store.state.settings.sidebarWidth : 0
+    let expanded = min(max(200, min(380, sidebarWidthDraft ?? store.state.settings.sidebarWidth)), max(0, availableWindowWidth - 240 - store.state.settings.pageGutter * 2))
+    let fits = actions.library == nil || availableWindowWidth >= expanded + 260 + 240 + store.state.settings.pageGutter * 2
+    return store.state.settings.sidebarVisible && fits ? expanded : 0
   }
-  private var libraryBinding: Binding<LibrarySheet?> {
-    Binding(
-      get: { actions.library.map { LibrarySheet(id: $0) } }, set: { actions.library = $0?.id })
+  private var libraryWidth: Double {
+    min(libraryWidthDraft ?? store.state.settings.panelWidth, max(0, availableWindowWidth - sidebarWidth - 240 - store.state.settings.pageGutter * 2))
+  }
+  private var sidebarResizeRange: ClosedRange<Double> {
+    200...max(200, min(380, availableWindowWidth - (actions.library == nil ? 0 : 260) - 240 - store.state.settings.pageGutter * 2))
+  }
+  private var libraryResizeRange: ClosedRange<Double> {
+    260...max(260, min(560, availableWindowWidth - sidebarWidth - 240 - store.state.settings.pageGutter * 2))
   }
   private var themeBinding: Binding<SpaceTheme> {
-    Binding(
-      get: { theme },
-      set: { updated in
-        guard
-          let index = store.state.spaces.firstIndex(where: { $0.id == store.state.activeSpaceID })
-        else { return }
-        store.state.spaces[index].theme = updated
-        themeSaveTask?.cancel()
-        themeSaveTask = Task { @MainActor in
-          try? await Task.sleep(for: .milliseconds(180))
-          if !Task.isCancelled { store.save() }
-        }
-      })
+    Binding(get: { editingTheme }, set: { themeDraft?.theme = $0 })
   }
+  private func saveTheme() {
+    guard let draft = themeDraft, creatingSpace || draft.id == store.state.activeSpaceID else { return }
+    let name = draft.name.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !name.isEmpty else { return }
+    do {
+      try store.commit { state in
+        if creatingSpace {
+          var saved = draft; saved.name = String(name.prefix(60))
+          state.spaces.append(saved); state.activeSpaceID = saved.id; state.activeTabID = nil
+        } else if let index = state.spaces.firstIndex(where: { $0.id == draft.id }) {
+          state.spaces[index].theme = draft.theme
+          state.spaces[index].name = String(name.prefix(60))
+          state.spaces[index].icon = draft.icon
+        }
+        state.settings.appearance = draft.theme.appearance
+      }
+      themeError = nil; actions.themeEditor = false; themeDraft = nil
+    } catch { themeError = error.localizedDescription }
+  }
+
 
   var body: some View {
     ZStack {
@@ -104,207 +204,470 @@ struct BrowserShell<Content: View>: View {
             hole: (hasPage || actions.nativePageVisible) ? actions.contentFrame : .zero,
             radius: store.state.settings.pageRadius
           ).fill(style: FillStyle(eoFill: true)))
-      HStack(spacing: 0) {
-        if store.state.settings.sidebarVisible {
+      VStack(spacing: 0) {
+       HStack(spacing: 0) {
+        if sidebarWidth > 0 {
           sidebar.frame(width: sidebarWidth)
+            .overlay(alignment: .trailing) {
+              NativeResizeHandle(value: sidebarWidth, range: sidebarResizeRange,
+                reset: 224, label: "Resize sidebar", preview: { sidebarWidthDraft = $0.rounded() },
+                commit: { saveRailWidth($0, sidebar: true) }, cancel: { sidebarWidthDraft = nil })
+                .frame(width: 5)
+            }
             .transition(.move(edge: .leading).combined(with: .opacity))
         }
         pageArea
+        if let section = actions.library {
+          NativeLibrary(store: store, actions: actions, section: section)
+            .frame(width: libraryWidth)
+            .overlay(alignment: .leading) {
+              NativeResizeHandle(value: libraryWidth, range: libraryResizeRange, direction: -1,
+                reset: 336, label: "Resize Library", preview: { libraryWidthDraft = $0.rounded() },
+                commit: { saveRailWidth($0, sidebar: false) }, cancel: { libraryWidthDraft = nil })
+                .frame(width: 5)
+            }
+            .transition(.move(edge: .trailing).combined(with: .opacity))
+        }
+       }
+       if let message = store.lastError, editor == nil, themeError == nil, operationError == nil, nameError == nil {
+         HStack(spacing: 8) {
+           NativeGlyph("info.circle").foregroundStyle(accent).frame(width: 16)
+           Text(message).font(.system(size: 11)).lineLimit(2).frame(maxWidth: .infinity, alignment: .leading)
+           Button { store.clearError() } label: { NativeGlyph("xmark").frame(width: 24, height: 24) }
+             .buttonStyle(.plain).help("Dismiss message").accessibilityLabel("Dismiss message")
+         }.padding(.horizontal, 12).padding(.vertical, 5)
+           .background(colors.chrome.opacity(0.9))
+           .accessibilityElement(children: .contain).accessibilityAddTraits(.updatesFrequently)
+       }
       }
-
+    }
+    .ignoresSafeArea()
+    .background {
+      GeometryReader { geometry in
+        Color.clear.onAppear { availableWindowWidth = geometry.size.width }
+          .onChange(of: geometry.size.width) { _, width in availableWindowWidth = width }
+      }
     }
     .background {
       NativePalettePresenter(
         isPresented: $actions.palette,
         content: AnyView(
-          palette.tint(accent)
+          palette.tint(accent).environment(\.presentedSpaceTheme, theme)
             .preferredColorScheme(
               theme.appearance == "dark" ? .dark : theme.appearance == "light" ? .light : nil)),
-        motionScale: effectiveMotion
+        motionScale: effectiveMotion,
+        frame: actions.contentFrame.width > 0 ? actions.contentFrame : nil,
+        presentationID: actions.paletteSession
       )
       .frame(width: 0, height: 0).allowsHitTesting(false)
     }
+    .background {
+      NativePalettePresenter(
+        isPresented: Binding(get: { canDropSplit }, set: { if !$0 { drag.cancel() } }),
+        content: AnyView(NativeSplitDropOverlay(store: store, actions: actions, drag: drag, colors: colors)),
+        motionScale: effectiveMotion, frame: actions.contentFrame.insetBy(dx: store.state.settings.pageGutter, dy: store.state.settings.pageGutter),
+        takesKey: false, dismissOnOutsideClick: false, dismissOnResign: true)
+        .frame(width: 0, height: 0).allowsHitTesting(false)
+      NativePalettePresenter(
+        isPresented: $actions.findVisible,
+        content: AnyView(NativeFindBar(actions: actions, colors: colors)), motionScale: effectiveMotion,
+        frame: CGRect(x: max(actions.contentFrame.minX + 8, actions.contentFrame.maxX - 326), y: max(4, actions.contentFrame.minY),
+          width: min(310, max(200, actions.contentFrame.width - 24)), height: 32),
+        takesKey: true, dismissOnOutsideClick: false, dismissOnResign: false)
+        .frame(width: 0, height: 0).allowsHitTesting(false)
+      if sidebarWidth == 0 {
+        let items = showPageActions ? pageMenuItems : browserMenuItems
+        NativePalettePresenter(
+          isPresented: Binding(get: { showBrowserMenu || showPageActions }, set: { if !$0 { showBrowserMenu = false; showPageActions = false } }),
+          content: AnyView(NativeActionPopover(title: showPageActions ? "Page actions" : "Browser menu", items: items, colors: colors,
+            compactZoom: showPageActions,
+            onDismiss: { showBrowserMenu = false; showPageActions = false })),
+          motionScale: effectiveMotion,
+          frame: CGRect(x: actions.contentFrame.minX + 8, y: actions.contentFrame.minY + 40, width: 242,
+            height: max(80, min(actions.contentFrame.height - 48, CGFloat((items.count - (showPageActions ? 2 : 0)) * 31 + items.filter(\.divider).count * 9 + 10)))))
+          .frame(width: 0, height: 0).allowsHitTesting(false)
+      }
+    }
     .coordinateSpace(name: "browserWindow")
+    .font(.system(size: 13))
+    .foregroundStyle(colors.ink)
     .tint(accent)
     .preferredColorScheme(
       theme.appearance == "dark" ? .dark : theme.appearance == "light" ? .light : nil
     )
+    .environment(\.presentedSpaceTheme, theme)
     .animation(
       reduceMotion ? nil : .easeInOut(duration: 0.18 * effectiveMotion),
       value: store.state.settings.sidebarVisible
     )
-    .onPreferenceChange(ContentFramePreference.self) { frame in
-      guard frame != actions.contentFrame else { return }
-      actions.contentFrame = frame
-      actions.onLayout(frame, sidebarWidth)
-    }
+    .animation(reduceMotion ? nil : .easeOut(duration: 0.16 * effectiveMotion), value: actions.library != nil)
     .onReceive(Timer.publish(every: 0.15, on: .main, in: .common).autoconnect()) { _ in
       if drag.id != nil && NSEvent.pressedMouseButtons == 0 { drag.cancel() }
     }
-    .sheet(
-      isPresented: $actions.themeEditor,
-      onDismiss: {
-        themeSaveTask?.cancel()
-        store.save()
-      }
-    ) { ThemeEditor(theme: themeBinding) }
-    .sheet(item: libraryBinding) { NativeLibrary(store: store, actions: actions, section: $0.id) }
-    .alert(
-      renameTarget.map { "Rename \($0.kind)" } ?? "New \(creation ?? "item")",
-      isPresented: Binding(
+    .onAppear {
+      actions.performInterfaceCommand = performInterfaceCommand
+      actions.handleInterfaceEscape = dismissInterface
+      if !offeredOnboarding && !store.state.settings.onboardingCompleted && !CommandLine.arguments.contains("--engine-acceptance") {
+        offeredOnboarding = true; editor = .onboarding
+      } else { maybeOpenBlankPalette() }
+    }
+    .sheet(item: $editor) { destination in
+      NativeInterfaceEditors(store: store, actions: actions, destination: destination)
+    }
+    .onChange(of: actions.themeEditor) { _, presented in
+      themeError = nil
+      if presented {
+        actions.palette = false; showSiteControls = false; showBrowserMenu = false; showPageActions = false
+        if creatingSpace {
+          var initial = SpaceTheme(); initial.appearance = store.state.settings.appearance
+          themeDraft = BrowserSpace(profileID: store.activeProfileID, name: "", theme: initial)
+        }
+        else { themeDraft = store.state.activeSpace; themeDraft?.theme = savedTheme }
+      } else { themeDraft = nil; creatingSpace = false }
+    }
+    .onChange(of: store.state.activeSpaceID) { _, _ in
+      discardThemePreview()
+      maybeOpenBlankPalette()
+    }
+    .onChange(of: store.state.activeTabID) { _, _ in maybeOpenBlankPalette() }
+    .onChange(of: actions.palette) { _, presented in if presented { discardThemePreview() } }
+    .onChange(of: editor) { _, value in if value == nil { maybeOpenBlankPalette() } else { discardThemePreview() } }
+    .onChange(of: actions.library) { _, value in if value == nil { maybeOpenBlankPalette() } else { discardThemePreview() } }
+    .onChange(of: creation) { _, value in if value != nil { discardThemePreview() } }
+    .onChange(of: renameTarget) { _, value in if value != nil { discardThemePreview() } }
+    .onChange(of: showSiteControls) { _, presented in if presented { discardThemePreview() } }
+    .onChange(of: showBrowserMenu) { _, presented in if presented { discardThemePreview() } }
+    .onChange(of: showPageActions) { _, presented in if presented { discardThemePreview() } }
+    .alert("Couldn’t complete the action", isPresented: Binding(get: { operationError != nil }, set: { if !$0 { operationError = nil } })) {
+      Button("OK") { operationError = nil }
+    } message: { Text(operationError ?? "") }
+    .sheet(isPresented: Binding(
         get: { creation != nil || renameTarget != nil },
         set: {
           if !$0 {
             creation = nil
             renameTarget = nil
+            nameError = nil
           }
-        })
-    ) {
-      TextField("Name", text: $name)
-      Button(renameTarget == nil ? "Create" : "Save") { saveName() }
-        .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-      Button("Cancel", role: .cancel) {
-        creation = nil
-        renameTarget = nil
-      }
+        })) {
+      NativeNameEditor(title: renameTarget.map { "Rename \($0.kind)" } ?? "New \(creation ?? "item")",
+        name: $name, limit: nameLimit, saveTitle: renameTarget == nil ? "Create" : "Save", error: nameError, colors: colors,
+        save: saveName, cancel: { creation = nil; renameTarget = nil; nameError = nil })
     }
   }
 
+  private var canDropSplit: Bool {
+    guard let id = drag.id, let source = store.tab(id), let active = store.state.activeTab,
+      id != active.id, source.url != "about:blank", active.url != "about:blank", !active.isClosed,
+      active.peek == nil, store.profileID(for: source) == store.activeProfileID,
+      store.split(for: source.id) == nil, store.split(for: active.id) == nil else { return false }
+    return true
+  }
   private var pageArea: some View {
-    content()
+    ZStack {
+      content()
+      if store.state.activeTab?.homePage == true && store.state.activeTab?.url == "about:blank" && !actions.nativePageVisible {
+        NativeHomePage(store: store, actions: actions, colors: colors, sidebarVisible: sidebarWidth > 0)
+      }
+    }
+      .environment(\.presentedSpaceTheme, theme)
       .frame(maxWidth: .infinity, maxHeight: .infinity)
       .background {
-        GeometryReader { geometry in
-          Color.clear.preference(
-            key: ContentFramePreference.self, value: geometry.frame(in: .named("browserWindow")))
-        }
+        NativeContentFrameReporter { frame in publishContentFrame(frame) }
+          .frame(maxWidth: .infinity, maxHeight: .infinity).allowsHitTesting(false)
       }
       .clipShape(RoundedRectangle(cornerRadius: store.state.settings.pageRadius))
-      .shadow(color: .black.opacity(0.16), radius: 5, y: 2)
+      .background {
+        // Chromium pages are sibling native windows. The clear overlay has no
+        // alpha to cast a shadow, so the pane needs a retained solid underlay.
+        RoundedRectangle(cornerRadius: store.state.settings.pageRadius)
+          .fill(colors.chrome)
+          .shadow(color: Color(red: 32 / 255, green: 19 / 255, blue: 36 / 255).opacity(0.11), radius: 9, y: 4)
+      }
       .padding(store.state.settings.pageGutter)
       .overlay(alignment: .topLeading) {
-        if !store.state.settings.sidebarVisible { revealButton }
+        if sidebarWidth == 0 { revealButton }
       }
+  }
+  private func publishContentFrame(_ frame: CGRect) {
+    guard frame.width > 0, frame.height > 0, frame != actions.contentFrame else { return }
+    actions.contentFrame = frame
+    actions.onLayout(frame, sidebarWidth)
   }
   private var revealButton: some View {
     Button {
       toggleSidebar()
     } label: {
-      Image(systemName: "sidebar.left").frame(width: 32, height: 32)
+      NativeGlyph("sidebar.left").frame(width: 32, height: 32)
     }
     .buttonStyle(.plain).background { NativeControlSurface().clipShape(Circle()) }
     .padding(12).help("Show sidebar").accessibilityLabel("Show sidebar")
   }
   private var sidebar: some View {
-    VStack(spacing: 12) {
+    VStack(spacing: 0) {
       navigation
-      addressButton
+      addressButton.padding(.bottom, 8)
+      if let extensions = actions.pinnedExtensionsContent() { extensions.padding(.bottom, 8) }
+      else if !actions.siteControls.isPrivate && actions.siteControls.extensions.contains(where: { $0.pinned }) {
+        NativePinnedExtensions(extensions: actions.siteControls.extensions, colors: colors, width: sidebarWidth - 16).padding(.bottom, 8)
+      }
       SpaceGestureSurface(
         index: spaces.firstIndex(where: { $0.id == store.state.activeSpaceID }) ?? 0,
-        count: spaces.count, onProgress: { gestureProgress = $0 },
-        onSelect: { index in
-          if spaces.indices.contains(index) { store.selectSpace(id: spaces[index].id) }
+        count: spaces.count,
+        contextKey: store.activeProfileID,
+        onProgress: { value in
+          var transaction = Transaction(); transaction.animation = nil
+          withTransaction(transaction) { gestureTracking = value != 0; gestureProgress = value }
+        },
+        onSelect: { index, duration in
+          guard spaces.indices.contains(index) else { return }
+          gestureSettleDuration = duration
+          withAnimation(reduceMotion ? nil : .easeOut(duration: duration * effectiveMotion)) {
+            gestureTracking = false
+            gestureProgress = 0
+            store.selectSpace(id: spaces[index].id)
+          }
         }
       ) {
-        ScrollView {
-          tabList.padding(2)
-            .offset(x: reduceMotion ? 0 : -gestureProgress * 24)
-            .opacity(reduceMotion ? 1 : 1 - min(0.35, abs(gestureProgress) * 0.2))
-        }.scrollIndicators(.hidden)
+        GeometryReader { geometry in
+          let activeIndex = spaces.firstIndex(where: { $0.id == store.state.activeSpaceID }) ?? 0
+          ZStack(alignment: .topLeading) {
+            ForEach(Array(spaces.enumerated()), id: \.element.id) { index, space in
+              spacePage(space, height: geometry.size.height)
+                .frame(width: geometry.size.width, height: geometry.size.height)
+                .offset(x: (Double(index - activeIndex) - gestureProgress) * geometry.size.width)
+                .animation(gestureTracking || reduceMotion ? nil : .easeOut(duration: gestureSettleDuration * effectiveMotion), value: Double(activeIndex) + gestureProgress)
+            }
+          }.clipped()
+        }
       }
       spaceFooter
-    }.padding(.horizontal, 10)
+    }.padding(.horizontal, 8)
       .overlay(alignment: .leading) { spaceEdge(-1) }
       .overlay(alignment: .trailing) { spaceEdge(1) }
   }
+  private func favorites(in space: BrowserSpace) -> [BrowserTab] {
+    (drag.preview ?? store.state.tabs).filter {
+      $0.isFavorite && store.profileID(for: $0) == space.profileID && store.split(for: $0.id)?.spaceID != space.id
+    }
+  }
+  private func spacePage(_ space: BrowserSpace, height: CGFloat) -> some View {
+    let active = space.id == store.state.activeSpaceID
+    let favorites = favorites(in: space)
+    let rows = Int(ceil(Double(favorites.count) / 4))
+    let naturalHeight: CGFloat = favorites.isEmpty ? (drag.id != nil && active ? 52 : 4) : CGFloat(rows * 46 + max(0, rows - 1) * 7 + 8)
+    return VStack(spacing: 0) {
+      ScrollViewReader { reader in
+        ScrollView {
+          if active { favoriteGrid }
+          else { previewFavorites(favorites, selectedID: space.lastActiveTabID) }
+        }.scrollIndicators(.hidden).frame(height: min(naturalHeight, min(176, max(0, height * 0.35))))
+          .onChange(of: sidebarFocus) { _, id in
+            if active, let id, favorites.contains(where: { $0.id == id }) { reader.scrollTo(id) }
+          }
+      }
+      ScrollViewReader { reader in
+        ScrollView {
+          if active { tabList }
+          else { previewTabList(space) }
+        }.scrollIndicators(.hidden)
+          .onChange(of: sidebarFocus) { _, id in
+            if active, let id, !favorites.contains(where: { $0.id == id }) { reader.scrollTo(id) }
+          }
+      }
+    }.allowsHitTesting(active).accessibilityHidden(!active)
+      .onKeyPress(keys: [.upArrow, .downArrow, .leftArrow, .rightArrow, .home, .end, KeyEquivalent("\u{F70D}"), KeyEquivalent("\u{F735}")]) { handleSidebarKey($0) }
+  }
+  private func previewFavorites(_ favorites: [BrowserTab], selectedID: String?) -> some View {
+    let count = max(1, Int(ceil(Double(favorites.count) / 4)))
+    let size = favorites.count / count, fuller = favorites.count % count
+    return VStack(spacing: 7) {
+      if favorites.isEmpty { Color.clear.frame(height: 4) }
+      else {
+        ForEach(0..<count, id: \.self) { row in
+          HStack(spacing: 7) {
+            ForEach(Array(favorites.dropFirst(row * size + min(row, fuller)).prefix(size + (row < fuller ? 1 : 0)))) { tab in
+              previewRow(tab, selected: tab.id == selectedID, favorite: true)
+            }
+          }
+        }
+      }
+    }.padding(.bottom, favorites.isEmpty ? 0 : 8)
+  }
+  private func previewTabList(_ space: BrowserSpace) -> some View {
+    let profileID = space.profileID
+    let all = store.state.tabs.filter { $0.spaceID == space.id || ($0.isFavorite && store.profileID(for: $0) == profileID) }
+    let groups = store.state.splits.filter { $0.spaceID == space.id }
+    let grouped = Set(groups.flatMap(\.tabIDs))
+    return VStack(alignment: .leading, spacing: 2) {
+      HStack(spacing: 7) {
+        NativeGlyph(store.state.profiles.first(where: { $0.id == space.profileID })?.isPrivate == true ? "shield" : space.icon).frame(width: 14)
+        Text(space.name).fontWeight(.semibold)
+        Spacer()
+        if store.state.profiles.first(where: { $0.id == space.profileID })?.isPrivate == true { Text("Private").font(.system(size: 10)) }
+      }.font(.system(size: 12)).foregroundStyle(accent).padding(.horizontal, 8).frame(height: 32)
+      ForEach(store.state.folders.filter { $0.spaceID == space.id }) { folder in
+        HStack(spacing: 8) {
+          NativeGlyph("folder").font(.system(size: 16)).foregroundStyle(accent).frame(width: 16)
+          Text(folder.name).fontWeight(.semibold)
+          Spacer()
+        }.padding(.horizontal, 8).frame(height: 36)
+        if folder.isExpanded {
+          VStack(spacing: 2) {
+            ForEach(all.filter { $0.folderID == folder.id && !$0.isFavorite && !grouped.contains($0.id) }) { tab in
+              previewRow(tab, selected: tab.id == space.lastActiveTabID)
+            }
+          }.padding(.leading, 16)
+        }
+      }
+      ForEach(all.filter { $0.isPinned && !$0.isFavorite && $0.folderID == nil && !grouped.contains($0.id) }) { tab in
+        previewRow(tab, selected: tab.id == space.lastActiveTabID)
+      }
+      Rectangle().fill(colors.ink.opacity(0.12)).frame(height: 1).padding(.horizontal, 7).padding(.vertical, 10)
+      Label("New Tab", systemImage: "plus").foregroundStyle(colors.muted).padding(.horizontal, 8).frame(height: 36)
+      ForEach(groups) { group in
+        HStack(spacing: 0) {
+          if let left = store.tab(group.leftTabID) { previewRow(left, selected: false) }
+          Rectangle().fill(colors.ink.opacity(0.14)).frame(width: 1, height: 18)
+          if let right = store.tab(group.rightTabID) { previewRow(right, selected: false) }
+        }.background(group.tabIDs.contains(space.lastActiveTabID ?? "") ? selectionBackground(true) : colors.ink.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
+      }
+      ForEach(all.filter { !$0.isPinned && !$0.isFavorite && !$0.isClosed && $0.folderID == nil && !grouped.contains($0.id) && ($0.url != "about:blank" || $0.homePage == true) }) { tab in
+        previewRow(tab, selected: tab.id == space.lastActiveTabID)
+      }
+    }.frame(maxWidth: .infinity, alignment: .leading)
+  }
+  private func previewRow(_ tab: BrowserTab, selected: Bool, favorite: Bool = false) -> some View {
+    HStack(spacing: 8) {
+      Group {
+        if let image = actions.icons[tab.id] { Image(nsImage: image).resizable().scaledToFit() }
+        else { NativeGlyph("globe") }
+      }.frame(width: favorite ? 20 : 16, height: favorite ? 20 : 16)
+      if !favorite { Text(tab.displayTitle).lineLimit(1); Spacer(minLength: 0) }
+    }.font(.system(size: 13, weight: selected ? .medium : .regular))
+      .frame(maxWidth: .infinity, minHeight: favorite ? 46 : 36).padding(.horizontal, 8)
+      .background(selected && !tab.isClosed ? (favorite ? favoriteSelection(tab) : selectionBackground(true)) : favorite ? colors.ink.opacity(0.05) : .clear,
+        in: RoundedRectangle(cornerRadius: 10))
+  }
   private var navigation: some View {
-    HStack(spacing: 12) {
-      Spacer().frame(width: 60)
+    HStack(spacing: 0) {
+      Spacer().frame(width: 70)
       Button {
         toggleSidebar()
       } label: {
-        Image(systemName: "sidebar.left")
+        NativeGlyph("sidebar.left").font(.system(size: 16))
+          .frame(width: 26, height: 26)
       }.help("Hide sidebar")
       Spacer(minLength: 0)
-      Button(action: actions.back) { Image(systemName: "arrow.left") }.disabled(!actions.canGoBack)
+      Button(action: actions.back) { NativeGlyph("arrow.left").frame(width: 26, height: 26) }.disabled(!actions.canGoBack)
         .help("Back")
-      Button(action: actions.forward) { Image(systemName: "arrow.right") }.disabled(
+      Button(action: actions.forward) { NativeGlyph("arrow.right").frame(width: 26, height: 26) }.disabled(
         !actions.canGoForward
       ).help("Forward")
       Button(action: actions.reload) {
-        Image(systemName: actions.loading ? "xmark" : "arrow.clockwise")
-      }.help(actions.loading ? "Stop" : "Reload")
-    }.buttonStyle(.plain).padding(.top, 12)
+        NativeGlyph(actions.loading ? "xmark" : "arrow.clockwise")
+          .frame(width: 26, height: 26)
+      }.help(actions.loading ? "Stop" : "Reload").disabled(!hasPage)
+    }.font(.system(size: 14, weight: .regular)).foregroundStyle(accent)
+      .buttonStyle(.plain).frame(height: 36)
   }
   private var addressButton: some View {
     HStack(spacing: 2) {
       Button {
-        actions.openPalette(address: store.state.activeTab?.url ?? "")
+        actions.openPalette(address: hasPage ? currentAddress : "")
       } label: {
-        Text(store.state.activeTab.flatMap { URL(string: $0.url)?.host } ?? "Search or enter URL")
-          .lineLimit(1).font(.system(size: 12, weight: .medium))
-          .frame(maxWidth: .infinity, alignment: .leading).padding(.leading, 10).padding(
-            .vertical, 10
-          )
-          .contentShape(Rectangle())
-      }.buttonStyle(.plain).accessibilityLabel("Edit address or search")
+        HStack(spacing: 7) {
+          NativeGlyph(hasPage ? (currentAddress.hasPrefix("https://") ? "lock" : "globe") : "magnifyingglass")
+            .font(.system(size: 12)).foregroundStyle(accent)
+          Text(hasPage ? (URL(string: currentAddress)?.host ?? currentAddress) : "Search or enter URL")
+            .lineLimit(1).font(.system(size: 13, weight: .medium))
+        }.frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 8)
+          .frame(height: 32).contentShape(Rectangle())
+      }.buttonStyle(.plain).accessibilityLabel("Edit address or search").focused($sidebarFocus, equals: "address")
+        .contextMenu { NativeMenuCommands(items: pageMenuItems) }
+        .popover(isPresented: $showPageActions, arrowEdge: .bottom) {
+          NativeActionPopover(title: "Page actions", items: pageMenuItems, colors: colors, compactZoom: true)
+        }
       Button {
         showSiteControls.toggle()
       } label: {
-        Image(systemName: "slider.horizontal.3").font(.system(size: 12, weight: .medium))
+        NativeGlyph("slider.horizontal.3").font(.system(size: 12, weight: .medium))
           .frame(width: 28, height: 28).contentShape(RoundedRectangle(cornerRadius: 8))
       }.buttonStyle(.plain).padding(.trailing, 4)
         .help("Site controls").accessibilityLabel("Site controls")
         .popover(isPresented: $showSiteControls, arrowEdge: .bottom) {
-          SiteControls(actions: actions.siteControls, accent: accent)
+          SiteControls(actions: actions.siteControls, accent: accent, palette: colors)
         }
-    }.background(accent.opacity(0.09), in: RoundedRectangle(cornerRadius: 12))
+        .popover(isPresented: $showBrowserMenu, arrowEdge: .bottom) {
+          NativeActionPopover(title: "Browser menu", items: browserMenuItems, colors: colors)
+        }
+    }.background(colors.ink.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
   }
   private var tabList: some View {
-    VStack(alignment: .leading, spacing: 5) {
-      favoriteGrid
-      HStack {
-        Image(systemName: store.state.activeSpace?.icon ?? "circle.fill")
-        Text(store.state.activeSpace?.name ?? "Personal").fontWeight(.semibold)
-      }.font(.system(size: 12)).foregroundStyle(accent).padding(.vertical, 8)
+    VStack(alignment: .leading, spacing: 2) {
+      Button { editor = .spaces } label: {
+        HStack(spacing: 7) {
+          NativeGlyph(store.state.activeProfile?.isPrivate == true ? "shield" : store.state.activeSpace?.icon ?? "circle.fill").frame(width: 14)
+          Text(store.state.activeSpace?.name ?? "Personal").fontWeight(.semibold)
+          Spacer()
+          if store.state.activeProfile?.isPrivate == true { Text("Private").font(.system(size: 10)) }
+          NativeGlyph("chevron.down", size: 12)
+        }.font(.system(size: 12)).padding(.horizontal, 8).frame(height: 32).contentShape(Rectangle())
+      }.buttonStyle(.plain).foregroundStyle(accent).accessibilityLabel("Spaces & profiles")
         .contextMenu {
           if let space = store.state.activeSpace { spaceMenu(space) }
         }
       ForEach(store.state.folders.filter { $0.spaceID == store.state.activeSpaceID }) { folder in
-        DisclosureGroup(
-          isExpanded: Binding(
-            get: { store.state.folders.first(where: { $0.id == folder.id })?.isExpanded ?? true },
-            set: { store.updateFolder(id: folder.id, isExpanded: $0) })
-        ) {
-          rows(
-            tabs.filter { $0.folderID == folder.id && !$0.isFavorite }, section: .folder(folder.id))
-        } label: {
-          Label(folder.name, systemImage: "folder").foregroundStyle(accent)
-        }
-        .padding(8)
-        .contextMenu {
-          Button("Rename folder…") { beginRename(.folder(folder.id), name: folder.name) }
-          Button("Delete folder…", role: .destructive) {
-            confirmDelete(.folder(folder.id), name: folder.name)
+        VStack(spacing: 2) {
+          Button {
+            store.updateFolder(id: folder.id, isExpanded: !folder.isExpanded)
+          } label: {
+            HStack(spacing: 8) {
+              ZStack {
+                NativeGlyph("folder").opacity(hoveredFolder == folder.id || sidebarFocus == "folder:\(folder.id)" ? 0 : 1)
+                NativeGlyph("chevron.down")
+                  .rotationEffect(.degrees(folder.isExpanded ? 0 : -90))
+                  .animation(effectiveMotion > 0 ? .timingCurve(0.16, 1, 0.3, 1, duration: 0.12 * effectiveMotion) : nil, value: folder.isExpanded)
+                  .opacity(hoveredFolder == folder.id || sidebarFocus == "folder:\(folder.id)" ? 1 : 0)
+              }.foregroundStyle(accent).frame(width: 16, height: 16)
+                .animation(effectiveMotion > 0 ? .easeOut(duration: 0.12 * effectiveMotion) : nil, value: hoveredFolder == folder.id || sidebarFocus == "folder:\(folder.id)")
+              Text(folder.name).font(.system(size: 13, weight: .semibold)).lineLimit(1)
+              Spacer(minLength: 0)
+            }.padding(.horizontal, 8).frame(height: 36).contentShape(Rectangle())
+          }.buttonStyle(.plain).accessibilityLabel("\(folder.isExpanded ? "Collapse" : "Expand") \(folder.name)")
+            .focused($sidebarFocus, equals: "folder:\(folder.id)").id("folder:\(folder.id)")
+            .onHover { if $0 { hoveredFolder = folder.id } else if hoveredFolder == folder.id { hoveredFolder = nil } }
+          if folder.isExpanded {
+            VStack(spacing: 2) {
+              rows(tabs.filter { $0.folderID == folder.id && !$0.isFavorite }, section: .folder(folder.id))
+            }.padding(.leading, 8)
+              .overlay(alignment: .leading) { Rectangle().fill(accent.opacity(0.22)).frame(width: 1) }
+              .padding(.leading, 8)
           }
         }
+        .contextMenu { NativeMenuCommands(items: folderMenuItems(folder)) }
+        .background { menuAnchor(id: "folder:\(folder.id)", items: folderMenuItems(folder)) }
         .onDrop(of: [.plainText], delegate: dropDelegate(section: .folder(folder.id)))
       }
-      VStack(spacing: 5) {
+      VStack(spacing: 2) {
         rows(tabs.filter { $0.isPinned && !$0.isFavorite && $0.folderID == nil }, section: .pinned)
         Color.clear.frame(height: drag.id == nil ? 0 : 14)
       }.contentShape(Rectangle()).onDrop(of: [.plainText], delegate: dropDelegate(section: .pinned))
-      Divider().padding(.vertical, 10)
+      Rectangle().fill(colors.ink.opacity(0.12)).frame(height: 1)
+        .padding(.horizontal, 7).padding(.vertical, 10)
       Button {
         actions.openPalette()
       } label: {
-        Label("New Tab", systemImage: "plus").frame(maxWidth: .infinity, alignment: .leading)
-          .padding(10)
+        HStack(spacing: 8) {
+          NativeGlyph("plus").font(.system(size: 16)).foregroundStyle(accent).frame(width: 16)
+          Text("New Tab")
+        }.frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 8).frame(height: 36)
       }
-      .buttonStyle(.plain).foregroundStyle(.secondary)
-      VStack(spacing: 5) {
+      .buttonStyle(.plain).foregroundStyle(colors.muted)
+      VStack(spacing: 2) {
+        splitRows
         rows(
-          tabs.filter { !$0.isPinned && !$0.isFavorite && !$0.isClosed && $0.folderID == nil },
+          tabs.filter { !$0.isPinned && !$0.isFavorite && !$0.isClosed && $0.folderID == nil && ($0.url != "about:blank" || $0.homePage == true) },
           section: .regular)
         Color.clear.frame(height: 28)
       }.contentShape(Rectangle()).onDrop(
@@ -312,129 +675,159 @@ struct BrowserShell<Content: View>: View {
     }
   }
   private var favoriteGrid: some View {
-    let favorites = tabs.filter(\.isFavorite)
-    let columns = max(2, min(4, favorites.count))
-    return LazyVGrid(
-      columns: Array(repeating: GridItem(.flexible(), spacing: 7), count: columns), spacing: 7
-    ) {
-      ForEach(
-        favorites.filter { tab in store.split(for: tab.id).map { $0.leftTabID == tab.id } ?? true }
-      ) { tab in
-        if let group = store.split(for: tab.id),
-          let partner = tabs.first(where: { $0.id == group.rightTabID })
-        {
-          HStack(spacing: 0) {
-            tabRow(tab, section: .favorite, grouped: true)
-            Divider().frame(height: 20)
-            tabRow(partner, section: .favorite, grouped: true)
-          }.background(
-            selectionBackground(group.tabIDs.contains(store.state.activeTabID ?? "")),
-            in: RoundedRectangle(cornerRadius: 11))
-        } else {
-          tabRow(tab, section: .favorite)
+    let favorites = tabs.filter { $0.isFavorite && store.split(for: $0.id)?.spaceID != store.state.activeSpaceID }
+    // Balance rows just like the original twelve-track Favorites grid: six
+    // favorites are two rows of three, five are a row of three then two.
+    let rowCount = max(1, Int(ceil(Double(favorites.count) / 4)))
+    let rowSize = favorites.count / rowCount
+    let fullerRows = favorites.count % rowCount
+    return VStack(spacing: 7) {
+      if favorites.isEmpty {
+        Color.clear.frame(height: drag.id == nil ? 4 : 44)
+      } else { ForEach(0..<rowCount, id: \.self) { row in
+        let count = rowSize + (row < fullerRows ? 1 : 0)
+        let start = row * rowSize + min(row, fullerRows)
+        HStack(spacing: 7) {
+          ForEach(Array(favorites.dropFirst(start).prefix(count))) { tab in
+            tabRow(tab, section: .favorite)
+          }
         }
-      }
-      if favorites.isEmpty && drag.id != nil {
-        Color.clear.frame(height: 45).gridCellColumns(columns)
-      }
-    }.padding(.bottom, 8).contentShape(Rectangle())
+      } }
+    }.padding(.bottom, favorites.isEmpty && drag.id == nil ? 0 : 8).contentShape(Rectangle())
       .onDrop(of: [.plainText], delegate: dropDelegate(section: .favorite))
   }
-  private func rows(_ candidates: [BrowserTab], section: SidebarSection) -> some View {
-    ForEach(
-      candidates.filter { tab in
-        guard let group = store.split(for: tab.id) else { return true }
-        return group.leftTabID == tab.id
-      }
-    ) { tab in
-      if let group = store.split(for: tab.id),
-        let left = tabs.first(where: { $0.id == group.leftTabID }),
-        let right = tabs.first(where: { $0.id == group.rightTabID })
-      {
-        HStack(spacing: 0) {
-          tabRow(left, section: section, grouped: true)
-          Divider().frame(height: 20)
-          tabRow(right, section: section, grouped: true)
-        }.background(
-          selectionBackground(group.tabIDs.contains(store.state.activeTabID ?? "")),
-          in: RoundedRectangle(cornerRadius: 11))
-      } else {
-        tabRow(tab, section: section)
-      }
+  private var splitRows: some View {
+    ForEach(store.state.splits.filter { $0.spaceID == store.state.activeSpaceID }) { group in
+      HStack(spacing: 0) {
+        if let left = store.tab(group.leftTabID) { tabRow(left, section: .regular, grouped: true) }
+        Rectangle().fill(colors.ink.opacity(0.14)).frame(width: 1, height: 18)
+        if let right = store.tab(group.rightTabID) { tabRow(right, section: .regular, grouped: true) }
+      }.background(group.tabIDs.contains(store.state.activeTabID ?? "") ? selectionBackground(true) : colors.ink.opacity(0.06),
+        in: RoundedRectangle(cornerRadius: 10))
+        .shadow(color: .black.opacity(0.07), radius: 1.5, y: 1)
+        .accessibilityElement(children: .contain).accessibilityLabel("Split view")
     }
   }
-  private func selectionBackground(_ selected: Bool) -> Color {
-    Color.primary.opacity(selected ? 0.085 : 0)
+  private func rows(_ candidates: [BrowserTab], section: SidebarSection) -> some View {
+    ForEach(candidates.filter { store.split(for: $0.id) == nil }) { tab in tabRow(tab, section: section) }
   }
-  private func tabRow(_ tab: BrowserTab, section: SidebarSection, grouped: Bool = false)
-    -> some View
-  {
-    let favorite = section == .favorite
-    return Button {
-      store.selectTab(id: tab.id)
-      actions.activate(tab.id)
-    } label: {
-      HStack(spacing: 8) {
-        Group {
-          if let icon = actions.icons[tab.id] {
-            Image(nsImage: icon).resizable().scaledToFit()
-          } else {
-            Image(systemName: "globe")
-          }
-        }.frame(width: 18, height: 18)
-          .overlay(alignment: .topTrailing) {
-            if tab.peek != nil {
-              Image(systemName: "rectangle.on.rectangle").font(.system(size: 9)).padding(2)
-                .background(.regularMaterial, in: Circle()).offset(x: 5, y: -5)
-            }
-          }
-        if !favorite {
-          Text(tab.displayTitle).lineLimit(1)
-          Spacer(minLength: 0)
+  private func selectionBackground(_ selected: Bool) -> Color {
+    colors.card.opacity(selected ? 0.46 : 0)
+  }
+  private func favoriteSelection(_ tab: BrowserTab) -> Color {
+    let logo = NSColor(actions.iconColors[tab.id] ?? accent)
+    let card = NSColor(colors.card)
+    return Color(nsColor: card.blended(withFraction: 0.22, of: logo) ?? card).opacity(0.86)
+  }
+  @ViewBuilder private func tabIcon(_ tab: BrowserTab, size: CGFloat) -> some View {
+    Group {
+      if tab.id == store.state.activeTabID && actions.loading { ProgressView().controlSize(.mini).scaleEffect(0.7) }
+      else if let icon = actions.icons[tab.id] { Image(nsImage: icon).resizable().scaledToFit() }
+      else { NativeGlyph("globe") }
+    }.frame(width: size, height: size)
+      .opacity(tab.isClosed ? 0.65 : 1)
+      .overlay(alignment: .topTrailing) {
+        if let peek = tab.peek {
+          Group {
+            if let icon = actions.peekIcons[tab.id] { Image(nsImage: icon).resizable().scaledToFit() }
+            else { NativeGlyph("globe").font(.system(size: 9)) }
+          }.frame(width: 12, height: 12).padding(2)
+            .background(colors.card.opacity(0.95), in: RoundedRectangle(cornerRadius: 4))
+            .shadow(color: .black.opacity(0.15), radius: 1, y: 1).offset(x: 6, y: -6)
+            .accessibilityLabel("Preview: \(peek.title.isEmpty ? (URL(string: peek.url)?.host ?? peek.url) : peek.title)")
         }
-      }.font(.system(size: 13, weight: tab.id == store.state.activeTabID ? .medium : .regular))
-        .frame(maxWidth: .infinity, minHeight: favorite ? 45 : 32)
-        .padding(.horizontal, 8)
-        .background(
-          grouped
-            ? .clear
-            : tab.id == store.state.activeTabID
-              ? (favorite
-                ? (actions.iconColors[tab.id] ?? accent).opacity(0.22) : selectionBackground(true))
-              : favorite ? accent.opacity(0.1) : .clear, in: RoundedRectangle(cornerRadius: 11)
-        )
-        .contentShape(RoundedRectangle(cornerRadius: 11))
-    }.buttonStyle(.plain).help(tab.displayTitle)
-      .contextMenu {
-        Button("Rename tab…") { beginRename(.tab(tab.id), name: tab.displayTitle) }
-        Button(isBookmarked(tab.url) ? "Remove bookmark" : "Bookmark tab") {
-          store.toggleBookmark(url: tab.url, title: tab.displayTitle)
-        }
-        Divider()
-        Button(tab.isFavorite ? "Remove from Favorites" : "Add to Favorites") {
-          store.toggleFavorite(id: tab.id)
-        }
-        Button(tab.isPinned ? "Unpin" : "Pin") { store.togglePin(id: tab.id) }
-        if let current = store.state.activeTabID, current != tab.id {
-          Button("Split with active tab") { store.setSplit(left: current, right: tab.id) }
-        }
-        if store.split(for: tab.id) != nil { Button("Unsplit") { store.unsplit(tabID: tab.id) } }
-        Button("Close tab") { actions.closeTab(tab.id) }
       }
+  }
+  private func tabRow(_ tab: BrowserTab, section: SidebarSection, grouped: Bool = false) -> some View {
+    let favorite = section == .favorite
+    let selected = tab.id == store.state.activeTabID && !tab.isClosed
+    let hovered = hoveredTab == tab.id || sidebarFocus == tab.id
+    let away = tab.isPinned && !tab.isClosed && tab.savedURL != nil && tab.savedURL != tab.url
+    return HStack(spacing: 0) {
+      if !favorite && !grouped && tab.isPinned {
+        Button { store.resetPinnedDestination(id: tab.id); actions.activate(tab.id) } label: {
+          Group {
+            if hoveredPin == tab.id { NativeGlyph("arrow.left").frame(width: 16, height: 16) }
+            else { tabIcon(tab, size: 16) }
+          }.frame(width: 28, height: 28)
+        }.buttonStyle(.plain).padding(.leading, 3).help("Reset to saved page")
+          .onHover { if $0 { hoveredPin = tab.id } else if hoveredPin == tab.id { hoveredPin = nil } }
+      }
+      Button { store.selectTab(id: tab.id); actions.activate(tab.id) } label: {
+        HStack(spacing: 8) {
+          if favorite || grouped || !tab.isPinned { tabIcon(tab, size: favorite ? 20 : 16) }
+          if !favorite {
+            if away && !grouped { Text("/").foregroundStyle(colors.muted).padding(.trailing, -5) }
+            Text(tab.displayTitle).lineLimit(1)
+            Spacer(minLength: 0)
+          }
+        }.frame(maxWidth: .infinity, minHeight: favorite ? 46 : tabHeight)
+          .padding(.leading, grouped ? 6 : !favorite && tab.isPinned ? 2 : 8)
+          .padding(.trailing, hovered && !favorite ? 0 : 8)
+          .contentShape(Rectangle())
+      }.buttonStyle(.plain).focused($sidebarFocus, equals: tab.id).id(tab.id)
+      if !favorite && (tab.isMuted || actions.audibleTabIDs.contains(tab.id)) {
+        Button { performTabAction("tab:mute", tab: tab) } label: {
+          NativeGlyph(tab.isMuted ? "speaker.slash" : "speaker.wave.2").font(.system(size: 12)).frame(width: 24, height: 24)
+        }.buttonStyle(.plain).foregroundStyle(accent).help(tab.isMuted ? "Unmute tab" : "Mute tab")
+      }
+      if !favorite && hovered {
+        Button { actions.closeTab(tab.id) } label: {
+          NativeGlyph("xmark").font(.system(size: 11)).frame(width: grouped ? 20 : 24, height: 24)
+        }.buttonStyle(.plain).foregroundStyle(colors.muted).padding(.trailing, 3)
+          .help(tab.isPinned ? "Close page · keep pin" : "Close tab").accessibilityLabel("Close \(tab.displayTitle)")
+      }
+    }.font(.system(size: 13, weight: selected ? .medium : .regular))
+      .frame(maxWidth: .infinity)
+      .background(grouped ? .clear : selected ? (favorite ? favoriteSelection(tab) : selectionBackground(true)) : favorite || hovered ? colors.ink.opacity(0.05) : .clear,
+        in: RoundedRectangle(cornerRadius: 10))
+      .opacity(drag.id == tab.id ? 0.45 : 1)
+      .shadow(color: .black.opacity(selected && !grouped && drag.id == nil ? 0.07 : 0), radius: 1.5, y: 1)
+      .onHover { if $0 { hoveredTab = tab.id } else if hoveredTab == tab.id { hoveredTab = nil } }
+      .help("\(tab.displayTitle) — \(tab.isClosed ? "Closed" : actions.loadedTabIDs.contains(tab.id) ? "Loaded" : "Sleeping")\n\(tab.savedURL ?? tab.url)")
+      .accessibilityElement(children: .contain).accessibilityAddTraits(selected ? [.isSelected] : [])
+      .contextMenu { tabMenu(tab) }
+      .background { menuAnchor(id: tab.id, items: tabMenuItems(tab)) }
       .onDrag {
+        guard !grouped else { return NSItemProvider() }
         drag.start(tab.id, tabs: store.state.tabs)
         return NSItemProvider(object: tab.id as NSString)
       }
-      .onDrop(of: [.plainText], delegate: dropDelegate(section: section, before: tab.id))
+      .background {
+        GeometryReader { geometry in
+          Color.clear.onDrop(of: [.plainText], delegate: SidebarDropDelegate(store: store, drag: drag,
+            section: section, spaceID: store.state.activeSpaceID, before: tab.id, extent: geometry.size))
+        }
+      }
+  }
+  private func tabMenu(_ tab: BrowserTab) -> some View { NativeMenuCommands(items: tabMenuItems(tab)) }
+  private func tabMenuItems(_ tab: BrowserTab) -> [NativeMenuAction] {
+    var items = [
+      NativeMenuAction(id: "pin", title: tab.isPinned ? "Unpin tab" : "Pin tab", glyph: "pin") { store.togglePin(id: tab.id) },
+      NativeMenuAction(id: "favorite", title: tab.isFavorite ? "Move to pinned tabs" : "Add to Favorites", glyph: "star") { store.toggleFavorite(id: tab.id) },
+    ]
+    if tab.isPinned {
+      items.append(.init(id: "reset", title: "Reset to saved page", glyph: "undo") { store.resetPinnedDestination(id: tab.id); actions.activate(tab.id) })
+      if !tab.isClosed && tab.savedURL != tab.url { items.append(.init(id: "replace", title: "Replace pin with current page", glyph: "edit") { store.replacePinnedDestination(id: tab.id) }) }
+    }
+    items.append(.init(id: "duplicate", title: "Duplicate tab", glyph: "copy", divider: true) { if let duplicate = store.duplicateTab(id: tab.id) { actions.activate(duplicate.id) } })
+    if store.split(for: tab.id) != nil { items.append(.init(id: "split", title: "Unsplit tabs", glyph: "split") { store.unsplit(tabID: tab.id) }) }
+    else { items.append(.init(id: "split", title: "Open in split view", glyph: "split") { store.selectTab(id: tab.id); actions.activate(tab.id); showPalette(.split) }) }
+    items.append(.init(id: "move", title: "Move to Space or folder", glyph: "folder") { showPalette(.move(tabID: tab.id, pin: false)) })
+    items.append(.init(id: "rename", title: "Rename tab…", glyph: "edit") { beginRename(.tab(tab.id), name: tab.displayTitle) })
+    items.append(.init(id: "bookmark", title: isBookmarked(tab.url) ? "Remove bookmark" : "Bookmark tab", glyph: "bookmark") { store.toggleBookmark(url: tab.url, title: tab.displayTitle) })
+    if tab.isPinned && tab.id != store.state.activeTabID && actions.loadedTabIDs.contains(tab.id) {
+      items.append(.init(id: "sleep", title: "Put to sleep", glyph: "moon") { performTabAction("tab:sleep", tab: tab) })
+    }
+    items.append(.init(id: "close", title: tab.isPinned ? "Close page · keep pin" : "Close tab", glyph: "close", divider: true) { actions.closeTab(tab.id) })
+    return items
   }
   private var spaceFooter: some View {
     HStack {
       Menu {
-        ForEach(["Bookmarks", "History", "Downloads", "Archive", "Settings"], id: \.self) {
+        ForEach(["Bookmarks", "History", "Downloads", "Archive", "Settings", "Extensions", "AI"], id: \.self) {
           section in Button(section) { actions.library = section }
         }
-        Button("Extensions", action: actions.openExtensions)
-        Button("Chrome Web Store", action: actions.openExtensionStore)
         Divider()
         Button("New folder") {
           name = ""
@@ -461,30 +854,58 @@ struct BrowserShell<Content: View>: View {
           }
         }
       } label: {
-        Image(systemName: "archivebox")
-      }.menuStyle(.borderlessButton).frame(width: 24)
+        NativeGlyph("archivebox")
+      }.menuStyle(.borderlessButton).menuIndicator(.hidden).frame(width: 28, height: 28)
       Spacer(minLength: 4)
       ForEach(spaces) { space in
         Button {
           store.selectSpace(id: space.id)
         } label: {
-          Image(systemName: space.icon).font(.system(size: 12)).opacity(
-            space.id == store.state.activeSpaceID ? 1 : 0.4)
+          NativeGlyph(space.icon).font(.system(size: 13)).opacity(
+            space.id == store.state.activeSpaceID ? 1 : 0.45)
+            .frame(width: 26, height: 26)
+            .background(selectionBackground(space.id == store.state.activeSpaceID), in: RoundedRectangle(cornerRadius: 7))
         }.buttonStyle(.plain).help(space.name).accessibilityLabel("Switch to \(space.name)")
           .accessibilityAddTraits(space.id == store.state.activeSpaceID ? [.isSelected] : [])
-          .padding(3).contextMenu { spaceMenu(space) }
+          .contextMenu { spaceMenu(space) }
+          .focused($sidebarFocus, equals: "space:\(space.id)")
+          .onKeyPress(keys: [KeyEquivalent("\u{F70D}"), KeyEquivalent("\u{F735}")]) { key in
+            guard isContextMenuKey(key) else { return .ignored }
+            contextMenuRequest = "space:\(space.id)"; return .handled
+          }
+          .background { menuAnchor(id: "space:\(space.id)", items: spaceMenuItems(space)) }
           .onDrop(
             of: [.plainText],
             delegate: SpaceHoverDropDelegate(store: store, drag: drag, target: { space.id }))
       }
       Spacer(minLength: 4)
-      Button {
-        name = ""
-        creation = "Space"
+      Menu {
+        Button("New tab") { actions.openPalette() }
+        Button("New folder") { name = ""; creation = "folder" }
+        Button("New Space") { openNewSpace() }
+        Divider()
+        Button("Private session") { actions.runtimeCommands.first(where: { $0.id == "new-private-space" })?.action() }
       } label: {
-        Image(systemName: "plus")
-      }.buttonStyle(.plain)
-    }.foregroundStyle(accent).padding(.bottom, 10)
+        NativeGlyph("plus")
+      }.menuStyle(.borderlessButton).menuIndicator(.hidden).frame(width: 26, height: 26).accessibilityLabel("Add")
+    }.foregroundStyle(accent).frame(height: 32).padding(.bottom, 4)
+      .popover(isPresented: $actions.themeEditor, arrowEdge: .bottom) {
+        ThemeEditor(theme: themeBinding,
+          identity: AnyView(VStack(alignment: .leading, spacing: 10) {
+            NativeSpaceIdentity(name: Binding(get: { themeDraft?.name ?? "" }, set: { themeDraft?.name = $0 }),
+              icon: Binding(get: { themeDraft?.icon ?? "circle" }, set: { themeDraft?.icon = $0 }), initiallyExpanded: creatingSpace)
+            if creatingSpace {
+              Picker("Profile", selection: Binding(get: { themeDraft?.profileID ?? store.activeProfileID }, set: { themeDraft?.profileID = $0 })) {
+                ForEach(store.state.profiles) { profile in Text(profile.name).tag(profile.id) }
+              }.font(.system(size: 12))
+            }
+          }),
+          canSave: !(themeDraft?.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true),
+          errorMessage: themeError,
+          saveTitle: creatingSpace ? "Create Space" : "Save changes",
+          motionScale: effectiveMotion,
+          onSave: saveTheme, onCancel: { actions.themeEditor = false })
+      }
   }
   private func spaceEdge(_ offset: Int) -> some View {
     Color.clear.frame(width: drag.id == nil ? 0 : 12).contentShape(Rectangle())
@@ -505,204 +926,159 @@ struct BrowserShell<Content: View>: View {
     )
   }
 
-  private var paletteResults: [PaletteResult] {
-    var result = [PaletteResult]()
-    let query = actions.query.trimmingCharacters(in: .whitespacesAndNewlines)
-    func matches(_ values: String...) -> Bool {
-      query.isEmpty || values.contains { $0.localizedCaseInsensitiveContains(query) }
-    }
-    let profileTabs = store.state.tabs.filter { store.profileID(for: $0) == store.activeProfileID }
-    let commandNames = [
-      "Unsplit", "Customize Space", "Bookmark Tab", "Bookmarks", "History", "Downloads", "Archive",
-      "Settings", "Extensions", "Extension Store",
-    ].filter { command in
-      if command == "Bookmark Tab" {
-        return store.state.activeTab.map { BrowserAddress.webURL($0.url) != nil } ?? false
-      }
-      if command == "Unsplit" {
-        return store.state.activeTabID.flatMap { store.split(for: $0) } != nil
-      }
+  private var palette: some View { NativeCommandPalette(store: store, actions: actions) }
+  private func toggleSidebar() {
+    if store.state.settings.sidebarVisible && sidebarWidth == 0 { actions.library = nil }
+    else { store.state.settings.sidebarVisible.toggle(); store.save() }
+  }
+  private func showPalette(_ request: NativePaletteRequest) {
+    actions.openPalette()
+    actions.paletteRequest = request
+  }
+  private func performInterfaceCommand(_ id: String) -> Bool {
+    if id.hasPrefix("focus-folder:"), let folder = store.state.folders.first(where: { $0.id == String(id.dropFirst(13)) }),
+      store.state.spaces.contains(where: { $0.id == folder.spaceID && $0.profileID == store.activeProfileID }) {
+      store.selectSpace(id: folder.spaceID); store.updateFolder(id: folder.id, isExpanded: true)
+      store.state.settings.sidebarVisible = true
+      if sidebarWidth == 0 { actions.library = nil }
+      DispatchQueue.main.async { sidebarFocus = "folder:\(folder.id)" }
       return true
     }
-    let exactCommand = commandNames.first { $0.caseInsensitiveCompare(query) == .orderedSame }
-    func commandResult(_ command: String) -> PaletteResult {
-      PaletteResult(
-        id: "command:\(command)", title: command,
-        icon: command == "Bookmark Tab" ? "bookmark" : "command", detail: "Action"
-      ) {
-        actions.palette = false
-        if command == "Unsplit" {
-          if let id = store.state.activeTabID { store.unsplit(tabID: id) }
-        } else if command == "Customize Space" {
-          actions.themeEditor = true
-        } else if command == "Bookmark Tab" {
-          if let tab = store.state.activeTab {
-            store.toggleBookmark(url: tab.url, title: tab.displayTitle)
-          }
-        } else if command == "Extensions" {
-          actions.openExtensions()
-        } else if command == "Extension Store" {
-          actions.openExtensionStore()
-        } else {
-          actions.library = command
-        }
+    switch id {
+    case "new-space": openNewSpace()
+    case "new-folder": name = ""; creation = "folder"
+    case "rename-tab":
+      guard let tab = store.state.activeTab else { return true }
+      beginRename(.tab(tab.id), name: tab.displayTitle)
+    case "move-tab":
+      if let id = store.state.activeTabID { showPalette(.move(tabID: id, pin: false)) }
+    case "split":
+      if let id = store.state.activeTabID, store.split(for: id) != nil { store.unsplit(tabID: id) }
+      else { showPalette(.split) }
+    case "shortcuts": editor = .shortcuts
+    case "profiles": editor = .profiles
+    case "spaces": editor = .spaces
+    case "onboarding": editor = .onboarding
+    case "permissions": editor = .permissions
+    case "home-page":
+      actions.palette = false; actions.library = nil
+      if let tab = store.createTab(address: "about:blank") {
+        store.updateTab(tab.id) { $0.homePage = true }
+        actions.activate(tab.id)
       }
+    case "space-theme", "customize-space":
+      actions.library = nil; store.state.settings.sidebarVisible = true; actions.themeEditor = true
+    case "site-searches": showPalette(.siteSearches)
+    case "focus-sidebar", "reveal-tab":
+      store.state.settings.sidebarVisible = true
+      if sidebarWidth == 0 { actions.library = nil }
+      if let tab = store.state.activeTab, let folder = tab.folderID { store.updateFolder(id: folder, isExpanded: true) }
+      sidebarFocus = store.state.activeTabID ?? sidebarKeyboardItems.first ?? "address"
+    case "browser-menu":
+      showSiteControls = false; showPageActions = false; showBrowserMenu = true
+    case "page-actions":
+      showSiteControls = false; showBrowserMenu = false; showPageActions = true
+    default: return false
     }
-    if let exactCommand { result.append(commandResult(exactCommand)) }
-    if !query.isEmpty {
-      let address = BrowserAddress.resolve(query, engine: store.state.settings.searchEngine)
-      let isAddress =
-        !query.contains(where: \.isWhitespace)
-        && (query.contains("://") || query.contains(".") || query.hasPrefix("localhost"))
-      let title =
-        isAddress
-        ? "Open \(query)"
-        : "Search \(store.state.settings.searchEngine.rawValue.capitalized) for “\(query)”"
-      if address != nil {
-        result.append(
-          PaletteResult(
-            id: "search:web", title: title, icon: isAddress ? "arrow.up.right" : "magnifyingglass"
-          ) { actions.submit(query) })
-      }
-      if let host = store.state.activeTab.flatMap({ URL(string: $0.url)?.host }) {
-        result.append(
-          PaletteResult(id: "search:site", title: "Search \(host)", icon: "globe", detail: query) {
-            actions.submit("site:\(host) \(query)")
-          })
-      }
-    }
-    var representedURLs = Set<String>()
-    for tab in profileTabs.filter({ matches($0.displayTitle, $0.url) }).prefix(6) {
-      representedURLs.insert(tab.url)
-      let owner = store.state.spaces.first { $0.id == tab.spaceID }?.name ?? "Tab"
-      result.append(
-        PaletteResult(
-          id: "tab:\(tab.id)", title: tab.displayTitle,
-          icon: tab.isFavorite ? "star" : tab.isPinned ? "pin" : "globe", detail: owner
-        ) {
-          store.selectTab(id: tab.id)
-          actions.activate(tab.id)
-          actions.palette = false
-        })
-    }
-    if !query.isEmpty {
-      for space in spaces.filter({ matches($0.name) }).prefix(4) {
-        result.append(
-          PaletteResult(
-            id: "space:\(space.id)", title: space.name, icon: space.icon, detail: "Space"
-          ) {
-            store.selectSpace(id: space.id)
-            actions.palette = false
-            if let id = store.state.activeTabID { actions.activate(id) }
-          })
-      }
-      for bookmark in store.state.bookmarks.filter({
-        $0.profileID == store.activeProfileID && matches($0.title, $0.url)
-      }).prefix(4) {
-        representedURLs.insert(bookmark.url)
-        result.append(
-          PaletteResult(
-            id: "bookmark:\(bookmark.id)",
-            title: bookmark.title.isEmpty ? bookmark.url : bookmark.title, icon: "bookmark",
-            detail: bookmark.url
-          ) { actions.submit(bookmark.url) })
-      }
-      var historyCount = 0
-      for visit in store.state.history
-      where visit.profileID == store.activeProfileID && matches(visit.title, visit.url)
-        && !representedURLs.contains(visit.url)
-      {
-        representedURLs.insert(visit.url)
-        result.append(
-          PaletteResult(
-            id: "history:\(visit.id)", title: visit.title.isEmpty ? visit.url : visit.title,
-            icon: "clock", detail: visit.url
-          ) { actions.submit(visit.url) })
-        historyCount += 1
-        if historyCount == 4 { break }
-      }
-    }
-    for command in commandNames where command != exactCommand && matches(command) {
-      if command == "Bookmark Tab" && store.state.activeTab == nil { continue }
-      if command == "Unsplit" && store.state.activeTabID.flatMap({ store.split(for: $0) }) == nil {
-        continue
-      }
-      result.append(commandResult(command))
-    }
-    return result
+    return true
   }
-  private var palette: some View {
-    ZStack(alignment: .top) {
-      Color.black.opacity(0.12).contentShape(Rectangle()).onTapGesture { actions.palette = false }
-      VStack(spacing: 5) {
-        PaletteSearchField(
-          text: $actions.query, submit: activatePaletteSelection, move: movePaletteSelection,
-          cancel: { actions.palette = false }
-        )
-        .frame(height: 40).padding(.horizontal, 10)
-        Divider()
-        paletteResultList
-      }.padding(12).frame(width: 560)
-        .background { NativeControlSurface().clipShape(RoundedRectangle(cornerRadius: 12)) }
-        .shadow(color: .black.opacity(0.18), radius: 24, y: 8).padding(.top, 70)
-    }.onAppear { paletteSelection = 0 }.onChange(of: actions.query) { _, _ in paletteSelection = 0 }
-      .onChange(of: paletteResults.map(\.id)) { _, values in
-        paletteSelection = min(paletteSelection, max(0, values.count - 1))
-      }
+  private func dismissInterface() -> Bool {
+    if showSiteControls { showSiteControls = false }
+    else if showPageActions { showPageActions = false }
+    else if showBrowserMenu { showBrowserMenu = false }
+    else if actions.themeEditor { actions.themeEditor = false }
+    else if editor != nil { editor = nil }
+    else if creation != nil || renameTarget != nil { creation = nil; renameTarget = nil; nameError = nil }
+    else { return false }
+    return true
   }
-  private var paletteResultList: some View {
-    ScrollViewReader { reader in
-      ScrollView {
-        LazyVStack(spacing: 4) {
-          ForEach(Array(paletteResults.enumerated()), id: \.element.id) { index, item in
-            Button(action: item.action) {
-              HStack(spacing: 10) {
-                Image(systemName: item.icon).frame(width: 20).accessibilityHidden(true)
-                VStack(alignment: .leading, spacing: 2) {
-                  Text(item.title).lineLimit(1)
-                  if let detail = item.detail {
-                    Text(detail).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                  }
-                }
-                Spacer(minLength: 0)
-              }.frame(maxWidth: .infinity, alignment: .leading).padding(10)
-                .background(
-                  selectionBackground(index == paletteSelection),
-                  in: RoundedRectangle(cornerRadius: 11)
-                )
-                .contentShape(Rectangle())
-            }.buttonStyle(.plain).onHover { if $0 { paletteSelection = index } }
-              .accessibilityLabel(item.title + (item.detail.map { ", " + $0 } ?? ""))
-              .accessibilityAddTraits(index == paletteSelection ? [.isSelected] : [])
-              .id(item.id)
-          }
-        }
-      }.scrollIndicators(.hidden)
-        .frame(maxHeight: min(420, max(120, actions.contentFrame.height - 180)))
-        .onChange(of: paletteSelection) { _, index in
-          let items = paletteResults
-          guard items.indices.contains(index) else { return }
-          withAnimation(reduceMotion ? nil : .easeOut(duration: 0.1)) {
-            reader.scrollTo(items[index].id, anchor: .center)
-          }
-        }
+  private func saveRailWidth(_ proposed: Double, sidebar: Bool) {
+    let range = sidebar ? sidebarResizeRange : libraryResizeRange
+    let value = min(range.upperBound, max(range.lowerBound, proposed.rounded()))
+    do {
+      try store.commit { state in
+        if sidebar { state.settings.sidebarWidth = value } else { state.settings.panelWidth = value }
+      }
+    } catch { operationError = error.localizedDescription; store.clearError() }
+    if sidebar { sidebarWidthDraft = nil } else { libraryWidthDraft = nil }
+  }
+
+  private func discardThemePreview() {
+    guard actions.themeEditor || themeDraft != nil else { return }
+    actions.themeEditor = false; themeDraft = nil; themeError = nil; creatingSpace = false
+  }
+  private func openNewSpace() {
+    guard store.state.spaces.count < 500 else { operationError = "Space limit reached."; return }
+    actions.palette = false; actions.library = nil; store.state.settings.sidebarVisible = true
+    creatingSpace = true; actions.themeEditor = true
+  }
+  private var sidebarKeyboardItems: [String] {
+    var items = tabs.filter { $0.isFavorite && store.split(for: $0.id)?.spaceID != store.state.activeSpaceID }.map(\.id)
+    for folder in store.state.folders where folder.spaceID == store.state.activeSpaceID {
+      items.append("folder:\(folder.id)")
+      if folder.isExpanded { items += tabs.filter { $0.folderID == folder.id && !$0.isFavorite && store.split(for: $0.id) == nil }.map(\.id) }
+    }
+    items += tabs.filter { $0.isPinned && !$0.isFavorite && $0.folderID == nil && store.split(for: $0.id) == nil }.map(\.id)
+    items += store.state.splits.filter { $0.spaceID == store.state.activeSpaceID }.flatMap(\.tabIDs)
+    items += tabs.filter { !$0.isPinned && !$0.isFavorite && !$0.isClosed && $0.folderID == nil && ($0.url != "about:blank" || $0.homePage == true) && store.split(for: $0.id) == nil }.map(\.id)
+    return items
+  }
+  private func handleSidebarKey(_ key: KeyPress) -> KeyPress.Result {
+    if isContextMenuKey(key), let current = sidebarFocus {
+      contextMenuRequest = current; return .handled
+    }
+    guard key.modifiers.intersection([.command, .control, .option, .shift]).isEmpty,
+      let current = sidebarFocus, let index = sidebarKeyboardItems.firstIndex(of: current) else { return .ignored }
+    let items = sidebarKeyboardItems
+    switch key.key {
+    case .home: sidebarFocus = items.first
+    case .end: sidebarFocus = items.last
+    case .upArrow: sidebarFocus = items[max(0, index - 1)]
+    case .downArrow: sidebarFocus = items[min(items.count - 1, index + 1)]
+    case .leftArrow, .rightArrow:
+      let folderID = current.hasPrefix("folder:") ? String(current.dropFirst(7)) : store.tab(current)?.folderID
+      if let folderID, let folder = store.state.folders.first(where: { $0.id == folderID }) {
+        if key.key == .leftArrow {
+          if current != "folder:\(folderID)" { sidebarFocus = "folder:\(folderID)" }
+          else { store.updateFolder(id: folderID, isExpanded: false) }
+        } else if !folder.isExpanded { store.updateFolder(id: folderID, isExpanded: true) }
+        else { sidebarFocus = items[min(items.count - 1, index + 1)] }
+      } else if store.tab(current)?.isFavorite == true {
+        let favorites = items.filter { store.tab($0)?.isFavorite == true }
+        guard let position = favorites.firstIndex(of: current) else { return .ignored }
+        sidebarFocus = favorites[min(favorites.count - 1, max(0, position + (key.key == .leftArrow ? -1 : 1)))]
+      } else { return .ignored }
+    default: return .ignored
+    }
+    return .handled
+  }
+  private func performTabAction(_ action: String, tab: BrowserTab) {
+    guard let operation = actions.performLibraryAction, let profileID = store.profileID(for: tab) else { return }
+    Task { @MainActor in
+      do { try await operation(action, ["tabID": tab.id, "profileId": profileID]) }
+      catch { operationError = error.localizedDescription }
     }
   }
-  private func movePaletteSelection(_ offset: Int) {
-    guard !paletteResults.isEmpty else { return }
-    paletteSelection = min(paletteResults.count - 1, max(0, paletteSelection + offset))
-  }
-  private func activatePaletteSelection() {
-    let results = paletteResults
-    guard results.indices.contains(paletteSelection) else { return }
-    results[paletteSelection].action()
-  }
-  private func toggleSidebar() {
-    store.state.settings.sidebarVisible.toggle()
-    store.save()
+  private func maybeOpenBlankPalette() {
+    let tab = store.state.activeTab
+    guard (tab == nil || (tab?.url == "about:blank" && tab?.homePage != true)),
+      !actions.palette, actions.library == nil, !actions.themeEditor, editor == nil,
+      !showBrowserMenu, !showPageActions, !showSiteControls,
+      creation == nil, renameTarget == nil, drag.id == nil else { return }
+    let context = "\(store.state.activeSpaceID):\(store.state.activeTabID ?? "empty")"
+    guard blankPaletteContext != context else { return }
+    blankPaletteContext = context
+    DispatchQueue.main.async {
+      guard "\(store.state.activeSpaceID):\(store.state.activeTabID ?? "empty")" == context,
+        editor == nil, actions.library == nil, !actions.themeEditor,
+        store.state.activeTab?.homePage != true,
+        store.state.activeTab == nil || store.state.activeTab?.url == "about:blank" else { return }
+      actions.openPalette()
+    }
   }
   private func beginRename(_ target: SidebarNamedItem, name: String) {
     creation = nil
+    nameError = nil
     self.name = name
     renameTarget = target
   }
@@ -713,33 +1089,91 @@ struct BrowserShell<Content: View>: View {
       createNamedItem()
       return
     }
-    switch target {
-    case .tab(let id): store.updateTab(id) { $0.customTitle = value }
-    case .folder(let id): store.updateFolder(id: id, name: value)
-    case .space(let id): store.updateSpace(id) { $0.name = value }
-    case .profile(let id):
-      if let index = store.state.profiles.firstIndex(where: { $0.id == id }) {
-        store.state.profiles[index].name = value
-        store.save()
+    do {
+      try store.commit { state in
+        switch target {
+        case .tab(let id):
+          if let index = state.tabs.firstIndex(where: { $0.id == id }) { state.tabs[index].customTitle = value }
+        case .folder(let id):
+          if let index = state.folders.firstIndex(where: { $0.id == id }) { state.folders[index].name = String(value.prefix(60)) }
+        case .space(let id):
+          if let index = state.spaces.firstIndex(where: { $0.id == id }) { state.spaces[index].name = String(value.prefix(60)) }
+        case .profile(let id):
+          if let index = state.profiles.firstIndex(where: { $0.id == id }) { state.profiles[index].name = String(value.prefix(60)) }
+        }
       }
-    }
-    renameTarget = nil
+      renameTarget = nil; nameError = nil
+    } catch { nameError = error.localizedDescription; store.clearError() }
   }
+  private var nameLimit: Int { if let renameTarget, case .tab = renameTarget { return 200 }; return 60 }
   private func canDeleteProfile(_ id: String) -> Bool {
     store.state.profiles.contains { !$0.isPrivate && $0.id != id }
   }
   private func canDeleteSpace(_ space: BrowserSpace) -> Bool {
     store.state.spaces.filter { $0.profileID == space.profileID }.count > 1
   }
-  @ViewBuilder private func spaceMenu(_ space: BrowserSpace) -> some View {
-    Button("Customize Space") {
+  private func spaceMenu(_ space: BrowserSpace) -> some View { NativeMenuCommands(items: spaceMenuItems(space)) }
+  private func spaceMenuItems(_ space: BrowserSpace) -> [NativeMenuAction] {
+    var items: [NativeMenuAction] = []
+    if space.id != store.state.activeSpaceID { items.append(.init(id: "switch", title: "Switch to Space", glyph: "arrow") { store.selectSpace(id: space.id) }) }
+    items.append(.init(id: "customize", title: "Customize Space", glyph: "settings") {
       store.selectSpace(id: space.id)
       actions.themeEditor = true
+    })
+    items.append(.init(id: "rename", title: "Rename Space…", glyph: "edit") { beginRename(.space(space.id), name: space.name) })
+    if let tab = store.state.activeTab, tab.spaceID != space.id, tab.url != "about:blank" {
+      items.append(.init(id: "move", title: "Move current tab here", glyph: "folder") { store.moveTab(id: tab.id, spaceID: space.id) })
     }
-    Button("Rename Space…") { beginRename(.space(space.id), name: space.name) }
-    Button("Delete Space…", role: .destructive) {
+    items.append(.init(id: "new", title: "New Space", glyph: "plus", divider: true) { openNewSpace() })
+    items.append(.init(id: "delete", title: "Delete Space…", glyph: "trash", enabled: canDeleteSpace(space)) {
       confirmDelete(.space(space.id), name: space.name)
-    }.disabled(!canDeleteSpace(space))
+    })
+    return items
+  }
+  private func folderMenuItems(_ folder: BrowserFolder) -> [NativeMenuAction] {
+    [
+      .init(id: "rename", title: "Rename folder…", glyph: "edit") { beginRename(.folder(folder.id), name: folder.name) },
+      .init(id: "delete", title: "Remove folder", glyph: "trash") { store.deleteFolder(id: folder.id) },
+    ]
+  }
+  private func menuAnchor(id: String, items: [NativeMenuAction]) -> some View {
+    NativeContextMenuAnchor(requested: contextMenuRequest == id, items: items) {
+      if contextMenuRequest == id { contextMenuRequest = nil }
+      if editor == nil, creation == nil, renameTarget == nil, !actions.palette, !actions.themeEditor,
+        !showBrowserMenu, !showPageActions,
+        store.tab(id) != nil || id.hasPrefix("space:") || id.hasPrefix("folder:") { sidebarFocus = id }
+    }.allowsHitTesting(false)
+  }
+  private func isContextMenuKey(_ key: KeyPress) -> Bool {
+    key.modifiers.intersection([.command, .control, .option]).isEmpty
+      && (key.key == KeyEquivalent("\u{F735}") || (key.key == KeyEquivalent("\u{F70D}") && key.modifiers.contains(.shift)))
+  }
+  private var pageMenuItems: [NativeMenuAction] {
+    let controls = actions.siteControls
+    let shortcuts = BrowserShortcut.catalog(overrides: store.state.settings.shortcutOverrides)
+    func shortcut(_ id: String) -> String? { shortcuts.first(where: { $0.id == id })?.accelerator }
+    return [
+      .init(id: "bookmark", title: controls.isBookmarked ? "Remove bookmark" : "Bookmark this page", glyph: "star", shortcut: shortcut("bookmark"), enabled: hasPage, action: controls.bookmark),
+      .init(id: "split", title: controls.isSplit ? "Unsplit tabs" : "Split view", glyph: "split", action: controls.split),
+      .init(id: "find", title: "Find on page", glyph: "search", shortcut: shortcut("find"), enabled: hasPage, action: controls.find),
+      .init(id: "print", title: "Print page", glyph: "print", shortcut: shortcut("print"), enabled: hasPage, action: controls.printPage),
+      .init(id: "zoom-out", title: "Zoom out", glyph: "minimize", enabled: hasPage, divider: true, keepsOpen: true, action: controls.zoomOut),
+      .init(id: "zoom-reset", title: "\(controls.zoomPercent)% · Actual size", glyph: "monitor", enabled: hasPage, keepsOpen: true, action: controls.resetZoom),
+      .init(id: "zoom-in", title: "Zoom in", glyph: "plus", enabled: hasPage, keepsOpen: true, action: controls.zoomIn),
+      .init(id: "external", title: "Open in default browser", glyph: "external", enabled: hasPage, divider: true, action: controls.openDefaultBrowser),
+      .init(id: "menu", title: "Browser menu", glyph: "more", shortcut: shortcut("browser-menu"), action: controls.browserMenu),
+    ]
+  }
+  private var browserMenuItems: [NativeMenuAction] {
+    let order = ["command-palette", "new-private-space", "spaces", "page-actions", "find", "zoom-in", "zoom-out", "zoom-reset", "print", "developer-tools", "extensions", "preferences", "shortcuts", "onboarding", "home-page", "about"]
+    return order.compactMap { id in
+      if id == "spaces" { return .init(id: id, title: "Spaces & profiles", glyph: "user") { _ = performInterfaceCommand("spaces") } }
+      if id == "page-actions" { return .init(id: id, title: "Page actions", glyph: "pageControls") { _ = performInterfaceCommand(id) } }
+      if id == "home-page" { return .init(id: id, title: "Home page", glyph: "monitor") { _ = performInterfaceCommand(id) } }
+      guard let command = actions.runtimeCommands.first(where: { $0.id == id }) else { return nil }
+      return .init(id: id, title: id == "command-palette" ? "New tab" : command.title, glyph: command.icon,
+        shortcut: command.shortcut, enabled: command.available, divider: id == "find" || id == "extensions", action: command.action)
+    }
   }
   private func confirmDelete(_ target: SidebarNamedItem, name: String) {
     let alert = NSAlert()
@@ -750,9 +1184,7 @@ struct BrowserShell<Content: View>: View {
     case .space(let id):
       guard let space = store.state.spaces.first(where: { $0.id == id }), canDeleteSpace(space)
       else { return }
-      let count = store.state.tabs.filter { $0.spaceID == id }.count
-      alert.informativeText =
-        "This removes the Space, its folders, and \(count) saved or open tabs."
+      alert.informativeText = "Tabs will move to another Space in this profile."
     case .profile(let id):
       guard canDeleteProfile(id) else { return }
       alert.informativeText =
@@ -776,22 +1208,60 @@ struct BrowserShell<Content: View>: View {
     store.state.bookmarks.contains { $0.profileID == store.activeProfileID && $0.url == url }
   }
   private func createNamedItem() {
-    let trimmed = String(name.trimmingCharacters(in: .whitespacesAndNewlines).prefix(200))
+    let trimmed = String(name.trimmingCharacters(in: .whitespacesAndNewlines).prefix(60))
     guard !trimmed.isEmpty else { return }
-    if creation == "Space" {
-      _ = store.createSpace(name: trimmed)
-    } else if creation == "profile" {
-      _ = store.createProfile(name: trimmed)
-    } else {
-      _ = store.createFolder(name: trimmed)
+    do {
+      if creation == "Space" {
+        let space = BrowserSpace(profileID: store.activeProfileID, name: trimmed)
+        try store.commit { state in state.spaces.append(space); state.activeSpaceID = space.id; state.activeTabID = nil }
+      } else if creation == "profile" {
+        _ = try store.createProfileDurably(name: trimmed)
+      } else {
+        _ = try store.createFolderDurably(name: trimmed)
+      }
+      creation = nil; nameError = nil
+    } catch {
+      nameError = error.localizedDescription; store.clearError()
     }
-    creation = nil
   }
 }
 
-private struct ContentFramePreference: PreferenceKey {
-  static var defaultValue = CGRect.zero
-  static func reduce(value: inout CGRect, nextValue: () -> CGRect) { value = nextValue() }
+/// Native child browser windows need actual AppKit bounds. A SwiftUI preference
+/// can disappear across hosting boundaries, so publish from a retained native
+/// view after each layout, in the parent's top-left content coordinates.
+private struct NativeContentFrameReporter: NSViewRepresentable {
+  var changed: (CGRect) -> Void
+  func makeNSView(context: Context) -> FrameView {
+    let view = FrameView(); view.changed = changed; return view
+  }
+  func updateNSView(_ view: FrameView, context: Context) { view.changed = changed; view.report() }
+  func sizeThatFits(_ proposal: ProposedViewSize, nsView: FrameView, context: Context) -> CGSize? {
+    CGSize(width: proposal.width ?? 0, height: proposal.height ?? 0)
+  }
+  final class FrameView: NSView {
+    var changed: (CGRect) -> Void = { _ in }
+    private var pending = false
+    private var last = CGRect.zero
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    override func layout() { super.layout(); report() }
+    override func setFrameOrigin(_ newOrigin: NSPoint) { super.setFrameOrigin(newOrigin); report() }
+    override func setFrameSize(_ newSize: NSSize) { super.setFrameSize(newSize); report() }
+    override func viewDidMoveToWindow() { super.viewDidMoveToWindow(); last = .zero; report() }
+    override func viewDidMoveToSuperview() { super.viewDidMoveToSuperview(); report() }
+    func report() {
+      guard !pending else { return }
+      pending = true
+      DispatchQueue.main.async { [weak self] in
+        guard let self else { return }
+        self.pending = false
+        guard let root = self.window?.contentView, self.bounds.width > 0, self.bounds.height > 0 else { return }
+        let native = root.convert(self.bounds, from: self)
+        let frame = root.isFlipped ? native : CGRect(x: native.minX, y: root.bounds.height - native.maxY, width: native.width, height: native.height)
+        guard frame != self.last else { return }
+        self.last = frame; self.changed(frame)
+      }
+    }
+  }
 }
 private struct WindowMaterialMask: Shape {
   var hole: CGRect
@@ -804,7 +1274,7 @@ private struct WindowMaterialMask: Shape {
     return path
   }
 }
-private enum SidebarNamedItem {
+private enum SidebarNamedItem: Equatable {
   case tab(String)
   case folder(String)
   case space(String)
@@ -818,64 +1288,6 @@ private enum SidebarNamedItem {
     }
   }
 }
-private struct LibrarySheet: Identifiable { let id: String }
-private struct PaletteResult: Identifiable {
-  let id: String
-  let title: String
-  let icon: String
-  let detail: String?
-  let action: () -> Void
-  init(id: String, title: String, icon: String, detail: String? = nil, action: @escaping () -> Void)
-  {
-    self.id = id
-    self.title = title
-    self.icon = icon
-    self.detail = detail
-    self.action = action
-  }
-}
-private struct PaletteSearchField: NSViewRepresentable {
-  @Binding var text: String
-  var submit: () -> Void
-  var move: (Int) -> Void
-  var cancel: () -> Void
-  func makeCoordinator() -> Coordinator { Coordinator(self) }
-  func makeNSView(context: Context) -> NSTextField {
-    let field = NSTextField()
-    field.focusRingType = .none
-    field.placeholderString = "Search or enter URL"
-    field.setAccessibilityLabel("Search tabs, Spaces, bookmarks, history, or the web")
-    field.isBordered = false
-    field.drawsBackground = false
-    field.font = .systemFont(ofSize: 20)
-    field.delegate = context.coordinator
-    DispatchQueue.main.async { field.window?.makeFirstResponder(field) }
-    return field
-  }
-  func updateNSView(_ field: NSTextField, context: Context) {
-    context.coordinator.parent = self
-    if field.stringValue != text { field.stringValue = text }
-  }
-  final class Coordinator: NSObject, NSTextFieldDelegate {
-    var parent: PaletteSearchField
-    init(_ parent: PaletteSearchField) { self.parent = parent }
-    func controlTextDidChange(_ obj: Notification) {
-      if let field = obj.object as? NSTextField { parent.text = field.stringValue }
-    }
-    func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool
-    {
-      switch selector {
-      case #selector(NSResponder.moveUp(_:)): parent.move(-1)
-      case #selector(NSResponder.moveDown(_:)): parent.move(1)
-      case #selector(NSResponder.insertNewline(_:)): parent.submit()
-      case #selector(NSResponder.cancelOperation(_:)): parent.cancel()
-      default: return false
-      }
-      return true
-    }
-  }
-}
-
 private enum SidebarSection: Equatable {
   case favorite, pinned, regular
   case folder(String)
@@ -908,53 +1320,45 @@ private enum SidebarSection: Equatable {
     stopHover()
     let work = DispatchWorkItem(block: action)
     hover = work
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.65, execute: work)
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.55, execute: work)
   }
-  func project(store: BrowserStore, space: String, section: SidebarSection, before: String?) {
-    guard let id, let source = store.tab(id),
+  func project(store: BrowserStore, space: String, section: SidebarSection, before: String?, after: Bool = false) {
+    guard let id, let source = store.tab(id), before != id,
       store.state.spaces.first(where: { $0.id == space })?.profileID == store.profileID(for: source)
     else { return }
-    var tabs = preview ?? store.state.tabs
-    let members = store.split(for: id)?.tabIDs ?? [id]
-    for member in members {
-      guard let index = tabs.firstIndex(where: { $0.id == member }) else { continue }
-      tabs[index].spaceID = space
-      tabs[index].folderID = section.folderID
-      tabs[index].isFavorite = section == .favorite
-      tabs[index].isPinned = section.pinned
+    var projected = preview ?? store.state.tabs
+    guard let index = projected.firstIndex(where: { $0.id == id }) else { return }
+    var moved = projected.remove(at: index)
+    moved.spaceID = space; moved.folderID = section.folderID
+    moved.isFavorite = section == .favorite; moved.isPinned = section.pinned
+    moved.savedURL = section.pinned ? (moved.savedURL ?? moved.url) : nil
+    if !section.pinned { moved.isClosed = false }
+    let destination: Int
+    if let before, let target = projected.firstIndex(where: { $0.id == before }) {
+      destination = target + (after ? 1 : 0)
+    } else {
+      let last = projected.lastIndex { tab in
+        if section == .favorite { return tab.isFavorite && store.profileID(for: tab) == store.activeProfileID }
+        guard tab.spaceID == space, !tab.isFavorite else { return false }
+        if let folder = section.folderID { return tab.folderID == folder }
+        return tab.folderID == nil && tab.isPinned == section.pinned
+      }
+      destination = last.map { $0 + 1 } ?? projected.count
     }
-    if let before, before != id, let from = tabs.firstIndex(where: { $0.id == id }) {
-      let moved = tabs.remove(at: from)
-      let destination = tabs.firstIndex(where: { $0.id == before }) ?? tabs.count
-      tabs.insert(moved, at: destination)
-    }
-    withAnimation(
-      NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? nil : .easeInOut(duration: 0.15)
-    ) { preview = tabs }
+    projected.insert(moved, at: min(projected.count, destination))
+    guard projected != preview else { return }
+    withAnimation(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? nil : .easeInOut(duration: 0.14)) { preview = projected }
   }
   func commit(store: BrowserStore, space: String, section: SidebarSection? = nil) -> Bool {
     guard let id, let source = store.tab(id),
       store.state.spaces.first(where: { $0.id == space })?.profileID == store.profileID(for: source)
-    else {
-      cancel()
-      return false
-    }
-    let members = store.split(for: id)?.tabIDs ?? [id]
-    let index = preview?.firstIndex(where: { $0.id == id })
-    store.moveTab(id: id, spaceID: space, folderID: section?.folderID, index: index)
-    if let section {
-      for member in members {
-        store.updateTab(member) { tab in
-          tab.isFavorite = section == .favorite
-          tab.isPinned = section.pinned
-          tab.savedURL = section.pinned ? (tab.savedURL ?? tab.url) : nil
-          if section == .regular { tab.isClosed = false }
-        }
-      }
-    }
-    cancel()
-    return true
+    else { cancel(); return false }
+    let index = section == nil ? nil : preview?.firstIndex(where: { $0.id == id })
+    store.moveTab(id: id, spaceID: space, folderID: section?.folderID, index: index,
+      pinned: section?.pinned, favorite: section.map { $0 == .favorite }, clearFolder: section != nil)
+    cancel(); return true
   }
+
 }
 private struct SidebarDropDelegate: DropDelegate {
   let store: BrowserStore
@@ -962,14 +1366,20 @@ private struct SidebarDropDelegate: DropDelegate {
   let section: SidebarSection
   let spaceID: String
   var before: String?
+  var extent: CGSize?
   func validateDrop(info: DropInfo) -> Bool { drag.id != nil }
   func dropEntered(info: DropInfo) {
     drag.stopHover()
-    drag.project(store: store, space: spaceID, section: section, before: before)
+    project(info)
   }
-  func dropUpdated(info: DropInfo) -> DropProposal? { DropProposal(operation: .move) }
+  private func project(_ info: DropInfo) {
+    let after = extent.map { section == .favorite ? info.location.x > $0.width / 2 : info.location.y > $0.height / 2 } ?? false
+    drag.project(store: store, space: spaceID, section: section, before: before, after: after)
+  }
+  func dropUpdated(info: DropInfo) -> DropProposal? { project(info); return DropProposal(operation: .move) }
   func performDrop(info: DropInfo) -> Bool {
-    drag.commit(store: store, space: spaceID, section: section)
+    project(info)
+    return drag.commit(store: store, space: spaceID, section: section)
   }
 }
 private struct SpaceHoverDropDelegate: DropDelegate {
@@ -1010,6 +1420,11 @@ private struct NativePalettePresenter: NSViewRepresentable {
   @Binding var isPresented: Bool
   var content: AnyView
   var motionScale: Double
+  var frame: CGRect? = nil
+  var presentationID: UInt64 = 0
+  var takesKey = true
+  var dismissOnOutsideClick = true
+  var dismissOnResign = true
 
   func makeCoordinator() -> Coordinator { Coordinator(self) }
   func makeNSView(context: Context) -> PaletteAnchorView {
@@ -1034,6 +1449,7 @@ private struct NativePalettePresenter: NSViewRepresentable {
     private var hosting: NSHostingView<AnyView>?
     private var observers: [NSObjectProtocol] = []
     private var mouseMonitor: Any?
+    private var lastPresentationID: UInt64?
     init(_ presenter: NativePalettePresenter) { self.presenter = presenter }
 
     func attach(to window: NSWindow?) {
@@ -1042,12 +1458,22 @@ private struct NativePalettePresenter: NSViewRepresentable {
         parent = window
       }
       guard presenter.isPresented, let parent else {
+        if presenter.isPresented { trace("awaiting parent") }
         hide()
         return
       }
-      if let hosting {
+      if let hosting, let panel {
         hosting.rootView = presenter.content
         resize()
+        // AppKit may hide a floating panel during native popup/application
+        // activation. An explicit command must always bring that panel back.
+        if !panel.isVisible || lastPresentationID != presenter.presentationID {
+          lastPresentationID = presenter.presentationID
+          panel.alphaValue = 1
+          if presenter.takesKey { panel.makeKeyAndOrderFront(nil) } else { panel.orderFront(nil) }
+          trace("restore panel \(panel.windowNumber)")
+        }
+        lastPresentationID = presenter.presentationID
         return
       }
       let panel = PalettePanel(
@@ -1060,15 +1486,17 @@ private struct NativePalettePresenter: NSViewRepresentable {
       panel.isReleasedWhenClosed = false
       panel.level = .floating
       panel.collectionBehavior = [.fullScreenAuxiliary, .transient]
-      panel.setAccessibilityLabel("Command palette")
-      let hosting = NSHostingView(rootView: presenter.content)
+      panel.setAccessibilityLabel(presenter.takesKey && presenter.dismissOnOutsideClick ? "Command palette" : "Browser controls")
+      let hosting = NativeOverlayHostingView(rootView: presenter.content)
       hosting.autoresizingMask = [.width, .height]
       panel.contentView = hosting
       self.hosting = hosting
       self.panel = panel
+      lastPresentationID = presenter.presentationID
       parent.addChildWindow(panel, ordered: .above)
       panel.alphaValue = presenter.motionScale > 0 ? 0 : 1
-      panel.makeKeyAndOrderFront(nil)
+      if presenter.takesKey { panel.makeKeyAndOrderFront(nil) } else { panel.orderFront(nil) }
+      trace("show panel \(panel.windowNumber) parent \(parent.windowNumber) frame \(panel.frame)")
       if presenter.motionScale > 0 {
         NSAnimationContext.runAnimationGroup { context in
           context.duration = 0.12 * presenter.motionScale
@@ -1087,21 +1515,28 @@ private struct NativePalettePresenter: NSViewRepresentable {
       observers.append(
         NotificationCenter.default.addObserver(
           forName: NSWindow.willCloseNotification, object: parent, queue: .main
-        ) { [weak self] _ in Task { @MainActor in self?.dismiss() } })
+        ) { [weak self, weak panel] _ in Task { @MainActor in
+          guard let self, let panel, self.panel === panel else { return }
+          self.dismiss(reason: "parent closed")
+        } })
       observers.append(
         NotificationCenter.default.addObserver(
           forName: NSApplication.didResignActiveNotification, object: nil, queue: .main
-        ) { [weak self] _ in Task { @MainActor in self?.dismiss() } })
+        ) { [weak self, weak panel] _ in Task { @MainActor in
+          guard let self, let panel, self.panel === panel, !NSApp.isActive,
+            self.presenter.dismissOnResign else { return }
+          self.dismiss(reason: "application resigned")
+        } })
       mouseMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) {
         [weak self] event in
-        guard let self, let parent = self.parent, let clicked = event.window,
+        guard let self, self.presenter.dismissOnOutsideClick, let parent = self.parent, let clicked = event.window,
           clicked !== self.panel
         else { return event }
         // Never inspect or consume mouse events from another app/window tree.
         var candidate: NSWindow? = clicked
         while let window = candidate {
           if window === parent {
-            self.dismiss()
+            self.dismiss(reason: "outside click")
             break
           }
           candidate = window.parent
@@ -1113,13 +1548,20 @@ private struct NativePalettePresenter: NSViewRepresentable {
       guard let view = window.contentView else {
         return window.contentRect(forFrameRect: window.frame)
       }
-      return window.convertToScreen(view.convert(view.bounds, to: nil))
+      let rect: CGRect
+      if let frame = presenter.frame {
+        // Shared browser geometry is top-left based; AppKit content views are not.
+        rect = view.isFlipped ? frame : CGRect(x: frame.minX, y: view.bounds.height - frame.maxY, width: frame.width, height: frame.height)
+      } else { rect = view.bounds }
+      return window.convertToScreen(view.convert(rect, to: nil))
     }
     private func resize() {
       guard let parent, let panel else { return }
-      panel.setFrame(contentRect(parent), display: true)
+      let next = contentRect(parent)
+      if panel.frame != next { panel.setFrame(next, display: true) }
     }
-    private func dismiss() {
+    private func dismiss(reason: String) {
+      trace("dismiss \(reason)")
       presenter.isPresented = false
       hide()
     }
@@ -1131,13 +1573,19 @@ private struct NativePalettePresenter: NSViewRepresentable {
         self.mouseMonitor = nil
       }
       guard let panel else { return }
+      trace("hide panel \(panel.windowNumber)")
       let restoreKey = NSApp.keyWindow === panel
       parent?.removeChildWindow(panel)
       panel.orderOut(nil)
       panel.contentView = nil
       hosting = nil
       self.panel = nil
+      lastPresentationID = nil
       if restoreKey, parent?.isVisible == true { parent?.makeKey() }
+    }
+    private func trace(_ message: String) {
+      guard ProcessInfo.processInfo.environment["ZACRO_NATIVE_LAYOUT_TRACE"] == "1" else { return }
+      fputs("[Native overlay] \(message); presented=\(presenter.isPresented) key=\(NSApp.keyWindow?.windowNumber ?? -1) active=\(NSApp.isActive)\n", stderr)
     }
   }
 }
@@ -1152,4 +1600,117 @@ private final class PaletteAnchorView: NSView {
 private final class PalettePanel: NSPanel {
   override var canBecomeKey: Bool { true }
   override var canBecomeMain: Bool { false }
+}
+
+/// Keep the original browser's unobtrusive scrolling even when macOS is set to
+/// show legacy scrollbars. Scrolling and accessibility scrolling remain intact.
+private final class NativeOverlayHostingView: NSHostingView<AnyView> {
+  override func layout() {
+    super.layout()
+    func visit(_ view: NSView) {
+      if let scroll = view as? NSScrollView {
+        if scroll.hasVerticalScroller { scroll.hasVerticalScroller = false }
+        if scroll.hasHorizontalScroller { scroll.hasHorizontalScroller = false }
+        scroll.autohidesScrollers = true
+      }
+      for child in view.subviews { visit(child) }
+    }
+    for child in subviews { visit(child) }
+  }
+}
+
+private struct NativeSplitDropOverlay: View {
+  @ObservedObject var store: BrowserStore
+  @ObservedObject var actions: BrowserActions
+  @ObservedObject var drag: SidebarDragSession
+  let colors: NativeSpacePalette
+  @State private var hovered: String?
+  var body: some View {
+    HStack(spacing: 6) {
+      ForEach(["left", "right"], id: \.self) { side in
+        ZStack {
+          RoundedRectangle(cornerRadius: store.state.settings.pageRadius)
+            .fill(colors.chrome.opacity(hovered == side ? 0.58 : 0))
+          Text("Split \(side)").font(.system(size: 13, weight: .semibold))
+            .foregroundStyle(colors.ink).padding(.horizontal, 14).padding(.vertical, 9)
+            .background(colors.card, in: RoundedRectangle(cornerRadius: 12))
+            .shadow(color: .black.opacity(0.15), radius: 6, y: 2)
+        }.contentShape(Rectangle())
+          .onDrop(of: [.plainText], isTargeted: Binding(get: { hovered == side }, set: { if $0 { hovered = side } else if hovered == side { hovered = nil } })) { _ in
+            guard let id = drag.id, let source = store.tab(id), let target = store.state.activeTab,
+              target.id != id, store.profileID(for: source) == store.activeProfileID,
+              store.split(for: id) == nil, store.split(for: target.id) == nil else { return false }
+            if source.spaceID != store.state.activeSpaceID && !source.isFavorite { store.moveTab(id: id, spaceID: store.state.activeSpaceID) }
+            if source.isClosed { store.updateTab(id) { $0.isClosed = false } }
+            store.setSplit(left: side == "left" ? id : target.id, right: side == "right" ? id : target.id)
+            store.selectTab(id: id); actions.activate(id); drag.cancel(); return true
+          }
+      }
+    }
+  }
+}
+
+private struct NativeFindBar: View {
+  @ObservedObject var actions: BrowserActions
+  let colors: NativeSpacePalette
+  var body: some View {
+    HStack(spacing: 3) {
+      NativeFindField(text: $actions.findQuery, ink: NSColor(colors.ink), muted: NSColor(colors.muted), changed: actions.updateFind,
+        next: actions.findNext, previous: actions.findPrevious, close: close)
+        .frame(minWidth: 80, maxWidth: 160)
+      Text(actions.findQuery.isEmpty ? "" : "\(actions.findActiveMatch) / \(actions.findMatchCount)")
+        .font(.system(size: 10)).monospacedDigit()
+        .foregroundStyle(!actions.findQuery.isEmpty && actions.findMatchCount == 0 ? .red : colors.muted)
+      Button(action: actions.findPrevious) { NativeGlyph("chevron.up").frame(width: 26, height: 26) }
+        .help("Previous match").accessibilityLabel("Previous match")
+      Button(action: actions.findNext) { NativeGlyph("chevron.down").frame(width: 26, height: 26) }
+        .help("Next match").accessibilityLabel("Next match")
+      Button(action: close) { NativeGlyph("xmark").frame(width: 26, height: 26) }
+        .help("Close find").accessibilityLabel("Close find")
+    }.buttonStyle(.plain).font(.system(size: 12)).padding(.leading, 8).padding(.trailing, 5)
+      .frame(maxWidth: .infinity, maxHeight: .infinity)
+      .foregroundStyle(colors.ink).background { NativeControlSurface().overlay(colors.card.opacity(0.84)).clipShape(RoundedRectangle(cornerRadius: 7)) }
+      .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(colors.ink.opacity(0.1), lineWidth: 1))
+      .shadow(color: .black.opacity(0.09), radius: 7, y: 4)
+  }
+  private func close() { actions.findVisible = false; actions.closeFind() }
+}
+private struct NativeFindField: NSViewRepresentable {
+  @Binding var text: String
+  let ink: NSColor
+  let muted: NSColor
+  let changed: (String) -> Void
+  let next: () -> Void
+  let previous: () -> Void
+  let close: () -> Void
+  func makeCoordinator() -> Coordinator { Coordinator(self) }
+  func makeNSView(context: Context) -> NSTextField {
+    let field = NSTextField(); field.font = .systemFont(ofSize: 12); field.drawsBackground = false; field.isBordered = false
+    field.focusRingType = .none; field.placeholderString = "Find on page"; field.delegate = context.coordinator
+    field.setAccessibilityLabel("Find on page")
+    DispatchQueue.main.async { field.window?.makeFirstResponder(field); field.selectText(nil) }
+    return field
+  }
+  func updateNSView(_ field: NSTextField, context: Context) {
+    context.coordinator.parent = self
+    field.textColor = ink
+    field.placeholderAttributedString = NSAttributedString(string: "Find on page", attributes: [.foregroundColor: muted, .font: NSFont.systemFont(ofSize: 12)])
+    if field.stringValue != text { field.stringValue = text }
+  }
+  final class Coordinator: NSObject, NSTextFieldDelegate {
+    var parent: NativeFindField
+    init(_ parent: NativeFindField) { self.parent = parent }
+    func controlTextDidChange(_ notification: Notification) {
+      guard let field = notification.object as? NSTextField else { return }
+      parent.text = field.stringValue; parent.changed(field.stringValue)
+    }
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
+      if selector == #selector(NSResponder.cancelOperation(_:)) { parent.close(); return true }
+      if selector == #selector(NSResponder.insertNewline(_:)) {
+        if NSApp.currentEvent?.modifierFlags.contains(.shift) == true { parent.previous() } else { parent.next() }
+        return true
+      }
+      return false
+    }
+  }
 }

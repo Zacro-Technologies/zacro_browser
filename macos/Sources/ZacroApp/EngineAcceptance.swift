@@ -10,9 +10,22 @@ final class EngineAcceptance {
   private var stage = 0
   private var started = Date()
   private var pages: [ChromiumPage] = []
+  private var task: Task<Void, Never>?
+  private var finished = false
+  private var checks: [String: Bool] = [:]
+  private var capabilities: [String: Bool] = [:]
+  private var popup: ChromiumPage?
   init(engine: ChromiumEngine) { self.engine = engine }
   func run(url: URL) {
-    DispatchQueue.main.async { [self] in startPages(url: url) }
+    task = Task { @MainActor [self] in
+      do {
+        let probeStarted = Date()
+        do { _ = try await engine.nativeCapabilities() }
+        catch let error as CefDevToolsError where error.isUnsupportedMethod { /* Stock runtime. */ }
+        try require(Date().timeIntervalSince(probeStarted) < 3, "coldRuntimeCapabilityProbe")
+        startPages(url: url)
+      } catch { finish(error: error.localizedDescription) }
+    }
   }
   private func startPages(url: URL) {
     pages = [
@@ -32,7 +45,7 @@ final class EngineAcceptance {
     }
   }
   private func tick() {
-    if Date().timeIntervalSince(started) > 25 {
+    if Date().timeIntervalSince(started) > 40 {
       finish(error: "Timed out at stage \(stage)")
       return
     }
@@ -81,17 +94,118 @@ final class EngineAcceptance {
         finish(error: "Hidden document lost state")
         return
       }
-      finish(error: nil)
+      stage = 3
+      task = Task { [weak self] in
+        guard let self else { return }
+        do { try await self.checkNativeProtocols(); self.finish(error: nil) }
+        catch { self.finish(error: error.localizedDescription) }
+      }
     default: break
     }
   }
+  private struct Failure: LocalizedError {
+    let message: String
+    var errorDescription: String? { message }
+  }
+  private func require(_ condition: Bool, _ name: String) throws {
+    guard condition else { throw Failure(message: name) }; checks[name] = true
+  }
+  private func checkNativeProtocols() async throws {
+    guard let page = pages.first, let browser = page.browser, let url = page.url else { throw Failure(message: "Missing test document") }
+    let value = try await browser.devTools.evaluate("({number:42,text:'native-json'})") as? [String: Any]
+    try require(value?["number"] as? Int == 42 && value?["text"] as? String == "native-json", "devToolsJSON")
+    let icon = await browser.downloadFavicon(url.appendingPathComponent("favicon.svg"))
+    try require(icon?.prefix(8) == Data([137, 80, 78, 71, 13, 10, 26, 10]), "nativeSVGFaviconDecode")
+    do {
+      let nativeTab = try await browser.devTools.nativeTabTarget()
+      capabilities["trustedNativeTabTarget"] = !nativeTab.isEmpty
+    } catch { capabilities["trustedNativeTabTarget"] = false }
+    do {
+      _ = try await browser.devTools.evaluate("Promise.reject(new Error('expected-acceptance-error'))")
+      throw Failure(message: "JavaScript rejection was reported as success")
+    } catch let error as CefDevToolsError {
+      try require(error.localizedDescription.contains("expected-acceptance-error"), "devToolsRejection")
+    }
+    _ = try await browser.devTools.evaluate("window.zacroMainWorldMarker='private-to-page'; document.body.innerHTML='<input id=retained value=initial><p>Local engine check</p>'; document.querySelector('input').value='unsaved-form-value'; null")
+    let isolated = try await browser.devTools.evaluateIsolated("typeof window.zacroMainWorldMarker") as? String
+    try require(isolated == "undefined", "isolatedWorld")
+    let response = try await browser.fetchResource(url, maximumBytes: 1024 * 1024)
+    try require(response.status == 200 && String(data: response.data, encoding: .utf8)?.contains("acceptance") == true, "profileResourceFetch")
+    do {
+      _ = try await browser.fetchResource(url, maximumBytes: 8)
+      throw Failure(message: "Resource limit was ignored")
+    } catch let error as CefResourceError {
+      try require(error == .tooLarge, "resourceByteLimit")
+    }
+    let nativeID = browser.id
+    let adopted = engine.adoptPage(fromID: page.id, toID: "acceptance-promoted")
+    try require(adopted === page && adopted?.browser?.id == nativeID, "documentAdoptionIdentity")
+    let draft = try await browser.devTools.evaluate("document.querySelector('input').value") as? String
+    try require(draft == "unsaved-form-value", "documentAdoptionRetainsForm")
+    page.onPopupCreated = { [weak self] child, _ in self?.popup = child }
+    _ = try await browser.devTools.evaluate("window.zacroPopup=window.open('about:blank','zacro-acceptance-popup'); !!window.zacroPopup", userGesture: true)
+    let deadline = Date().addingTimeInterval(5)
+    while popup?.browser == nil, Date() < deadline { try await Task.sleep(nanoseconds: 50_000_000) }
+    guard let popup, let popupBrowser = popup.browser else { throw Failure(message: "Native popup was not adopted") }
+    let opener = try await popupBrowser.devTools.evaluate("!!window.opener && window.opener.zacroMainWorldMarker==='private-to-page'") as? Bool
+    try require(opener == true && popup.profileID == page.profileID, "popupRetainsOpener")
+    _ = try await popupBrowser.devTools.evaluate("window.opener.zacroPopupReply='retained-callback'; null")
+    let reply = try await browser.devTools.evaluate("window.zacroPopupReply") as? String
+    try require(reply == "retained-callback", "popupCallback")
+    let manager = ChromeExtensionManager(engine: engine, profileID: "a")
+    let snapshot = try await manager.snapshot()
+    try require(snapshot.extensions.allSatisfy { $0.id.count == 32 }, "nativeExtensionRegistry")
+    let initial = engine.page(id: "acceptance-initial", profileID: "a", isPrivate: false, url: nil)
+    let initialBrowser = try await initial.ready()
+    try require(initialBrowser.id >= 0 && initial.browser === initialBrowser, "nativeDocumentReadiness")
+    let initialAddress = initialBrowser.url
+    let probeStarted = Date()
+    do { _ = try await engine.nativeCapabilities() }
+    catch let error as CefDevToolsError where error.isUnsupportedMethod { /* Stock runtime, explicitly unsupported. */ }
+    try require(Date().timeIntervalSince(probeStarted) < 3 && initialBrowser.url == initialAddress,
+      "freshDocumentCapabilityProbe")
+    let firstLoadStarted = Date()
+    initial.load(url)
+    while (initialBrowser.url != url || initialBrowser.isLoading), Date().timeIntervalSince(firstLoadStarted) < 5 {
+      try await Task.sleep(for: .milliseconds(30))
+    }
+    try require(initialBrowser.url == url && !initialBrowser.isLoading,
+      "freshDocumentFirstLoad")
+    var closeAttempts = 0
+    popup.beforeClose = {
+      closeAttempts += 1
+      _ = try? await popupBrowser.devTools.evaluate("window.opener.zacroPopupReply")
+      return closeAttempts > 1
+    }
+    popup.close()
+    let cancellationDeadline = Date().addingTimeInterval(3)
+    while closeAttempts == 0, Date() < cancellationDeadline { try await Task.sleep(for: .milliseconds(30)) }
+    try await Task.sleep(for: .milliseconds(100))
+    try require(closeAttempts == 1 && popup.browser === popupBrowser, "nativeClosePreparationCancellation")
+    popup.close()
+    let closeDeadline = Date().addingTimeInterval(3)
+    while popup.browser != nil, Date() < closeDeadline { try await Task.sleep(for: .milliseconds(30)) }
+    try require(popup.browser == nil && closeAttempts == 2, "nativeClosePreparationRetry")
+    // Keep a real native popup alive through multi-profile shutdown. Closing
+    // it earlier missed the longer GUI sequence that exposed teardown hangs.
+    self.popup = nil
+    _ = try await browser.devTools.evaluate("window.zacroQuitPopup=window.open(location.href+'?retained-popup=1','zacro-quit-popup'); !!window.zacroQuitPopup", userGesture: true)
+    let retainedDeadline = Date().addingTimeInterval(5)
+    while (self.popup?.browser == nil || self.popup?.isLoading == true), Date() < retainedDeadline {
+      try await Task.sleep(for: .milliseconds(30))
+    }
+    try require(self.popup?.browser != nil, "retainedPopupForTermination")
+  }
   private func finish(error: String?) {
+    guard !finished else { return }; finished = true
     timer?.invalidate()
     timer = nil
     let result: [String: Any] = [
       "passed": error == nil, "error": error ?? "", "documents": pages.count,
       "chromeRuntime": pages.allSatisfy { $0.browser?.isChromeRuntime == true },
       "extensionCompatibilityVerified": false,
+      "checks": checks,
+      "capabilities": capabilities,
       "pages": pages.map {
         [
           "id": $0.id, "nativeID": $0.browser?.id ?? -999, "url": $0.url?.absoluteString ?? "",

@@ -70,6 +70,7 @@
 #include "include/capi/cef_registration_capi.h"
 #include "include/capi/cef_render_handler_capi.h"
 #include "include/capi/cef_request_capi.h"
+#include "include/capi/cef_urlrequest_capi.h"
 #include "include/capi/cef_request_context_capi.h"
 #include "include/capi/cef_request_context_handler_capi.h"
 #include "include/capi/cef_request_handler_capi.h"

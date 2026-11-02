@@ -1,0 +1,691 @@
+--- a/extensions/browser/api/storage/storage_frontend.h
++++ b/extensions/browser/api/storage/storage_frontend.h
+@@ -9,6 +9,7 @@
+ #include <memory>
+ #include <string>
+ 
++#include "base/callback_list.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/scoped_refptr.h"
+ #include "base/memory/weak_ptr.h"
+@@ -136,20 +137,40 @@
+   void Set(scoped_refptr<const Extension> extension,
+            StorageAreaNamespace storage_area,
+            base::DictValue values,
+-           base::OnceCallback<void(ResultStatus)> callback);
++           base::OnceCallback<void(ResultStatus)> callback,
++           std::string origin = {});
+ 
+   // For a given `extension` and `storage_area`, removes the items specified by
+   // `keys` from storage and fires `callback`.
+   void Remove(scoped_refptr<const Extension> extension,
+               StorageAreaNamespace storage_area,
+               const std::vector<std::string>& keys,
+-              base::OnceCallback<void(ResultStatus)> callback);
++              base::OnceCallback<void(ResultStatus)> callback,
++              std::string origin = {});
+ 
+   // For a given `extension` and `storage_area`, clears the storage and fires
+   // `callback`.
+   void Clear(scoped_refptr<const Extension> extension,
+              StorageAreaNamespace storage_area,
+-             base::OnceCallback<void(ResultStatus)> callback);
++             base::OnceCallback<void(ResultStatus)> callback,
++             std::string origin = {});
++
++  // Applies one native cloud patch against an exact snapshot. The backend
++  // validates final quotas and commits additions/removals in one transaction.
++  void ApplyNativeChanges(scoped_refptr<const Extension> extension,
++                          StorageAreaNamespace storage_area,
++                          base::DictValue expected,
++                          base::DictValue changes,
++                          base::OnceCallback<void(ResultStatus)> callback,
++                          std::string origin);
++
++  // Browser-process observation, independent of extension JS listeners.
++  // Native synchronization supplies an origin to avoid echoing remote writes.
++  using NativeChangesCallback = base::RepeatingCallback<void(
++      const ExtensionId&, StorageAreaNamespace, const base::Value&,
++      const std::string&, const Extension*)>;
++  base::CallbackListSubscription ObserveNativeChanges(
++      NativeChangesCallback callback);
+ 
+   // Gets the Settings change callback.
+   SettingsChangedCallback GetObserver();
+@@ -195,8 +216,9 @@
+   // Should be called on the UI thread after a write has been performed in
+   // `storage_area`. Fires events if any values were changed and then runs
+   // `callback` with the `result` from the write operation.
+-  void OnWriteFinished(const ExtensionId& extension_id,
++  void OnWriteFinished(scoped_refptr<const Extension> extension,
+                        StorageAreaNamespace storage_area,
++                       std::string origin,
+                        base::OnceCallback<void(ResultStatus)> callback,
+                        value_store::ValueStore::WriteResult result);
+ 
+@@ -208,6 +230,18 @@
+                          std::optional<api::storage::AccessLevel> access_level,
+                          base::Value changes);
+ 
++  void OnSettingsChangedWithOrigin(
++      const ExtensionId& extension_id,
++      StorageAreaNamespace storage_area,
++      std::optional<api::storage::AccessLevel> access_level,
++      base::Value changes,
++      const std::string& origin,
++      const Extension* mutation_owner = nullptr);
++
++  base::RepeatingCallbackList<void(
++      const ExtensionId&, StorageAreaNamespace, const base::Value&,
++      const std::string&, const Extension*)> native_change_observers_;
++
+   // The (non-incognito) browser context this Frontend belongs to.
+   const raw_ptr<content::BrowserContext> browser_context_;
+ 
+--- a/extensions/browser/api/storage/storage_frontend.cc
++++ b/extensions/browser/api/storage/storage_frontend.cc
+@@ -142,6 +142,17 @@
+       FROM_HERE, base::BindOnce(std::move(callback), size));
+ }
+ 
++void ApplyNativeChangesWithValueStore(
++    base::DictValue expected,
++    base::DictValue replacement,
++    base::OnceCallback<void(ValueStore::WriteResult)> callback,
++    ValueStore* store) {
++  ValueStore::WriteResult result =
++      store->CompareAndReplace(expected, replacement);
++  content::GetUIThreadTaskRunner({})->PostTask(
++      FROM_HERE, base::BindOnce(std::move(callback), std::move(result)));
++}
++
+ void SetWithValueStore(
+     StorageAreaNamespace storage_area,
+     const base::DictValue& values,
+@@ -300,18 +311,21 @@
+ }
+ 
+ void StorageFrontend::OnWriteFinished(
+-    const ExtensionId& extension_id,
+-    StorageAreaNamespace storage_area,
++    scoped_refptr<const Extension> extension,
++    StorageAreaNamespace storage_area,
++    std::string origin,
+     base::OnceCallback<void(StorageFrontend::ResultStatus)> callback,
+     ValueStore::WriteResult result) {
++  const ExtensionId& extension_id = extension->id();
+   bool success = result.status().ok();
+ 
+   if (success && !result.changes().empty()) {
+-    OnSettingsChanged(
++    OnSettingsChangedWithOrigin(
+         extension_id, storage_area,
+         storage_utils::GetAccessLevelForArea(extension_id, *browser_context_,
+                                              storage_area),
+-        value_store::ValueStoreChange::ToValue(result.PassChanges()));
++        value_store::ValueStoreChange::ToValue(result.PassChanges()), origin,
++        extension.get());
+   }
+ 
+   ResultStatus status;
+@@ -436,10 +450,54 @@
+                                 std::move(callback)));
+ }
+ 
++void StorageFrontend::ApplyNativeChanges(
++    scoped_refptr<const Extension> extension,
++    StorageAreaNamespace storage_area,
++    base::DictValue expected,
++    base::DictValue changes,
++    base::OnceCallback<void(ResultStatus)> callback,
++    std::string origin) {
++  DCHECK_CURRENTLY_ON(BrowserThread::UI);
++  base::DictValue replacement = expected.Clone();
++  bool valid = storage_area == StorageAreaNamespace::kSync &&
++               !browser_context_->IsOffTheRecord() &&
++               origin.starts_with("zacro.remote:") && origin.size() <= 512 &&
++               expected.size() <= 512 && changes.size() <= 1024;
++  for (const auto [key, value] : changes) {
++    const base::DictValue* change = value.GetIfDict();
++    if (!change || change->size() > 1 ||
++        (!change->empty() && !change->contains("newValue"))) {
++      valid = false;
++      break;
++    }
++    if (const base::Value* next = change->Find("newValue"))
++      replacement.Set(key, next->Clone());
++    else
++      replacement.Remove(key);
++  }
++  if (!valid || !IsStorageEnabled(settings_namespace::SYNC)) {
++    ResultStatus status;
++    status.success = false;
++    status.error = "Invalid native storage patch.";
++    content::GetUIThreadTaskRunner({})->PostTask(
++        FROM_HERE, base::BindOnce(std::move(callback), std::move(status)));
++    return;
++  }
++  RunWithStorage(
++      extension, settings_namespace::SYNC,
++      base::BindOnce(&ApplyNativeChangesWithValueStore, std::move(expected),
++                    std::move(replacement),
++                    base::BindOnce(&StorageFrontend::OnWriteFinished,
++                                   weak_factory_.GetWeakPtr(), extension,
++                                   storage_area, std::move(origin),
++                                   std::move(callback))));
++}
++
+ void StorageFrontend::Set(scoped_refptr<const Extension> extension,
+                           StorageAreaNamespace storage_area,
+                           base::DictValue values,
+-                          base::OnceCallback<void(ResultStatus)> callback) {
++                          base::OnceCallback<void(ResultStatus)> callback,
++                          std::string origin) {
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
+ 
+   if (storage_area == StorageAreaNamespace::kSession) {
+@@ -457,10 +515,12 @@
+                                         changes, &error);
+ 
+     if (success && !changes.empty()) {
+-      OnSettingsChanged(extension->id(), storage_area,
+-                        storage_utils::GetAccessLevelForArea(
+-                            extension->id(), *browser_context_, storage_area),
+-                        storage_utils::ValueChangeToValue(std::move(changes)));
++      OnSettingsChangedWithOrigin(
++          extension->id(), storage_area,
++          storage_utils::GetAccessLevelForArea(
++              extension->id(), *browser_context_, storage_area),
++          storage_utils::ValueChangeToValue(std::move(changes)), origin,
++          extension.get());
+     }
+ 
+     ResultStatus status;
+@@ -483,14 +543,16 @@
+       extension, settings_namespace,
+       base::BindOnce(&SetWithValueStore, storage_area, std::move(values),
+                      base::BindOnce(&StorageFrontend::OnWriteFinished,
+-                                    weak_factory_.GetWeakPtr(), extension->id(),
+-                                    storage_area, std::move(callback))));
++                                    weak_factory_.GetWeakPtr(), extension,
++                                    storage_area, std::move(origin),
++                                    std::move(callback))));
+ }
+ 
+ void StorageFrontend::Remove(scoped_refptr<const Extension> extension,
+                              StorageAreaNamespace storage_area,
+                              const std::vector<std::string>& keys,
+-                             base::OnceCallback<void(ResultStatus)> callback) {
++                             base::OnceCallback<void(ResultStatus)> callback,
++                             std::string origin) {
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
+ 
+   if (storage_area == StorageAreaNamespace::kSession) {
+@@ -501,10 +563,12 @@
+     storage_manager->Remove(extension->id(), keys, changes);
+ 
+     if (!changes.empty()) {
+-      OnSettingsChanged(extension->id(), storage_area,
+-                        storage_utils::GetAccessLevelForArea(
+-                            extension->id(), *browser_context_, storage_area),
+-                        storage_utils::ValueChangeToValue(std::move(changes)));
++      OnSettingsChangedWithOrigin(
++          extension->id(), storage_area,
++          storage_utils::GetAccessLevelForArea(
++              extension->id(), *browser_context_, storage_area),
++          storage_utils::ValueChangeToValue(std::move(changes)), origin,
++          extension.get());
+     }
+ 
+     // Using a task here is important since we want to consistently fire the
+@@ -524,14 +588,16 @@
+       extension, settings_namespace,
+       base::BindOnce(&RemoveWithValueStore, storage_area, keys,
+                      base::BindOnce(&StorageFrontend::OnWriteFinished,
+-                                    weak_factory_.GetWeakPtr(), extension->id(),
+-                                    storage_area, std::move(callback))));
++                                    weak_factory_.GetWeakPtr(), extension,
++                                    storage_area, std::move(origin),
++                                    std::move(callback))));
+ }
+ 
+ void StorageFrontend::Clear(
+     scoped_refptr<const Extension> extension,
+     StorageAreaNamespace storage_area,
+-    base::OnceCallback<void(StorageFrontend::ResultStatus)> callback) {
++    base::OnceCallback<void(StorageFrontend::ResultStatus)> callback,
++    std::string origin) {
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
+ 
+   if (storage_area == StorageAreaNamespace::kSession) {
+@@ -542,10 +608,12 @@
+     storage_manager->Clear(extension->id(), changes);
+ 
+     if (!changes.empty()) {
+-      OnSettingsChanged(extension->id(), storage_area,
+-                        storage_utils::GetAccessLevelForArea(
+-                            extension->id(), *browser_context_, storage_area),
+-                        storage_utils::ValueChangeToValue(std::move(changes)));
++      OnSettingsChangedWithOrigin(
++          extension->id(), storage_area,
++          storage_utils::GetAccessLevelForArea(
++              extension->id(), *browser_context_, storage_area),
++          storage_utils::ValueChangeToValue(std::move(changes)), origin,
++          extension.get());
+     }
+ 
+     // Using a task here is important since we want to consistently fire the
+@@ -565,8 +633,9 @@
+       extension, settings_namespace,
+       base::BindOnce(&ClearWithValueStore, storage_area,
+                      base::BindOnce(&StorageFrontend::OnWriteFinished,
+-                                    weak_factory_.GetWeakPtr(), extension->id(),
+-                                    storage_area, std::move(callback))));
++                                    weak_factory_.GetWeakPtr(), extension,
++                                    storage_area, std::move(origin),
++                                    std::move(callback))));
+ }
+ 
+ ValueStoreCache* StorageFrontend::GetValueStoreCache(
+@@ -615,6 +684,12 @@
+   }
+ }
+ 
++base::CallbackListSubscription StorageFrontend::ObserveNativeChanges(
++    NativeChangesCallback callback) {
++  DCHECK_CURRENTLY_ON(BrowserThread::UI);
++  return native_change_observers_.Add(std::move(callback));
++}
++
+ SettingsChangedCallback StorageFrontend::GetObserver() {
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
+   return base::BindRepeating(&StorageFrontend::OnSettingsChanged,
+@@ -646,7 +721,22 @@
+     StorageAreaNamespace storage_area,
+     std::optional<api::storage::AccessLevel> access_level,
+     base::Value changes) {
+-  DCHECK_CURRENTLY_ON(BrowserThread::UI);
++  OnSettingsChangedWithOrigin(extension_id, storage_area, access_level,
++                              std::move(changes), std::string());
++}
++
++void StorageFrontend::OnSettingsChangedWithOrigin(
++    const ExtensionId& extension_id,
++    StorageAreaNamespace storage_area,
++    std::optional<api::storage::AccessLevel> access_level,
++    base::Value changes,
++    const std::string& origin,
++    const Extension* mutation_owner) {
++  DCHECK_CURRENTLY_ON(BrowserThread::UI);
++  // Notify before listener filtering: an extension need not listen to its own
++  // writes for those changes to synchronize through the native host.
++  native_change_observers_.Notify(extension_id, storage_area, changes, origin,
++                                  mutation_owner);
+   TRACE_EVENT1("browser", "StorageFrontend::OnSettingsChanged", "extension_id",
+                extension_id);
+ 
+--- a/extensions/browser/api/storage/storage_api.cc
++++ b/extensions/browser/api/storage/storage_api.cc
+@@ -380,7 +380,8 @@
+   frontend->Set(
+       extension(), storage_area(), std::move(input).TakeDict(),
+       base::BindOnce(&StorageStorageAreaSetFunction::OnWriteOperationFinished,
+-                     this));
++                     this),
++      browser_context()->IsOffTheRecord() ? "zacro.private" : std::string());
+ 
+   return RespondLater();
+ }
+@@ -415,7 +416,8 @@
+   frontend->Remove(
+       extension(), storage_area(), keys,
+       base::BindOnce(
+-          &StorageStorageAreaRemoveFunction::OnWriteOperationFinished, this));
++          &StorageStorageAreaRemoveFunction::OnWriteOperationFinished, this),
++      browser_context()->IsOffTheRecord() ? "zacro.private" : std::string());
+ 
+   return RespondLater();
+ }
+@@ -430,7 +432,8 @@
+   frontend->Clear(
+       extension(), storage_area(),
+       base::BindOnce(&StorageStorageAreaClearFunction::OnWriteOperationFinished,
+-                     this));
++                     this),
++      browser_context()->IsOffTheRecord() ? "zacro.private" : std::string());
+ 
+   return RespondLater();
+ }
+--- a/extensions/browser/api/storage/storage_frontend_unittest.cc
++++ b/extensions/browser/api/storage/storage_frontend_unittest.cc
+@@ -12,7 +12,11 @@
+ #include "base/run_loop.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/test/metrics/histogram_tester.h"
++#include "base/test/test_future.h"
+ #include "components/value_store/value_store.h"
++#include "components/value_store/leveldb_value_store.h"
++#include "extensions/browser/api/storage/settings_storage_quota_enforcer.h"
++#include "extensions/browser/extension_registry.h"
+ #include "components/value_store/value_store_factory_impl.h"
+ #include "content/public/browser/browser_context.h"
+ #include "content/public/test/test_browser_context.h"
+@@ -414,4 +418,142 @@
+                                     1);
+ }
+ 
++// Native observation preserves JS dispatch while recording causal write origin.
++TEST_F(ExtensionSettingsFrontendTest,
++       NativeAtomicPatchValidatesFinalQuotaAndPreservesDataOnFailure) {
++  SettingsStorageQuotaEnforcer store(
++      {.quota_bytes = 20, .quota_bytes_per_item = 10, .max_items = 2},
++      std::make_unique<value_store::LeveldbValueStore>(
++          "NativeSyncTest", temp_dir_.GetPath().AppendASCII("native-atomic")));
++  base::DictValue old = base::DictValue().Set("old", 1).Set("keep", 2);
++  base::DictValue next = base::DictValue().Set("keep", 2).Set("new", 3);
++  ASSERT_TRUE(store.Set(ValueStore::DEFAULTS, old).status().ok());
++  // Already at max_items: one delete and one add must succeed as one change.
++  auto accepted = store.CompareAndReplace(old, next);
++  ASSERT_TRUE(accepted.status().ok());
++  EXPECT_EQ(accepted.changes().size(), 2u);
++  EXPECT_EQ(store.Get().settings(), next);
++  EXPECT_EQ(store.GetBytesInUse(), 9u);
++
++  EXPECT_FALSE(store.CompareAndReplace(old, base::DictValue()).status().ok());
++  EXPECT_EQ(store.Get().settings(), next);
++  auto oversized = next.Clone();
++  oversized.Set("new", std::string(20, 'a'));
++  EXPECT_EQ(store.CompareAndReplace(next, oversized).status().code,
++            ValueStore::QUOTA_EXCEEDED);
++  EXPECT_EQ(store.Get().settings(), next);
++  EXPECT_EQ(store.GetBytesInUse(), 9u);
++  auto too_many = next.Clone();
++  too_many.Set("third", 4);
++  EXPECT_EQ(store.CompareAndReplace(next, too_many).status().code,
++            ValueStore::QUOTA_EXCEEDED);
++  EXPECT_EQ(store.Get().settings(), next);
++}
++
++TEST_F(ExtensionSettingsFrontendTest,
++       NativeObserverReceivesWritesWithoutJavaScriptListeners) {
++  const std::string id(32, 'a');
++  auto extension = settings_test_util::AddExtensionWithId(
++      browser_context(), id, Manifest::Type::kExtension);
++  std::vector<std::string> origins;
++  std::vector<base::Value> changes;
++  auto subscription = frontend_->ObserveNativeChanges(base::BindRepeating(
++      [&origins, &changes, &id, &extension](const ExtensionId& extension_id,
++                               StorageAreaNamespace area,
++                               const base::Value& delta,
++                               const std::string& origin,
++                               const Extension* owner) {
++        EXPECT_EQ(owner, extension.get());
++        EXPECT_EQ(extension_id, id);
++        EXPECT_EQ(area, StorageAreaNamespace::kLocal);
++        origins.push_back(origin);
++        changes.push_back(delta.Clone());
++      }));
++  {
++    base::test::TestFuture<StorageFrontend::ResultStatus> completed;
++    frontend_->Set(extension, StorageAreaNamespace::kLocal,
++                   base::DictValue().Set("first", 1), completed.GetCallback(),
++                   "remote:set");
++    ASSERT_TRUE(completed.Get().success);
++  }
++  {
++    base::test::TestFuture<StorageFrontend::ResultStatus> completed;
++    frontend_->Set(extension, StorageAreaNamespace::kLocal,
++                   base::DictValue().Set("second", 2), completed.GetCallback());
++    ASSERT_TRUE(completed.Get().success);
++  }
++  {
++    base::test::TestFuture<StorageFrontend::ResultStatus> completed;
++    frontend_->Remove(extension, StorageAreaNamespace::kLocal, {"first"},
++                      completed.GetCallback(), "remote:remove");
++    ASSERT_TRUE(completed.Get().success);
++  }
++  {
++    base::test::TestFuture<StorageFrontend::ResultStatus> completed;
++    frontend_->Clear(extension, StorageAreaNamespace::kLocal,
++                     completed.GetCallback(), "remote:clear");
++    ASSERT_TRUE(completed.Get().success);
++  }
++  EXPECT_EQ(origins, (std::vector<std::string>{
++      "remote:set", "", "remote:remove", "remote:clear"}));
++  ASSERT_EQ(changes.size(), 4u);
++  ASSERT_TRUE(changes[0].GetDict().FindDict("first"));
++  EXPECT_EQ(changes[0].GetDict().FindDict("first")->FindInt("newValue"), 1);
++  ASSERT_TRUE(changes[2].GetDict().FindDict("first"));
++  EXPECT_FALSE(changes[2].GetDict().FindDict("first")->contains("newValue"));
++  ASSERT_TRUE(changes[3].GetDict().FindDict("second"));
++  EXPECT_EQ(changes[3].GetDict().FindDict("second")->FindInt("oldValue"), 2);
++}
++
++TEST_F(ExtensionSettingsFrontendTest,
++       NativeObserverReceivesBackendChangesAndCanUnsubscribe) {
++  const std::string id(32, 'b');
++  auto extension = settings_test_util::AddExtensionWithId(
++      browser_context(), id, Manifest::Type::kExtension);
++  int calls = 0;
++  auto subscription = frontend_->ObserveNativeChanges(base::BindRepeating(
++      [&calls](const ExtensionId&, StorageAreaNamespace area,
++               const base::Value& delta, const std::string& origin,
++               const Extension* owner) {
++        EXPECT_EQ(owner, nullptr);
++        ++calls;
++        EXPECT_EQ(area, StorageAreaNamespace::kSync);
++        EXPECT_TRUE(origin.empty());
++        EXPECT_TRUE(delta.GetDict().contains("key"));
++      }));
++  auto callback = frontend_->GetObserver();
++  callback.Run(id, StorageAreaNamespace::kSync, std::nullopt,
++               base::Value(base::DictValue().Set(
++                   "key", base::DictValue().Set("newValue", "value"))));
++  EXPECT_EQ(calls, 1);
++  subscription = {};
++  callback.Run(id, StorageAreaNamespace::kSync, std::nullopt,
++               base::Value(base::DictValue().Set(
++                   "key", base::DictValue().Set("newValue", "later"))));
++  EXPECT_EQ(calls, 1);
++}
++
++TEST_F(ExtensionSettingsFrontendTest,
++       NativeObserverRetainsOriginalWriterAcrossRegistryReplacement) {
++  const std::string id(32, 'c');
++  auto old_extension = settings_test_util::AddExtensionWithId(
++      browser_context(), id, Manifest::Type::kExtension);
++  const Extension* observed_owner = nullptr;
++  auto subscription = frontend_->ObserveNativeChanges(base::BindRepeating(
++      [&observed_owner](const ExtensionId&, StorageAreaNamespace,
++                        const base::Value&, const std::string&,
++                        const Extension* owner) { observed_owner = owner; }));
++  base::test::TestFuture<StorageFrontend::ResultStatus> completed;
++  frontend_->Set(old_extension, StorageAreaNamespace::kLocal,
++                 base::DictValue().Set("old-writer", 1), completed.GetCallback());
++  auto* registry = ExtensionRegistry::Get(browser_context());
++  ASSERT_TRUE(registry->RemoveEnabled(id));
++  auto replacement = settings_test_util::AddExtensionWithId(
++      browser_context(), id, Manifest::Type::kExtension);
++  ASSERT_NE(old_extension.get(), replacement.get());
++  ASSERT_TRUE(completed.Get().success);
++  EXPECT_EQ(observed_owner, old_extension.get());
++  EXPECT_NE(observed_owner, registry->GetInstalledExtension(id));
++}
++
+ }  // namespace extensions
+--- a/components/value_store/value_store.h
++++ b/components/value_store/value_store.h
+@@ -206,6 +206,14 @@
+   // Removes multiple keys from the storage.
+   virtual WriteResult Remove(const std::vector<std::string>& keys) = 0;
+ 
++  // Native compare-and-replace is a single backend transaction. Unsupported
++  // stores must fail closed rather than approximate it with Set then Remove.
++  virtual WriteResult CompareAndReplace(const base::DictValue& expected,
++                                       const base::DictValue& replacement) {
++    return WriteResult(Status(OTHER_ERROR,
++                             "Atomic native storage changes are unsupported."));
++  }
++
+   // Clears the storage.
+   virtual WriteResult Clear() = 0;
+ };
+--- a/components/value_store/leveldb_value_store.h
++++ b/components/value_store/leveldb_value_store.h
+@@ -56,6 +56,8 @@
+                   const base::DictValue& values) override;
+   WriteResult Remove(const std::string& key) override;
+   WriteResult Remove(const std::vector<std::string>& keys) override;
++  WriteResult CompareAndReplace(const base::DictValue& expected,
++                               const base::DictValue& replacement) override;
+   WriteResult Clear() override;
+ 
+   // Write directly to the backing levelDB. Only used for testing to cause
+--- a/components/value_store/leveldb_value_store.cc
++++ b/components/value_store/leveldb_value_store.cc
+@@ -181,6 +181,44 @@
+                      : WriteResult(std::move(status));
+ }
+ 
++ValueStore::WriteResult LeveldbValueStore::CompareAndReplace(
++    const base::DictValue& expected,
++    const base::DictValue& replacement) {
++  // Every operation on this store runs on the same backend sequence. No write
++  // can interleave between this comparison and the single LevelDB WriteBatch.
++  ReadResult current = Get();
++  if (!current.status().ok())
++    return WriteResult(current.PassStatus());
++  if (current.settings() != expected)
++    return WriteResult(Status(OTHER_ERROR, "Native storage snapshot changed."));
++
++  leveldb::WriteBatch batch;
++  ValueStoreChangeList changes;
++  for (const auto [key, value] : current.settings()) {
++    if (!replacement.contains(key)) {
++      batch.Delete(key);
++      changes.emplace_back(key, value.Clone(), std::nullopt);
++    }
++  }
++  for (const auto [key, value] : replacement) {
++    const base::Value* old = current.settings().Find(key);
++    if (old && *old == value)
++      continue;
++    std::string json;
++    if (!base::JSONWriter::Write(value, &json))
++      return WriteResult(Status(OTHER_ERROR, kCannotSerialize));
++    batch.Put(key, json);
++    changes.emplace_back(key,
++                         old ? std::make_optional(old->Clone()) : std::nullopt,
++                         value.Clone());
++  }
++  if (changes.empty())
++    return WriteResult(std::move(changes), Status());
++  Status status = WriteToDb(&batch);
++  return status.ok() ? WriteResult(std::move(changes), std::move(status))
++                     : WriteResult(std::move(status));
++}
++
+ ValueStore::WriteResult LeveldbValueStore::Remove(const std::string& key) {
+   return Remove(std::vector<std::string>(1, key));
+ }
+--- a/components/value_store/leveldb_value_store_unittest.cc
++++ b/components/value_store/leveldb_value_store_unittest.cc
+@@ -243,4 +243,22 @@
+       << "Remove() reported success but the database is closed";
+ }
+ 
++TEST_F(LeveldbValueStoreUnitTest, NativeCompareAndReplaceIsAtomicAndDurable) {
++  base::DictValue old = base::DictValue().Set("remove", 1).Set("keep", 2);
++  base::DictValue next = base::DictValue().Set("keep", 2).Set("added", 3);
++  ASSERT_TRUE(store()->Set(ValueStore::DEFAULTS, old).status().ok());
++  auto result = store()->CompareAndReplace(old, next);
++  ASSERT_TRUE(result.status().ok());
++  EXPECT_EQ(result.changes().size(), 2u);
++  EXPECT_EQ(store()->Get().settings(), next);
++  EXPECT_FALSE(store()->CompareAndReplace(old, base::DictValue()).status().ok());
++  EXPECT_EQ(store()->Get().settings(), next);
++  CloseStore();
++  CreateStore();
++  EXPECT_EQ(store()->Get().settings(), next);
++  auto no_change = store()->CompareAndReplace(next, next);
++  ASSERT_TRUE(no_change.status().ok());
++  EXPECT_TRUE(no_change.changes().empty());
++}
++
+ }  // namespace value_store
+--- a/extensions/browser/api/storage/settings_storage_quota_enforcer.h
++++ b/extensions/browser/api/storage/settings_storage_quota_enforcer.h
+@@ -56,6 +56,8 @@
+   WriteResult Set(WriteOptions options, const base::DictValue& values) override;
+   WriteResult Remove(const std::string& key) override;
+   WriteResult Remove(const std::vector<std::string>& keys) override;
++  WriteResult CompareAndReplace(const base::DictValue& expected,
++                               const base::DictValue& replacement) override;
+   WriteResult Clear() override;
+ 
+   value_store::ValueStore* get_delegate_for_test() { return delegate_.get(); }
+--- a/extensions/browser/api/storage/settings_storage_quota_enforcer.cc
++++ b/extensions/browser/api/storage/settings_storage_quota_enforcer.cc
+@@ -196,6 +196,31 @@
+   return result;
+ }
+ 
++ValueStore::WriteResult SettingsStorageQuotaEnforcer::CompareAndReplace(
++    const base::DictValue& expected,
++    const base::DictValue& replacement) {
++  // Validate the final dictionary, not an intermediate add-before-remove state.
++  size_t total = 0;
++  std::map<std::string, size_t> per_setting;
++  for (const auto [key, value] : replacement) {
++    Allocate(key, value, &total, &per_setting);
++    if (per_setting[key] > limits_.quota_bytes_per_item)
++      return WriteResult(QuotaExceededError(Resource::kQuotaBytesPerItem));
++  }
++  if (total > limits_.quota_bytes)
++    return WriteResult(QuotaExceededError(Resource::kQuotaBytes));
++  if (per_setting.size() > limits_.max_items)
++    return WriteResult(QuotaExceededError(Resource::kMaxItems));
++  WriteResult result =
++      HandleResult(delegate_->CompareAndReplace(expected, replacement));
++  if (result.status().ok()) {
++    used_total_ = total;
++    used_per_setting_ = std::move(per_setting);
++    usage_calculated_ = true;
++  }
++  return result;
++}
++
+ ValueStore::WriteResult SettingsStorageQuotaEnforcer::Clear() {
+   LazyCalculateUsage();
+   WriteResult result = HandleResult(delegate_->Clear());
+--- a/chrome/browser/extensions/api/storage/syncable_settings_storage.h
++++ b/chrome/browser/extensions/api/storage/syncable_settings_storage.h
+@@ -59,6 +59,8 @@
+   WriteResult Set(WriteOptions options, const base::DictValue& values) override;
+   WriteResult Remove(const std::string& key) override;
+   WriteResult Remove(const std::vector<std::string>& keys) override;
++  WriteResult CompareAndReplace(const base::DictValue& expected,
++                               const base::DictValue& replacement) override;
+   WriteResult Clear() override;
+ 
+   // Sync-related methods, analogous to those on SyncableService (handled by
+--- a/chrome/browser/extensions/api/storage/syncable_settings_storage.cc
++++ b/chrome/browser/extensions/api/storage/syncable_settings_storage.cc
+@@ -135,6 +135,17 @@
+     return result;
+   }
+   SyncResultIfEnabled(result);
++  return result;
++}
++
++ValueStore::WriteResult SyncableSettingsStorage::CompareAndReplace(
++    const base::DictValue& expected,
++    const base::DictValue& replacement) {
++  DCHECK(IsOnBackendSequence());
++  WriteResult result =
++      HandleResult(delegate_->CompareAndReplace(expected, replacement));
++  if (result.status().ok())
++    SyncResultIfEnabled(result);
+   return result;
+ }
+ 

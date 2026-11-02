@@ -114,6 +114,7 @@ public final class CefProfile {
     /// Chrome BrowserViews require a fully initialized request context.
     /// Disk profile initialization is asynchronous, unlike an OTR context.
     func whenReady(_ callback: @escaping () -> Void) {
+        if CommandLine.arguments.contains("--engine-acceptance") { NSLog("CEF profile wait kind=%@ initialized=%d", String(describing: kind), initialized ? 1 : 0) }
         if kind == .global { callback(); return }
         if raw == nil { raw = createContext() }
         guard raw != nil else { preconditionFailure("Chromium failed to create isolated profile context") }
@@ -121,6 +122,7 @@ public final class CefProfile {
     }
 
     fileprivate func didInitialize() {
+        if CommandLine.arguments.contains("--engine-acceptance") { NSLog("CEF profile ready kind=%@ callbacks=%d", String(describing: kind), readyCallbacks.count) }
         initialized = true
         let callbacks = readyCallbacks
         readyCallbacks.removeAll()

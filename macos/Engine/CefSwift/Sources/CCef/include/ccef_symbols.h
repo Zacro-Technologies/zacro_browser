@@ -99,6 +99,10 @@ CCEF_SYM(int, cef_register_scheme_handler_factory,
 CCEF_SYM(int, cef_clear_scheme_handler_factories, (void), ())
 
 // --- Request context / command line ------------------------------------------
+CCEF_SYM(cef_request_t*, cef_request_create, (void), ())
+CCEF_SYM(cef_urlrequest_t*, cef_urlrequest_create,
+         (cef_request_t* request, cef_urlrequest_client_t* client,
+          cef_request_context_t* request_context), (request, client, request_context))
 CCEF_SYM(cef_request_context_t*, cef_request_context_get_global_context,
          (void), ())
 CCEF_SYM(cef_request_context_t*, cef_request_context_create_context,

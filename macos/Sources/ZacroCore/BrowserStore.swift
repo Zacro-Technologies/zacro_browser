@@ -7,27 +7,50 @@ public final class BrowserStore: ObservableObject {
   @Published public private(set) var lastError: String?
   public let directory: URL
   private let file: URL
+  private let persistence: SessionPersistence
   private var loadingFailed = false
+  private var autosaveDelay: TimeInterval?
+  private var pendingSave: DispatchWorkItem?
+  private var pendingSince: TimeInterval?
+  private var saveRevision: UInt64 = 0
   public init(directory: URL, initialState: BrowserState? = nil) {
     self.directory = directory
     file = directory.appendingPathComponent("native-state.json")
+    persistence = SessionPersistence(file: file)
     state = initialState ?? BrowserState()
     if initialState == nil, FileManager.default.fileExists(atPath: file.path) {
       do {
-        state = try JSONDecoder().decode(BrowserState.self, from: Data(contentsOf: file))
+        state = try readState(file)
         repair()
       } catch {
         lastError =
           "Could not load the saved browser session. The original file has been preserved: \(error.localizedDescription)"
         loadingFailed = true
+        persistence.preserveUnreadablePrimary()
+        if let recovered = try? readState(file.appendingPathExtension("bak")) {
+          state = recovered
+          repair()
+          lastError = "Recovered your session from its last backup."
+        }
       }
     }
-    if !state.settings.restoreSession {
+    if initialState == nil, !state.settings.restoreSession {
       let kept = Set(state.splits.flatMap(\.tabIDs))
-      state.tabs.removeAll {
-        !$0.isPinned && !$0.isFavorite && $0.peek == nil && !kept.contains($0.id)
-      }
+      let removed = state.tabs.filter { !$0.isPinned && !$0.isFavorite && $0.peek == nil && !kept.contains($0.id) }
+      state.archive.insert(contentsOf: removed.filter { tab in
+        tab.url != "about:blank" && !state.profiles.contains { $0.id == profileID(for: tab) && $0.isPrivate }
+      }.map { ArchivedTab(tab: $0) }, at: 0)
+      state.tabs.removeAll { tab in removed.contains { $0.id == tab.id } }
+      state.activeTabID = nil
       repair()
+    }
+    if initialState == nil, let selected = state.activeTab, selected.isPinned, selected.peek == nil, split(for: selected.id) == nil {
+      state.activeTabID = state.tabs.first { $0.spaceID == state.activeSpaceID && !$0.isPinned && !$0.isClosed }?.id
+    }
+    if initialState == nil {
+      for i in state.downloads.indices where !["completed", "cancelled", "interrupted"].contains(state.downloads[i].status) {
+        state.downloads[i].status = "interrupted"
+      }
     }
   }
   public var activeProfileID: String { state.activeSpace?.profileID ?? "default" }
@@ -41,22 +64,91 @@ public final class BrowserStore: ObservableObject {
     state.spaces.first { $0.id == tab.spaceID }?.profileID
   }
   public func tab(_ id: String) -> BrowserTab? { state.tabs.first { $0.id == id } }
+  /// Keyboard navigation follows the same organization and split placement as the sidebar.
+  public func sidebarTabs(spaceID: String? = nil) -> [BrowserTab] {
+    let spaceID = spaceID ?? state.activeSpaceID
+    guard let space = state.spaces.first(where: { $0.id == spaceID }) else { return [] }
+    let groups = state.splits.filter { $0.spaceID == spaceID }
+    let grouped = Set(groups.flatMap(\.tabIDs))
+    let favorites = state.tabs.filter { !grouped.contains($0.id) && $0.isFavorite && profileID(for: $0) == space.profileID }
+    let tabs = state.tabs.filter { !grouped.contains($0.id) && !$0.isFavorite && $0.spaceID == spaceID
+      && ($0.isPinned || $0.folderID != nil || $0.url != "about:blank" || $0.homePage == true) }
+    return favorites
+      + state.folders.filter { $0.spaceID == spaceID }.flatMap { folder in tabs.filter { $0.folderID == folder.id } }
+      + tabs.filter { $0.isPinned && $0.folderID == nil }
+      + groups.flatMap { $0.tabIDs.compactMap(tab) }
+      + tabs.filter { !$0.isPinned && $0.folderID == nil }
+  }
   public func split(for tabID: String) -> SplitGroup? {
     state.splits.first { $0.tabIDs.contains(tabID) }
   }
+  private func readState(_ url: URL) throws -> BrowserState {
+    let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+    guard size <= 32 * 1024 * 1024 else { throw ShortcutError("Browser data exceeds its safety limit.") }
+    let data = try Data(contentsOf: url)
+    guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+      root["version"] as? Int == 1, root["profiles"] is [[String: Any]], root["spaces"] is [[String: Any]]
+    else { throw LegacyImportError.invalidState }
+    var decoded = try JSONDecoder().decode(BrowserState.self, from: data)
+    decoded.profiles.removeAll(where: \.isPrivate)
+    guard !decoded.profiles.isEmpty else { throw LegacyImportError.invalidState }
+    return decoded
+  }
   public func save() {
-    do {
-      try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-      if loadingFailed, FileManager.default.fileExists(atPath: file.path) {
-        let preserved = directory.appendingPathComponent(
-          "native-state-unreadable-\(UUID().uuidString).json")
-        try FileManager.default.moveItem(at: file, to: preserved)
-        loadingFailed = false
+    if autosaveDelay == nil {
+      do { try flush() } catch { lastError = "Could not save the browser session: \(error.localizedDescription)" }
+      return
+    }
+    pendingSave?.cancel()
+    let now = ProcessInfo.processInfo.systemUptime
+    pendingSince = pendingSince ?? now
+    let delay = min(autosaveDelay ?? 0, max(0, 1 - (now - (pendingSince ?? now))))
+    let work = DispatchWorkItem { [weak self] in self?.performAutosave() }
+    pendingSave = work
+    DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+  }
+  /// Opt in after loading. Defaults remain synchronous for command-line tools and migrations.
+  public func enableDebouncedPersistence(delay: TimeInterval = 0.25) {
+    autosaveDelay = min(1, max(0.01, delay.isFinite ? delay : 0.25))
+  }
+  private func performAutosave() {
+    pendingSave = nil; pendingSince = nil; saveRevision &+= 1
+    let revision = saveRevision
+    persistence.write(persistableState(), purgeRecovery: false) { [weak self] error in
+      Task { @MainActor [weak self] in
+        guard let self, self.saveRevision == revision else { return }
+        if let error { self.lastError = "Could not save the browser session: \(error)" }
       }
-      let data = try JSONEncoder().encode(persistableState())
-      try data.write(to: file, options: [.atomic])
-      try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
-    } catch { lastError = "Could not save the browser session: \(error.localizedDescription)" }
+    }
+  }
+  /// Flushes the latest state after all older queued writes. Call before application termination.
+  public func flush() throws {
+    pendingSave?.cancel(); pendingSave = nil; pendingSince = nil; saveRevision &+= 1
+    do {
+      try persistence.writeSynchronously(persistableState(), purgeRecovery: false)
+      loadingFailed = false
+    } catch {
+      lastError = "Could not save the browser session: \(error.localizedDescription)"
+      throw error
+    }
+  }
+  /// Publishes the candidate only after its complete, normalized state is durably saved.
+  /// Suitable for editors that must remain open when storage is unavailable.
+  public func commit(purgeRecovery: Bool = false, _ mutate: (inout BrowserState) -> Void) throws {
+    var candidate = state
+    mutate(&candidate)
+    let normalized = BrowserStore(directory: directory, initialState: candidate)
+    normalized.repair()
+    pendingSave?.cancel(); pendingSave = nil; pendingSince = nil; saveRevision &+= 1
+    do {
+      try persistence.writeSynchronously(normalized.persistableState(), purgeRecovery: purgeRecovery)
+      loadingFailed = false; lastError = nil
+      state = normalized.state
+    } catch {
+      lastError = "Could not save the browser session: \(error.localizedDescription)"
+      if autosaveDelay != nil && !purgeRecovery { save() }
+      throw error
+    }
   }
   public func updateSettings(_ mutate: (inout BrowserSettings) -> Void) {
     mutate(&state.settings)
@@ -66,6 +158,7 @@ public final class BrowserStore: ObservableObject {
   public func updateTab(_ id: String, _ mutate: (inout BrowserTab) -> Void) {
     guard let index = state.tabs.firstIndex(where: { $0.id == id }) else { return }
     mutate(&state.tabs[index])
+    normalizeTabText(index)
     save()
   }
   public func updateSpace(_ id: String, _ mutate: (inout BrowserSpace) -> Void) {
@@ -76,17 +169,26 @@ public final class BrowserStore: ObservableObject {
   }
   public func selectSpace(id: String) {
     guard let space = state.spaces.first(where: { $0.id == id }) else { return }
+    markCurrentTabActive()
     state.activeSpaceID = id
-    state.activeTabID =
-      state.tabs.first(where: { $0.id == space.lastActiveTabID && !$0.isClosed })?.id
-      ?? state.tabs.first(where: { $0.spaceID == id && !$0.isClosed })?.id
+    let remembered = state.tabs.first { $0.id == space.lastActiveTabID && !$0.isClosed
+      && ($0.spaceID == id || ($0.isFavorite && profileID(for: $0) == space.profileID)) }
+    if let remembered, remembered.isFavorite, let index = state.tabs.firstIndex(where: { $0.id == remembered.id }) {
+      state.tabs[index].spaceID = id
+    }
+    state.activeTabID = remembered?.id
+      ?? state.tabs.first(where: { $0.spaceID == id && !$0.isFavorite && !$0.isClosed })?.id
+    markCurrentTabActive()
     save()
   }
   public func selectTab(id: String) {
     guard let index = state.tabs.firstIndex(where: { $0.id == id }) else { return }
     let tab = state.tabs[index]
+    markCurrentTabActive()
     if !tab.isFavorite || profileID(for: tab) != activeProfileID {
       state.activeSpaceID = tab.spaceID
+    } else {
+      state.tabs[index].spaceID = state.activeSpaceID
     }
     state.activeTabID = id
     state.tabs[index].isClosed = false
@@ -99,6 +201,7 @@ public final class BrowserStore: ObservableObject {
   @discardableResult public func createTab(
     address: String = "about:blank", spaceID: String? = nil, activate: Bool = true
   ) -> BrowserTab? {
+    guard state.tabs.count < 1_000 else { lastError = "Close some tabs before opening more."; return nil }
     let destination = spaceID ?? state.activeSpaceID
     guard state.spaces.contains(where: { $0.id == destination }),
       let url = BrowserAddress.resolve(address, engine: state.settings.searchEngine)
@@ -116,29 +219,54 @@ public final class BrowserStore: ObservableObject {
   }
   public func closeTab(id: String) {
     guard let index = state.tabs.firstIndex(where: { $0.id == id }) else { return }
-    let tab = state.tabs[index]
+    if state.activeTabID == id || state.activeTabID.flatMap({ split(for: $0) })?.tabIDs.contains(id) == true { markCurrentTabActive() }
+    var tab = state.tabs[index]
+    tab.peek = nil
+    tab.openerTabID = nil
     state.splits.removeAll { $0.tabIDs.contains(id) }
+    for i in state.tabs.indices where state.tabs[i].openerTabID == id { state.tabs[i].openerTabID = nil }
     if tab.isFavorite || tab.isPinned {
       state.tabs[index].isClosed = true
       state.tabs[index].peek = nil
+      state.tabs[index].openerTabID = nil
       state.tabs[index].url = tab.savedURL ?? tab.url
       state.tabs[index].navigation = [NavigationEntry(url: state.tabs[index].url)]
       state.tabs[index].navigationIndex = 0
     } else {
-      state.archive.insert(ArchivedTab(tab: tab), at: 0)
+      if tab.url != "about:blank", !state.profiles.contains(where: { $0.id == profileID(for: tab) && $0.isPrivate }) {
+        state.archive.removeAll { $0.id == tab.id }
+        state.archive.insert(ArchivedTab(tab: tab), at: 0)
+      }
       state.tabs.remove(at: index)
     }
     if state.activeTabID == id {
-      state.activeTabID =
-        state.tabs.first(where: { $0.spaceID == state.activeSpaceID && !$0.isClosed })?.id
+      let offset = tab.isPinned ? index + 1 : index
+      state.activeTabID = state.tabs.dropFirst(offset).first { $0.spaceID == tab.spaceID && !$0.isPinned && !$0.isClosed }?.id
+        ?? state.tabs.last { $0.spaceID == tab.spaceID && !$0.isPinned && !$0.isClosed }?.id
+      if let space = state.spaces.firstIndex(where: { $0.id == tab.spaceID }) { state.spaces[space].lastActiveTabID = state.activeTabID }
     }
-    state.archive = Array(state.archive.prefix(500))
+    state.archive = Array(state.archive.prefix(1_000))
     save()
   }
+  @discardableResult public func createExtensionTab(url: String, title: String = "", spaceID: String? = nil, activate: Bool = true) -> BrowserTab? {
+    guard let address = BrowserAddress.extensionURL(url),
+      let tab = createTab(spaceID: spaceID, activate: false) else { return nil }
+    updateTab(tab.id) { $0.url = address.absoluteString; $0.title = title.isEmpty ? "Extension" : String(title.prefix(500)); $0.navigation = []; $0.navigationIndex = -1 }
+    if activate { selectTab(id: tab.id) }
+    return self.tab(tab.id)
+  }
+  public func setExtensionPage(tabID: String, url: String, title: String = "") {
+    guard let address = BrowserAddress.extensionURL(url) else { return }
+    updateTab(tabID) { tab in
+      tab.url = address.absoluteString; tab.homePage = nil
+      if !title.isEmpty { tab.title = String(title.prefix(500)) }
+    }
+  }
   @discardableResult public func restoreTab(id: String? = nil) -> BrowserTab? {
+    guard state.tabs.count < 1_000 else { lastError = "Close some tabs before restoring more."; return nil }
     guard
       let index = state.archive.firstIndex(where: { entry in
-        (id == nil || entry.id == id)
+        (id != nil ? entry.id == id : entry.tab.spaceID == state.activeSpaceID)
           && state.spaces.first(where: { space in space.id == entry.tab.spaceID })?.profileID
             == activeProfileID
       })
@@ -146,57 +274,76 @@ public final class BrowserStore: ObservableObject {
     var tab = state.archive.remove(at: index).tab
     if state.tabs.contains(where: { $0.id == tab.id }) { tab.id = UUID().uuidString }
     tab.isClosed = false
+    tab.openerTabID = nil
     state.tabs.append(tab)
     selectTab(id: tab.id)
     return tab
   }
   public func toggleFavorite(id: String) {
     guard let index = state.tabs.firstIndex(where: { $0.id == id }) else { return }
+    let wasPinned = state.tabs[index].isPinned
+    if profileID(for: state.tabs[index]) == activeProfileID { state.tabs[index].spaceID = state.activeSpaceID }
     state.tabs[index].isFavorite.toggle()
-    state.tabs[index].isPinned = state.tabs[index].isFavorite
-    state.tabs[index].savedURL = state.tabs[index].isFavorite ? state.tabs[index].url : nil
-    if state.tabs[index].isClosed && !state.tabs[index].isFavorite { state.tabs.remove(at: index) }
+    state.tabs[index].isPinned = true
+    if !wasPinned || state.tabs[index].savedURL == nil {
+      state.tabs[index].savedURL = state.tabs[index].url
+      state.tabs[index].savedTitle = state.tabs[index].title
+    }
+    state.tabs[index].folderID = nil
     save()
   }
   public func togglePin(id: String) {
     guard let index = state.tabs.firstIndex(where: { $0.id == id }) else { return }
+    if state.tabs[index].isFavorite, profileID(for: state.tabs[index]) == activeProfileID { state.tabs[index].spaceID = state.activeSpaceID }
     state.tabs[index].isPinned.toggle()
     state.tabs[index].isFavorite = false
     state.tabs[index].savedURL = state.tabs[index].isPinned ? state.tabs[index].url : nil
+    state.tabs[index].savedTitle = state.tabs[index].isPinned ? state.tabs[index].title : nil
+    state.tabs[index].folderID = nil
     if state.tabs[index].isClosed && !state.tabs[index].isPinned { state.tabs.remove(at: index) }
     save()
   }
   public func moveTab(
-    id: String, spaceID: String? = nil, folderID: String? = nil, index: Int? = nil
+    id: String, spaceID: String? = nil, folderID: String? = nil, index: Int? = nil,
+    pinned: Bool? = nil, favorite: Bool? = nil, clearFolder: Bool = false
   ) {
-    guard let tab = tab(id) else { return }
-    let target = spaceID ?? tab.spaceID
-    guard state.spaces.first(where: { $0.id == target })?.profileID == profileID(for: tab) else {
-      lastError = "Tabs cannot move between browsing profiles."
-      return
+    guard let source = tab(id) else { return }
+    let target = spaceID ?? source.spaceID
+    guard state.spaces.first(where: { $0.id == target })?.profileID == profileID(for: source) else {
+      lastError = "Tabs cannot move between browsing profiles."; return
     }
-    if let folderID, !state.folders.contains(where: { $0.id == folderID && $0.spaceID == target }) {
-      return
-    }
-    let partners = split(for: id)?.tabIDs ?? [id]
-    for tabID in partners {
-      guard let i = state.tabs.firstIndex(where: { $0.id == tabID }) else { continue }
-      state.tabs[i].spaceID = target
-      state.tabs[i].folderID = folderID
-      if folderID != nil {
-        state.tabs[i].isPinned = true
-        state.tabs[i].isFavorite = false
+    if let folderID, !state.folders.contains(where: { $0.id == folderID && $0.spaceID == target }) { return }
+    let group = split(for: id)
+    let movingGroup = group != nil && spaceID != nil && group?.spaceID != target
+    if movingGroup, let group {
+      for i in state.tabs.indices where group.tabIDs.contains(state.tabs[i].id) {
+        state.tabs[i].spaceID = target; state.tabs[i].folderID = nil
       }
+      if let i = state.splits.firstIndex(where: { $0.id == group.id }) { state.splits[i].spaceID = target }
     }
-    if let splitIndex = state.splits.firstIndex(where: { $0.tabIDs.contains(id) }) {
-      state.splits[splitIndex].spaceID = target
+    guard let i = state.tabs.firstIndex(where: { $0.id == id }) else { return }
+    state.tabs[i].spaceID = target
+    if clearFolder || folderID != nil || source.spaceID != target { state.tabs[i].folderID = folderID }
+    let makeFavorite = favorite ?? ((folderID != nil || pinned == false || source.spaceID != target) ? false : source.isFavorite)
+    let makePinned = makeFavorite || (pinned ?? (folderID != nil ? true : source.isPinned))
+    if makePinned {
+      if !source.isPinned || state.tabs[i].savedURL == nil { state.tabs[i].savedURL = source.url }
+      if state.tabs[i].savedTitle == nil { state.tabs[i].savedTitle = source.title }
+      state.tabs[i].isPinned = true; state.tabs[i].isFavorite = makeFavorite
+      if makeFavorite { state.tabs[i].folderID = nil }
+    } else {
+      state.tabs[i].isPinned = false; state.tabs[i].isFavorite = false; state.tabs[i].folderID = nil
+      state.tabs[i].savedURL = nil; state.tabs[i].savedTitle = nil; state.tabs[i].isClosed = false
     }
-    if let i = state.tabs.firstIndex(where: { $0.id == id }), let index {
+    if let index {
       let moved = state.tabs.remove(at: i)
       state.tabs.insert(moved, at: max(0, min(index, state.tabs.count)))
     }
-    if state.activeTabID == id { state.activeSpaceID = target }
-    save()
+    if let active = state.activeTabID, active == id || (movingGroup && group?.tabIDs.contains(active) == true) {
+      state.activeSpaceID = target
+      if let i = state.spaces.firstIndex(where: { $0.id == target }) { state.spaces[i].lastActiveTabID = active }
+    }
+    repair(); save()
   }
   public func navigate(
     tabID: String, address: String, title: String = "", recordHistory: Bool = true
@@ -204,8 +351,10 @@ public final class BrowserStore: ObservableObject {
     guard let url = BrowserAddress.resolve(address, engine: state.settings.searchEngine),
       let i = state.tabs.firstIndex(where: { $0.id == tabID })
     else { return }
+    let title = boundedText(title, limit: 500)
     let value = url.absoluteString
     state.tabs[i].url = value
+    if value != "about:blank" { state.tabs[i].homePage = nil }
     if !title.isEmpty { state.tabs[i].title = title }
     let old = state.tabs[i]
     if old.navigation.indices.contains(old.navigationIndex),
@@ -224,9 +373,14 @@ public final class BrowserStore: ObservableObject {
       let profile = profileID(for: state.tabs[i]),
       !state.profiles.contains(where: { $0.id == profile && $0.isPrivate })
     {
-      state.history.removeAll { $0.profileID == profile && $0.url == value }
-      state.history.insert(HistoryEntry(profileID: profile, url: value, title: title), at: 0)
-      state.history = Array(state.history.prefix(10_000))
+      if let recent = state.history.firstIndex(where: { $0.profileID == profile }),
+        state.history[recent].url == value, Date().timeIntervalSince(state.history[recent].visitedAt) < 60 {
+        if !title.isEmpty { state.history[recent].title = title }
+        state.history[recent].visitedAt = Date()
+      } else {
+        state.history.insert(HistoryEntry(profileID: profile, url: value, title: title), at: 0)
+      }
+      state.history = Array(state.history.prefix(20_000))
     }
     save()
   }
@@ -243,37 +397,51 @@ public final class BrowserStore: ObservableObject {
     return state.tabs[i].url
   }
   public func setSplit(left: String, right: String) {
-    guard left != right, let lhs = tab(left), let rhs = tab(right), lhs.spaceID == rhs.spaceID,
-      !lhs.isClosed, !rhs.isClosed
+    guard left != right, let lhs = tab(left), let rhs = tab(right),
+      profileID(for: lhs) == activeProfileID, profileID(for: rhs) == activeProfileID,
+      (lhs.spaceID == state.activeSpaceID || lhs.isFavorite),
+      (rhs.spaceID == state.activeSpaceID || rhs.isFavorite),
+      !lhs.isClosed, (!rhs.isClosed || rhs.isPinned || rhs.isFavorite), lhs.url != "about:blank", rhs.url != "about:blank"
     else { return }
-    state.splits.removeAll { $0.tabIDs.contains(left) || $0.tabIDs.contains(right) }
-    state.splits.append(SplitGroup(spaceID: lhs.spaceID, leftTabID: left, rightTabID: right))
+    if let group = state.splits.first(where: { $0.tabIDs.contains(left) || $0.tabIDs.contains(right) }) {
+      if Set(group.tabIDs) != Set([left, right]) { lastError = "Unsplit these tabs before adding them to another split view." }
+      return
+    }
+    for i in state.tabs.indices where [left, right].contains(state.tabs[i].id) {
+      state.tabs[i].spaceID = state.activeSpaceID
+      state.tabs[i].isClosed = false
+    }
+    state.splits.append(SplitGroup(spaceID: state.activeSpaceID, leftTabID: left, rightTabID: right))
     selectTab(id: left)
   }
   public func unsplit(tabID: String) {
+    if state.activeTabID.flatMap({ split(for: $0) })?.tabIDs.contains(tabID) == true { markCurrentTabActive() }
     state.splits.removeAll { $0.tabIDs.contains(tabID) }
     save()
   }
   public func setSplitRatio(id: String, ratio: Double) {
     guard ratio.isFinite, let i = state.splits.firstIndex(where: { $0.id == id }) else { return }
-    state.splits[i].ratio = min(0.85, max(0.15, ratio))
+    state.splits[i].ratio = min(0.9, max(0.1, ratio))
     save()
   }
   public func setPeek(tabID: String, address: String, title: String = "") {
-    guard let url = BrowserAddress.webURL(address) else { return }
-    updateTab(tabID) { $0.peek = SavedPeek(url: url.absoluteString, title: title) }
+    guard let url = BrowserAddress.webURL(address), let tab = tab(tabID), !tab.isClosed else { return }
+    updateTab(tabID) { $0.peek = SavedPeek(url: url.absoluteString, title: String(title.prefix(500))) }
   }
   public func closePeek(tabID: String) { updateTab(tabID) { $0.peek = nil } }
   @discardableResult public func promotePeek(tabID: String) -> BrowserTab? {
-    guard let tab = tab(tabID), let peek = tab.peek else { return nil }
-    closePeek(tabID: tabID)
-    return createTab(address: peek.url, spaceID: tab.spaceID)
+    guard let tab = tab(tabID), let peek = tab.peek,
+      let created = createTab(address: peek.url, spaceID: tab.spaceID, activate: false) else { return nil }
+    updateTab(created.id) { $0.title = peek.title.isEmpty ? $0.title : peek.title }
+    closePeek(tabID: tabID); selectTab(id: created.id)
+    return self.tab(created.id)
   }
   @discardableResult public func createSpace(name: String, profileID: String? = nil) -> BrowserSpace
   {
+    guard state.spaces.count < 500 else { lastError = "Space limit reached."; return state.activeSpace ?? state.spaces[0] }
     let space = BrowserSpace(
       profileID: profileID ?? activeProfileID,
-      name: name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "New Space" : name)
+      name: boundedText(name, limit: 200, fallback: "New Space"))
     guard state.profiles.contains(where: { $0.id == space.profileID }) else {
       return state.spaces[0]
     }
@@ -285,53 +453,116 @@ public final class BrowserStore: ObservableObject {
     guard state.spaces.count > 1, let space = state.spaces.first(where: { $0.id == id }),
       state.spaces.filter({ $0.profileID == space.profileID }).count > 1
     else { return }
-    state.tabs.removeAll { $0.spaceID == id }
-    state.archive.removeAll { $0.tab.spaceID == id }
+    guard let destination = state.spaces.first(where: { $0.id != id && $0.profileID == space.profileID }) else { return }
+    for i in state.tabs.indices where state.tabs[i].spaceID == id {
+      state.tabs[i].spaceID = destination.id; state.tabs[i].folderID = nil
+    }
+    for i in state.archive.indices where state.archive[i].tab.spaceID == id {
+      state.archive[i].tab.spaceID = destination.id; state.archive[i].tab.folderID = nil
+    }
+    for i in state.splits.indices where state.splits[i].spaceID == id { state.splits[i].spaceID = destination.id }
     state.folders.removeAll { $0.spaceID == id }
-    state.splits.removeAll { $0.spaceID == id }
     state.spaces.removeAll { $0.id == id }
+    if state.activeSpaceID == id { selectSpace(id: destination.id) }
     repair()
     save()
   }
   @discardableResult public func createProfile(name: String, isPrivate: Bool = false)
     -> BrowserProfile
   {
-    let profile = BrowserProfile(name: name, isPrivate: isPrivate)
+    guard state.profiles.count < 100, state.spaces.count < 500 else {
+      lastError = "Profile or Space limit reached."; return state.activeProfile ?? state.profiles[0]
+    }
+    let profile = BrowserProfile(name: boundedText(name, limit: 200, fallback: "Profile"), isPrivate: isPrivate)
     state.profiles.append(profile)
     _ = createSpace(name: name, profileID: profile.id)
+    if isPrivate, let i = state.spaces.firstIndex(where: { $0.profileID == profile.id }) {
+      state.spaces[i].name = "Private"; state.spaces[i].icon = "moon"; state.spaces[i].theme.primaryColor = "#69519c"; save()
+    }
+    return profile
+  }
+  @discardableResult public func createProfileDurably(name: String, isPrivate: Bool = false) throws -> BrowserProfile {
+    guard state.profiles.count < 100, state.spaces.count < 500 else { throw ShortcutError("Profile or Space limit reached.") }
+    let profile = BrowserProfile(name: boundedText(name, limit: 200, fallback: "Profile"), isPrivate: isPrivate)
+    var space = BrowserSpace(profileID: profile.id, name: boundedText(name, limit: 200, fallback: "New Space"))
+    if isPrivate { space.name = "Private"; space.icon = "moon"; space.theme.primaryColor = "#69519c" }
+    let visible = visibleActivityIDs(), now = Date()
+    try commit { state in
+      for index in state.tabs.indices where visible.contains(state.tabs[index].id) { state.tabs[index].lastAccessedAt = now }
+      state.profiles.append(profile); state.spaces.append(space)
+      state.activeSpaceID = space.id; state.activeTabID = nil
+    }
     return profile
   }
   public func deleteProfile(id: String) {
-    guard state.profiles.contains(where: { $0.id == id }),
-      state.profiles.filter({ !$0.isPrivate && $0.id != id }).count > 0
-    else { return }
-    state.profiles.removeAll { $0.id == id }
-    state.spaces.removeAll { $0.profileID == id }
-    state.history.removeAll { $0.profileID == id }
-    state.bookmarks.removeAll { $0.profileID == id }
-    state.downloads.removeAll { $0.profileID == id }
-    repair()
-    save()
+    do { try deleteProfileDurably(id: id) } catch { lastError = "Could not delete this profile: \(error.localizedDescription)" }
+  }
+  /// Private data is memory-only; closing its window must never depend on a
+  /// successful write to the persistent profiles' directory.
+  public func discardPrivateProfile(id: String) {
+    guard state.profiles.contains(where: { $0.id == id && $0.isPrivate }) else { return }
+    var candidate = state
+    let spaces = Set(candidate.spaces.filter { $0.profileID == id }.map(\.id))
+    candidate.profiles.removeAll { $0.id == id }
+    candidate.spaces.removeAll { spaces.contains($0.id) }
+    candidate.tabs.removeAll { spaces.contains($0.spaceID) }
+    candidate.folders.removeAll { spaces.contains($0.spaceID) }
+    candidate.splits.removeAll { spaces.contains($0.spaceID) }
+    candidate.archive.removeAll { spaces.contains($0.tab.spaceID) }
+    candidate.history.removeAll { $0.profileID == id }
+    candidate.bookmarks.removeAll { $0.profileID == id }
+    candidate.downloads.removeAll { $0.profileID == id }
+    candidate.permissions.removeAll { $0.profileID == id }
+    let normalized = BrowserStore(directory: directory, initialState: candidate)
+    normalized.repair()
+    state = normalized.state
+  }
+  public func deleteProfileDurably(id: String) throws {
+    guard state.profiles.contains(where: { $0.id == id }) else { return }
+    guard state.profiles.contains(where: { !$0.isPrivate && $0.id != id }) else {
+      throw ShortcutError("Keep at least one non-private browsing profile.")
+    }
+    try commit(purgeRecovery: true) { state in
+      state.profiles.removeAll { $0.id == id }
+      state.spaces.removeAll { $0.profileID == id }
+      state.history.removeAll { $0.profileID == id }
+      state.bookmarks.removeAll { $0.profileID == id }
+      state.downloads.removeAll { $0.profileID == id }
+      state.permissions.removeAll { $0.profileID == id }
+    }
   }
   @discardableResult public func createFolder(
     name: String, spaceID: String? = nil, parentID: String? = nil
   ) -> BrowserFolder {
     let folder = BrowserFolder(
-      spaceID: spaceID ?? state.activeSpaceID, name: name, parentID: parentID)
+      spaceID: spaceID ?? state.activeSpaceID, name: boundedText(name, limit: 200, fallback: "Folder"), parentID: parentID)
+    guard state.folders.count < 1_000 else { lastError = "Folder limit reached."; return folder }
     state.folders.append(folder)
     repair()
     save()
     return folder
   }
+  @discardableResult public func createFolderDurably(name: String, spaceID: String? = nil, parentID: String? = nil) throws -> BrowserFolder {
+    let spaceID = spaceID ?? state.activeSpaceID
+    guard state.spaces.contains(where: { $0.id == spaceID }) else { throw ShortcutError("This Space is no longer available.") }
+    guard parentID == nil || state.folders.contains(where: { $0.id == parentID && $0.spaceID == spaceID }) else {
+      throw ShortcutError("The destination folder is no longer available in this Space.")
+    }
+    guard state.folders.count < 1_000 else { throw ShortcutError("Folder limit reached.") }
+    let folder = BrowserFolder(spaceID: spaceID, name: boundedText(name, limit: 200, fallback: "Folder"), parentID: parentID)
+    try commit { $0.folders.append(folder) }
+    return folder
+  }
   public func updateFolder(id: String, name: String? = nil, isExpanded: Bool? = nil) {
     guard let i = state.folders.firstIndex(where: { $0.id == id }) else { return }
-    if let name { state.folders[i].name = name }
+    if let name { state.folders[i].name = boundedText(name, limit: 200, fallback: "Folder") }
     if let isExpanded { state.folders[i].isExpanded = isExpanded }
     save()
   }
   public func deleteFolder(id: String) {
     state.folders.removeAll { $0.id == id }
     for i in state.tabs.indices where state.tabs[i].folderID == id { state.tabs[i].folderID = nil }
+    for i in state.archive.indices where state.archive[i].tab.folderID == id { state.archive[i].tab.folderID = nil }
     for i in state.folders.indices where state.folders[i].parentID == id {
       state.folders[i].parentID = nil
     }
@@ -339,11 +570,12 @@ public final class BrowserStore: ObservableObject {
   }
   public func toggleBookmark(url: String, title: String, profileID: String? = nil) {
     let profile = profileID ?? activeProfileID
-    guard BrowserAddress.webURL(url) != nil else { return }
+    guard state.profiles.contains(where: { $0.id == profile }), let address = BrowserAddress.webURL(url) else { return }
+    let url = address.absoluteString
     if let i = state.bookmarks.firstIndex(where: { $0.url == url && $0.profileID == profile }) {
       state.bookmarks.remove(at: i)
     } else {
-      state.bookmarks.append(Bookmark(profileID: profile, url: url, title: title))
+      state.bookmarks.insert(Bookmark(profileID: profile, url: url, title: boundedText(title, limit: 500, fallback: url)), at: 0)
     }
     save()
   }
@@ -352,30 +584,44 @@ public final class BrowserStore: ObservableObject {
     save()
   }
   public func clearHistory(profileID: String? = nil) {
+    do { try clearHistoryDurably(profileID: profileID) } catch { lastError = "Could not clear history: \(error.localizedDescription)" }
+  }
+  public func clearHistoryDurably(profileID: String? = nil) throws {
     let profile = profileID ?? activeProfileID
-    state.history.removeAll { $0.profileID == profile }
-    for i in state.tabs.indices where self.profileID(for: state.tabs[i]) == profile {
-      state.tabs[i].navigation = [
-        NavigationEntry(url: state.tabs[i].url, title: state.tabs[i].title)
-      ]
-      state.tabs[i].navigationIndex = 0
+    let spaces = Set(state.spaces.filter { $0.profileID == profile }.map(\.id))
+    try commit(purgeRecovery: true) { state in
+      state.history.removeAll { $0.profileID == profile }
+      for i in state.tabs.indices where spaces.contains(state.tabs[i].spaceID) {
+        state.tabs[i].navigation = [NavigationEntry(url: state.tabs[i].url, title: state.tabs[i].title)]
+        state.tabs[i].navigationIndex = 0
+      }
+      for i in state.archive.indices where spaces.contains(state.archive[i].tab.spaceID) {
+        state.archive[i].tab.navigation = [NavigationEntry(url: state.archive[i].tab.url, title: state.archive[i].tab.title)]
+        state.archive[i].tab.navigationIndex = 0
+      }
     }
-    state.archive.removeAll { self.profileID(for: $0.tab) == profile }
-    save()
   }
   public func clearArchive(profileID: String? = nil) {
-    let profile = profileID ?? activeProfileID
-    state.archive.removeAll { self.profileID(for: $0.tab) == profile }
-    save()
+    do { try clearArchiveDurably(profileID: profileID) } catch { lastError = "Could not clear archived tabs: \(error.localizedDescription)" }
   }
-  public func archiveStale(now: Date = Date()) {
+  public func clearArchiveDurably(profileID: String? = nil) throws {
+    let profile = profileID ?? activeProfileID
+    let spaces = Set(state.spaces.filter { $0.profileID == profile }.map(\.id))
+    try commit(purgeRecovery: true) { $0.archive.removeAll { spaces.contains($0.tab.spaceID) } }
+  }
+  /// The runtime excludes pages with active media, downloads, pending beforeunload,
+  /// form edits, capture, opener relationships, or other engine-owned activity.
+  public func archiveCandidates(now: Date = Date(), excludeIDs: Set<String> = []) -> [BrowserTab] {
     let splitIDs = Set(state.splits.flatMap(\.tabIDs))
-    let stale = state.tabs.filter {
-      !$0.isFavorite && !$0.isPinned && $0.peek == nil && !splitIDs.contains($0.id)
-        && $0.id != state.activeTabID
-        && now.timeIntervalSince($0.lastAccessedAt) > state.settings.archiveAfterHours * 3600
+    return state.tabs.filter {
+      !$0.isFavorite && !$0.isPinned && $0.folderID == nil && $0.peek == nil && !splitIDs.contains($0.id)
+        && $0.id != state.activeTabID && !excludeIDs.contains($0.id)
+        && archiveHours(profileID: profileID(for: $0) ?? "") > 0
+        && now.timeIntervalSince($0.lastAccessedAt) >= archiveHours(profileID: profileID(for: $0) ?? "") * 3600
     }
-    for tab in stale { closeTab(id: tab.id) }
+  }
+  public func archiveStale(now: Date = Date(), excludeIDs: Set<String> = []) {
+    for tab in archiveCandidates(now: now, excludeIDs: excludeIDs) { closeTab(id: tab.id) }
   }
   public func recordDownload(_ record: DownloadRecord) {
     if let i = state.downloads.firstIndex(where: { $0.id == record.id }) {
@@ -385,16 +631,91 @@ public final class BrowserStore: ObservableObject {
     }
     save()
   }
-  public func exportData(to url: URL) throws {
-    try JSONEncoder().encode(persistableState()).write(to: url, options: [.atomic])
+  public func clearError() { lastError = nil }
+  public static let archiveCadences: [Double] = [0, 1, 6, 12, 24, 48, 72, 168, 720]
+  private func markCurrentTabActive() {
+    markVisibleTabActivity(now: Date())
   }
-  public func importData(from url: URL) throws {
-    let imported = try JSONDecoder().decode(BrowserState.self, from: Data(contentsOf: url))
-    state = imported
-    repair()
+  private func markVisibleTabActivity(now: Date) {
+    let ids = visibleActivityIDs()
+    for i in state.tabs.indices where ids.contains(state.tabs[i].id) { state.tabs[i].lastAccessedAt = now }
+  }
+  private func visibleActivityIDs() -> Set<String> {
+    guard let active = state.activeTabID else { return [] }
+    let group = state.splits.first { $0.spaceID == state.activeSpaceID && $0.tabIDs.contains(active) }
+    return Set(group?.tabIDs ?? [active])
+  }
+  public func recordVisibleTabActivity(now: Date = Date()) {
+    markVisibleTabActivity(now: now); save()
+  }
+  public func archiveHours(profileID: String) -> Double {
+    state.profiles.first(where: { $0.id == profileID })?.archiveAfterHours ?? state.settings.archiveAfterHours
+  }
+  public func setArchiveHours(profileID: String, hours: Double?) {
+    guard let i = state.profiles.firstIndex(where: { $0.id == profileID }),
+      hours.map(Self.archiveCadences.contains) ?? true else { return }
+    let defaultProfile = state.profiles.first(where: { $0.id == "default" && !$0.isPrivate })
+      ?? state.profiles.first(where: { !$0.isPrivate })
+    if defaultProfile?.id == profileID {
+      if let hours { state.settings.archiveAfterHours = hours }
+      state.profiles[i].archiveAfterHours = nil
+    } else { state.profiles[i].archiveAfterHours = hours }
     save()
   }
-  public func clearError() { lastError = nil }
+  public func updateShortcut(id: String, accelerator: String) throws {
+    let overrides = try BrowserShortcut.updating(state.settings.shortcutOverrides, id: id, accelerator: accelerator)
+    try commit { $0.settings.shortcutOverrides = overrides }
+  }
+  public func resetShortcut(id: String? = nil) throws {
+    if let id, let entry = BrowserShortcut.defaults.first(where: { $0.id == id }) {
+      try updateShortcut(id: id, accelerator: entry.accelerator)
+    } else if id == nil { try commit { $0.settings.shortcutOverrides = [:] } }
+  }
+  public func setSiteSearches(_ engines: [SiteSearchEngine]) throws {
+    for engine in engines { if let error = engine.validationError { throw ShortcutError(error) } }
+    let normalized = SiteSearchEngine.normalized(engines)
+    guard normalized.count == engines.count else { throw ShortcutError("Choose unique keywords for up to 20 site searches.") }
+    try commit { $0.settings.siteSearches = normalized }
+  }
+  public func replacePinnedDestination(id: String) {
+    guard let tab = tab(id), tab.isPinned || tab.isFavorite else { return }
+    updateTab(id) { $0.savedURL = $0.url; $0.savedTitle = $0.title }
+  }
+  public func resetPinnedDestination(id: String) {
+    guard let tab = tab(id), tab.isPinned || tab.isFavorite else { return }
+    updateTab(id) { $0.url = $0.savedURL ?? $0.url }
+  }
+  @discardableResult public func duplicateTab(id: String) -> BrowserTab? {
+    guard let tab = tab(id) else { return nil }
+    let duplicate = BrowserAddress.extensionURL(tab.url) == nil
+      ? createTab(address: tab.url, spaceID: tab.spaceID)
+      : createExtensionTab(url: tab.url, title: tab.title, spaceID: tab.spaceID)
+    guard let created = duplicate else { return nil }
+    if tab.homePage == true { updateTab(created.id) { $0.homePage = true } }
+    return self.tab(created.id)
+  }
+  public func setPermission(profileID: String, origin: String, permission: String, allowed: Bool) {
+    guard state.profiles.contains(where: { $0.id == profileID }), let origin = BrowserAddress.webOrigin(origin),
+      !permission.isEmpty, permission.count <= 80
+    else { return }
+    state.permissions.removeAll { $0.profileID == profileID && $0.origin == origin && $0.permission == permission }
+    state.permissions.append(.init(profileID: profileID, origin: origin, permission: permission, allowed: allowed))
+    save()
+  }
+  public func clearPermissions(profileID: String? = nil) {
+    do { try clearPermissionsDurably(profileID: profileID) } catch { lastError = "Could not reset site permissions: \(error.localizedDescription)" }
+  }
+  public func clearPermissionsDurably(profileID: String? = nil) throws {
+    let profile = profileID ?? activeProfileID
+    try commit(purgeRecovery: true) { $0.permissions.removeAll { $0.profileID == profile } }
+  }
+  public func removePermissionDurably(id: String) throws {
+    try commit(purgeRecovery: true) { $0.permissions.removeAll { $0.id == id } }
+  }
+  public func savedPermission(profileID: String, origin: String, permission: String) -> Bool? {
+    guard let origin = BrowserAddress.webOrigin(origin) else { return nil }
+    return state.permissions.first { $0.profileID == profileID && $0.origin == origin && $0.permission == permission }?.allowed
+  }
   private func persistableState() -> BrowserState {
     var clean = state
     clean.profiles.removeAll(where: \.isPrivate)
@@ -408,6 +729,7 @@ public final class BrowserStore: ObservableObject {
     clean.history.removeAll { !profiles.contains($0.profileID) }
     clean.bookmarks.removeAll { !profiles.contains($0.profileID) }
     clean.downloads.removeAll { !profiles.contains($0.profileID) }
+    clean.permissions.removeAll { !profiles.contains($0.profileID) }
     if !spaces.contains(clean.activeSpaceID) {
       clean.activeSpaceID = clean.spaces.first?.id ?? "home"
       clean.activeTabID = nil
@@ -415,35 +737,46 @@ public final class BrowserStore: ObservableObject {
     return clean
   }
   public func repair() {
-    state.profiles = unique(state.profiles)
-    state.spaces = unique(state.spaces)
-    state.tabs = unique(state.tabs)
-    state.folders = unique(state.folders)
-    state.bookmarks = unique(state.bookmarks)
-    state.history = unique(state.history)
-    state.downloads = unique(state.downloads)
-    state.archive = unique(state.archive)
+    state.profiles = Array(unique(state.profiles).prefix(100))
+    state.spaces = Array(unique(state.spaces).prefix(500))
+    state.tabs = Array(unique(state.tabs).prefix(1_000))
+    state.folders = Array(unique(state.folders).prefix(1_000))
+    state.bookmarks = Array(unique(state.bookmarks).prefix(20_000))
+    state.history = Array(unique(state.history).prefix(20_000))
+    state.downloads = Array(unique(state.downloads).prefix(1_000))
+    state.archive = Array(unique(state.archive).prefix(1_000))
     state.splits = unique(state.splits)
     if state.profiles.isEmpty { state.profiles = BrowserState().profiles }
     let profiles = Set(state.profiles.map(\.id))
     state.spaces.removeAll { !profiles.contains($0.profileID) }
-    if state.spaces.isEmpty {
-      state.spaces = [BrowserSpace(id: "home", profileID: state.profiles[0].id, name: "Personal")]
+    for profile in state.profiles where !state.spaces.contains(where: { $0.profileID == profile.id }) {
+      state.spaces.append(BrowserSpace(profileID: profile.id, name: profile.name))
     }
     let spaces = Set(state.spaces.map(\.id))
     state.tabs.removeAll {
       !spaces.contains($0.spaceID)
-        || (BrowserAddress.webURL($0.url) == nil && $0.url != "about:blank")
+        || BrowserAddress.documentURL($0.url) == nil
+    }
+    let spaceProfiles = Dictionary(uniqueKeysWithValues: state.spaces.map { ($0.id,$0.profileID) })
+    let openTabs = Dictionary(uniqueKeysWithValues: state.tabs.filter { !$0.isClosed }.map { ($0.id,$0) })
+    for i in state.tabs.indices {
+      guard let openerID = state.tabs[i].openerTabID else { continue }
+      if state.tabs[i].isClosed || openerID == state.tabs[i].id || openTabs[openerID] == nil ||
+          openTabs[openerID].flatMap({ spaceProfiles[$0.spaceID] }) != spaceProfiles[state.tabs[i].spaceID] {
+        state.tabs[i].openerTabID = nil
+      }
     }
     state.folders.removeAll { !spaces.contains($0.spaceID) }
     state.archive.removeAll {
       !spaces.contains($0.tab.spaceID)
-        || (BrowserAddress.webURL($0.tab.url) == nil && $0.tab.url != "about:blank")
+        || BrowserAddress.documentURL($0.tab.url) == nil
     }
     state.splits.removeAll { group in
       !spaces.contains(group.spaceID) || group.leftTabID == group.rightTabID
         || group.tabIDs.contains { id in
-          !state.tabs.contains { $0.id == id && $0.spaceID == group.spaceID && !$0.isClosed }
+          !state.tabs.contains { tab in tab.id == id && !tab.isClosed
+            && profileID(for: tab) == state.spaces.first(where: { $0.id == group.spaceID })?.profileID
+            && (tab.spaceID == group.spaceID || tab.isFavorite) }
         }
     }
     var splitMembers = Set<String>()
@@ -453,7 +786,7 @@ public final class BrowserStore: ObservableObject {
       return true
     }
     for i in state.splits.indices {
-      state.splits[i].ratio = finiteClamp(state.splits[i].ratio, 0.15, 0.85, 0.5)
+      state.splits[i].ratio = finiteClamp(state.splits[i].ratio, 0.1, 0.9, 0.5)
     }
     state.history.removeAll {
       !profiles.contains($0.profileID) || BrowserAddress.webURL($0.url) == nil
@@ -461,8 +794,29 @@ public final class BrowserStore: ObservableObject {
     state.bookmarks.removeAll {
       !profiles.contains($0.profileID) || BrowserAddress.webURL($0.url) == nil
     }
+    for i in state.history.indices {
+      state.history[i].url = BrowserAddress.webURL(state.history[i].url)!.absoluteString
+      state.history[i].title = boundedText(state.history[i].title, limit: 500, fallback: state.history[i].url)
+    }
+    for i in state.bookmarks.indices {
+      state.bookmarks[i].url = BrowserAddress.webURL(state.bookmarks[i].url)!.absoluteString
+      state.bookmarks[i].title = boundedText(state.bookmarks[i].title, limit: 500, fallback: state.bookmarks[i].url)
+    }
     state.downloads.removeAll { !profiles.contains($0.profileID) }
+    var permissionIDs = Set<String>()
+    state.permissions = Array(state.permissions.compactMap { permission in
+      guard profiles.contains(permission.profileID), let origin = BrowserAddress.webOrigin(permission.origin),
+        !permission.permission.isEmpty, permission.permission.count <= 80 else { return nil }
+      var permission = permission; permission.origin = origin
+      return permissionIDs.insert(permission.id).inserted ? permission : nil
+    }.prefix(2_000))
     for i in state.folders.indices {
+      var visited: Set<String> = [state.folders[i].id]
+      var ancestor = state.folders[i].parentID
+      while let id = ancestor {
+        if !visited.insert(id).inserted { state.folders[i].parentID = nil; break }
+        ancestor = state.folders.first(where: { $0.id == id })?.parentID
+      }
       if let parent = state.folders[i].parentID,
         parent == state.folders[i].id
           || !state.folders.contains(where: {
@@ -472,21 +826,8 @@ public final class BrowserStore: ObservableObject {
         state.folders[i].parentID = nil
       }
     }
-    for i in state.tabs.indices {
-      state.tabs[i].navigation = state.tabs[i].navigation.filter {
-        BrowserAddress.webURL($0.url) != nil || $0.url == "about:blank"
-      }
-      state.tabs[i].navigationIndex = min(
-        max(-1, state.tabs[i].navigationIndex), state.tabs[i].navigation.count - 1)
-      if let folderID = state.tabs[i].folderID,
-        !state.folders.contains(where: { $0.id == folderID && $0.spaceID == state.tabs[i].spaceID })
-      {
-        state.tabs[i].folderID = nil
-      }
-      if let peek = state.tabs[i].peek, BrowserAddress.webURL(peek.url) == nil {
-        state.tabs[i].peek = nil
-      }
-    }
+    for i in state.tabs.indices { var tab = state.tabs[i]; repairTab(&tab); state.tabs[i] = tab }
+    for i in state.archive.indices { var tab = state.archive[i].tab; repairTab(&tab); tab.peek = nil; tab.openerTabID = nil; state.archive[i].tab = tab }
     if !spaces.contains(state.activeSpaceID) {
       state.activeSpaceID = state.spaces[0].id
       state.activeTabID = nil
@@ -500,18 +841,93 @@ public final class BrowserStore: ObservableObject {
     {
       state.activeTabID = nil
     }
-    state.settings.pageGutter = finiteClamp(state.settings.pageGutter, 4, 20, 4)
-    state.settings.pageRadius = finiteClamp(state.settings.pageRadius, 0, 24, 12)
-    state.settings.sidebarWidth = finiteClamp(state.settings.sidebarWidth, 180, 380, 224)
-    state.settings.motionScale = finiteClamp(state.settings.motionScale, 0, 2, 1)
-    state.settings.archiveAfterHours = finiteClamp(state.settings.archiveAfterHours, 1, 8760, 12)
-    for i in state.spaces.indices {
-      state.spaces[i].theme.intensity = finiteClamp(state.spaces[i].theme.intensity, 0, 1, 0.45)
-      state.spaces[i].theme.blend = finiteClamp(state.spaces[i].theme.blend, 0, 1, 0.5)
-      state.spaces[i].theme.opacity = finiteClamp(state.spaces[i].theme.opacity, 0, 1, 0.85)
-      state.spaces[i].theme.blur = finiteClamp(state.spaces[i].theme.blur, 0, 1, 0.5)
-      state.spaces[i].theme.grain = finiteClamp(state.spaces[i].theme.grain, 0, 1, 0.08)
+    state.settings.pageGutter = finiteClamp(state.settings.pageGutter, 4, 20, 4).rounded()
+    state.settings.pageRadius = finiteClamp(state.settings.pageRadius, 0, 20, 12).rounded()
+    state.settings.sidebarWidth = finiteClamp(state.settings.sidebarWidth, 200, 380, 224).rounded()
+    state.settings.panelWidth = finiteClamp(state.settings.panelWidth, 260, 560, 336).rounded()
+    state.settings.motionScale = (finiteClamp(state.settings.motionScale, 0.7, 1.4, 1) * 100).rounded() / 100
+    if !Self.archiveCadences.contains(state.settings.archiveAfterHours) { state.settings.archiveAfterHours = 12 }
+    state.settings.siteSearches = SiteSearchEngine.normalized(state.settings.siteSearches)
+    state.settings.shortcutOverrides = BrowserShortcut.sanitized(state.settings.shortcutOverrides)
+    state.settings.openSourcesLimit = min(10, max(1, state.settings.openSourcesLimit))
+    if ![0, 5, 10, 20, 30, 60, 120].contains(state.settings.pinnedSleepMinutes) { state.settings.pinnedSleepMinutes = 20 }
+    if !["comfortable", "compact"].contains(state.settings.tabDensity) { state.settings.tabDensity = "comfortable" }
+    if !["system", "light", "dark"].contains(state.settings.appearance) { state.settings.appearance = "system" }
+    if !["codex", "claude-code", "openai", "anthropic", "compatible", "openrouter"].contains(state.settings.aiProvider) { state.settings.aiProvider = "codex" }
+    if !state.settings.aiModel.isEmpty && state.settings.aiModel.range(of: "^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,159}$", options: .regularExpression) == nil { state.settings.aiModel = "" }
+    state.windowBounds.width = finiteClamp(state.windowBounds.width, 560, 7680, 1440)
+    state.windowBounds.height = finiteClamp(state.windowBounds.height, 420, 4320, 940)
+    if state.windowBounds.x?.isFinite != true { state.windowBounds.x = nil }
+    if state.windowBounds.y?.isFinite != true { state.windowBounds.y = nil }
+    if state.windowBounds.sizeKind != "window" { state.windowBounds.sizeKind = "content" }
+    for i in state.profiles.indices {
+      state.profiles[i].name = boundedText(state.profiles[i].name, limit: 200, fallback: "Profile")
+      if let cadence = state.profiles[i].archiveAfterHours, !Self.archiveCadences.contains(cadence) { state.profiles[i].archiveAfterHours = nil }
+      var seen = Set<String>()
+      state.profiles[i].pinnedExtensionIDs = Array(state.profiles[i].pinnedExtensionIDs.filter {
+        $0.range(of: "^[a-p]{32}$", options: .regularExpression) != nil && seen.insert($0).inserted
+      }.prefix(256))
     }
+    if let i = state.profiles.firstIndex(where: { $0.id == "default" && !$0.isPrivate }) ?? state.profiles.firstIndex(where: { !$0.isPrivate }),
+      let cadence = state.profiles[i].archiveAfterHours {
+      state.settings.archiveAfterHours = cadence
+      state.profiles[i].archiveAfterHours = nil
+    }
+    for i in state.folders.indices { state.folders[i].name = boundedText(state.folders[i].name, limit: 200, fallback: "Folder") }
+    for i in state.spaces.indices {
+      state.spaces[i].name = boundedText(state.spaces[i].name, limit: 200, fallback: "Space")
+      if let last = state.spaces[i].lastActiveTabID,
+        !state.tabs.contains(where: { $0.id == last && ($0.spaceID == state.spaces[i].id || ($0.isFavorite && profileID(for: $0) == state.spaces[i].profileID)) }) {
+        state.spaces[i].lastActiveTabID = nil
+      }
+      if state.spaces[i].theme.primaryColor.range(of: "^#[0-9a-fA-F]{6}$", options: .regularExpression) == nil { state.spaces[i].theme.primaryColor = SpaceTheme().primaryColor }
+      if state.spaces[i].theme.secondaryColor.range(of: "^#[0-9a-fA-F]{6}$", options: .regularExpression) == nil { state.spaces[i].theme.secondaryColor = SpaceTheme().secondaryColor }
+      if !["system", "light", "dark"].contains(state.spaces[i].theme.appearance) { state.spaces[i].theme.appearance = "system" }
+      state.spaces[i].theme.intensity = finiteClamp(state.spaces[i].theme.intensity, 0, 1, 0)
+      state.spaces[i].theme.blend = finiteClamp(state.spaces[i].theme.blend, 0, 1, 0.5)
+      state.spaces[i].theme.opacity = finiteClamp(state.spaces[i].theme.opacity, 0, 1, 1)
+      state.spaces[i].theme.blur = finiteClamp(state.spaces[i].theme.blur, 0, 1, 0)
+      state.spaces[i].theme.grain = finiteClamp(state.spaces[i].theme.grain, 0, 1, 0)
+    }
+  }
+  private func boundedText(_ value: String, limit: Int, fallback: String = "") -> String {
+    let clean = String(value.trimmingCharacters(in: .whitespacesAndNewlines).prefix(limit))
+    return clean.isEmpty ? fallback : clean
+  }
+  private func normalizeTabText(_ index: Int) {
+    state.tabs[index].title = boundedText(state.tabs[index].title, limit: 500, fallback: "New tab")
+    state.tabs[index].customTitle = state.tabs[index].customTitle.flatMap { let value = boundedText($0, limit: 500); return value.isEmpty ? nil : value }
+    state.tabs[index].savedTitle = state.tabs[index].savedTitle.map { boundedText($0, limit: 500) }
+    if let peek = state.tabs[index].peek { state.tabs[index].peek?.title = boundedText(peek.title, limit: 500) }
+  }
+  private func repairTab(_ tab: inout BrowserTab) {
+    if let url = BrowserAddress.documentURL(tab.url) { tab.url = url.absoluteString }
+    tab.savedURL = tab.savedURL.flatMap { BrowserAddress.documentURL($0)?.absoluteString }
+    if let folder = tab.folderID, !state.folders.contains(where: { $0.id == folder && $0.spaceID == tab.spaceID }) { tab.folderID = nil }
+    if tab.isFavorite { tab.folderID = nil; tab.isPinned = true }
+    if tab.folderID != nil { tab.isPinned = true }
+    tab.title = boundedText(tab.title, limit: 500, fallback: "New tab")
+    tab.customTitle = tab.customTitle.flatMap { let value = boundedText($0, limit: 500); return value.isEmpty ? nil : value }
+    if tab.isPinned {
+      if tab.savedURL.flatMap(BrowserAddress.documentURL) == nil { tab.savedURL = tab.url }
+      tab.savedTitle = boundedText(tab.savedTitle ?? tab.title, limit: 500, fallback: tab.title)
+    } else { tab.savedURL = nil; tab.savedTitle = nil; tab.isClosed = false }
+    if tab.isClosed || tab.peek.map({ BrowserAddress.webURL($0.url) == nil }) == true { tab.peek = nil }
+    else if let peek = tab.peek, let url = BrowserAddress.webURL(peek.url) { tab.peek = .init(url: url.absoluteString, title: boundedText(peek.title, limit: 500)) }
+    let originalIndex = tab.navigationIndex
+    var entries: [NavigationEntry] = []
+    var currentIndex: Int?
+    if !tab.isClosed, tab.navigation.indices.contains(originalIndex) {
+      let start = max(0, originalIndex - 49), end = min(tab.navigation.count, max(0, originalIndex - 49) + 100)
+      for index in start..<end {
+        let entry = tab.navigation[index]
+        guard let url = BrowserAddress.webURL(entry.url)?.absoluteString ?? (entry.url == "about:blank" ? entry.url : nil) else { continue }
+        if index == originalIndex, url == tab.url { currentIndex = entries.count }
+        entries.append(.init(url: url, title: boundedText(entry.title, limit: 500)))
+      }
+    }
+    if let currentIndex { tab.navigation = entries; tab.navigationIndex = currentIndex }
+    else { tab.navigation = [.init(url: tab.url, title: tab.title)]; tab.navigationIndex = 0 }
   }
   private func unique<T: Identifiable>(_ values: [T]) -> [T] where T.ID == String {
     var seen = Set<String>()

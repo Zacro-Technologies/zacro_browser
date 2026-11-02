@@ -1,0 +1,1499 @@
+--- a/libcef/browser/devtools/devtools_controller.h
++++ b/libcef/browser/devtools/devtools_controller.h
+@@ -6,9 +6,13 @@
+ #define CEF_LIBCEF_BROWSER_DEVTOOLS_DEVTOOLS_CONTROLLER_H_
+ 
+ #include <memory>
++#include <map>
++#include <set>
++#include <vector>
+ 
+ #include "base/containers/span.h"
+ #include "base/memory/raw_ptr.h"
++#include "base/callback_list.h"
+ #include "base/memory/scoped_refptr.h"
+ #include "base/memory/weak_ptr.h"
+ #include "base/observer_list.h"
+@@ -18,6 +22,11 @@
+ namespace content {
+ class WebContents;
+ }
++
++class ZacroDataRemoval;
++class ZacroDiscardOperation;
++class ZacroDocumentObserver;
++namespace sessions { class SerializedNavigationEntry; }
+ 
+ class CefDevToolsController : public content::DevToolsAgentHostClient {
+  public:
+@@ -68,6 +77,22 @@
+                                base::span<const uint8_t> message) override;
+ 
+   bool EnsureAgentHost();
++  bool DispatchZacro(const std::string_view& message);
++  void ReplyZacro(int id, base::DictValue result, const std::string& error = {});
++  void EmitZacro(const std::string& method, const base::DictValue& params);
++  bool DispatchZacroExtensions(int id, const std::string& method, const base::DictValue* params);
++  bool DispatchZacroTopology(int id, const std::string& method, const base::DictValue* params);
++  base::CallbackListSubscription zacro_extension_subscription_;
++  void FinishZacroDataRemoval(int id, uint64_t failed_types);
++  void FinishZacroDiscard(int id, int entry_id, const std::string& error);
++  std::unique_ptr<ZacroDiscardOperation> zacro_discard_;
++  std::unique_ptr<ZacroDocumentObserver> zacro_document_observer_;
++  int zacro_dormant_entry_ = 0;
++  std::vector<sessions::SerializedNavigationEntry> zacro_dormant_history_;
++  int zacro_dormant_selected_ = 0;
++  scoped_refptr<content::DevToolsAgentHost> zacro_browser_agent_;
++  std::set<std::string> zacro_browser_sessions_;
++  std::map<int, std::unique_ptr<ZacroDataRemoval>> zacro_data_removals_;
+ 
+   const raw_ptr<content::WebContents> inspected_contents_;
+   scoped_refptr<content::DevToolsAgentHost> agent_host_;
+--- a/libcef/browser/devtools/devtools_controller.cc
++++ b/libcef/browser/devtools/devtools_controller.cc
+@@ -9,6 +9,7 @@
+ #include "cef/libcef/browser/devtools/devtools_util.h"
+ #include "cef/libcef/browser/thread_util.h"
+ #include "content/public/browser/devtools_agent_host.h"
++#include "cef/libcef/browser/devtools/zacro_native_adapter.inc"
+ 
+ CefDevToolsController::CefDevToolsController(
+     content::WebContents* inspected_contents)
+@@ -17,6 +18,14 @@
+ }
+ 
+ CefDevToolsController::~CefDevToolsController() {
++  zacro_data_removals_.clear();
++  zacro_discard_.reset();
++  zacro_document_observer_.reset();
++  zacro_extension_subscription_ = {};
++  if (zacro_browser_agent_) {
++    zacro_browser_agent_->DetachClient(this);
++    zacro_browser_agent_ = nullptr;
++  }
+   if (agent_host_) {
+     agent_host_->DetachClient(this);
+     AgentHostClosed(agent_host_.get());
+@@ -34,6 +43,7 @@
+     return false;
+   }
+ 
++  if (DispatchZacro(message)) return true;
+   agent_host_->DispatchProtocolMessage(this,
+                                        base::as_bytes(base::span(message)));
+   return true;
+@@ -75,6 +85,11 @@
+ 
+ void CefDevToolsController::AgentHostClosed(
+     content::DevToolsAgentHost* agent_host) {
++  if (agent_host == zacro_browser_agent_.get()) {
++    zacro_browser_agent_ = nullptr;
++    zacro_browser_sessions_.clear();
++    return;
++  }
+   DCHECK(agent_host == agent_host_.get());
+   agent_host_ = nullptr;
+   for (auto& observer : observers_) {
+@@ -104,6 +119,23 @@
+   if (!devtools_util::ProtocolParser::IsValidMessage(str_message)) {
+     LOG(WARNING) << "Invalid message: " << str_message.substr(0, 100);
+     return;
++  }
++
++  // Flattened sessions attached through the browser agent must keep routing
++  // through that agent, rather than the inspected document's page agent.
++  if (agent_host == zacro_browser_agent_.get()) {
++    if (auto response = base::JSONReader::ReadDict(str_message, base::JSON_PARSE_RFC)) {
++      if (const auto* result = response->FindDict("result")) {
++        if (const auto* session = result->FindString("sessionId")) zacro_browser_sessions_.insert(*session);
++      }
++      const auto* method = response->FindString("method");
++      const auto* params = response->FindDict("params");
++      const auto* session = params ? params->FindString("sessionId") : nullptr;
++      if (method && session) {
++        if (*method == "Target.attachedToTarget") zacro_browser_sessions_.insert(*session);
++        else if (*method == "Target.detachedFromTarget") zacro_browser_sessions_.erase(*session);
++      }
++    }
+   }
+ 
+   devtools_util::ProtocolParser parser;
+--- a/BUILD.gn
++++ b/BUILD.gn
+@@ -981,6 +981,9 @@
+     "//components/proxy_config",
+     "//components/services/print_compositor/public/cpp",
+     "//components/services/print_compositor/public/mojom",
++    "//components/sessions",
++    "//components/os_crypt/async/browser",
++    "//components/os_crypt/async/common",
+     "//components/update_client",
+     "//components/url_formatter",
+     "//components/user_prefs",
+--- a/libcef/browser/browser_platform_delegate.h
++++ b/libcef/browser/browser_platform_delegate.h
+@@ -42,6 +42,7 @@
+ class RenderViewHostDelegateView;
+ class RenderWidgetHostImpl;
+ class WebContents;
++class ScopedAccessibilityMode;
+ class WebContentsView;
+ }  // namespace content
+ 
+@@ -381,6 +382,7 @@
+ 
+   // Not owned by this object.
+   raw_ptr<content::WebContents> web_contents_ = nullptr;
++  std::unique_ptr<content::ScopedAccessibilityMode> accessibility_mode_;
+   raw_ptr<CefBrowserHostBase> browser_ = nullptr;
+ };
+ 
+--- a/libcef/browser/browser_platform_delegate.cc
++++ b/libcef/browser/browser_platform_delegate.cc
+@@ -21,6 +21,8 @@
+ #include "components/prefs/pref_service.h"
+ #include "content/browser/web_contents/web_contents_impl.h"
+ #include "content/public/browser/render_view_host.h"
++#include "content/public/browser/browser_accessibility_state.h"
++#include "content/public/browser/scoped_accessibility_mode.h"
+ #include "content/public/browser/render_widget_host.h"
+ #include "content/public/browser/render_widget_host_view.h"
+ 
+@@ -509,27 +511,17 @@
+ 
+ void CefBrowserPlatformDelegate::SetAccessibilityState(
+     cef_state_t accessibility_state) {
+-  // Do nothing if state is set to default. It'll be disabled by default and
+-  // controlled by the command-line flags "force-renderer-accessibility" and
+-  // "disable-renderer-accessibility".
+-  if (accessibility_state == STATE_DEFAULT) {
++  // Own the accessibility request through Chromium's mode manager. Setting
++  // WebContentsImpl's current mode directly is lost when visibility/platform
++  // signals recompute the effective mode for a retained document.
++  if (accessibility_state != STATE_ENABLED) {
++    accessibility_mode_.reset();
+     return;
+   }
+-
+-  content::WebContentsImpl* web_contents_impl =
+-      static_cast<content::WebContentsImpl*>(web_contents_);
+-
+-  if (!web_contents_impl) {
+-    return;
+-  }
+-
+-  ui::AXMode accMode;
+-  // In windowless mode set accessibility to TreeOnly mode. Else native
+-  // accessibility APIs, specific to each platform, are also created.
+-  if (accessibility_state == STATE_ENABLED) {
+-    accMode = IsWindowless() ? ui::kAXModeWebContentsOnly : ui::kAXModeComplete;
+-  }
+-  web_contents_impl->SetAccessibilityMode(accMode);
++  if (!web_contents_ || accessibility_mode_) return;
++  accessibility_mode_ = content::BrowserAccessibilityState::GetInstance()
++      ->CreateScopedModeForWebContents(web_contents_,
++          IsWindowless() ? ui::kAXModeWebContentsOnly : ui::kAXModeComplete);
+ }
+ 
+ bool CefBrowserPlatformDelegate::IsPrintPreviewSupported() const {
+--- a/libcef/browser/chrome/chrome_browser_main_extra_parts_cef.h
++++ b/libcef/browser/chrome/chrome_browser_main_extra_parts_cef.h
+@@ -47,6 +47,7 @@
+ 
+  private:
+   // ChromeBrowserMainExtraParts overrides.
++  void PreProfileInit() override;
+   void PostProfileInit(Profile* profile, bool is_initial_profile) override;
+   void PostBrowserStart() override;
+   void PreMainMessageLoopRun() override;
+--- a/libcef/browser/chrome/chrome_browser_main_extra_parts_cef.cc
++++ b/libcef/browser/chrome/chrome_browser_main_extra_parts_cef.cc
+@@ -36,6 +36,12 @@
+     ui::PrintingContextLinuxDelegate::SetInstance(nullptr);
+   }
+ #endif
++}
++
++// Native process-only hooks are installed before extension workers can start.
++void ZacroInstallTopologyHooks();
++void ChromeBrowserMainExtraPartsCef::PreProfileInit() {
++  ZacroInstallTopologyHooks();
+ }
+ 
+ void ChromeBrowserMainExtraPartsCef::PostProfileInit(Profile* profile,
+--- /dev/null
++++ b/libcef/browser/devtools/zacro_native_adapter.inc
+@@ -0,0 +1,513 @@
++// Zacro's browser-process adapter, included by CefDevToolsController.
++// This channel is reachable only through CEF's native API. It is never exposed
++// as a page binding, socket, scheme handler, or extension API.
++#include <algorithm>
++#include "base/base64.h"
++#include "base/functional/bind.h"
++#include "base/pickle.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/timer/timer.h"
++#include "chrome/browser/browsing_data/chrome_browsing_data_remover_constants.h"
++#include "chrome/browser/devtools/devtools_window.h"
++#include "chrome/browser/browser_process.h"
++#include "chrome/browser/extensions/browser_window_util.h"
++#include "chrome/browser/extensions/webstore_install_with_prompt.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/extensions/extension_action_view_model.h"
++#include "chrome/browser/ui/extensions/extensions_container.h"
++#include "chrome/browser/ui/toolbar/toolbar_action_view_model.h"
++#include "components/os_crypt/async/browser/os_crypt_async.h"
++#include "components/os_crypt/async/common/encryptor.h"
++#include "components/sessions/content/content_serialized_navigation_builder.h"
++#include "components/sessions/content/session_tab_helper.h"
++#include "components/sessions/core/serialized_navigation_entry.h"
++#include "content/public/browser/browser_context.h"
++#include "content/public/browser/browsing_data_remover.h"
++#include "content/public/browser/download_manager.h"
++#include "content/public/browser/navigation_controller.h"
++#include "content/public/browser/navigation_entry.h"
++#include "content/public/browser/navigation_handle.h"
++#include "content/public/browser/restore_type.h"
++#include "content/public/browser/web_contents.h"
++#include "content/public/browser/web_contents_observer.h"
++#include "content/public/browser/visibility.h"
++#include "crypto/aead.h"
++#include "crypto/random.h"
++#include "extensions/browser/extension_registry.h"
++#include "extensions/browser/extension_action.h"
++#include "extensions/browser/extension_action_manager.h"
++#include "extensions/common/extension.h"
++#include "ui/gfx/image/image.h"
++#include "cef/libcef/browser/devtools/zacro_extensions_adapter.inc"
++#include "cef/libcef/browser/devtools/zacro_topology_adapter.inc"
++
++namespace {
++constexpr char kZacroBrowserSession[] = "zacro.native.browser.v1";
++constexpr size_t kZacroMaximumHistoryBytes = 6 * 1024 * 1024;
++
++std::string ZacroHistoryBinding(content::WebContents* contents) {
++  return "zacro.navigation.v2:" +
++      contents->GetBrowserContext()->GetPath().AsUTF8Unsafe();
++}
++
++bool ZacroRestorableURL(const GURL& url, content::BrowserContext* context) {
++  if (!url.is_valid() || url.has_username() || url.has_password()) return false;
++  if (url.SchemeIsHTTPOrHTTPS() || url == GURL("about:blank")) return true;
++  if (url.SchemeIs("chrome-extension")) {
++    auto* registry = extensions::ExtensionRegistry::Get(context);
++    return registry && registry->enabled_extensions().Contains(std::string(url.host()));
++  }
++  return false;
++}
++}
++
++class ZacroDataRemoval : public content::BrowsingDataRemover::Observer {
++ public:
++  ZacroDataRemoval(content::BrowsingDataRemover* remover,
++                   base::OnceCallback<void(uint64_t)> completion)
++      : remover_(remover), completion_(std::move(completion)) {
++    remover_->AddObserver(this);
++  }
++  ~ZacroDataRemoval() override { remover_->RemoveObserver(this); }
++  void Start(uint64_t mask) {
++    remover_->RemoveAndReply(base::Time(), base::Time::Max(), mask,
++        content::BrowsingDataRemover::ORIGIN_TYPE_UNPROTECTED_WEB |
++        content::BrowsingDataRemover::ORIGIN_TYPE_PROTECTED_WEB, this);
++  }
++  void OnBrowsingDataRemoverDone(uint64_t failed_data_types) override {
++    std::move(completion_).Run(failed_data_types);
++  }
++ private:
++  raw_ptr<content::BrowsingDataRemover> remover_;
++  base::OnceCallback<void(uint64_t)> completion_;
++};
++
++class ZacroDocumentObserver : public content::WebContentsObserver {
++ public:
++  ZacroDocumentObserver(content::WebContents* contents,
++      base::RepeatingCallback<void(bool)> audio)
++      : content::WebContentsObserver(contents), audio_(std::move(audio)) {}
++  void OnAudioStateChanged(bool audible) override { audio_.Run(audible); }
++ private:
++  base::RepeatingCallback<void(bool)> audio_;
++};
++
++class ZacroDiscardOperation : public content::WebContentsObserver {
++ public:
++  ZacroDiscardOperation(content::WebContents* contents,
++      base::OnceCallback<void(int, const std::string&)> completion)
++      : content::WebContentsObserver(contents), completion_(std::move(completion)) {}
++  void Start() {
++    timer_.Start(FROM_HERE, base::Seconds(15), base::BindOnce(
++        &ZacroDiscardOperation::TimedOut, base::Unretained(this)));
++    web_contents()->GetController().LoadURL(GURL("about:blank"), content::Referrer(),
++        ui::PAGE_TRANSITION_AUTO_TOPLEVEL, std::string());
++  }
++  void DidFinishNavigation(content::NavigationHandle* navigation) override {
++    if (!navigation->IsInPrimaryMainFrame() || !navigation->HasCommitted()) return;
++    if (navigation->GetURL() != GURL("about:blank") || navigation->IsErrorPage()) {
++      Finish(0, "The document changed while sleeping.");
++    } else { committed_blank_ = true; }
++  }
++  void DidStopLoading() override {
++    if (!committed_blank_ || !completion_) return;
++    auto* contents = web_contents();
++    auto& controller = contents->GetController();
++    if (contents->GetLastCommittedURL() != GURL("about:blank") ||
++        contents->IsCurrentlyAudible() || contents->IsBeingCaptured() ||
++        !controller.CanPruneAllButLastCommitted()) {
++      Finish(0, "The document could not be discarded safely."); return;
++    }
++    controller.PruneAllButLastCommitted();
++    Finish(controller.GetLastCommittedEntry()->GetUniqueID(), {});
++  }
++  void WebContentsDestroyed() override { Finish(0, "The document closed while sleeping."); }
++ private:
++  void TimedOut() {
++    // Stop may synchronously invoke observer callbacks. Disable observation
++    // first so they cannot delete this operation underneath the timeout.
++    auto* contents = web_contents();
++    Observe(nullptr);
++    timer_.Stop();
++    auto completion = std::move(completion_);
++    if (contents) contents->Stop();
++    // Stop can destroy the owning controller. Do not touch this afterward.
++    if (completion) std::move(completion).Run(0, "The document did not finish sleeping in time.");
++  }
++  void Finish(int entry_id, const std::string& error) {
++    timer_.Stop();
++    if (completion_) std::move(completion_).Run(entry_id, error);
++  }
++  base::OneShotTimer timer_;
++  bool committed_blank_ = false;
++  base::OnceCallback<void(int, const std::string&)> completion_;
++};
++
++void CefDevToolsController::ReplyZacro(int id, base::DictValue result,
++                                      const std::string& error) {
++  base::DictValue response;
++  response.Set("id", id);
++  if (error.empty()) response.Set("result", std::move(result));
++  else response.Set("error", base::DictValue().Set("code", -32000).Set("message", error));
++  if (auto json = base::WriteJson(response)) {
++    DispatchProtocolMessage(nullptr, base::as_bytes(base::span(*json)));
++  }
++}
++
++bool CefDevToolsController::DispatchZacro(const std::string_view& message) {
++  auto request = base::JSONReader::ReadDict(message, base::JSON_PARSE_RFC);
++  if (!request) return false;
++  const auto* method = request->FindString("method");
++  const auto id = request->FindInt("id");
++  if (!method || !id) return false;
++  if (*method == "Zacro.observeDocument") {
++    const auto* params = request->FindDict("params");
++    zacro_document_observer_.reset();
++    if (params && params->FindBool("enabled").value_or(false)) {
++      zacro_document_observer_ = std::make_unique<ZacroDocumentObserver>(inspected_contents_, base::BindRepeating(
++          [](base::WeakPtr<CefDevToolsController> self, bool audible) {
++            if (self) self->EmitZacro("Zacro.documentAudioChanged", base::DictValue().Set("audible", audible));
++          }, weak_ptr_factory_.GetWeakPtr()));
++    }
++    ReplyZacro(*id, base::DictValue().Set("audible", inspected_contents_->IsCurrentlyAudible())); return true;
++  }
++  if (DispatchZacroTopology(*id, *method, request->FindDict("params"))) return true;
++  if (DispatchZacroExtensions(*id, *method, request->FindDict("params"))) return true;
++  const auto* session = request->FindString("sessionId");
++  if (session && (*session == kZacroBrowserSession || zacro_browser_sessions_.contains(*session))) {
++    if (!zacro_browser_agent_) {
++      ReplyZacro(*id, {}, "The native browser session has closed."); return true;
++    }
++    if (*session == kZacroBrowserSession) request->Remove("sessionId");
++    if (auto json = base::WriteJson(*request)) {
++      zacro_browser_agent_->DispatchProtocolMessage(this, base::as_bytes(base::span(*json)));
++    }
++    return true;
++  }
++  if (*method == "Target.attachToBrowserTarget") {
++    if (!zacro_browser_agent_) {
++      zacro_browser_agent_ = content::DevToolsAgentHost::CreateForBrowser(
++          nullptr, content::DevToolsAgentHost::CreateServerSocketCallback());
++      if (!zacro_browser_agent_ || !zacro_browser_agent_->AttachClient(this)) {
++        zacro_browser_agent_ = nullptr;
++        ReplyZacro(*id, {}, "The native browser protocol session could not attach.");
++        return true;
++      }
++    }
++    ReplyZacro(*id, base::DictValue().Set("sessionId", kZacroBrowserSession));
++    return true;
++  }
++  if (*method == "Zacro.getCapabilities") {
++    ReplyZacro(*id, base::DictValue().Set("version", 1).Set("browserProtocol", true)
++        .Set("documentState", true).Set("browsingData", true).Set("navigationState", true)
++        .Set("encryptedNavigation", true).Set("retainedDiscard", true)
++        .Set("extensionActions", true).Set("legacyNavigation", true).Set("extensionStorage", true).Set("extensionBrowser", true)
++        .Set("volatileDiscard", true));
++    return true;
++  }
++  if (*method == "Zacro.installWebStoreExtension") {
++    const auto* params = request->FindDict("params");
++    const auto* extension_id = params ? params->FindString("id") : nullptr;
++    auto* context = inspected_contents_->GetBrowserContext();
++    if (context->IsOffTheRecord() || !extension_id || extension_id->size() != 32 ||
++        !std::ranges::all_of(*extension_id, [](char ch) { return ch >= 'a' && ch <= 'p'; })) {
++      ReplyZacro(*id, {}, "Choose a valid Web Store extension in a persistent profile."); return true;
++    }
++    // This native installer verifies the store response, CRX signature, item
++    // identity and permissions. Its dialog is centered rather than attached to
++    // the deliberately hidden management document's native child window.
++    auto installer = base::MakeRefCounted<extensions::WebstoreInstallWithPrompt>(
++        *extension_id, Profile::FromBrowserContext(context), gfx::NativeWindow(),
++        base::BindOnce([](base::WeakPtr<CefDevToolsController> self, int id,
++            bool success, const std::string& error, extensions::webstore_install::Result) {
++          if (self) self->ReplyZacro(id, base::DictValue().Set("installed", success),
++              success ? "" : (error.empty() ? "The Web Store installation was cancelled." : error));
++        }, weak_ptr_factory_.GetWeakPtr(), *id));
++    installer->BeginInstall();
++    return true;
++  }
++  if (*method == "Zacro.performExtensionAction" || *method == "Zacro.getExtensionAction") {
++    const auto* params = request->FindDict("params");
++    const auto* extension_id = params ? params->FindString("id") : nullptr;
++    auto* context = inspected_contents_->GetBrowserContext();
++    auto* registry = extensions::ExtensionRegistry::Get(context);
++    const auto* extension = extension_id && registry ? registry->enabled_extensions().GetByID(*extension_id) : nullptr;
++    auto* manager = extensions::ExtensionActionManager::Get(context);
++    auto* action = extension && manager ? manager->GetExtensionAction(*extension) : nullptr;
++    if (!action) { ReplyZacro(*id, {}, "This extension has no available toolbar action."); return true; }
++    const int tab_id = sessions::SessionTabHelper::IdForTab(inspected_contents_).id();
++    if (*method == "Zacro.getExtensionAction") {
++      auto color = [](SkColor value) { return base::ListValue().Append(static_cast<int>(SkColorGetR(value))).Append(static_cast<int>(SkColorGetG(value))).Append(static_cast<int>(SkColorGetB(value))).Append(static_cast<int>(SkColorGetA(value))); };
++      base::DictValue result;
++      result.Set("title", action->GetTitle(tab_id));
++      result.Set("badgeText", action->GetDisplayBadgeText(tab_id));
++      result.Set("badgeColor", color(action->GetBadgeBackgroundColor(tab_id)));
++      result.Set("badgeForeground", color(action->GetBadgeTextColor(tab_id)));
++      result.Set("enabled", action->GetIsVisible(tab_id));
++      auto icon = action->GetExplicitlySetIcon(tab_id);
++      if (!icon.IsEmpty()) {
++        auto png = icon.As1xPNGBytes();
++        if (png && png->size() <= 512 * 1024) result.Set("iconPNG", base::Base64Encode(base::span(*png)));
++      }
++      ReplyZacro(*id, std::move(result)); return true;
++    }
++    auto* browser = extensions::browser_window_util::GetBrowserForTabContents(*inspected_contents_);
++    auto* container = browser ? ExtensionsContainer::From(*browser) : nullptr;
++    auto* model = container ? container->GetActionForId(*extension_id) : nullptr;
++    if (!model) { ReplyZacro(*id, {}, "The native extension action container is unavailable."); return true; }
++    model->ExecuteUserAction(ExtensionActionViewModel::InvocationSource::kCdp);
++    ReplyZacro(*id, base::DictValue().Set("performed", true)); return true;
++  }
++  if (*method == "Zacro.restoreNavigationEntries") {
++    const auto* params = request->FindDict("params");
++    const auto* items = params ? params->FindList("entries") : nullptr;
++    const auto selected = params ? params->FindInt("selectedIndex") : std::nullopt;
++    auto& controller = inspected_contents_->GetController();
++    if (!items || items->empty() || items->size() > 500 || !selected || *selected < 0 ||
++        static_cast<size_t>(*selected) >= items->size() || !controller.GetLastCommittedEntry()->IsInitialEntry() || controller.GetPendingEntry()) {
++      ReplyZacro(*id, {}, "Legacy history can only restore a fresh initial document."); return true;
++    }
++    std::vector<sessions::SerializedNavigationEntry> serialized;
++    for (const auto& value : *items) {
++      const auto* item = value.GetIfDict();
++      const auto* url = item ? item->FindString("url") : nullptr;
++      const auto* title = item ? item->FindString("title") : nullptr;
++      if (!url || url->size() > 32768 || !title || title->size() > 8192 ||
++          !ZacroRestorableURL(GURL(*url), inspected_contents_->GetBrowserContext())) {
++        ReplyZacro(*id, {}, "Legacy navigation contains an invalid entry."); return true;
++      }
++      sessions::SerializedNavigationEntry entry;
++      entry.set_index(serialized.size()); entry.set_virtual_url(GURL(*url)); entry.set_title(base::UTF8ToUTF16(*title));
++      serialized.push_back(std::move(entry));
++    }
++    auto entries = sessions::ContentSerializedNavigationBuilder::ToNavigationEntries(serialized, inspected_contents_->GetBrowserContext());
++    controller.Restore(*selected, content::RestoreType::kRestored, &entries);
++    controller.LoadIfNecessary();
++    ReplyZacro(*id, base::DictValue().Set("restored", true)); return true;
++  }
++  if (*method == "Zacro.getDocumentState") {
++    auto* context = inspected_contents_->GetBrowserContext();
++    ReplyZacro(*id, base::DictValue()
++        .Set("audible", inspected_contents_->IsCurrentlyAudible())
++        .Set("capturing", inspected_contents_->IsBeingCaptured())
++        .Set("beforeUnload", inspected_contents_->NeedToFireBeforeUnloadOrUnloadEvents())
++        .Set("devToolsOpen", DevToolsWindow::GetInstanceForInspectedWebContents(inspected_contents_) != nullptr)
++        .Set("profileDownloads", context->GetDownloadManager()->InProgressCount())
++        .Set("crashed", inspected_contents_->IsCrashed())
++        .Set("loading", inspected_contents_->IsLoading()));
++    return true;
++  }
++  if (*method == "Zacro.clearBrowsingData") {
++    const auto* params = request->FindDict("params");
++    const bool site = params && params->FindBool("siteData").value_or(false);
++    const bool cache = params && params->FindBool("cache").value_or(false);
++    uint64_t mask = 0;
++    if (site) mask |= chrome_browsing_data_remover::DATA_TYPE_SITE_DATA;
++    if (cache) mask |= content::BrowsingDataRemover::DATA_TYPE_CACHE;
++    if (!mask || zacro_data_removals_.contains(*id)) {
++      ReplyZacro(*id, {}, "Choose site data or cache to clear."); return true;
++    }
++    auto removal = std::make_unique<ZacroDataRemoval>(
++        inspected_contents_->GetBrowserContext()->GetBrowsingDataRemover(),
++        base::BindOnce(&CefDevToolsController::FinishZacroDataRemoval,
++                       weak_ptr_factory_.GetWeakPtr(), *id));
++    auto* operation = removal.get();
++    zacro_data_removals_[*id] = std::move(removal);
++    operation->Start(mask);
++    return true;
++  }
++  if (*method == "Zacro.discardDocument") {
++    if (zacro_discard_ || inspected_contents_->GetVisibility() != content::Visibility::HIDDEN || inspected_contents_->IsLoading() ||
++        inspected_contents_->IsCurrentlyAudible() || inspected_contents_->IsBeingCaptured() ||
++        inspected_contents_->NeedToFireBeforeUnloadOrUnloadEvents() ||
++        DevToolsWindow::GetInstanceForInspectedWebContents(inspected_contents_) ||
++        inspected_contents_->GetBrowserContext()->GetDownloadManager()->InProgressCount() > 0) {
++      ReplyZacro(*id, {}, "The document is in use and cannot be put to sleep."); return true;
++    }
++    // Private documents keep their history only in this native controller's
++    // memory. Nothing is exported, encrypted for storage, or written to disk.
++    auto& controller = inspected_contents_->GetController();
++    if (controller.GetEntryCount() < 1 || controller.GetEntryCount() > 500) {
++      ReplyZacro(*id, {}, "The document history cannot be retained safely."); return true;
++    }
++    zacro_dormant_history_.clear();
++    size_t retained_bytes = 0;
++    for (int index = 0; index < controller.GetEntryCount(); ++index) {
++      auto* entry = controller.GetEntryAtIndex(index);
++      if (!ZacroRestorableURL(entry->GetVirtualURL(), inspected_contents_->GetBrowserContext())) {
++        zacro_dormant_history_.clear(); ReplyZacro(*id, {}, "The document history contains an unsupported address."); return true;
++      }
++      auto saved = sessions::ContentSerializedNavigationBuilder::FromNavigationEntry(index, entry);
++      retained_bytes += sizeof(saved) + saved.EstimateMemoryUsage();
++      if (retained_bytes > kZacroMaximumHistoryBytes) {
++        zacro_dormant_history_.clear();
++        ReplyZacro(*id, {}, "The retained navigation state exceeds the supported size."); return true;
++      }
++      zacro_dormant_history_.push_back(std::move(saved));
++    }
++    zacro_dormant_selected_ = controller.GetLastCommittedEntryIndex();
++    zacro_discard_ = std::make_unique<ZacroDiscardOperation>(inspected_contents_,
++        base::BindOnce(&CefDevToolsController::FinishZacroDiscard,
++                       weak_ptr_factory_.GetWeakPtr(), *id));
++    zacro_discard_->Start();
++    return true;
++  }
++  if (*method == "Zacro.restoreDiscardedDocument") {
++    auto& controller = inspected_contents_->GetController();
++    if (zacro_dormant_history_.empty() || zacro_discard_ || controller.GetEntryCount() != 1 ||
++        !zacro_dormant_entry_ || controller.GetLastCommittedEntry()->GetUniqueID() != zacro_dormant_entry_ ||
++        controller.GetPendingEntry() || inspected_contents_->IsLoading() ||
++        inspected_contents_->GetLastCommittedURL() != GURL("about:blank")) {
++      ReplyZacro(*id, {}, "This document does not have a retained sleeping session."); return true;
++    }
++    auto entries = sessions::ContentSerializedNavigationBuilder::ToNavigationEntries(
++        zacro_dormant_history_, inspected_contents_->GetBrowserContext());
++    controller.Restore(zacro_dormant_selected_ + 1, content::RestoreType::kRestored, &entries);
++    CHECK(controller.RemoveEntryAtIndex(0));
++    zacro_dormant_entry_ = 0; zacro_dormant_history_.clear();
++    controller.LoadIfNecessary(); ReplyZacro(*id, base::DictValue().Set("restored", true)); return true;
++  }
++  if (*method == "Zacro.serializeNavigation") {
++    if (inspected_contents_->GetBrowserContext()->IsOffTheRecord()) {
++      ReplyZacro(*id, {}, "Private navigation state cannot be persisted."); return true;
++    }
++    auto& controller = inspected_contents_->GetController();
++    const int count = controller.GetEntryCount();
++    if (count < 1 || count > 500) {
++      ReplyZacro(*id, {}, "Navigation history exceeds the supported entry count."); return true;
++    }
++    base::Pickle pickle;
++    pickle.WriteInt(1);
++    pickle.WriteInt(controller.GetLastCommittedEntryIndex());
++    pickle.WriteInt(count);
++    for (int index = 0; index < count; ++index) {
++      if (!ZacroRestorableURL(controller.GetEntryAtIndex(index)->GetURL(),
++                             inspected_contents_->GetBrowserContext())) {
++        ReplyZacro(*id, {}, "This navigation contains a non-restorable browser URL."); return true;
++      }
++      auto entry = sessions::ContentSerializedNavigationBuilder::FromNavigationEntry(
++          index, controller.GetEntryAtIndex(index));
++      entry.WriteToPickle(512 * 1024, &pickle);
++      if (pickle.size() > kZacroMaximumHistoryBytes - 4096) {
++        ReplyZacro(*id, {}, "Navigation state exceeds the supported size."); return true;
++      }
++    }
++    auto* crypt = g_browser_process ? g_browser_process->os_crypt_async() : nullptr;
++    if (!crypt) { ReplyZacro(*id, {}, "Native navigation encryption is unavailable."); return true; }
++    crypt->GetInstance(base::BindOnce(
++        [](base::WeakPtr<CefDevToolsController> self, int id,
++           std::string plain, std::string binding,
++           scoped_refptr<os_crypt_async::Encryptor> encryptor) {
++          if (!self) return;
++          const auto key = crypto::RandBytesAsArray<32>();
++          const auto nonce = crypto::RandBytesAsArray<12>();
++          const auto wrapped_key = encryptor->EncryptString(
++              std::string(base::as_string_view(key)));
++          if (!wrapped_key) { self->ReplyZacro(id, {}, "Navigation encryption failed."); return; }
++          const auto sealed = crypto::aead::Seal(crypto::aead::AES_256_GCM, key,
++              base::as_bytes(base::span(plain)), nonce, base::as_bytes(base::span(binding)));
++          if (sealed.empty()) { self->ReplyZacro(id, {}, "Navigation encryption failed."); return; }
++          // OSCrypt wraps a fresh random AEAD key using the already configured
++          // Chromium OS/keychain provider. AES-GCM authenticates the entire
++          // history and profile binding even when the OS provider is legacy.
++          base::Pickle envelope;
++          envelope.WriteInt(2);
++          envelope.WriteString(base::as_string_view(*wrapped_key));
++          envelope.WriteString(base::as_string_view(nonce));
++          envelope.WriteString(base::as_string_view(sealed));
++          if (envelope.size() > kZacroMaximumHistoryBytes) {
++            self->ReplyZacro(id, {}, "Encrypted navigation state exceeds the supported size."); return;
++          }
++          self->ReplyZacro(id, base::DictValue().Set("version", 2)
++              .Set("state", base::Base64Encode(envelope.AsBytes())));
++        }, weak_ptr_factory_.GetWeakPtr(), *id,
++        std::string(pickle.AsStringView()), ZacroHistoryBinding(inspected_contents_)));
++    return true;
++  }
++  if (*method == "Zacro.restoreNavigation") {
++    const auto* params = request->FindDict("params");
++    const auto* encoded = params ? params->FindString("state") : nullptr;
++    std::string bytes;
++    if (!encoded || encoded->size() > 8 * 1024 * 1024 ||
++        !base::Base64Decode(*encoded, &bytes) || bytes.size() > kZacroMaximumHistoryBytes) {
++      ReplyZacro(*id, {}, "Invalid navigation state."); return true;
++    }
++    auto envelope = base::Pickle::WithData(base::as_bytes(base::span(bytes)));
++    base::PickleIterator envelope_iterator(envelope);
++    int envelope_version = 0;
++    std::string wrapped_key, nonce, ciphertext;
++    if (!envelope_iterator.ReadInt(&envelope_version) || envelope_version != 2 ||
++        !envelope_iterator.ReadString(&wrapped_key) || wrapped_key.size() > 1024 ||
++        !envelope_iterator.ReadString(&nonce) || nonce.size() != 12 ||
++        !envelope_iterator.ReadString(&ciphertext) || !envelope_iterator.ReachedEnd() ||
++        inspected_contents_->GetBrowserContext()->IsOffTheRecord()) {
++      ReplyZacro(*id, {}, "Invalid encrypted navigation state."); return true;
++    }
++    auto* crypt = g_browser_process ? g_browser_process->os_crypt_async() : nullptr;
++    if (!crypt) { ReplyZacro(*id, {}, "Native navigation encryption is unavailable."); return true; }
++    crypt->GetInstance(base::BindOnce(
++        [](base::WeakPtr<CefDevToolsController> self, int id,
++           std::string wrapped_key, std::string nonce, std::string ciphertext,
++           scoped_refptr<os_crypt_async::Encryptor> encryptor) {
++          if (!self) return;
++          auto key = encryptor->DecryptData(base::as_bytes(base::span(wrapped_key)));
++          if (!key || key->size() != 32) { self->ReplyZacro(id, {}, "Navigation decryption failed."); return; }
++          const auto binding = ZacroHistoryBinding(self->inspected_contents_);
++          auto plain = crypto::aead::Open(crypto::aead::AES_256_GCM,
++              base::as_bytes(base::span(*key)), base::as_bytes(base::span(ciphertext)),
++              base::as_bytes(base::span(nonce)), base::as_bytes(base::span(binding)));
++          if (!plain) { self->ReplyZacro(id, {}, "Navigation state is damaged or belongs to another profile."); return; }
++          auto pickle = base::Pickle::WithData(*plain);
++          base::PickleIterator iterator(pickle);
++          int version = 0, selected = -1, count = 0;
++          if (!iterator.ReadInt(&version) || version != 1 || !iterator.ReadInt(&selected) ||
++              !iterator.ReadInt(&count) || count < 1 || count > 500 || selected < 0 || selected >= count) {
++            self->ReplyZacro(id, {}, "Unsupported navigation state."); return;
++          }
++          auto* context = self->inspected_contents_->GetBrowserContext();
++          std::vector<sessions::SerializedNavigationEntry> saved;
++          for (int index = 0; index < count; ++index) {
++            sessions::SerializedNavigationEntry entry;
++            if (!entry.ReadFromPickle(&iterator) || !ZacroRestorableURL(entry.virtual_url(), context)) {
++              self->ReplyZacro(id, {}, "Invalid navigation entry."); return;
++            }
++            saved.push_back(std::move(entry));
++          }
++          auto& controller = self->inspected_contents_->GetController();
++          const bool initial = controller.GetLastCommittedEntry()->IsInitialEntry();
++          const bool dormant = self->zacro_dormant_entry_ > 0 && controller.GetEntryCount() == 1 &&
++              controller.GetLastCommittedEntry()->GetUniqueID() == self->zacro_dormant_entry_ &&
++              self->inspected_contents_->GetLastCommittedURL() == GURL("about:blank") &&
++              !self->inspected_contents_->IsLoading();
++          if (!iterator.ReachedEnd() || controller.GetPendingEntry() || (!initial && !dormant)) {
++            self->ReplyZacro(id, {}, "Restore requires a fresh document with no navigation in progress."); return;
++          }
++          auto entries = sessions::ContentSerializedNavigationBuilder::ToNavigationEntries(saved, context);
++          controller.Restore(selected + (dormant ? 1 : 0), content::RestoreType::kRestored, &entries);
++          if (dormant) {
++            CHECK(controller.RemoveEntryAtIndex(0));
++            self->zacro_dormant_entry_ = 0;
++            self->zacro_dormant_history_.clear();
++          }
++          controller.LoadIfNecessary();
++          self->ReplyZacro(id, base::DictValue().Set("restored", true));
++        }, weak_ptr_factory_.GetWeakPtr(), *id, std::move(wrapped_key), std::move(nonce), std::move(ciphertext)));
++    return true;
++  }
++  return false;
++}
++
++void CefDevToolsController::FinishZacroDataRemoval(int id, uint64_t failed_types) {
++  ReplyZacro(id, base::DictValue().Set("cleared", failed_types == 0),
++      failed_types ? "Some browsing data could not be cleared (mask " +
++          base::NumberToString(failed_types) + ")." : "");
++  zacro_data_removals_.erase(id);
++}
++
++void CefDevToolsController::FinishZacroDiscard(int id, int entry_id, const std::string& error) {
++  zacro_dormant_entry_ = entry_id;
++  if (!entry_id) zacro_dormant_history_.clear();
++  ReplyZacro(id, base::DictValue().Set("discarded", entry_id > 0), error);
++  zacro_discard_.reset();
++}
+--- /dev/null
++++ b/libcef/browser/devtools/zacro_extensions_adapter.inc
+@@ -0,0 +1,180 @@
++// Browser-context-owned registry/storage observation. No renderer bridge.
++#include "base/supports_user_data.h"
++#include "base/uuid.h"
++#include "chrome/browser/extensions/extension_action_dispatcher.h"
++#include "extensions/browser/api/storage/storage_frontend.h"
++#include "extensions/browser/api/storage/storage_area_namespace.h"
++#include "extensions/browser/extension_registry_observer.h"
++#include "extensions/browser/extension_prefs.h"
++#include "extensions/browser/install_prefs_helper.h"
++#include "extensions/common/permissions/permissions_data.h"
++
++void ZacroSetTopologyObserved(content::BrowserContext* context, bool observed);
++
++class ZacroExtensionContext : public base::SupportsUserData::Data,
++                              public extensions::ExtensionRegistryObserver,
++                              public extensions::ExtensionActionDispatcher::Observer {
++ public:
++  using Events = base::RepeatingCallbackList<void(const std::string&, const base::DictValue&)>;
++  static ZacroExtensionContext* Get(content::BrowserContext* context) {
++    static const char key[] = "zacro.native.extensions";
++    if (auto* value = context->GetUserData(key)) return static_cast<ZacroExtensionContext*>(value);
++    auto value = std::make_unique<ZacroExtensionContext>(context);
++    auto* result = value.get(); context->SetUserData(key, std::move(value)); return result;
++  }
++  explicit ZacroExtensionContext(content::BrowserContext* context) : context_(context) {
++    registry_ = extensions::ExtensionRegistry::Get(context);
++    if (registry_) registry_->AddObserver(this);
++    dispatcher_ = extensions::ExtensionActionDispatcher::Get(context);
++    if (dispatcher_) dispatcher_->AddObserver(this);
++    // Incognito state never participates in a portable storage stream.
++    if (!context->IsOffTheRecord()) {
++      auto* storage = extensions::StorageFrontend::Get(context);
++      if (storage) storage_observer_ = storage->ObserveNativeChanges(base::BindRepeating(
++          &ZacroExtensionContext::StorageChanged, base::Unretained(this)));
++    }
++  }
++  ~ZacroExtensionContext() override {
++    if (registry_) registry_->RemoveObserver(this);
++    if (dispatcher_) dispatcher_->RemoveObserver(this);
++  }
++  std::string InstallationID(const extensions::Extension& extension) {
++    auto& entry = installations_[extension.id()];
++    if (entry.first.get() != &extension) {
++      entry.first = &extension; entry.second = base::Uuid::GenerateRandomV4().AsLowercaseString();
++    }
++    return entry.second;
++  }
++  bool IsCurrent(const extensions::Extension& extension, const std::string& installation) {
++    return registry_ && registry_->GetInstalledExtension(extension.id()) == &extension &&
++        InstallationID(extension) == installation;
++  }
++  std::string IncarnationID(const extensions::Extension& extension) {
++    auto* prefs = extensions::ExtensionPrefs::Get(context_);
++    if (!prefs) return {};
++    auto first = extensions::GetFirstInstallTime(prefs, extension.id());
++    if (first.is_null()) return {};
++    // Chromium preserves first_install_time across updates and deletes it at
++    // uninstall. This is an incarnation identifier, separate from the random
++    // in-process nonce that invalidates outstanding work on object replacement.
++    return extension.id() + ":" + base::NumberToString(first.ToDeltaSinceWindowsEpoch().InMicroseconds());
++  }
++  base::CallbackListSubscription Observe(Events::CallbackType callback) { return events_.Add(std::move(callback)); }
++  void NotifyHost(const base::DictValue& request) { events_.Notify("Zacro.extensionHostRequest", request); }
++  void OnExtensionLoaded(content::BrowserContext*, const extensions::Extension* extension) override {
++    InstallationID(*extension); RegistryChanged();
++  }
++  void OnExtensionUnloaded(content::BrowserContext*, const extensions::Extension*, extensions::UnloadedExtensionReason) override { RegistryChanged(); }
++  void OnExtensionWillBeInstalled(content::BrowserContext*, const extensions::Extension* extension,
++      bool, const std::string&) override { installations_.erase(extension->id()); }
++  void OnExtensionInstalled(content::BrowserContext*, const extensions::Extension* extension, bool is_update) override {
++    InstallationID(*extension);
++    events_.Notify("Zacro.extensionInstallationChanged", base::DictValue().Set("id", extension->id())
++        .Set("kind", is_update ? "updated" : "installed"));
++    RegistryChanged();
++  }
++  void OnExtensionUninstalled(content::BrowserContext*, const extensions::Extension* extension, extensions::UninstallReason) override {
++    installations_.erase(extension->id());
++    events_.Notify("Zacro.extensionInstallationChanged", base::DictValue().Set("id", extension->id()).Set("kind", "uninstalled"));
++    RegistryChanged();
++  }
++  void OnShutdown(extensions::ExtensionRegistry* registry) override {
++    registry->RemoveObserver(this); registry_ = nullptr; installations_.clear();
++  }
++  void OnShuttingDown() override { dispatcher_->RemoveObserver(this); dispatcher_ = nullptr; }
++  void OnExtensionActionUpdated(extensions::ExtensionAction* action, content::WebContents* contents,
++      content::BrowserContext* context) override {
++    if (!action || context != context_) return;
++    base::DictValue params; params.Set("id", action->extension_id());
++    if (contents) params.Set("tabID", sessions::SessionTabHelper::IdForTab(contents).id());
++    events_.Notify("Zacro.extensionActionChanged", params);
++  }
++ private:
++  void RegistryChanged() { events_.Notify("Zacro.extensionRegistryChanged", base::DictValue()); }
++  void StorageChanged(const extensions::ExtensionId& id, extensions::StorageAreaNamespace area,
++      const base::Value& changes, const std::string& origin, const extensions::Extension* mutation_owner) {
++    if (area != extensions::StorageAreaNamespace::kSync || origin == "zacro.private" ||
++        !registry_ || context_->IsOffTheRecord()) return;
++    const auto* extension = registry_->GetInstalledExtension(id);
++    if (!extension || (mutation_owner && mutation_owner != extension) ||
++        !extension->permissions_data()->HasAPIPermission("storage")) return;
++    events_.Notify("Zacro.extensionStorageChanged", base::DictValue().Set("id", id)
++        .Set("installationID", InstallationID(*extension)).Set("changes", changes.Clone()).Set("origin", origin));
++  }
++  raw_ptr<content::BrowserContext> context_;
++  raw_ptr<extensions::ExtensionRegistry> registry_ = nullptr;
++  raw_ptr<extensions::ExtensionActionDispatcher> dispatcher_ = nullptr;
++  std::map<std::string, std::pair<scoped_refptr<const extensions::Extension>, std::string>> installations_;
++  Events events_;
++  base::CallbackListSubscription storage_observer_;
++};
++
++void CefDevToolsController::EmitZacro(const std::string& method, const base::DictValue& params) {
++  if (auto json = base::WriteJson(base::DictValue().Set("method", method).Set("params", params.Clone()))) {
++    DispatchProtocolMessage(nullptr, base::as_bytes(base::span(*json)));
++  }
++}
++
++bool CefDevToolsController::DispatchZacroExtensions(int id, const std::string& method,
++                                                   const base::DictValue* params) {
++  if (!method.starts_with("Zacro.")) return false;
++  if (method != "Zacro.observeExtensions" && method != "Zacro.getExtensionStorage" &&
++      method != "Zacro.applyExtensionStorage") return false;
++  auto* context = inspected_contents_->GetBrowserContext();
++  auto* state = ZacroExtensionContext::Get(context);
++  if (method == "Zacro.observeExtensions") {
++    zacro_extension_subscription_ = {};
++    bool enabled = params && params->FindBool("enabled").value_or(false);
++    if (enabled) {
++      zacro_extension_subscription_ = state->Observe(base::BindRepeating(
++          &CefDevToolsController::EmitZacro, weak_ptr_factory_.GetWeakPtr()));
++    }
++    ZacroSetTopologyObserved(context, enabled);
++    ReplyZacro(id, {}); return true;
++  }
++  if (context->IsOffTheRecord()) { ReplyZacro(id, {}, "Private extension storage cannot be synchronized."); return true; }
++  const auto* extension_id = params ? params->FindString("id") : nullptr;
++  auto* registry = extensions::ExtensionRegistry::Get(context);
++  scoped_refptr<const extensions::Extension> extension = extension_id && registry ? registry->GetInstalledExtension(*extension_id) : nullptr;
++  auto* frontend = extensions::StorageFrontend::Get(context);
++  if (!extension || !frontend || !extension->permissions_data()->HasAPIPermission("storage")) {
++    ReplyZacro(id, {}, "This installed extension does not have storage permission."); return true;
++  }
++  const std::string installation = state->InstallationID(*extension);
++  if (method == "Zacro.getExtensionStorage") {
++    frontend->GetValues(extension, extensions::StorageAreaNamespace::kSync, std::nullopt,
++        base::BindOnce([](base::WeakPtr<CefDevToolsController> self, int id,
++            scoped_refptr<const extensions::Extension> extension, std::string installation,
++            extensions::StorageFrontend::GetResult result) {
++          if (!self) return;
++          auto* state = ZacroExtensionContext::Get(self->inspected_contents_->GetBrowserContext());
++          if (!state->IsCurrent(*extension, installation)) { self->ReplyZacro(id, {}, "The extension installation changed."); return; }
++          if (!result.status.success || !result.data) { self->ReplyZacro(id, {}, result.status.error.value_or("Extension storage could not be read.")); return; }
++          self->ReplyZacro(id, base::DictValue().Set("installationID", installation)
++              .Set("incarnationID", state->IncarnationID(*extension)).Set("values", std::move(*result.data)));
++        }, weak_ptr_factory_.GetWeakPtr(), id, extension, installation));
++    return true;
++  }
++  const auto* expected = params->FindString("installationID");
++  const auto* changes = params->FindDict("changes");
++  const auto* origin = params->FindString("origin");
++  if (!expected || *expected != installation || !changes || changes->size() > 1024 ||
++      !origin || !origin->starts_with("zacro.remote:") || origin->size() > 512) {
++    ReplyZacro(id, {}, "The remote storage operation is stale or invalid."); return true;
++  }
++  const auto* expected_values = params->FindDict("expectedValues");
++  if (!expected_values) { ReplyZacro(id, {}, "The native storage baseline is required."); return true; }
++  frontend->ApplyNativeChanges(extension, extensions::StorageAreaNamespace::kSync,
++      expected_values->Clone(), changes->Clone(),
++      base::BindOnce([](base::WeakPtr<CefDevToolsController> self, int id,
++          scoped_refptr<const extensions::Extension> extension, std::string installation,
++          extensions::StorageFrontend::ResultStatus status) {
++        if (!self) return;
++        if (!ZacroExtensionContext::Get(self->inspected_contents_->GetBrowserContext())->IsCurrent(*extension, installation)) {
++          self->ReplyZacro(id, {}, "The extension installation changed."); return;
++        }
++        self->ReplyZacro(id, base::DictValue().Set("applied", status.success),
++            status.success ? "" : status.error.value_or("Extension storage could not be written."));
++      }, weak_ptr_factory_.GetWeakPtr(), id, extension, installation), *origin);
++  return true;
++}
+--- /dev/null
++++ b/libcef/browser/devtools/zacro_topology_adapter.inc
+@@ -0,0 +1,574 @@
++// The Swift shell owns logical tabs and windows. Chromium still owns the
++// extension caller, schema, permission grants and real WebContents identities.
++#include "base/strings/pattern.h"
++#include "base/no_destructor.h"
++#include "chrome/browser/extensions/extension_tab_util.h"
++#include "chrome/common/extensions/api/tabs.h"
++#include "chrome/common/extensions/api/windows.h"
++#include "extensions/browser/event_router.h"
++#include "extensions/browser/extension_function.h"
++#include "extensions/common/url_pattern_set.h"
++#include "cef/libcef/browser/devtools/zacro_tab_reservation.h"
++
++namespace {
++using ZacroNativeResponse = ExtensionFunction::NativeResponse;
++using ZacroTabUtil = extensions::ExtensionTabUtil;
++
++constexpr char kZacroReservedTabID[] = "zacro.native.reserved-session-tab-id";
++class ZacroReservedTabID : public base::SupportsUserData::Data {
++ public:
++  explicit ZacroReservedTabID(SessionID value) : id(value) {}
++  const SessionID id;
++};
++
++std::optional<extensions::events::HistogramValue> ZacroBrowserEvent(const std::string& name) {
++  using namespace extensions::events;
++  static const base::NoDestructor<std::map<std::string, HistogramValue>> events({
++    {"tabs.onCreated", TABS_ON_CREATED}, {"tabs.onUpdated", TABS_ON_UPDATED},
++    {"tabs.onRemoved", TABS_ON_REMOVED}, {"tabs.onActivated", TABS_ON_ACTIVATED},
++    {"tabs.onHighlighted", TABS_ON_HIGHLIGHTED}, {"tabs.onMoved", TABS_ON_MOVED},
++    {"tabs.onAttached", TABS_ON_ATTACHED}, {"tabs.onDetached", TABS_ON_DETACHED},
++    {"tabs.onReplaced", TABS_ON_REPLACED}, {"tabs.onZoomChange", TABS_ON_ZOOM_CHANGE},
++    {"windows.onCreated", WINDOWS_ON_CREATED}, {"windows.onRemoved", WINDOWS_ON_REMOVED},
++    {"windows.onFocusChanged", WINDOWS_ON_FOCUS_CHANGED}, {"windows.onBoundsChanged", WINDOWS_ON_BOUNDS_CHANGED},
++  });
++  auto it = events->find(name);
++  return it == events->end() ? std::nullopt : std::make_optional(it->second);
++}
++
++// Return nullopt for functions whose implementation remains wholly Chromium.
++std::optional<bool> ZacroValidateFunction(const std::string& method, const base::ListValue& args) {
++#define ZACRO_TAB(name, type) if (method == "tabs." name) return extensions::api::tabs::type::Params::Create(args).has_value()
++  ZACRO_TAB("query", Query); ZACRO_TAB("get", Get); ZACRO_TAB("getSelected", GetSelected);
++  ZACRO_TAB("getAllInWindow", GetAllInWindow); ZACRO_TAB("create", Create);
++  ZACRO_TAB("update", Update); ZACRO_TAB("remove", Remove); ZACRO_TAB("reload", Reload);
++  ZACRO_TAB("duplicate", Duplicate); ZACRO_TAB("move", Move); ZACRO_TAB("highlight", Highlight);
++  ZACRO_TAB("discard", Discard); ZACRO_TAB("goBack", GoBack); ZACRO_TAB("goForward", GoForward);
++  ZACRO_TAB("getZoom", GetZoom); ZACRO_TAB("setZoom", SetZoom);
++  ZACRO_TAB("getZoomSettings", GetZoomSettings); ZACRO_TAB("setZoomSettings", SetZoomSettings);
++  ZACRO_TAB("captureVisibleTab", CaptureVisibleTab); ZACRO_TAB("detectLanguage", DetectLanguage);
++  ZACRO_TAB("createSplit", CreateSplit); ZACRO_TAB("unsplit", Unsplit);
++#undef ZACRO_TAB
++#define ZACRO_WINDOW(name, type) if (method == "windows." name) return extensions::api::windows::type::Params::Create(args).has_value()
++  ZACRO_WINDOW("get", Get); ZACRO_WINDOW("getCurrent", GetCurrent);
++  ZACRO_WINDOW("getLastFocused", GetLastFocused); ZACRO_WINDOW("getAll", GetAll);
++  ZACRO_WINDOW("create", Create); ZACRO_WINDOW("update", Update); ZACRO_WINDOW("remove", Remove);
++#undef ZACRO_WINDOW
++  if (method == "tabs.getCurrent") return args.empty();
++  return std::nullopt;
++}
++
++bool ZacroPrepareNavigation(ExtensionFunction* function, base::ListValue& args, std::string& error) {
++  const std::string method(function->name());
++  if (method != "tabs.create" && method != "tabs.update" && method != "windows.create") return true;
++  for (auto& argument : args) {
++    if (!argument.is_dict()) continue;
++    auto* url = argument.GetDict().Find("url");
++    if (!url) continue;
++    auto prepare = [&](base::Value& value) {
++      if (!value.is_string()) { error = "The navigation address is invalid."; return false; }
++      auto checked = ZacroTabUtil::PrepareURLForNavigation(value.GetString(), function->extension(), function->browser_context());
++      if (!checked.has_value()) { error = checked.error(); return false; }
++      value = base::Value(checked->spec()); return true;
++    };
++    if (url->is_list()) {
++      for (auto& value : url->GetList()) if (!prepare(value)) return false;
++    } else if (!prepare(*url)) return false;
++  }
++  return true;
++}
++
++class ZacroBrowserContext : public base::SupportsUserData::Data {
++ public:
++  static constexpr char kKey[] = "zacro.native.browser-model";
++  static ZacroBrowserContext* Find(content::BrowserContext* context) {
++    return context ? static_cast<ZacroBrowserContext*>(context->GetUserData(kKey)) : nullptr;
++  }
++  static ZacroBrowserContext* Get(content::BrowserContext* context) {
++    if (auto* found = Find(context)) return found;
++    auto value = std::make_unique<ZacroBrowserContext>(context);
++    auto* result = value.get(); context->SetUserData(kKey, std::move(value)); return result;
++  }
++  explicit ZacroBrowserContext(content::BrowserContext* context) : context_(context) {}
++  static void InstallHooks() {
++    sessions::SessionTabHelper::SetNativeInitialIDProvider(base::BindRepeating(
++        [](content::WebContents* contents) -> std::optional<SessionID> {
++          auto* reserved = static_cast<ZacroReservedTabID*>(contents->GetUserData(kZacroReservedTabID));
++          if (!reserved) return std::nullopt;
++          const auto id = reserved->id;
++          contents->RemoveUserData(kZacroReservedTabID);
++          return id;
++        }));
++    ZacroTabUtil::SetNativeTabDecorator(base::BindRepeating(
++        [](content::WebContents* contents, extensions::api::tabs::Tab* value) {
++          if (!contents) return false;
++          auto* state = Get(contents->GetBrowserContext());
++          auto found = state->tabs_.find(sessions::SessionTabHelper::IdForTab(contents).id());
++          if (found == state->tabs_.end() || found->second->web_contents() != contents) return false;
++          if (value) {
++            const auto& tab = *found->second;
++            value->window_id = tab.window; value->index = tab.index;
++            value->active = tab.active; value->selected = tab.active; value->highlighted = tab.active;
++            value->pinned = tab.pinned; value->discarded = tab.discarded;
++            value->auto_discardable = tab.auto_discardable;
++            value->split_view_id = tab.split_view_id;
++            value->opener_tab_id = tab.opener_tab_id;
++          }
++          return true;
++        }));
++    ExtensionFunction::SetNativeDispatcher(base::BindRepeating(
++        [](ExtensionFunction* function, const base::ListValue& args, ZacroNativeResponse response) {
++          if (!function->browser_context()) return false;
++          return Get(function->browser_context())->Dispatch(function, args, std::move(response));
++        }));
++    extensions::EventRouter::SetNativeEventFilter(base::BindRepeating(
++        [](content::BrowserContext* context, const extensions::Event& event) {
++          if (event.native_host_topology || !ZacroBrowserEvent(event.event_name)) return true;
++          auto* state = Get(context);
++          // Zoom events already use true SessionTabIDs and no physical window
++          // IDs. Preserve Chromium's native ZoomController attribution.
++          if (event.event_name == "tabs.onZoomChange" && !event.args().empty() && event.args()[0].is_dict()) {
++            auto tab = event.args()[0].GetDict().FindInt("tabId");
++            return tab && state->tabs_.contains(*tab);
++          }
++          return false;
++        }));
++  }
++  ~ZacroBrowserContext() override {
++    weak_.InvalidateWeakPtrs();
++    auto pending = std::move(pending_);
++    for (auto& [id, request] : pending) {
++      std::move(request->response).Run({}, "The browser profile closed.");
++    }
++  }
++  void SetObserved(bool observed) {
++    observed_ = observed;
++    if (!observed) return;
++    // Extension workers can query their browser during profile startup, before
++    // the Swift observer is attached. Queue those requests without revealing
++    // physical implementation windows or spuriously failing initialization.
++    for (auto& [id, request] : pending_) {
++      if (!request->dispatched) {
++        request->dispatched = true;
++        ZacroExtensionContext::Get(context_)->NotifyHost(request->event);
++      }
++    }
++  }
++  struct Tab : content::WebContentsObserver {
++    explicit Tab(content::WebContents* contents) : content::WebContentsObserver(contents) {}
++    void Bind(content::WebContents* contents) { Observe(contents); }
++    std::string logical_id;
++    int window = 1;
++    int index = 0;
++    bool active = false;
++    bool pinned = false;
++    bool discarded = false;
++    bool auto_discardable = true;
++    int split_view_id = -1;
++    std::optional<int> opener_tab_id;
++  };
++  // Snapshot publication reserves identities without allocating WebContents,
++  // renderer processes or native windows for dormant restored tabs.
++  base::DictValue Synchronize(const base::DictValue& params, std::string& error) {
++    const auto revision = params.FindDouble("revision");
++    const auto* entries = params.FindList("tabs");
++    if (!revision || *revision < revision_ || *revision > 9007199254740991.0 ||
++        !entries || entries->size() > 4096) {
++      error = "The logical tab snapshot is stale or invalid."; return {};
++    }
++    std::set<std::string> logical_ids;
++    for (const auto& entry : *entries) {
++      if (!entry.is_dict() || !ValidMetadata(entry.GetDict(), error)) return {};
++      if (!logical_ids.insert(*entry.GetDict().FindString("logicalID")).second) {
++        error = "The logical tab snapshot contains duplicate identities."; return {};
++      }
++    }
++    // Validate the whole snapshot before changing existing identities.
++    for (const auto& [token, reservation] : reservations_) {
++      auto tab = tabs_.find(reservation.tab_id);
++      if (reservation.claimed && (tab == tabs_.end() || !logical_ids.contains(tab->second->logical_id))) {
++        error = "A native tab creation is in progress; retry the snapshot after it finishes."; return {};
++      }
++    }
++    for (auto it = tabs_.begin(); it != tabs_.end();) {
++      if (!logical_ids.contains(it->second->logical_id)) it = tabs_.erase(it); else ++it;
++    }
++    for (auto it = reservations_.begin(); it != reservations_.end();) {
++      if (!tabs_.contains(it->second.tab_id)) it = reservations_.erase(it); else ++it;
++    }
++    base::ListValue identities;
++    for (const auto& entry : *entries) {
++      const auto& data = entry.GetDict(); const auto& logical = *data.FindString("logicalID");
++      int id = FindLogical(logical);
++      if (!id) {
++        id = SessionID::NewUnique().id();
++        tabs_[id] = std::make_unique<Tab>(nullptr);
++      }
++      UpdateMetadata(*tabs_.at(id), data);
++      identities.Append(base::DictValue().Set("logicalID", logical).Set("tabID", id)
++          .Set("materialized", tabs_.at(id)->web_contents() != nullptr));
++    }
++    for (const auto& entry : *entries) {
++      const auto& data = entry.GetDict(); const int id = FindLogical(*data.FindString("logicalID"));
++      const auto* opener = data.FindString("openerLogicalID");
++      const int opener_id = opener ? FindLogical(*opener) : 0;
++      tabs_.at(id)->opener_tab_id = opener_id && opener_id != id ? std::make_optional(opener_id) : std::nullopt;
++    }
++    revision_ = *revision;
++    return base::DictValue().Set("tabs", std::move(identities));
++  }
++  base::DictValue Prepare(const std::string& logical, std::string& error) {
++    const int id = FindLogical(logical);
++    if (!id) { error = "The logical tab has not been reserved."; return {}; }
++    if (tabs_.at(id)->web_contents()) { error = "The logical tab already has a native document."; return {}; }
++    for (const auto& [token, reservation] : reservations_) {
++      if (reservation.tab_id == id) {
++        if (reservation.claimed) { error = "The logical tab is already being created."; return {}; }
++        return base::DictValue().Set("tabID", id).Set("token", token);
++      }
++    }
++    const auto token = base::Uuid::GenerateRandomV4().AsLowercaseString();
++    reservations_.emplace(token, Reservation{id, false});
++    return base::DictValue().Set("tabID", id).Set("token", token);
++  }
++  bool Claim(const std::string& token) {
++    auto found = reservations_.find(token);
++    if (found == reservations_.end() || found->second.claimed) return false;
++    auto tab = tabs_.find(found->second.tab_id);
++    if (tab == tabs_.end() || tab->second->web_contents()) return false;
++    found->second.claimed = true; return true;
++  }
++  bool Consume(content::WebContents* contents, const std::string& token) {
++    auto found = reservations_.find(token);
++    if (found == reservations_.end() || !found->second.claimed || !contents ||
++        contents->GetBrowserContext() != context_ || sessions::SessionTabHelper::FromWebContents(contents)) return false;
++    auto tab = tabs_.find(found->second.tab_id);
++    if (tab == tabs_.end() || tab->second->web_contents()) return false;
++    const int id = found->second.tab_id;
++    contents->SetUserData(kZacroReservedTabID, std::make_unique<ZacroReservedTabID>(SessionID::FromSerializedValue(id)));
++    tab->second->Bind(contents);
++    reservations_.erase(found); return true;
++  }
++  void Abort(const std::string& token) { reservations_.erase(token); }
++  int Register(content::WebContents* contents, const base::DictValue& params, std::string& error) {
++    const auto* logical = params.FindString("logicalID");
++    auto window = params.FindInt("windowID"); auto index = params.FindInt("index");
++    auto active = params.FindBool("active"), pinned = params.FindBool("pinned"), discarded = params.FindBool("discarded");
++    const int split = params.FindInt("splitViewID").value_or(-1);
++    const auto opener = params.FindInt("openerTabID");
++    const int native_id = sessions::SessionTabHelper::IdForTab(contents).id();
++    if (!logical || logical->empty() || logical->size() > 256 || !window || *window < 1 || !index || *index < 0 ||
++        !active || !pinned || !discarded || native_id < 1 || split < -1 ||
++        (opener && (*opener <= 0 || *opener == native_id || !tabs_.contains(*opener))) ||
++        contents->GetBrowserContext() != context_) {
++      error = "The native tab registration is invalid."; return 0;
++    }
++    const int reserved = FindLogical(*logical);
++    if (reserved && reserved != native_id) { error = "The native document does not match its reserved tab identity."; return 0; }
++    if (!tabs_.contains(native_id) && tabs_.size() >= 4096) { error = "Too many registered tabs."; return 0; }
++    auto& tab = tabs_[native_id]; if (!tab) tab = std::make_unique<Tab>(contents);
++    if (tab->web_contents() && tab->web_contents() != contents) { error = "The native tab identity changed."; return 0; }
++    if (!tab->web_contents()) tab->Bind(contents);
++    tab->logical_id = *logical; tab->window = *window; tab->index = *index;
++    tab->active = *active; tab->pinned = *pinned; tab->discarded = *discarded;
++    tab->auto_discardable = params.FindBool("autoDiscardable").value_or(true);
++    tab->split_view_id = split; tab->opener_tab_id = opener;
++    return native_id;
++  }
++  bool Validate(const std::string& id, std::string& error) {
++    auto it = pending_.find(id);
++    if (it == pending_.end()) { error = "The native extension request is no longer pending."; return false; }
++    auto& request = *it->second;
++    auto* registry = extensions::ExtensionRegistry::Get(context_);
++    if (request.function->browser_context() != context_ || !registry ||
++        registry->enabled_extensions().GetByID(request.extension->id()) != request.extension.get() ||
++        !ZacroExtensionContext::Get(context_)->IsCurrent(*request.extension, request.installation)) {
++      error = "The extension caller or installation changed."; return false;
++    }
++    return true;
++  }
++  void Complete(const std::string& id, base::ListValue results, std::string error) {
++    auto it = pending_.find(id); if (it == pending_.end()) return;
++    std::string validation;
++    if (!Validate(id, validation)) error = validation;
++    auto request = std::move(it->second); pending_.erase(it);
++    request->timer.Stop();
++    if (error.empty()) {
++      if (!SanitizeResults(*request, results)) { results.clear(); error = "The native tab response is invalid."; }
++    }
++    std::move(request->response).Run(std::move(results), std::move(error));
++  }
++  bool Publish(const std::string& name, const base::ListValue& args, std::string& error) {
++    const auto histogram = ZacroBrowserEvent(name);
++    if (!histogram || args.size() > 4) { error = "The browser event is invalid."; return false; }
++    if ((name == "tabs.onCreated" && (args.size() != 1 || !ValidTab(args[0]))) ||
++        (name == "tabs.onUpdated" && (args.size() != 3 || !args[0].is_int() || !args[1].is_dict() || !ValidTab(args[2]))) ||
++        ((name == "windows.onCreated" || name == "windows.onBoundsChanged") && (args.size() != 1 || !ValidWindow(args[0])))) {
++      error = "The native browser event has an invalid schema."; return false;
++    }
++    auto event = std::make_unique<extensions::Event>(*histogram, name, args.Clone(), context_);
++    event->native_host_topology = true;
++    event->will_dispatch_callback = base::BindRepeating(
++        [](base::WeakPtr<ZacroBrowserContext> self, const std::string& name, const base::ListValue& original,
++           content::BrowserContext* context, extensions::mojom::ContextType type,
++           const extensions::Extension* extension, const base::DictValue*,
++           std::optional<base::ListValue>& output, extensions::mojom::EventFilteringInfoPtr&, bool*) {
++          if (!self || !extension || context != self->context_) return false;
++          auto result = original.Clone();
++          if (!self->ScrubValues(extension, type, result)) return false;
++          // changeInfo carries a second copy of privileged fields, separate
++          // from the final Tab object in onUpdated.
++          if (name == "tabs.onUpdated" && result.size() == 3 && result[1].is_dict() && result[2].is_dict()) {
++            auto& change = result[1].GetDict(); const auto& tab = result[2].GetDict();
++            for (auto key : {"url", "pendingUrl", "title", "favIconUrl"}) if (!tab.contains(key)) change.Remove(key);
++          }
++          output = std::move(result); return true;
++        }, weak_.GetWeakPtr(), name, args.Clone());
++    auto* router = extensions::EventRouter::Get(context_);
++    if (!router) { error = "The extension event router is unavailable."; return false; }
++    router->BroadcastEvent(std::move(event)); return true;
++  }
++ private:
++  struct Reservation { int tab_id; bool claimed; };
++  int FindLogical(const std::string& logical) const {
++    for (const auto& [id, tab] : tabs_) if (tab->logical_id == logical) return id;
++    return 0;
++  }
++  static bool ValidMetadata(const base::DictValue& data, std::string& error) {
++    const auto* logical = data.FindString("logicalID");
++    const auto window = data.FindInt("windowID"), index = data.FindInt("index");
++    const auto split = data.FindInt("splitViewID").value_or(-1);
++    if (!logical || logical->empty() || logical->size() > 256 || !window || *window < 1 || !index || *index < 0 ||
++        !data.FindBool("active") || !data.FindBool("pinned") || !data.FindBool("discarded") || split < -1) {
++      error = "The logical tab metadata is invalid."; return false;
++    }
++    return true;
++  }
++  static void UpdateMetadata(Tab& tab, const base::DictValue& data) {
++    tab.logical_id = *data.FindString("logicalID"); tab.window = *data.FindInt("windowID"); tab.index = *data.FindInt("index");
++    tab.active = *data.FindBool("active"); tab.pinned = *data.FindBool("pinned"); tab.discarded = *data.FindBool("discarded");
++    tab.auto_discardable = data.FindBool("autoDiscardable").value_or(true);
++    tab.split_view_id = data.FindInt("splitViewID").value_or(-1);
++    tab.opener_tab_id = data.FindInt("openerTabID");
++  }
++  struct Request {
++    scoped_refptr<ExtensionFunction> function;
++    scoped_refptr<const extensions::Extension> extension;
++    std::string installation;
++    base::ListValue arguments;
++    base::DictValue event;
++    bool dispatched = false;
++    ZacroNativeResponse response;
++    base::OneShotTimer timer;
++  };
++  bool Dispatch(ExtensionFunction* function, const base::ListValue& args, ZacroNativeResponse response) {
++    const std::string method(function->name());
++    const auto valid = ZacroValidateFunction(method, args);
++    if (!valid) return false;
++    if (!*valid) { function->SetBadMessage(); std::move(response).Run({}, "Invalid extension API arguments."); return true; }
++    // Document-local APIs retain Chromium's exact implementation. Resolve only
++    // their optional logical target, leaving their permissions and mutations to
++    // the original ExtensionFunction after this native hook returns false.
++    if (method == "tabs.getZoom" || method == "tabs.setZoom" || method == "tabs.getZoomSettings" ||
++        method == "tabs.setZoomSettings" || method == "tabs.captureVisibleTab" || method == "tabs.detectLanguage") {
++      int target = -1;
++      bool capture = method == "tabs.captureVisibleTab";
++      if (!args.empty() && args[0].is_int() && !capture) target = args[0].GetInt();
++      if (capture && !args.empty() && args[0].is_int() && args[0].GetInt() != 1 && args[0].GetInt() != -2) {
++        std::move(response).Run({}, "Unknown logical browser window."); return true;
++      }
++      if (target < 0) for (const auto& [id, tab] : tabs_) if (tab->active && tab->web_contents()) { target = id; break; }
++      auto tab = tabs_.find(target);
++      if (tab == tabs_.end() || !tab->second->web_contents() || tab->second->discarded) {
++        std::move(response).Run({}, "The target tab is not currently loaded."); return true;
++      }
++      auto native_args = args.Clone();
++      const int native_target = capture ? ZacroTabUtil::GetWindowIdOfTab(tab->second->web_contents()) : target;
++      if (native_args.empty()) native_args.Append(native_target); else native_args[0] = base::Value(native_target);
++      function->ReplaceNativeArguments(std::move(native_args));
++      return false;
++    }
++    if (!function->extension() || pending_.size() >= 256) {
++      std::move(response).Run({}, "The native browser host is unavailable."); return true;
++    }
++    auto arguments = args.Clone(); std::string error;
++    if (!ZacroPrepareNavigation(function, arguments, error)) { std::move(response).Run({}, error); return true; }
++    // Parse match patterns now, before exposing a request to the host.
++    if (method == "tabs.query" && !arguments.empty() && arguments[0].is_dict()) {
++      extensions::URLPatternSet patterns;
++      if (!QueryPatterns(arguments[0].GetDict(), patterns, error)) { std::move(response).Run({}, error); return true; }
++    }
++    const std::string id = base::Uuid::GenerateRandomV4().AsLowercaseString();
++    auto request = std::make_unique<Request>(); request->function = function; request->extension = function->extension();
++    request->installation = ZacroExtensionContext::Get(context_)->InstallationID(*function->extension());
++    request->arguments = arguments.Clone(); request->response = std::move(response);
++    // A beforeunload decision has no arbitrary deadline. Do not report failure
++    // and then perform a delayed close after the user finally makes a choice.
++    if (method != "tabs.remove" && method != "windows.remove") {
++      request->timer.Start(FROM_HERE, base::Seconds(60), base::BindOnce(
++          &ZacroBrowserContext::Complete, weak_.GetWeakPtr(), id, base::ListValue(), "The native browser request timed out."));
++    }
++    auto event = base::DictValue().Set("requestID", id).Set("extensionID", function->extension_id())
++        .Set("method", method).Set("arguments", std::move(arguments)).Set("userGesture", function->user_gesture())
++        .Set("incognito", context_->IsOffTheRecord());
++    if (auto* sender = function->GetSenderWebContents()) {
++      int source = sessions::SessionTabHelper::IdForTab(sender).id();
++      if (tabs_.contains(source)) event.Set("sourceTabID", source);
++    }
++    request->event = event.Clone(); request->dispatched = observed_;
++    pending_[id] = std::move(request);
++    if (observed_) ZacroExtensionContext::Get(context_)->NotifyHost(event);
++    return true;
++  }
++  bool ScrubValues(const extensions::Extension* extension, extensions::mojom::ContextType type, base::ListValue& values) {
++    for (auto& value : values) if (!ScrubValue(extension, type, value)) return false;
++    return true;
++  }
++  bool ScrubValue(const extensions::Extension* extension, extensions::mojom::ContextType type, base::Value& value) {
++    if (value.is_list()) return ScrubValues(extension, type, value.GetList());
++    if (!value.is_dict()) return true;
++    auto& dict = value.GetDict();
++    if (auto* tabs = dict.FindList("tabs")) if (!ScrubValues(extension, type, *tabs)) return false;
++    if (!dict.contains("windowId") || !dict.contains("index")) return true;
++    const auto id = dict.FindInt("id"); if (!id) return false;
++    auto found = tabs_.find(*id);
++    if (found == tabs_.end()) return false;
++    auto* contents = found == tabs_.end() ? nullptr : found->second->web_contents();
++    // Real registered documents use their grant-bearing WebContents. Dormant
++    // model URLs may differ from its blank document, so grants are also checked
++    // for the model address before revealing it.
++    const auto* address = dict.FindString("url");
++    const auto model = ZacroTabUtil::GetScrubTabBehavior(extension, type, GURL(address ? *address : ""));
++    auto behavior = contents ? ZacroTabUtil::GetScrubTabBehavior(extension, type, contents) : model;
++    if (!contents || (address && contents->GetLastCommittedURL().spec() != *address)) behavior = model;
++    if (const auto* pending = dict.FindString("pendingUrl")) {
++      const auto* entry = contents ? contents->GetController().GetPendingEntry() : nullptr;
++      if (!entry || entry->GetVirtualURL().spec() != *pending) {
++        behavior.pending_info = ZacroTabUtil::GetScrubTabBehavior(extension, type, GURL(*pending)).committed_info;
++      }
++    }
++    auto tab = extensions::api::tabs::Tab::FromValue(dict);
++    if (!tab.has_value()) return false;
++    ZacroTabUtil::ScrubTabForExtension(extension, contents, &*tab, behavior);
++    dict = tab->ToValue(); return true;
++  }
++  static bool QueryPatterns(const base::DictValue& query, extensions::URLPatternSet& patterns, std::string& error) {
++    std::vector<std::string> strings;
++    if (auto* value = query.Find("url")) {
++      if (value->is_string()) strings.push_back(value->GetString());
++      else if (value->is_list()) for (const auto& item : value->GetList()) {
++        if (!item.is_string()) { error = "The URL pattern is invalid."; return false; }
++        strings.push_back(item.GetString());
++      }
++    }
++    return patterns.Populate(strings, URLPattern::SCHEME_ALL, true, &error);
++  }
++  bool SanitizeResults(const Request& request, base::ListValue& results) {
++    const std::string method(request.function->name());
++    if (!ValidResults(method, results)) return false;
++    if (!ScrubValues(request.extension.get(), request.function->source_context_type(), results)) return false;
++    if (std::string(request.function->name()) != "tabs.query" || request.arguments.empty() ||
++        !request.arguments[0].is_dict() || results.size() != 1 || !results[0].is_list()) return true;
++    const auto& query = request.arguments[0].GetDict(); extensions::URLPatternSet patterns; std::string error;
++    if (!QueryPatterns(query, patterns, error)) return false;
++    auto& list = results[0].GetList();
++    list.EraseIf([&](const base::Value& value) {
++      if (!value.is_dict()) return true;
++      const auto& tab = value.GetDict();
++      if (const auto* title = query.FindString("title"); title && !title->empty()) {
++        const auto* actual = tab.FindString("title");
++        if (!actual || !base::MatchPattern(*actual, *title)) return true;
++      }
++      if (!patterns.is_empty()) {
++        const auto* url = tab.FindString("url"); const auto* pending = tab.FindString("pendingUrl");
++        if ((!url || !patterns.MatchesURL(GURL(*url))) && (!pending || !patterns.MatchesURL(GURL(*pending)))) return true;
++      }
++      return false;
++    });
++    return true;
++  }
++  static bool ValidTab(const base::Value& value) {
++    return value.is_dict() && extensions::api::tabs::Tab::FromValue(value.GetDict()).has_value();
++  }
++  static bool ValidWindow(const base::Value& value) {
++    return value.is_dict() && extensions::api::windows::Window::FromValue(value.GetDict()).has_value();
++  }
++  static bool ValidResults(const std::string& method, const base::ListValue& results) {
++    const bool window = method.starts_with("windows.") || method == "tabs.highlight";
++    if (method == "tabs.remove" || method == "tabs.reload" || method == "tabs.goBack" || method == "tabs.goForward" ||
++        method == "windows.remove" || method == "tabs.unsplit") return results.empty();
++    if (method == "tabs.createSplit") return results.size() == 1 && results[0].is_int() && results[0].GetInt() >= 0;
++    if (method == "tabs.getCurrent" && results.empty()) return true;
++    if (results.size() != 1) return false;
++    if (method == "tabs.query" || method == "tabs.getAllInWindow" || method == "windows.getAll" ||
++        (method == "tabs.move" && results[0].is_list())) {
++      if (!results[0].is_list()) return false;
++      for (const auto& value : results[0].GetList()) if (window ? !ValidWindow(value) : !ValidTab(value)) return false;
++      return true;
++    }
++    return window ? ValidWindow(results[0]) : ValidTab(results[0]);
++  }
++  raw_ptr<content::BrowserContext> context_;
++  bool observed_ = false;
++  double revision_ = 0;
++  std::map<int, std::unique_ptr<Tab>> tabs_;
++  std::map<std::string, Reservation> reservations_;
++  std::map<std::string, std::unique_ptr<Request>> pending_;
++  base::WeakPtrFactory<ZacroBrowserContext> weak_{this};
++};
++}  // namespace
++
++void ZacroSetTopologyObserved(content::BrowserContext* context, bool observed) {
++  ZacroBrowserContext::Get(context)->SetObserved(observed);
++}
++
++void ZacroInstallTopologyHooks() { ZacroBrowserContext::InstallHooks(); }
++
++bool ZacroClaimTabReservation(content::BrowserContext* context, const std::string& token) {
++  auto* state = ZacroBrowserContext::Find(context);
++  return state && state->Claim(token);
++}
++bool ZacroConsumeTabReservation(content::WebContents* contents, const std::string& token) {
++  auto* state = contents ? ZacroBrowserContext::Find(contents->GetBrowserContext()) : nullptr;
++  return state && state->Consume(contents, token);
++}
++void ZacroAbortTabReservation(content::BrowserContext* context, const std::string& token) {
++  if (auto* state = ZacroBrowserContext::Find(context)) state->Abort(token);
++}
++
++bool CefDevToolsController::DispatchZacroTopology(int id, const std::string& method, const base::DictValue* params) {
++  if (method != "Zacro.registerExtensionTab" && method != "Zacro.validateExtensionHostRequest" &&
++      method != "Zacro.completeExtensionHostRequest" && method != "Zacro.publishBrowserEvent" &&
++      method != "Zacro.synchronizeTabs" && method != "Zacro.prepareTabMaterialization") return false;
++  if (!params) { ReplyZacro(id, {}, "The native browser parameters are missing."); return true; }
++  auto* state = ZacroBrowserContext::Get(inspected_contents_->GetBrowserContext());
++  std::string error;
++  if (method == "Zacro.synchronizeTabs") {
++    auto result = state->Synchronize(*params, error);
++    ReplyZacro(id, std::move(result), error); return true;
++  }
++  if (method == "Zacro.prepareTabMaterialization") {
++    const auto* logical = params->FindString("logicalID");
++    auto result = logical ? state->Prepare(*logical, error) : base::DictValue();
++    if (!logical) error = "The logical tab identity is missing.";
++    ReplyZacro(id, std::move(result), error); return true;
++  }
++  if (method == "Zacro.registerExtensionTab") {
++    int tab = state->Register(inspected_contents_, *params, error);
++    ReplyZacro(id, base::DictValue().Set("tabID", tab), error); return true;
++  }
++  if (method == "Zacro.publishBrowserEvent") {
++    const auto* name = params->FindString("name"); const auto* arguments = params->FindList("arguments");
++    if (!name || !arguments) error = "The native browser event is invalid.";
++    else state->Publish(*name, *arguments, error);
++    ReplyZacro(id, {}, error); return true;
++  }
++  const auto* request = params->FindString("requestID");
++  if (!request || !state->Validate(*request, error)) { ReplyZacro(id, {}, error.empty() ? "The native request is missing." : error); return true; }
++  if (method == "Zacro.completeExtensionHostRequest") {
++    const auto* results = params->FindList("results"); const auto* failure = params->FindString("error");
++    if (!results) { ReplyZacro(id, {}, "The native result arguments are missing."); return true; }
++    state->Complete(*request, results->Clone(), failure ? *failure : "");
++  }
++  ReplyZacro(id, {}); return true;
++}

@@ -1,0 +1,270 @@
+--- a/components/sessions/content/session_tab_helper.h
++++ b/components/sessions/content/session_tab_helper.h
+@@ -4,6 +4,8 @@
+ 
+ #ifndef COMPONENTS_SESSIONS_CONTENT_SESSION_TAB_HELPER_H_
+ #define COMPONENTS_SESSIONS_CONTENT_SESSION_TAB_HELPER_H_
++
++#include <optional>
+ 
+ #include "base/callback_list.h"
+ #include "base/functional/callback.h"
+@@ -21,6 +23,13 @@
+     : public content::WebContentsObserver,
+       public content::WebContentsUserData<SessionTabHelper> {
+  public:
++  // Browser-process integration only. The provider may consume an ID already
++  // allocated by SessionID::NewUnique for these exact WebContents. Returning
++  // nullopt preserves normal Chromium allocation. IDs never change afterward.
++  using NativeInitialIDProvider =
++      base::RepeatingCallback<std::optional<SessionID>(content::WebContents*)>;
++  static void SetNativeInitialIDProvider(NativeInitialIDProvider provider);
++
+   using DelegateLookup =
+       base::RepeatingCallback<SessionTabHelperDelegate*(content::WebContents*)>;
+   using WindowIdChangedCallbackList =
+--- a/components/sessions/content/session_tab_helper.cc
++++ b/components/sessions/content/session_tab_helper.cc
+@@ -4,23 +4,51 @@
+ 
+ #include "components/sessions/content/session_tab_helper.h"
+ 
++#include "base/check.h"
+ #include "base/memory/ptr_util.h"
++#include "base/no_destructor.h"
+ #include "components/sessions/content/content_serialized_navigation_builder.h"
+ #include "components/sessions/content/session_tab_helper_delegate.h"
+ #include "components/sessions/core/serialized_navigation_entry.h"
+ #include "components/sessions/core/serialized_user_agent_override.h"
++#include "content/public/browser/browser_thread.h"
+ #include "content/public/browser/navigation_controller.h"
+ #include "content/public/browser/navigation_details.h"
+ #include "content/public/browser/web_contents.h"
+ 
+ namespace sessions {
++namespace {
++SessionTabHelper::NativeInitialIDProvider& NativeInitialIDCallback() {
++  static base::NoDestructor<SessionTabHelper::NativeInitialIDProvider> callback;
++  return *callback;
++}
++
++SessionID InitialSessionID(content::WebContents* contents) {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  auto& provider = NativeInitialIDCallback();
++  if (provider) {
++    if (auto reserved = provider.Run(contents)) {
++      CHECK(reserved->is_valid());
++      return *reserved;
++    }
++  }
++  return SessionID::NewUnique();
++}
++}  // namespace
++
++void SessionTabHelper::SetNativeInitialIDProvider(
++    NativeInitialIDProvider provider) {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  NativeInitialIDCallback() = std::move(provider);
++}
++
+ 
+ SessionTabHelper::SessionTabHelper(content::WebContents* contents,
+                                    DelegateLookup lookup)
+     : content::WebContentsObserver(contents),
+       content::WebContentsUserData<SessionTabHelper>(*contents),
+       delegate_lookup_(std::move(lookup)),
+-      session_id_(SessionID::NewUnique()),
++      session_id_(InitialSessionID(contents)),
+       window_id_(SessionID::InvalidValue()) {}
+ 
+ SessionTabHelper::~SessionTabHelper() = default;
+--- a/cef/libcef/browser/chrome/chrome_browser_delegate.cc
++++ b/cef/libcef/browser/chrome/chrome_browser_delegate.cc
+@@ -16,6 +16,7 @@
+ #include "cef/libcef/browser/chrome/views/chrome_browser_view.h"
+ #include "cef/libcef/browser/chrome/views/chrome_child_window.h"
+ #include "cef/libcef/browser/devtools/devtools_window_runner.h"
++#include "cef/libcef/browser/devtools/zacro_tab_reservation.h"
+ #include "cef/libcef/browser/request_context_impl.h"
+ #include "cef/libcef/browser/views/browser_view_impl.h"
+ #include "cef/libcef/browser/views/window_impl.h"
+@@ -223,6 +224,17 @@
+ 
+ void ChromeBrowserDelegate::OnWebContentsCreated(
+     content::WebContents* new_contents) {
++  if (create_params_.extra_info &&
++      create_params_.extra_info->HasKey("_zacroTabReservation")) {
++    const auto token = create_params_.extra_info
++                           ->GetString("_zacroTabReservation").ToString();
++    // Initial Create owns this writable copy. Remove in place so every retained
++    // create-params copy (and future popup BrowserInfo) loses the one-use token.
++    CHECK(create_params_.extra_info->Remove("_zacroTabReservation"));
++    // Create preclaims the token on this UI thread before allocating a Browser.
++    // The broker cannot revoke a claim before this synchronous consumption.
++    CHECK(ZacroConsumeTabReservation(new_contents, token));
++  }
+   // Necessary to receive LoadingStateChanged calls during initial navigation.
+   // This will be called again in Browser::SetAsDelegate, which should be
+   // fine.
+--- a/cef/libcef/browser/chrome/chrome_browser_host_impl.cc
++++ b/cef/libcef/browser/chrome/chrome_browser_host_impl.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "cef/libcef/browser/chrome/chrome_browser_host_impl.h"
+ 
++#include "base/functional/bind.h"
++#include "base/functional/callback_helpers.h"
+ #include "base/logging.h"
+ #include "base/notimplemented.h"
+ #include "cef/libcef/browser/browser_platform_delegate.h"
+@@ -11,6 +13,7 @@
+ #include "cef/libcef/browser/chrome/browser_util.h"
+ #include "cef/libcef/browser/chrome/views/chrome_browser_view.h"
+ #include "cef/libcef/browser/chrome/views/chrome_browser_widget.h"
++#include "cef/libcef/browser/devtools/zacro_tab_reservation.h"
+ #include "cef/libcef/browser/thread_util.h"
+ #include "cef/libcef/browser/views/browser_view_impl.h"
+ #include "cef/libcef/common/net/url_util.h"
+@@ -27,7 +30,32 @@
+ // static
+ CefRefPtr<ChromeBrowserHostImpl> ChromeBrowserHostImpl::Create(
+     const CefBrowserCreateParams& params) {
+-  auto browser = CreateBrowser(params, std::nullopt);
++  CefBrowserCreateParams create_params = params;
++  base::ScopedClosureRunner abort_reservation;
++  if (params.extra_info && params.extra_info->HasKey("_zacroTabReservation")) {
++    if (params.extra_info->GetType("_zacroTabReservation") != VTYPE_STRING) {
++      return nullptr;
++    }
++    const auto token = params.extra_info
++                           ->GetString("_zacroTabReservation").ToString();
++    auto* context = CefRequestContextImpl::GetProfile(params.request_context);
++    if (!context || !ZacroClaimTabReservation(context, token)) {
++      return nullptr;
++    }
++    abort_reservation.ReplaceClosure(base::BindOnce(
++        &ZacroAbortTabReservation, base::Unretained(context), token));
++    // Preserve the caller's dictionary, including a read-only input. Every
++    // internal copy shares this writable dictionary until the token is removed
++    // by OnWebContentsCreated, before BrowserInfo exposes extra_info.
++    create_params.extra_info = params.extra_info->Copy(false);
++    if (!create_params.extra_info) {
++      return nullptr;
++    }
++  }
++  auto browser = CreateBrowser(create_params, std::nullopt);
++  if (!browser) {
++    return nullptr;
++  }
+ 
+   GURL url = url_util::MakeGURL(params.url, /*fixup=*/true);
+   const bool url_is_empty = url.is_empty();
+--- a/components/sessions/BUILD.gn
++++ b/components/sessions/BUILD.gn
+@@ -218,6 +218,7 @@
+       "content/content_serialized_navigation_builder_unittest.cc",
+       "content/content_serialized_navigation_driver_unittest.cc",
+       "content/navigation_task_id_unittest.cc",
++      "content/native_session_tab_helper_unittest.cc",
+     ]
+   } else {
+     sources += [
+--- /dev/null
++++ b/cef/libcef/browser/devtools/zacro_tab_reservation.h
+@@ -0,0 +1,25 @@
++// Native-only, profile-scoped dormant tab materialization.
++#ifndef CEF_LIBCEF_BROWSER_DEVTOOLS_ZACRO_TAB_RESERVATION_H_
++#define CEF_LIBCEF_BROWSER_DEVTOOLS_ZACRO_TAB_RESERVATION_H_
++
++#include <string>
++
++namespace content {
++class BrowserContext;
++class WebContents;
++}
++
++// UI thread only. A claim rejects reused, expired and cross-profile tokens.
++// Once claimed it cannot be canceled/replaced before synchronous consumption.
++bool ZacroClaimTabReservation(content::BrowserContext* context,
++                             const std::string& token);
++// Consume binds the broker-allocated SessionID to these exact WebContents.
++// SessionTabHelper reads that native-owned metadata once during construction.
++bool ZacroConsumeTabReservation(content::WebContents* contents,
++                               const std::string& token);
++// Abort an unconsumed claim after a creation failure; no-op once consumed.
++// The logical dormant tab remains and may obtain a fresh one-use token.
++void ZacroAbortTabReservation(content::BrowserContext* context,
++                             const std::string& token);
++
++#endif  // CEF_LIBCEF_BROWSER_DEVTOOLS_ZACRO_TAB_RESERVATION_H_
+--- /dev/null
++++ b/components/sessions/content/native_session_tab_helper_unittest.cc
+@@ -0,0 +1,68 @@
++// Native host tab identity reservations retain Chromium's unique ID allocator.
++#include "components/sessions/content/session_tab_helper.h"
++
++#include "base/functional/bind.h"
++#include "base/test/bind.h"
++#include "content/public/browser/web_contents.h"
++#include "content/public/test/browser_task_environment.h"
++#include "content/public/test/test_browser_context.h"
++#include "content/public/test/web_contents_tester.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace sessions {
++namespace {
++class NativeSessionTabHelperTest : public testing::Test {
++ protected:
++  void TearDown() override {
++    SessionTabHelper::SetNativeInitialIDProvider({});
++  }
++
++  std::unique_ptr<content::WebContents> NewContents() {
++    return content::WebContentsTester::CreateTestWebContents(&context_, nullptr);
++  }
++
++  void Attach(content::WebContents* contents) {
++    SessionTabHelper::CreateForWebContents(contents, base::BindRepeating(
++        [](content::WebContents*) -> SessionTabHelperDelegate* { return nullptr; }));
++  }
++
++  content::BrowserTaskEnvironment environment_;
++  content::TestBrowserContext context_;
++};
++
++TEST_F(NativeSessionTabHelperTest, ReservedIdentityBelongsOnlyToMatchingContents) {
++  const auto reserved = SessionID::NewUnique();
++  auto target = NewContents();
++  auto unrelated = NewContents();
++  int reservations_used = 0;
++  SessionTabHelper::SetNativeInitialIDProvider(base::BindLambdaForTesting(
++      [&](content::WebContents* contents) -> std::optional<SessionID> {
++        if (contents != target.get()) return std::nullopt;
++        ++reservations_used;
++        return reserved;
++      }));
++  Attach(unrelated.get());
++  Attach(target.get());
++  EXPECT_EQ(SessionTabHelper::IdForTab(target.get()), reserved);
++  EXPECT_TRUE(SessionTabHelper::IdForTab(unrelated.get()).is_valid());
++  EXPECT_NE(SessionTabHelper::IdForTab(unrelated.get()), reserved);
++  // Reattaching helpers must not consume a second token or change tab identity.
++  Attach(target.get());
++  EXPECT_EQ(reservations_used, 1);
++  EXPECT_EQ(SessionTabHelper::IdForTab(target.get()), reserved);
++}
++
++TEST_F(NativeSessionTabHelperTest, MissingReservationPreservesNormalUniqueIDs) {
++  SessionTabHelper::SetNativeInitialIDProvider(base::BindRepeating(
++      [](content::WebContents*) -> std::optional<SessionID> { return std::nullopt; }));
++  auto first = NewContents();
++  auto second = NewContents();
++  Attach(first.get());
++  SessionTabHelper::SetNativeInitialIDProvider({});
++  Attach(second.get());
++  EXPECT_TRUE(SessionTabHelper::IdForTab(first.get()).is_valid());
++  EXPECT_TRUE(SessionTabHelper::IdForTab(second.get()).is_valid());
++  EXPECT_NE(SessionTabHelper::IdForTab(first.get()), SessionTabHelper::IdForTab(second.get()));
++}
++}  // namespace
++}  // namespace sessions

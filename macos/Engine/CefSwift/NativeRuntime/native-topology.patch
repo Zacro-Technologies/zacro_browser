@@ -1,0 +1,203 @@
+--- a/extensions/browser/extension_function.h
++++ b/extensions/browser/extension_function.h
+@@ -301,6 +301,14 @@
+   // Specifies the raw arguments to the function, as a JSON value.
+   void SetArgs(base::ListValue args);
+ 
++  using NativeResponse = base::OnceCallback<void(base::ListValue, std::string)>;
++  using NativeDispatcher = base::RepeatingCallback<bool(
++      ExtensionFunction*, const base::ListValue&, NativeResponse)>;
++  static void SetNativeDispatcher(NativeDispatcher dispatcher);
++  // Trusted native dispatcher only. The original function parses and validates
++  // these arguments again when it resumes its unchanged Chromium Run().
++  void ReplaceNativeArguments(base::ListValue args);
++
+   // Retrieves the results of the function as a base::ListValue for testing
+   // purposes.
+   const base::ListValue* GetResultListForTest() const;
+--- a/extensions/browser/extension_function.cc
++++ b/extensions/browser/extension_function.cc
+@@ -476,6 +476,23 @@
+   return true;
+ }
+ 
++namespace {
++ExtensionFunction::NativeDispatcher& NativeFunctionDispatcher() {
++  static base::NoDestructor<ExtensionFunction::NativeDispatcher> callback;
++  return *callback;
++}
++}  // namespace
++
++void ExtensionFunction::SetNativeDispatcher(NativeDispatcher dispatcher) {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  NativeFunctionDispatcher() = std::move(dispatcher);
++}
++
++void ExtensionFunction::ReplaceNativeArguments(base::ListValue args) {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  args_ = std::move(args);
++}
++
+ ExtensionFunction::ResponseAction ExtensionFunction::RunWithValidation() {
+   DCHECK(!did_run_);
+   did_run_ = true;
+@@ -489,6 +506,16 @@
+   if (!PreRunValidation(&error)) {
+     DCHECK(!error.empty() || bad_message_);
+     return bad_message_ ? ValidationFailure(this) : RespondNow(Error(error));
++  }
++  auto& native = NativeFunctionDispatcher();
++  if (native && native.Run(this, args(), base::BindOnce(
++      [](scoped_refptr<ExtensionFunction> function, base::ListValue results,
++         std::string error) {
++        if (function->did_respond()) return;
++        function->Respond(error.empty() ? function->ArgumentList(std::move(results))
++                                       : function->Error(std::move(error)));
++      }, base::WrapRefCounted(this)))) {
++    return did_respond() ? AlreadyResponded() : RespondLater();
+   }
+   return Run();
+ }
+--- a/extensions/browser/event_router.h
++++ b/extensions/browser/event_router.h
+@@ -141,6 +141,12 @@
+     virtual void OnNonExtensionEventDispatched(const std::string& event_name) {}
+     virtual void OnWillBroadcastEvent(const Event& event) {}
+   };
++
++  // Browser-process topology ownership. Returning false suppresses physical
++  // implementation-window events; native host events retain normal routing.
++  using NativeEventFilter = base::RepeatingCallback<bool(
++      content::BrowserContext*, const Event&)>;
++  static void SetNativeEventFilter(NativeEventFilter filter);
+ 
+   // Gets the EventRouter for `browser_context`.
+   static EventRouter* Get(content::BrowserContext* browser_context);
+@@ -725,6 +731,8 @@
+   // The event to dispatch.
+   const std::string event_name;
+ 
++  bool native_host_topology = false;
++
+   // Returns a reference to the event arguments for read-only access.
+   // The reference is valid only for the lifetime of the current arguments
+   // on this Event. Use `args_ptr()` if retaining ownership is needed.
+--- a/extensions/browser/event_router.cc
++++ b/extensions/browser/event_router.cc
+@@ -23,6 +23,7 @@
+ #include "base/metrics/histogram_functions.h"
+ #include "base/metrics/histogram_macros.h"
+ #include "base/notreached.h"
++#include "base/no_destructor.h"
+ #include "base/strings/string_util.h"
+ #include "base/task/sequenced_task_runner.h"
+ #include "components/crx_file/id_util.h"
+@@ -1380,11 +1381,25 @@
+   }
+ }
+ 
++namespace {
++EventRouter::NativeEventFilter& NativeTopologyEventFilter() {
++  static base::NoDestructor<EventRouter::NativeEventFilter> callback;
++  return *callback;
++}
++}  // namespace
++
++void EventRouter::SetNativeEventFilter(NativeEventFilter filter) {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  NativeTopologyEventFilter() = std::move(filter);
++}
++
+ void EventRouter::DispatchEventImpl(const std::string& restrict_to_extension_id,
+                                     const GURL& restrict_to_url,
+                                     std::unique_ptr<Event> event) {
++  DCHECK(event);
++  auto& native = NativeTopologyEventFilter();
++  if (native && !native.Run(browser_context_, *event)) return;
+   event->dispatch_start_time = base::TimeTicks::Now();
+-  DCHECK(event);
+   // We don't expect to get events from a completely different browser context.
+   DCHECK(!event->restrict_to_browser_context ||
+          ExtensionsBrowserClient::Get()->IsSameContext(
+@@ -2128,6 +2143,7 @@
+       user_gesture, std::move(copied_filter_info),
+       lazy_background_active_on_dispatch, dispatch_start_time);
+ 
++  copy->native_host_topology = native_host_topology;
+   copy->exclude_process_id = exclude_process_id;
+   copy->will_dispatch_callback = will_dispatch_callback;
+   copy->did_dispatch_callback = did_dispatch_callback;
+--- a/chrome/browser/extensions/extension_tab_util.h
++++ b/chrome/browser/extensions/extension_tab_util.h
+@@ -78,6 +78,10 @@
+       "Cannot navigate to a file URL without local file access.";
+ 
+   static constexpr char kTabsKey[] = "tabs";
++  using NativeTabDecorator = base::RepeatingCallback<bool(
++      content::WebContents*, api::tabs::Tab*)>;
++  static void SetNativeTabDecorator(NativeTabDecorator decorator);
++  static bool IsVisibleToNativeBrowserModel(content::WebContents* contents);
+ 
+   enum ScrubTabBehaviorType {
+     kScrubTabFully,
+--- a/chrome/browser/extensions/extension_tab_util.cc
++++ b/chrome/browser/extensions/extension_tab_util.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "chrome/browser/extensions/extension_tab_util.h"
++#include "base/no_destructor.h"
+ 
+ #include <stddef.h>
+ 
+@@ -344,6 +345,22 @@
+   return nullptr;
+ }
+ 
++namespace {
++ExtensionTabUtil::NativeTabDecorator& NativeBrowserTabDecorator() {
++  static base::NoDestructor<ExtensionTabUtil::NativeTabDecorator> callback;
++  return *callback;
++}
++}  // namespace
++
++void ExtensionTabUtil::SetNativeTabDecorator(NativeTabDecorator decorator) {
++  NativeBrowserTabDecorator() = std::move(decorator);
++}
++
++bool ExtensionTabUtil::IsVisibleToNativeBrowserModel(content::WebContents* contents) {
++  auto& decorator = NativeBrowserTabDecorator();
++  return !decorator || decorator.Run(contents, nullptr);
++}
++
+ int ExtensionTabUtil::GetWindowId(BrowserWindowInterface* browser) {
+   return WindowControllerFromBrowser(browser)->GetWindowId();
+ }
+@@ -470,6 +487,15 @@
+     }
+   }
+ 
++  auto& decorator = NativeBrowserTabDecorator();
++  if (decorator && !decorator.Run(contents, &tab_object)) {
++    tab_object.id = api::tabs::TAB_ID_NONE;
++    tab_object.window_id = -1;
++    tab_object.index = -1;
++    tab_object.active = false;
++    tab_object.selected = false;
++    tab_object.highlighted = false;
++  }
+   ScrubTabForExtension(extension, contents, &tab_object, scrub_tab_behavior);
+   return tab_object;
+ }
+--- a/chrome/browser/extensions/api/messaging/chrome_messaging_delegate.cc
++++ b/chrome/browser/extensions/api/messaging/chrome_messaging_delegate.cc
+@@ -83,7 +83,8 @@
+ std::optional<base::DictValue> ChromeMessagingDelegate::MaybeGetTabInfo(
+     content::WebContents* web_contents) {
+   // Add info about the opener's tab (if it was a tab).
+-  if (web_contents && ExtensionTabUtil::GetTabId(web_contents) >= 0) {
++  if (web_contents && ExtensionTabUtil::GetTabId(web_contents) >= 0 &&
++      ExtensionTabUtil::IsVisibleToNativeBrowserModel(web_contents)) {
+     // Only the tab id is useful to platform apps for internal use. The
+     // unnecessary bits will be stripped out in
+     // MessagingBindings::DispatchOnConnect().

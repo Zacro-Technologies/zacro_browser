@@ -36,8 +36,19 @@ public final class CefBrowser: Identifiable {
 
     /// Event observer. Held weakly.
     public weak var delegate: CefBrowserDelegate?
+    /// Profile-owned downloads may outlive their originating browser. Set a
+    /// weakly captured application/service observer rather than a tab closure.
+    public var downloadObserver: ((CefDownload, CefDownloadControl?) -> Void)? {
+        get { client?.downloadObserver }
+        set { client?.downloadObserver = newValue }
+    }
     /// Distinguishes application teardown from an individual tab close.
     public internal(set) var closingForTermination = false
+    public var onCloseCancelled: (() -> Void)?
+    public var onFindResult: ((Int, Int, Bool) -> Void)? {
+        get { client?.onFindResult }
+        set { client?.onFindResult = newValue }
+    }
 
     /// Current main-frame URL.
     public private(set) var url: URL?
@@ -53,7 +64,20 @@ public final class CefBrowser: Identifiable {
     /// Owned +1 reference to the underlying cef_browser_t; nil after close.
     private var raw: UnsafeMutablePointer<cef_browser_t>?
     private var pendingNavigation: URL?
+    private var protocolChannel: CefDevTools?
+    private var isClosed = false
+    private var readyWaiters: [UUID: CheckedContinuation<Void, Error>] = [:]
+    private var readyDeadlines: [UUID: Task<Void, Never>] = [:]
+    var resourceFetches: [UUID: CefResourceFetch] = [:]
     let client: BrowserClient?
+
+    /// Native-only access to this document's Chromium protocol channel.
+    public var devTools: CefDevTools {
+        if let protocolChannel { return protocolChannel }
+        let channel = CefDevTools(browser: self)
+        protocolChannel = channel
+        return channel
+    }
 
     init(raw: UnsafeMutablePointer<cef_browser_t>?, client: BrowserClient?, delegate: CefBrowserDelegate?) {
         self.raw = raw
@@ -62,10 +86,39 @@ public final class CefBrowser: Identifiable {
         self.id = raw.map { $0.pointee.get_identifier?($0) ?? -1 } ?? -1
     }
 
+    /// Wait for native creation without navigating or replacing the initial
+    /// document. Cancellation, creation timeout and close resolve every waiter.
+    public func waitUntilReady() async throws {
+        try Task.checkCancellation()
+        if isClosed { throw CefDevToolsError.browserClosed }
+        if raw != nil { return }
+        let token = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                readyWaiters[token] = continuation
+                readyDeadlines[token] = Task { @MainActor [weak self] in
+                    do { try await Task.sleep(for: .seconds(30)) }
+                    catch { return }
+                    self?.finishReadyWaiter(token, error: CefDevToolsError.timeout)
+                }
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in self?.finishReadyWaiter(token, error: CancellationError()) }
+        }
+    }
+
+    private func finishReadyWaiter(_ token: UUID, error: Error? = nil) {
+        readyDeadlines.removeValue(forKey: token)?.cancel()
+        guard let continuation = readyWaiters.removeValue(forKey: token) else { return }
+        if let error { continuation.resume(throwing: error) }
+        else { continuation.resume() }
+    }
+
     // MARK: Navigation
 
     /// Navigates the main frame to `url`.
     public func load(_ url: URL) {
+        if CommandLine.arguments.contains("--engine-acceptance") { NSLog("CEF load id=%d ready=%d host=%@", id, raw == nil ? 0 : 1, url.host ?? url.scheme ?? "") }
         guard raw != nil else { pendingNavigation = url; return }
         withMainFrame { frame in
             CefStringUtil.withCefString(url.absoluteString) { cefURL in
@@ -154,9 +207,21 @@ public final class CefBrowser: Identifiable {
         set { withHost { $0.pointee.set_audio_muted?($0, newValue ? 1 : 0) } }
     }
 
+    /// Enable Chromium's complete native accessibility tree for a visible
+    /// document. Passing nil restores Chromium's automatic/default policy.
+    public func setAccessibilityEnabled(_ enabled: Bool?) {
+        guard hasRawBrowser, requestedAccessibility != enabled else { return }
+        requestedAccessibility = enabled
+        withHost { host in
+            host.pointee.set_accessibility_state?(host,
+                enabled.map { $0 ? STATE_ENABLED : STATE_DISABLED } ?? STATE_DEFAULT)
+        }
+    }
+    private var requestedAccessibility: Bool?
+
     /// Opens Chrome DevTools for this browser in its own window. No-op if a
     /// DevTools window is already open (CEF brings it to front).
-    public func showDevTools() {
+    public func showDevTools(inspecting point: CGPoint? = nil) {
         withHost { host in
             var windowInfo = cef_window_info_t()
             windowInfo.size = MemoryLayout<cef_window_info_t>.stride
@@ -166,9 +231,21 @@ public final class CefBrowser: Identifiable {
             windowInfo.runtime_style = CEF_RUNTIME_STYLE_DEFAULT
             var settings = cef_browser_settings_t()
             settings.size = MemoryLayout<cef_browser_settings_t>.stride
-            host.pointee.show_dev_tools?(host, &windowInfo, nil, &settings, nil)
+            if let point {
+                var location = cef_point_t(x: Int32(clamping: Int(point.x)), y: Int32(clamping: Int(point.y)))
+                host.pointee.show_dev_tools?(host, &windowInfo, nil, &settings, &location)
+            } else { host.pointee.show_dev_tools?(host, &windowInfo, nil, &settings, nil) }
         }
     }
+
+    /// Starts a download in this exact browser's authenticated request context.
+    public func download(_ url: URL) {
+        guard ["http", "https"].contains(url.scheme?.lowercased() ?? ""), url.user == nil, url.password == nil else { return }
+        withHost { host in CefStringUtil.withCefString(url.absoluteString) { host.pointee.start_download?(host, $0) } }
+    }
+
+    /// Native Chromium printing; page script overrides of window.print do not apply.
+    public func printPage() { withHost { $0.pointee.print?($0) } }
 
     /// Closes the DevTools window, if open.
     public func closeDevTools() {
@@ -190,12 +267,16 @@ public final class CefBrowser: Identifiable {
     }
 
     /// Searches the page for `text`.
-    public func find(_ text: String, forward: Bool, matchCase: Bool) {
+    public func find(_ text: String, forward: Bool, matchCase: Bool, findNext: Bool = false) {
         withHost { host in
             CefStringUtil.withCefString(text) { cefText in
-                host.pointee.find?(host, cefText, forward ? 1 : 0, matchCase ? 1 : 0, 0)
+                host.pointee.find?(host, cefText, forward ? 1 : 0, matchCase ? 1 : 0, findNext ? 1 : 0)
             }
         }
+    }
+
+    public func stopFinding(clearSelection: Bool = true) {
+        withHost { $0.pointee.stop_finding?($0, clearSelection ? 1 : 0) }
     }
 
     /// Requests that the browser close. With `force: false` JavaScript
@@ -229,7 +310,9 @@ public final class CefBrowser: Identifiable {
         }
         raw = newRaw
         id = newRaw.pointee.get_identifier?(newRaw) ?? -1
+        if CommandLine.arguments.contains("--engine-acceptance") { NSLog("CEF browser ready id=%d waiters=%d", id, readyWaiters.count) }
         CefRuntime.shared.registerBrowser(self)
+        for token in Array(readyWaiters.keys) { finishReadyWaiter(token) }
         if let url = pendingNavigation {
             pendingNavigation = nil
             load(url)
@@ -277,12 +360,14 @@ public final class CefBrowser: Identifiable {
     }
 
     func applyURL(_ urlString: String) {
+        if CommandLine.arguments.contains("--engine-acceptance") { NSLog("CEF address id=%d host=%@", id, URL(string: urlString)?.host ?? "") }
         let url = URL(string: urlString)
         self.url = url
         delegate?.browser(self, didChangeURL: url)
     }
 
     func applyLoadingState(isLoading: Bool, canGoBack: Bool, canGoForward: Bool) {
+        if CommandLine.arguments.contains("--engine-acceptance") { NSLog("CEF loading id=%d active=%d", id, isLoading ? 1 : 0) }
         self.isLoading = isLoading
         self.canGoBack = canGoBack
         self.canGoForward = canGoForward
@@ -290,12 +375,26 @@ public final class CefBrowser: Identifiable {
     }
 
     func handleBeforeClose() {
+        guard !isClosed else { return }
+        isClosed = true
+        for token in Array(readyWaiters.keys) { finishReadyWaiter(token, error: CefDevToolsError.browserClosed) }
+        for fetch in resourceFetches.values { fetch.cancel(CefResourceError.browserClosed) }
+        resourceFetches.removeAll()
+        protocolChannel?.close()
+        protocolChannel = nil
         delegate?.browserDidClose(self)
         if let raw {
             cefRelease(UnsafeMutableRawPointer(raw))
         }
         raw = nil
         CefRuntime.shared.unregisterBrowser(id: id)
+    }
+
+    func failCreation(_ message: String) {
+        guard !isClosed, raw == nil else { return }
+        delegate?.browser(self, didFailLoad: -2, errorText: message,
+                          failedURL: pendingNavigation?.absoluteString ?? "")
+        handleBeforeClose()
     }
 }
 
@@ -604,7 +703,7 @@ extension CefBrowser {
     /// Enables or disables accessibility for this browser. When enabled, CEF
     /// builds the AX tree and delivers it via the accessibility handler.
     public func setAccessibilityEnabled(_ enabled: Bool) {
-        withHostInternal { $0.pointee.set_accessibility_state?($0, enabled ? STATE_ENABLED : STATE_DISABLED) }
+        setAccessibilityEnabled(Optional(enabled))
     }
 }
 

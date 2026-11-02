@@ -6,6 +6,11 @@ import Foundation
 /// ``CefChromeBrowser/create(url:options:delegate:)``.
 @MainActor
 public struct CefChromeBrowserOptions {
+    /// Whether creation should show the CEF window. Native browser shells can
+    /// keep an internal Chrome window hidden while hosting its document windows
+    /// beneath their own AppKit window.
+    public var showsWindowOnCreation: Bool = true
+
     /// Shows Chrome's own toolbar (back/forward/omnibox) inside the window.
     /// `false` (the default) hides Chrome's UI entirely — the window shows
     /// only web content while the full Chrome runtime remains available.
@@ -25,6 +30,8 @@ public struct CefChromeBrowserOptions {
 
     /// Isolated request context used by this Chrome browser.
     public var profile: CefProfile?
+    /// Native-only, single-use identity token issued by the Chromium broker.
+    public var nativeTabReservation: String?
 
     public init() {}
 }
@@ -61,6 +68,12 @@ public final class CefChromeBrowser {
     /// Called after CEF destroys the window (user close, ``close()``, or app
     /// teardown). The instance is unusable afterwards.
     public var onWindowDestroyed: (() -> Void)?
+    /// A real Chromium-created document, retaining POST data, referrer, named
+    /// window identity and window.opener. The host can adopt it as a tab.
+    public var onPopupCreated: ((CefChromeBrowser, CefWindowOpenRequest) -> Void)?
+    public var beforeClose: (() async -> Bool)?
+    private var closePreparation: Task<Void, Never>?
+    private var closePrepared = false
 
     /// The AppKit window CEF created, once available. CEF owns this window —
     /// don't close or release it directly (use ``close()``); ordering,
@@ -84,9 +97,15 @@ public final class CefChromeBrowser {
     private var rawWindow: UnsafeMutablePointer<cef_window_t>?
     private var rawBrowserView: UnsafeMutablePointer<cef_browser_view_t>?
     private weak var windowOwner: CefChromeBrowser?
+    private weak var hostingWindow: NSWindow?
+    private weak var presentationParent: NSWindow?
     private var hostedBrowsers: [CefChromeBrowser] = []
     private var manualFrame: CGRect?
     private var manualVisible = true
+    private var pageCornerRadius: CGFloat = 0
+    private var closeRequested = false
+    private var pendingPopups: [Int32: CefChromeBrowser] = [:]
+    private var popupRequest: CefWindowOpenRequest?
     public var onLayout: (() -> Void)?
 
     /// Border space (DIP) reserved around the browser view inside the window,
@@ -123,7 +142,7 @@ public final class CefChromeBrowser {
     /// window is destroyed.
     @discardableResult
     public static func create(
-        url: URL,
+        url: URL?,
         options: CefChromeBrowserOptions = .init(),
         delegate: CefBrowserDelegate? = nil
     ) -> CefChromeBrowser {
@@ -136,6 +155,7 @@ public final class CefChromeBrowser {
         let cefBrowser = CefBrowser(raw: nil, client: client, delegate: delegate)
         client.attach(cefBrowser)
         let chrome = CefChromeBrowser(browser: cefBrowser, options: options)
+        chrome.configurePopupClient(client)
         liveInstances[ObjectIdentifier(chrome)] = chrome
         let windowDelegate = ChromeWindowDelegate(chrome: chrome, options: options)
         chrome.windowDelegate = windowDelegate
@@ -150,15 +170,31 @@ public final class CefChromeBrowser {
             }
             let viewDelegate = ChromeBrowserViewDelegate(chrome: chrome, options: options)
             chrome.viewDelegate = viewDelegate
-            chrome.rawBrowserView = CefStringUtil.withCefString(url.absoluteString) { cefURL in
-                cef_browser_view_create(client.makeClient(), cefURL, &settings, nil, options.profile?.makeRequestContext(), viewDelegate.makeStruct())
+            var extraInfo: UnsafeMutablePointer<cef_dictionary_value_t>?
+            if let token = options.nativeTabReservation {
+                extraInfo = cef_dictionary_value_create()
+                if let extraInfo {
+                    CefStringUtil.withCefString("_zacroTabReservation") { key in
+                        CefStringUtil.withCefString(token) { value in
+                            _ = extraInfo.pointee.set_string?(extraInfo, key, value)
+                        }
+                    }
+                }
+            }
+            chrome.rawBrowserView = CefStringUtil.withCefString(url?.absoluteString ?? "") { cefURL in
+                cef_browser_view_create(client.makeClient(), cefURL, &settings, extraInfo, options.profile?.makeRequestContext(), viewDelegate.makeStruct())
             }
             guard chrome.rawBrowserView != nil else {
-                preconditionFailure("Chromium rejected a Chrome BrowserView after profile initialization")
+                chrome.browser.failCreation("Chromium could not create the native document.")
+                window.pointee.close?(window)
+                return
             }
             chrome.handleWindowCreated(window)
             if chrome.windowOwner != nil {
-                if chrome.manualVisible { chrome.applyPageFrame() } else { chrome.hide() }
+                if chrome.manualVisible {
+                    chrome.show()
+                    chrome.applyPageFrame()
+                } else { chrome.hide() }
             } else if !chrome.manualVisible, let view = chrome.rawBrowserView {
                 let base = UnsafeMutableRawPointer(view).assumingMemoryBound(to: cef_view_t.self)
                 base.pointee.set_visible?(base, 0)
@@ -170,23 +206,100 @@ public final class CefChromeBrowser {
         return chrome
     }
 
-    /// Creates an independent Chrome runtime surface as a native child window.
-    /// CEF permits only one Chrome BrowserView per window; no Alloy substitution.
-    public func createPage(url: URL, profile: CefProfile, delegate: CefBrowserDelegate?) -> CefChromeBrowser {
-        precondition(windowOwner == nil && rawWindow != nil)
-        var pageOptions = CefChromeBrowserOptions()
-        pageOptions.profile = profile
-        pageOptions.isFrameless = true
-        pageOptions.initialBounds = CGRect(x: -16000, y: -16000, width: 600, height: 400)
-        let page = Self.create(url: url, options: pageOptions, delegate: delegate)
-        page.windowOwner = self
-        page.hide()
-        page.manualVisible = false
-        if let child = page.nsWindow, let parent = nsWindow {
+    private func configurePopupClient(_ client: BrowserClient) {
+        client.chromeOwner = self
+        client.popupClientFactory = { [weak self] popupID, request in
+            guard let self else { return nil }
+            let client = BrowserClient()
+            let browser = CefBrowser(raw: nil, client: client, delegate: nil)
+            client.attach(browser)
+            var options = self.options
+            options.nativeTabReservation = nil
+            options.isFrameless = true
+            options.showsWindowOnCreation = false
+            options.initialBounds = CGRect(x: -16000, y: -16000, width: 600, height: 400)
+            let popup = CefChromeBrowser(browser: browser, options: options)
+            popup.windowOwner = self.windowOwner ?? self
+            popup.hostingWindow = self.hostingWindow ?? self.nsWindow
+            popup.manualVisible = false
+            popup.popupRequest = request
+            popup.configurePopupClient(client)
+            Self.liveInstances[ObjectIdentifier(popup)] = popup
+            self.pendingPopups[popupID] = popup
+            if CommandLine.arguments.contains("--engine-acceptance") { NSLog("Acceptance popup client allocated id=%d", popupID) }
+            return client
+        }
+        client.popupAborted = { [weak self] identifier in
+            guard let popup = self?.pendingPopups.removeValue(forKey: identifier) else { return }
+            Self.liveInstances.removeValue(forKey: ObjectIdentifier(popup))
+        }
+    }
+
+    fileprivate func attachPopupView(_ view: UnsafeMutablePointer<cef_browser_view_t>) -> Bool {
+        guard let rawBrowser = view.pointee.get_browser?(view) else { return false }
+        let identifier = rawBrowser.pointee.get_identifier?(rawBrowser) ?? -1
+        defer { cefRelease(UnsafeMutableRawPointer(rawBrowser)) }
+        var clientOwner: CefChromeBrowser?
+        if let host = rawBrowser.pointee.get_host?(rawBrowser) {
+            if let client = host.pointee.get_client?(host) {
+                clientOwner = BrowserClient.fromNativeClient(UnsafeMutableRawPointer(client))?.chromeOwner
+                cefRelease(UnsafeMutableRawPointer(client))
+            }
+            cefRelease(UnsafeMutableRawPointer(host))
+        }
+        if CommandLine.arguments.contains("--engine-acceptance") { NSLog("Acceptance popup view native=%d candidates=%@", identifier, pendingPopups.values.map { String($0.browser.id) }.joined(separator: ",")) }
+        guard let match = pendingPopups.first(where: { $0.value === clientOwner || $0.value.browser.id == identifier }) else { return false }
+        let popup = match.value
+        // Chrome announces this view before the lifetime/view delegates in
+        // some creation paths. Resolve by the exact native client identity and
+        // adopt now, rather than depending on callback ordering.
+        if !popup.browser.hasRawBrowser {
+            cefAddRef(UnsafeMutableRawPointer(rawBrowser))
+            popup.browser.adoptRaw(rawBrowser)
+        }
+        pendingPopups.removeValue(forKey: match.key)
+        cefAddRef(UnsafeMutableRawPointer(view))
+        popup.rawBrowserView = view
+        let delegate = ChromeWindowDelegate(chrome: popup, options: popup.options)
+        popup.windowDelegate = delegate
+        popup.rawWindow = cef_window_create_top_level(delegate.makeStruct())
+        // The delegate receives on_window_created before rawWindow is assigned.
+        popup.applyLayout()
+        if let child = popup.nsWindow, let parent = popup.hostingWindow {
             child.isExcludedFromWindowsMenu = true
             child.collectionBehavior.insert(.fullScreenAuxiliary)
             parent.addChildWindow(child, ordered: .above)
         }
+        popup.hide()
+        popup.windowOwner?.hostedBrowsers.append(popup)
+        if let request = popup.popupRequest { onPopupCreated?(popup, request) }
+        return true
+    }
+
+    /// Creates an independent Chrome runtime surface as a native child window.
+    /// CEF permits only one Chrome BrowserView per window; no Alloy substitution.
+    public func createPage(
+        url: URL?, profile: CefProfile, delegate: CefBrowserDelegate?,
+        hostingWindow: NSWindow? = nil, nativeTabReservation: String? = nil
+    ) -> CefChromeBrowser {
+        precondition(windowOwner == nil && rawWindow != nil)
+        var pageOptions = CefChromeBrowserOptions()
+        pageOptions.profile = profile
+        pageOptions.nativeTabReservation = nativeTabReservation
+        pageOptions.isFrameless = true
+        pageOptions.showsWindowOnCreation = false
+        pageOptions.initialBounds = CGRect(x: -16000, y: -16000, width: 600, height: 400)
+        let page = Self.create(url: url, options: pageOptions, delegate: delegate)
+        page.windowOwner = self
+        page.hostingWindow = hostingWindow ?? nsWindow
+        page.hide()
+        page.manualVisible = false
+        if let child = page.nsWindow, let parent = page.hostingWindow {
+            child.isExcludedFromWindowsMenu = true
+            child.collectionBehavior.insert(.fullScreenAuxiliary)
+            parent.addChildWindow(child, ordered: .above)
+        }
+        page.hide()
         hostedBrowsers.append(page)
         return page
     }
@@ -198,8 +311,42 @@ public final class CefChromeBrowser {
         applyPageFrame()
     }
 
+    /// Clip the actual native document window; a SwiftUI mask cannot clip an
+    /// independently composited Chromium child window.
+    public func setPageCornerRadius(_ radius: CGFloat) {
+        pageCornerRadius = radius.isFinite ? max(0, min(64, radius)) : 0
+        applyPageCornerRadius()
+    }
+
+    /// Keep geometry anchored to the shell while presenting the page above a
+    /// native overlay (for example the Peek tint panel).
+    public func setPresentationParent(_ parent: NSWindow?) {
+        presentationParent = parent
+        guard manualVisible, let window = nsWindow,
+              let intended = parent ?? hostingWindow, window.parent !== intended else { return }
+        window.parent?.removeChildWindow(window)
+        intended.addChildWindow(window, ordered: .above)
+    }
+
+    private func applyPageCornerRadius() {
+        guard let window = nsWindow, let content = window.contentView else { return }
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.hasShadow = false
+        content.wantsLayer = true
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        content.layer?.cornerRadius = pageCornerRadius
+        content.layer?.masksToBounds = pageCornerRadius > 0
+        content.layer?.cornerCurve = .continuous
+        CATransaction.commit()
+    }
+
     public func setPageVisible(_ visible: Bool) {
-        guard manualVisible != visible else { return }
+        guard manualVisible != visible else {
+            if !visible, windowOwner != nil { hide() }
+            return
+        }
         manualVisible = visible
         if windowOwner != nil {
             if visible { show(); applyPageFrame(); nsWindow?.orderFront(nil) } else { hide() }
@@ -210,11 +357,12 @@ public final class CefChromeBrowser {
     }
 
     private func applyPageFrame() {
-        guard let frame = manualFrame, let parent = windowOwner?.nsWindow,
+        guard let frame = manualFrame, let parent = hostingWindow ?? windowOwner?.nsWindow,
               let content = parent.contentView, let window = nsWindow else { return }
         let nativeRect = CGRect(x: frame.minX, y: content.bounds.height - frame.maxY, width: max(1,frame.width), height: max(1,frame.height))
         let target = parent.convertToScreen(content.convert(nativeRect, to: nil))
         if window.frame != target {
+            if CommandLine.arguments.contains("--engine-acceptance") { NSLog("CEF frame id=%d window=%ld visible=%d frame=%@", browser.id, window.windowNumber, manualVisible ? 1 : 0, String(describing: target)) }
             if let rawWindow {
                 var rect = Self.cefScreenRect(from: target)
                 withUnsafeMutablePointer(to: &rawWindow.pointee.base.base) { view in
@@ -240,18 +388,46 @@ public final class CefChromeBrowser {
     /// Shows (or re-shows) the window.
     public func show() {
         guard let rawWindow else { return }
+        if CommandLine.arguments.contains("--engine-acceptance") { NSLog("CEF show id=%d window=%ld hosted=%d", browser.id, nsWindow?.windowNumber ?? -1, windowOwner == nil ? 0 : 1) }
+        if windowOwner != nil, let view = rawBrowserView {
+            // Views and its native window maintain independent visibility.
+            // A hosted document must restore both after hidden creation or
+            // adoption; showing only the window can leave an empty container.
+            let base = UnsafeMutableRawPointer(view).assumingMemoryBound(to: cef_view_t.self)
+            base.pointee.set_visible?(base, 1)
+        }
+        if let window = nsWindow, let parent = presentationParent ?? hostingWindow, window.parent !== parent {
+            window.parent?.removeChildWindow(window)
+            parent.addChildWindow(window, ordered: .above)
+        }
         rawWindow.pointee.show?(rawWindow)
+        // AppKit caches accessibility children across orderOut/reparent. The
+        // live Chromium AX tree is retained; announce the new native hierarchy
+        // after Views has shown the document instead of reloading its renderer.
+        if windowOwner != nil, let window = nsWindow {
+            browser.setAccessibilityEnabled(true)
+            NSAccessibility.post(element: window, notification: .layoutChanged)
+            DispatchQueue.main.async { [weak self, weak window] in
+                guard let self, self.manualVisible, let window else { return }
+                NSAccessibility.post(element: window, notification: .layoutChanged)
+                if let content = window.contentView {
+                    NSAccessibility.post(element: content, notification: .layoutChanged)
+                }
+            }
+        }
     }
 
     /// Hides the window without destroying it.
     public func hide() {
         guard let rawWindow else { return }
         rawWindow.pointee.hide?(rawWindow)
+        if let window = nsWindow { window.parent?.removeChildWindow(window) }
     }
 
     /// Closes the window (and its browser). JavaScript `onbeforeunload`
     /// handlers may prompt first; ``onWindowDestroyed`` fires when done.
     public func close() {
+        closeRequested = true
         guard let rawWindow else { return }
         rawWindow.pointee.close?(rawWindow)
     }
@@ -319,26 +495,55 @@ public final class CefChromeBrowser {
             var size = cef_size_t(width: 1100, height: 760)
             window.pointee.center_window?(window, &size)
         }
-        window.pointee.show?(window)
+        if options.showsWindowOnCreation { window.pointee.show?(window) }
     }
 
     fileprivate func handleBrowserCreated(_ raw: UnsafeMutablePointer<cef_browser_t>) {
         browser.adoptRaw(raw)
+        if CommandLine.arguments.contains("--engine-acceptance") { NSLog("CEF view attached id=%d hosted=%d visible=%d", browser.id, windowOwner == nil ? 0 : 1, manualVisible ? 1 : 0) }
         // Chrome's window and compositor can finish attaching after create().
         // Reapply retained geometry after that native turn, without reloading.
         DispatchQueue.main.async { [weak self] in
-            guard let self, self.windowOwner != nil else { return }
+            guard let self else { return }
+            if self.closeRequested { self.close(); return }
+            guard self.windowOwner != nil else { return }
             self.applyPageFrame()
-            if self.manualVisible { self.nsWindow?.orderFront(nil) }
+            self.applyPageCornerRadius()
+            if self.manualVisible { self.browser.setAccessibilityEnabled(true); self.show(); self.nsWindow?.orderFront(nil) }
+            else { self.hide() }
         }
     }
 
     fileprivate func handleCanClose() -> Bool {
+        if !closePrepared, let prepare = beforeClose {
+            if closePreparation == nil {
+                closePreparation = Task { @MainActor [weak self] in
+                    let accepted = await prepare()
+                    guard let self else { return }
+                    self.closePreparation = nil
+                    guard accepted else { self.browser.onCloseCancelled?(); return }
+                    self.closePrepared = true
+                    self.close()
+                }
+            }
+            return false
+        }
         let pagesClosed = hostedBrowsers.map { $0.browser.tryCloseFromWindow() }.allSatisfy { $0 }
         return pagesClosed && browser.tryCloseFromWindow()
     }
 
+    public func cancelPreparedClose() { closePrepared = false }
+
     fileprivate func handleWindowDestroyed() {
+        closePreparation?.cancel(); closePreparation = nil
+        if !browser.hasRawBrowser { browser.failCreation("The document window closed before creation completed.") }
+        // Popup creation can be canceled after OnBeforePopup without producing
+        // an attached BrowserView. Do not retain those pending owners forever.
+        for popup in pendingPopups.values {
+            popup.browser.close(force: true)
+            Self.liveInstances.removeValue(forKey: ObjectIdentifier(popup))
+        }
+        pendingPopups.removeAll()
         if let rawWindow {
             cefRelease(UnsafeMutableRawPointer(rawWindow))
         }
@@ -429,9 +634,9 @@ final class ChromeBrowserViewDelegate {
             // (BrowserClient.on_before_close → CefBrowser.handleBeforeClose).
         }
 
-        d.pointee.get_delegate_for_popup_browser_view = { delegateSelf, browserView, _, popupClient, _ in
+        d.pointee.get_delegate_for_popup_browser_view = { delegateSelf, browserView, _, popupClient, isDevTools in
             cefRelease(browserView.map(UnsafeMutableRawPointer.init))
-            cefRelease(popupClient.map(UnsafeMutableRawPointer.init))
+            defer { cefRelease(popupClient.map(UnsafeMutableRawPointer.init)) }
             guard let me = ChromeBrowserViewDelegate.owner(delegateSelf.map(UnsafeMutableRawPointer.init)) else {
                 return nil
             }
@@ -440,16 +645,22 @@ final class ChromeBrowserViewDelegate {
             MainActor.assumeIsolated {
                 // Fresh delegate so the popup inherits toolbar config but has
                 // no back-reference to the originating CefChromeBrowser.
-                let popupDelegate = ChromeBrowserViewDelegate(chrome: nil, options: me.options)
+                let popup = isDevTools == 0 ? BrowserClient.fromNativeClient(popupClient.map(UnsafeMutableRawPointer.init))?.chromeOwner : nil
+                if CommandLine.arguments.contains("--engine-acceptance") { NSLog("Acceptance popup view delegate has wrapper=%d devtools=%d", popup == nil ? 0 : 1, isDevTools) }
+                let popupDelegate = ChromeBrowserViewDelegate(chrome: popup, options: popup?.options ?? me.options)
                 // The struct's initial +1 transfers to CEF via this return.
                 result = popupDelegate.makeStruct()
             }
             return result
         }
 
-        d.pointee.on_popup_browser_view_created = { _, browserView, popupBrowserView, _ in
+        d.pointee.on_popup_browser_view_created = { delegateSelf, browserView, popupBrowserView, isDevTools in
             cefRelease(browserView.map(UnsafeMutableRawPointer.init))
-            cefRelease(popupBrowserView.map(UnsafeMutableRawPointer.init))
+            defer { cefRelease(popupBrowserView.map(UnsafeMutableRawPointer.init)) }
+            if isDevTools == 0, let popupBrowserView,
+                let me = ChromeBrowserViewDelegate.owner(delegateSelf.map(UnsafeMutableRawPointer.init)) {
+                return MainActor.assumeIsolated { me.chrome?.attachPopupView(popupBrowserView) == true ? 1 : 0 }
+            }
             // Return 0: CEF creates a default top-level window for the popup
             // (DevTools windows included), using the popup view delegate above.
             return 0

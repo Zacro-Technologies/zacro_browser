@@ -112,6 +112,9 @@ public final class CefRuntime {
     /// CEF objects and call shutdown() only after the event loop has returned.
     public var onReadyToTerminate: (() -> Void)?
     public var onTerminationChanged: ((Bool) -> Void)?
+    /// Snapshot native documents before asking any of them to close. A false
+    /// result cancels this quit attempt without unloading a document.
+    public var beforeClosingDocuments: (() async -> Bool)?
 
     var messagePump: CefMessagePump?
     private var appContext: CefAppContext?
@@ -119,6 +122,7 @@ public final class CefRuntime {
     private var browsers: [Int32: CefBrowser] = [:]
     private var isTerminationRequested = false
     private var isTerminationScheduled = false
+    private var isPreparingTermination = false
 
     private init() {}
 
@@ -245,6 +249,7 @@ public final class CefRuntime {
         CEFApplication.setTerminateHandler(nil)
         onReadyToTerminate = nil
         onTerminationChanged = nil
+        beforeClosingDocuments = nil
         cef_shutdown()
         ccef_unload_framework()
         appContext = nil
@@ -442,7 +447,7 @@ public final class CefRuntime {
     }
 
     private func scheduleTerminationIfReady() {
-        guard isTerminationRequested, browsers.isEmpty, !CefChromeBrowser.hasLiveWindows,
+        guard isTerminationRequested, !isPreparingTermination, browsers.isEmpty, !CefChromeBrowser.hasLiveWindows,
               !isTerminationScheduled else { return }
         // on_before_close is still on CEF's message-loop stack. Calling
         // cef_shutdown synchronously here destroys objects that the enclosing
@@ -451,7 +456,7 @@ public final class CefRuntime {
         isTerminationScheduled = true
         DispatchQueue.main.async { [self] in
             isTerminationScheduled = false
-            guard isInitialized, isTerminationRequested, browsers.isEmpty,
+            guard isInitialized, isTerminationRequested, !isPreparingTermination, browsers.isEmpty,
                   !CefChromeBrowser.hasLiveWindows else { return }
             if let onReadyToTerminate {
                 onReadyToTerminate()
@@ -469,7 +474,22 @@ public final class CefRuntime {
         if !isTerminationRequested {
             isTerminationRequested = true
             onTerminationChanged?(true)
+            if let prepare = beforeClosingDocuments {
+                isPreparingTermination = true
+                Task { @MainActor [weak self] in
+                    let accepted = await prepare()
+                    guard let self else { return }
+                    self.isPreparingTermination = false
+                    guard self.isInitialized, self.isTerminationRequested else { return }
+                    if accepted { _ = self.handleTerminationRequest() }
+                    else {
+                        self.isTerminationRequested = false
+                        self.onTerminationChanged?(false)
+                    }
+                }
+            }
         }
+        guard !isPreparingTermination else { return false }
         let roots = CefChromeBrowser.rootBrowserIDs
         let hasChildren = CefChromeBrowser.hasHostedWindows
         for browser in Array(browsers.values)

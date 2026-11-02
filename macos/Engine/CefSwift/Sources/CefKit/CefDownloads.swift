@@ -17,6 +17,9 @@ public struct CefDownload: Sendable, Equatable {
     public var isComplete: Bool
     /// Whether the download was canceled or interrupted.
     public var isCanceled: Bool
+    public var isInterrupted: Bool
+    public var isPaused: Bool
+    public var isInProgress: Bool
     /// Where the file is being written, once a destination is known.
     public var fullPath: URL?
 
@@ -27,7 +30,10 @@ public struct CefDownload: Sendable, Equatable {
         totalBytes: Int64,
         isComplete: Bool,
         isCanceled: Bool,
-        fullPath: URL?
+        fullPath: URL?,
+        isInterrupted: Bool = false,
+        isPaused: Bool = false,
+        isInProgress: Bool = true
     ) {
         self.id = id
         self.url = url
@@ -35,6 +41,9 @@ public struct CefDownload: Sendable, Equatable {
         self.totalBytes = totalBytes
         self.isComplete = isComplete
         self.isCanceled = isCanceled
+        self.isInterrupted = isInterrupted
+        self.isPaused = isPaused
+        self.isInProgress = isInProgress
         self.fullPath = fullPath
     }
 }
@@ -77,9 +86,43 @@ extension CefDownload {
             receivedBytes: item.pointee.get_received_bytes?(item) ?? 0,
             totalBytes: item.pointee.get_total_bytes?(item) ?? 0,
             isComplete: (item.pointee.is_complete?(item) ?? 0) != 0,
-            isCanceled: (item.pointee.is_canceled?(item) ?? 0) != 0
-                || (item.pointee.is_interrupted?(item) ?? 0) != 0,
-            fullPath: path.isEmpty ? nil : URL(fileURLWithPath: path)
+            isCanceled: (item.pointee.is_canceled?(item) ?? 0) != 0,
+            fullPath: path.isEmpty ? nil : URL(fileURLWithPath: path),
+            isInterrupted: (item.pointee.is_interrupted?(item) ?? 0) != 0,
+            isPaused: (item.pointee.is_paused?(item) ?? 0) != 0,
+            isInProgress: (item.pointee.is_in_progress?(item) ?? 0) != 0
         )
+    }
+}
+
+/// Controls Chromium's original download, including after its source tab closes.
+/// A successful call means the command was sent; the following download update
+/// is authoritative for the resulting state.
+@MainActor
+public final class CefDownloadControl {
+    nonisolated(unsafe) private var raw: UnsafeMutablePointer<cef_download_item_callback_t>?
+    init(raw: UnsafeMutablePointer<cef_download_item_callback_t>) { self.raw = raw }
+    deinit { cefRelease(raw.map(UnsafeMutableRawPointer.init)) }
+
+    @discardableResult public func pause() -> Bool {
+        guard let raw, let pause = raw.pointee.pause else { return false }
+        pause(raw)
+        return true
+    }
+    @discardableResult public func resume() -> Bool {
+        guard let raw, let resume = raw.pointee.resume else { return false }
+        resume(raw)
+        return true
+    }
+    @discardableResult public func cancel() -> Bool {
+        guard let raw, let cancel = raw.pointee.cancel else { return false }
+        cancel(raw)
+        return true
+    }
+    /// Release before Chromium is shut down. Repeated calls are harmless.
+    public func invalidate() {
+        let old = raw
+        raw = nil
+        cefRelease(old.map(UnsafeMutableRawPointer.init))
     }
 }

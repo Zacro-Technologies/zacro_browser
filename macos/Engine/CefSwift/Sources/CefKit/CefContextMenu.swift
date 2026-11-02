@@ -38,6 +38,7 @@ public struct CefContextMenuParams: Sendable, Equatable {
     public var mediaType: CefContextMenuMediaType
     /// Whether the node is editable (text field, contentEditable, …).
     public var isEditable: Bool
+    public var hasImageContents: Bool
 
     public init(
         x: Int = 0,
@@ -47,7 +48,8 @@ public struct CefContextMenuParams: Sendable, Equatable {
         pageURL: URL? = nil,
         selectionText: String = "",
         mediaType: CefContextMenuMediaType = .none,
-        isEditable: Bool = false
+        isEditable: Bool = false,
+        hasImageContents: Bool = false
     ) {
         self.x = x
         self.y = y
@@ -57,6 +59,7 @@ public struct CefContextMenuParams: Sendable, Equatable {
         self.selectionText = selectionText
         self.mediaType = mediaType
         self.isEditable = isEditable
+        self.hasImageContents = hasImageContents
     }
 }
 
@@ -76,7 +79,8 @@ extension CefContextMenuParams {
             pageURL: url(pageURLString),
             selectionText: selection,
             mediaType: CefContextMenuMediaType(cefValue: params.pointee.get_media_type?(params) ?? CM_MEDIATYPE_NONE),
-            isEditable: (params.pointee.is_editable?(params) ?? 0) != 0
+            isEditable: (params.pointee.is_editable?(params) ?? 0) != 0,
+            hasImageContents: (params.pointee.has_image_contents?(params) ?? 0) != 0
         )
     }
 }
@@ -122,6 +126,12 @@ public final class CefMenuModel {
     public func addSeparator() {
         _ = raw.pointee.add_separator?(raw)
     }
+    public func setEnabled(commandID: Int, enabled: Bool) {
+        _ = raw.pointee.set_enabled?(raw, Int32(commandID), enabled ? 1 : 0)
+    }
+    public func setTitle(at index: Int, title: String) {
+        CefStringUtil.withCefString(title) { _ = raw.pointee.set_label_at?(raw, index, $0) }
+    }
 
     /// Inserts a command item at `index`.
     public func insertItem(at index: Int, commandID: Int, title: String) {
@@ -139,6 +149,19 @@ public final class CefMenuModel {
     @discardableResult
     public func remove(commandID: Int) -> Bool {
         (raw.pointee.remove?(raw, Int32(commandID)) ?? 0) != 0
+    }
+
+    /// Resolve Chromium's own command IDs instead of depending on labels or
+    /// numeric ranges that also contain extension-provided menu entries.
+    @discardableResult public func removeChromeCommand(named name: String) -> Bool {
+        let identifier = name.withCString { cef_id_for_command_id_name($0) }
+        return identifier > 0 && remove(commandID: Int(identifier))
+    }
+
+    public func compactSeparators() {
+        for index in (0..<count).reversed() where isSeparator(at: index) {
+            if index == 0 || index == count - 1 || isSeparator(at: index - 1) { removeItem(at: index) }
+        }
     }
 
     /// Removes the item at `index`. Returns whether it existed.
