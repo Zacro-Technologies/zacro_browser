@@ -23,7 +23,10 @@ HOST_H = "chrome/browser/extensions/extension_view_host.h"
 FACTORY_CC = "chrome/browser/extensions/extension_view_host_factory.cc"
 BROWSER_H = "chrome/browser/ui/views/frame/browser_view.h"
 BROWSER_CC = "chrome/browser/ui/views/frame/browser_view.cc"
-PATHS = (REGISTRY_H, REGISTRY_CC, UI_H, VIEWS_H, VIEWS_CC, COORDINATOR_H,
+SERVICE_H = "chrome/browser/extensions/api/side_panel/side_panel_service.h"
+SERVICE_CC = "chrome/browser/extensions/api/side_panel/side_panel_service.cc"
+SERVICE_TEST = "chrome/browser/extensions/api/side_panel/side_panel_apitest.cc"
+PATHS = (SERVICE_H, SERVICE_CC, SERVICE_TEST, REGISTRY_H, REGISTRY_CC, UI_H, VIEWS_H, VIEWS_CC, COORDINATOR_H,
          COORDINATOR_CC, MANAGER_H, MANAGER_CC, HOST_H, FACTORY_CC, BROWSER_H, BROWSER_CC)
 
 
@@ -35,6 +38,23 @@ def replace(text, old, new):
 
 def generated(originals):
     result = dict(originals)
+    result[SERVICE_H] = replace(result[SERVICE_H], "    virtual void OnSidePanelServiceShutdown() = 0;", """    virtual void OnSidePanelServiceShutdown() = 0;
+    // Browser UI must track presentation even when the extension has no JS
+    // event listener. This callback does not itself dispatch an extension event.
+    virtual void OnNativePanelPresentationChanged(const ExtensionId& extension_id,
+        int window_id, std::optional<int> tab_id, bool visible) {}
+""")
+    for event, visible in (("Opened", "true"), ("Closed", "false")):
+        signature = f"void SidePanelService::DispatchOn{event}Event"
+        begin = result[SERVICE_CC].index(signature)
+        position = result[SERVICE_CC].index("  auto* router = EventRouter::Get(browser_context_);", begin)
+        result[SERVICE_CC] = (result[SERVICE_CC][:position] +
+            f"  for (auto& observer : observers_) {{\n    observer.OnNativePanelPresentationChanged(extension_id, window_id, tab_id, {visible});\n  }}\n" +
+            result[SERVICE_CC][position:])
+    result[SERVICE_TEST] = replace(result[SERVICE_TEST], '#include "extensions/browser/disable_reason.h"',
+        '#include "extensions/browser/disable_reason.h"\n#include "extensions/browser/event_router.h"')
+    result[SERVICE_TEST] = replace(result[SERVICE_TEST], "}  // namespace extensions\n",
+        (ROOT / "sidepanel_observer_tests.inc").read_text() + "\n}  // namespace extensions\n")
     result[UI_H] = replace(result[UI_H], '#include "chrome/browser/ui/side_panel/side_panel_enums.h"',
         '#include "chrome/browser/ui/side_panel/side_panel_enums.h"\n#include "chrome/browser/ui/side_panel/side_panel_native_view.h"')
     result[UI_H] = replace(result[UI_H], "  // Close the side panel.", """  // Native embedders may host one logical window in several BrowserViews.

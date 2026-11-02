@@ -1,3 +1,92 @@
+--- a/chrome/browser/extensions/api/side_panel/side_panel_service.h
++++ b/chrome/browser/extensions/api/side_panel/side_panel_service.h
+@@ -35,6 +35,11 @@
+         const ExtensionId& extension_id,
+         const api::side_panel::PanelOptions& updated_options) = 0;
+     virtual void OnSidePanelServiceShutdown() = 0;
++    // Browser UI must track presentation even when the extension has no JS
++    // event listener. This callback does not itself dispatch an extension event.
++    virtual void OnNativePanelPresentationChanged(const ExtensionId& extension_id,
++        int window_id, std::optional<int> tab_id, bool visible) {}
++
+   };
+ 
+   explicit SidePanelService(content::BrowserContext* context);
+--- a/chrome/browser/extensions/api/side_panel/side_panel_service.cc
++++ b/chrome/browser/extensions/api/side_panel/side_panel_service.cc
+@@ -337,6 +337,9 @@
+                                              int window_id,
+                                              std::optional<int> tab_id,
+                                              std::string_view path) {
++  for (auto& observer : observers_) {
++    observer.OnNativePanelPresentationChanged(extension_id, window_id, tab_id, false);
++  }
+   auto* router = EventRouter::Get(browser_context_);
+   if (!router->ExtensionHasEventListener(
+           extension_id, api::side_panel::OnClosed::kEventName)) {
+@@ -450,6 +453,9 @@
+                                              int window_id,
+                                              std::optional<int> tab_id,
+                                              std::string_view path) {
++  for (auto& observer : observers_) {
++    observer.OnNativePanelPresentationChanged(extension_id, window_id, tab_id, true);
++  }
+   auto* router = EventRouter::Get(browser_context_);
+   if (!router->ExtensionHasEventListener(
+           extension_id, api::side_panel::OnOpened::kEventName)) {
+--- a/chrome/browser/extensions/api/side_panel/side_panel_apitest.cc
++++ b/chrome/browser/extensions/api/side_panel/side_panel_apitest.cc
+@@ -11,6 +11,7 @@
+ #include "components/version_info/channel.h"
+ #include "content/public/test/browser_test.h"
+ #include "extensions/browser/disable_reason.h"
++#include "extensions/browser/event_router.h"
+ #include "extensions/browser/extension_host_test_helper.h"
+ #include "extensions/browser/extension_registrar.h"
+ #include "extensions/browser/test_extension_registry_observer.h"
+@@ -145,4 +146,42 @@
+ IN_PROC_BROWSER_TEST_F(SidePanelApiTest, ClosePanelErrors) {
+   ASSERT_TRUE(RunExtensionTest("side_panel/close_panel_errors"));
+ }
++// Browser-owned presentation is independent of extension JS subscriptions.
++IN_PROC_BROWSER_TEST_F(SidePanelApiTest, NativePresentationWithoutJSListeners) {
++  class PresentationObserver : public SidePanelService::Observer {
++   public:
++    void OnPanelOptionsChanged(const ExtensionId&,
++        const api::side_panel::PanelOptions&) override {}
++    void OnSidePanelServiceShutdown() override {}
++    void OnNativePanelPresentationChanged(const ExtensionId& extension_id,
++        int window_id, std::optional<int> tab_id, bool visible) override {
++      EXPECT_EQ(extension_id, std::string(32, 'a'));
++      EXPECT_EQ(window_id, 47);
++      EXPECT_EQ(tab_id, expected_tab);
++      EXPECT_EQ(visible, expected_visible);
++      ++calls;
++    }
++    int calls = 0;
++    bool expected_visible = true;
++    std::optional<int> expected_tab;
++  } observer;
++  auto* service = SidePanelService::Get(profile());
++  const std::string extension_id(32, 'a');
++  ASSERT_FALSE(EventRouter::Get(profile())->ExtensionHasEventListener(extension_id, "sidePanel.onOpened"));
++  ASSERT_FALSE(EventRouter::Get(profile())->ExtensionHasEventListener(extension_id, "sidePanel.onClosed"));
++  service->AddObserver(&observer);
++  service->DispatchOnOpenedEvent(extension_id, 47, std::nullopt, "panel.html");
++  observer.expected_visible = false;
++  service->DispatchOnClosedEvent(extension_id, 47, std::nullopt, "panel.html");
++  observer.expected_tab = 83;
++  observer.expected_visible = true;
++  service->DispatchOnOpenedEvent(extension_id, 47, 83, "contextual.html");
++  observer.expected_visible = false;
++  service->DispatchOnClosedEvent(extension_id, 47, 83, "contextual.html");
++  EXPECT_EQ(observer.calls, 4);
++  service->RemoveObserver(&observer);
++  service->DispatchOnOpenedEvent(extension_id, 47, std::nullopt, "panel.html");
++  EXPECT_EQ(observer.calls, 4);
++}
++
+ }  // namespace extensions
 --- a/chrome/browser/ui/side_panel/side_panel_registry.h
 +++ b/chrome/browser/ui/side_panel/side_panel_registry.h
 @@ -64,6 +64,10 @@

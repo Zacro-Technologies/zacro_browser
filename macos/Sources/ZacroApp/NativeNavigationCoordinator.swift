@@ -12,6 +12,7 @@ final class NativeNavigationCoordinator {
   private let vault: NativeNavigationStateStore
   private var restores: [String: Task<Void, Never>] = [:]
   private var restoreTokens: [String: UUID] = [:]
+  private var restoreFailures: [String: String] = [:]
   private var captures: [String: Task<Void, Never>] = [:]
   private var historyCapability: [String: Bool] = [:]
   private var urlOnlyRestorations = Set<String>()
@@ -36,6 +37,8 @@ final class NativeNavigationCoordinator {
       try Task.checkCancellation()
       guard engine.pages[page.id] === page else { throw CancellationError() }
     }
+    guard engine.pages[page.id] === page else { throw CancellationError() }
+    if let failure = restoreFailures[page.id] { throw ShortcutError(failure) }
   }
 
   func validateDestination(of tab: BrowserTab) async throws -> ChromeNavigationApproval? {
@@ -87,6 +90,7 @@ final class NativeNavigationCoordinator {
   func restore(_ page: ChromiumPage, tabID: String, peek: Bool, address: String, dormant: Bool = false) {
     let id = page.id
     restores[id]?.cancel()
+    restoreFailures.removeValue(forKey: id)
     let token = UUID(); restoreTokens[id] = token
     restores[id] = Task { [weak self, weak page] in
       guard let self, let page else { return }
@@ -97,6 +101,7 @@ final class NativeNavigationCoordinator {
         }
       }
       var restored = false
+      var historyNavigationStarted = false
       var destinationApproval: ChromeNavigationApproval?
       do {
         let browser = try await page.ready()
@@ -104,7 +109,7 @@ final class NativeNavigationCoordinator {
         do { try await self.beforeRestore?(page) }
         catch {
           fputs("Zacro could not prepare native tab ownership: \(error.localizedDescription)\n", stderr)
-          if !(error is CancellationError) { self.didFailPreparation?(id, error.localizedDescription) }
+          if !(error is CancellationError) { self.failPreparation(id: id, token: token, error: error) }
           return
         }
         guard self.owns(page, tabID: tabID, peek: peek, address: address) else { return }
@@ -116,11 +121,12 @@ final class NativeNavigationCoordinator {
           guard self.owns(page, tabID: tabID, peek: peek, address: address) else { return }
           if let destinationApproval { try page.authorizeNavigation(destinationApproval) }
         } catch {
-          if !(error is CancellationError) { self.didFailPreparation?(id, error.localizedDescription) }
+          if !(error is CancellationError) { self.failPreparation(id: id, token: token, error: error) }
           return
         }
         if let tab = self.store.document(id: page.id) { try await self.authorizeHistory(page, tab: tab) }
         if dormant {
+          historyNavigationStarted = true
           try await browser.restoreDiscardedDocument()
           restored = true
         } else if !page.isPrivate, await self.supportsHistory(page) {
@@ -128,6 +134,7 @@ final class NativeNavigationCoordinator {
           try Task.checkCancellation()
           guard self.owns(page, tabID: tabID, peek: peek, address: address) else { return }
           if let state {
+            historyNavigationStarted = true
             try await browser.restoreNavigationState(state)
             restored = true
           } else if let tab = self.store.document(id: page.id), tab.navigation.count > 1,
@@ -137,6 +144,7 @@ final class NativeNavigationCoordinator {
               return CefNavigationEntry(url: url, title: entry.title)
             }
             if entries.count == tab.navigation.count {
+              historyNavigationStarted = true
               try await browser.restoreNavigationEntries(entries, selectedIndex: tab.navigationIndex)
               restored = true
             }
@@ -145,6 +153,12 @@ final class NativeNavigationCoordinator {
       } catch is CancellationError { return }
       catch {
         fputs("Zacro could not restore native navigation: \(error.localizedDescription)\n", stderr)
+        // Once Chromium has started a navigation, a replacement/cancellation
+        // must not silently load the saved URL over the user's newer choice.
+        if historyNavigationStarted || page.browser == nil {
+          self.failPreparation(id: id, token: token, error: error)
+          return
+        }
       }
       guard !Task.isCancelled, self.owns(page, tabID: tabID, peek: peek, address: address) else { return }
       if !restored && (self.store.document(id: page.id)?.navigation.count ?? 0) > 1 {
@@ -153,9 +167,13 @@ final class NativeNavigationCoordinator {
       if !restored {
         do {
           if let destinationApproval { try await page.loadApprovedNavigation(destinationApproval) }
-          else if let url = BrowserAddress.documentURL(address) { page.load(url) }
+          else if let url = BrowserAddress.documentURL(address) {
+            if await self.supportsHistory(page), let browser = page.browser {
+              try await browser.loadAndWaitForNavigationCommit(url)
+            } else { page.load(url) }
+          }
         } catch {
-          if !(error is CancellationError) { self.didFailPreparation?(id, error.localizedDescription) }
+          if !(error is CancellationError) { self.failPreparation(id: id, token: token, error: error) }
           return
         }
       }
@@ -166,7 +184,14 @@ final class NativeNavigationCoordinator {
     }
   }
 
+  private func failPreparation(id: String, token: UUID, error: Error) {
+    guard restoreTokens[id] == token else { return }
+    restoreFailures[id] = error.localizedDescription
+    didFailPreparation?(id, error.localizedDescription)
+  }
+
   func cancelRestore(_ page: ChromiumPage) {
+    restoreFailures.removeValue(forKey: page.id)
     restoreTokens.removeValue(forKey: page.id)
     restores.removeValue(forKey: page.id)?.cancel()
   }
@@ -244,6 +269,7 @@ final class NativeNavigationCoordinator {
   }
 
   func forget(_ pageID: String) {
+    restoreFailures.removeValue(forKey: pageID)
     urlOnlyRestorations.remove(pageID)
     restoreTokens.removeValue(forKey: pageID)
     restores.removeValue(forKey: pageID)?.cancel()

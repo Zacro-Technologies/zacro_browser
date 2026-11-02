@@ -14,7 +14,7 @@
  #include "base/memory/scoped_refptr.h"
  #include "base/memory/weak_ptr.h"
  #include "base/observer_list.h"
-@@ -18,6 +22,11 @@
+@@ -18,6 +22,13 @@
  namespace content {
  class WebContents;
  }
@@ -22,11 +22,13 @@
 +class ZacroDataRemoval;
 +class ZacroDiscardOperation;
 +class ZacroDocumentObserver;
++class ZacroNavigationCommit;
++class GURL;
 +namespace sessions { class SerializedNavigationEntry; }
  
  class CefDevToolsController : public content::DevToolsAgentHostClient {
   public:
-@@ -68,6 +77,24 @@
+@@ -68,6 +79,27 @@
                                 base::span<const uint8_t> message) override;
  
    bool EnsureAgentHost();
@@ -40,6 +42,9 @@
 +  base::CallbackListSubscription zacro_extension_subscription_;
 +  void FinishZacroDataRemoval(int id, uint64_t failed_types);
 +  void FinishZacroDiscard(int id, int entry_id, const std::string& error);
++  bool StartZacroNavigationCommit(int id, const GURL& expected, base::DictValue result);
++  void FinishZacroNavigationCommit(int id, base::DictValue result, const std::string& error);
++  std::unique_ptr<ZacroNavigationCommit> zacro_navigation_commit_;
 +  std::unique_ptr<ZacroDiscardOperation> zacro_discard_;
 +  std::unique_ptr<ZacroDocumentObserver> zacro_document_observer_;
 +  int zacro_dormant_entry_ = 0;
@@ -61,10 +66,11 @@
  
  CefDevToolsController::CefDevToolsController(
      content::WebContents* inspected_contents)
-@@ -17,6 +18,14 @@
+@@ -17,6 +18,15 @@
  }
  
  CefDevToolsController::~CefDevToolsController() {
++  zacro_navigation_commit_.reset();
 +  zacro_data_removals_.clear();
 +  zacro_discard_.reset();
 +  zacro_document_observer_.reset();
@@ -76,7 +82,7 @@
    if (agent_host_) {
      agent_host_->DetachClient(this);
      AgentHostClosed(agent_host_.get());
-@@ -34,6 +43,7 @@
+@@ -34,6 +44,7 @@
      return false;
    }
  
@@ -84,7 +90,7 @@
    agent_host_->DispatchProtocolMessage(this,
                                         base::as_bytes(base::span(message)));
    return true;
-@@ -75,6 +85,11 @@
+@@ -75,6 +86,11 @@
  
  void CefDevToolsController::AgentHostClosed(
      content::DevToolsAgentHost* agent_host) {
@@ -96,7 +102,7 @@
    DCHECK(agent_host == agent_host_.get());
    agent_host_ = nullptr;
    for (auto& observer : observers_) {
-@@ -104,6 +119,23 @@
+@@ -104,6 +120,23 @@
    if (!devtools_util::ProtocolParser::IsValidMessage(str_message)) {
      LOG(WARNING) << "Invalid message: " << str_message.substr(0, 100);
      return;
@@ -251,7 +257,7 @@
    // Identify the RenderFrameHost that originated the navigation.
 --- /dev/null
 +++ b/libcef/browser/devtools/zacro_native_adapter.inc
-@@ -0,0 +1,779 @@
+@@ -0,0 +1,868 @@
 +// Zacro's browser-process adapter, included by CefDevToolsController.
 +// This channel is reachable only through CEF's native API. It is never exposed
 +// as a page binding, socket, scheme handler, or extension API.
@@ -263,6 +269,7 @@
 +#include "base/strings/string_number_conversions.h"
 +#include "base/strings/utf_string_conversions.h"
 +#include "base/timer/timer.h"
++#include "cef/libcef/browser/browser_host_base.h"
 +#include "chrome/browser/browsing_data/chrome_browsing_data_remover_constants.h"
 +#include "chrome/browser/devtools/devtools_window.h"
 +#include "chrome/browser/browser_process.h"
@@ -412,6 +419,68 @@
 +  base::RepeatingCallback<void(bool)> panel_;
 +  base::CallbackListSubscription subscription_;
 +};
++
++// Correlate a native host operation with its actual primary navigation, not
++// loading-state notifications or a URL string which can still describe blank.
++class ZacroNavigationCommit : public content::WebContentsObserver {
++ public:
++  ZacroNavigationCommit(content::WebContents* contents, const GURL& expected,
++      base::OnceCallback<void(const std::string&)> completion)
++      : content::WebContentsObserver(contents), expected_(expected),
++        previous_document_(contents->GetPrimaryMainFrame()->GetWeakDocumentPtr()),
++        completion_(std::move(completion)) {
++    timer_.Start(FROM_HERE, base::Seconds(45), base::BindOnce(
++        &ZacroNavigationCommit::Finish, base::Unretained(this),
++        "The requested document did not commit in time."));
++  }
++  void DidStartNavigation(content::NavigationHandle* navigation) override {
++    if (!navigation->IsInPrimaryMainFrame()) return;
++    if (navigation_id_ || navigation->GetURL() != expected_) {
++      Finish("The requested navigation was replaced before it committed."); return;
++    }
++    navigation_id_ = navigation->GetNavigationId();
++  }
++  void DidFinishNavigation(content::NavigationHandle* navigation) override {
++    if (!navigation->IsInPrimaryMainFrame() || navigation->GetNavigationId() != navigation_id_) return;
++    if (!navigation->HasCommitted() || navigation->IsErrorPage()) {
++      Finish("The requested navigation failed or was cancelled."); return;
++    }
++    if (!navigation->IsSameDocument() &&
++        previous_document_.AsRenderFrameHostIfValid() == web_contents()->GetPrimaryMainFrame()) {
++      Finish("The original document is still active."); return;
++    }
++    Finish({});
++  }
++  void PrimaryMainFrameRenderProcessGone(base::TerminationStatus) override {
++    Finish("The document renderer stopped before navigation committed.");
++  }
++  void WebContentsDestroyed() override { Finish("The document closed before navigation committed."); }
++ private:
++  void Finish(const std::string& error) {
++    timer_.Stop();
++    Observe(nullptr);
++    // Completion deletes this observer. Never access members afterwards.
++    if (completion_) std::move(completion_).Run(error);
++  }
++  GURL expected_;
++  content::WeakDocumentPtr previous_document_;
++  int64_t navigation_id_ = 0;
++  base::OnceCallback<void(const std::string&)> completion_;
++  base::OneShotTimer timer_;
++};
++
++bool CefDevToolsController::StartZacroNavigationCommit(int id, const GURL& expected, base::DictValue result) {
++  if (zacro_navigation_commit_) {
++    ReplyZacro(id, {}, "A native document restoration is already in progress."); return false;
++  }
++  zacro_navigation_commit_ = std::make_unique<ZacroNavigationCommit>(inspected_contents_, expected,
++      base::BindOnce(&CefDevToolsController::FinishZacroNavigationCommit, weak_ptr_factory_.GetWeakPtr(), id, std::move(result)));
++  return true;
++}
++void CefDevToolsController::FinishZacroNavigationCommit(int id, base::DictValue result, const std::string& error) {
++  zacro_navigation_commit_.reset();
++  ReplyZacro(id, error.empty() ? std::move(result) : base::DictValue(), error);
++}
 +
 +class ZacroDiscardOperation : public content::WebContentsObserver {
 + public:
@@ -766,12 +835,34 @@
 +    NativeExtensionPopupAnchor::CancelPrepared(inspected_contents_);
 +    ReplyZacro(*id, base::DictValue().Set("performed", true)); return true;
 +  }
++  if (*method == "Zacro.loadAndWaitForNavigationCommit") {
++    const auto* params = request->FindDict("params");
++    const auto* address = params ? params->FindString("url") : nullptr;
++    const GURL url(address ? *address : "");
++    auto browser = CefBrowserHostBase::GetBrowserForContents(inspected_contents_);
++    if (!address || address->size() > 32768 || !ZacroRestorableURL(url, inspected_contents_->GetBrowserContext()) || !browser) {
++      ReplyZacro(*id, {}, "This document destination is invalid or unavailable."); return true;
++    }
++    auto& controller = inspected_contents_->GetController();
++    if (zacro_navigation_commit_) {
++      ReplyZacro(*id, {}, "A native document restoration is already in progress."); return true;
++    }
++    if (url == GURL("about:blank") && controller.GetLastCommittedEntry()->IsInitialEntry() &&
++        !controller.GetPendingEntry() && !inspected_contents_->IsLoading() &&
++        inspected_contents_->GetPrimaryMainFrame()->IsRenderFrameLive() &&
++        inspected_contents_->GetLastCommittedURL() == url) {
++      ReplyZacro(*id, base::DictValue().Set("committed", true)); return true;
++    }
++    if (StartZacroNavigationCommit(*id, url, base::DictValue().Set("committed", true)))
++      browser->GetMainFrame()->LoadURL(url.spec());
++    return true;
++  }
 +  if (*method == "Zacro.restoreNavigationEntries") {
 +    const auto* params = request->FindDict("params");
 +    const auto* items = params ? params->FindList("entries") : nullptr;
 +    const auto selected = params ? params->FindInt("selectedIndex") : std::nullopt;
 +    auto& controller = inspected_contents_->GetController();
-+    if (!items || items->empty() || items->size() > 500 || !selected || *selected < 0 ||
++    if (zacro_navigation_commit_ || !items || items->empty() || items->size() > 500 || !selected || *selected < 0 ||
 +        static_cast<size_t>(*selected) >= items->size() || !controller.GetLastCommittedEntry()->IsInitialEntry() || controller.GetPendingEntry()) {
 +      ReplyZacro(*id, {}, "Legacy history can only restore a fresh initial document."); return true;
 +    }
@@ -792,8 +883,9 @@
 +    }
 +    auto entries = sessions::ContentSerializedNavigationBuilder::ToNavigationEntries(serialized, inspected_contents_->GetBrowserContext());
 +    controller.Restore(*selected, content::RestoreType::kRestored, &entries);
-+    controller.LoadIfNecessary();
-+    ReplyZacro(*id, base::DictValue().Set("restored", true)); return true;
++    if (StartZacroNavigationCommit(*id, controller.GetLastCommittedEntry()->GetURL(),
++        base::DictValue().Set("restored", true))) controller.LoadIfNecessary();
++    return true;
 +  }
 +  if (*method == "Zacro.getDocumentState") {
 +    auto* context = inspected_contents_->GetBrowserContext();
@@ -804,6 +896,7 @@
 +        .Set("devToolsOpen", DevToolsWindow::GetInstanceForInspectedWebContents(inspected_contents_) != nullptr)
 +        .Set("profileDownloads", context->GetDownloadManager()->InProgressCount())
 +        .Set("extensionUI", ZacroHasExtensionUI(inspected_contents_))
++        .Set("navigationPending", zacro_navigation_commit_ != nullptr)
 +        .Set("crashed", inspected_contents_->IsCrashed())
 +        .Set("loading", inspected_contents_->IsLoading()));
 +    return true;
@@ -868,7 +961,7 @@
 +  }
 +  if (*method == "Zacro.restoreDiscardedDocument") {
 +    auto& controller = inspected_contents_->GetController();
-+    if (zacro_dormant_history_.empty() || zacro_discard_ || controller.GetEntryCount() != 1 ||
++    if (zacro_navigation_commit_ || zacro_dormant_history_.empty() || zacro_discard_ || controller.GetEntryCount() != 1 ||
 +        !zacro_dormant_entry_ || controller.GetLastCommittedEntry()->GetUniqueID() != zacro_dormant_entry_ ||
 +        controller.GetPendingEntry() || inspected_contents_->IsLoading() ||
 +        inspected_contents_->GetLastCommittedURL() != GURL("about:blank")) {
@@ -879,7 +972,9 @@
 +    controller.Restore(zacro_dormant_selected_ + 1, content::RestoreType::kRestored, &entries);
 +    CHECK(controller.RemoveEntryAtIndex(0));
 +    zacro_dormant_entry_ = 0; zacro_dormant_history_.clear();
-+    controller.LoadIfNecessary(); ReplyZacro(*id, base::DictValue().Set("restored", true)); return true;
++    if (StartZacroNavigationCommit(*id, controller.GetLastCommittedEntry()->GetURL(),
++        base::DictValue().Set("restored", true))) controller.LoadIfNecessary();
++    return true;
 +  }
 +  if (*method == "Zacro.serializeNavigation") {
 +    if (inspected_contents_->GetBrowserContext()->IsOffTheRecord()) {
@@ -1000,7 +1095,7 @@
 +              controller.GetLastCommittedEntry()->GetUniqueID() == self->zacro_dormant_entry_ &&
 +              self->inspected_contents_->GetLastCommittedURL() == GURL("about:blank") &&
 +              !self->inspected_contents_->IsLoading();
-+          if (!iterator.ReachedEnd() || controller.GetPendingEntry() || (!initial && !dormant)) {
++          if (self->zacro_navigation_commit_ || !iterator.ReachedEnd() || controller.GetPendingEntry() || (!initial && !dormant)) {
 +            self->ReplyZacro(id, {}, "Restore requires a fresh document with no navigation in progress."); return;
 +          }
 +          auto entries = sessions::ContentSerializedNavigationBuilder::ToNavigationEntries(saved, context);
@@ -1010,8 +1105,8 @@
 +            self->zacro_dormant_entry_ = 0;
 +            self->zacro_dormant_history_.clear();
 +          }
-+          controller.LoadIfNecessary();
-+          self->ReplyZacro(id, base::DictValue().Set("restored", true));
++          if (self->StartZacroNavigationCommit(id, controller.GetLastCommittedEntry()->GetURL(),
++              base::DictValue().Set("restored", true))) controller.LoadIfNecessary();
 +        }, weak_ptr_factory_.GetWeakPtr(), *id, std::move(wrapped_key), std::move(nonce), std::move(ciphertext)));
 +    return true;
 +  }
@@ -1033,7 +1128,7 @@
 +}
 --- /dev/null
 +++ b/libcef/browser/devtools/zacro_extensions_adapter.inc
-@@ -0,0 +1,202 @@
+@@ -0,0 +1,220 @@
 +// Browser-context-owned registry/storage observation. No renderer bridge.
 +#include "base/supports_user_data.h"
 +#include "base/uuid.h"
@@ -1050,10 +1145,13 @@
 +void ZacroObserveProfileDownloads(content::BrowserContext* context);
 +
 +void ZacroSetTopologyObserved(content::BrowserContext* context, bool observed);
++void ZacroPanelPresentationChanged(content::BrowserContext* context, const std::string& extension,
++    int window_id, std::optional<int> tab_id, bool visible);
 +
 +class ZacroExtensionContext : public base::SupportsUserData::Data,
 +                              public extensions::ExtensionRegistryObserver,
 +                              public extensions::CommandService::Observer,
++                              public extensions::SidePanelService::Observer,
 +                              public extensions::ExtensionActionDispatcher::Observer {
 + public:
 +  using Events = base::RepeatingCallbackList<void(const std::string&, const base::DictValue&)>;
@@ -1068,6 +1166,8 @@
 +    if (registry_) registry_->AddObserver(this);
 +    dispatcher_ = extensions::ExtensionActionDispatcher::Get(context);
 +    if (dispatcher_) dispatcher_->AddObserver(this);
++    panels_ = extensions::SidePanelService::Get(context);
++    if (panels_) panels_->AddObserver(this);
 +    commands_ = extensions::CommandService::Get(context);
 +    if (commands_) commands_->AddObserver(this);
 +    if (auto* events = extensions::EventRouter::Get(context)) {
@@ -1087,6 +1187,7 @@
 +    if (registry_) registry_->RemoveObserver(this);
 +    if (dispatcher_) dispatcher_->RemoveObserver(this);
 +    if (commands_) commands_->RemoveObserver(this);
++    if (panels_) panels_->RemoveObserver(this);
 +  }
 +  std::string InstallationID(const extensions::Extension& extension) {
 +    auto& entry = installations_[extension.id()];
@@ -1136,6 +1237,17 @@
 +  void OnExtensionCommandAdded(const extensions::ExtensionId&, const std::string&) override { CommandsChanged(); }
 +  void OnExtensionCommandRemoved(const extensions::ExtensionId&, const std::string&) override { CommandsChanged(); }
 +  void OnCommandServiceDestroying() override { commands_->RemoveObserver(this); commands_ = nullptr; }
++  void OnSidePanelServiceShutdown() override { panels_->RemoveObserver(this); panels_ = nullptr; }
++  void OnPanelOptionsChanged(const extensions::ExtensionId& extension_id,
++      const extensions::api::side_panel::PanelOptions& options) override {
++    base::DictValue params; params.Set("id", extension_id);
++    if (options.tab_id) params.Set("tabID", *options.tab_id);
++    events_.Notify("Zacro.extensionActionChanged", params);
++  }
++  void OnNativePanelPresentationChanged(const extensions::ExtensionId& extension_id,
++      int window_id, std::optional<int> tab_id, bool visible) override {
++    ZacroPanelPresentationChanged(context_, extension_id, window_id, tab_id, visible);
++  }
 +  void OnExtensionActionUpdated(extensions::ExtensionAction* action, content::WebContents* contents,
 +      content::BrowserContext* context) override {
 +    if (!action || context != context_) return;
@@ -1160,6 +1272,7 @@
 +  raw_ptr<extensions::ExtensionRegistry> registry_ = nullptr;
 +  raw_ptr<extensions::ExtensionActionDispatcher> dispatcher_ = nullptr;
 +  raw_ptr<extensions::CommandService> commands_ = nullptr;
++  raw_ptr<extensions::SidePanelService> panels_ = nullptr;
 +  std::map<std::string, std::pair<scoped_refptr<const extensions::Extension>, std::string>> installations_;
 +  Events events_;
 +  base::CallbackListSubscription storage_observer_;
@@ -1238,7 +1351,7 @@
 +}
 --- /dev/null
 +++ b/libcef/browser/devtools/zacro_topology_adapter.inc
-@@ -0,0 +1,1152 @@
+@@ -0,0 +1,1201 @@
 +// The Swift shell owns logical tabs and windows. Chromium still owns the
 +// extension caller, schema, permission grants and real WebContents identities.
 +#include "base/strings/pattern.h"
@@ -1250,6 +1363,8 @@
 +#include "chrome/browser/ui/views/extensions/extension_keybinding_registry_views.h"
 +#include "chrome/browser/ui/extensions/extension_side_panel_manager.h"
 +#include "chrome/common/extensions/api/tabs.h"
++#include "chrome/common/extensions/api/debugger.h"
++#include "extensions/common/api/scripting.h"
 +#include "chrome/common/extensions/api/tab_groups.h"
 +#include "chrome/common/extensions/api/windows.h"
 +#include "chrome/common/extensions/api/sessions.h"
@@ -1309,6 +1424,7 @@
 +  ZACRO_TAB("captureVisibleTab", CaptureVisibleTab); ZACRO_TAB("detectLanguage", DetectLanguage);
 +  ZACRO_TAB("createSplit", CreateSplit); ZACRO_TAB("unsplit", Unsplit);
 +  ZACRO_TAB("group", Group); ZACRO_TAB("ungroup", Ungroup);
++  ZACRO_TAB("executeScript", ExecuteScript); ZACRO_TAB("insertCSS", InsertCSS); ZACRO_TAB("removeCSS", RemoveCSS);
 +#undef ZACRO_TAB
 +#define ZACRO_WINDOW(name, type) if (method == "windows." name) return extensions::api::windows::type::Params::Create(args).has_value()
 +  ZACRO_WINDOW("get", Get); ZACRO_WINDOW("getCurrent", GetCurrent);
@@ -1318,6 +1434,10 @@
 +#define ZACRO_GROUP(name, type) if (method == "tabGroups." name) return extensions::api::tab_groups::type::Params::Create(args).has_value()
 +  ZACRO_GROUP("get", Get); ZACRO_GROUP("query", Query); ZACRO_GROUP("update", Update); ZACRO_GROUP("move", Move);
 +#undef ZACRO_GROUP
++  if (method == "scripting.executeScript") return extensions::api::scripting::ExecuteScript::Params::Create(args).has_value();
++  if (method == "scripting.insertCSS") return extensions::api::scripting::InsertCSS::Params::Create(args).has_value();
++  if (method == "scripting.removeCSS") return extensions::api::scripting::RemoveCSS::Params::Create(args).has_value();
++  if (method == "debugger.attach") return extensions::api::debugger::Attach::Params::Create(args).has_value();
 +  if (method == "sidePanel.open") return extensions::api::side_panel::Open::Params::Create(args).has_value();
 +  if (method == "sidePanel.close") return extensions::api::side_panel::Close::Params::Create(args).has_value();
 +  if (method == "sessions.getRecentlyClosed") return extensions::api::sessions::GetRecentlyClosed::Params::Create(args).has_value();
@@ -1465,28 +1585,17 @@
 +            const auto physical = info.FindInt("windowId");
 +            if (!physical) return false;
 +            std::optional<int> logical;
-+            content::WebContents* owner = nullptr;
 +            for (const auto& [id, tab] : state->tabs_) {
 +              if (tab->web_contents() && ZacroTabUtil::GetWindowIdOfTab(tab->web_contents()) == *physical) {
-+                logical = tab->window; owner = tab->web_contents(); break;
++                logical = tab->window; break;
 +              }
 +            }
 +            if (!logical) for (const auto& [window, parked] : state->panel_parking_) {
 +              if (parked && ZacroTabUtil::GetWindowIdOfTab(parked.get()) == *physical) {
-+                logical = window; owner = parked.get(); break;
++                logical = window; break;
 +              }
 +            }
 +            if (!logical) return false;
-+            ZacroRefreshSidePanelPresentation(owner);
-+            if (!info.FindInt("tabId") && !extension_id.empty()) {
-+              if (event.event_name == "sidePanel.onOpened") {
-+                state->global_panels_[*logical] = {extension_id, owner->GetWeakPtr()};
-+              } else {
-+                auto current = state->global_panels_.find(*logical);
-+                if (current != state->global_panels_.end() && current->second.extension == extension_id &&
-+                    current->second.contents.get() == owner) state->global_panels_.erase(current);
-+              }
-+            }
 +            info.Set("windowId", *logical); event.ReplaceNativeArguments(std::move(arguments));
 +            return true;
 +          }
@@ -1553,6 +1662,31 @@
 +    return found != tabs_.end() && found->second->web_contents() == contents &&
 +        found->second->active && !found->second->closing &&
 +        focused_window_ == found->second->window;
++  }
++  void PanelPresentationChanged(const std::string& extension, int physical_window,
++      std::optional<int> tab_id, bool visible) {
++    std::optional<int> logical;
++    content::WebContents* owner = nullptr;
++    for (const auto& [id, tab] : tabs_) {
++      if (tab->web_contents() && ZacroTabUtil::GetWindowIdOfTab(tab->web_contents()) == physical_window) {
++        logical = tab->window; owner = tab->web_contents(); break;
++      }
++    }
++    if (!logical) for (const auto& [window, parked] : panel_parking_) {
++      if (parked && ZacroTabUtil::GetWindowIdOfTab(parked.get()) == physical_window) {
++        logical = window; owner = parked.get(); break;
++      }
++    }
++    if (!logical || !owner) return;
++    if (!tab_id && !extension.empty()) {
++      if (visible) global_panels_[*logical] = {extension, owner->GetWeakPtr()};
++      else {
++        auto current = global_panels_.find(*logical);
++        if (current != global_panels_.end() && current->second.extension == extension &&
++            current->second.contents.get() == owner) global_panels_.erase(current);
++      }
++    }
++    ZacroRefreshSidePanelPresentation(owner);
 +  }
 +  std::optional<int> WindowForBrowser(BrowserWindowInterface* browser) const {
 +    if (!browser) return std::nullopt;
@@ -1843,7 +1977,9 @@
 +        const int target = request->capture_document ? ZacroTabUtil::GetWindowIdOfTab(tab->second->web_contents()) : *request->prepare_document;
 +        if (request->side_panel_document) {
 +          if (arguments[0].GetDict().contains("windowId")) arguments[0].GetDict().Set("windowId", ZacroTabUtil::GetWindowIdOfTab(tab->second->web_contents()));
-+        } else if (arguments.empty()) arguments.Append(target); else arguments[0] = base::Value(target);
++        } else if (!request->document_arguments_unchanged) {
++          if (arguments.empty()) arguments.Append(target); else arguments[0] = base::Value(target);
++        }
 +        function->ReplaceNativeArguments(std::move(arguments));
 +        // RunWithValidation was already entered when this request was
 +        // deferred. Recheck its public validation hook, then enter Run exactly
@@ -1941,6 +2077,7 @@
 +    std::optional<int> prepare_document;
 +    bool capture_document = false;
 +    bool side_panel_document = false;
++    bool document_arguments_unchanged = false;
 +    scoped_refptr<ExtensionFunction> function;
 +    scoped_refptr<const extensions::Extension> extension;
 +    std::string installation;
@@ -1973,6 +2110,20 @@
 +    std::optional<int> prepare_document;
 +    bool capture_document = false;
 +    bool side_panel_document = false;
++    bool document_arguments_unchanged = false;
++    if (method.starts_with("scripting.") || method == "debugger.attach") {
++      const auto& first = args[0].GetDict();
++      const auto target = method == "debugger.attach" ? first.FindInt("tabId")
++          : first.FindDict("target")->FindInt("tabId");
++      // Background/opaque debugger targets retain Chromium's normal path.
++      if (!target) return false;
++      auto tab = tabs_.find(*target);
++      if (tab == tabs_.end()) {
++        std::move(response).Run({}, "The target tab does not exist in this profile."); return true;
++      }
++      if (tab->second->web_contents() && !tab->second->discarded) return false;
++      prepare_document = *target; document_arguments_unchanged = true;
++    }
 +    if (method == "sidePanel.open" || method == "sidePanel.close") {
 +      if (method == "sidePanel.open" && !function->user_gesture()) {
 +        std::move(response).Run({}, "sidePanel.open() may only be called in response to a user gesture."); return true;
@@ -2008,7 +2159,8 @@
 +      prepare_document = target; side_panel_document = true;
 +    }
 +    if (method == "tabs.getZoom" || method == "tabs.setZoom" || method == "tabs.getZoomSettings" ||
-+        method == "tabs.setZoomSettings" || method == "tabs.captureVisibleTab" || method == "tabs.detectLanguage") {
++        method == "tabs.setZoomSettings" || method == "tabs.captureVisibleTab" || method == "tabs.detectLanguage" ||
++        method == "tabs.executeScript" || method == "tabs.insertCSS" || method == "tabs.removeCSS") {
 +      int target = -1;
 +      bool capture = method == "tabs.captureVisibleTab";
 +      if (!args.empty() && args[0].is_int() && !capture) target = args[0].GetInt();
@@ -2047,6 +2199,7 @@
 +    request->arguments = arguments.Clone(); request->response = std::move(response);
 +    request->prepare_document = prepare_document; request->capture_document = capture_document;
 +    request->side_panel_document = side_panel_document;
++    request->document_arguments_unchanged = document_arguments_unchanged;
 +    // A beforeunload decision has no arbitrary deadline. Do not report failure
 +    // and then perform a delayed close after the user finally makes a choice.
 +    if (method != "tabs.remove" && method != "windows.remove") {
@@ -2272,6 +2425,11 @@
 +};
 +}  // namespace
 +
++void ZacroPanelPresentationChanged(content::BrowserContext* context, const std::string& extension,
++    int window_id, std::optional<int> tab_id, bool visible) {
++  ZacroBrowserContext::Get(context)->PanelPresentationChanged(extension, window_id, tab_id, visible);
++}
++
 +void ZacroSetTopologyObserved(content::BrowserContext* context, bool observed) {
 +  ZacroBrowserContext::Get(context)->SetObserved(observed);
 +}
@@ -2341,8 +2499,12 @@
 +    }
 +    if (method == "Zacro.navigateApproved") {
 +      ZacroNavigationApprovals::ForDocument(inspected_contents_)->destinations[*url] = {*extension, *incarnation};
-+      inspected_contents_->GetController().LoadURL(
-+          GURL(*url), content::Referrer(), ui::PAGE_TRANSITION_AUTO_TOPLEVEL, std::string());
++      if (StartZacroNavigationCommit(id, GURL(*url), base::DictValue().Set("extensionID", *extension)
++          .Set("incarnationID", *incarnation).Set("url", *url))) {
++        inspected_contents_->GetController().LoadURL(
++            GURL(*url), content::Referrer(), ui::PAGE_TRANSITION_AUTO_TOPLEVEL, std::string());
++      }
++      return true;
 +    }
 +    ReplyZacro(id, base::DictValue().Set("extensionID", *extension).Set("incarnationID", *incarnation).Set("url", *url)); return true;
 +  }

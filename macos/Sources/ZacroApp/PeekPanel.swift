@@ -39,7 +39,8 @@ final class PeekPanelController {
     parent: NSWindow, contentFrame: CGRect, preview: NSWindow?, close: @escaping () -> Void,
     expand: @escaping () -> Void, theme: SpaceTheme = SpaceTheme(), radius: Double = 12,
     motionScale: Double = 1, previewFrame: CGRect? = nil, originFrame: CGRect? = nil,
-    updatePreviewFrame: ((CGRect) -> Void)? = nil
+    updatePreviewFrame: ((CGRect) -> Void)? = nil,
+    error: String? = nil, url: String = "", retry: (() -> Void)? = nil
   ) {
     guard let content = parent.contentView else { return }
     let replacesSnapshot = closingSnapshot
@@ -73,7 +74,8 @@ final class PeekPanelController {
     self.motionScale = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : max(0, motionScale)
     updatePreview = updatePreviewFrame
     model.close = close; model.expand = expand
-    model.update(theme: theme, radius: radius)
+    model.update(theme: theme, radius: radius, error: error, url: url)
+    model.retry = retry ?? {}
     // CEF creates its child asynchronously. The first arriving window belongs
     // to the opening already in progress; it must not restart that animation.
     let freshPreview = preview != nil && orderedPreview != nil && orderedPreview !== preview
@@ -185,11 +187,16 @@ private final class PeekBackdropModel: ObservableObject {
   @Published private(set) var frame = CGRect.zero
   @Published private(set) var opacity = 1.0
   @Published var snapshot: NSImage?
+  @Published private(set) var error: String?
+  @Published private(set) var url = ""
   var close: () -> Void = {}
   var expand: () -> Void = {}
-  func update(theme: SpaceTheme, radius: Double) {
+  var retry: () -> Void = {}
+  func update(theme: SpaceTheme, radius: Double, error: String?, url: String) {
     if self.theme != theme { self.theme = theme }
     if self.radius != radius { self.radius = radius }
+    if self.error != error { self.error = error }
+    if self.url != url { self.url = url }
   }
   func present(frame: CGRect, opacity: Double) {
     if self.frame != frame { self.frame = frame }
@@ -218,6 +225,11 @@ private struct PeekBackdrop: View {
           .clipShape(RoundedRectangle(cornerRadius: model.radius, style: .continuous))
           .offset(x: model.frame.minX, y: model.frame.minY).opacity(model.opacity)
           .allowsHitTesting(false).accessibilityHidden(true)
+      } else if let error = model.error {
+        NativePageErrorView(message: error, url: model.url, isPeek: true, theme: model.theme, retry: model.retry)
+          .frame(width: max(0, model.frame.width), height: max(0, model.frame.height))
+          .clipShape(RoundedRectangle(cornerRadius: model.radius, style: .continuous))
+          .offset(x: model.frame.minX, y: model.frame.minY).opacity(model.opacity)
       }
       VStack(spacing: 8) {
         peekButton("xmark", label: "Close Peek", action: model.close)

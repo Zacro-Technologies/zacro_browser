@@ -90,8 +90,17 @@ extension CefBrowser {
     /// retained by discardDocument. A live page can never be overwritten.
     public func restoreNavigationState(_ state: Data) async throws {
         guard !state.isEmpty, state.count <= 6 * 1024 * 1024 else { throw CefDevToolsError.invalidMessage }
-        let response = try await devTools.call("Zacro.restoreNavigation", parameters: ["state": state.base64EncodedString()])
+        let response = try await devTools.call("Zacro.restoreNavigation", parameters: ["state": state.base64EncodedString()], timeout: 50)
         guard response["restored"] as? Bool == true else { throw CefDevToolsError.invalidMessage }
+    }
+
+    /// Uses CEF's normal navigation path, but returns only after the issued
+    /// primary-frame navigation commits. Redirects retain their navigation ID;
+    /// errors, cancellation, closure and replacement reject the operation.
+    public func loadAndWaitForNavigationCommit(_ url: URL) async throws {
+        let response = try await devTools.call("Zacro.loadAndWaitForNavigationCommit",
+            parameters: ["url": url.absoluteString], timeout: 50)
+        guard response["committed"] as? Bool == true else { throw CefDevToolsError.invalidMessage }
     }
 
     /// Sleeps the document by navigating to an empty page and pruning history,
@@ -104,7 +113,7 @@ extension CefBrowser {
     /// Restores the native in-memory history retained while sleeping. Private
     /// documents use this route exclusively and never export their page state.
     public func restoreDiscardedDocument() async throws {
-        let response = try await devTools.call("Zacro.restoreDiscardedDocument")
+        let response = try await devTools.call("Zacro.restoreDiscardedDocument", timeout: 50)
         guard response["restored"] as? Bool == true else { throw CefDevToolsError.invalidMessage }
     }
 
@@ -117,7 +126,7 @@ extension CefBrowser {
         let response = try await devTools.call("Zacro.restoreNavigationEntries", parameters: [
             "entries": entries.map { ["url": $0.url.absoluteString, "title": $0.title] },
             "selectedIndex": selectedIndex,
-        ])
+        ], timeout: 50)
         guard response["restored"] as? Bool == true else { throw CefDevToolsError.invalidMessage }
     }
 

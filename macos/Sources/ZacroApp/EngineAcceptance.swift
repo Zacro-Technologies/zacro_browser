@@ -174,6 +174,9 @@ final class EngineAcceptance {
     }
     try require(initialBrowser.url == url && !initialBrowser.isLoading,
       "freshDocumentFirstLoad")
+    if let native = try? await engine.nativeCapabilities(), native.navigationState {
+      try await checkNavigationCommits(url: url)
+    }
     var closeAttempts = 0
     popup.beforeClose = {
       closeAttempts += 1
@@ -199,6 +202,78 @@ final class EngineAcceptance {
       try await Task.sleep(for: .milliseconds(30))
     }
     try require(self.popup?.browser != nil, "retainedPopupForTermination")
+  }
+
+  private func checkNavigationCommits(url: URL) async throws {
+    func fresh(_ name: String) async throws -> CefBrowser {
+      let page = engine.page(id: "acceptance-commit-" + name, profileID: "a", isPrivate: false, url: nil)
+      return try await page.ready()
+    }
+    func actualAddress(_ browser: CefBrowser) async throws -> String? {
+      try await browser.devTools.evaluate("location.href") as? String
+    }
+    let loaded = try await fresh("load")
+    try await loaded.loadAndWaitForNavigationCommit(url)
+    try require(try await actualAddress(loaded) == url.absoluteString, "navigationLoadAwaitsPrimaryCommit")
+    let state = try await loaded.serializedNavigationState()
+    let encrypted = try await fresh("encrypted")
+    try await encrypted.restoreNavigationState(state)
+    try require(try await actualAddress(encrypted) == url.absoluteString, "encryptedRestoreAwaitsPrimaryCommit")
+    let legacy = try await fresh("legacy")
+    var components = URLComponents(url: url, resolvingAgainstBaseURL: false)!
+    components.query = "native-history=second"
+    let second = components.url!
+    try await legacy.restoreNavigationEntries([
+      CefNavigationEntry(url: url, title: "First"), CefNavigationEntry(url: second, title: "Second")
+    ], selectedIndex: 1)
+    try require(try await actualAddress(legacy) == second.absoluteString, "legacyRestoreAwaitsPrimaryCommit")
+    let loadingDeadline = Date().addingTimeInterval(5)
+    while legacy.isLoading && Date() < loadingDeadline { try await Task.sleep(for: .milliseconds(20)) }
+    try await legacy.discardDocument()
+    try require(try await actualAddress(legacy) == "about:blank", "navigationDiscardReachesBlank")
+    try await legacy.restoreDiscardedDocument()
+    try require(try await actualAddress(legacy) == second.absoluteString, "discardRestoreAwaitsPrimaryCommit")
+    var delayedComponents = URLComponents(url: url, resolvingAgainstBaseURL: false)!
+    delayedComponents.path = "/native-delayed-commit"; delayedComponents.query = nil
+    let delayedURL = delayedComponents.url!
+    func awaitPending(_ browser: CefBrowser) async throws {
+      let deadline = Date().addingTimeInterval(3)
+      repeat {
+        let state = try await browser.devTools.call("Zacro.getDocumentState")
+        if state["navigationPending"] as? Bool == true { return }
+        try await Task.sleep(for: .milliseconds(10))
+      } while Date() < deadline
+      throw Failure(message: "The delayed native navigation never entered its commit barrier")
+    }
+    let replacement = try await fresh("replacement")
+    let replaced = Task { try await replacement.loadAndWaitForNavigationCommit(delayedURL) }
+    try await awaitPending(replacement)
+    replacement.load(second)
+    do {
+      try await replaced.value
+      throw Failure(message: "Replacement navigation incorrectly fulfilled the original commit barrier")
+    } catch let error as CefDevToolsError {
+      try require(error.localizedDescription.contains("replaced") || error.localizedDescription.contains("cancelled"),
+        "navigationCommitRejectsReplacement")
+    }
+    let cancelled = try await fresh("cancelled")
+    let pending = Task { try await cancelled.loadAndWaitForNavigationCommit(delayedURL) }
+    try await awaitPending(cancelled)
+    cancelled.stopLoading()
+    do {
+      try await pending.value
+      throw Failure(message: "Cancelled navigation incorrectly fulfilled its commit barrier")
+    } catch let error as CefDevToolsError {
+      try require(error.localizedDescription.contains("cancelled"), "navigationCommitRejectsCancellation")
+    }
+    let failed = try await fresh("failure")
+    do {
+      try await failed.loadAndWaitForNavigationCommit(URL(string: "http://127.0.0.1:1/native-unreachable")!)
+      throw Failure(message: "A failed primary navigation was reported as committed")
+    } catch let error as CefDevToolsError {
+      try require(error.localizedDescription.contains("failed") || error.localizedDescription.contains("cancelled"),
+        "navigationCommitRejectsFailedDocument")
+    }
   }
 
   private func checkWindowContexts(page: ChromiumPage, browser: CefBrowser, url: URL) async throws {

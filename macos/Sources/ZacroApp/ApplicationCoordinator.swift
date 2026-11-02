@@ -170,6 +170,7 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
       guard let self, let owner = self.owner(tabID: id), owner.selectedDocumentID == id,
         self.deletingProfileID == nil, owner.windowContext.isOpen,
         !owner.windowContext.isClosing, !self.engine.isTerminating else { return }
+      if self.engine.pages[id]?.documentError != nil { owner.scheduleLayout(); return }
       owner.showError("This tab could not be opened: " + message)
     }
     navigation.didRestore = { [weak self] id, restored in

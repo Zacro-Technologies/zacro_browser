@@ -14,10 +14,13 @@
 void ZacroObserveProfileDownloads(content::BrowserContext* context);
 
 void ZacroSetTopologyObserved(content::BrowserContext* context, bool observed);
+void ZacroPanelPresentationChanged(content::BrowserContext* context, const std::string& extension,
+    int window_id, std::optional<int> tab_id, bool visible);
 
 class ZacroExtensionContext : public base::SupportsUserData::Data,
                               public extensions::ExtensionRegistryObserver,
                               public extensions::CommandService::Observer,
+                              public extensions::SidePanelService::Observer,
                               public extensions::ExtensionActionDispatcher::Observer {
  public:
   using Events = base::RepeatingCallbackList<void(const std::string&, const base::DictValue&)>;
@@ -32,6 +35,8 @@ class ZacroExtensionContext : public base::SupportsUserData::Data,
     if (registry_) registry_->AddObserver(this);
     dispatcher_ = extensions::ExtensionActionDispatcher::Get(context);
     if (dispatcher_) dispatcher_->AddObserver(this);
+    panels_ = extensions::SidePanelService::Get(context);
+    if (panels_) panels_->AddObserver(this);
     commands_ = extensions::CommandService::Get(context);
     if (commands_) commands_->AddObserver(this);
     if (auto* events = extensions::EventRouter::Get(context)) {
@@ -51,6 +56,7 @@ class ZacroExtensionContext : public base::SupportsUserData::Data,
     if (registry_) registry_->RemoveObserver(this);
     if (dispatcher_) dispatcher_->RemoveObserver(this);
     if (commands_) commands_->RemoveObserver(this);
+    if (panels_) panels_->RemoveObserver(this);
   }
   std::string InstallationID(const extensions::Extension& extension) {
     auto& entry = installations_[extension.id()];
@@ -100,6 +106,17 @@ class ZacroExtensionContext : public base::SupportsUserData::Data,
   void OnExtensionCommandAdded(const extensions::ExtensionId&, const std::string&) override { CommandsChanged(); }
   void OnExtensionCommandRemoved(const extensions::ExtensionId&, const std::string&) override { CommandsChanged(); }
   void OnCommandServiceDestroying() override { commands_->RemoveObserver(this); commands_ = nullptr; }
+  void OnSidePanelServiceShutdown() override { panels_->RemoveObserver(this); panels_ = nullptr; }
+  void OnPanelOptionsChanged(const extensions::ExtensionId& extension_id,
+      const extensions::api::side_panel::PanelOptions& options) override {
+    base::DictValue params; params.Set("id", extension_id);
+    if (options.tab_id) params.Set("tabID", *options.tab_id);
+    events_.Notify("Zacro.extensionActionChanged", params);
+  }
+  void OnNativePanelPresentationChanged(const extensions::ExtensionId& extension_id,
+      int window_id, std::optional<int> tab_id, bool visible) override {
+    ZacroPanelPresentationChanged(context_, extension_id, window_id, tab_id, visible);
+  }
   void OnExtensionActionUpdated(extensions::ExtensionAction* action, content::WebContents* contents,
       content::BrowserContext* context) override {
     if (!action || context != context_) return;
@@ -124,6 +141,7 @@ class ZacroExtensionContext : public base::SupportsUserData::Data,
   raw_ptr<extensions::ExtensionRegistry> registry_ = nullptr;
   raw_ptr<extensions::ExtensionActionDispatcher> dispatcher_ = nullptr;
   raw_ptr<extensions::CommandService> commands_ = nullptr;
+  raw_ptr<extensions::SidePanelService> panels_ = nullptr;
   std::map<std::string, std::pair<scoped_refptr<const extensions::Extension>, std::string>> installations_;
   Events events_;
   base::CallbackListSubscription storage_observer_;

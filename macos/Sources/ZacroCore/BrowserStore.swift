@@ -50,10 +50,33 @@ public final class BrowserStore: ObservableObject {
       }.map { ArchivedTab(tab: $0) }, at: 0)
       state.tabs.removeAll { tab in removed.contains { $0.id == tab.id } }
       state.activeTabID = nil
+      if var windows = state.windowSessions {
+        for i in windows.indices {
+          windows[i].activeTabID = nil
+          windows[i].highlightedTabIDs.removeAll()
+        }
+        state.windowSessions = windows
+      }
       repair()
     }
-    if initialState == nil, let selected = state.activeTab, selected.isPinned, selected.peek == nil, split(for: selected.id) == nil {
-      state.activeTabID = state.tabs.first { $0.spaceID == state.activeSpaceID && !$0.isPinned && !$0.isClosed }?.id
+    if initialState == nil {
+      func dormantAtStartup(_ id: String?) -> Bool {
+        guard let selected = state.tabs.first(where: { $0.id == id }) else { return false }
+        return selected.isPinned && selected.peek == nil && split(for: selected.id) == nil
+      }
+      if var windows = state.windowSessions {
+        for i in windows.indices where dormantAtStartup(windows[i].activeTabID) {
+          let window = windows[i]
+          windows[i].activeTabID = state.tabs.first {
+            $0.windowID == window.id && $0.spaceID == window.activeSpaceID && !$0.isPinned && !$0.isClosed
+          }?.id
+          windows[i].highlightedTabIDs = Set(windows[i].activeTabID.map { [$0] } ?? [])
+        }
+        state.windowSessions = windows
+        BrowserWindowState.applyFocusedSelection(&state)
+      } else if dormantAtStartup(state.activeTabID) {
+        state.activeTabID = state.tabs.first { $0.spaceID == state.activeSpaceID && !$0.isPinned && !$0.isClosed }?.id
+      }
     }
     if initialState == nil {
       for i in state.downloads.indices {

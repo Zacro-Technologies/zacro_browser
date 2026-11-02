@@ -87,7 +87,7 @@ struct NativeLibrary: View {
     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     .foregroundStyle(colors.ink).tint(colors.accent).font(.system(size: 13))
     .buttonStyle(LibraryActionStyle(colors: colors))
-    .onAppear { if isRecords { focus = "search" } }
+    .onAppear { focus = isRecords ? "search" : "section" }
     .onChange(of: actions.library) { _, value in
       guard let value else { return }
       section = value; query = ""; focus = isRecords ? "search" : "section"

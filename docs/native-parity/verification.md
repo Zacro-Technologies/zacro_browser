@@ -131,6 +131,18 @@ The normal build script now requires a custom-runtime receipt. Nine packaging-va
 
 Evidence: `macos/.build/verification/integrated-release-17.log`, `application-17/application.json`, `application-17/application.log`, `core-services-post17-full.log`, `runtime-receipt-validation-17.log`, `plugin-custom-framework-17.log`, `native-messaging-fixtures.log`, and `native-messaging-objects/object-check.json`.
 
+## 2026-11-02: integrated build 18
+
+The first release build compiled in 123.38 seconds without warnings. Its new error-state acceptance exposed a real focus regression: showing an underlying split window could select it while Peek was opening, redirecting subsequent address navigation away from the preview. The coordinator now rejects underlying-document focus while Peek is presented. The successful retry compiled in 94.25 seconds, passed deep/strict signature verification, all **61 application checks**, and clean shutdown. The separate stock-engine acceptance passed and exited cleanly. The complete Core/Services suite passed **203 cases** (130 Core and 73 Services), with no failures or skips and the real bundled Codex handshake/PDF helper.
+
+New application checks cover the Find layout reservation and repeat focus request, retained native drag-source attachment across category/Space presentation removal, exactly-once drag cleanup and UTF-8 pasteboard identity, normal and Peek failure cards, address editing, and recovery without replacing either Chromium document. The Peek check requires an actually visible retained panel as well as the rendered source. No physical drag event is synthesized by these checks.
+
+The build also applies dormant-start/session-restoration settings independently to each saved window, preserves intentional empty selection, resets the palette on profile changes, and adds the original loading strip and page/Peek error presentation. A focused CEF callback regression passed, confirming subframe failures cannot replace main-document error state and transferred frame references are released. Native restoration now waits for a correlated main-frame navigation commit and propagates failure rather than allowing extension document actions to target the temporary blank page. Custom-only fixtures expand coverage for listener-independent side panels, dormant document APIs, native identity windows, and isolated native-messaging framing/origin/process cleanup. Those custom branches still await the linked Chromium framework.
+
+The application harness renders its own NSView trees into `view-renders`. The palette, page-error and Peek-error artifacts were visually inspected for layout, typography, glyphs and readable controls. These are **not desktop screenshots**: native web-document windows and behind-window material composition are excluded, and the metadata explicitly records desktop input and material-compositing verification as false. They do not replace Computer acceptance or README screenshots of the completed browser.
+
+Evidence: `macos/.build/verification/integrated-release-18.log`, `integrated-release-18-retry.log`, `application-18-retry/application.json`, `application-18-retry/view-renders`, `engine-18/engine.json`, `core-services-post18-full.log`, and `cef-load-error-tests-18-retry.log`. The initial failing run remains in `application-18`. Stock reports continue to mark native extension compatibility and desktop input as unverified.
+
 ## Required release evidence
 
 - Successful custom Chromium build and package provenance; native protocol capability checks.

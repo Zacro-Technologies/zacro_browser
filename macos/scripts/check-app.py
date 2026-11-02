@@ -3,6 +3,8 @@
 
 import argparse
 import http.server
+from native_auth_fixture import handle_native_auth
+from native_messaging_fixture import build_host
 import json
 import os
 from pathlib import Path
@@ -24,7 +26,11 @@ class Fixture(http.server.BaseHTTPRequestHandler):
             self.send_error(405)
 
     def do_GET(self):
+        if handle_native_auth(self):
+            return
         route = urlsplit(self.path).path
+        if route == "/native-delayed-commit":
+            time.sleep(0.5)
         if route.startswith("/media/"):
             self.media_fixture(route)
             return
@@ -43,7 +49,10 @@ class Fixture(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type", mime)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def media_fixture(self, route, head_only=False):
         types = {"synthetic-h264.mp4": "video/mp4", "synthetic-aac.m4a": "audio/mp4", "synthetic.pdf": "application/pdf",
@@ -166,6 +175,7 @@ def main():
         parser.error(f"Build the application first: {executable}")
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
+    native_host = build_host(output / "native-messaging-host") if args.integration else None
     name = "application" if args.integration else "ui" if args.ui else "engine"
     report = output / (name + ".json")
     report.unlink(missing_ok=True)
@@ -186,7 +196,10 @@ def main():
                 MallocNanoZone="0",
                 ZACRO_NATIVE_EXTENSION_FIXTURE=str(native_root / "scripts/fixtures/native-extension"),
                 ZACRO_REQUIRE_NATIVE_EXTENSIONS="1" if args.require_extensions else "0",
+                ZACRO_RENDER_EVIDENCE="1" if args.integration else "0",
             )
+            if native_host:
+                env["ZACRO_NATIVE_MESSAGING_FIXTURE"] = str(native_host)
             with (output / (name + ".log")).open("w") as log:
                 arguments = [str(executable), "--engine-acceptance", "-ApplePersistenceIgnoreState", "YES"]
                 if args.ui:

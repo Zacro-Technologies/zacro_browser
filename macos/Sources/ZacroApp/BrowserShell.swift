@@ -40,6 +40,7 @@ final class BrowserActions: ObservableObject {
   @Published var audibleTabIDs: Set<String> = []
   @Published var loadedTabIDs: Set<String> = []
   @Published var loadingTabIDs: Set<String> = []
+  @Published var documentErrors: [String: String] = [:]
   @Published var recordingShortcut = false
   @Published var shortcutCaptureReady = false
   @Published var shortcutCaptureError: String?
@@ -51,6 +52,7 @@ final class BrowserActions: ObservableObject {
   var findNext: () -> Void = {}
   var findPrevious: () -> Void = {}
   var closeFind: () -> Void = {}
+  var focusPage: () -> Void = {}
   var updateFind: (String) -> Void = { _ in }
   @Published var nativePageVisible = false
   @Published var contentFrame = CGRect.zero
@@ -58,6 +60,7 @@ final class BrowserActions: ObservableObject {
   @Published var runtimeCommands: [BrowserRuntimeCommand] = []
   @Published var libraryCapabilities: Set<String> = []
   @Published var libraryMessages: [String: String] = [:]
+  @Published var interfaceError: String?
   @Published var defaultBrowser: Bool?
   var performInterfaceCommand: (String) -> Bool = { _ in false }
   var handlePaletteEscape: () -> Bool = { false }
@@ -120,10 +123,13 @@ struct BrowserShell<Content: View>: View {
   @State private var hoveredTab: String?
   @State private var hoveredFolder: String?
   @State private var hoveredPin: String?
+  @State private var hoveredNewTab = false
+  @State private var rowMotionSpaceID: String?
   @State private var editingGroupColor: String?
   @State private var operationError: String?
   @State private var nameError: String?
   @FocusState private var sidebarFocus: String?
+  @State private var libraryReturnFocus: String?
   @Environment(\.accessibilityReduceMotion) private var reduceMotion
   @Environment(\.colorScheme) private var colorScheme
   @Environment(\.colorSchemeContrast) private var contrast
@@ -152,6 +158,13 @@ struct BrowserShell<Content: View>: View {
     return value
   }
   private var effectiveMotion: Double { reduceMotion ? 0 : store.state.settings.motionScale }
+  private var allowsRowMotion: Bool {
+    effectiveMotion > 0 && rowMotionSpaceID == store.state.activeSpaceID
+      && !gestureTracking && gestureProgress == 0 && drag.id == nil
+  }
+  private var rowAnimation: Animation? {
+    allowsRowMotion ? .timingCurve(0.16, 1, 0.3, 1, duration: 0.14 * effectiveMotion) : nil
+  }
   private var isPopup: Bool {
     store.state.windowSessions?.first(where: { $0.id == store.owningWindowID })?.kind == .popup
   }
@@ -232,12 +245,13 @@ struct BrowserShell<Content: View>: View {
         NativeContentFrameReporter { frame in publishContentFrame(frame) }
           .frame(maxWidth: .infinity, maxHeight: .infinity).allowsHitTesting(false)
       }
+      .padding(.top, actions.findVisible ? 40 : 0)
       .background {
         NativePalettePresenter(
           isPresented: $actions.findVisible,
           content: AnyView(NativeFindBar(actions: actions, colors: colors)), motionScale: effectiveMotion,
           frame: CGRect(x: max(actions.contentFrame.minX + 8, actions.contentFrame.maxX - 326),
-            y: max(4, actions.contentFrame.minY), width: min(310, max(200, actions.contentFrame.width - 24)), height: 32),
+            y: 4, width: min(310, max(200, actions.contentFrame.width - 24)), height: 32),
           presentationID: actions.findSession, takesKey: true, dismissOnOutsideClick: false, dismissOnResign: false)
           .frame(width: 0, height: 0).allowsHitTesting(false)
       }
@@ -280,11 +294,14 @@ struct BrowserShell<Content: View>: View {
             .transition(.move(edge: .trailing).combined(with: .opacity))
         }
        }
-       if let message = store.lastError, editor == nil, themeError == nil, operationError == nil, nameError == nil {
+       if let message = actions.interfaceError ?? store.lastError, editor == nil, themeError == nil, operationError == nil, nameError == nil {
          HStack(spacing: 8) {
            NativeGlyph("info.circle").foregroundStyle(accent).frame(width: 16)
            Text(message).font(.system(size: 11)).lineLimit(2).frame(maxWidth: .infinity, alignment: .leading)
-           Button { store.clearError() } label: { NativeGlyph("xmark").frame(width: 24, height: 24) }
+           Button {
+             if actions.interfaceError != nil { actions.interfaceError = nil }
+             else { store.clearError() }
+           } label: { NativeGlyph("xmark").frame(width: 24, height: 24) }
              .buttonStyle(.plain).help("Dismiss message").accessibilityLabel("Dismiss message")
          }.padding(.horizontal, 12).padding(.vertical, 5)
            .background(colors.chrome.opacity(0.9))
@@ -322,7 +339,7 @@ struct BrowserShell<Content: View>: View {
       NativePalettePresenter(
         isPresented: $actions.findVisible,
         content: AnyView(NativeFindBar(actions: actions, colors: colors)), motionScale: effectiveMotion,
-        frame: CGRect(x: max(actions.contentFrame.minX + 8, actions.contentFrame.maxX - 326), y: max(4, actions.contentFrame.minY),
+        frame: CGRect(x: max(actions.contentFrame.minX + 8, actions.contentFrame.maxX - 326), y: 4,
           width: min(310, max(200, actions.contentFrame.width - 24)), height: 32),
         presentationID: actions.findSession, takesKey: true, dismissOnOutsideClick: false, dismissOnResign: false)
         .frame(width: 0, height: 0).allowsHitTesting(false)
@@ -353,9 +370,10 @@ struct BrowserShell<Content: View>: View {
     )
     .animation(reduceMotion ? nil : .easeOut(duration: 0.16 * effectiveMotion), value: actions.library != nil)
     .onReceive(Timer.publish(every: 0.15, on: .main, in: .common).autoconnect()) { _ in
-      if drag.id != nil && NSEvent.pressedMouseButtons == 0 { drag.cancel() }
+      if drag.id != nil && !drag.native.isDragging && NSEvent.pressedMouseButtons == 0 { drag.cancel() }
     }
     .onAppear {
+      rowMotionSpaceID = store.state.activeSpaceID
       actions.performInterfaceCommand = performInterfaceCommand
       actions.handleInterfaceEscape = dismissInterface
       if !offeredOnboarding && !store.state.settings.onboardingCompleted && !CommandLine.arguments.contains("--engine-acceptance") {
@@ -377,6 +395,7 @@ struct BrowserShell<Content: View>: View {
       } else { themeDraft = nil; creatingSpace = false }
     }
     .onChange(of: store.state.activeSpaceID) { _, _ in
+      rowMotionSpaceID = store.state.activeSpaceID
       drag.resetReflow(store: store)
       discardThemePreview()
       maybeOpenBlankPalette()
@@ -386,7 +405,15 @@ struct BrowserShell<Content: View>: View {
     .onChange(of: store.state.activeTabID) { _, _ in maybeOpenBlankPalette() }
     .onChange(of: actions.palette) { _, presented in if presented { discardThemePreview() } }
     .onChange(of: editor) { _, value in if value == nil { maybeOpenBlankPalette() } else { discardThemePreview() } }
-    .onChange(of: actions.library) { _, value in if value == nil { maybeOpenBlankPalette() } else { discardThemePreview() } }
+    .onChange(of: actions.library) { previous, value in
+      if value == nil {
+        restoreLibraryFocus()
+        maybeOpenBlankPalette()
+      } else {
+        if previous == nil { libraryReturnFocus = sidebarFocus ?? "library" }
+        discardThemePreview()
+      }
+    }
     .onChange(of: creation) { _, value in if value != nil { discardThemePreview() } }
     .onChange(of: renameTarget) { _, value in if value != nil { discardThemePreview() } }
     .onChange(of: showSiteControls) { _, presented in if presented { discardThemePreview() } }
@@ -438,7 +465,9 @@ struct BrowserShell<Content: View>: View {
           .fill(colors.chrome)
           .shadow(color: Color(red: 32 / 255, green: 19 / 255, blue: 36 / 255).opacity(0.11), radius: 9, y: 4)
       }
-      .padding(store.state.settings.pageGutter)
+      .padding(.horizontal, store.state.settings.pageGutter)
+      .padding(.bottom, store.state.settings.pageGutter)
+      .padding(.top, actions.findVisible ? 40 : store.state.settings.pageGutter)
       .overlay(alignment: .topLeading) {
         if sidebarWidth == 0 { revealButton }
       }
@@ -499,6 +528,15 @@ struct BrowserShell<Content: View>: View {
       }
       spaceFooter
     }.padding(.horizontal, 8)
+      .background {
+        NativeSidebarDragHost(controller: drag.native, motionScale: effectiveMotion, canStart: { [weak store] id in
+          guard let store, let tab = store.tab(id) else { return false }
+          return store.profileID(for: tab) == store.activeProfileID && store.split(for: id) == nil
+        }, began: { [weak drag, weak store] id in
+          guard let store else { return }
+          drag?.start(id, tabs: store.state.tabs)
+        }, ended: { [weak drag] in drag?.cancel() })
+      }
       .overlay(alignment: .leading) { spaceEdge(-1) }
       .overlay(alignment: .trailing) { spaceEdge(1) }
   }
@@ -581,7 +619,7 @@ struct BrowserShell<Content: View>: View {
       }
       Rectangle().fill(colors.ink.opacity(0.12)).frame(height: 1).padding(.horizontal, 7).padding(.vertical, 10)
       HStack(spacing: 8) { NativeGlyph("plus"); Text("New Tab"); Spacer() }
-        .foregroundStyle(colors.muted).padding(.horizontal, 8).frame(height: 36)
+        .foregroundStyle(colors.muted).padding(.horizontal, 8).frame(height: 34)
       ForEach(store.state.tabGroups.filter { group in all.contains { !$0.isClosed && $0.groupID == group.id } }) { group in
         HStack(spacing: 8) {
           NativeGlyph("chevron.down", size: 12).rotationEffect(.degrees(group.collapsed ? -90 : 0)).foregroundStyle(accent).frame(width: 16)
@@ -628,6 +666,7 @@ struct BrowserShell<Content: View>: View {
       .frame(maxWidth: .infinity, minHeight: favorite ? 46 : tabHeight).padding(.horizontal, 8)
       .background(selected && !tab.isClosed ? (favorite ? favoriteSelection(tab) : selectionBackground(true)) : favorite ? colors.ink.opacity(0.05) : .clear,
         in: RoundedRectangle(cornerRadius: 10))
+      .overlay(alignment: .topTrailing) { if favorite { peekBadge(tab, favorite: true).padding(2) } }
   }
   private var navigation: some View {
     HStack(spacing: 0) {
@@ -742,9 +781,14 @@ struct BrowserShell<Content: View>: View {
         HStack(spacing: 8) {
           NativeGlyph("plus").font(.system(size: 16)).foregroundStyle(accent).frame(width: 16)
           Text("New Tab")
-        }.frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 8).frame(height: 36)
+          Spacer(minLength: 0)
+          Text(NativeInterfaceEditors.keyLabel(BrowserShortcut.catalog(overrides: store.state.settings.shortcutOverrides)
+            .first(where: { $0.id == "command-palette" })?.accelerator ?? ""))
+            .font(.system(size: 10)).opacity(hoveredNewTab || sidebarFocus == "new-tab" ? 1 : 0)
+        }.frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 8).frame(height: 34)
       }
       .buttonStyle(NativePressButtonStyle(motionScale: effectiveMotion)).foregroundStyle(colors.muted)
+        .focused($sidebarFocus, equals: "new-tab").onHover { hoveredNewTab = $0 }
       VStack(spacing: 2) {
         tabGroupRows
         splitRows
@@ -754,7 +798,8 @@ struct BrowserShell<Content: View>: View {
         Color.clear.frame(height: 28)
       }.contentShape(Rectangle()).onDrop(
         of: [.plainText], delegate: dropDelegate(section: .regular))
-    }
+    }.animation(rowAnimation, value: sidebarKeyboardItems)
+      .transaction { if !allowsRowMotion && drag.id == nil { $0.animation = nil } }
   }
   private var favoriteGrid: some View {
     let favorites = tabs.filter { $0.isFavorite && store.split(for: $0.id)?.spaceID != store.state.activeSpaceID }
@@ -776,6 +821,8 @@ struct BrowserShell<Content: View>: View {
         }
       } }
     }.padding(.bottom, favorites.isEmpty && drag.id == nil ? 0 : 8).contentShape(Rectangle())
+      .animation(rowAnimation, value: favorites.map(\.id))
+      .transaction { if !allowsRowMotion && drag.id == nil { $0.animation = nil } }
       .onDrop(of: [.plainText], delegate: dropDelegate(section: .favorite))
   }
   private var visibleTabGroups: [BrowserTabGroup] {
@@ -924,19 +971,22 @@ struct BrowserShell<Content: View>: View {
     }.frame(width: size, height: size)
       .opacity(tab.isClosed || (favorite && !actions.loadedTabIDs.contains(tab.id)) ? 0.65 : 1)
       .overlay(alignment: .topTrailing) {
-        if let peek = tab.peek {
-          Group {
-            if let icon = actions.peekIcons[tab.id] { Image(nsImage: icon).resizable().scaledToFit() }
-            else { NativeGlyph("globe").font(.system(size: 9)) }
-          }.frame(width: 12, height: 12).padding(2)
-            .background(colors.card.opacity(0.95), in: RoundedRectangle(cornerRadius: 4))
-            .shadow(color: .black.opacity(0.15), radius: 1, y: 1).offset(x: 6, y: -6)
-            .opacity(peek.isPresented == false ? 0.7 : 1)
-            .contentShape(Rectangle()).onTapGesture { actions.activate(tab.id) }
-            .accessibilityLabel("Show preview: \(peek.title.isEmpty ? NativePageIdentity.label(peek.url) : peek.title)")
-            .accessibilityAddTraits(.isButton).accessibilityAction { actions.activate(tab.id) }
-        }
+        if !favorite { peekBadge(tab).offset(x: 6, y: -5) }
       }
+  }
+  @ViewBuilder private func peekBadge(_ tab: BrowserTab, favorite: Bool = false) -> some View {
+    if let peek = tab.peek {
+      Group {
+        if let icon = actions.peekIcons[tab.id] { Image(nsImage: icon).resizable().scaledToFit() }
+        else { NativeGlyph("globe", size: 9) }
+      }.frame(width: favorite ? 15 : 12, height: favorite ? 15 : 12).padding(1)
+        .background(colors.card, in: RoundedRectangle(cornerRadius: 4))
+        .shadow(color: .black.opacity(0.25), radius: 1.5, y: 1)
+        .opacity(peek.isPresented == false ? 0.7 : 1)
+        .contentShape(Rectangle()).onTapGesture { actions.activate(tab.id) }
+        .accessibilityLabel("Show preview: \(peek.title.isEmpty ? NativePageIdentity.label(peek.url) : peek.title)")
+        .accessibilityAddTraits(.isButton).accessibilityAction { actions.activate(tab.id) }
+    }
   }
   private func tabRow(_ tab: BrowserTab, section: SidebarSection, grouped: Bool = false) -> some View {
     let favorite = section == .favorite
@@ -969,6 +1019,7 @@ struct BrowserShell<Content: View>: View {
             in: RoundedRectangle(cornerRadius: 10))
           .modifier(NativeSelectionContrast(selected: favorite && selected && drag.id == nil, color: colors.ink, radius: 10))
           .shadow(color: .black.opacity(favorite && drag.id == nil ? (selected ? 0.07 : 0.05) : 0), radius: selected ? 1.5 : 2.5, y: selected ? 1 : 2)
+          .overlay(alignment: .topTrailing) { if favorite { peekBadge(tab, favorite: true).padding(2) } }
       }.buttonStyle(NativePressButtonStyle(scale: favorite ? 0.96 : 0.985, motionScale: effectiveMotion))
         .focused($sidebarFocus, equals: tab.id).id(tab.id)
       if !favorite && (tab.isMuted || actions.audibleTabIDs.contains(tab.id)) {
@@ -989,16 +1040,17 @@ struct BrowserShell<Content: View>: View {
       .modifier(NativeSelectionContrast(selected: selected && !grouped && !favorite && drag.id == nil, color: colors.ink, radius: 10))
       .opacity(drag.id == tab.id ? 0.45 : 1)
       .shadow(color: .black.opacity(selected && !grouped && !favorite && drag.id == nil ? 0.07 : 0), radius: 1.5, y: 1)
+      .modifier(NativeTabSelectionPulse(selected: tab.id == store.state.activeTabID && !tab.isClosed,
+        enabled: allowsRowMotion, motionScale: effectiveMotion))
+      .transition(allowsRowMotion ? .asymmetric(insertion: .modifier(
+        active: NativeTabEntry(opacity: 0.3, offset: -3, scale: 0.985),
+        identity: NativeTabEntry(opacity: 1, offset: 0, scale: 1)), removal: .identity) : .identity)
       .onHover { if $0 { hoveredTab = tab.id } else if hoveredTab == tab.id { hoveredTab = nil } }
       .help("\(tab.displayTitle) — \(tab.isClosed ? "Closed" : actions.loadedTabIDs.contains(tab.id) ? "Loaded" : "Sleeping")\n\(tab.savedURL ?? tab.url)")
       .accessibilityElement(children: .contain).accessibilityAddTraits(selected ? [.isSelected] : [])
       .contextMenu { tabMenu(tab) }
       .background { menuAnchor(id: tab.id, items: tabMenuItems(tab)) }
-      .onDrag {
-        guard !grouped else { return NSItemProvider() }
-        drag.start(tab.id, tabs: store.state.tabs)
-        return NSItemProvider(object: tab.id as NSString)
-      }
+      .background { if !grouped { NativeSidebarDragAnchor(controller: drag.native, id: tab.id) } }
       .background {
         GeometryReader { geometry in
           Color.clear.onDrop(of: [.plainText], delegate: SidebarDropDelegate(store: store, drag: drag,
@@ -1074,6 +1126,7 @@ struct BrowserShell<Content: View>: View {
       } label: {
         NativeGlyph("archivebox")
       }.menuStyle(.borderlessButton).menuIndicator(.hidden).frame(width: 28, height: 28)
+        .focused($sidebarFocus, equals: "library").accessibilityLabel("Library")
       spaceDots
       Menu {
         Button("New tab") { actions.openPalette() }
@@ -1163,6 +1216,18 @@ struct BrowserShell<Content: View>: View {
   private func toggleSidebar() {
     if store.state.settings.sidebarVisible && sidebarWidth == 0 { actions.library = nil }
     else { store.updateSettings { $0.sidebarVisible.toggle() } }
+  }
+  private func restoreLibraryFocus() {
+    let requested = libraryReturnFocus ?? "library"
+    libraryReturnFocus = nil
+    guard !actions.palette, !actions.themeEditor, editor == nil,
+      creation == nil, renameTarget == nil, !showSiteControls, !showBrowserMenu,
+      !showPageActions, !actions.findVisible else { return }
+    guard sidebarWidth > 0 else { actions.focusPage(); return }
+    let exists = requested == "library" || requested == "address"
+      || sidebarKeyboardItems.contains(requested)
+      || spaces.contains { "space:\($0.id)" == requested }
+    sidebarFocus = exists ? requested : "library"
   }
   private func showPalette(_ request: NativePaletteRequest) {
     actions.openPalette()
@@ -1553,6 +1618,7 @@ private enum SidebarSection: Equatable {
   var pinned: Bool { self != .regular }
 }
 @MainActor private final class SidebarDragSession: ObservableObject {
+  let native = NativeSidebarDragController()
   @Published var id: String?
   @Published var preview: [BrowserTab]?
   private var hover: DispatchWorkItem?
@@ -1654,6 +1720,46 @@ private enum SidebarSection: Equatable {
   }
 
 }
+private struct NativeTabEntry: ViewModifier {
+  let opacity: Double
+  let offset: CGFloat
+  let scale: CGFloat
+  func body(content: Content) -> some View {
+    content.opacity(opacity).offset(y: offset).scaleEffect(scale)
+  }
+}
+
+/// Selection feedback belongs to the row, not its Chromium document. Each
+/// newer selection or disabled-motion state cancels the previous pending pulse.
+private struct NativeTabSelectionPulse: ViewModifier {
+  let selected: Bool
+  let enabled: Bool
+  let motionScale: Double
+  @State private var opacity = 1.0
+  @State private var generation = 0
+  func body(content: Content) -> some View {
+    content.opacity(opacity)
+      .onChange(of: selected) { _, value in
+        generation &+= 1
+        var transaction = Transaction(); transaction.animation = nil
+        withTransaction(transaction) { opacity = value && enabled ? 0.7 : 1 }
+      }
+      .onChange(of: enabled) { _, value in
+        if !value {
+          generation &+= 1
+          var transaction = Transaction(); transaction.animation = nil
+          withTransaction(transaction) { opacity = 1 }
+        }
+      }
+      .task(id: generation) {
+        guard generation != 0, selected, enabled else { return }
+        await Task.yield()
+        guard !Task.isCancelled else { return }
+        withAnimation(.timingCurve(0.16, 1, 0.3, 1, duration: 0.11 * motionScale)) { opacity = 1 }
+      }
+  }
+}
+
 private struct SidebarDropDelegate: DropDelegate {
   let store: BrowserStore
   let drag: SidebarDragSession
@@ -2008,6 +2114,7 @@ private struct NativeFindField: NSViewRepresentable {
       parent.text = field.stringValue; parent.changed(field.stringValue)
     }
     func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
+      guard !textView.hasMarkedText() else { return false }
       if selector == #selector(NSResponder.cancelOperation(_:)) { parent.close(); return true }
       if selector == #selector(NSResponder.insertNewline(_:)) {
         if NSApp.currentEvent?.modifierFlags.contains(.shift) == true { parent.previous() } else { parent.next() }

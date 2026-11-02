@@ -41,7 +41,7 @@ struct NativeCommandPalette: View {
   private var filter: String { prefix ?? scope }
   private var isNested: Bool { context != nil || site != nil }
   private var profileTabs: [BrowserTab] {
-    store.state.tabs.filter { store.profileID(for: $0) == store.activeProfileID && $0.url != "about:blank" }
+    store.state.tabs.filter { store.profileID(for: $0) == store.activeProfileID && ($0.url != "about:blank" || $0.homePage == true) }
       .sorted { $0.lastAccessedAt > $1.lastAccessedAt }
   }
   private var currentDocumentURL: String? {
@@ -93,6 +93,11 @@ struct NativeCommandPalette: View {
       }
       .onDisappear { actions.handlePaletteEscape = { false } }
       .onChange(of: actions.paletteSession) { _, _ in resetSession() }
+      .onChange(of: store.activeProfileID) { _, _ in
+        actions.paletteRequest = nil; actions.query = ""
+        editingSearch = nil; error = nil
+        resetSession()
+      }
       .onChange(of: actions.paletteRequest) { _, request in if let request { enter(request, remember: false) } }
       .onChange(of: actions.query) { _, value in
         if restoredQuery == value { restoredQuery = nil }
@@ -114,7 +119,7 @@ struct NativeCommandPalette: View {
       CommandSearchField(text: $actions.query, placeholder: placeholder, textColor: NSColor(colors.ink), placeholderColor: NSColor(colors.muted), focusRequest: focusRequest, selectAllRequest: actions.paletteSession,
         submit: { activate(separate: $0) }, move: moveSelection,
         cancel: { if !back() { actions.palette = false } }, tab: enterSelected,
-        backward: { _ = back() }, backspace: { raw.isEmpty && back() })
+        backward: back, backspace: { raw.isEmpty && back() })
       Button {
         if !back() { actions.setPaletteDestination(editsAddress: !actions.paletteEditsAddress) }
       } label: {
@@ -206,7 +211,8 @@ struct NativeCommandPalette: View {
         if query.isEmpty && filter == "all" && (tab.id == store.state.activeTabID || index > 5) { continue }
         let detail = tab.spaceID == store.state.activeSpaceID ? NativePageIdentity.label(tab.url) : (store.state.spaces.first { $0.id == tab.spaceID }?.name ?? "")
         add(Entry(id: "tab:\(tab.id)", kind: "tab", title: tab.displayTitle, icon: "globe", detail: detail,
-          type: tab.isClosed ? tab.isFavorite ? "Open favorite" : "Open pinned tab" : "Switch to tab",
+          type: tab.isPinned && (tab.isClosed || !actions.loadedTabIDs.contains(tab.id))
+            ? tab.isFavorite ? "Open favorite" : "Open pinned tab" : "Switch to tab",
           keywords: "\(tab.url) \(tab.title) \(tab.savedURL ?? "")", url: tab.url) {
             close { store.selectTab(id: tab.id); actions.activate(tab.id) }
           }, priority: query.isEmpty ? Double(100 - index) : 14)
@@ -307,7 +313,7 @@ struct NativeCommandPalette: View {
       }
     case .split:
       guard let active = store.state.activeTabID else { return [] }
-      return profileTabs.filter { $0.id != active && ($0.spaceID == store.state.activeSpaceID || $0.isFavorite) && store.split(for: $0.id) == nil }.map { tab in
+      return profileTabs.filter { $0.id != active && $0.url != "about:blank" && ($0.spaceID == store.state.activeSpaceID || $0.isFavorite) && store.split(for: $0.id) == nil }.map { tab in
         task("split:\(tab.id)", tab.displayTitle, "rectangle.split.2x1", detail: tab.url) { close { store.setSplit(left: active, right: tab.id) } }
       }
     case .siteSearches:
@@ -326,7 +332,16 @@ struct NativeCommandPalette: View {
       if BrowserAddress.webURL(pageURL) != nil {
         items.append(task("result:newtab", "Open in new tab", "plus") { navigate(pageURL, separate: true) })
         if actions.libraryCapabilities.contains("peek:open") {
-          items.append(task("result:peek", "Peek at page", "eye") { close { Task { try? await actions.performLibraryAction?("peek:open", ["url": pageURL, "profileId": store.activeProfileID]) } } })
+          items.append(task("result:peek", "Peek at page", "eye") {
+            guard let operation = actions.performLibraryAction else { return }
+            let profileID = store.activeProfileID
+            close {
+              Task { @MainActor in
+                do { try await operation("peek:open", ["url": pageURL, "profileId": profileID]) }
+                catch { actions.interfaceError = error.localizedDescription }
+              }
+            }
+          })
         }
       } else if let tab, NativePageIdentity.hasDocument(URL(string: pageURL)) {
         items.append(task("result:newtab", "Open in new tab", "plus") { duplicate(tab) })
@@ -412,12 +427,13 @@ struct NativeCommandPalette: View {
     focusRequest += 1
     return true
   }
-  private func enterSelected() {
-    if !isNested, filter == "all", let engine = store.state.settings.siteSearches.first(where: { $0.keyword == raw.lowercased() }) { enterSite(engine); return }
+  private func enterSelected() -> Bool {
+    if !isNested, filter == "all", let engine = store.state.settings.siteSearches.first(where: { $0.keyword == raw.lowercased() }) { enterSite(engine); return true }
     if !isNested, let item = selectedEntry, ["tab", "history", "bookmark"].contains(item.kind) {
-      enter(.result(kind: item.kind, id: item.id, title: item.title, url: item.url ?? "")); return
+      enter(.result(kind: item.kind, id: item.id, title: item.title, url: item.url ?? "")); return true
     }
-    if !isNested && ["", "/", ">"].contains(raw) { actions.query = raw.isEmpty ? "/" : "" }
+    if !isNested && ["", "/", ">"].contains(raw) { actions.query = raw.isEmpty ? "/" : ""; return true }
+    return false
   }
   private func editSearch(_ engine: SiteSearchEngine?) {
     guard engine != nil || store.state.settings.siteSearches.count < 20 else { error = "You can save up to 20 site searches."; return }
@@ -499,8 +515,8 @@ private struct CommandSearchField: NSViewRepresentable {
   var submit: (Bool) -> Void
   var move: (Int) -> Void
   var cancel: () -> Void
-  var tab: () -> Void
-  var backward: () -> Void
+  var tab: () -> Bool
+  var backward: () -> Bool
   var backspace: () -> Bool
   func makeCoordinator() -> Coordinator { Coordinator(self) }
   func makeNSView(context: Context) -> NSTextField {
@@ -531,6 +547,7 @@ private struct CommandSearchField: NSViewRepresentable {
     init(_ parent: CommandSearchField) { self.parent = parent }
     func controlTextDidChange(_ notification: Notification) { if let field = notification.object as? NSTextField { parent.text = field.stringValue } }
     func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
+      guard !textView.hasMarkedText() else { return false }
       switch selector {
       case #selector(NSResponder.moveUp(_:)): parent.move(-1)
       case #selector(NSResponder.moveDown(_:)): parent.move(1)
@@ -541,8 +558,8 @@ private struct CommandSearchField: NSViewRepresentable {
         guard flags.intersection([.command, .control, .shift]).isEmpty else { return false }
         parent.submit(flags.contains(.option))
       case #selector(NSResponder.cancelOperation(_:)): parent.cancel()
-      case #selector(NSResponder.insertTab(_:)): parent.tab()
-      case #selector(NSResponder.insertBacktab(_:)): parent.backward()
+      case #selector(NSResponder.insertTab(_:)): return parent.tab()
+      case #selector(NSResponder.insertBacktab(_:)): return parent.backward()
       case #selector(NSResponder.deleteBackward(_:)): return parent.backspace()
       default: return false
       }

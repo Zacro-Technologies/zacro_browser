@@ -71,6 +71,9 @@ final class BrowserWindowCoordinator: NSObject {
   private var keyMonitor: Any?
   private var replayingExtensionKey = false
   private let peekPanel = PeekPanelController()
+  var hasPresentedPeek: Bool { peekPanel.presentationWindow?.isVisible == true }
+  private let loadingStrips = NativeLoadingStripController()
+  private var loadingDocumentIDs = Set<String>()
   private var pendingDeletion: (Set<String>, () -> Void)? { get { application.pendingDeletion } set { application.pendingDeletion = newValue } }
   private var profileDeletionPageIDs: Set<String> { get { application.profileDeletionPageIDs } set { application.profileDeletionPageIDs = newValue } }
   private var deletingProfileID: String? { get { application.deletingProfileID } set { application.deletingProfileID = newValue } }
@@ -153,6 +156,7 @@ final class BrowserWindowCoordinator: NSObject {
     scheduleLayout()
   }
   func prepareTermination() {
+    loadingStrips.hide()
     extensions.close()
     idleSweep?.cancel()
     for task in pageCreations.values { task.cancel() }
@@ -289,7 +293,7 @@ final class BrowserWindowCoordinator: NSObject {
     restoreWindowBounds(window)
     guard let parent = window.contentView else { return }
     let root = BrowserShell(store: store, actions: actions) { [weak self] in
-      NativeContentOverlay(store: self!.store, coordinator: self!)
+      NativeContentOverlay(store: self!.store, actions: self!.actions, coordinator: self!)
     }
     let host = PassthroughHostingView(rootView: AnyView(root))
     host.frame = parent.bounds
@@ -328,6 +332,12 @@ final class BrowserWindowCoordinator: NSObject {
     actions.zoom = { [weak self] in self?.activePage?.zoom(by: $0) }
     actions.printPage = { [weak self] in self?.activePage?.printPage() }
     actions.find = { [weak self] in self?.find() }
+    actions.focusPage = { [weak self] in
+      guard let self, self.windowContext.isOpen, !self.windowContext.isClosing,
+        !self.engine.isTerminating, !self.actions.palette, !self.actions.themeEditor,
+        self.actions.library == nil, self.window?.attachedSheet == nil, NSApp.modalWindow == nil else { return }
+      self.activePage?.focus()
+    }
     actions.findNext = { [weak self] in guard let self else { return }; self.activePage?.find(self.actions.findQuery) }
     actions.findPrevious = { [weak self] in guard let self else { return }; self.activePage?.find(self.actions.findQuery, forward: false) }
     actions.updateFind = { [weak self] value in self?.activePage?.find(String(value.prefix(1000))) }
@@ -355,6 +365,9 @@ final class BrowserWindowCoordinator: NSObject {
     windowContext.onClosed = { [weak self] in
       guard let self else { return }
       self.hidePeekPresentation(immediately: true)
+      self.loadingStrips.hide()
+      self.loadingDocumentIDs.removeAll()
+      self.actions.documentErrors.removeAll()
       self.actions.nativePageVisible = false
       self.visiblePageFrames.removeAll()
       self.sidePanelPageIDs.removeAll()
@@ -428,7 +441,7 @@ final class BrowserWindowCoordinator: NSObject {
     if let id = store.state.activeTabID, store.state.activeTab?.peek != nil, store.state.activeTab?.peek?.isPresented != false,
       let frame = peekFrames[id]
     {
-      return frame.contains(top)
+      return actions.documentErrors["peek:" + id] == nil && frame.contains(top)
     }
     if let split = visibleSplit {
       let x = contentFrame.minX + (contentFrame.width - 6) * split.ratio
@@ -438,7 +451,38 @@ final class BrowserWindowCoordinator: NSObject {
         return false
       }
     }
+    for (id, frame) in documentFrames() where actions.documentErrors[id] != nil && frame.contains(top) { return false }
     return contentFrame.contains(top)
+  }
+  private func documentFrames() -> [String: CGRect] {
+    if let split = visibleSplit {
+      let width = (contentFrame.width - 6) * split.ratio
+      return [split.leftTabID: CGRect(x: contentFrame.minX, y: contentFrame.minY, width: width, height: contentFrame.height),
+        split.rightTabID: CGRect(x: contentFrame.minX + width + 6, y: contentFrame.minY,
+          width: contentFrame.width - width - 6, height: contentFrame.height)]
+    }
+    return store.state.activeTabID.map { [$0: contentFrame] } ?? [:]
+  }
+  private func refreshDocumentPresentation(_ page: ChromiumPage) {
+    let message = page.documentError?.message
+    var changed = actions.documentErrors[page.id] != message
+    if changed { actions.documentErrors[page.id] = message }
+    if page.isLoading != loadingDocumentIDs.contains(page.id) {
+      if page.isLoading { loadingDocumentIDs.insert(page.id) } else { loadingDocumentIDs.remove(page.id) }
+      changed = true
+    }
+    if changed { scheduleLayout() }
+  }
+  func retryDocument(_ id: String) {
+    guard let tab = store.document(id: id), !tab.isClosed, let page = engine.pages[id],
+      page.ownerWindowID == windowContext.id else { return }
+    navigation.cancelRestore(page)
+    page.reload()
+  }
+  func editDocumentAddress(_ id: String) {
+    guard let tab = store.document(id: id), !tab.isClosed else { return }
+    do { try store.selectDocumentDurably(id: id); actions.openPalette(address: tab.url) }
+    catch { showError(error.localizedDescription) }
   }
   func scheduleLayout() {
     guard !engine.isTerminating, !layoutQueued else { return }
@@ -699,7 +743,9 @@ final class BrowserWindowCoordinator: NSObject {
       return true
     }
     page.onChange = { [weak self, weak page] in
-      guard let self, let page, self.owns(page, tabID: tabID), !self.navigation.isRestoring(page),
+      guard let self, let page, self.owns(page, tabID: tabID) else { return }
+      self.refreshDocumentPresentation(page)
+      guard !self.navigation.isRestoring(page),
         !self.reservedPages.contains(page.id), !self.discardingPages.contains(page.id), !self.dormantPages.contains(page.id) else { return }
       defer { self.extensionBrowser.reconcile() }
       if !peek, page.isLoading != self.actions.loadingTabIDs.contains(tabID) {
@@ -854,6 +900,9 @@ final class BrowserWindowCoordinator: NSObject {
     }
     page.onFocused = { [weak self, weak page] in
       guard let self, let page, self.owns(page, tabID: tabID) else { return }
+      // Showing/reparenting native split windows can emit focus callbacks. A
+      // document beneath the modal Peek cannot take logical selection from it.
+      if !peek, let preview = self.store.state.activeTab?.peek, preview.isPresented != false { return }
       if !peek, self.store.state.activeTabID != tabID,
         self.visibleSplit?.tabIDs.contains(tabID) == true {
         self.store.selectTab(id: tabID)
@@ -884,6 +933,8 @@ final class BrowserWindowCoordinator: NSObject {
       guard let self, let page else { return }
       defer { self.finishCloseWaiters(page.id, accepted: true) }
       self.navigation.forget(page.id)
+      self.actions.documentErrors.removeValue(forKey: page.id)
+      self.loadingDocumentIDs.remove(page.id)
       if !peek || self.engine.pages[tabID]?.isAudible != true { self.actions.audibleTabIDs.remove(tabID) }
       self.reservedPages.remove(page.id)
       self.dormantPages.remove(page.id); self.discardingPages.remove(page.id); self.mediaPermissionPages.remove(page.id)
@@ -936,6 +987,8 @@ final class BrowserWindowCoordinator: NSObject {
       self.reservedPages.remove(id)
       self.retiringPageIDs.remove(id)
       self.visiblePageFrames.removeValue(forKey: id)
+      self.actions.documentErrors.removeValue(forKey: id)
+      self.loadingDocumentIDs.remove(id)
       self.sidePanelPageIDs.remove(id)
       self.modelURLs.removeValue(forKey: id)
       self.pendingHistory.removeValue(forKey: id)
@@ -1011,6 +1064,11 @@ final class BrowserWindowCoordinator: NSObject {
       return tab.id
     })
     if actions.loadingTabIDs != loading { actions.loadingTabIDs = loading }
+    let errors = Dictionary(uniqueKeysWithValues: windowPages.values.compactMap { page -> (String, String)? in
+      guard store.document(id: page.id) != nil, let error = page.documentError else { return nil }
+      return (page.id, error.message)
+    })
+    if actions.documentErrors != errors { actions.documentErrors = errors }
     if let pending = pendingDeletion, pending.0.allSatisfy({ engine.pages[$0] == nil }) {
       pendingDeletion = nil
       profileDeletionPageIDs.subtract(pending.0)
@@ -1019,10 +1077,11 @@ final class BrowserWindowCoordinator: NSObject {
     if store.state.activeTab?.peek == nil || store.state.activeTab?.peek?.isPresented == false { hidePeekPresentation() }
     if contentFrame.width <= 0, let bounds = window?.contentView?.bounds {
       let gutter = isPopup ? 0 : store.state.settings.pageGutter
+      let top = actions.findVisible ? 40 : gutter
       let sidebar = !isPopup && store.state.settings.sidebarVisible ? store.state.settings.sidebarWidth : 0
       contentFrame = CGRect(
-        x: sidebar + gutter, y: gutter, width: max(1, bounds.width - sidebar - 2 * gutter),
-        height: max(1, bounds.height - 2 * gutter))
+        x: sidebar + gutter, y: top, width: max(1, bounds.width - sidebar - 2 * gutter),
+        height: max(1, bounds.height - top - gutter))
     }
     guard contentFrame.width > 0 else { return }
     var desired: [String: (ChromiumPage, CGRect)] = [:]
@@ -1069,20 +1128,22 @@ final class BrowserWindowCoordinator: NSObject {
     // Persistent tabs keep their native document and layer attached. Only
     // actual visibility/frame changes reach Chromium, avoiding hide/show flash.
     for entry in desired.values { entry.0.setCornerRadius(isPopup ? 0 : store.state.settings.pageRadius) }
-    for (id, _) in visiblePageFrames where desired[id] == nil {
+    let visible = desired.filter { $0.value.0.documentError == nil }
+    for (id, _) in visiblePageFrames where visible[id] == nil {
       engine.pages[id]?.hide()
-      if id.hasPrefix("peek:") { engine.pages[id]?.setPresentationParent(nil) }
+      if id.hasPrefix("peek:"), desired[id] == nil { engine.pages[id]?.setPresentationParent(nil) }
     }
-    for (id, entry) in desired where visiblePageFrames[id] != entry.1 {
+    for (id, entry) in visible where visiblePageFrames[id] != entry.1 {
       if id.hasPrefix("peek:"), peekPanel.isAnimating { continue }
       entry.0.show(frame: entry.1)
     }
-    visiblePageFrames = desired.mapValues { $0.1 }
+    visiblePageFrames = visible.mapValues { $0.1 }
     if let id = store.state.activeTabID, let preview = desired["peek:" + id]?.0,
       let parent = window
     {
       peekPanel.show(
-        parent: parent, contentFrame: contentFrame, preview: preview.browser?.nativeView?.window,
+        parent: parent, contentFrame: contentFrame,
+        preview: preview.documentError == nil ? preview.browser?.nativeView?.window : nil,
         close: { [weak self] in self?.closePeek() }, expand: { [weak self] in self?.promotePeek() },
         theme: presentationTheme, radius: store.state.settings.pageRadius,
         motionScale: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : store.state.settings.motionScale,
@@ -1090,12 +1151,21 @@ final class BrowserWindowCoordinator: NSObject {
         updatePreviewFrame: { [weak self, weak preview] frame in
           guard let self, let preview, self.engine.pages[preview.id] === preview,
             self.store.state.activeTabID == id else { return }
-          preview.show(frame: frame)
           self.peekFrames[id] = frame
-          self.visiblePageFrames[preview.id] = frame
-        })
+          if preview.documentError == nil {
+            preview.show(frame: frame)
+            self.visiblePageFrames[preview.id] = frame
+          }
+        }, error: preview.documentError?.message, url: store.document(id: preview.id)?.url ?? "",
+        retry: { [weak self, weak preview] in if let preview { self?.retryDocument(preview.id) } })
       preview.setPresentationParent(peekPanel.presentationWindow)
     }
+    let loadingWindows = Dictionary(uniqueKeysWithValues: visible.compactMap { id, entry -> (String, NSWindow)? in
+      guard entry.0.isLoading, let window = entry.0.nativeWindow else { return nil }
+      return (id, window)
+    })
+    loadingStrips.update(windows: loadingWindows, theme: presentationTheme,
+      motionScale: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : store.state.settings.motionScale)
     let ids = Set(store.state.tabs.filter { !$0.isClosed }.map(\.id))
     for id in Array(windowPages.keys) {
       if id.hasPrefix("extensions:") || id.hasPrefix("extension-store:") || id.hasPrefix("maintenance:")
@@ -1729,8 +1799,12 @@ extension BrowserWindowCoordinator {
     case "force-reload": activePage?.browser?.reload(ignoreCache: true)
     case "stop": activePage?.stop()
     case "find": find()
-    case "find-next": actions.findNext()
-    case "find-previous": actions.findPrevious()
+    case "find-next":
+      if !actions.findVisible { find() }
+      actions.findNext()
+    case "find-previous":
+      if !actions.findVisible { find() }
+      actions.findPrevious()
     case "bookmark":
       toggleBookmark()
     case "save-page": _ = activePage?.browser?.executeChromeCommand(named: "IDC_SAVE_PAGE")
@@ -1797,7 +1871,7 @@ extension BrowserWindowCoordinator {
     let dark = theme.appearance == "dark" || (theme.appearance == "system" && NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua)
     return NativeSpacePalette(theme: theme, dark: dark)
   }
-  private var presentationTheme: SpaceTheme {
+  fileprivate var presentationTheme: SpaceTheme {
     var theme = store.state.activeSpace?.theme ?? SpaceTheme()
     theme.appearance = store.state.settings.appearance
     return theme
@@ -1819,8 +1893,8 @@ extension BrowserWindowCoordinator {
       guard let tab = store.state.activeTab ?? store.createTab(address: "about:blank"),
         store.profileID(for: tab) == profileID else { throw ChromeExtensionError.managementUnavailable }
       page = try await ensurePageReady(tab)
-      try await navigation.waitForRestore(page)
     }
+    try await navigation.waitForRestore(page)
     guard page.profileID == profileID, page.ownerWindowID == windowContext.id,
       store.activeProfileID == profileID, activePage === page,
       windowContext.isOpen, !windowContext.isClosing, !engine.isTerminating else { throw CancellationError() }
@@ -2270,6 +2344,7 @@ final class PassthroughHostingView<Content: View>: NSHostingView<Content> {
 
 private struct NativeContentOverlay: View {
   @ObservedObject var store: BrowserStore
+  @ObservedObject var actions: BrowserActions
   let coordinator: BrowserWindowCoordinator
   @State private var resizeRatio: Double?
   var body: some View {
@@ -2306,7 +2381,26 @@ private struct NativeContentOverlay: View {
         } else {
           Color.clear
         }
+        ForEach(panes(width: geometry.size.width, height: geometry.size.height), id: \.id) { pane in
+          if let message = actions.documentErrors[pane.id] {
+            NativePageErrorView(message: message, url: store.document(id: pane.id)?.url ?? "",
+              theme: coordinator.presentationTheme,
+              retry: { coordinator.retryDocument(pane.id) }, editAddress: { coordinator.editDocumentAddress(pane.id) })
+              .clipShape(RoundedRectangle(cornerRadius: coordinator.isPopup ? 0 : store.state.settings.pageRadius))
+              .frame(width: pane.frame.width, height: pane.frame.height)
+              .position(x: pane.frame.midX, y: pane.frame.midY)
+          }
+        }
       }.coordinateSpace(name: "content")
     }
+  }
+  private struct Pane { let id: String; let frame: CGRect }
+  private func panes(width: CGFloat, height: CGFloat) -> [Pane] {
+    if let split = coordinator.visibleSplit {
+      let first = max(0, width - 6) * (resizeRatio ?? split.ratio)
+      return [Pane(id: split.leftTabID, frame: CGRect(x: 0, y: 0, width: first, height: height)),
+        Pane(id: split.rightTabID, frame: CGRect(x: first + 6, y: 0, width: max(0, width - first - 6), height: height))]
+    }
+    return store.state.activeTabID.map { [Pane(id: $0, frame: CGRect(x: 0, y: 0, width: width, height: height))] } ?? []
   }
 }

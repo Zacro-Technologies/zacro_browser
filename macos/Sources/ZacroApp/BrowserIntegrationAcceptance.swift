@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import Foundation
 import ZacroChromium
 import ZacroCore
@@ -34,6 +35,8 @@ final class BrowserIntegrationAcceptance {
     let engine = application.engine
     guard let first = application.focusedCoordinator else { throw Failure("No application window") }
     try await wait("initialShellLayout") { first.actions.contentFrame.width > 400 }
+    guard let firstWindow = first.window else { throw Failure("No application window presentation") }
+    for (name, passed) in NativeSidebarDragAcceptance.check(in: firstWindow) { try require(passed, name) }
     first.actions.palette = false
     guard let tab = first.store.createTab(address: url.appendingPathComponent("first").absoluteString) else { throw Failure("First tab creation") }
     let page = try await first.ensurePageReady(tab)
@@ -49,11 +52,26 @@ final class BrowserIntegrationAcceptance {
     try require(page.onPermission?(.init(kinds: .screenCapture, origin: origin)) == .useDefault,
       "screenCaptureRequiresNativeChooser")
     _ = try await browser.devTools.evaluate("document.body.innerHTML='<input id=draft value=initial><a target=_blank href=\"/popup\">Popup</a>'; document.querySelector('#draft').value='keep this draft'; null")
+    try NativeViewRenderEvidence.capture("sidebar", window: firstWindow)
     first.actions.openPalette()
-    try await Task.sleep(for: .milliseconds(120))
+    try await Task.sleep(for: .milliseconds(220))
+    try NativeViewRenderEvidence.capture("palette", window: firstWindow)
     first.actions.palette = false
     let paletteDraft = try await browser.devTools.evaluate("document.querySelector('#draft').value") as? String
     try require(engine.pages[tab.id] === page && paletteDraft == "keep this draft", "paletteRetainsLiveDocument")
+    let normalTop = first.actions.contentFrame.minY
+    first.find()
+    try await wait("findReservesSpaceAboveLivePage") { abs(first.actions.contentFrame.minY - 40) < 0.5 }
+    let findSession = first.actions.findSession
+    first.find()
+    try require(first.actions.findVisible && first.actions.findSession != findSession, "repeatedFindRequestsFocusAgain")
+    first.actions.closeFind()
+    try await wait("closingFindRestoresPageGutter") { abs(first.actions.contentFrame.minY - normalTop) < 0.5 }
+    first.runCommand("find-next")
+    try require(first.actions.findVisible, "findNextOpensHiddenFindBar")
+    first.actions.closeFind()
+    let findDraft = try await browser.devTools.evaluate("document.querySelector('#draft').value") as? String
+    try require(engine.pages[tab.id] === page && findDraft == "keep this draft", "findLayoutRetainsLiveDocument")
 
     first.store.setPeek(tabID: tab.id, address: url.appendingPathComponent("peek").absoluteString)
     first.layoutPages()
@@ -222,6 +240,7 @@ final class BrowserIntegrationAcceptance {
     let siblingStatus = await second.services.aiService.status(for: AIProfileScope(id: second.store.activeProfileID))
     try require(siblingStatus["profileId"].string == second.store.activeProfileID
       && first.services.aiService === application.services.aiService, "closingWindowPresentationKeepsSharedServices")
+    try await checkFailedDocuments(url: url, owner: second, survivor: page)
     do { nativeExtensions = try await engine.nativeCapabilities().extensionBrowser == true }
     catch let error as CefDevToolsError where error.isUnsupportedMethod { nativeExtensions = false }
     if nativeExtensions {
@@ -247,6 +266,51 @@ final class BrowserIntegrationAcceptance {
       "webStoreUsesOneOrdinaryOwnedTab")
     second.store.selectTab(id: page.id)
     if nativeExtensions { try await checkProfileClear(url: url, survivor: page, owner: second) }
+  }
+
+  private func checkFailedDocuments(url: URL, owner: BrowserWindowCoordinator, survivor: ChromiumPage) async throws {
+    // Port1 is Chromium's deliberately blocked loopback port: deterministic
+    // failure without contacting an external server or a user service.
+    guard let tab = owner.store.createTab(address: "http://127.0.0.1:1/native-error") else { throw Failure("Error fixture tab") }
+    owner.actions.palette = false; owner.actions.library = nil
+    let failed = try await owner.ensurePageReady(tab)
+    let browser = try await failed.ready(), nativeID = browser.id
+    try await wait("failedPageUsesRetainedNativeErrorCard") {
+      failed.documentError != nil && owner.actions.documentErrors[tab.id] != nil
+        && failed.nativeWindow?.isVisible == false
+    }
+    if let window = owner.window { try NativeViewRenderEvidence.capture("page-error", window: window) }
+    owner.editDocumentAddress(tab.id)
+    try require(owner.actions.palette && owner.actions.paletteEditsAddress
+      && owner.actions.query == tab.url, "failedPageCanEditItsOwnAddress")
+    owner.actions.palette = false
+    owner.navigate(url.appendingPathComponent("recovered-error").absoluteString)
+    try await loaded(failed)
+    try await wait("failedPageRecoversWithoutReplacingNativeIdentity") {
+      failed.documentError == nil && owner.actions.documentErrors[tab.id] == nil
+        && failed.nativeWindow?.isVisible == true && failed.browser?.id == nativeID
+    }
+    try require(await owner.requestCloseTab(tab.id), "recoveredErrorTabClosesCleanly")
+    owner.store.selectTab(id: survivor.id)
+    owner.store.setPeek(tabID: survivor.id, address: "http://127.0.0.1:1/peek-error")
+    owner.layoutPages()
+    try await wait("failedPeekKeepsSourceVisible") {
+      guard let preview = self.application.engine.pages["peek:" + survivor.id] else { return false }
+      return preview.documentError != nil && owner.actions.documentErrors[preview.id] != nil
+        && preview.nativeWindow?.isVisible == false && survivor.nativeWindow?.isVisible == true
+        && owner.store.state.activeTabID == survivor.id && owner.hasPresentedPeek
+    }
+    if let window = owner.window { try NativeViewRenderEvidence.capture("peek-error", window: window) }
+    guard let preview = application.engine.pages["peek:" + survivor.id], let previewID = preview.browser?.id else {
+      throw Failure("Failed Peek retains its browser")
+    }
+    owner.navigate(url.appendingPathComponent("recovered-peek").absoluteString)
+    try await loaded(preview)
+    try await wait("failedPeekRecoversWithoutReplacingNativeIdentity") {
+      preview.documentError == nil && owner.actions.documentErrors[preview.id] == nil
+        && preview.nativeWindow?.isVisible == true && preview.browser?.id == previewID
+    }
+    try require(await owner.requestCloseTab(preview.id), "recoveredPeekClosesCleanly")
   }
 
   private func checkProfileClear(url: URL, survivor: ChromiumPage, owner: BrowserWindowCoordinator) async throws {
@@ -372,6 +436,8 @@ final class BrowserIntegrationAcceptance {
         let networkChecks = network["checks"] as? [String: Bool] else { throw Failure("Invalid extension network fixture result") }
       for (name, passed) in networkChecks { checks["extension-network:" + name] = passed }
       guard network["passed"] as? Bool == true else { throw Failure("Native extension network fixture: \(network["errors"] ?? "failed")") }
+      try await checkNativeIdentity(worker: worker, baseURL: url)
+      try await checkNativeMessaging(worker: worker, identifier: identifier)
       owner.store.selectTab(id: page.id)
       owner.windowContext.show()
       try await application.extensionBrowser.prepareInitialNavigation(page)
@@ -410,15 +476,73 @@ final class BrowserIntegrationAcceptance {
         "extensionPopupOnBlankUsesLogicalOwnerAndActiveTab")
       _ = try await worker.evaluate("zacroAcceptance.configureAction('record')")
       owner.store.selectTab(id: page.id)
+      _ = try await worker.evaluate("zacroAcceptance.setPanelEventObservation(false)")
       try await checkNativeSidePanel(manager: manager, identifier: identifier, worker: worker,
                                      owner: owner, source: page, url: url)
       try await checkParkedSidePanel(manager: manager, identifier: identifier, worker: worker,
                                     owner: owner, url: url)
+      _ = try await worker.evaluate("zacroAcceptance.setPanelEventObservation(true)")
       extensionFixturePassed = true
       await worker.close()
     } catch {
       await worker.close()
       throw error
+    }
+  }
+
+  private func checkNativeMessaging(worker: ChromeExtensionWorkerSession, identifier: String) async throws {
+    let files = FileManager.default
+    guard identifier.range(of: "^[a-p]{32}$", options: .regularExpression) != nil,
+      let executablePath = ProcessInfo.processInfo.environment["ZACRO_NATIVE_MESSAGING_FIXTURE"],
+      files.isExecutableFile(atPath: executablePath) else { throw Failure("Missing disposable native messaging host") }
+    let data = application.engine.dataDirectory.standardizedFileURL.resolvingSymlinksInPath()
+    guard data.lastPathComponent.hasPrefix("zacro-native-acceptance-"),
+      data.deletingLastPathComponent() == files.temporaryDirectory.standardizedFileURL.resolvingSymlinksInPath() else {
+      throw Failure("Native messaging fixtures require the disposable acceptance profile")
+    }
+    let token = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+    let chromium = data.appendingPathComponent("Chromium", isDirectory: true)
+    let directory = chromium.appendingPathComponent("ZacroNativeMessagingFixture-" + token, isDirectory: true)
+    let registrations = chromium.appendingPathComponent("NativeMessagingHosts", isDirectory: true)
+    try files.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+    try files.createDirectory(at: registrations, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+    var manifests: [URL] = []
+    defer {
+      for manifest in manifests { try? files.removeItem(at: manifest) }
+      try? files.removeItem(at: directory)
+    }
+    var hosts: [String: String] = [:]
+    for kind in ["echo", "fragments", "batch", "oversized", "truncated", "invalidjson", "hold", "denied"] {
+      let host = directory.appendingPathComponent(kind)
+      try files.copyItem(at: URL(fileURLWithPath: executablePath), to: host)
+      try files.setAttributes([.posixPermissions: 0o700], ofItemAtPath: host.path)
+      let name = "com.zacro.native_fixture_" + token + "." + kind
+      let denied = String(repeating: identifier == String(repeating: "a", count: 32) ? "b" : "a", count: 32)
+      let manifest: [String: Any] = ["name": name, "description": "Disposable Zacro acceptance host",
+        "path": host.path, "type": "stdio", "allowed_origins": ["chrome-extension://" + (kind == "denied" ? denied : identifier) + "/"]]
+      let location = registrations.appendingPathComponent(name + ".json")
+      try JSONSerialization.data(withJSONObject: manifest).write(to: location, options: .withoutOverwriting)
+      manifests.append(location)
+      try files.setAttributes([.posixPermissions: 0o600], ofItemAtPath: location.path)
+      hosts[kind] = name
+    }
+    hosts["missing"] = "com.zacro.native_fixture_" + token + ".missing"
+    let config = String(decoding: try JSONSerialization.data(withJSONObject: ["hosts": hosts]), as: UTF8.self)
+    guard let result = try await worker.evaluate("zacroNativeMessagingAcceptance.run(\(config))", timeout: 90) as? [String: Any],
+      let results = result["checks"] as? [String: Bool], results.count == 9 else { throw Failure("Invalid native messaging fixture result") }
+    for (name, passed) in results { checks["extension-messaging:" + name] = passed }
+    guard result["passed"] as? Bool == true else { throw Failure("Native messaging: \(result["errors"] ?? "failed")") }
+    try require(!files.fileExists(atPath: directory.appendingPathComponent("denied.pid").path), "nativeDeniedHostNeverLaunched")
+    let pidText = try String(contentsOf: directory.appendingPathComponent("hold.pid"), encoding: .utf8)
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    guard let pid = Int32(pidText), pid > 1 else { throw Failure("Native host process identity") }
+    try await wait("nativeDisconnectedHostExited", timeout: 8) {
+      // An exited child awaiting Chromium's background reap is already dead.
+      // A failed process query is not evidence of exit; never signal a PID.
+      var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+      var info = kinfo_proc(), size = MemoryLayout<kinfo_proc>.stride
+      let status = mib.withUnsafeMutableBufferPointer { sysctl($0.baseAddress, 4, &info, &size, nil, 0) }
+      return status == 0 && (size == 0 || info.kp_proc.p_stat == Int8(SZOMB))
     }
   }
 
@@ -448,6 +572,46 @@ final class BrowserIntegrationAcceptance {
     }
     let after = try await worker.evaluate("zacroAcceptance.commandResult()") as? [String: Any]
     try require(after?["nativeCommandCount"] as? Int == count + 1, "suspendedShortcutDoesNotDeliverDuplicateCommand")
+  }
+
+  private func checkNativeIdentity(worker: ChromeExtensionWorkerSession, baseURL: URL) async throws {
+    guard let result = try await worker.evaluate("zacroIdentityAcceptance.run({baseURL:\(try literal(baseURL.absoluteString))})", timeout: 90) as? [String: Any],
+      let identityChecks = result["checks"] as? [String: Bool], identityChecks.count == 6 else {
+      throw Failure("Invalid native identity fixture result")
+    }
+    for (name, passed) in identityChecks { checks["extension-identity:" + name] = passed }
+    guard identityChecks.values.allSatisfy({ $0 }) else { throw Failure("Native identity: \(result["errors"] ?? "failed")") }
+    for cancel in [false, true] {
+      let token = "zacro-native-" + UUID().uuidString
+      let encoded = try literal(token)
+      let before = Set(NSApp.windows.map(ObjectIdentifier.init))
+      guard let flow = try await worker.evaluate("zacroIdentityAcceptance.startInteractive({baseURL:\(try literal(baseURL.absoluteString)),token:\(encoded)})") as? [String: Any],
+        let title = flow["title"] as? String else { throw Failure("Interactive native auth start") }
+      var window: NSWindow?
+      try await wait("nativeAuthPresentsOwnedWindow", record: false) {
+        window = NSApp.windows.first { !before.contains(ObjectIdentifier($0)) && $0.title == title && $0.isVisible }
+        return window != nil
+      }
+      guard let window else { throw Failure("Native auth window") }
+      let pending = try await worker.evaluate("zacroIdentityAcceptance.status(\(encoded))") as? [String: Any]
+      try require(pending?["state"] as? String == "pending"
+        && (pending?["logicalAuthTabIDs"] as? [Int])?.isEmpty == true
+        && (pending?["logicalAuthWindowIDs"] as? [Int])?.isEmpty == true,
+        cancel ? "cancelAuthFlowKeepsCredentialsOutsideTabCatalog" : "nativeAuthFlowKeepsCredentialsOutsideTabCatalog")
+      if cancel {
+        // Owned fixture window lifecycle only; this does not simulate a click
+        // or establish desktop keyboard/pointer acceptance.
+        window.performClose(nil)
+      } else {
+        _ = try await worker.evaluate("zacroIdentityAcceptance.release(\(encoded))")
+      }
+      try await wait(cancel ? "nativeAuthCancellationRejectsAndCloses" : "nativeAuthCallbackResolvesAndCloses") {
+        let status = try await worker.evaluate("zacroIdentityAcceptance.status(\(encoded))") as? [String: Any]
+        return !window.isVisible && status?["state"] as? String == (cancel ? "rejected" : "resolved")
+          && (cancel || status?["exactCallback"] as? Bool == true)
+      }
+      _ = try await worker.evaluate("zacroIdentityAcceptance.finish(\(encoded))")
+    }
   }
 
   private func checkParkedSidePanel(manager: ChromeExtensionManager, identifier: String,

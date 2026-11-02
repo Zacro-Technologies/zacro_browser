@@ -16,6 +16,8 @@
     "bookmarks",
     "sessions",
     "downloads",
+    "identity",
+    "nativeMessaging",
     "declarativeNetRequestWithHostAccess",
     "webRequest"
   ],

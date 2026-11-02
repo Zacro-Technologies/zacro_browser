@@ -24,6 +24,13 @@ struct NativeHomePage: View {
       .map { Link(url: $0.url, title: $0.title) })
   }
   var body: some View {
+    GeometryReader { geometry in
+      ScrollView {
+        homeContents.frame(maxWidth: .infinity, minHeight: geometry.size.height)
+      }.scrollIndicators(.hidden)
+    }
+  }
+  private var homeContents: some View {
     VStack(spacing: 20) {
       if store.state.activeProfile?.isPrivate == true {
         VStack(spacing: 10) {
@@ -79,7 +86,7 @@ struct NativeHomePage: View {
         }
       }
     }.font(.system(size: 13)).foregroundStyle(colors.ink).tint(colors.accent)
-      .frame(maxWidth: 420).padding(32).frame(maxWidth: .infinity, maxHeight: .infinity)
+      .frame(maxWidth: 420).padding(32)
   }
   @ViewBuilder private func favicon(_ url: String) -> some View {
     if let image = actions.iconForURL(url) ?? store.state.tabs.first(where: { $0.url == url }).flatMap({ actions.icons[$0.id] }) {

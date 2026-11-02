@@ -72,8 +72,8 @@ struct NativeInterfaceEditors: View {
         Text(title).font(.system(size: 17, weight: .semibold))
         Spacer()
         if destination == .shortcuts { Button("Reset all") { apply { try store.resetShortcut() } }.buttonStyle(.plain) }
-        Button { dismiss() } label: { NativeGlyph("xmark").frame(width: 24, height: 24) }
-          .buttonStyle(.plain).help("Close").accessibilityLabel("Close \(title)")
+        Button(action: closeEditor) { NativeGlyph("xmark").frame(width: 24, height: 24) }
+          .keyboardShortcut(.cancelAction).buttonStyle(.plain).help("Close").accessibilityLabel("Close \(title)")
       }
       switch destination {
       case .shortcuts: shortcutEditor
@@ -105,6 +105,10 @@ struct NativeInterfaceEditors: View {
             }
         }, cancel: { renameProfile = nil; profileName = ""; error = nil })
       }
+  }
+  private func closeEditor() {
+    if destination == .onboarding { finishTour() }
+    else { dismiss() }
   }
   private var shortcutEditor: some View {
     VStack(spacing: 12) {

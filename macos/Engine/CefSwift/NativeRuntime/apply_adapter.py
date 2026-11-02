@@ -35,7 +35,7 @@ def main():
     header = output[paths[0]]
     header = replace_once(header, "#include <memory>", "#include <memory>\n#include <map>\n#include <set>\n#include <vector>")
     header = replace_once(header, '#include "base/memory/raw_ptr.h"', '#include "base/memory/raw_ptr.h"\n#include "base/callback_list.h"')
-    header = replace_once(header, "class CefDevToolsController", "class ZacroDataRemoval;\nclass ZacroDiscardOperation;\nclass ZacroDocumentObserver;\nnamespace sessions { class SerializedNavigationEntry; }\n\nclass CefDevToolsController")
+    header = replace_once(header, "class CefDevToolsController", "class ZacroDataRemoval;\nclass ZacroDiscardOperation;\nclass ZacroDocumentObserver;\nclass ZacroNavigationCommit;\nclass GURL;\nnamespace sessions { class SerializedNavigationEntry; }\n\nclass CefDevToolsController")
     header = replace_once(header, "  bool EnsureAgentHost();", """  bool EnsureAgentHost();
   bool DispatchZacro(const std::string_view& message);
   void ReplyZacro(int id, base::DictValue result, const std::string& error = {});
@@ -47,6 +47,9 @@ def main():
   base::CallbackListSubscription zacro_extension_subscription_;
   void FinishZacroDataRemoval(int id, uint64_t failed_types);
   void FinishZacroDiscard(int id, int entry_id, const std::string& error);
+  bool StartZacroNavigationCommit(int id, const GURL& expected, base::DictValue result);
+  void FinishZacroNavigationCommit(int id, base::DictValue result, const std::string& error);
+  std::unique_ptr<ZacroNavigationCommit> zacro_navigation_commit_;
   std::unique_ptr<ZacroDiscardOperation> zacro_discard_;
   std::unique_ptr<ZacroDocumentObserver> zacro_document_observer_;
   int zacro_dormant_entry_ = 0;
@@ -59,6 +62,7 @@ def main():
     code = output[paths[1]]
     code = replace_once(code, '#include "content/public/browser/devtools_agent_host.h"', '#include "content/public/browser/devtools_agent_host.h"\n#include "cef/libcef/browser/devtools/zacro_native_adapter.inc"')
     code = replace_once(code, "CefDevToolsController::~CefDevToolsController() {", """CefDevToolsController::~CefDevToolsController() {
+  zacro_navigation_commit_.reset();
   zacro_data_removals_.clear();
   zacro_discard_.reset();
   zacro_document_observer_.reset();

@@ -1,6 +1,8 @@
 /* Real MV3 APIs only. Loaded solely into a fresh disposable acceptance profile. */
 importScripts('peek.js');
 importScripts('network.js');
+importScripts('identity.js');
+importScripts('native-messaging.js');
 const events = [];
 const record = (name, ...args) => {
   events.push({ name, args });
@@ -27,9 +29,9 @@ chrome.commands.onCommand.addListener((name, tab) => {
   });
 });
 let nativeActionMode = "record";
-for (const name of ["onOpened", "onClosed"]) {
-  chrome.sidePanel[name].addListener(info => record(`sidePanel.${name}`, info));
-}
+const panelEventObservers = Object.fromEntries(["onOpened", "onClosed"].map(name =>
+  [name, info => record(`sidePanel.${name}`, info)]));
+for (const [name, listener] of Object.entries(panelEventObservers)) chrome.sidePanel[name].addListener(listener);
 chrome.action.onClicked.addListener(async tab => {
   // Invoke in the real action event's user-gesture scope before awaiting work.
   if (nativeActionMode === "panel") {
@@ -59,6 +61,13 @@ async function loaded(tabId) {
 
 globalThis.zacroAcceptance = {
   events,
+  setPanelEventObservation(enabled) {
+    for (const [name, listener] of Object.entries(panelEventObservers)) {
+      chrome.sidePanel[name][enabled ? "addListener" : "removeListener"](listener);
+      assert(chrome.sidePanel[name].hasListener(listener) === enabled, "Panel listener state did not change");
+    }
+    return true;
+  },
   async commandResult() {
     await commandWrite;
     return await chrome.storage.local.get(["nativeCommandCount", "lastNativeCommand"]);
@@ -230,6 +239,29 @@ globalThis.zacroAcceptance = {
       const zoom = await chrome.tabs.getZoom(sleeper.id);
       assert(Number.isFinite(zoom) && zoom > 0, "Dormant API did not resume the actual native function");
       assert((await chrome.tabs.get(sleeper.id)).id === sleeper.id, "Waking replaced the native tab identity");
+      const sleepAgain = async () => {
+        const value = await chrome.tabs.discard(sleeper.id);
+        assert(value.id === sleeper.id && value.discarded, "Native document did not return to sleep");
+      };
+      await sleepAgain();
+      const script = await chrome.scripting.executeScript({ target: { tabId: sleeper.id }, func: () => location.href });
+      assert(script[0].result === sleeper.url, "Scripting did not restore the intended dormant document");
+      await sleepAgain();
+      const css = "body { --zacro-native-wake: restored; }";
+      await chrome.scripting.insertCSS({ target: { tabId: sleeper.id }, css });
+      const style = await chrome.scripting.executeScript({ target: { tabId: sleeper.id },
+        func: () => getComputedStyle(document.body).getPropertyValue("--zacro-native-wake").trim() });
+      assert(style[0].result === "restored", "CSS injection ran before native document restoration");
+      await sleepAgain();
+      await chrome.scripting.removeCSS({ target: { tabId: sleeper.id }, css });
+      assert(!(await chrome.tabs.get(sleeper.id)).discarded, "CSS removal did not prepare the dormant document");
+      await sleepAgain();
+      const target = { tabId: sleeper.id };
+      await chrome.debugger.attach(target, "1.3");
+      try {
+        const result = await chrome.debugger.sendCommand(target, "Runtime.evaluate", { expression: "location.href", returnByValue: true });
+        assert(result.result.value === sleeper.url, "Debugger attached before dormant navigation restored");
+      } finally { await chrome.debugger.detach(target); }
     });
     await check("workerStorageAndNotifications", async () => {
       const start = events.length;

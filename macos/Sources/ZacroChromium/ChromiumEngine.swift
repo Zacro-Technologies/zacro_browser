@@ -641,6 +641,7 @@ public final class ChromiumPage: CefBrowserDelegate {
   public private(set) var canGoForward = false
   public private(set) var progress = 0.0
   public private(set) var error: String?
+  public private(set) var documentError: ChromiumDocumentError?
   public private(set) var creationFailed = false
   public private(set) var faviconURL: URL?
   /// The committed document that supplied `faviconURL`; never the pinned home URL.
@@ -736,7 +737,7 @@ public final class ChromiumPage: CefBrowserDelegate {
   public func loadApprovedNavigation(_ approval: ChromeNavigationApproval) async throws {
     try authorizeNavigation(approval)
     do {
-      _ = try await ready().devTools.call("Zacro.navigateApproved", parameters: approval.parameters)
+      _ = try await ready().devTools.call("Zacro.navigateApproved", parameters: approval.parameters, timeout: 50)
     } catch {
       approvedNavigationURLs.remove(approval.url.absoluteString)
       throw error
@@ -794,7 +795,8 @@ public final class ChromiumPage: CefBrowserDelegate {
       faviconDocumentURL = nil
     }
     self.url = url
-    error = nil
+    // Error pages may commit their URL after on_load_error. Keep the failure
+    // until a genuine subsequent main-frame navigation begins.
     onChange?()
   }
   public func browser(
@@ -821,7 +823,9 @@ public final class ChromiumPage: CefBrowserDelegate {
   public func browser(_ b: CefBrowser, didFailLoad code: Int, errorText: String, failedURL: String)
   {
     if code != -3 {
-      error = errorText
+      let message = errorText.isEmpty ? "This page could not be loaded." : String(errorText.prefix(2000))
+      error = message
+      documentError = ChromiumDocumentError(url: URL(string: failedURL) ?? url, code: code, message: message)
       onChange?()
     }
   }
@@ -866,13 +870,19 @@ public final class ChromiumPage: CefBrowserDelegate {
   public func browser(_ b: CefBrowser, decidePolicyForNavigation url: URL?, isMainFrame: Bool, isRedirect: Bool, userGesture: Bool) -> CefNavigationDecision {
     guard isMainFrame else { return .allow }
     guard let url else { return .cancel }
-    if Self.webURL(url) || url.absoluteString == "about:blank" || approvedNavigationURLs.contains(url.absoluteString) { return .allow }
+    func allowMainFrameNavigation() -> CefNavigationDecision {
+      if documentError != nil || error != nil {
+        documentError = nil; error = nil; onChange?()
+      }
+      return .allow
+    }
+    if Self.webURL(url) || url.absoluteString == "about:blank" || approvedNavigationURLs.contains(url.absoluteString) { return allowMainFrameNavigation() }
     if url.scheme == "chrome", (id.hasPrefix("extensions:") || id.hasPrefix("extension-settings:")),
-      url.host == "extensions" { return .allow }
+      url.host == "extensions" { return allowMainFrameNavigation() }
     // Chromium still validates extension resource ownership and web-accessible
     // resources. No privileged native bridge exists in this document.
     if url.scheme == "chrome-extension", let host = url.host,
-      host.count == 32, host.utf8.allSatisfy({ (97...112).contains($0) }) { return .allow }
+      host.count == 32, host.utf8.allSatisfy({ (97...112).contains($0) }) { return allowMainFrameNavigation() }
     return .cancel
   }
   public func browserDidClose(_ b: CefBrowser) {
@@ -1015,7 +1025,9 @@ public final class ChromiumPage: CefBrowserDelegate {
   public func browser(
     _ b: CefBrowser, renderProcessDidTerminate reason: CefTerminationReason, errorCode: Int
   ) {
-    error = "This page stopped responding. Reload to continue."
+    let message = "This page stopped responding. Reload to continue."
+    error = message
+    documentError = ChromiumDocumentError(url: url, code: errorCode, message: message, isRendererTermination: true)
     onChange?()
   }
 }

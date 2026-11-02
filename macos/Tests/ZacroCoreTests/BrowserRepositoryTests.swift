@@ -14,6 +14,74 @@ import XCTest
     try FileManager.default.createDirectory(at: file, withIntermediateDirectories: true)
   }
 
+  func testDisabledSessionRestoreKeepsSavedDocumentsDormantInEveryWindow() throws {
+    let repository = BrowserRepository(directory: try directory()), first = repository.focusedStore
+    let a = try XCTUnwrap(first.createTab(address: "https://split.example/a"))
+    let b = try XCTUnwrap(first.createTab(address: "https://split.example/b"))
+    first.setSplit(left: a.id, right: b.id)
+    let discarded = try XCTUnwrap(first.createTab(address: "https://ordinary.example"))
+    first.selectTab(id: a.id)
+    let second = try repository.makeWindow(addresses: ["https://preview.example"])
+    let source = try XCTUnwrap(second.state.activeTabID)
+    second.setPeek(tabID: source, address: "https://peek.example")
+    second.updateSettings { $0.restoreSession = false }
+    let reopened = BrowserRepository(directory: repository.directory)
+    XCTAssertEqual(Set(reopened.canonicalStore.state.tabs.map(\.id)), [a.id, b.id, source])
+    XCTAssertEqual(reopened.canonicalStore.state.archive.first?.id, discarded.id)
+    XCTAssertEqual(reopened.canonicalStore.state.splits.count, 1)
+    XCTAssertEqual(reopened.canonicalStore.tab(source)?.peek?.url, "https://peek.example/")
+    XCTAssertTrue(reopened.windows.allSatisfy { $0.activeTabID == nil && $0.highlightedTabIDs.isEmpty })
+    // An unrelated transaction and another disk round trip must not resurrect
+    // the remembered split/Peek selection through window normalization.
+    reopened.canonicalStore.updateSettings { $0.pageGutter = 8 }
+    let twice = BrowserRepository(directory: repository.directory)
+    XCTAssertTrue(twice.windows.allSatisfy { $0.activeTabID == nil })
+    let firstAgain = try XCTUnwrap(twice.store(for: first.owningWindowID!))
+    firstAgain.selectTab(id: a.id)
+    XCTAssertEqual(firstAgain.state.activeTabID, a.id)
+    XCTAssertNil(twice.store(for: second.owningWindowID!)?.state.activeTabID)
+  }
+
+  func testPinnedStartupSelectionIsWindowLocalAndKeepsPeekOrSplitActive() throws {
+    let repository = BrowserRepository(directory: try directory()), first = repository.focusedStore
+    let ordinary = try XCTUnwrap(first.createTab(address: "https://ordinary.example"))
+    let pinned = try XCTUnwrap(first.createTab(address: "https://pinned.example"))
+    first.togglePin(id: pinned.id)
+    let second = try repository.makeWindow(addresses: ["https://favorite.example"])
+    let favorite = try XCTUnwrap(second.state.activeTabID)
+    second.toggleFavorite(id: favorite)
+    let third = try repository.makeWindow(addresses: ["https://preview.example"])
+    let preview = try XCTUnwrap(third.state.activeTabID)
+    third.togglePin(id: preview); third.setPeek(tabID: preview, address: "https://peek.example")
+    let fourth = try repository.makeWindow(addresses: ["https://left.example", "https://right.example"])
+    let members = fourth.state.tabs.map(\.id)
+    fourth.togglePin(id: members[0]); fourth.setSplit(left: members[0], right: members[1])
+    fourth.selectTab(id: members[0])
+    let reopened = BrowserRepository(directory: repository.directory)
+    XCTAssertEqual(reopened.store(for: first.owningWindowID!)?.state.activeTabID, ordinary.id)
+    XCTAssertNil(reopened.store(for: second.owningWindowID!)?.state.activeTabID)
+    XCTAssertEqual(reopened.store(for: third.owningWindowID!)?.state.activeTabID, preview)
+    XCTAssertEqual(reopened.store(for: fourth.owningWindowID!)?.state.activeTabID, members[0])
+    let secondAgain = try XCTUnwrap(reopened.store(for: second.owningWindowID!))
+    secondAgain.updateProfile("default") { $0.name = "Still dormant" }
+    XCTAssertNil(secondAgain.state.activeTabID)
+    secondAgain.selectTab(id: favorite)
+    XCTAssertEqual(secondAgain.state.activeTabID, favorite)
+  }
+
+  func testIntentionalEmptySelectionSurvivesNormalizationButInvalidSelectionRepairs() throws {
+    let repository = BrowserRepository(directory: try directory()), first = repository.focusedStore
+    let tab = try XCTUnwrap(first.createTab(address: "https://remembered.example"))
+    let windowID = first.owningWindowID!
+    try repository.updateWindow(windowID) { $0.activeTabID = nil }
+    XCTAssertNil(first.state.activeTabID)
+    XCTAssertEqual(repository.windows[0].lastActiveTabBySpace["home"], tab.id)
+    let reopened = BrowserRepository(directory: repository.directory)
+    XCTAssertNil(reopened.focusedStore.state.activeTabID)
+    try reopened.updateWindow(windowID) { $0.activeTabID = "missing" }
+    XCTAssertEqual(reopened.focusedStore.state.activeTabID, tab.id)
+  }
+
   func testSecondWindowSidebarReordersUseItsProjectionAcrossCategoryChanges() throws {
     let repository = BrowserRepository(directory: try directory()), first = repository.focusedStore
     _ = first.createTab(address:"https://first.example/a")

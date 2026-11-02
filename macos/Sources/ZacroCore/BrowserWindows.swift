@@ -67,7 +67,10 @@ enum BrowserWindowState {
         tab.windowID == window.id && !tab.isClosed &&
           (tab.spaceID == window.activeSpaceID || (tab.isFavorite && spaces[tab.spaceID]?.profileID == profile))
       }
-      if window.activeTabID.flatMap({ tabMap[$0] }).map(canSelect) != true {
+      // A nil selection is intentional (for example, a fresh launch with
+      // session restoration disabled). Repair invalid references without
+      // turning an empty content pane into a request to wake a saved page.
+      if let active = window.activeTabID, tabMap[active].map(canSelect) != true {
         window.activeTabID = window.lastActiveTabBySpace[window.activeSpaceID]
           .flatMap { tabMap[$0] }.flatMap { canSelect($0) ? $0.id : nil }
           ?? own.first(where: { $0.spaceID == window.activeSpaceID && !$0.isPinned })?.id

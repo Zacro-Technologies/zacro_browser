@@ -12,6 +12,7 @@ struct NativeSpacePalette {
   let primary: Color
   let secondary: Color
   let card: Color
+  let surface: Color
   let dark: Bool
   private static let cache = NSCache<NSString, CachedPalette>()
   private final class CachedPalette: NSObject {
@@ -82,6 +83,7 @@ struct NativeSpacePalette {
     self.primary = Self.color(tintPrimary)
     self.secondary = Self.color(tintSecondary)
     self.card = Self.color(card)
+    self.surface = Self.color(surface)
     Self.cache.countLimit = 32
     Self.cache.setObject(CachedPalette(self), forKey: key)
   }

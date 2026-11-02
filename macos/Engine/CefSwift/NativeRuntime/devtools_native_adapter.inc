@@ -9,6 +9,7 @@
 #include "base/strings/string_number_conversions.h"
 #include "base/strings/utf_string_conversions.h"
 #include "base/timer/timer.h"
+#include "cef/libcef/browser/browser_host_base.h"
 #include "chrome/browser/browsing_data/chrome_browsing_data_remover_constants.h"
 #include "chrome/browser/devtools/devtools_window.h"
 #include "chrome/browser/browser_process.h"
@@ -158,6 +159,68 @@ class ZacroDocumentObserver : public content::WebContentsObserver {
   base::RepeatingCallback<void(bool)> panel_;
   base::CallbackListSubscription subscription_;
 };
+
+// Correlate a native host operation with its actual primary navigation, not
+// loading-state notifications or a URL string which can still describe blank.
+class ZacroNavigationCommit : public content::WebContentsObserver {
+ public:
+  ZacroNavigationCommit(content::WebContents* contents, const GURL& expected,
+      base::OnceCallback<void(const std::string&)> completion)
+      : content::WebContentsObserver(contents), expected_(expected),
+        previous_document_(contents->GetPrimaryMainFrame()->GetWeakDocumentPtr()),
+        completion_(std::move(completion)) {
+    timer_.Start(FROM_HERE, base::Seconds(45), base::BindOnce(
+        &ZacroNavigationCommit::Finish, base::Unretained(this),
+        "The requested document did not commit in time."));
+  }
+  void DidStartNavigation(content::NavigationHandle* navigation) override {
+    if (!navigation->IsInPrimaryMainFrame()) return;
+    if (navigation_id_ || navigation->GetURL() != expected_) {
+      Finish("The requested navigation was replaced before it committed."); return;
+    }
+    navigation_id_ = navigation->GetNavigationId();
+  }
+  void DidFinishNavigation(content::NavigationHandle* navigation) override {
+    if (!navigation->IsInPrimaryMainFrame() || navigation->GetNavigationId() != navigation_id_) return;
+    if (!navigation->HasCommitted() || navigation->IsErrorPage()) {
+      Finish("The requested navigation failed or was cancelled."); return;
+    }
+    if (!navigation->IsSameDocument() &&
+        previous_document_.AsRenderFrameHostIfValid() == web_contents()->GetPrimaryMainFrame()) {
+      Finish("The original document is still active."); return;
+    }
+    Finish({});
+  }
+  void PrimaryMainFrameRenderProcessGone(base::TerminationStatus) override {
+    Finish("The document renderer stopped before navigation committed.");
+  }
+  void WebContentsDestroyed() override { Finish("The document closed before navigation committed."); }
+ private:
+  void Finish(const std::string& error) {
+    timer_.Stop();
+    Observe(nullptr);
+    // Completion deletes this observer. Never access members afterwards.
+    if (completion_) std::move(completion_).Run(error);
+  }
+  GURL expected_;
+  content::WeakDocumentPtr previous_document_;
+  int64_t navigation_id_ = 0;
+  base::OnceCallback<void(const std::string&)> completion_;
+  base::OneShotTimer timer_;
+};
+
+bool CefDevToolsController::StartZacroNavigationCommit(int id, const GURL& expected, base::DictValue result) {
+  if (zacro_navigation_commit_) {
+    ReplyZacro(id, {}, "A native document restoration is already in progress."); return false;
+  }
+  zacro_navigation_commit_ = std::make_unique<ZacroNavigationCommit>(inspected_contents_, expected,
+      base::BindOnce(&CefDevToolsController::FinishZacroNavigationCommit, weak_ptr_factory_.GetWeakPtr(), id, std::move(result)));
+  return true;
+}
+void CefDevToolsController::FinishZacroNavigationCommit(int id, base::DictValue result, const std::string& error) {
+  zacro_navigation_commit_.reset();
+  ReplyZacro(id, error.empty() ? std::move(result) : base::DictValue(), error);
+}
 
 class ZacroDiscardOperation : public content::WebContentsObserver {
  public:
@@ -512,12 +575,34 @@ bool CefDevToolsController::DispatchZacro(const std::string_view& message) {
     NativeExtensionPopupAnchor::CancelPrepared(inspected_contents_);
     ReplyZacro(*id, base::DictValue().Set("performed", true)); return true;
   }
+  if (*method == "Zacro.loadAndWaitForNavigationCommit") {
+    const auto* params = request->FindDict("params");
+    const auto* address = params ? params->FindString("url") : nullptr;
+    const GURL url(address ? *address : "");
+    auto browser = CefBrowserHostBase::GetBrowserForContents(inspected_contents_);
+    if (!address || address->size() > 32768 || !ZacroRestorableURL(url, inspected_contents_->GetBrowserContext()) || !browser) {
+      ReplyZacro(*id, {}, "This document destination is invalid or unavailable."); return true;
+    }
+    auto& controller = inspected_contents_->GetController();
+    if (zacro_navigation_commit_) {
+      ReplyZacro(*id, {}, "A native document restoration is already in progress."); return true;
+    }
+    if (url == GURL("about:blank") && controller.GetLastCommittedEntry()->IsInitialEntry() &&
+        !controller.GetPendingEntry() && !inspected_contents_->IsLoading() &&
+        inspected_contents_->GetPrimaryMainFrame()->IsRenderFrameLive() &&
+        inspected_contents_->GetLastCommittedURL() == url) {
+      ReplyZacro(*id, base::DictValue().Set("committed", true)); return true;
+    }
+    if (StartZacroNavigationCommit(*id, url, base::DictValue().Set("committed", true)))
+      browser->GetMainFrame()->LoadURL(url.spec());
+    return true;
+  }
   if (*method == "Zacro.restoreNavigationEntries") {
     const auto* params = request->FindDict("params");
     const auto* items = params ? params->FindList("entries") : nullptr;
     const auto selected = params ? params->FindInt("selectedIndex") : std::nullopt;
     auto& controller = inspected_contents_->GetController();
-    if (!items || items->empty() || items->size() > 500 || !selected || *selected < 0 ||
+    if (zacro_navigation_commit_ || !items || items->empty() || items->size() > 500 || !selected || *selected < 0 ||
         static_cast<size_t>(*selected) >= items->size() || !controller.GetLastCommittedEntry()->IsInitialEntry() || controller.GetPendingEntry()) {
       ReplyZacro(*id, {}, "Legacy history can only restore a fresh initial document."); return true;
     }
@@ -538,8 +623,9 @@ bool CefDevToolsController::DispatchZacro(const std::string_view& message) {
     }
     auto entries = sessions::ContentSerializedNavigationBuilder::ToNavigationEntries(serialized, inspected_contents_->GetBrowserContext());
     controller.Restore(*selected, content::RestoreType::kRestored, &entries);
-    controller.LoadIfNecessary();
-    ReplyZacro(*id, base::DictValue().Set("restored", true)); return true;
+    if (StartZacroNavigationCommit(*id, controller.GetLastCommittedEntry()->GetURL(),
+        base::DictValue().Set("restored", true))) controller.LoadIfNecessary();
+    return true;
   }
   if (*method == "Zacro.getDocumentState") {
     auto* context = inspected_contents_->GetBrowserContext();
@@ -550,6 +636,7 @@ bool CefDevToolsController::DispatchZacro(const std::string_view& message) {
         .Set("devToolsOpen", DevToolsWindow::GetInstanceForInspectedWebContents(inspected_contents_) != nullptr)
         .Set("profileDownloads", context->GetDownloadManager()->InProgressCount())
         .Set("extensionUI", ZacroHasExtensionUI(inspected_contents_))
+        .Set("navigationPending", zacro_navigation_commit_ != nullptr)
         .Set("crashed", inspected_contents_->IsCrashed())
         .Set("loading", inspected_contents_->IsLoading()));
     return true;
@@ -614,7 +701,7 @@ bool CefDevToolsController::DispatchZacro(const std::string_view& message) {
   }
   if (*method == "Zacro.restoreDiscardedDocument") {
     auto& controller = inspected_contents_->GetController();
-    if (zacro_dormant_history_.empty() || zacro_discard_ || controller.GetEntryCount() != 1 ||
+    if (zacro_navigation_commit_ || zacro_dormant_history_.empty() || zacro_discard_ || controller.GetEntryCount() != 1 ||
         !zacro_dormant_entry_ || controller.GetLastCommittedEntry()->GetUniqueID() != zacro_dormant_entry_ ||
         controller.GetPendingEntry() || inspected_contents_->IsLoading() ||
         inspected_contents_->GetLastCommittedURL() != GURL("about:blank")) {
@@ -625,7 +712,9 @@ bool CefDevToolsController::DispatchZacro(const std::string_view& message) {
     controller.Restore(zacro_dormant_selected_ + 1, content::RestoreType::kRestored, &entries);
     CHECK(controller.RemoveEntryAtIndex(0));
     zacro_dormant_entry_ = 0; zacro_dormant_history_.clear();
-    controller.LoadIfNecessary(); ReplyZacro(*id, base::DictValue().Set("restored", true)); return true;
+    if (StartZacroNavigationCommit(*id, controller.GetLastCommittedEntry()->GetURL(),
+        base::DictValue().Set("restored", true))) controller.LoadIfNecessary();
+    return true;
   }
   if (*method == "Zacro.serializeNavigation") {
     if (inspected_contents_->GetBrowserContext()->IsOffTheRecord()) {
@@ -746,7 +835,7 @@ bool CefDevToolsController::DispatchZacro(const std::string_view& message) {
               controller.GetLastCommittedEntry()->GetUniqueID() == self->zacro_dormant_entry_ &&
               self->inspected_contents_->GetLastCommittedURL() == GURL("about:blank") &&
               !self->inspected_contents_->IsLoading();
-          if (!iterator.ReachedEnd() || controller.GetPendingEntry() || (!initial && !dormant)) {
+          if (self->zacro_navigation_commit_ || !iterator.ReachedEnd() || controller.GetPendingEntry() || (!initial && !dormant)) {
             self->ReplyZacro(id, {}, "Restore requires a fresh document with no navigation in progress."); return;
           }
           auto entries = sessions::ContentSerializedNavigationBuilder::ToNavigationEntries(saved, context);
@@ -756,8 +845,8 @@ bool CefDevToolsController::DispatchZacro(const std::string_view& message) {
             self->zacro_dormant_entry_ = 0;
             self->zacro_dormant_history_.clear();
           }
-          controller.LoadIfNecessary();
-          self->ReplyZacro(id, base::DictValue().Set("restored", true));
+          if (self->StartZacroNavigationCommit(id, controller.GetLastCommittedEntry()->GetURL(),
+              base::DictValue().Set("restored", true))) controller.LoadIfNecessary();
         }, weak_ptr_factory_.GetWeakPtr(), *id, std::move(wrapped_key), std::move(nonce), std::move(ciphertext)));
     return true;
   }
