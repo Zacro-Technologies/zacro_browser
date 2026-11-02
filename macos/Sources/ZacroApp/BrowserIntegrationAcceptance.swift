@@ -30,6 +30,7 @@ final class BrowserIntegrationAcceptance {
   }
 
   private func checkApplication(url: URL) async throws {
+    try checkAIResetOrdering()
     let engine = application.engine
     guard let first = application.focusedCoordinator else { throw Failure("No application window") }
     try await wait("initialShellLayout") { first.actions.contentFrame.width > 400 }
@@ -39,6 +40,14 @@ final class BrowserIntegrationAcceptance {
     try await application.navigation.waitForRestore(page)
     try await loaded(page)
     let browser = try await page.ready(), nativeID = browser.id
+    var permissionOrigin = URLComponents()
+    permissionOrigin.scheme = url.scheme; permissionOrigin.host = url.host; permissionOrigin.port = url.port
+    guard let origin = permissionOrigin.url?.absoluteString else { throw Failure("Fixture origin") }
+    first.store.setPermission(profileID: page.profileID, origin: origin, permission: "camera", allowed: true)
+    try require(page.onPermission?(.init(kinds: .camera, origin: origin)) == .allow,
+      "visiblePageUsesExplicitSavedPermission")
+    try require(page.onPermission?(.init(kinds: .screenCapture, origin: origin)) == .useDefault,
+      "screenCaptureRequiresNativeChooser")
     _ = try await browser.devTools.evaluate("document.body.innerHTML='<input id=draft value=initial><a target=_blank href=\"/popup\">Popup</a>'; document.querySelector('#draft').value='keep this draft'; null")
     first.actions.openPalette()
     try await Task.sleep(for: .milliseconds(120))
@@ -82,6 +91,10 @@ final class BrowserIntegrationAcceptance {
     try require(abs((first.store.split(for: tab.id)?.ratio ?? 0) - 0.63) < 0.001, "splitRatioCommitted")
     guard let unrelated = first.store.createTab(address: url.appendingPathComponent("unrelated").absoluteString) else { throw Failure("Unrelated tab") }
     _ = try await first.ensurePageReady(unrelated)
+    first.layoutPages()
+    try require(page.onPermission?(.init(kinds: .camera, origin: origin)) == .deny,
+      "hiddenPageCannotReuseSavedPermission")
+    try first.store.clearPermissionsDurably(profileID: page.profileID)
     first.store.selectTab(id: tab.id)
     try require(first.store.split(for: tab.id)?.id == split.id, "splitSurvivesTabSwitch")
 
@@ -233,6 +246,72 @@ final class BrowserIntegrationAcceptance {
       && webStoreTab.windowID == second.windowContext.id && webStorePage.ownerWindowID == second.windowContext.id,
       "webStoreUsesOneOrdinaryOwnedTab")
     second.store.selectTab(id: page.id)
+    if nativeExtensions { try await checkProfileClear(url: url, survivor: page, owner: second) }
+  }
+
+  private func checkProfileClear(url: URL, survivor: ChromiumPage, owner: BrowserWindowCoordinator) async throws {
+    let originalSpace = owner.store.state.activeSpaceID
+    let profile = try owner.store.createProfileDurably(name: "Disposable data-clear profile")
+    guard let tab = owner.store.createTab(address: url.appendingPathComponent("clear-one").absoluteString) else {
+      throw Failure("Profile clear first tab")
+    }
+    let page = try await owner.ensurePageReady(tab)
+    try await loaded(page)
+    _ = try await page.ready().devTools.evaluate("localStorage.setItem('clear-fixture','before'); true")
+    owner.store.setPeek(tabID: tab.id, address: url.appendingPathComponent("clear-peek-one").absoluteString)
+    owner.windowContext.show(); application.repository.focusWindow(owner.windowContext.id)
+    application.newWindow()
+    guard let sibling = application.focusedCoordinator, sibling !== owner,
+      sibling.store.activeProfileID == profile.id,
+      let other = sibling.store.createTab(address: url.appendingPathComponent("clear-two").absoluteString) else {
+      throw Failure("Profile clear second window")
+    }
+    sibling.actions.palette = false
+    let otherPage = try await sibling.ensurePageReady(other)
+    try await loaded(otherPage)
+    sibling.store.setPeek(tabID: other.id, address: url.appendingPathComponent("clear-peek-two").absoluteString)
+    guard let firstAction = owner.actions.performLibraryAction, let secondAction = sibling.actions.performLibraryAction else {
+      throw Failure("Profile clear Library actions")
+    }
+    let operation = Task { try await firstAction("data:clear", ["profileId":profile.id]) }
+    try await wait("profileClearAcquiresSharedLock", record: false) { self.application.deletingProfileID == profile.id }
+    var rejectedConcurrentClear = false
+    do { try await secondAction("data:clear", ["profileId":profile.id]) }
+    catch { rejectedConcurrentClear = true }
+    try await operation.value
+    try require(rejectedConcurrentClear && application.deletingProfileID == nil,
+      "profileClearCannotOverwriteAnotherWindowOperation")
+    try require(application.store.tab(tab.id)?.peek == nil && application.store.tab(other.id)?.peek == nil
+      && !application.store.state.history.contains(where: { $0.profileID == profile.id }),
+      "profileClearRemovesPeekAndHistoryAcrossAllWindows")
+    guard let retained = owner.store.tab(tab.id) else { throw Failure("Profile clear removed saved tab") }
+    let restored = try await owner.ensurePageReady(retained)
+    try await loaded(restored)
+    let cleared = try await restored.ready().devTools.evaluate("localStorage.getItem('clear-fixture')===null") as? Bool
+    try require(cleared == true && application.engine.pages[survivor.id] === survivor,
+      "profileClearErasesActualSiteStorageAndPreservesOtherProfiles")
+    try require(await sibling.requestCloseWindow(), "clearedProfileWindowCloses")
+    owner.store.selectSpace(id: originalSpace)
+  }
+
+  private func checkAIResetOrdering() throws {
+    let conversation = NativeAIConversationState()
+    conversation.activate(profileID: "acceptance-reset")
+    func reset(_ revision: Int, cancelled: ServiceJSON = .null) -> ServiceJSON {
+      ["type":"ai:reset", "profileId":"acceptance-reset", "resetRevision":.number(Double(revision)),
+       "cancelledRequestId":cancelled]
+    }
+    conversation.receive(reset(1))
+    conversation.begin(question: "Retry", request: ["requestId":"retry"])
+    conversation.receive(reset(1))
+    try require(conversation.busy && conversation.messages.count == 2, "duplicateAIResetPreservesNewRequest")
+    conversation.receive(reset(2))
+    conversation.receive(["type":"ai:answer", "profileId":"acceptance-reset", "requestId":"retry",
+      "resetRevision":1, "answer":"Stale answer"])
+    try require(conversation.busy && conversation.messages.count == 2
+      && conversation.messages.last?.text == "", "staleAIAnswerCannotCrossReset")
+    conversation.receive(reset(3, cancelled: "retry"))
+    try require(!conversation.busy && conversation.messages.isEmpty, "AIResetCancelsItsActualRequest")
   }
 
   private func checkNativeMedia(url: URL, owner: BrowserWindowCoordinator) async throws {
@@ -333,6 +412,8 @@ final class BrowserIntegrationAcceptance {
       owner.store.selectTab(id: page.id)
       try await checkNativeSidePanel(manager: manager, identifier: identifier, worker: worker,
                                      owner: owner, source: page, url: url)
+      try await checkParkedSidePanel(manager: manager, identifier: identifier, worker: worker,
+                                    owner: owner, url: url)
       extensionFixturePassed = true
       await worker.close()
     } catch {
@@ -367,6 +448,46 @@ final class BrowserIntegrationAcceptance {
     }
     let after = try await worker.evaluate("zacroAcceptance.commandResult()") as? [String: Any]
     try require(after?["nativeCommandCount"] as? Int == count + 1, "suspendedShortcutDoesNotDeliverDuplicateCommand")
+  }
+
+  private func checkParkedSidePanel(manager: ChromeExtensionManager, identifier: String,
+                                    worker: ChromeExtensionWorkerSession,
+                                    owner: BrowserWindowCoordinator, url: URL) async throws {
+    owner.windowContext.show()
+    application.repository.focusWindow(owner.windowContext.id)
+    application.newWindow()
+    guard let empty = application.focusedCoordinator, empty !== owner,
+      empty.store.activeProfileID == owner.store.activeProfileID else { throw Failure("Panel parking window") }
+    empty.actions.palette = false
+    let host = try await empty.extensionActionPage(profileID: empty.store.activeProfileID)
+    _ = try await worker.evaluate("zacroAcceptance.configureAction('panel')")
+    try await manager.performAction(identifier, on: host)
+    try await wait("parkingFixtureOpensPanel", record: false) { host.isSidePanelVisible }
+    guard let initial = try await worker.evaluate("zacroAcceptance.panelState('last-tab panel draft')") as? [String: Any],
+      let instance = initial["instance"] as? String else { throw Failure("Panel parking instance") }
+    try require(await empty.requestCloseTab(host.id), "lastTabWithPanelCloses")
+    try await wait("globalPanelSurvivesAnEmptyWindow") {
+      empty.store.state.activeTab == nil
+        && self.application.engine.parkedExtensionPanel(ownerWindowID: empty.windowContext.id,
+          profileID: empty.store.activeProfileID)?.nativeWindow?.isVisible == true
+    }
+    let logicalTabs = try await worker.evaluate("chrome.tabs.query({windowId:\(empty.windowContext.nativeID)}).then(t=>t.length)") as? Int
+    let parked = try await worker.evaluate("zacroAcceptance.panelState()") as? [String: Any]
+    try require(logicalTabs == 0 && parked?["instance"] as? String == instance
+      && parked?["draft"] as? String == "last-tab panel draft", "parkedPanelHasNoInventedTabAndRetainsDraft")
+    guard let next = empty.store.createTab(address: url.appendingPathComponent("panel-after-empty").absoluteString) else {
+      throw Failure("Panel return tab")
+    }
+    let nextPage = try await empty.ensurePageReady(next)
+    try await loaded(nextPage)
+    try await wait("panelReturnsFromEmptyWindow") { nextPage.isSidePanelVisible }
+    let returned = try await worker.evaluate("zacroAcceptance.panelState()") as? [String: Any]
+    try require(returned?["instance"] as? String == instance
+      && returned?["draft"] as? String == "last-tab panel draft", "panelReturnKeepsActualDocument")
+    _ = try await worker.evaluate("zacroAcceptance.closePanel(\(empty.windowContext.nativeID))")
+    try require(await empty.requestCloseWindow(), "panelParkingWindowClosesCleanly")
+    _ = try await worker.evaluate("zacroAcceptance.configureAction('record')")
+    owner.windowContext.show()
   }
 
   private func checkNativeOptions(worker: ChromeExtensionWorkerSession, identifier: String,

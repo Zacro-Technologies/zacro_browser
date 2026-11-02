@@ -19,6 +19,8 @@ public struct CefPermissionKind: OptionSet, Sendable, Hashable {
     public static let sensors = CefPermissionKind(rawValue: 1 << 8)
     public static let windowManagement = CefPermissionKind(rawValue: 1 << 9)
     public static let downloads = CefPermissionKind(rawValue: 1 << 10)
+    public static let screenCapture = CefPermissionKind(rawValue: 1 << 11)
+    public static let systemAudioCapture = CefPermissionKind(rawValue: 1 << 12)
     /// Any requested permission not mapped to a more specific case above.
     public static let other = CefPermissionKind(rawValue: 1 << 31)
 
@@ -68,8 +70,13 @@ public struct CefPermissionKind: OptionSet, Sendable, Hashable {
         var kinds: CefPermissionKind = []
         if value & UInt32(CEF_MEDIA_PERMISSION_DEVICE_AUDIO_CAPTURE.rawValue) != 0 { kinds.insert(.microphone) }
         if value & UInt32(CEF_MEDIA_PERMISSION_DEVICE_VIDEO_CAPTURE.rawValue) != 0 { kinds.insert(.camera) }
-        if value & UInt32(CEF_MEDIA_PERMISSION_DESKTOP_AUDIO_CAPTURE.rawValue) != 0 { kinds.insert(.microphone) }
-        if value & UInt32(CEF_MEDIA_PERMISSION_DESKTOP_VIDEO_CAPTURE.rawValue) != 0 { kinds.insert(.camera) }
+        if value & UInt32(CEF_MEDIA_PERMISSION_DESKTOP_AUDIO_CAPTURE.rawValue) != 0 { kinds.insert(.systemAudioCapture) }
+        if value & UInt32(CEF_MEDIA_PERMISSION_DESKTOP_VIDEO_CAPTURE.rawValue) != 0 { kinds.insert(.screenCapture) }
+        let mappedMask = UInt32(CEF_MEDIA_PERMISSION_DEVICE_AUDIO_CAPTURE.rawValue)
+            | UInt32(CEF_MEDIA_PERMISSION_DEVICE_VIDEO_CAPTURE.rawValue)
+            | UInt32(CEF_MEDIA_PERMISSION_DESKTOP_AUDIO_CAPTURE.rawValue)
+            | UInt32(CEF_MEDIA_PERMISSION_DESKTOP_VIDEO_CAPTURE.rawValue)
+        if value & ~mappedMask != 0 { kinds.insert(.other) }
         return kinds
     }
 
@@ -80,10 +87,14 @@ public struct CefPermissionKind: OptionSet, Sendable, Hashable {
         var mask: UInt32 = 0
         if contains(.microphone) {
             mask |= UInt32(CEF_MEDIA_PERMISSION_DEVICE_AUDIO_CAPTURE.rawValue)
-            mask |= UInt32(CEF_MEDIA_PERMISSION_DESKTOP_AUDIO_CAPTURE.rawValue)
         }
         if contains(.camera) {
             mask |= UInt32(CEF_MEDIA_PERMISSION_DEVICE_VIDEO_CAPTURE.rawValue)
+        }
+        if contains(.systemAudioCapture) {
+            mask |= UInt32(CEF_MEDIA_PERMISSION_DESKTOP_AUDIO_CAPTURE.rawValue)
+        }
+        if contains(.screenCapture) {
             mask |= UInt32(CEF_MEDIA_PERMISSION_DESKTOP_VIDEO_CAPTURE.rawValue)
         }
         return mask & requested
@@ -92,6 +103,8 @@ public struct CefPermissionKind: OptionSet, Sendable, Hashable {
 
 /// How to resolve a ``CefPermissionRequest``.
 public enum CefPermissionDecision: Sendable, Equatable {
+    /// Let Chromium apply its native permission and capture-source UI.
+    case useDefault
     /// Grant the request.
     case allow
     /// Refuse the request.
@@ -118,6 +131,7 @@ extension CefPermissionDecision {
     /// Maps to the `cef_permission_request_result_t` continue value.
     var cefResult: cef_permission_request_result_t {
         switch self {
+        case .useDefault: return CEF_PERMISSION_RESULT_IGNORE
         case .allow: return CEF_PERMISSION_RESULT_ACCEPT
         case .deny: return CEF_PERMISSION_RESULT_DENY
         case .dismiss: return CEF_PERMISSION_RESULT_DISMISS

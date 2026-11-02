@@ -32,6 +32,7 @@ struct NativeActionPopover: View {
   let items: [NativeMenuAction]
   let colors: NativeSpacePalette
   var compactZoom = false
+  var motionScale = 1.0
   var onDismiss: (() -> Void)? = nil
   @Environment(\.dismiss) private var dismiss
   @FocusState private var focus: String?
@@ -97,7 +98,7 @@ struct NativeActionPopover: View {
       }.padding(.horizontal, 8).frame(minHeight: 30)
         .background(colors.ink.opacity(focus == item.id || hovered == item.id ? 0.06 : 0), in: RoundedRectangle(cornerRadius: 6))
         .contentShape(Rectangle())
-    }.buttonStyle(.plain).disabled(!item.enabled).opacity(item.enabled ? 1 : 0.4)
+    }.buttonStyle(NativePressButtonStyle(motionScale: motionScale)).disabled(!item.enabled).opacity(item.enabled ? 1 : 0.4)
       .focused($focus, equals: item.id).id(item.id).accessibilityLabel(item.title)
       .onHover { if $0 { hovered = item.id } else if hovered == item.id { hovered = nil } }
   }
@@ -151,6 +152,7 @@ struct SiteExtensionItem: Identifiable {
   var badgeColor: NSColor?
   var badgeForeground: NSColor?
   var enabled = true
+  var actionEnabled = true
   var pinned = false
   var canPin = true
   var perform: () -> Void = {}
@@ -375,7 +377,7 @@ struct NativePinnedExtensions: View {
           LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: columns), spacing: 6) {
             ForEach(items) { item in
               Button(action: item.perform) {
-                ExtensionTileGlyph(item: item, size: 18, colors: colors).frame(width: side, height: side)
+                ExtensionTileGlyph(item: item, size: 18, colors: colors, dimmed: !item.enabled || !item.actionEnabled).frame(width: side, height: side)
                   .background(colors.ink.opacity(0.045), in: RoundedRectangle(cornerRadius: 9))
                   .shadow(color: .black.opacity(0.05), radius: 2.5, y: 2)
                   .overlay(alignment: .bottomTrailing) {
@@ -386,7 +388,7 @@ struct NativePinnedExtensions: View {
                         .background(item.badgeColor.map(Color.init(nsColor:)) ?? .black, in: RoundedRectangle(cornerRadius: 3)).padding(1)
                     }
                   }
-              }.buttonStyle(.plain).disabled(!item.enabled).help(item.name).accessibilityLabel(item.name)
+              }.buttonStyle(.plain).disabled(!item.enabled || !item.actionEnabled).help(item.name).accessibilityLabel(item.name)
                 .contextMenu { if item.canPin { Button("Unpin extension", action: item.togglePin) } }
             }
           }
@@ -400,10 +402,11 @@ private struct ExtensionTileGlyph: View {
   let item: SiteExtensionItem
   let size: Double
   let colors: NativeSpacePalette
+  var dimmed: Bool? = nil
   var body: some View {
     Group {
       if let image = item.image { Image(nsImage: image).resizable().scaledToFit().frame(width: size, height: size) }
       else { NativeGlyph("extension").frame(width: size, height: size).foregroundStyle(colors.accent) }
-    }.opacity(item.enabled ? 1 : 0.4)
+    }.opacity((dimmed ?? !item.enabled) ? 0.4 : 1)
   }
 }

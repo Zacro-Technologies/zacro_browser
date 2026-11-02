@@ -13,6 +13,7 @@
 #include "chrome/browser/devtools/devtools_window.h"
 #include "chrome/browser/browser_process.h"
 #include "chrome/browser/extensions/browser_window_util.h"
+#include "chrome/browser/extensions/api/side_panel/side_panel_service.h"
 #include "chrome/browser/extensions/webstore_install_with_prompt.h"
 #include "chrome/browser/profiles/profile.h"
 #include "chrome/browser/ui/extensions/extension_action_view_model.h"
@@ -392,12 +393,15 @@ bool CefDevToolsController::DispatchZacro(const std::string_view& message) {
     ReplyZacro(*id, base::DictValue().Set("shortcuts", std::move(shortcuts))); return true;
   }
   if (*method == "Zacro.performExtensionAction" || *method == "Zacro.getExtensionAction" ||
+      *method == "Zacro.openExtensionSidePanel" ||
       *method == "Zacro.performExtensionShortcut") {
     const auto* params = request->FindDict("params");
     const auto* extension_id = params ? params->FindString("id") : nullptr;
     auto* context = inspected_contents_->GetBrowserContext();
     auto* registry = extensions::ExtensionRegistry::Get(context);
     const auto* extension = extension_id && registry ? registry->enabled_extensions().GetByID(*extension_id) : nullptr;
+    if (*method == "Zacro.getExtensionAction" && extension_id && registry)
+      extension = registry->GetInstalledExtension(*extension_id);
     if (*method == "Zacro.performExtensionShortcut") {
       const auto* name = params ? params->FindString("name") : nullptr;
       const auto* binding = params ? params->FindString("keybinding") : nullptr;
@@ -442,26 +446,44 @@ bool CefDevToolsController::DispatchZacro(const std::string_view& message) {
     }
     auto* manager = extensions::ExtensionActionManager::Get(context);
     auto* action = extension && manager ? manager->GetExtensionAction(*extension) : nullptr;
-    if (!action) {
-      if (*method == "Zacro.performExtensionShortcut") ReplyZacro(*id, base::DictValue().Set("performed", false));
-      else ReplyZacro(*id, {}, "This extension has no available toolbar action.");
-      return true;
-    }
+    const auto* info = extension ? extensions::ActionInfo::GetExtensionActionInfo(extension) : nullptr;
+    const bool has_action = info && !info->synthesized;
     const int tab_id = sessions::SessionTabHelper::IdForTab(inspected_contents_).id();
+    auto* panels = extensions::SidePanelService::Get(context);
+    const bool logical_document = extensions::ExtensionTabUtil::IsVisibleToNativeBrowserModel(inspected_contents_);
     if (*method == "Zacro.getExtensionAction") {
+      if (!extension) { ReplyZacro(*id, {}, "The extension is no longer installed."); return true; }
       auto color = [](SkColor value) { return base::ListValue().Append(static_cast<int>(SkColorGetR(value))).Append(static_cast<int>(SkColorGetG(value))).Append(static_cast<int>(SkColorGetB(value))).Append(static_cast<int>(SkColorGetA(value))); };
+      auto options = panels ? panels->GetOptions(*extension, logical_document ? std::optional<int>(tab_id) : std::nullopt)
+          : extensions::api::side_panel::PanelOptions();
       base::DictValue result;
-      result.Set("title", action->GetTitle(tab_id));
-      result.Set("badgeText", action->GetDisplayBadgeText(tab_id));
-      result.Set("badgeColor", color(action->GetBadgeBackgroundColor(tab_id)));
-      result.Set("badgeForeground", color(action->GetBadgeTextColor(tab_id)));
-      result.Set("enabled", action->GetIsVisible(tab_id));
-      auto icon = action->GetExplicitlySetIcon(tab_id);
+      result.Set("title", has_action && action ? action->GetTitle(tab_id) : extension->name());
+      result.Set("badgeText", has_action && action ? action->GetDisplayBadgeText(tab_id) : "");
+      result.Set("badgeColor", color(has_action && action ? action->GetBadgeBackgroundColor(tab_id) : SK_ColorTRANSPARENT));
+      result.Set("badgeForeground", color(has_action && action ? action->GetBadgeTextColor(tab_id) : SK_ColorTRANSPARENT));
+      result.Set("hasAction", has_action);
+      result.Set("hasSidePanel", options.enabled.value_or(false) && options.path.has_value());
+      result.Set("enabled", has_action && action && action->GetIsVisible(tab_id));
+      auto icon = has_action && action ? action->GetExplicitlySetIcon(tab_id) : gfx::Image();
       if (!icon.IsEmpty()) {
         auto png = icon.As1xPNGBytes();
         if (png && png->size() <= 512 * 1024) result.Set("iconPNG", base::Base64Encode(base::span(*png)));
       }
       ReplyZacro(*id, std::move(result)); return true;
+    }
+    if (*method == "Zacro.openExtensionSidePanel") {
+      if (!extension || !panels || !logical_document || !ZacroBrowserContext::Get(context)->IsCommandTarget(inspected_contents_)) {
+        ReplyZacro(*id, {}, "An enabled extension and the selected logical tab are required."); return true;
+      }
+      auto opened = panels->OpenSidePanelForTab(*extension, context, tab_id, std::nullopt, false);
+      if (!opened.has_value()) { ReplyZacro(*id, {}, opened.error()); return true; }
+      ZacroRefreshSidePanelPresentation(inspected_contents_);
+      ReplyZacro(*id, base::DictValue().Set("opened", opened.value())); return true;
+    }
+    if (!has_action || !action || !action->GetIsVisible(tab_id)) {
+      if (*method == "Zacro.performExtensionShortcut") ReplyZacro(*id, base::DictValue().Set("performed", false));
+      else ReplyZacro(*id, {}, "This extension has no enabled toolbar action for the selected tab.");
+      return true;
     }
     auto* browser = extensions::browser_window_util::GetBrowserForTabContents(*inspected_contents_);
     auto* container = browser ? ExtensionsContainer::From(*browser) : nullptr;

@@ -736,6 +736,10 @@ extension BrowserClient {
             return BrowserClientCallbacks.run(handlerSelf, browserID: callbackBrowserID, default: Int32(0)) { _, cefBrowser in
                 let decision = cefBrowser.delegate?.browser(cefBrowser, requestsPermission: request) ?? .deny
                 switch decision {
+                case .useDefault:
+                    // In Chrome runtime this continues into the native source
+                    // chooser and permission policy without granting a mask.
+                    return 0
                 case .allow:
                     callback.pointee.cont?(callback, kinds.mediaMask(within: requestedPermissions))
                 case .deny, .dismiss:
@@ -755,6 +759,7 @@ extension BrowserClient {
             let request = CefPermissionRequest(kinds: kinds, origin: origin)
             return BrowserClientCallbacks.run(handlerSelf, browserID: callbackBrowserID, default: Int32(0)) { _, cefBrowser in
                 let decision = cefBrowser.delegate?.browser(cefBrowser, requestsPermission: request) ?? .deny
+                if decision == .useDefault { return 0 }
                 callback.pointee.cont?(callback, decision.cefResult)
                 return 1
             }

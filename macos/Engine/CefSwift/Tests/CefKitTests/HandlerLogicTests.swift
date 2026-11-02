@@ -67,6 +67,27 @@ struct HandlerLogicTests {
         #expect(CefMenuModel.userCommandIDFirst < CefMenuModel.userCommandIDLast)
     }
 
+    @Test func devicePermissionsDoNotAuthorizeScreenOrSystemAudio() {
+        let device = UInt32(CEF_MEDIA_PERMISSION_DEVICE_AUDIO_CAPTURE.rawValue)
+            | UInt32(CEF_MEDIA_PERMISSION_DEVICE_VIDEO_CAPTURE.rawValue)
+        let desktop = UInt32(CEF_MEDIA_PERMISSION_DESKTOP_AUDIO_CAPTURE.rawValue)
+            | UInt32(CEF_MEDIA_PERMISSION_DESKTOP_VIDEO_CAPTURE.rawValue)
+        let deviceKinds: CefPermissionKind = [.camera, .microphone]
+        #expect(deviceKinds.mediaMask(within: desktop) == 0)
+        #expect(deviceKinds.mediaMask(within: device | desktop) == device)
+        let desktopKinds = CefPermissionKind.fromMediaTypes(desktop)
+        #expect(desktopKinds == [.screenCapture, .systemAudioCapture])
+        #expect(desktopKinds.mediaMask(within: device | desktop) == desktop)
+    }
+
+    @Test func unknownMediaPermissionCannotDisappear() {
+        let value = UInt32(CEF_MEDIA_PERMISSION_DEVICE_AUDIO_CAPTURE.rawValue) | (1 << 31)
+        let kinds = CefPermissionKind.fromMediaTypes(value)
+        #expect(kinds.contains(.microphone))
+        #expect(kinds.contains(.other))
+        #expect(kinds.mediaMask(within: value) == UInt32(CEF_MEDIA_PERMISSION_DEVICE_AUDIO_CAPTURE.rawValue))
+    }
+
     // MARK: Key event mapping
 
     @Test func keyEventMapping() {

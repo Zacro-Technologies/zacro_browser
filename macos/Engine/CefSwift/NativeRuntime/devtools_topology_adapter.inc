@@ -180,11 +180,7 @@ class ZacroBrowserContext : public base::SupportsUserData::Data {
                        host->extension_host_type() == extensions::mojom::ViewType::kExtensionSidePanel)) {
             auto* controller = static_cast<extensions::ExtensionViewHost*>(host)->GetExtensionWindowController();
             auto* browser = controller ? controller->GetBrowserWindowInterface() : nullptr;
-            for (const auto& [id, candidate] : state->tabs_) {
-              if (candidate->web_contents() && extensions::browser_window_util::GetBrowserForTabContents(*candidate->web_contents()) == browser) {
-                value->window_id = candidate->window; break;
-              }
-            }
+            if (auto window = state->WindowForBrowser(browser)) value->window_id = *window;
           }
           return value->context_type != extensions::api::runtime::ContextType::kTab;
         }));
@@ -232,6 +228,11 @@ class ZacroBrowserContext : public base::SupportsUserData::Data {
             for (const auto& [id, tab] : state->tabs_) {
               if (tab->web_contents() && ZacroTabUtil::GetWindowIdOfTab(tab->web_contents()) == *physical) {
                 logical = tab->window; owner = tab->web_contents(); break;
+              }
+            }
+            if (!logical) for (const auto& [window, parked] : state->panel_parking_) {
+              if (parked && ZacroTabUtil::GetWindowIdOfTab(parked.get()) == *physical) {
+                logical = window; owner = parked.get(); break;
               }
             }
             if (!logical) return false;
@@ -311,6 +312,32 @@ class ZacroBrowserContext : public base::SupportsUserData::Data {
     return found != tabs_.end() && found->second->web_contents() == contents &&
         found->second->active && !found->second->closing &&
         focused_window_ == found->second->window;
+  }
+  std::optional<int> WindowForBrowser(BrowserWindowInterface* browser) const {
+    if (!browser) return std::nullopt;
+    for (const auto& [id, tab] : tabs_) if (auto* contents = tab->web_contents(); contents &&
+        extensions::browser_window_util::GetBrowserForTabContents(*contents) == browser) return tab->window;
+    for (const auto& [window, parked] : panel_parking_) if (parked &&
+        extensions::browser_window_util::GetBrowserForTabContents(*parked) == browser) return window;
+    return std::nullopt;
+  }
+  bool OwnsGlobalPanel(content::WebContents* contents, int window) const {
+    const auto found = global_panels_.find(window);
+    return found != global_panels_.end() && found->second.contents.get() == contents;
+  }
+  bool RegisterPanelParking(content::WebContents* contents, int window, std::string& error) {
+    if (!contents || contents->GetBrowserContext() != context_ || window <= 0 ||
+        tabs_.contains(sessions::SessionTabHelper::IdForTab(contents).id()) ||
+        contents->GetVisibleURL() != GURL("about:blank")) {
+      error = "The extension panel parking document is invalid."; return false;
+    }
+    auto found = panel_parking_.find(window);
+    if (found != panel_parking_.end() && found->second && found->second.get() != contents) {
+      error = "This logical window already has a retained panel owner."; return false;
+    }
+    panel_parking_[window] = contents->GetWeakPtr();
+    ReconcileGlobalPanels();
+    return true;
   }
   struct Tab : content::WebContentsObserver {
     explicit Tab(content::WebContents* contents) { Bind(contents); }
@@ -721,6 +748,14 @@ class ZacroBrowserContext : public base::SupportsUserData::Data {
         if (tab->window == *window && tab->active) { target = id; break; }
       }
       auto tab = tabs_.find(target);
+      if (!requested_tab && window && tab == tabs_.end()) {
+        auto parking = panel_parking_.find(*window);
+        if (parking != panel_parking_.end() && parking->second) {
+          auto arguments = args.Clone();
+          arguments[0].GetDict().Set("windowId", ZacroTabUtil::GetWindowIdOfTab(parking->second.get()));
+          function->ReplaceNativeArguments(std::move(arguments)); return false;
+        }
+      }
       if (tab == tabs_.end() || (window && tab->second->window != *window)) {
         std::move(response).Run({}, "The side panel target is not in the requested logical window."); return true;
       }
@@ -804,12 +839,7 @@ class ZacroBrowserContext : public base::SupportsUserData::Data {
     auto* dispatcher = function->dispatcher();
     auto* controller = dispatcher ? dispatcher->GetExtensionWindowController() : nullptr;
     auto* source = controller ? controller->GetBrowserWindowInterface() : nullptr;
-    if (!source) return std::nullopt;
-    for (const auto& [id, tab] : tabs_) {
-      if (auto* contents = tab->web_contents(); contents &&
-          extensions::browser_window_util::GetBrowserForTabContents(*contents) == source) return tab->window;
-    }
-    return std::nullopt;
+    return WindowForBrowser(source);
   }
   bool ScrubValues(const extensions::Extension* extension, extensions::mojom::ContextType type, base::ListValue& values) {
     for (auto& value : values) if (!ScrubValue(extension, type, value)) return false;
@@ -953,12 +983,19 @@ class ZacroBrowserContext : public base::SupportsUserData::Data {
           current->second.contents.get() != panel.contents.get()) continue;
       if (!panel.contents) { global_panels_.erase(current); continue; }
       content::WebContents* destination = nullptr;
+      content::WebContents* fallback = nullptr;
       for (const auto& [id, tab] : tabs_) {
         if (tab->window == window && !tab->closing && tab->web_contents() && !tab->discarded) {
           if (tab->active) { destination = tab->web_contents(); break; }
-          if (!destination && closing_contents == panel.contents.get()) destination = tab->web_contents();
+          if (!fallback && closing_contents == panel.contents.get()) fallback = tab->web_contents();
         }
       }
+      if (!destination) {
+        const auto parking = panel_parking_.find(window);
+        if (parking != panel_parking_.end() && parking->second && !parking->second->IsBeingDestroyed())
+          destination = parking->second.get();
+      }
+      if (!destination) destination = fallback;
       if (!destination || destination == panel.contents.get()) continue;
       auto* source_browser = extensions::browser_window_util::GetBrowserForTabContents(*panel.contents);
       auto* target_browser = extensions::browser_window_util::GetBrowserForTabContents(*destination);
@@ -984,6 +1021,9 @@ class ZacroBrowserContext : public base::SupportsUserData::Data {
   std::optional<int> last_focused_window_;
   std::map<int, std::unique_ptr<Tab>> tabs_;
   std::map<int, GlobalPanel> global_panels_;
+  // These contents own only retained extension UI. They never acquire a
+  // logical tab identity, activeTab grant, or visibility in tabs/debugger APIs.
+  std::map<int, base::WeakPtr<content::WebContents>> panel_parking_;
   std::map<std::string, Group> groups_;
   std::map<std::string, Reservation> reservations_;
   std::map<std::string, std::unique_ptr<Request>> pending_;
@@ -1029,10 +1069,22 @@ bool CefDevToolsController::DispatchZacroTopology(int id, const std::string& met
       method != "Zacro.synchronizeTabs" && method != "Zacro.prepareTabMaterialization" &&
       method != "Zacro.setFocusedWindow" && method != "Zacro.synchronizeGroups" &&
       method != "Zacro.authorizeHostNavigation" && method != "Zacro.validateNavigation" &&
+      method != "Zacro.hasOwnedGlobalPanel" && method != "Zacro.registerPanelParking" &&
       method != "Zacro.navigateApproved") return false;
   if (!params) { ReplyZacro(id, {}, "The native browser parameters are missing."); return true; }
   auto* state = ZacroBrowserContext::Get(inspected_contents_->GetBrowserContext());
   std::string error;
+  if (method == "Zacro.hasOwnedGlobalPanel" || method == "Zacro.registerPanelParking") {
+    const auto window = params->FindInt("windowID");
+    if (!window || *window <= 0) { ReplyZacro(id, {}, "The logical window is invalid."); return true; }
+    if (method == "Zacro.hasOwnedGlobalPanel") {
+      ReplyZacro(id, base::DictValue().Set("owned", state->OwnsGlobalPanel(inspected_contents_, *window)));
+    } else {
+      const bool registered = state->RegisterPanelParking(inspected_contents_, *window, error);
+      ReplyZacro(id, base::DictValue().Set("registered", registered), error);
+    }
+    return true;
+  }
   if (method == "Zacro.authorizeHostNavigation") {
     const auto* request = params->FindString("requestID"); const auto* url = params->FindString("url");
     auto result = request && url ? state->AuthorizeNavigation(*request, *url, error) : base::DictValue();

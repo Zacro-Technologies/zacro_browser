@@ -13,6 +13,8 @@ public final class ChromiumEngine: NSObject {
   private var privateExtensionAccess: [String: Set<String>] = [:]
   private var downloadControls: [String: CefDownloadControl] = [:]
   private var retiredProfiles: Set<String> = []
+  private var profilesUnderMaintenance: Set<String> = []
+  private var profileMaintenanceEpochs: [String: UInt64] = [:]
   private var shuttingDown = false
   private var host: CefChromeBrowser?
   private var capabilities: CefNativeCapabilities?
@@ -240,11 +242,19 @@ public final class ChromiumEngine: NSObject {
       return allowed?.contains(identifier) == true
     }
     page.adoptCurrentDocumentState()
+    page.onSidePanelChangedInternal = { [weak self, weak page] visible in
+      guard visible, let self, let page, !page.id.hasPrefix("panel-parking:") else { return }
+      Task { [weak self, weak page] in
+        guard let self, let page else { return }
+        _ = await self.prepareRetainedPanelBeforeClosing(page)
+      }
+    }
     page.observeDocumentState()
     chrome.beforeClose = { [weak self, weak page] in
       guard let self, let page else { return true }
       if self.isTerminating || page.ownerWindowID.flatMap({ self.contexts[$0]?.isClosing }) == true { return true }
-      return await page.beforeClose?() ?? true
+      guard await page.beforeClose?() ?? true else { return false }
+      return await self.prepareRetainedPanelBeforeClosing(page)
     }
     chrome.browser.onCloseCancelled = { [weak self, weak page] in
       page?.chrome?.cancelPreparedClose()
@@ -285,6 +295,77 @@ public final class ChromiumEngine: NSObject {
       if let callback = page.onPopupCreated { callback(popup, request.disposition.prefersForeground) }
       else if let callback = self.onUnownedPopupCreated { callback(page, popup, request.disposition.prefersForeground) }
       else { popup.close() }
+    }
+  }
+
+  /// A real Chromium owner for global extension UI when its logical window
+  /// temporarily has no live document. It is never a user tab or action target.
+  /// The shell may present this transparent blank BrowserView over its empty
+  /// canvas; selecting a live tab transfers the existing panel back to it.
+  public func parkedExtensionPanel(ownerWindowID: String, profileID: String) -> ChromiumPage? {
+    let id = panelParkingID(ownerWindowID: ownerWindowID, profileID: profileID)
+    guard let page = pages[id], page.isSidePanelVisible else { return nil }
+    return page
+  }
+
+  /// Prevents panel retention from creating documents while a profile-wide
+  /// clear/delete transaction is closing its complete document snapshot.
+  public func setProfileMaintenance(_ profileID: String, active: Bool) {
+    let changed = active ? profilesUnderMaintenance.insert(profileID).inserted
+      : profilesUnderMaintenance.remove(profileID) != nil
+    if changed { profileMaintenanceEpochs[profileID, default: 0] &+= 1 }
+  }
+
+  private func panelParkingID(ownerWindowID: String, profileID: String) -> String {
+    "panel-parking:\(ownerWindowID):\(profileID)"
+  }
+
+  private func prepareRetainedPanelBeforeClosing(_ page: ChromiumPage) async -> Bool {
+    guard !page.isPrivate, !profilesUnderMaintenance.contains(page.profileID),
+      !page.id.hasPrefix("panel-parking:"),
+      capabilities?.extensionBrowser == true, let ownerID = page.ownerWindowID,
+      let context = contexts[ownerID], context.isOpen, !context.isClosing,
+      let browser = page.browser else { return true }
+    let originalID = page.id
+    let maintenanceEpoch = profileMaintenanceEpochs[page.profileID, default: 0]
+    func retentionNoLongerNeeded() -> Bool {
+      isTerminating || context.isClosing || profilesUnderMaintenance.contains(page.profileID)
+        || profileMaintenanceEpochs[page.profileID, default: 0] != maintenanceEpoch
+    }
+    do {
+      let result = try await browser.devTools.call("Zacro.hasOwnedGlobalPanel", parameters: ["windowID": context.nativeID])
+      if retentionNoLongerNeeded() { return true }
+      guard pages[originalID] === page, page.browser === browser, page.ownerWindowID == ownerID,
+        context.isOpen, let owned = result["owned"] as? Bool else { return false }
+      guard owned else { return true }
+      let parkingID = panelParkingID(ownerWindowID: ownerID, profileID: page.profileID)
+      let parking = self.page(id: parkingID, profileID: page.profileID, isPrivate: false,
+        url: URL(string: "about:blank"), ownerWindowID: ownerID)
+      parking.onChange = { [weak context] in context?.onLayout?() }
+      let parkingBrowser = try await parking.ready()
+      let deadline = Date().addingTimeInterval(5)
+      while parking.url?.absoluteString != "about:blank" || parking.isLoading {
+        if retentionNoLongerNeeded() { return true }
+        guard context.isOpen, pages[parkingID] === parking, Date() < deadline else {
+          throw CefDevToolsError.unavailable
+        }
+        try await Task.sleep(for: .milliseconds(20))
+      }
+      if retentionNoLongerNeeded() { return true }
+      guard context.isOpen, pages[originalID] === page, page.ownerWindowID == ownerID,
+        pages[parkingID] === parking, parking.browser === parkingBrowser else { return false }
+      let registered = try await parkingBrowser.devTools.call("Zacro.registerPanelParking",
+        parameters: ["windowID": context.nativeID])
+      if retentionNoLongerNeeded() { return true }
+      guard pages[originalID] === page, page.browser === browser, page.ownerWindowID == ownerID,
+        registered["registered"] as? Bool == true else { return false }
+      // The real view moves only in Chromium's accepted WillDetach callback.
+      // A beforeunload cancellation leaves the source panel untouched.
+      return true
+    } catch {
+      if retentionNoLongerNeeded() { return true }
+      page.reportClosePreparationError("The extension panel could not be retained: " + error.localizedDescription)
+      return false
     }
   }
 
@@ -555,6 +636,7 @@ public final class ChromiumPage: CefBrowserDelegate {
   public private(set) var isSidePanelVisible = false
   private var documentEventToken: UUID?
   private var documentObservation: Task<Void, Never>?
+  fileprivate var onSidePanelChangedInternal: ((Bool) -> Void)?
   public private(set) var canGoBack = false
   public private(set) var canGoForward = false
   public private(set) var progress = 0.0
@@ -600,6 +682,10 @@ public final class ChromiumPage: CefBrowserDelegate {
     canGoForward = browser.canGoForward
   }
 
+  fileprivate func reportClosePreparationError(_ message: String) {
+    error = message; onChange?()
+  }
+
   fileprivate func observeDocumentState() {
     documentObservation?.cancel()
     documentObservation = Task { [weak self] in
@@ -612,7 +698,7 @@ public final class ChromiumPage: CefBrowserDelegate {
           if method == "Zacro.documentAudioChanged", let audible = params["audible"] as? Bool {
             self.isAudible = audible; self.onChange?()
           } else if method == "Zacro.documentSidePanelChanged", let visible = params["visible"] as? Bool {
-            self.isSidePanelVisible = visible; self.onChange?()
+            self.updateSidePanelVisible(visible)
           }
         }
         documentEventToken = token
@@ -620,12 +706,19 @@ public final class ChromiumPage: CefBrowserDelegate {
           let state = try await browser.devTools.call("Zacro.observeDocument", parameters: ["enabled": true])
           guard !Task.isCancelled, self.browser === browser else { return }
           if let audible = state["audible"] as? Bool { isAudible = audible; onChange?() }
-          if let visible = state["sidePanelVisible"] as? Bool { isSidePanelVisible = visible; onChange?() }
+          if let visible = state["sidePanelVisible"] as? Bool { updateSidePanelVisible(visible) }
         } catch {
           browser.devTools.removeEventObserver(token); documentEventToken = nil
         }
       } catch { /* Native creation or shutdown ended observation. */ }
     }
+  }
+
+  private func updateSidePanelVisible(_ visible: Bool) {
+    let changed = isSidePanelVisible != visible
+    isSidePanelVisible = visible
+    onChange?()
+    if changed { onSidePanelChangedInternal?(visible) }
   }
 
   fileprivate init(id: String, profileID: String, isPrivate: Bool) {
@@ -895,6 +988,10 @@ public final class ChromiumPage: CefBrowserDelegate {
   public func browser(_ b: CefBrowser, requestsPermission request: CefPermissionRequest)
     -> CefPermissionDecision
   {
+    if request.kinds.contains(.screenCapture) || request.kinds.contains(.systemAudioCapture) ||
+      URL(string: request.origin)?.scheme?.lowercased() == "chrome-extension" {
+      return .useDefault
+    }
     if let onPermission { return onPermission(request) }
     guard let origin = URL(string: request.origin),
       ["https", "http"].contains(origin.scheme?.lowercased() ?? ""),

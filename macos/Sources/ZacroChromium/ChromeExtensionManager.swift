@@ -110,6 +110,8 @@ public struct ChromeExtensionSnapshot: Decodable, Sendable {
 }
 
 public struct ChromeExtensionAction: Decodable, Sendable {
+  public let hasAction: Bool
+  public let hasSidePanel: Bool
   public let title: String
   public let badgeText: String
   public let badgeColor: [Int]
@@ -431,13 +433,29 @@ public final class ChromeExtensionManager {
     ])
   }
 
-  public func action(_ identifier: String, on page: ChromiumPage) async throws -> ChromeExtensionAction {
+  public func action(_ identifier: String, on page: ChromiumPage? = nil) async throws -> ChromeExtensionAction {
+    try validate(identifier)
+    let browser: CefBrowser
+    if let page {
+      guard page.profileID == profileID, engine.pages[page.id] === page else { throw ChromeExtensionError.managementUnavailable }
+      browser = try await page.ready()
+    } else { browser = try await nativeBrowser() }
+    let result = try await browser.devTools.call("Zacro.getExtensionAction", parameters: ["id": identifier])
+    if let page {
+      guard engine.pages[page.id] === page, page.browser === browser else { throw ChromeExtensionError.managementUnavailable }
+    }
+    return try JSONDecoder().decode(ChromeExtensionAction.self, from: JSONSerialization.data(withJSONObject: result))
+  }
+
+  /// Opens Chromium's actual contextual/global panel in response to an explicit
+  /// native user action. The target must be the selected registered document.
+  public func openSidePanel(_ identifier: String, on page: ChromiumPage) async throws {
     try validate(identifier)
     guard page.profileID == profileID, engine.pages[page.id] === page else { throw ChromeExtensionError.managementUnavailable }
     let browser = try await page.ready()
-    let result = try await browser.devTools.call("Zacro.getExtensionAction", parameters: ["id": identifier])
     guard engine.pages[page.id] === page, page.browser === browser else { throw ChromeExtensionError.managementUnavailable }
-    return try JSONDecoder().decode(ChromeExtensionAction.self, from: JSONSerialization.data(withJSONObject: result))
+    let result = try await browser.devTools.call("Zacro.openExtensionSidePanel", parameters: ["id": identifier])
+    guard result["opened"] as? Bool == true else { throw ChromeExtensionError.invalidResponse }
   }
 
   /// Uses Chromium's verified Web Store installer and native permission UI.

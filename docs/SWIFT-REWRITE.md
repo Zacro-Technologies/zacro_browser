@@ -24,6 +24,18 @@ The branch now vendors CefSwift with Zacro patches for isolated profile contexts
 - Google is the default search engine and page spacing defaults to 4px. Preserve explicit existing settings.
 - Never advertise unsupported controls as working. Disabling an unavailable feature requires an accurate explanation and leaves its parity item open.
 
+## Building the native application
+
+The normal build requires the completed custom Chromium framework and its generated receipt:
+
+```sh
+macos/scripts/build-app.sh --runtime-build /path/to/Release_GN_arm64/zacro-runtime-build.json
+```
+
+The receipt must match the pinned revisions, current native adapters, framework binary, resources and links. Packaging verifies it before assembly and copies its provenance into the app. A local framework is copied and normalized without changing the compiler's output. The build defaults to ad-hoc signing; this is not notarized distribution. `--output` selects another destination, and `--sign` supplies an explicitly chosen identity.
+
+`--stock-runtime` is an explicit diagnostic alternative. It cannot validate native extension integration and must not be presented as the completed browser. The final custom app must pass `macos/scripts/check-app.py --integration --require-extensions`, plus the outstanding desktop interaction and distribution checks in [the verification record](native-parity/verification.md).
+
 ## Required parity and acceptance
 
 | Area | Required native behavior | Acceptance evidence |

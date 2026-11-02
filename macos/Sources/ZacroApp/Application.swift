@@ -104,6 +104,7 @@ final class BrowserWindowCoordinator: NSObject {
   private var windowCloseWaiters: [CheckedContinuation<Bool, Never>] = []
   private var discardingPages = Set<String>()
   private var mediaPermissionPages = Set<String>()
+  private var permissionPrompts = Set<String>()
   private var idleSweep: Task<Void, Never>?
   private lazy var extensions = NativeExtensionsModel(store: store, engine: engine, actions: actions)
   private var siteControlsInitialized = false
@@ -413,7 +414,9 @@ final class BrowserWindowCoordinator: NSObject {
     }.store(in: &observations)
   }
   private func passesThrough(_ point: NSPoint) -> Bool {
-    guard let host, store.state.activeTab != nil, !actions.palette,
+    guard let host,
+      store.state.activeTab != nil || engine.parkedExtensionPanel(ownerWindowID: windowContext.id, profileID: store.activeProfileID) != nil,
+      !actions.palette,
       actions.library == nil, !actions.themeEditor
     else { return false }
     let top = CGPoint(x: point.x, y: host.isFlipped ? point.y : host.bounds.height - point.y)
@@ -699,6 +702,10 @@ final class BrowserWindowCoordinator: NSObject {
       guard let self, let page, self.owns(page, tabID: tabID), !self.navigation.isRestoring(page),
         !self.reservedPages.contains(page.id), !self.discardingPages.contains(page.id), !self.dormantPages.contains(page.id) else { return }
       defer { self.extensionBrowser.reconcile() }
+      if !peek, page.isLoading != self.actions.loadingTabIDs.contains(tabID) {
+        if page.isLoading { self.actions.loadingTabIDs.insert(tabID) }
+        else { self.actions.loadingTabIDs.remove(tabID) }
+      }
       if page.isSidePanelVisible != self.sidePanelPageIDs.contains(page.id) {
         if page.isSidePanelVisible { self.sidePanelPageIDs.insert(page.id) }
         else { self.sidePanelPageIDs.remove(page.id) }
@@ -868,10 +875,7 @@ final class BrowserWindowCoordinator: NSObject {
       guard let self, let page else { return }
       self.finishCloseWaiters(page.id, accepted: false)
       self.peekClosingSnapshots.removeValue(forKey: tabID)
-      if self.profileDeletionPageIDs.remove(page.id) != nil {
-        self.pendingDeletion = nil; self.deletingProfileID = nil
-        let cancel = self.scopeCloseCancelled; self.scopeCloseCancelled = nil; cancel?()
-      }
+      self.application.cancelProfileOperation(forPage: page.id)
       self.scheduleLayout()
     }
     let muted = store.document(id: page.id)?.isMuted ?? false
@@ -1001,6 +1005,12 @@ final class BrowserWindowCoordinator: NSObject {
     }
     let loaded = Set(store.state.tabs.compactMap { engine.pages[$0.id] == nil || dormantPages.contains($0.id) || reservedPages.contains($0.id) ? nil : $0.id })
     if actions.loadedTabIDs != loaded { actions.loadedTabIDs = loaded }
+    let loading = Set(store.state.tabs.compactMap { tab -> String? in
+      guard let page = engine.pages[tab.id], page.ownerWindowID == windowContext.id,
+        page.isLoading, !dormantPages.contains(tab.id), !reservedPages.contains(tab.id) else { return nil }
+      return tab.id
+    })
+    if actions.loadingTabIDs != loading { actions.loadingTabIDs = loading }
     if let pending = pendingDeletion, pending.0.allSatisfy({ engine.pages[$0] == nil }) {
       pendingDeletion = nil
       profileDeletionPageIDs.subtract(pending.0)
@@ -1052,6 +1062,10 @@ final class BrowserWindowCoordinator: NSObject {
     } else {
       updateNavigationState(nil)
     }
+    if desired.isEmpty, deletingProfileID != store.activeProfileID,
+      let parking = engine.parkedExtensionPanel(ownerWindowID: windowContext.id, profileID: store.activeProfileID) {
+      desired[parking.id] = (parking, contentFrame)
+    }
     // Persistent tabs keep their native document and layer attached. Only
     // actual visibility/frame changes reach Chromium, avoiding hide/show flash.
     for entry in desired.values { entry.0.setCornerRadius(isPopup ? 0 : store.state.settings.pageRadius) }
@@ -1084,7 +1098,8 @@ final class BrowserWindowCoordinator: NSObject {
     }
     let ids = Set(store.state.tabs.filter { !$0.isClosed }.map(\.id))
     for id in Array(windowPages.keys) {
-      if id.hasPrefix("extensions:") || id.hasPrefix("extension-store:") || id.hasPrefix("maintenance:") { continue }
+      if id.hasPrefix("extensions:") || id.hasPrefix("extension-store:") || id.hasPrefix("maintenance:")
+        || id.hasPrefix("panel-parking:") { continue }
       if id.hasPrefix("peek:") {
         let source = String(id.dropFirst(5))
         if !ids.contains(source) || store.tab(source)?.peek == nil { retirePage(id: id) }
@@ -1219,7 +1234,7 @@ final class BrowserWindowCoordinator: NSObject {
     else { store.closePeek(tabID: id) }
   }
   func find() {
-    actions.findVisible = true
+    actions.openFind()
   }
   func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
     let menu = NSMenu()
@@ -1813,6 +1828,12 @@ extension BrowserWindowCoordinator {
     return page
   }
   private func installServices() {
+    extensions.invokeSidePanel = { [weak self] profile, identifier in
+      guard let self else { throw CancellationError() }
+      let page = try await self.extensionActionPage(profileID: profile)
+      try await ChromeExtensionManager(engine: self.engine, profileID: profile)
+        .openSidePanel(identifier, on: page)
+    }
     extensions.invokeOptions = { [weak self] profile, identifier in
       guard let self, self.store.activeProfileID == profile, self.store.state.activeProfile?.isPrivate == false,
         self.windowContext.isOpen, !self.windowContext.isClosing, !self.engine.isTerminating else { throw CancellationError() }
@@ -1935,25 +1956,48 @@ extension BrowserWindowCoordinator {
     return results
   }
   private func requestPermission(_ request: CefPermissionRequest, page: ChromiumPage) -> CefPermissionDecision {
+    guard mayRequestPermission(page) else { return .deny }
+    // Extension permission policy and screen/source selection belong to Chromium.
+    // A saved camera or microphone choice must never authorize screen sharing.
+    if URL(string: request.origin)?.scheme?.lowercased() == "chrome-extension"
+      || !request.kinds.intersection([.screenCapture, .systemAudioCapture]).isEmpty {
+      return .useDefault
+    }
     guard let url = BrowserAddress.webURL(request.origin), !request.kinds.contains(.other), !request.kinds.isEmpty else { return .deny }
     var origin = URLComponents(); origin.scheme = url.scheme; origin.host = url.host; origin.port = url.port
     guard let key = origin.url?.absoluteString else { return .deny }
     let kinds: [(CefPermissionKind,String,String)] = [(.camera,"camera","camera"),(.microphone,"microphone","microphone"),(.geolocation,"geolocation","location"),(.notifications,"notifications","notifications"),(.clipboard,"clipboard","clipboard"),(.midi,"midi","MIDI devices"),(.pointerLock,"pointer-lock","pointer lock"),(.storageAccess,"storage-access","site storage"),(.sensors,"sensors","sensors"),(.windowManagement,"window-management","window management"),(.downloads,"downloads","multiple downloads")]
     let requested = kinds.filter { request.kinds.contains($0.0) }
+    guard !requested.isEmpty else { return .deny }
     if requested.contains(where: { store.savedPermission(profileID: page.profileID, origin: key, permission: $0.1) == false }) { return .deny }
     if requested.allSatisfy({ store.savedPermission(profileID: page.profileID, origin: key, permission: $0.1) == true }) {
       if !request.kinds.intersection([.camera, .microphone]).isEmpty { mediaPermissionPages.insert(page.id) }
       return .allow
     }
+    let promptID = "\(page.profileID):\(key):\(request.kinds.rawValue)"
+    guard permissionPrompts.insert(promptID).inserted else { return .deny }
+    defer { permissionPrompts.remove(promptID) }
     let originalURL = page.url
     let alert = NSAlert(); alert.messageText = "Allow \(url.host ?? request.origin) to use \(requested.map { $0.2 }.joined(separator: ", "))?"
+    alert.informativeText = "Profile: \(store.state.profiles.first(where: { $0.id == page.profileID })?.name ?? "Personal")"
+    alert.showsSuppressionButton = true
+    alert.suppressionButton?.title = "Remember for this site"
+    alert.suppressionButton?.state = .off
     alert.addButton(withTitle: "Don’t Allow"); alert.addButton(withTitle: "Allow")
     let allowed = alert.runModal() == .alertSecondButtonReturn
-    guard page.url == originalURL, engine.pages[page.id] === page,
+    guard mayRequestPermission(page), page.url == originalURL, engine.pages[page.id] === page,
       store.state.profiles.contains(where: { $0.id == page.profileID }) else { return .deny }
-    for kind in requested { store.setPermission(profileID: page.profileID, origin: key, permission: kind.1, allowed: allowed) }
+    if alert.suppressionButton?.state == .on {
+      for kind in requested { store.setPermission(profileID: page.profileID, origin: key, permission: kind.1, allowed: allowed) }
+    }
     if allowed && !request.kinds.intersection([.camera, .microphone]).isEmpty { mediaPermissionPages.insert(page.id) }
     return allowed ? .allow : .deny
+  }
+  private func mayRequestPermission(_ page: ChromiumPage) -> Bool {
+    windowContext.isOpen && !windowContext.isClosing && !engine.isTerminating
+      && engine.pages[page.id] === page && page.ownerWindowID == windowContext.id
+      && store.activeProfileID == page.profileID
+      && (activePage === page || visiblePageFrames[page.id] != nil)
   }
   private func libraryAction(_ action: String, payload: [String:String]) async throws {
     guard !windowContext.isClosing, !engine.isTerminating else { throw CancellationError() }
@@ -2061,6 +2105,10 @@ extension BrowserWindowCoordinator {
       let profile = store.state.profiles.first(where: { $0.id == profileID }) else {
       throw ShortcutError("Finish the current profile operation first.")
     }
+    // Reserve the shared profile operation before creating or awaiting a native
+    // maintenance page. A second window must not replace its close continuation.
+    deletingProfileID = profileID
+    defer { deletingProfileID = nil; scheduleLayout() }
     let maintenance = engine.page(id: "maintenance:" + profileID, profileID: profileID,
       isPrivate: profile.isPrivate, url: URL(string: "about:blank")!, ownerWindowID: nil)
     defer { maintenance.close() }
@@ -2069,19 +2117,16 @@ extension BrowserWindowCoordinator {
     guard try await browser.nativeCapabilities().browsingData else {
       throw ShortcutError("The Chromium runtime cannot clear all site data.")
     }
-    if !profile.isPrivate && store.activeProfileID == profileID {
-      _ = try await services.aiAction("ai:reset", payload: [:])
+    if !profile.isPrivate {
+      await services.resetAIConversations(profileID: profileID)
     }
-    deletingProfileID = profileID
     navigation.beginProfileReset(profileID)
     application.bookmarks.removeProfile(profileID)
     downloads.removeProfile(profileID)
     await extensionSync.pauseProfile(profileID)
     defer {
-      deletingProfileID = nil
       navigation.endProfileReset(profileID)
       extensionSync.resumeProfile(profileID)
-      scheduleLayout()
     }
     let documents = engine.pages.values.filter { $0.profileID == profileID && $0 !== maintenance }
     let ids = Set(documents.map(\.id))
@@ -2103,11 +2148,18 @@ extension BrowserWindowCoordinator {
     try store.clearHistoryDurably(profileID: profileID)
     try store.clearPermissionsDurably(profileID: profileID)
     try await navigation.clearSavedHistory(profileID: profileID)
-    let tabs = store.state.tabs.filter { store.profileID(for: $0) == profileID }
-    for tab in tabs {
-      if tab.peek != nil { store.closePeek(tabID: tab.id) }
-      actions.icons.removeValue(forKey: tab.id); actions.iconColors.removeValue(forKey: tab.id)
-      actions.peekIcons.removeValue(forKey: tab.id)
+    let tabs = application.store.state.tabs.filter { application.store.profileID(for: $0) == profileID }
+    let tabIDs = Set(tabs.map(\.id))
+    try application.store.commit(purgeRecovery: true) { state in
+      for index in state.tabs.indices where tabIDs.contains(state.tabs[index].id) {
+        state.tabs[index].peek = nil
+      }
+    }
+    for owner in application.windows.values {
+      for id in tabIDs {
+        owner.actions.icons.removeValue(forKey: id); owner.actions.iconColors.removeValue(forKey: id)
+        owner.actions.peekIcons.removeValue(forKey: id)
+      }
     }
     favicons.clear(profile: profileID)
   }

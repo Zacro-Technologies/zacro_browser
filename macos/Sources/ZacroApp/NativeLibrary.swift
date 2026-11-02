@@ -112,7 +112,7 @@ struct NativeLibrary: View {
           Button {
             actions.library = item
           } label: {
-            Label(item == "AI" ? "Ask AI" : item, systemImage: symbol(item))
+            Label { Text(item == "AI" ? "Ask AI" : item) } icon: { NativeGlyph(symbol(item)) }
           }
         }
       } label: {
@@ -139,17 +139,23 @@ struct NativeLibrary: View {
     if section == "Settings" {
       settings
     } else if section == "Downloads" {
-      ScrollView {
-        if downloads.isEmpty { emptyState }
-        else {
-          LazyVStack(alignment: .leading, spacing: 5) {
-            ForEach(downloadGroups, id: \.label) { group in
-              groupHeading(group.label, count: group.items.count)
-              ForEach(group.items) { download in downloadRow(download) }
-            }
-          }.padding(.horizontal, 12).padding(.bottom, 12)
-        }
-      }.scrollIndicators(.hidden)
+      ScrollViewReader { reader in
+        ScrollView {
+          if downloads.isEmpty { emptyState }
+          else {
+            LazyVStack(alignment: .leading, spacing: 5) {
+              ForEach(downloadGroups, id: \.label) { group in
+                groupHeading(group.label, count: group.items.count)
+                ForEach(group.items) { download in downloadRow(download).id(download.id) }
+              }
+            }.padding(.horizontal, 12).padding(.bottom, 12)
+          }
+        }.scrollIndicators(.hidden)
+          .onChange(of: focus) { _, id in
+            guard let id, downloads.contains(where: { $0.id == id }) else { return }
+            reader.scrollTo(id)
+          }
+      }
     } else if section == "Windows" {
       ScrollViewReader { reader in
         ScrollView {
@@ -356,7 +362,8 @@ struct NativeLibrary: View {
           NativeGlyph(paused || resumable ? "play" : "pause").frame(width: 24, height: 26)
         }.buttonStyle(.plain).help(paused || resumable ? "Resume download" : "Pause download")
       }
-      Menu {
+      if (complete && item.path != nil) || (running && actions.libraryCapabilities.contains("download:cancel")) {
+       Menu {
         if complete, let path = item.path {
           Button("Open file") { NSWorkspace.shared.open(URL(fileURLWithPath: path)) }
           if actions.libraryCapabilities.contains("download:rename") {
@@ -375,7 +382,14 @@ struct NativeLibrary: View {
       } label: { NativeGlyph("ellipsis").frame(width: 24, height: 26) }
         .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
         .accessibilityLabel("Actions for \(item.filename)")
-    }.padding(8).background(colors.ink.opacity(0.025), in: RoundedRectangle(cornerRadius: 9))
+      }
+    }.padding(8).background(focus == item.id ? colors.card.opacity(0.46) : colors.ink.opacity(0.025), in: RoundedRectangle(cornerRadius: 9))
+      .focusable().focusEffectDisabled().focused($focus, equals: item.id)
+      .onKeyPress(.downArrow) { moveFocus(item.id, offset: 1); return .handled }
+      .onKeyPress(.upArrow) { moveFocus(item.id, offset: -1); return .handled }
+      .onKeyPress(.home) { focus = downloads.first?.id; return .handled }
+      .onKeyPress(.end) { focus = downloads.last?.id; return .handled }
+      .accessibilityElement(children: .contain).accessibilityLabel(item.filename)
       .disabled(busy.contains(item.id))
   }
 
@@ -490,7 +504,7 @@ struct NativeLibrary: View {
           Button {
             value.wrappedValue = options[index].0
           } label: {
-            if options[index].0 == value.wrappedValue { Label(options[index].1, systemImage: "checkmark") }
+            if options[index].0 == value.wrappedValue { Label { Text(options[index].1) } icon: { NativeGlyph("check") } }
             else { Text(options[index].1) }
           }
         }
@@ -596,12 +610,12 @@ struct NativeLibrary: View {
   private func symbol(_ section: String) -> String {
     switch section {
     case "Bookmarks": "bookmark"
-    case "History": "clock.arrow.circlepath"
-    case "Downloads": "arrow.down.circle"
-    case "Archive": "archivebox"
-    case "Windows": "square.stack"
-    case "Settings": "gearshape"
-    case "Extensions": "puzzlepiece.extension"
+    case "History": "history"
+    case "Downloads": "download"
+    case "Archive": "archive"
+    case "Windows": "layers"
+    case "Settings": "settings"
+    case "Extensions": "extension"
     default: "sparkles"
     }
   }

@@ -1,14 +1,45 @@
 #!/bin/bash
 set -euo pipefail
 native_root="$(cd "$(dirname "$0")/.." && pwd)"
+native_output="$native_root/dist"
+native_sign="-"
+native_runtime_record="${ZACRO_RUNTIME_BUILD:-$native_root/.build/native-runtime/zacro-runtime-build.json}"
+native_stock=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --runtime-build|--output|--sign)
+      [[ $# -ge 2 ]] || { echo "Missing value for $1" >&2; exit 2; }
+      case "$1" in
+        --runtime-build) native_runtime_record="$2" ;;
+        --output) native_output="$2" ;;
+        --sign) native_sign="$2" ;;
+      esac
+      shift 2 ;;
+    --stock-runtime) native_stock=1; shift ;;
+    --help|-h)
+      echo 'Usage: build-app.sh [--runtime-build receipt.json] [--output directory] [--sign identity]'
+      echo 'Requires the pinned custom Chromium runtime. --stock-runtime is for diagnostic builds only.'
+      exit 0 ;;
+    *) echo "Unknown build option: $1" >&2; exit 2 ;;
+  esac
+done
+native_framework_args=()
+if [[ "$native_stock" == 0 ]]; then
+  native_framework="$(python3 -B "$native_root/scripts/validate-runtime.py" "$native_runtime_record")"
+  native_framework_args=(--framework "$native_framework")
+else
+  echo 'Building a diagnostic app with stock CEF; native extension integration is unavailable.' >&2
+fi
+mkdir -p "$native_output"
+native_output="$(cd "$native_output" && pwd)"
 swift package --package-path "$native_root" \
   --allow-writing-to-package-directory --allow-network-connections all \
   cef bundle --product ZacroNative --configuration release \
   --manifest "$native_root/Engine/CefSwift/CEF_VERSION.json" \
   --bundle-id com.zacro.browser.native --name 'Zacro Native' \
-  "$@"
+  --output "$native_output" --sign "$native_sign" ${native_framework_args[@]+"${native_framework_args[@]}"}
 
-native_app="$native_root/dist/Zacro Native.app"
+native_app="$native_output/Zacro Native.app"
 native_licenses="$native_app/Contents/Resources/Licenses"
 native_providers="$native_app/Contents/Resources/Providers"
 mkdir -p "$native_licenses" "$native_providers"
@@ -44,9 +75,13 @@ cp "$native_root/Engine/CefSwift/Sources/CCef/LICENSE.CEF.txt" "$native_licenses
 cp "$native_root/../assets/CODEX-LICENSE.txt" "$native_licenses/Codex.txt"
 python3 "$native_root/scripts/configure-app-plist.py" "$native_app/Contents/Info.plist" --version 0.11.0
 plutil -lint "$native_app/Contents/Info.plist"
+if [[ "$native_stock" == 0 ]]; then
+  python3 -B "$native_root/scripts/validate-runtime.py" "$native_runtime_record" \
+    --write-provenance "$native_app/Contents/Resources/zacro-runtime-build.json" > /dev/null
+fi
 # This script produces development bundles only. Re-sign the changed outer
 # resources without weakening the already-signed Chromium helper entitlements.
-codesign --force --sign - --preserve-metadata=entitlements,requirements,flags "$native_providers/codex"
-codesign --force --sign - "$native_providers/ZacroTextExtractor"
-codesign --force --sign - --preserve-metadata=entitlements,requirements,flags "$native_app"
+codesign --force --sign "$native_sign" --preserve-metadata=entitlements,requirements,flags "$native_providers/codex"
+codesign --force --sign "$native_sign" "$native_providers/ZacroTextExtractor"
+codesign --force --sign "$native_sign" --preserve-metadata=entitlements,requirements,flags "$native_app"
 codesign --verify --deep --strict "$native_app"

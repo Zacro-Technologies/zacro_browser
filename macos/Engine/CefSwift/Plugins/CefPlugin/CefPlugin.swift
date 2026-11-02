@@ -54,6 +54,7 @@ struct CefPlugin: CommandPlugin {
       bundle --product <Name> [--configuration debug|release] [--flavor minimal|standard]
              [--platform macosarm64|macosx64] [--output <dir>] [--bundle-id <id>]
              [--name <DisplayName>] [--manifest <path>] [--sign <identity|->]
+             [--framework <local-framework-path>]
           Build <Name> and cef-helper, then assemble a runnable <Name>.app
           (framework + five helper apps + Info.plists + codesign).
           --sign: codesign identity; '-' forces ad-hoc. Default: auto-detect
@@ -61,6 +62,8 @@ struct CefPlugin: CommandPlugin {
           ad-hoc). Precedence: --sign > cefapp.json "signingIdentity" > auto.
           Default output: <packageDir>/dist/<Name>.app.
           Optional per-product overrides: cefapp.json next to the target sources.
+          --framework: use a locally built framework instead of downloading the
+          stock distribution. Its source directory is never modified.
 
       info
           Print the pinned CEF version and the state of the .cef/ cache.
@@ -106,6 +109,7 @@ struct CefPlugin: CommandPlugin {
         let bundleIDOption = extractor.extractOption(named: "bundle-id").last
         let nameOption = extractor.extractOption(named: "name").last
         let signOption = extractor.extractOption(named: "sign").last
+        let frameworkPath = extractor.extractOption(named: "framework").last
         // Hidden flags for testing the assembler without buildable products,
         // and for forcing the CLI build fallback.
         let testExe = extractor.extractOption(named: "_test-exe").last
@@ -129,9 +133,18 @@ struct CefPlugin: CommandPlugin {
 
         // 1. CEF distribution (downloads on first use).
         let manifest = try CefManifest.resolve(context: context, explicitPath: manifestPath)
-        let downloader = Downloader(cacheRoot: cacheRoot(context: context))
-        let dist = try downloader.ensure(manifest: manifest, platform: platform, flavor: flavor)
-        let framework = downloader.frameworkURL(in: dist)
+        let framework: URL
+        if let frameworkPath {
+            framework = URL(fileURLWithPath: frameworkPath, relativeTo: context.package.directoryURL).absoluteURL
+            guard framework.lastPathComponent == "Chromium Embedded Framework.framework" else {
+                throw CefPluginError("--framework must name Chromium Embedded Framework.framework.")
+            }
+            try FrameworkLayout.validate(framework: framework)
+        } else {
+            let downloader = Downloader(cacheRoot: cacheRoot(context: context))
+            let dist = try downloader.ensure(manifest: manifest, platform: platform, flavor: flavor)
+            framework = downloader.frameworkURL(in: dist)
+        }
 
         // 2. Build the product and the cef-helper.
         let mainExecutable: URL

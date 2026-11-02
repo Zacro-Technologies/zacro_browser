@@ -25,6 +25,7 @@ final class NativeExtensionsModel: ObservableObject {
   private var shortcutRequest: Task<Void, Never>?
   private var shortcutGeneration = 0
   private var recordingObservation: AnyCancellable?
+  private var recordingFocusObservation: AnyCancellable?
   private var recordingTask: Task<Void, Never>?
   private var recordingGeneration = 0
   private var suspendedProfile: String?
@@ -38,6 +39,7 @@ final class NativeExtensionsModel: ObservableObject {
   private var actionIcons: [String: NSImage] = [:]
   var invokeAction: ((String, String, NSRect?) async throws -> Void)?
   var invokeOptions: ((String, String) async throws -> Void)?
+  var invokeSidePanel: ((String, String) async throws -> Void)?
   init(store: BrowserStore, engine: ChromiumEngine, actions: BrowserActions) {
     self.store = store; self.engine = engine; self.actions = actions
     recordingObservation = actions.$recordingShortcut.removeDuplicates().sink { [weak self] active in
@@ -112,13 +114,16 @@ final class NativeExtensionsModel: ObservableObject {
     guard valid(profile,revision) else { return }
     actions.siteControls.extensions = entries.map { entry in
       let state = actionStates[entry.id]
+      let usableAction = entry.isEnabled && state?.hasAction == true && state?.enabled == true
+      let operation = usableAction ? "action" : entry.isEnabled && state?.hasSidePanel == true ? "side-panel"
+        : entry.isEnabled && entry.optionsPage != nil ? "options" : "manage"
       return SiteExtensionItem(id: entry.id, name: state?.title.isEmpty == false ? state!.title : entry.name,
         image: actionIcons[entry.id] ?? icons[entry.id], badgeText: state?.badgeText ?? "",
         badgeColor: state.flatMap { Self.color($0.badgeColor) },
         badgeForeground: state.flatMap { Self.color($0.badgeForeground) },
-        enabled: entry.isEnabled && (state?.enabled ?? true),
-        pinned: entry.isPinned, canPin: entry.userMayModify,
-        perform: { [weak self] in self?.perform("action", id: entry.id, expectedProfile: profile) },
+        enabled: entry.isEnabled, actionEnabled: usableAction,
+        pinned: entry.isPinned && state?.hasAction == true, canPin: entry.userMayModify && state?.hasAction == true,
+        perform: { [weak self] in self?.perform(operation, id: entry.id, expectedProfile: profile) },
         togglePin: { [weak self] in self?.perform(entry.isPinned ? "unpin" : "pin", id: entry.id, expectedProfile: profile) })
     }
     actions.siteControls.extensionsReady = true; actions.siteControls.extensionError = nil
@@ -171,18 +176,21 @@ final class NativeExtensionsModel: ObservableObject {
     if let scope { publish(scope, generation) }
     refreshActions()
   }
+  func canPin(_ identifier: String) -> Bool {
+    entries.first(where: { $0.id == identifier })?.userMayModify == true && actionStates[identifier]?.hasAction == true
+  }
   private func refreshActions() {
     actionRequest?.cancel(); actionGeneration += 1
-    guard let page = activeDocument, page.profileID == store.activeProfileID,
-      !isPrivate, let windowID = page.ownerWindowID, windowID == store.owningWindowID,
+    guard !isPrivate, let windowID = store.owningWindowID,
       let context = engine.context(id: windowID), context.isOpen, !context.isClosing else { return }
+    let page = activeDocument
+    if let page, page.profileID != store.activeProfileID || page.ownerWindowID != windowID { return }
     let profile = store.activeProfileID, revision = generation, actionRevision = actionGeneration
     actionRequest = Task { [weak self, weak page] in
-      do { try await Task.sleep(for: .milliseconds(40)) } catch { return }
-      guard let self, let page, self.valid(profile, revision) else { return }
+      guard let self else { return }
       let manager = ChromeExtensionManager(engine: self.engine, profileID: profile)
       var states: [String: ChromeExtensionAction] = [:], images: [String: NSImage] = [:]
-      for entry in self.entries where entry.isEnabled {
+      for entry in self.entries {
         guard !Task.isCancelled, self.activeDocument === page, self.actionGeneration == actionRevision else { return }
         if let state = try? await manager.action(entry.id, on: page) {
           states[entry.id] = state
@@ -191,8 +199,9 @@ final class NativeExtensionsModel: ObservableObject {
         }
       }
       guard self.valid(profile, revision), self.activeDocument === page,
-        page.ownerWindowID == windowID, context.isOpen, !context.isClosing,
+        page == nil || page?.ownerWindowID == windowID, context.isOpen, !context.isClosing,
         self.actionGeneration == actionRevision else { return }
+      self.objectWillChange.send()
       self.actionStates = states; self.actionIcons = images
       self.publish(profile, revision)
     }
@@ -226,6 +235,10 @@ final class NativeExtensionsModel: ObservableObject {
         case "options":
           guard let invoke = self.invokeOptions else { throw ChromeExtensionError.managementUnavailable }
           try await invoke(profile, id)
+        case "side-panel":
+          guard let invoke = self.invokeSidePanel else { throw ChromeExtensionError.managementUnavailable }
+          try await invoke(profile, id)
+        case "manage": self.actions.openExtensions()
         case "file-access": try await manager.setFileAccess(id, allowed: value == "true")
         case "user-scripts": try await manager.setUserScriptsAccess(id, allowed: value == "true")
         case "incognito": try await manager.setIncognitoAccess(id, allowed: value == "true")
@@ -268,6 +281,18 @@ final class NativeExtensionsModel: ObservableObject {
     if !active { recordingCommand = nil }
     recordingGeneration += 1
     let revision = recordingGeneration, previous = suspendedProfile
+    recordingFocusObservation = nil
+    if active, let window = NSApp.keyWindow {
+      // A key window can retain its first responder when it loses focus. End
+      // recording even while native suspension is still being prepared.
+      recordingFocusObservation = NotificationCenter.default.publisher(for: NSWindow.didResignKeyNotification, object: window)
+        .merge(with: NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification))
+        .receive(on: RunLoop.main)
+        .sink { [weak self] _ in
+          guard let self, self.recordingGeneration == revision, self.actions.recordingShortcut else { return }
+          self.recordShortcut(nil)
+        }
+    }
     let profile = active ? (isPrivate ? store.state.profiles.first(where: { !$0.isPrivate })?.id : store.activeProfileID) : nil
     suspendedProfile = profile
     actions.shortcutCaptureReady = false; actions.shortcutCaptureError = nil
@@ -469,7 +494,7 @@ private struct NativeExtensionCard: View {
           .fixedSize(horizontal: false, vertical: true).accessibilityLabel(notices.joined(separator: ". "))
       }
       HStack {
-        Button(item.isPinned ? "Unpin":"Pin") { model.perform(item.isPinned ? "unpin":"pin",id:item.id) }.disabled(!item.userMayModify)
+        Button(item.isPinned ? "Unpin":"Pin") { model.perform(item.isPinned ? "unpin":"pin",id:item.id) }.disabled(!model.canPin(item.id))
         if item.optionsPage != nil { Button("Options") { model.perform("options",id:item.id) }.disabled(!item.isEnabled) }
         Spacer()
         Menu {
@@ -582,6 +607,7 @@ private struct NativeExtensionCommands: View {
   @ObservedObject var model: NativeExtensionsModel
   let palette: NativeSpacePalette
   @State private var recording: String?
+  @State private var recordingSession = UUID()
   @State private var saving: String?
   @State private var error: String?
 
@@ -594,8 +620,9 @@ private struct NativeExtensionCommands: View {
             HStack(spacing: 6) {
               if recording == command.name && model.recordingCommand == item.id + ":" + command.name {
                 if model.recordingReady {
+                  let session = recordingSession
                   NativeExtensionShortcutCapture(ink: NSColor(palette.ink), surface: NSColor(palette.card.opacity(0.35))) { result in
-                    guard recording == command.name else { return }
+                    guard recording == command.name, recordingSession == session else { return }
                   switch result {
                   case .cancel: stopRecording()
                   case .invalid(let message): error = message
@@ -603,7 +630,7 @@ private struct NativeExtensionCommands: View {
                     stopRecording()
                     save(command.name) { try await model.updateShortcut(extensionID: item.id, commandName: command.name, keybinding: value) }
                   }
-                  }.frame(minWidth: 95, maxWidth: .infinity).frame(height: 28)
+                  }.id(session).frame(minWidth: 95, maxWidth: .infinity).frame(height: 28)
                 } else {
                   if let message = model.recordingError {
                     Text(message).font(.system(size: 10)).fixedSize(horizontal: false, vertical: true)
@@ -613,7 +640,7 @@ private struct NativeExtensionCommands: View {
                 }
               } else {
                 Button {
-                  error = nil; recording = command.name; model.recordShortcut(item.id + ":" + command.name)
+                  error = nil; recordingSession = UUID(); recording = command.name; model.recordShortcut(item.id + ":" + command.name)
                 } label: {
                   Text(command.keybinding.isEmpty ? "Not set" : command.keybinding)
                     .font(.system(size: 12, weight: .medium, design: .rounded))
@@ -696,7 +723,7 @@ private struct NativeExtensionShortcutCapture: NSViewRepresentable {
     let view = CaptureView(); view.receive = receive; view.ink = ink; view.surface = surface
     view.setAccessibilityElement(true); view.setAccessibilityRole(.textField)
     view.setAccessibilityLabel("Press an extension shortcut")
-    DispatchQueue.main.async { view.window?.makeFirstResponder(view) }
+    DispatchQueue.main.async { if let window = view.window, window.isKeyWindow { window.makeFirstResponder(view) } }
     return view
   }
   func updateNSView(_ view: CaptureView, context: Context) {

@@ -53,6 +53,7 @@ struct NativeInterfaceEditors: View {
   @Environment(\.presentedSpaceTheme) private var presentedTheme
   @State private var query = ""
   @State private var recording: String?
+  @State private var recordingSession = UUID()
   @State private var error: String?
   @State private var profileName = ""
   @State private var tourStep = 0
@@ -89,6 +90,7 @@ struct NativeInterfaceEditors: View {
       .font(.system(size: 13)).foregroundStyle(colors.ink).tint(colors.accent)
       .background { NativeControlSurface().overlay(colors.chrome.opacity(0.65)) }
       .onChange(of: recording) { _, value in actions.recordingShortcut = value != nil }
+      .onChange(of: actions.recordingShortcut) { _, value in if !value { recording = nil } }
       .onDisappear { actions.recordingShortcut = false }
       .sheet(item: $renameProfile) { profile in
         NativeNameEditor(title: "Rename profile", name: $profileName, error: error, colors: colors, save: {
@@ -130,28 +132,29 @@ struct NativeInterfaceEditors: View {
       Spacer(minLength: 8)
       if recording == shortcut.id {
         if actions.shortcutCaptureReady {
+          let session = recordingSession
           ShortcutCapture { result in
-            guard recording == shortcut.id else { return }
+            guard recording == shortcut.id, recordingSession == session else { return }
           switch result {
           case .cancel: recording = nil
           case .value(let value):
             do { try store.updateShortcut(id: shortcut.id, accelerator: value); error = nil; recording = nil }
             catch { self.error = error.localizedDescription }
           }
-          }.frame(width: 150, height: 28)
+          }.id(session).frame(width: 150, height: 28)
         } else {
           if actions.shortcutCaptureError == nil { ProgressView().controlSize(.mini); Text("Preparing shortcut…").font(.system(size: 11)) }
           Button("Cancel") { recording = nil }.buttonStyle(.plain)
         }
       } else {
-        Button { error = nil; recording = shortcut.id } label: {
+        Button { error = nil; recordingSession = UUID(); recording = shortcut.id } label: {
           Text(shortcut.accelerator.isEmpty ? "Not set" : Self.keyLabel(shortcut.accelerator))
             .font(.system(size: 12, weight: .medium, design: .rounded)).frame(minWidth: 74).padding(.horizontal, 7).padding(.vertical, 6)
             .background(colors.card.opacity(0.4), in: RoundedRectangle(cornerRadius: 7))
         }.buttonStyle(.plain).help("Change \(shortcut.title)")
       }
       Menu {
-        Button("Change shortcut") { error = nil; recording = shortcut.id }
+        Button("Change shortcut") { error = nil; recordingSession = UUID(); recording = shortcut.id }
         Button("Disable shortcut") { apply { try store.updateShortcut(id: shortcut.id, accelerator: "") } }
         Button("Reset shortcut") { apply { try store.resetShortcut(id: shortcut.id) } }
       } label: { NativeGlyph("ellipsis").frame(width: 18, height: 26) }.menuStyle(.borderlessButton).menuIndicator(.hidden).frame(width: 20)
@@ -380,7 +383,7 @@ private struct ShortcutCapture: NSViewRepresentable {
   let receive: (Result) -> Void
   func makeNSView(context: Context) -> CaptureView {
     let view = CaptureView(); view.receive = receive
-    DispatchQueue.main.async { view.window?.makeFirstResponder(view) }
+    DispatchQueue.main.async { if let window = view.window, window.isKeyWindow { window.makeFirstResponder(view) } }
     return view
   }
   func updateNSView(_ view: CaptureView, context: Context) { view.receive = receive }

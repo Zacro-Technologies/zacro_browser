@@ -73,6 +73,7 @@ struct NativeCommandPalette: View {
           .background { NativeControlSurface().overlay(colors.chrome.opacity(0.86)).clipShape(RoundedRectangle(cornerRadius: 12)) }
           .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(colors.ink.opacity(0.08), lineWidth: 0.5))
           .shadow(color: .black.opacity(0.14), radius: 16, y: 8)
+          .opacity(entered || reduceMotion ? 1 : 0)
           .scaleEffect(entered || reduceMotion ? 1 : 0.99)
           .offset(y: entered || reduceMotion ? 0 : -4)
           .padding(.top, max(36, min(110, geometry.size.height * 0.12)))

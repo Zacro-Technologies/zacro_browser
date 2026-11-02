@@ -50,6 +50,9 @@ public actor NativeAIService {
   private var conversations: [ConversationKey: ServiceJSON] = [:]
   private var sourcesByConversation: [ConversationKey:[[ServiceJSON]]] = [:]
   private var conversationRevisions: [ConversationKey:Int] = [:]
+  private var resetSerial = 0
+  private var profileResets: [String:ServiceJSON] = [:]
+  private var conversationResets: [ConversationKey:ServiceJSON] = [:]
   private var requestConversation: ConversationKey?
   private var request: Task<ServiceJSON, Error>?
   private var requestID: String?, requestProfile: String?
@@ -81,7 +84,28 @@ public actor NativeAIService {
     }
   }
   private func removeSubscriber(_ id: UUID) { subscribers.removeValue(forKey: id) }
-  private func emit(_ event: ServiceJSON) { if !closed { for s in subscribers.values { s.yield(event) } } }
+  private func emit(_ value: ServiceJSON) {
+    guard !closed else { return }
+    var event = value
+    if event["type"] != "ai:reset", event.contains("conversationId") {
+      event["resetRevision"] = latestReset(ConversationKey(event["profileId"].string, event["conversationId"].string))["resetRevision"]
+    }
+    for s in subscribers.values { s.yield(event) }
+  }
+  private func latestReset(_ conversation: ConversationKey) -> ServiceJSON {
+    let profile = profileResets[conversation.profile] ?? .null
+    let scoped = conversationResets[conversation] ?? .null
+    return scoped["resetRevision"].int > profile["resetRevision"].int ? scoped : profile
+  }
+  private func publishReset(profileID: String, conversation: ConversationKey? = nil, cancelledRequestID: String?) -> ServiceJSON {
+    resetSerial += 1
+    var event: ServiceJSON = ["type":"ai:reset", "profileId":.string(profileID),
+      "resetRevision":.number(Double(resetSerial)), "cancelledRequestId":cancelledRequestID.map(ServiceJSON.string) ?? .null]
+    if let conversation {
+      event["conversationId"] = .string(conversation.id); conversationResets[conversation] = event
+    } else { profileResets[profileID] = event }
+    emit(event); return event
+  }
   private func provider(_ profile: String) -> NativeAIProvider { NativeAIProvider(rawValue: preferences["profiles"][profile]["provider"].string) ?? .codex }
   private func config(_ profile: String, _ provider: NativeAIProvider) -> ServiceJSON {
     let defaults: ServiceJSON = ["model":.string(provider.defaultModel),"baseUrl":.string(provider.endpoint)]
@@ -129,7 +153,8 @@ public actor NativeAIService {
     }
     return state.merging(["provider":.string(provider.rawValue),"providerName":.string(provider.name),"providers":Self.providersJSON,
       "model":config["model"],"baseUrl":config["baseUrl"],"researchSupported":.bool(provider.supportsResearch),
-      "busy":.bool(request != nil || configuring),"profileId":.string(profile.id),"latest":conversations[ConversationKey(profile.id, conversationID)]?["latest"] ?? .null])
+      "busy":.bool(request != nil || configuring),"profileId":.string(profile.id),"latest":conversations[ConversationKey(profile.id, conversationID)]?["latest"] ?? .null,
+      "latestReset":latestReset(ConversationKey(profile.id, conversationID))])
   }
   private static var providersJSON: ServiceJSON { .array(NativeAIProvider.allCases.map { ["id":.string($0.rawValue),"name":.string($0.name),"kind":.string($0.isSubscription ? "subscription" : "api")] }) }
   public func handle(_ action: String, payload: ServiceJSON = [:], expectedProfileID: String? = nil, conversationID: String? = nil) async throws -> ServiceJSON {
@@ -148,9 +173,10 @@ public actor NativeAIService {
     case "ai:cancel": if requestConversation == conversation { request?.cancel() }; return .null
     case "ai:reset":
       conversationRevisions[conversation, default: 0] += 1
-      if requestConversation == conversation { request?.cancel() }
+      let cancelled = requestConversation == conversation ? requestID : nil
+      if cancelled != nil { request?.cancel() }
       conversations.removeValue(forKey: conversation); sourcesByConversation.removeValue(forKey: conversation)
-      emit(["type":"ai:reset","profileId":.string(profile.id),"conversationId":.string(conversation.id)]); return .null
+      return publishReset(profileID: profile.id, conversation: conversation, cancelledRequestID: cancelled)
     case "ai:login":
       guard request == nil, !configuring, let connection = connection(provider(profile.id)) else { throw ServiceError("INPUT", "Choose a subscription connection before signing in.") }
       let url = try await connection.login()
@@ -259,6 +285,7 @@ public actor NativeAIService {
     conversations = conversations.filter { $0.key.profile != id }
     sourcesByConversation = sourcesByConversation.filter { $0.key.profile != id }
     conversationRevisions = conversationRevisions.filter { $0.key.profile != id }
+    conversationResets = conversationResets.filter { $0.key.profile != id }; profileResets.removeValue(forKey:id)
     var next = preferences; next["profiles"] = .object(next["profiles"].object.filter { $0.key != id })
     try ServiceFiles.write(next, file: preferenceFile); preferences = next
     retiringProfiles.remove(id)
@@ -286,7 +313,11 @@ public actor NativeAIService {
       catch { if requestConversation == key { request?.cancel() } }
     } else { revision += 1; request?.cancel() }
   }
+  /// Trusted browser privacy/profile lifecycle operation. No credentials or
+  /// context are read, and other profiles' conversations remain untouched.
+  public func clearProfileConversations(profileID: String) { resetProfileConversations(profileID) }
   private func resetProfileConversations(_ profileID: String) {
+    let cancelled = requestProfile == profileID ? requestID : nil
     let keys = Set(conversations.keys).union(sourcesByConversation.keys).union(conversationRevisions.keys)
     for key in keys where key.profile == profileID { conversationRevisions[key, default: 0] += 1 }
     if let key = requestConversation, key.profile == profileID {
@@ -294,7 +325,7 @@ public actor NativeAIService {
     }
     conversations = conversations.filter { $0.key.profile != profileID }
     sourcesByConversation = sourcesByConversation.filter { $0.key.profile != profileID }
-    emit(["type":"ai:reset","profileId":.string(profileID)])
+    _ = publishReset(profileID:profileID, cancelledRequestID:cancelled)
   }
   public func verifiedSources(expectedProfileID: String? = nil, conversationID: String? = nil) async throws -> [ServiceJSON] {
     let profile = try await scope(expectedProfileID, conversationID: conversationID)
@@ -424,6 +455,7 @@ public actor NativeAIService {
     var complete = answer.removing("historyContent","searchError").merging(["type":"ai:answer","question":.string(question),"sharedTabs":.array(shared),"unreadable":.array(context.unreadable),"mode":.string(research ? "research" : general ? "general" : "pages"),"complete":true,"profileId":.string(profile.id),"conversationId":.string(conversationKey.id),"requestId":.string(id),"provider":.string(provider.rawValue),"model":config["model"]])
     if general { complete["warning"] = "This connection does not provide web research. This answer has no verified web sources." }
     if research && answer["sources"].array.isEmpty { complete["warning"] = "No supporting web sources were returned. Treat this answer as unverified." }
+    complete["resetRevision"] = latestReset(conversationKey)["resetRevision"]
     conversation["turns"] = .array(Self.history(messages + [["role":"assistant","content":answer["historyContent"]]]))
     conversation["latest"] = complete; conversations[conversationKey] = conversation
     sourcesByConversation[conversationKey] = Array((sourcesByConversation[conversationKey,default:[]] + [Array((complete["sources"].array + complete["citations"].array).prefix(128))]).suffix(8))

@@ -36,10 +36,11 @@ struct NativeAIMessage: Identifiable {
   @Published var pendingReview: String?
   private(set) var profileID = ""
   private var requestID = ""
+  private var lastResetRevision = 0
   var sources: [ServiceJSON] { messages.last(where: { $0.role == "assistant" && !$0.error && !$0.incomplete })?.result["sources"].array ?? [] }
   func activate(profileID: String, isPrivate: Bool = false) {
     guard self.profileID != profileID || isPrivate else { return }
-    self.profileID = profileID; draft = ""; savedQuestions = []; grants = []; context = "research"; pendingReview = nil; reset()
+    self.profileID = profileID; lastResetRevision = 0; draft = ""; savedQuestions = []; grants = []; context = "research"; pendingReview = nil; reset()
   }
   func reset() { messages = []; requestID = ""; busy = false; progress = ""; notice = "" }
   func prepare(_ question: String) {
@@ -55,7 +56,19 @@ struct NativeAIMessage: Identifiable {
   }
   func receive(_ event: ServiceJSON) {
     guard event["profileId"].string == profileID else { return }
-    if event["type"] == "ai:reset" { reset(); return }
+    if event["type"] == "ai:reset" {
+      let revision = event["resetRevision"].int
+      guard revision > lastResetRevision else { return }
+      lastResetRevision = revision
+      // A reset emitted before this request was registered clears old history,
+      // while retaining the newly submitted question. A later reset identifies
+      // and cancels the actual running request instead.
+      if busy, !requestID.isEmpty, event["cancelledRequestId"].string != requestID {
+        messages.removeAll { $0.requestID != requestID }
+      } else { reset() }
+      return
+    }
+    guard !event.contains("resetRevision") || event["resetRevision"].int >= lastResetRevision else { return }
     guard !requestID.isEmpty, event["requestId"].string == requestID,
       let index = messages.lastIndex(where: { $0.role == "assistant" && $0.requestID == requestID }) else { return }
     switch event["type"].string {

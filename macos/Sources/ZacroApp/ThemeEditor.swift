@@ -107,6 +107,19 @@ struct NativeSpacePalette {
   }
 }
 
+/// Small controls acknowledge a press without changing surrounding layout.
+struct NativePressButtonStyle: ButtonStyle {
+  var scale = 0.985
+  var motionScale = 1.0
+  @Environment(\.accessibilityReduceMotion) private var reduceMotion
+  @Environment(\.isEnabled) private var enabled
+  func makeBody(configuration: Configuration) -> some View {
+    configuration.label
+      .scaleEffect(enabled && configuration.isPressed && !reduceMotion && motionScale > 0 ? scale : 1)
+      .animation(reduceMotion || motionScale <= 0 ? nil : .timingCurve(0.16, 1, 0.3, 1, duration: 0.1 * motionScale), value: configuration.isPressed)
+  }
+}
+
 /// The original interface only outlines selections when macOS requests more
 /// contrast. Ordinary and drag presentations keep their translucent fill.
 struct NativeSelectionContrast: ViewModifier {

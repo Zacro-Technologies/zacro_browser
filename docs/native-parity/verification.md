@@ -119,6 +119,18 @@ The source now includes native extension shortcut dispatch and capture suspensio
 
 Evidence: `macos/.build/verification/integrated-release-16.log`, `application-16/application.json`, `application-16/application.log`, `engine-16/engine.json`, `core-services-window-authority.log`, and `cef-envelope-tests.log` beneath the same verification directory. Earlier failed PDF runs remain in `application-15*`.
 
+## 2026-11-02: integrated build 17
+
+The release build passed in 108.21 seconds without warnings. The isolated app passed deep, strict signature verification, all 42 application checks and clean shutdown. New checks cover saved camera permission only for a visible owned page, screen capture delegation to Chromium's native chooser, denial for a hidden page, and AI reset/answer ordering that preserves a newly started request while cancelling the intended older request. The complete Core/Services suite passed 200 tests (127 Core and 73 Services), with no failures or skips.
+
+This build restores the permission prompt's explicit remember choice; separates device and desktop capture permission masks; fixes profile-clear locking, all-window Peek cleanup and profile-wide AI reset; retains global side panels in an empty logical window; and includes the audited sidebar/loading/press/Find-focus refinements. The custom extension fixtures now test last-tab panel parking and actual profile data clearing across windows. These custom branches have not run yet. The stock report still records native extension and desktop input verification as false.
+
+The CEF permission mapping/callback tests passed 15 cases, including native chooser deferral without invoking an allow/cancel callback. Native messaging discovery adds Chrome/Chromium registration fallbacks while retaining Chromium's original manifest and origin checks: four isolated fixtures passed, including twelve cases against the actual generated resolver body; the native implementation and test objects compiled. Native GTests are not yet linked/executed.
+
+The normal build script now requires a custom-runtime receipt. Nine packaging-validator regressions passed, covering stale inputs/arguments/binaries/resources/revisions/links. Eight build-driver provenance tests passed. The Swift package plugin compiled with local-framework support. These checks protect build provenance; they do not replace actual custom-framework acceptance or signing/notarization.
+
+Evidence: `macos/.build/verification/integrated-release-17.log`, `application-17/application.json`, `application-17/application.log`, `core-services-post17-full.log`, `runtime-receipt-validation-17.log`, `plugin-custom-framework-17.log`, `native-messaging-fixtures.log`, and `native-messaging-objects/object-check.json`.
+
 ## Required release evidence
 
 - Successful custom Chromium build and package provenance; native protocol capability checks.

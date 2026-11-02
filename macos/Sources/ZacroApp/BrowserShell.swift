@@ -39,10 +39,12 @@ final class BrowserActions: ObservableObject {
   var iconForURL: (String) -> NSImage? = { _ in nil }
   @Published var audibleTabIDs: Set<String> = []
   @Published var loadedTabIDs: Set<String> = []
+  @Published var loadingTabIDs: Set<String> = []
   @Published var recordingShortcut = false
   @Published var shortcutCaptureReady = false
   @Published var shortcutCaptureError: String?
   @Published var findVisible = false
+  @Published var findSession: UInt64 = 0
   @Published var findQuery = ""
   @Published var findMatchCount = 0
   @Published var findActiveMatch = 0
@@ -79,6 +81,12 @@ final class BrowserActions: ObservableObject {
   var closeTab: (String) -> Void = { _ in }
   var deleteSpace: (String) -> Void = { _ in }
   var deleteProfile: (String) -> Void = { _ in }
+  func openFind() {
+    palette = false
+    _ = handleInterfaceEscape()
+    findSession &+= 1
+    findVisible = true
+  }
   func openPalette(address: String = "") {
     paletteRequest = nil
     paletteEditsAddress = !address.isEmpty
@@ -230,7 +238,7 @@ struct BrowserShell<Content: View>: View {
           content: AnyView(NativeFindBar(actions: actions, colors: colors)), motionScale: effectiveMotion,
           frame: CGRect(x: max(actions.contentFrame.minX + 8, actions.contentFrame.maxX - 326),
             y: max(4, actions.contentFrame.minY), width: min(310, max(200, actions.contentFrame.width - 24)), height: 32),
-          takesKey: true, dismissOnOutsideClick: false, dismissOnResign: false)
+          presentationID: actions.findSession, takesKey: true, dismissOnOutsideClick: false, dismissOnResign: false)
           .frame(width: 0, height: 0).allowsHitTesting(false)
       }
       .onAppear {
@@ -316,14 +324,14 @@ struct BrowserShell<Content: View>: View {
         content: AnyView(NativeFindBar(actions: actions, colors: colors)), motionScale: effectiveMotion,
         frame: CGRect(x: max(actions.contentFrame.minX + 8, actions.contentFrame.maxX - 326), y: max(4, actions.contentFrame.minY),
           width: min(310, max(200, actions.contentFrame.width - 24)), height: 32),
-        takesKey: true, dismissOnOutsideClick: false, dismissOnResign: false)
+        presentationID: actions.findSession, takesKey: true, dismissOnOutsideClick: false, dismissOnResign: false)
         .frame(width: 0, height: 0).allowsHitTesting(false)
       if sidebarWidth == 0 {
         let items = showPageActions ? pageMenuItems : browserMenuItems
         NativePalettePresenter(
           isPresented: Binding(get: { showBrowserMenu || showPageActions }, set: { if !$0 { showBrowserMenu = false; showPageActions = false } }),
           content: AnyView(NativeActionPopover(title: showPageActions ? "Page actions" : "Browser menu", items: items, colors: colors,
-            compactZoom: showPageActions,
+            compactZoom: showPageActions, motionScale: effectiveMotion,
             onDismiss: { showBrowserMenu = false; showPageActions = false })),
           motionScale: effectiveMotion,
           frame: CGRect(x: actions.contentFrame.minX + 8, y: actions.contentFrame.minY + 40, width: 242,
@@ -485,7 +493,9 @@ struct BrowserShell<Content: View>: View {
                 .animation(gestureTracking || reduceMotion ? nil : .easeOut(duration: gestureSettleDuration * effectiveMotion), value: Double(activeIndex) + gestureProgress)
             }
           }.clipped()
-        }
+        }.font(.system(size: 13)).foregroundStyle(colors.ink).tint(accent)
+          .environment(\.presentedSpaceTheme, theme)
+          .preferredColorScheme(theme.appearance == "dark" ? .dark : theme.appearance == "light" ? .light : nil)
       }
       spaceFooter
     }.padding(.horizontal, 8)
@@ -570,7 +580,8 @@ struct BrowserShell<Content: View>: View {
         previewRow(tab, selected: tab.id == space.lastActiveTabID)
       }
       Rectangle().fill(colors.ink.opacity(0.12)).frame(height: 1).padding(.horizontal, 7).padding(.vertical, 10)
-      Label("New Tab", systemImage: "plus").foregroundStyle(colors.muted).padding(.horizontal, 8).frame(height: 36)
+      HStack(spacing: 8) { NativeGlyph("plus"); Text("New Tab"); Spacer() }
+        .foregroundStyle(colors.muted).padding(.horizontal, 8).frame(height: 36)
       ForEach(store.state.tabGroups.filter { group in all.contains { !$0.isClosed && $0.groupID == group.id } }) { group in
         HStack(spacing: 8) {
           NativeGlyph("chevron.down", size: 12).rotationEffect(.degrees(group.collapsed ? -90 : 0)).foregroundStyle(accent).frame(width: 16)
@@ -606,13 +617,15 @@ struct BrowserShell<Content: View>: View {
   }
   private func previewRow(_ tab: BrowserTab, selected: Bool, favorite: Bool = false) -> some View {
     HStack(spacing: 8) {
-      Group {
-        if let image = actions.icons[tab.id] { Image(nsImage: image).resizable().scaledToFit() }
-        else { NativeGlyph("globe") }
-      }.frame(width: favorite ? 20 : 16, height: favorite ? 20 : 16)
-      if !favorite { Text(tab.displayTitle).lineLimit(1); Spacer(minLength: 0) }
+      tabIcon(tab, size: favorite ? 20 : 16, favorite: favorite)
+      if !favorite {
+        if tab.isPinned && !tab.isClosed && tab.savedURL != nil && tab.savedURL != tab.url {
+          Text("/").foregroundStyle(colors.muted).padding(.trailing, -5)
+        }
+        Text(tab.displayTitle).lineLimit(1); Spacer(minLength: 0)
+      }
     }.font(.system(size: 13, weight: selected ? .medium : .regular))
-      .frame(maxWidth: .infinity, minHeight: favorite ? 46 : 36).padding(.horizontal, 8)
+      .frame(maxWidth: .infinity, minHeight: favorite ? 46 : tabHeight).padding(.horizontal, 8)
       .background(selected && !tab.isClosed ? (favorite ? favoriteSelection(tab) : selectionBackground(true)) : favorite ? colors.ink.opacity(0.05) : .clear,
         in: RoundedRectangle(cornerRadius: 10))
   }
@@ -653,7 +666,7 @@ struct BrowserShell<Content: View>: View {
       }.buttonStyle(.plain).accessibilityLabel("Edit address or search").focused($sidebarFocus, equals: "address")
         .contextMenu { NativeMenuCommands(items: pageMenuItems) }
         .popover(isPresented: $showPageActions, arrowEdge: .bottom) {
-          NativeActionPopover(title: "Page actions", items: pageMenuItems, colors: colors, compactZoom: true)
+          NativeActionPopover(title: "Page actions", items: pageMenuItems, colors: colors, compactZoom: true, motionScale: effectiveMotion)
         }
       Button {
         showSiteControls.toggle()
@@ -666,7 +679,7 @@ struct BrowserShell<Content: View>: View {
           SiteControls(actions: actions.siteControls, accent: accent, palette: colors)
         }
         .popover(isPresented: $showBrowserMenu, arrowEdge: .bottom) {
-          NativeActionPopover(title: "Browser menu", items: browserMenuItems, colors: colors)
+          NativeActionPopover(title: "Browser menu", items: browserMenuItems, colors: colors, motionScale: effectiveMotion)
         }
     }.background(colors.ink.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
       .modifier(NativeSelectionContrast(selected: true, color: colors.ink, radius: 10))
@@ -731,7 +744,7 @@ struct BrowserShell<Content: View>: View {
           Text("New Tab")
         }.frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 8).frame(height: 36)
       }
-      .buttonStyle(.plain).foregroundStyle(colors.muted)
+      .buttonStyle(NativePressButtonStyle(motionScale: effectiveMotion)).foregroundStyle(colors.muted)
       VStack(spacing: 2) {
         tabGroupRows
         splitRows
@@ -903,13 +916,13 @@ struct BrowserShell<Content: View>: View {
     let card = NSColor(colors.card)
     return Color(nsColor: card.blended(withFraction: 0.22, of: logo) ?? card).opacity(0.86)
   }
-  @ViewBuilder private func tabIcon(_ tab: BrowserTab, size: CGFloat) -> some View {
+  @ViewBuilder private func tabIcon(_ tab: BrowserTab, size: CGFloat, favorite: Bool = false) -> some View {
     Group {
-      if tab.id == store.state.activeTabID && actions.loading { ProgressView().controlSize(.mini).scaleEffect(0.7) }
+      if !favorite && actions.loadingTabIDs.contains(tab.id) { ProgressView().controlSize(.mini).scaleEffect(0.7) }
       else if let icon = actions.icons[tab.id] { Image(nsImage: icon).resizable().scaledToFit() }
       else { NativeGlyph("globe") }
     }.frame(width: size, height: size)
-      .opacity(tab.isClosed ? 0.65 : 1)
+      .opacity(tab.isClosed || (favorite && !actions.loadedTabIDs.contains(tab.id)) ? 0.65 : 1)
       .overlay(alignment: .topTrailing) {
         if let peek = tab.peek {
           Group {
@@ -942,7 +955,7 @@ struct BrowserShell<Content: View>: View {
       }
       Button { selectSidebarTab(tab) } label: {
         HStack(spacing: 8) {
-          if favorite || grouped || !tab.isPinned { tabIcon(tab, size: favorite ? 20 : 16) }
+          if favorite || grouped || !tab.isPinned { tabIcon(tab, size: favorite ? 20 : 16, favorite: favorite) }
           if !favorite {
             if away && !grouped { Text("/").foregroundStyle(colors.muted).padding(.trailing, -5) }
             Text(tab.displayTitle).lineLimit(1)
@@ -952,7 +965,12 @@ struct BrowserShell<Content: View>: View {
           .padding(.leading, grouped ? 6 : !favorite && tab.isPinned ? 2 : 8)
           .padding(.trailing, hovered && !favorite ? 0 : 8)
           .contentShape(Rectangle())
-      }.buttonStyle(.plain).focused($sidebarFocus, equals: tab.id).id(tab.id)
+          .background(favorite ? (selected ? favoriteSelection(tab) : hovered ? colors.card.opacity(0.25) : colors.ink.opacity(0.05)) : .clear,
+            in: RoundedRectangle(cornerRadius: 10))
+          .modifier(NativeSelectionContrast(selected: favorite && selected && drag.id == nil, color: colors.ink, radius: 10))
+          .shadow(color: .black.opacity(favorite && drag.id == nil ? (selected ? 0.07 : 0.05) : 0), radius: selected ? 1.5 : 2.5, y: selected ? 1 : 2)
+      }.buttonStyle(NativePressButtonStyle(scale: favorite ? 0.96 : 0.985, motionScale: effectiveMotion))
+        .focused($sidebarFocus, equals: tab.id).id(tab.id)
       if !favorite && (tab.isMuted || actions.audibleTabIDs.contains(tab.id)) {
         Button { performTabAction("tab:mute", tab: tab) } label: {
           NativeGlyph(tab.isMuted ? "speaker.slash" : "speaker.wave.2").font(.system(size: 12)).frame(width: 24, height: 24)
@@ -966,11 +984,11 @@ struct BrowserShell<Content: View>: View {
       }
     }.font(.system(size: 13, weight: selected ? .medium : .regular))
       .frame(maxWidth: .infinity)
-      .background(grouped ? .clear : selected ? (favorite ? favoriteSelection(tab) : selectionBackground(true)) : favorite || hovered ? colors.ink.opacity(0.05) : .clear,
+      .background(grouped || favorite ? .clear : selected ? selectionBackground(true) : hovered ? colors.ink.opacity(0.05) : .clear,
         in: RoundedRectangle(cornerRadius: 10))
-      .modifier(NativeSelectionContrast(selected: selected && !grouped && drag.id == nil, color: colors.ink, radius: 10))
+      .modifier(NativeSelectionContrast(selected: selected && !grouped && !favorite && drag.id == nil, color: colors.ink, radius: 10))
       .opacity(drag.id == tab.id ? 0.45 : 1)
-      .shadow(color: .black.opacity(selected && !grouped && drag.id == nil ? 0.07 : 0), radius: 1.5, y: 1)
+      .shadow(color: .black.opacity(selected && !grouped && !favorite && drag.id == nil ? 0.07 : 0), radius: 1.5, y: 1)
       .onHover { if $0 { hoveredTab = tab.id } else if hoveredTab == tab.id { hoveredTab = nil } }
       .help("\(tab.displayTitle) — \(tab.isClosed ? "Closed" : actions.loadedTabIDs.contains(tab.id) ? "Loaded" : "Sleeping")\n\(tab.savedURL ?? tab.url)")
       .accessibilityElement(children: .contain).accessibilityAddTraits(selected ? [.isSelected] : [])
@@ -1056,30 +1074,7 @@ struct BrowserShell<Content: View>: View {
       } label: {
         NativeGlyph("archivebox")
       }.menuStyle(.borderlessButton).menuIndicator(.hidden).frame(width: 28, height: 28)
-      Spacer(minLength: 4)
-      ForEach(spaces) { space in
-        Button {
-          store.selectSpace(id: space.id)
-        } label: {
-          NativeGlyph(space.icon).font(.system(size: 13)).opacity(
-            space.id == store.state.activeSpaceID ? 1 : 0.45)
-            .frame(width: 26, height: 26)
-            .background(selectionBackground(space.id == store.state.activeSpaceID), in: RoundedRectangle(cornerRadius: 7))
-            .modifier(NativeSelectionContrast(selected: space.id == store.state.activeSpaceID, color: colors.ink, radius: 7))
-        }.buttonStyle(.plain).help(space.name).accessibilityLabel("Switch to \(space.name)")
-          .accessibilityAddTraits(space.id == store.state.activeSpaceID ? [.isSelected] : [])
-          .contextMenu { spaceMenu(space) }
-          .focused($sidebarFocus, equals: "space:\(space.id)")
-          .onKeyPress(keys: [KeyEquivalent("\u{F70D}"), KeyEquivalent("\u{F735}")]) { key in
-            guard isContextMenuKey(key) else { return .ignored }
-            contextMenuRequest = "space:\(space.id)"; return .handled
-          }
-          .background { menuAnchor(id: "space:\(space.id)", items: spaceMenuItems(space)) }
-          .onDrop(
-            of: [.plainText],
-            delegate: SpaceHoverDropDelegate(store: store, drag: drag, target: { space.id }))
-      }
-      Spacer(minLength: 4)
+      spaceDots
       Menu {
         Button("New tab") { actions.openPalette() }
         Button("New folder") { name = ""; creation = "folder" }
@@ -1107,6 +1102,43 @@ struct BrowserShell<Content: View>: View {
           motionScale: effectiveMotion,
           onSave: saveTheme, onCancel: { actions.themeEditor = false })
       }
+  }
+  private var spaceDots: some View {
+    GeometryReader { geometry in
+      ScrollViewReader { reader in
+        ScrollView(.horizontal) {
+          HStack(spacing: 0) {
+            ForEach(spaces) { space in
+              Button {
+                store.selectSpace(id: space.id)
+              } label: {
+                NativeGlyph(space.icon).font(.system(size: 14)).opacity(
+                  space.id == store.state.activeSpaceID ? 1 : 0.55)
+                  .frame(width: 24, height: 28)
+                  .background(colors.card.opacity(space.id == store.state.activeSpaceID ? 0.546 : 0), in: RoundedRectangle(cornerRadius: 6))
+                  .modifier(NativeSelectionContrast(selected: space.id == store.state.activeSpaceID, color: colors.ink, radius: 6))
+              }.buttonStyle(NativePressButtonStyle(scale: 0.96, motionScale: effectiveMotion)).help(space.name).accessibilityLabel("Switch to \(space.name)")
+                .accessibilityAddTraits(space.id == store.state.activeSpaceID ? [.isSelected] : [])
+                .contextMenu { spaceMenu(space) }
+                .focused($sidebarFocus, equals: "space:\(space.id)")
+                .onKeyPress(keys: [KeyEquivalent("\u{F70D}"), KeyEquivalent("\u{F735}")]) { key in
+                  guard isContextMenuKey(key) else { return .ignored }
+                  contextMenuRequest = "space:\(space.id)"; return .handled
+                }
+                .background { menuAnchor(id: "space:\(space.id)", items: spaceMenuItems(space)) }
+                .onDrop(
+                  of: [.plainText],
+                  delegate: SpaceHoverDropDelegate(store: store, drag: drag, target: { space.id })).id(space.id)
+            }
+          }.frame(minWidth: geometry.size.width)
+        }.scrollIndicators(.hidden)
+          .onAppear { reader.scrollTo(store.state.activeSpaceID) }
+          .onChange(of: store.state.activeSpaceID) { _, id in reader.scrollTo(id) }
+          .onChange(of: sidebarFocus) { _, target in
+            if let target, target.hasPrefix("space:") { reader.scrollTo(String(target.dropFirst(6))) }
+          }
+      }
+    }.frame(height: 28).accessibilityElement(children: .contain).accessibilityLabel("Your Spaces")
   }
   private func spaceEdge(_ offset: Int) -> some View {
     Color.clear.frame(width: drag.id == nil ? 0 : 12).contentShape(Rectangle())
@@ -1283,7 +1315,9 @@ struct BrowserShell<Content: View>: View {
     blankPaletteContext = context
     DispatchQueue.main.async {
       guard "\(store.state.activeSpaceID):\(store.state.activeTabID ?? "empty")" == context,
-        editor == nil, actions.library == nil, !actions.themeEditor,
+        editor == nil, actions.library == nil, !actions.themeEditor, !actions.palette,
+        !showBrowserMenu, !showPageActions, !showSiteControls,
+        creation == nil, renameTarget == nil, drag.id == nil,
         store.state.activeTab?.homePage != true,
         store.state.activeTab == nil || store.state.activeTab?.url == "about:blank" else { return }
       actions.openPalette()
@@ -1916,7 +1950,7 @@ private struct NativeFindBar: View {
   let colors: NativeSpacePalette
   var body: some View {
     HStack(spacing: 3) {
-      NativeFindField(text: $actions.findQuery, ink: NSColor(colors.ink), muted: NSColor(colors.muted), changed: actions.updateFind,
+      NativeFindField(text: $actions.findQuery, focusRequest: actions.findSession, ink: NSColor(colors.ink), muted: NSColor(colors.muted), changed: actions.updateFind,
         next: actions.findNext, previous: actions.findPrevious, close: close)
         .frame(minWidth: 80, maxWidth: 160)
       Text(actions.findQuery.isEmpty ? "" : "\(actions.findActiveMatch) / \(actions.findMatchCount)")
@@ -1938,6 +1972,7 @@ private struct NativeFindBar: View {
 }
 private struct NativeFindField: NSViewRepresentable {
   @Binding var text: String
+  let focusRequest: UInt64
   let ink: NSColor
   let muted: NSColor
   let changed: (String) -> Void
@@ -1949,7 +1984,6 @@ private struct NativeFindField: NSViewRepresentable {
     let field = NSTextField(); field.font = .systemFont(ofSize: 12); field.drawsBackground = false; field.isBordered = false
     field.focusRingType = .none; field.placeholderString = "Find on page"; field.delegate = context.coordinator
     field.setAccessibilityLabel("Find on page")
-    DispatchQueue.main.async { field.window?.makeFirstResponder(field); field.selectText(nil) }
     return field
   }
   func updateNSView(_ field: NSTextField, context: Context) {
@@ -1957,9 +1991,17 @@ private struct NativeFindField: NSViewRepresentable {
     field.textColor = ink
     field.placeholderAttributedString = NSAttributedString(string: "Find on page", attributes: [.foregroundColor: muted, .font: NSFont.systemFont(ofSize: 12)])
     if field.stringValue != text { field.stringValue = text }
+    if context.coordinator.lastFocusRequest != focusRequest {
+      context.coordinator.lastFocusRequest = focusRequest
+      DispatchQueue.main.async { [weak field] in
+        guard let field, let window = field.window, window.isVisible else { return }
+        window.makeFirstResponder(field); field.selectText(nil)
+      }
+    }
   }
   final class Coordinator: NSObject, NSTextFieldDelegate {
     var parent: NativeFindField
+    var lastFocusRequest: UInt64?
     init(_ parent: NativeFindField) { self.parent = parent }
     func controlTextDidChange(_ notification: Notification) {
       guard let field = notification.object as? NSTextField else { return }

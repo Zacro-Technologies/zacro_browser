@@ -171,6 +171,13 @@ final class NativeServicesModel: ObservableObject {
     guard status["profileId"].string == store.activeProfileID else { return }
     ai = status
     aiConversation.activate(profileID: status["profileId"].string, isPrivate: status["private"].bool)
+    if status["latestReset"] != .null { aiConversation.receive(status["latestReset"]) }
+  }
+  func resetAIConversations(profileID: String) async {
+    await aiService.clearProfileConversations(profileID: profileID)
+    if store.activeProfileID == profileID {
+      applyAI(await aiService.status(for: scope, conversationID: conversationID))
+    }
   }
   private func applySync(_ status: ServiceJSON) {
     if sharedBackend == nil, status["state"] != "private" {
@@ -230,6 +237,9 @@ final class NativeServicesModel: ObservableObject {
     do {
       let result = try await aiService.handle(action, payload: payload, expectedProfileID: profile, conversationID: conversationID)
       try requireAIProfile(profile)
+      // Consume the acknowledged reset before a caller can begin its retry.
+      // The same event arriving later through AsyncStream is then a duplicate.
+      if result["type"] == "ai:reset" { aiConversation.receive(result) }
       if ["ai:login", "ai:install"].contains(action), let url = BrowserAddress.webURL(result["url"].string), !NSWorkspace.shared.open(url) {
         if action == "ai:login" {
           _ = try? await aiService.handle("ai:login-cancel", expectedProfileID: profile, conversationID: conversationID)

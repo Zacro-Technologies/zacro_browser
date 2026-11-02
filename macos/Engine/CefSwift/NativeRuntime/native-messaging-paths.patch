@@ -1,0 +1,177 @@
+--- a/chrome/browser/extensions/api/messaging/launch_context_posix.cc
++++ b/chrome/browser/extensions/api/messaging/launch_context_posix.cc
+@@ -7,6 +7,7 @@
+ #include <memory>
+ #include <utility>
+ 
++#include "base/base_paths.h"
+ #include "base/command_line.h"
+ #include "base/files/file_util.h"
+ #include "base/files/scoped_file.h"
+@@ -34,6 +35,24 @@
+   return base::FilePath();
+ }
+ 
++#if BUILDFLAG(IS_MAC)
++base::FilePath FindMacUserManifest(const std::string& host_name) {
++  base::FilePath home;
++  if (!base::PathService::Get(base::DIR_HOME, &home) || home.empty()) {
++    return base::FilePath();
++  }
++  for (const char* directory : {
++           "Library/Application Support/Chromium/NativeMessagingHosts",
++           "Library/Application Support/Google/Chrome/NativeMessagingHosts"}) {
++    base::FilePath path = home.Append(directory).Append(host_name + ".json");
++    if (base::PathExists(path)) {
++      return path;
++    }
++  }
++  return base::FilePath();
++}
++#endif
++
+ }  // namespace
+ 
+ // static
+@@ -43,10 +62,30 @@
+   base::FilePath result;
+   if (allow_user_level_hosts) {
+     result = FindManifestInDir(chrome::DIR_USER_NATIVE_MESSAGING, host_name);
++#if BUILDFLAG(IS_MAC)
++    // Prefer this browser's explicit registration, then existing vendor
++    // registrations. Policy disabling user hosts applies to every user path.
++    if (result.empty()) {
++      result = FindMacUserManifest(host_name);
++    }
++#endif
+   }
+   if (result.empty()) {
+     result = FindManifestInDir(chrome::DIR_NATIVE_MESSAGING, host_name);
+   }
++#if BUILDFLAG(IS_MAC)
++  if (result.empty()) {
++    base::FilePath chrome_manifest =
++        base::FilePath("/Library/Google/Chrome/NativeMessagingHosts")
++            .Append(host_name + ".json");
++    if (base::PathExists(chrome_manifest)) {
++      result = chrome_manifest;
++    }
++  }
++#endif
++  // Return the first existing registration, even if malformed. The existing
++  // launcher validates its contents, allowed origins, path and launch policy;
++  // an invalid higher-priority registration must never select another host.
+ 
+   if (result.empty()) {
+     error_message = "Can't find native messaging host " + host_name;
+--- a/chrome/browser/extensions/api/messaging/launch_context.h
++++ b/chrome/browser/extensions/api/messaging/launch_context.h
+@@ -69,6 +69,8 @@
+ #endif
+ 
+  private:
++  friend class NativeMessagingManifestPathsTest;
++
+   LaunchContext(scoped_refptr<base::TaskRunner> background_task_runner,
+                 NativeProcessLauncher::LaunchedCallback callback);
+ 
+--- a/chrome/browser/extensions/api/messaging/native_message_process_host_unittest.cc
++++ b/chrome/browser/extensions/api/messaging/native_message_process_host_unittest.cc
+@@ -32,16 +32,19 @@
+ #include "base/task/thread_pool.h"
+ #include "base/test/metrics/histogram_tester.h"
+ #include "base/test/scoped_feature_list.h"
++#include "base/test/scoped_path_override.h"
+ #include "base/test/test_timeouts.h"
+ #include "base/threading/platform_thread.h"
+ #include "base/time/time.h"
+ #include "base/values.h"
+ #include "build/build_config.h"
++#include "chrome/browser/extensions/api/messaging/launch_context.h"
+ #include "chrome/browser/extensions/api/messaging/native_messaging_launch_from_native.h"
+ #include "chrome/browser/extensions/api/messaging/native_messaging_test_util.h"
+ #include "chrome/browser/extensions/api/messaging/native_process_launcher.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/common/chrome_features.h"
++#include "chrome/common/chrome_paths.h"
+ #include "chrome/common/chrome_switches.h"
+ #include "chrome/test/base/testing_profile.h"
+ #include "components/version_info/version_info.h"
+@@ -548,4 +551,77 @@
+       1);
+ }
+ 
++#if BUILDFLAG(IS_MAC)
++// These fixtures only select dummy files under an isolated temporary home.
++// They never start a host process or read an installed user's registration.
++class NativeMessagingManifestPathsTest : public testing::Test {
++ protected:
++  void SetUp() override {
++    ASSERT_TRUE(directory_.CreateUniqueTempDir());
++    configured_user_ = directory_.GetPath().Append("configured-user");
++    configured_system_ = directory_.GetPath().Append("configured-system");
++    home_ = directory_.GetPath().Append("home");
++    ASSERT_TRUE(base::CreateDirectory(configured_user_));
++    ASSERT_TRUE(base::CreateDirectory(configured_system_));
++    ASSERT_TRUE(base::CreateDirectory(home_));
++    user_override_ = std::make_unique<base::ScopedPathOverride>(
++        chrome::DIR_USER_NATIVE_MESSAGING, configured_user_);
++    system_override_ = std::make_unique<base::ScopedPathOverride>(
++        chrome::DIR_NATIVE_MESSAGING, configured_system_);
++    home_override_ = std::make_unique<base::ScopedPathOverride>(base::DIR_HOME, home_);
++  }
++  base::FilePath Write(const base::FilePath& directory) {
++    EXPECT_TRUE(base::CreateDirectory(directory));
++    auto path = directory.Append(host_ + ".json");
++    // Intentionally invalid: selection must not skip an existing bad manifest.
++    EXPECT_TRUE(base::WriteFile(path, "not a manifest"));
++    return path;
++  }
++  base::FilePath UserChromium() const {
++    return home_.Append("Library/Application Support/Chromium/NativeMessagingHosts");
++  }
++  base::FilePath UserChrome() const {
++    return home_.Append("Library/Application Support/Google/Chrome/NativeMessagingHosts");
++  }
++  base::FilePath Find(bool user_allowed) {
++    std::string error;
++    return LaunchContext::FindManifest(host_, user_allowed, error);
++  }
++  // Random host identity ensures a test cannot match a real system host.
++  const std::string host_ = "com.zacro.fixture_" + base::NumberToString(base::RandUint64());
++  base::ScopedTempDir directory_;
++  base::FilePath configured_user_, configured_system_, home_;
++  std::unique_ptr<base::ScopedPathOverride> user_override_, system_override_, home_override_;
++};
++
++TEST_F(NativeMessagingManifestPathsTest, ConfiguredUserPrecedesVendorFallbacks) {
++  Write(UserChrome()); Write(UserChromium()); Write(configured_system_);
++  auto configured = Write(configured_user_);
++  EXPECT_EQ(configured, Find(true));
++}
++
++TEST_F(NativeMessagingManifestPathsTest, ChromiumUserPrecedesChromeUser) {
++  Write(UserChrome()); Write(configured_system_);
++  auto chromium = Write(UserChromium());
++  EXPECT_EQ(chromium, Find(true));
++}
++
++TEST_F(NativeMessagingManifestPathsTest, ChromeUserPrecedesSystem) {
++  Write(configured_system_);
++  auto chrome = Write(UserChrome());
++  EXPECT_EQ(chrome, Find(true));
++}
++
++TEST_F(NativeMessagingManifestPathsTest, DisabledUserPolicySkipsEveryUserPath) {
++  Write(configured_user_); Write(UserChromium()); Write(UserChrome());
++  auto system = Write(configured_system_);
++  EXPECT_EQ(system, Find(false));
++}
++
++TEST_F(NativeMessagingManifestPathsTest, MissingHostDoesNotInventRegistration) {
++  EXPECT_TRUE(Find(true).empty());
++  EXPECT_TRUE(Find(false).empty());
++}
++#endif
++
+ }  // namespace extensions

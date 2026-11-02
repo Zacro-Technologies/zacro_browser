@@ -77,6 +77,10 @@ struct AppBundler {
             "/bin/cp", ["-R", frameworkSource.path, frameworkDest.path],
             hint: "Could not copy the CEF framework into the app bundle. Check disk space and permissions."
         )
+        // Build outputs can be flat; normalize only the packaged copy so the
+        // compiler's framework and its provenance hashes remain untouched.
+        try FrameworkLayout.convertToVersionedBundle(framework: frameworkDest)
+        try FrameworkLayout.validate(framework: frameworkDest)
 
         // Five helper apps.
         var helperAppURLs: [URL] = []

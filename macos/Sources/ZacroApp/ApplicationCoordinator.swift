@@ -15,7 +15,13 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
   private var observations: Set<AnyCancellable> = []
   var pendingDeletion: (Set<String>, () -> Void)?
   var profileDeletionPageIDs = Set<String>()
-  var deletingProfileID: String?
+  var deletingProfileID: String? {
+    didSet {
+      guard oldValue != deletingProfileID else { return }
+      if let oldValue { engine.setProfileMaintenance(oldValue, active: false) }
+      if let deletingProfileID { engine.setProfileMaintenance(deletingProfileID, active: true) }
+    }
+  }
   var clearingHistoryProfiles: Set<String> = []
   var scopeCloseCancelled: (() -> Void)?
   lazy var favicons = FaviconCache(directory: engine.dataDirectory.appendingPathComponent("Icons"))
@@ -24,10 +30,12 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
   lazy var navigation = NativeNavigationCoordinator(engine: engine, store: store)
   lazy var services = NativeServicesModel(store: store, directory: engine.dataDirectory,
     conversationProfile: { [weak self] identifier in
-      await MainActor.run {
-        guard let self, let owner = self.windows[identifier], owner.windowContext.isOpen,
-          !owner.windowContext.isClosing, !self.engine.isTerminating,
-          let profile = owner.store.state.activeProfile else { return nil }
+      guard let coordinator = self else { return nil }
+      return await MainActor.run {
+        guard let owner = coordinator.windows[identifier], owner.windowContext.isOpen,
+          !owner.windowContext.isClosing, !coordinator.engine.isTerminating,
+          let profile = owner.store.state.activeProfile,
+          coordinator.deletingProfileID != profile.id else { return nil }
         return AIProfileScope(id: profile.id, isPrivate: profile.isPrivate)
       }
     }) { [weak self] grants in
@@ -71,20 +79,21 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
       grants.allSatisfy({ $0.conversationID == conversationID }),
       conversationID == nil || (requester?.windowContext.isOpen == true && requester?.windowContext.isClosing == false),
       let profile = scope.state.activeProfile, !profile.isPrivate,
+      deletingProfileID != profile.id,
       grants.allSatisfy({ $0.profileID == profile.id }) else {
       throw ServiceError("CONTEXT_CHANGED", "Review the selected pages in their regular profile before sharing.")
     }
     var result: [AIPageExtract] = []
     for grant in grants {
       try Task.checkCancellation()
-      guard scope.activeProfileID == profile.id, !engine.isTerminating,
+      guard scope.activeProfileID == profile.id, deletingProfileID != profile.id, !engine.isTerminating,
         conversationID == nil || (requester?.windowContext.isOpen == true && requester?.windowContext.isClosing == false),
         let owner = owner(tabID: grant.id),
         owner.windowContext.isOpen, !owner.windowContext.isClosing else {
         throw ServiceError("CONTEXT_CHANGED", "A selected page or its window changed. Review it again before sharing.")
       }
       let page = try await owner.readContext([grant])
-      guard scope.activeProfileID == profile.id, !engine.isTerminating,
+      guard scope.activeProfileID == profile.id, deletingProfileID != profile.id, !engine.isTerminating,
         conversationID == nil || (requester?.windowContext.isOpen == true && requester?.windowContext.isClosing == false),
         self.owner(tabID: grant.id) === owner,
         owner.windowContext.isOpen, !owner.windowContext.isClosing,
@@ -149,10 +158,7 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
     }
     engine.onPageClosed = { [weak self] _ in self?.scheduleAllWindows() }
     engine.onPageCloseCancelled = { [weak self] id in
-      guard let self, self.profileDeletionPageIDs.remove(id) != nil else { return }
-      self.pendingDeletion = nil; self.deletingProfileID = nil
-      let cancel = self.scopeCloseCancelled; self.scopeCloseCancelled = nil; cancel?()
-      self.scheduleAllWindows()
+      self?.cancelProfileOperation(forPage: id)
     }
     navigation.beforeRestore = { [weak self] page in
       guard let self, !page.isPrivate, self.store.document(id: page.id) != nil else { return }
@@ -273,6 +279,15 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
   }
 
   func scheduleAllWindows() { for owner in windows.values { owner.scheduleLayout() } }
+  func cancelProfileOperation(forPage id: String) {
+    guard profileDeletionPageIDs.remove(id) != nil, pendingDeletion?.0.contains(id) == true else { return }
+    pendingDeletion = nil
+    let cancel = scopeCloseCancelled; scopeCloseCancelled = nil
+    // The async clear operation owns its lock until its defer runs. Releasing
+    // it here would let another window start before the old operation unwinds.
+    if let cancel { cancel() } else { deletingProfileID = nil }
+    scheduleAllWindows()
+  }
   func libraryMessages(profileID: String) -> [String: String] { libraryStatus[profileID, default: [:]] }
   private func publishLibraryStatus(profileID: String, section: String, message: String?) {
     libraryStatus[profileID, default: [:]][section] = message

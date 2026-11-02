@@ -184,6 +184,57 @@ final class AIServiceTests: XCTestCase {
       await ai.close()
     }
   }
+  func testPrivacyResetClearsEveryWindowOfProfileAndCancelsOnlyItsRequest() async throws {
+    let owners = AIWindowOwners(), subscription = FixtureSubscription()
+    await owners.set("a",profile:"personal"); await owners.set("b",profile:"personal"); await owners.set("c",profile:"other")
+    let ai = NativeAIService(directory:try directory(),currentProfile:{ AIProfileScope(id:"personal") },
+      conversationProfile:{ await owners.profile($0) },context:{ grants in
+        grants.map { AIPageExtract(id:$0.id,url:$0.url,title:"Page",text:"Evidence that privacy clearing must forget") }
+      },codex:subscription,claude:subscription)
+    for window in ["a","b","c"] {
+      _ = try await ai.handle("ai:ask",payload:["question":"Read","tabIds":[.string(window)],
+        "contextTabs":[["id":.string(window),"url":.string("https://example.com/" + window)]]],conversationID:window)
+    }
+    await subscription.setDelay(.seconds(5))
+    let running = Task { try await ai.handle("ai:ask",payload:["question":"Pending","requestId":"pending"],conversationID:"b") }
+    for _ in 0..<100 { if await subscription.calls.count == 4 { break }; try await Task.sleep(for:.milliseconds(5)) }
+    let events = await ai.events(); var reader = events.makeAsyncIterator()
+    await ai.clearProfileConversations(profileID:"personal")
+    let receivedReset = await reader.next()
+    let reset = try XCTUnwrap(receivedReset)
+    expectEqual(reset["type"], "ai:reset"); expectEqual(reset["profileId"], "personal")
+    expectEqual(reset["cancelledRequestId"], "pending"); expectFalse(reset.contains("conversationId"))
+    do { _ = try await running.value; XCTFail("Privacy reset must cancel its pending extraction/answer") }
+    catch { expectEqual((error as? ServiceError)?.code,"CANCELLED") }
+    for window in ["a","b"] {
+      expectTrue(try await ai.verifiedSources(expectedProfileID:"personal",conversationID:window).isEmpty)
+      expectEqual(await ai.status(for:AIProfileScope(id:"personal"),conversationID:window)["latest"],.null)
+    }
+    expectFalse(try await ai.verifiedSources(expectedProfileID:"other",conversationID:"c").isEmpty)
+    expectEqual(await ai.status(for:AIProfileScope(id:"other"),conversationID:"c")["latest"]["question"],"Read")
+    await ai.close()
+  }
+  func testResetAcknowledgementOrdersQueuedEventsBeforeRetryAnswers() async throws {
+    let subscription = FixtureSubscription()
+    let ai = NativeAIService(directory:try directory(),currentProfile:{ AIProfileScope(id:"personal") },context:{ _ in [] },
+      codex:subscription,claude:subscription)
+    let stream = await ai.events(); var reader = stream.makeAsyncIterator()
+    let acknowledged = try await ai.handle("ai:reset",conversationID:"a")
+    // Delivery may be delayed until after the caller starts its next question.
+    let answer = try await ai.handle("ai:ask",payload:["question":"Retry","requestId":"retry"],conversationID:"a")
+    let receivedDelayed = await reader.next()
+    let delayed = try XCTUnwrap(receivedDelayed)
+    expectEqual(delayed, acknowledged)
+    expectTrue(acknowledged["resetRevision"].int > 0)
+    expectEqual(answer["resetRevision"], acknowledged["resetRevision"])
+    expectEqual(await ai.status(for:AIProfileScope(id:"personal"),conversationID:"a")["latestReset"], acknowledged)
+    await ai.clearProfileConversations(profileID:"personal")
+    let next = await ai.status(for:AIProfileScope(id:"personal"),conversationID:"a")["latestReset"]
+    expectGreater(next["resetRevision"].int, acknowledged["resetRevision"].int)
+    expectEqual(next["cancelledRequestId"], .null)
+    expectEqual(await ai.status(for:AIProfileScope(id:"personal"),conversationID:"b")["latestReset"], next)
+    await ai.close()
+  }
   private func directory() throws -> URL {
     let url = FileManager.default.temporaryDirectory.appendingPathComponent("ZacroServicesTests-" + UUID().uuidString)
     try FileManager.default.createDirectory(at:url,withIntermediateDirectories:true)

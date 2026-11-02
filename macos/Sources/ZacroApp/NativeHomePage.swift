@@ -53,7 +53,7 @@ struct NativeHomePage: View {
                 Text(link.title.isEmpty ? domain(link.url) : link.title).font(.system(size: 11)).lineLimit(1)
               }.frame(maxWidth: .infinity).frame(height: 64).contentShape(Rectangle())
                 .modifier(NativeSelectionContrast(selected: true, color: colors.ink, radius: 9))
-            }.buttonStyle(.plain).help("\(link.title) — \(link.url)")
+            }.buttonStyle(NativePressButtonStyle(scale: 0.96, motionScale: store.state.settings.motionScale)).help("\(link.title) — \(link.url)")
           }
         }.accessibilityElement(children: .contain).accessibilityLabel("Saved pages")
       }
@@ -74,7 +74,7 @@ struct NativeHomePage: View {
                 Text(domain(link.url)).font(.system(size: 10)).foregroundStyle(colors.muted).lineLimit(1)
                 NativeGlyph("arrow.right", size: 12).foregroundStyle(colors.muted)
               }.padding(.horizontal, 10).frame(height: 42).contentShape(Rectangle())
-            }.buttonStyle(.plain).help(link.url)
+            }.buttonStyle(NativePressButtonStyle(motionScale: store.state.settings.motionScale)).help(link.url)
           }
         }
       }

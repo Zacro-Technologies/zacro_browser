@@ -20,6 +20,8 @@ struct NativeGlyph: View {
     "chevron.down": "down", "chevron.up": "up", "chevron.left": "chevronLeft", "chevron.right": "chevronRight",
     "circle.fill": "circle", "house": "home", "sparkles": "sparkle", "paintpalette": "palette", "gearshape": "settings",
     "arrow.uturn.backward": "undo", "speaker.slash": "muted", "speaker.wave.2": "volume", "ellipsis": "more",
+    "clock.arrow.circlepath": "history", "arrow.down.circle": "download", "puzzlepiece.extension": "extension",
+    "pencil": "edit", "doc": "file", "refresh": "reload",
     "clock": "history", "arrow.down": "download", "square.and.arrow.up": "external", "checkmark": "check",
     "doc.on.doc": "copy", "printer": "print", "person": "user", "person.crop.circle": "user", "sun.max": "sun",
     "moon.stars.fill": "moon", "moon": "moon", "info.circle": "info", "exclamationmark.triangle": "alert",
