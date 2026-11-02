@@ -7,6 +7,7 @@ import ZacroCore
 struct NativeLibrary: View {
   @ObservedObject var store: BrowserStore
   @ObservedObject var actions: BrowserActions
+  @StateObject private var dialogs = NativeWindowDialogOwner()
   @State var section: String
   @State private var query = ""
   @State private var error: String?
@@ -25,6 +26,9 @@ struct NativeLibrary: View {
     return NativeSpacePalette(theme: theme, dark: colorScheme == .dark, increasedContrast: contrast == .increased)
   }
   private var isRecords: Bool { ["Bookmarks", "History", "Downloads", "Archive", "Windows"].contains(section) }
+  private var isOwnedWindowOpen: Bool {
+    store.owningWindowID.map { id in store.state.windowSessions?.contains { $0.id == id && $0.isOpen } == true } ?? true
+  }
   private var rows: [LibraryRow] {
     switch section {
     case "Bookmarks": return store.state.bookmarks.filter { $0.profileID == store.activeProfileID }.map {
@@ -87,12 +91,15 @@ struct NativeLibrary: View {
     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     .foregroundStyle(colors.ink).tint(colors.accent).font(.system(size: 13))
     .buttonStyle(LibraryActionStyle(colors: colors))
+    .background { NativeWindowDialogAnchor(owner: dialogs).frame(width: 0, height: 0) }
     .onAppear { focus = isRecords ? "search" : "section" }
+    .onDisappear { dialogs.cancel() }
+    .onChange(of: isOwnedWindowOpen) { _, open in if !open { dialogs.cancel() } }
     .onChange(of: actions.library) { _, value in
       guard let value else { return }
-      section = value; query = ""; focus = isRecords ? "search" : "section"
+      dialogs.cancel(); section = value; query = ""; focus = isRecords ? "search" : "section"
     }
-    .onChange(of: store.activeProfileID) { _, _ in query = ""; renameDownload = nil; renameError = nil }
+    .onChange(of: store.activeProfileID) { _, _ in dialogs.cancel(); query = ""; renameDownload = nil; renameError = nil }
     .onKeyPress(.escape) { actions.library = nil; return .handled }
     .alert("Couldn’t complete the action", isPresented: Binding(
       get: { error != nil }, set: { if !$0 { error = nil } })) {
@@ -547,8 +554,11 @@ struct NativeLibrary: View {
     alert.buttons.first?.hasDestructiveAction = true
     alert.buttons.first?.keyEquivalent = ""
     alert.buttons.last?.keyEquivalent = "\r"
-    guard alert.runModal() == .alertFirstButtonReturn, profileID == store.activeProfileID else { return }
-    perform(clearingSection == "History" ? "history:clear" : "archive:clear")
+    dialogs.perform { context in
+      guard await NativeWindowSheet.present(alert, for: context.window) == .alertFirstButtonReturn,
+        context.isCurrent, isOwnedWindowOpen, profileID == store.activeProfileID, section == clearingSection else { return }
+      perform(clearingSection == "History" ? "history:clear" : "archive:clear")
+    }
   }
   private func confirmClearData() {
     let profile = store.state.activeProfile
@@ -559,8 +569,11 @@ struct NativeLibrary: View {
     alert.addButton(withTitle: "Cancel"); alert.addButton(withTitle: "Clear data")
     alert.buttons.first?.keyEquivalent = "\r"
     alert.buttons.last?.keyEquivalent = ""; alert.buttons.last?.hasDestructiveAction = true
-    guard alert.runModal() == .alertSecondButtonReturn, profile?.id == store.activeProfileID else { return }
-    perform("data:clear")
+    dialogs.perform { context in
+      guard await NativeWindowSheet.present(alert, for: context.window) == .alertSecondButtonReturn,
+        context.isCurrent, isOwnedWindowOpen, profile?.id == store.activeProfileID else { return }
+      perform("data:clear")
+    }
   }
   private func perform(_ action: String, id: String = "", values: [String: String] = [:]) {
     guard let operation = actions.performLibraryAction else { return }
@@ -620,23 +633,28 @@ struct NativeLibrary: View {
     }
   }
   private func exportData() {
+    let profileID = store.activeProfileID
     let panel = NSSavePanel(); panel.allowedContentTypes = [.json]; panel.nameFieldStringValue = "Zacro.json"
-    guard panel.runModal() == .OK, let url = panel.url else { return }
-    do { try store.exportData(to: url) } catch { self.error = error.localizedDescription }
+    dialogs.perform { context in
+      guard await NativeWindowSheet.present(panel, for: context.window) == .OK,
+        context.isCurrent, isOwnedWindowOpen, profileID == store.activeProfileID, let url = panel.url else { return }
+      do { try store.exportData(to: url) } catch { self.error = error.localizedDescription }
+    }
   }
   private func importData(legacy: Bool) {
     let profileID = store.activeProfileID
     let panel = NSOpenPanel(); panel.allowedContentTypes = [.json, .html]; panel.allowsMultipleSelection = false
-    guard panel.runModal() == .OK, let url = panel.url else { return }
-    do {
-      if url.pathExtension.lowercased() == "html", let operation = actions.performLibraryAction {
-        guard profileID == store.activeProfileID else { return }
-        Task { @MainActor in
-          do { try await operation("data:import-bookmarks", ["path": url.path, "profileId": profileID]) }
-          catch { if profileID == store.activeProfileID { self.error = error.localizedDescription } }
-        }
-      } else if legacy { try store.importLegacy(from: url) } else { try store.importData(from: url) }
-    } catch { self.error = error.localizedDescription }
+    dialogs.perform { context in
+      guard await NativeWindowSheet.present(panel, for: context.window) == .OK,
+        context.isCurrent, isOwnedWindowOpen, profileID == store.activeProfileID, let url = panel.url else { return }
+      do {
+        if url.pathExtension.lowercased() == "html", let operation = actions.performLibraryAction {
+          try await operation("data:import-bookmarks", ["path": url.path, "profileId": profileID])
+        } else if legacy { try store.importLegacy(from: url) } else { try store.importData(from: url) }
+      } catch {
+        if context.isCurrent && isOwnedWindowOpen && profileID == store.activeProfileID { self.error = error.localizedDescription }
+      }
+    }
   }
 }
 private struct LibraryRow: Identifiable {

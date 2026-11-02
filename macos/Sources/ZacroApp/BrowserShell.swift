@@ -124,6 +124,7 @@ struct BrowserShell<Content: View>: View {
   @ViewBuilder var content: () -> Content
   @StateObject private var drag = SidebarDragSession()
   @StateObject private var spaceViewport = NativeSpaceViewport()
+  @StateObject private var dialogs = NativeWindowDialogOwner()
   @State private var spaceScroll = NativeSpaceScrollCache()
   @State private var name = ""
   @State private var creation: String?
@@ -327,6 +328,7 @@ struct BrowserShell<Content: View>: View {
       }
     }
     .ignoresSafeArea()
+    .background { NativeWindowDialogAnchor(owner: dialogs).frame(width: 0, height: 0) }
     .background {
       GeometryReader { geometry in
         Color.clear.onAppear { availableWindowWidth = geometry.size.width }
@@ -423,8 +425,9 @@ struct BrowserShell<Content: View>: View {
     }
     .onChange(of: spaces.map(\.id)) { _, _ in synchronizeSpaces() }
     .onChange(of: effectiveMotion) { _, _ in synchronizeSpaces() }
-    .onDisappear { spaceViewport.stop() }
-    .onChange(of: store.activeProfileID) { _, _ in drag.cancel() }
+    .onDisappear { dialogs.cancel(); spaceViewport.stop() }
+    .onChange(of: isOwnedWindowOpen) { _, open in if !open { dialogs.cancel() } }
+    .onChange(of: store.activeProfileID) { _, _ in dialogs.cancel(); drag.cancel() }
     .onChange(of: store.state.tabs) { _, _ in drag.reconcile(store: store) }
     .onChange(of: store.state.activeTabID) { _, _ in maybeOpenBlankPalette() }
     .onChange(of: actions.palette) { _, presented in
@@ -1569,17 +1572,27 @@ struct BrowserShell<Content: View>: View {
     }
   }
   private func confirmDelete(_ target: SidebarNamedItem, name: String) {
+    let profileID = store.activeProfileID
+    let spaceID = store.state.activeSpaceID
+    var folderRecord: BrowserFolder?
+    var spaceRecord: BrowserSpace?
+    var profileRecord: BrowserProfile?
     let alert = NSAlert()
     alert.messageText = "Delete \(target.kind.lowercased()) “\(name)”?"
     alert.alertStyle = .warning
     switch target {
-    case .folder: alert.informativeText = "The tabs inside this folder will remain in this Space."
+    case .folder(let id):
+      guard let folder = store.state.folders.first(where: { $0.id == id && $0.spaceID == spaceID }) else { return }
+      folderRecord = folder
+      alert.informativeText = "The tabs inside this folder will remain in this Space."
     case .space(let id):
       guard let space = store.state.spaces.first(where: { $0.id == id }), canDeleteSpace(space)
       else { return }
+      spaceRecord = space
       alert.informativeText = "Tabs will move to another Space in this profile."
     case .profile(let id):
-      guard canDeleteProfile(id) else { return }
+      guard let profile = store.state.profiles.first(where: { $0.id == id }), canDeleteProfile(id) else { return }
+      profileRecord = profile
       alert.informativeText =
         "This removes the profile and its Spaces, tabs, bookmarks, and history. Other profiles are kept."
     case .tab, .tabGroup: return
@@ -1589,12 +1602,25 @@ struct BrowserShell<Content: View>: View {
     alert.buttons.first?.hasDestructiveAction = true
     alert.buttons.last?.keyEquivalent = "\r"
     alert.buttons.first?.keyEquivalent = ""
-    guard alert.runModal() == .alertFirstButtonReturn else { return }
-    switch target {
-    case .folder(let id): store.deleteFolder(id: id)
-    case .space(let id): actions.deleteSpace(id)
-    case .profile(let id): actions.deleteProfile(id)
-    case .tab, .tabGroup: break
+    dialogs.perform { context in
+      guard await NativeWindowSheet.present(alert, for: context.window) == .alertFirstButtonReturn,
+        context.isCurrent, isOwnedWindowOpen, profileID == store.activeProfileID,
+        spaceID == store.state.activeSpaceID else { return }
+      switch target {
+      case .folder(let id):
+        guard let before = folderRecord, let current = store.state.folders.first(where: { $0.id == id }),
+          current.name == before.name, current.spaceID == before.spaceID, current.parentID == before.parentID else { return }
+        store.deleteFolder(id: id)
+      case .space(let id):
+        guard let before = spaceRecord, let current = store.state.spaces.first(where: { $0.id == id }),
+          current.name == before.name, current.profileID == before.profileID, canDeleteSpace(current) else { return }
+        actions.deleteSpace(id)
+      case .profile(let id):
+        guard let before = profileRecord, let current = store.state.profiles.first(where: { $0.id == id }),
+          current.name == before.name, current.isPrivate == before.isPrivate, canDeleteProfile(id) else { return }
+        actions.deleteProfile(id)
+      case .tab, .tabGroup: break
+      }
     }
   }
   private func isBookmarked(_ url: String) -> Bool {

@@ -36,6 +36,29 @@ import XCTest
     XCTAssertEqual(restarted.savedWindows.map(\.id), [secondID])
   }
 
+  func testRecoveredSessionWarningReachesNewWindowAndCanonicalFacades() throws {
+    let path = try directory(), repository = BrowserRepository(directory: path)
+    let first = repository.focusedStore
+    let tab = try XCTUnwrap(first.createTab(address: "https://recover.example"))
+    let second = try repository.makeWindow(addresses: ["https://second.example"])
+    let secondID = try XCTUnwrap(second.owningWindowID)
+    try repository.canonicalStore.flush() // Ensure both windows are also in the backup.
+    try Data("corrupt primary".utf8).write(to: path.appendingPathComponent("native-state.json"))
+    let recovered = BrowserRepository(directory: path)
+    XCTAssertEqual(recovered.canonicalStore.tab(tab.id)?.url, "https://recover.example/")
+    XCTAssertEqual(recovered.canonicalStore.lastError, "Recovered your session from its last backup.")
+    XCTAssertEqual(recovered.store(for: first.owningWindowID!)?.lastError, recovered.canonicalStore.lastError)
+    XCTAssertEqual(recovered.store(for: secondID)?.lastError, recovered.canonicalStore.lastError)
+    // Weakly held facades may be recreated when a parked window is opened.
+    var transient = recovered.store(for: secondID)
+    weak var released = transient
+    transient = nil
+    XCTAssertNil(released)
+    XCTAssertNotNil(recovered.store(for: secondID)?.lastError)
+    recovered.canonicalStore.clearError()
+    XCTAssertNil(recovered.store(for: secondID)?.lastError)
+  }
+
   func testDisabledSessionRestoreKeepsSavedDocumentsDormantInEveryWindow() throws {
     let repository = BrowserRepository(directory: try directory()), first = repository.focusedStore
     let a = try XCTUnwrap(first.createTab(address: "https://split.example/a"))

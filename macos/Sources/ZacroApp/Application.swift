@@ -80,6 +80,8 @@ final class BrowserWindowCoordinator: NSObject {
   private var observedDocumentBounds: [String: CGRect] = [:]
   private var selectionFocusIntent = DocumentFocusIntent()
   private var selectionFocusTask: Task<Void, Never>?
+  private var collectionPanelTask: Task<Void, Never>?
+  private var deferredWindowError: String?
   private weak var retiringPaletteEditor: NSTextView?
   private weak var retiringPaletteWindow: NSWindow?
   private var retiringPaletteDeadline: TimeInterval = 0
@@ -179,6 +181,7 @@ final class BrowserWindowCoordinator: NSObject {
     scheduleLayout()
   }
   func prepareTermination() {
+    collectionPanelTask?.cancel(); collectionPanelTask = nil
     cancelPermissionPrompts()
     loadingStrips.hide()
     documentErrorPanels.hide()
@@ -392,6 +395,9 @@ final class BrowserWindowCoordinator: NSObject {
     windowContext.onLayout = { [weak self] in self?.scheduleLayout() }
     windowContext.onClosed = { [weak self] in
       guard let self else { return }
+      self.collectionPanelTask?.cancel()
+      if let window = self.window { NativeWindowSheet.cancel(for: window) }
+      self.deferredWindowError = nil
       self.cancelPermissionPrompts()
       self.hidePeekPresentation(immediately: true)
       self.loadingStrips.hide()
@@ -415,6 +421,10 @@ final class BrowserWindowCoordinator: NSObject {
     windowContext.onCloseCancelled = { [weak self] in
       self?.finishWindowCloseWaiters(accepted: false)
       self?.scheduleLayout()
+      self?.application.resumeApplicationIntents()
+      if let self, let message = self.deferredWindowError {
+        self.deferredWindowError = nil; self.showError(message)
+      }
     }
     windowContext.beforeClosingDocuments = { [weak self] in
       guard let self else { return true }
@@ -422,6 +432,8 @@ final class BrowserWindowCoordinator: NSObject {
         self.showError("Wait for the current profile operation to finish before closing the browser.")
         return false
       }
+      self.collectionPanelTask?.cancel()
+      if let window = self.window { NativeWindowSheet.cancel(for: window) }
       for task in self.pageCreations.values { task.cancel() }
       self.cancelPermissionPrompts()
       for task in self.dormantNavigations.values { task.cancel() }
@@ -872,11 +884,14 @@ final class BrowserWindowCoordinator: NSObject {
     for continuation in closeWaiters.removeValue(forKey: id) ?? [] { continuation.resume(returning: accepted) }
   }
   func requestCloseWindow() async -> Bool {
-    guard windowContext.isOpen, let window = window else { return true }
+    guard windowContext.isOpen else { return true }
+    guard !engine.isTerminating else { return false }
     return await withCheckedContinuation { continuation in
       let pending = !windowCloseWaiters.isEmpty
       windowCloseWaiters.append(continuation)
-      if !pending { window.performClose(nil) }
+      // AppKit can refuse performClose while a sheet disables the titlebar's
+      // close button. The context owns cancellation and Chromium beforeunload.
+      if !pending { windowContext.close() }
     }
   }
   private func finishWindowCloseWaiters(accepted: Bool) {
@@ -1636,8 +1651,9 @@ final class BrowserWindowCoordinator: NSObject {
     _ = append("History", [("history-back","Back"),("history-forward","Forward"),("",""),("history","Show History"),("downloads","Downloads")])
     _ = append("Tabs", [("previous-tab","Previous Tab"),("next-tab","Next Tab"),("",""),("pin-tab","Pin / Unpin Tab"),("duplicate-tab","Duplicate Tab"),("rename-tab","Rename Tab…"),("move-tab","Move Tab…"),("mute-tab","Mute / Unmute Tab"),("split","Split View…"),("unsplit","Unsplit Tabs"),("",""),("previous-space","Previous Space"),("next-space","Next Space"),("new-space","New Space…"),("new-folder","New Folder…"),("",""),("bookmark","Bookmark This Page")])
     let window = append("Window", [("windows", "Saved Windows"),("", "")])
-    window.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
-    window.addItem(withTitle: "Zoom", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
+    let minimize = command("window-minimize", "Minimize")
+    minimize.keyEquivalent = "m"; minimize.keyEquivalentModifierMask = .command; window.addItem(minimize)
+    window.addItem(command("window-zoom", "Zoom"))
     window.addItem(.separator()); window.addItem(withTitle: "Bring All to Front", action: #selector(NSApplication.arrangeInFront(_:)), keyEquivalent: "")
     NSApp.windowsMenu = window
     NSApp.helpMenu = append("Help", [("onboarding","Welcome Tour"),("",""),("releases","Zacro Releases"),("issues","Report an Issue")])
@@ -1846,6 +1862,12 @@ extension BrowserWindowCoordinator {
     ["copy-url", "pin-tab", "duplicate-tab", "rename-tab", "move-tab", "mute-tab", "split", "reload", "force-reload", "stop", "find", "find-next", "find-previous", "bookmark", "save-page", "print", "zoom-in", "zoom-out", "zoom-reset", "developer-tools"]
   }
   private func commandAvailable(_ id: String) -> Bool {
+    let needsWindow = pageCommands.contains(id) || id.hasPrefix("peek-") || [
+      "close-tab", "close-window", "sidebar-toggle", "fullscreen", "previous-tab", "next-tab",
+      "history-back", "history-forward", "unsplit", "window-minimize", "window-zoom",
+    ].contains(id)
+    if needsWindow && (!windowContext.isOpen || windowContext.isClosing || engine.isTerminating) { return false }
+    if id == "window-minimize" { return window?.isMiniaturized == false }
     if id == "reopen-window" { return !application.repository.savedWindows.isEmpty }
     if id == "reopen-tab" { return recentlyClosedTabID != nil }
     if id == "history-back" { return actions.canGoBack }
@@ -1881,7 +1903,10 @@ extension BrowserWindowCoordinator {
   @objc private func menuCommand(_ item: NSMenuItem) {
     guard let id = item.representedObject as? String else { return }
     if id.hasPrefix("edit:") { editCommand(String(id.dropFirst(5))) }
-    else { runCommand(id) }
+    else {
+      application.performApplicationCommand(id,
+        preferredWindowID: application.focusedCoordinator?.windowContext.id ?? windowContext.id)
+    }
   }
   private func editCommand(_ id: String) {
     let selector = ["undo":"undo:","redo":"redo:","cut":"cut:","copy":"copy:","paste":"paste:","paste-match-style":"pasteAsPlainText:","select-all":"selectAll:"][id] ?? ""
@@ -1903,6 +1928,7 @@ extension BrowserWindowCoordinator {
     store.sidebarTabs()
   }
   func runCommand(_ id: String) {
+    guard application.permitWindowCommand(id, from: self) else { return }
     if isPopup {
       if id == "close-tab" || id == "close-window" {
         if id == "close-tab", store.state.activeTab?.peek != nil, store.state.activeTab?.peek?.isPresented != false { closePeek() }
@@ -1912,7 +1938,7 @@ extension BrowserWindowCoordinator {
       if id == "focus-chrome" { activePage?.focus(); return }
       let documentCommands: Set<String> = ["history-back", "history-forward", "copy-url", "mute-tab", "reload", "force-reload",
         "stop", "find", "find-next", "find-previous", "bookmark", "save-page", "print", "zoom-in", "zoom-out", "zoom-reset",
-        "developer-tools", "fullscreen", "about", "new-window", "open-browser", "peek-close", "peek-promote"]
+        "developer-tools", "fullscreen", "window-minimize", "window-zoom", "about", "new-window", "open-browser", "peek-close", "peek-promote"]
       if !documentCommands.contains(id) {
         do { try application.browsingWindow(profileID: store.activeProfileID).runCommand(id) }
         catch { showError(error.localizedDescription) }
@@ -2035,15 +2061,13 @@ extension BrowserWindowCoordinator {
     case "preferences": actions.library = "Settings"
     case "new-window": application.newWindow()
     case "open-browser": application.newWindow()
-    case "close-window": window?.performClose(nil)
+    case "close-window": windowContext.close()
+    case "window-minimize": window?.performMiniaturize(nil)
+    case "window-zoom": window?.performZoom(nil)
     case "fullscreen": window?.toggleFullScreen(nil)
     case "developer-tools": activePage?.showDevTools()
-    case "import":
-      let panel = NSOpenPanel(); panel.allowedContentTypes = [.json,.html]; panel.allowsMultipleSelection = false
-      if panel.runModal() == .OK, let url = panel.url { do { try store.importData(from: url) } catch { showError(error.localizedDescription) } }
-    case "export":
-      let panel = NSSavePanel(); panel.allowedContentTypes = [.json]; panel.nameFieldStringValue = "Zacro Collection.json"
-      if panel.runModal() == .OK, let url = panel.url { do { try store.exportData(to: url) } catch { showError(error.localizedDescription) } }
+    case "import": presentCollectionPanel(exporting: false)
+    case "export": presentCollectionPanel(exporting: true)
     case "releases", "issues":
       if let url = URL(string: "https://github.com/Zacro-Technologies/zacro_browser/" + id) { NSWorkspace.shared.open(url) }
     case "focus-chrome":
@@ -2060,8 +2084,43 @@ extension BrowserWindowCoordinator {
     }
   }
   func showError(_ message: String) {
+    guard let window, windowContext.isOpen else {
+      fputs("Zacro: \(message)\n", stderr); return
+    }
+    if windowContext.isClosing { deferredWindowError = message; return }
     let alert = NSAlert(); alert.messageText = message; alert.addButton(withTitle: "OK")
-    if let window = window { alert.beginSheetModal(for: window) } else { alert.runModal() }
+    Task { [weak self, weak window] in
+      guard let self, let window, self.windowContext.isOpen,
+        !self.windowContext.isClosing, self.window === window else { return }
+      _ = await NativeWindowSheet.present(alert, for: window)
+    }
+  }
+  private func presentCollectionPanel(exporting: Bool) {
+    guard collectionPanelTask == nil, let window, windowContext.isOpen, !windowContext.isClosing,
+      !engine.isTerminating else { return }
+    let profileID = store.activeProfileID
+    collectionPanelTask = Task { [weak self, weak window] in
+      guard let self, let window else { return }
+      defer { self.collectionPanelTask = nil }
+      let panel: NSSavePanel
+      if exporting {
+        panel = NSSavePanel(); panel.allowedContentTypes = [.json]
+        panel.nameFieldStringValue = "Zacro Collection.json"
+      } else {
+        let open = NSOpenPanel(); open.allowedContentTypes = [.json, .html]
+        open.allowsMultipleSelection = false; panel = open
+      }
+      guard await NativeWindowSheet.present(panel, for: window) == .OK, !Task.isCancelled,
+        self.window === window, self.windowContext.isOpen, !self.windowContext.isClosing,
+        !self.engine.isTerminating, let url = panel.url else { return }
+      do {
+        if exporting { try self.store.exportData(to: url) }
+        else {
+          guard url.pathExtension.lowercased() != "html" || self.store.activeProfileID == profileID else { return }
+          try self.store.importData(from: url)
+        }
+      } catch { self.showError(error.localizedDescription) }
+    }
   }
   private var servicePalette: NativeSpacePalette {
     let theme = presentationTheme
@@ -2363,6 +2422,7 @@ extension BrowserWindowCoordinator {
       && (activePage === page || visiblePageFrames[page.id] != nil)
   }
   private func libraryAction(_ action: String, payload: [String:String]) async throws {
+    try Task.checkCancellation()
     guard !windowContext.isClosing, !engine.isTerminating else { throw CancellationError() }
     if let profile = payload["profileId"], profile != store.activeProfileID { throw ShortcutError("The active profile changed. Try again.") }
     let id = payload["id"] ?? payload["tabID"] ?? store.state.activeTabID ?? ""
@@ -2385,13 +2445,20 @@ extension BrowserWindowCoordinator {
     } else if action.hasPrefix("download:"), action != "download:suggest" {
       try await downloads.perform(action, id: id, name: payload["name"] ?? "", profileID: store.activeProfileID)
     } else if action == "download:suggest" {
-      let record = try downloads.record(id, profileID: store.activeProfileID)
+      let profileID = store.activeProfileID
+      guard let window else { throw CancellationError() }
+      let record = try downloads.record(id, profileID: profileID)
       let suggestion = try await services.aiAction("ai:suggest-name", payload: ["name":.string(record.filename), "url":.string(record.sourceURL ?? record.url), "title":.string(record.sourceTitle ?? "")])
-      _ = try downloads.record(id, profileID: store.activeProfileID)
+      guard self.window === window, windowContext.isOpen, !windowContext.isClosing,
+        !engine.isTerminating, store.activeProfileID == profileID else { throw CancellationError() }
+      _ = try downloads.record(id, profileID: profileID)
       let alert = NSAlert(); alert.messageText = "Rename download"
       let field = NSTextField(frame: CGRect(x: 0, y: 0, width: 320, height: 24)); field.stringValue = suggestion["name"].string
       alert.accessoryView = field; alert.addButton(withTitle: "Rename"); alert.addButton(withTitle: "Cancel")
-      if alert.runModal() == .alertFirstButtonReturn { try await downloads.perform("download:rename", id: id, name: field.stringValue, profileID: store.activeProfileID) }
+      guard await NativeWindowSheet.present(alert, for: window) == .alertFirstButtonReturn,
+        !Task.isCancelled, self.window === window, windowContext.isOpen, !windowContext.isClosing,
+        !engine.isTerminating, store.activeProfileID == profileID else { return }
+      try await downloads.perform("download:rename", id: id, name: field.stringValue, profileID: profileID)
     } else if action == "tab:mute", let tab = store.tab(id), store.profileID(for: tab) == store.activeProfileID {
       store.updateTab(id) { $0.isMuted.toggle() }; engine.pages[id]?.browser?.isAudioMuted = !tab.isMuted
     } else if action == "tab:sleep" { try await sleepTab(id) }

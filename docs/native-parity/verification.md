@@ -165,6 +165,18 @@ The theme editor's actual owned view was rendered and inspected for layout and r
 
 Evidence: `macos/.build/verification/integrated-release-20.log`, `integrated-release-20-retry.log`, `application-20-engine-assisted/application.json`, `application-20-engine-assisted.log`, `application-20-engine-assisted/view-renders/theme-editor-0.png`, `engine-20/engine.json`, `core-services-post20-full.log`, `permission-callbacks-20.log`, `startup-window-20.log`, `action-open-popup-objects-20/object-check.json`, and `popup-owner-objects-20/object-check.json`. Stock extension compatibility, desktop input and material composition remain explicitly unverified.
 
+## 2026-11-02: integrated build 21
+
+The final release build passed in **105.10 seconds**, without warnings. The internal app passed deep/strict signature verification and all **113 application checks**, with clean shutdown. The complete **218 Core/Services tests** passed (141 Core and 77 Services), including the bundled Codex handshake and PDF helper, without failures or skips.
+
+New application coverage exercises actual asynchronous AppKit sheets, duplicate-sheet rejection, task cancellation, physical owner closure, and cancellation of a child editor's sheet when its logical browser owner closes. The first run reached 101 passing checks before an incorrect test lookup for the Window menu. After correcting the fixture, the next run exposed a real product hang: AppKit can refuse `performClose` while a sheet disables the titlebar's close button. Programmatic browser close now uses the existing Chromium window transaction, retaining page beforeunload checks. The successful run verifies that closing a browser cancels its sheet and completes normally.
+
+Application-level commands and external links now wait for window-close decisions and profile maintenance. Dock actions remain available after the last browser window closes; a command reopens the most recent saved window, external links use one live owner, and New Window creates exactly one window. Native menu commands preserve the focused Chromium document, and Minimize targets its owning shell. The application checks exercise all these paths. A Core regression also preserves recovery warnings in newly created window facades.
+
+Five native color-well checks and four dialog-owner lifetime checks pass. The actual theme-editor view renders clearer separate swatches; integrated capture revealed AppKit expanding a nominal 27-point well to 33 points, so exact sizing remains a follow-up. These own-view images still exclude desktop composition and input. The custom Chromium build guard passed nineteen driver/provenance cases; a monitored ten-job trial hit native memory-pressure warning and was stopped, then compilation resumed safely at eight jobs. No custom-runtime extension or desktop-input acceptance is claimed.
+
+Evidence: `macos/.build/verification/integrated-release-21-retry2.log`, `application-21-retry2/application.json`, `application-21-retry2/application.log`, `application-21-retry2/view-renders`, and `core-services-post21-full.log`. The initial fixture failure and interrupted close-hang run remain under `application-21` and `application-21-retry` respectively. Custom framework, physical interaction, material composition, signing/notarization and final distribution remain release gates.
+
 ## Required release evidence
 
 - Successful custom Chromium build and package provenance; native protocol capability checks.

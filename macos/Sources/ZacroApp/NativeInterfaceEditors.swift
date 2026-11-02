@@ -46,6 +46,7 @@ enum NativeInterfaceEditor: String, Identifiable {
 struct NativeInterfaceEditors: View {
   @ObservedObject var store: BrowserStore
   @ObservedObject var actions: BrowserActions
+  @StateObject private var dialogs = NativeWindowDialogOwner()
   let destination: NativeInterfaceEditor
   var navigate: (String) -> Void = { _ in }
   @Environment(\.dismiss) private var dismiss
@@ -59,6 +60,9 @@ struct NativeInterfaceEditors: View {
   @State private var profileName = ""
   @State private var tourStep = 0
   @State private var renameProfile: BrowserProfile?
+  private var isOwnedWindowOpen: Bool {
+    store.owningWindowID.map { id in store.state.windowSessions?.contains { $0.id == id && $0.isOpen } == true } ?? true
+  }
   private var colors: NativeSpacePalette {
     let theme = presentedTheme ?? store.state.activeSpace?.theme ?? SpaceTheme()
     return NativeSpacePalette(theme: theme, dark: colorScheme == .dark, increasedContrast: contrast == .increased)
@@ -90,9 +94,12 @@ struct NativeInterfaceEditors: View {
     }.padding(20).frame(width: 500)
       .font(.system(size: 13)).foregroundStyle(colors.ink).tint(colors.accent)
       .background { NativeControlSurface().overlay(colors.chrome.opacity(0.65)) }
+      .background { NativeWindowDialogAnchor(owner: dialogs).frame(width: 0, height: 0) }
       .onChange(of: recording) { _, value in actions.recordingShortcut = value != nil }
       .onChange(of: actions.recordingShortcut) { _, value in if !value { recording = nil } }
-      .onDisappear { actions.recordingShortcut = false }
+      .onDisappear { dialogs.cancel(); actions.recordingShortcut = false }
+      .onChange(of: store.activeProfileID) { _, _ in dialogs.cancel() }
+      .onChange(of: isOwnedWindowOpen) { _, open in if !open { dialogs.cancel() } }
       .sheet(item: $renameProfile) { profile in
         NativeNameEditor(title: "Rename profile", name: $profileName, error: error, colors: colors, save: {
             let name = profileName.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -209,11 +216,19 @@ struct NativeInterfaceEditors: View {
     }
   }
   private func deleteSpace(_ space: BrowserSpace) {
+    let profileID = store.activeProfileID
     let alert = NSAlert(); alert.messageText = "Delete Space “\(space.name)”?"
     alert.informativeText = "Tabs will move to another Space in this profile."
     alert.addButton(withTitle: "Delete"); alert.addButton(withTitle: "Cancel"); alert.alertStyle = .warning
     alert.buttons.first?.hasDestructiveAction = true; alert.buttons.first?.keyEquivalent = ""; alert.buttons.last?.keyEquivalent = "\r"
-    if alert.runModal() == .alertFirstButtonReturn { actions.deleteSpace(space.id) }
+    dialogs.perform { context in
+      guard await NativeWindowSheet.present(alert, for: context.window) == .alertFirstButtonReturn,
+        context.isCurrent, isOwnedWindowOpen, profileID == store.activeProfileID,
+        let current = store.state.spaces.first(where: { $0.id == space.id }),
+        current.name == space.name, current.profileID == space.profileID,
+        store.state.spaces.filter({ $0.profileID == current.profileID }).count > 1 else { return }
+      actions.deleteSpace(space.id)
+    }
   }
   private func showInterface(_ command: String) {
     navigate(command)
@@ -282,11 +297,19 @@ struct NativeInterfaceEditors: View {
     }
   }
   private func deleteProfile(_ profile: BrowserProfile) {
+    let profileID = store.activeProfileID
     let alert = NSAlert(); alert.messageText = "Delete profile “\(profile.name)”?"
     alert.informativeText = "This removes this profile’s Spaces, tabs, bookmarks, history, and browsing data."
     alert.addButton(withTitle: "Delete"); alert.addButton(withTitle: "Cancel"); alert.alertStyle = .warning
     alert.buttons.first?.hasDestructiveAction = true; alert.buttons.first?.keyEquivalent = ""; alert.buttons.last?.keyEquivalent = "\r"
-    if alert.runModal() == .alertFirstButtonReturn { actions.deleteProfile(profile.id) }
+    dialogs.perform { context in
+      guard await NativeWindowSheet.present(alert, for: context.window) == .alertFirstButtonReturn,
+        context.isCurrent, isOwnedWindowOpen, profileID == store.activeProfileID,
+        let current = store.state.profiles.first(where: { $0.id == profile.id }),
+        current.name == profile.name, current.isPrivate == profile.isPrivate,
+        store.state.profiles.contains(where: { !$0.isPrivate && $0.id != profile.id }) else { return }
+      actions.deleteProfile(profile.id)
+    }
   }
   private var permissions: some View {
     let entries = store.state.permissions.filter { $0.profileID == store.activeProfileID }

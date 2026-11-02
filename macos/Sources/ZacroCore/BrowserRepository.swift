@@ -9,6 +9,7 @@ import Foundation
     if let canonicalFacade { return canonicalFacade }
     let value = BrowserStore(directory: directory, initialState: writer.state, memoryOnly: true)
     value.attachRepository(self, windowID: nil)
+    value.acceptRepositoryState(writer.state, error: writer.lastError)
     canonicalFacade = value
     return value
   }
@@ -67,6 +68,7 @@ import Foundation
     if let value = facades[windowID]?.value { return value }
     let value = BrowserStore(directory: directory, initialState: snapshot(for: windowID), memoryOnly: true)
     value.attachRepository(self, windowID: windowID)
+    value.acceptRepositoryState(value.state, error: writer.lastError)
     facades[windowID] = WeakStore(value)
     return value
   }

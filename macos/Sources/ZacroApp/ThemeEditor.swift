@@ -463,16 +463,13 @@ private struct ThemeColorWell: View {
     VStack(alignment: .leading, spacing: 7) {
       Text(title).font(.caption).foregroundStyle(.secondary)
       HStack(spacing: 8) {
-        ColorPicker(
-          title,
-          selection: Binding(
-            get: { Color(nsColor: ThemeColor.nsColor(hex)) },
-            set: {
-              hex = ThemeColor.hex(NSColor($0))
-              select()
-              ThemeHaptics.tick()
-            }), supportsOpacity: false
-        ).labelsHidden()
+        NativeThemeColorWell(
+          title: title, color: ThemeColor.nsColor(hex), onSelect: select,
+          onChange: {
+            hex = ThemeColor.hex($0)
+            ThemeHaptics.tick()
+          }
+        ).frame(width: 27, height: 27)
         TextField("#RRGGBB", text: $draft)
           .font(.system(.caption, design: .monospaced))
           .textFieldStyle(.plain)

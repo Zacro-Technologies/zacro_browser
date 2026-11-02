@@ -20,6 +20,7 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
       guard oldValue != deletingProfileID else { return }
       if let oldValue { engine.setProfileMaintenance(oldValue, active: false) }
       if let deletingProfileID { engine.setProfileMaintenance(deletingProfileID, active: true) }
+      else { resumeApplicationIntents() }
     }
   }
   var clearingHistoryProfiles: Set<String> = []
@@ -49,6 +50,10 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
   private var runtimeCapabilities: CefNativeCapabilities?
   private var observedNativeProfiles: Set<String> = []
   private var libraryStatus: [String: [String: String]] = [:]
+  private var applicationIntents = ApplicationIntentQueue()
+  private var applicationReady = false
+  private var drainingApplicationIntents = false
+  var pendingApplicationIntentCount: Int { applicationIntents.count }
 
   init(engine: ChromiumEngine, repository: BrowserRepository) {
     self.engine = engine; self.repository = repository
@@ -137,6 +142,8 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
       let address = ProcessInfo.processInfo.environment["ZACRO_NATIVE_SMOKE_URL"] {
       focusedCoordinator?.navigate(address)
     }
+    applicationReady = true
+    drainApplicationIntents()
   }
 
   private func installRuntimeCallbacks() {
@@ -161,6 +168,7 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
     engine.onPageClosed = { [weak self] _ in self?.scheduleAllWindows() }
     engine.onPageCloseCancelled = { [weak self] id in
       self?.cancelProfileOperation(forPage: id)
+      self?.resumeApplicationIntents()
     }
     navigation.beforeRestore = { [weak self] page in
       guard let self, !page.isPrivate, self.store.document(id: page.id) != nil else { return }
@@ -183,10 +191,12 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
       if terminating {
         self.store.save()
         do { try self.store.flush() } catch { self.focusedCoordinator?.showError(error.localizedDescription) }
-      } else { self.scheduleAllWindows() }
+      } else { self.scheduleAllWindows(); self.resumeApplicationIntents() }
     }
     engine.beforeTermination = { [weak self] in
       guard let self else { return }
+      self.applicationReady = false
+      self.applicationIntents.removeAll()
       for owner in self.windows.values { owner.prepareTermination() }
       for owner in self.windows.values { await owner.closeServicesPresentation() }
       await self.downloads.close()
@@ -285,6 +295,7 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
     owner.installMenus()
     services.refreshContext()
     extensionBrowser.windowFocusChanged()
+    resumeApplicationIntents()
   }
 
   func scheduleAllWindows() { for owner in windows.values { owner.scheduleLayout() } }
@@ -326,6 +337,10 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
     }
     Task { [weak self] in await self?.extensionBrowser.didCloseWindow(owner.windowContext.id) }
     scheduleAllWindows()
+    // The menu installed by a parked coordinator must never continue to mutate
+    // its hidden session. Routes below rebind every action at invocation time.
+    (focusedCoordinator ?? owner).installMenus()
+    resumeApplicationIntents()
   }
 
   func newWindow() {
@@ -472,18 +487,108 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
   func applicationWillTerminate(_ notification: Notification) { store.save(); try? store.flush() }
   func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
   func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-    if let owner = focusedCoordinator { owner.windowContext.show() }
-    else if let session = repository.savedWindows.first {
-      do { try reopenWindow(id: session.id) }
-      catch { newWindow() }
-    } else { newWindow() }
+    enqueueApplicationIntent(.showWindow)
     return true
   }
   func application(_ application: NSApplication, open urls: [URL]) {
-    _ = applicationShouldHandleReopen(application, hasVisibleWindows: focusedCoordinator != nil)
-    for url in urls.prefix(32) where BrowserAddress.webURL(url.absoluteString) != nil {
-      focusedCoordinator?.actions.newTab(url.absoluteString)
+    let owner = focusedCoordinator?.windowContext.id
+    for url in urls.prefix(32) {
+      guard let address = BrowserAddress.webURL(url.absoluteString) else { continue }
+      _ = applicationIntents.append(.openURL(address.absoluteString), preferredWindowID: owner)
+    }
+    drainApplicationIntents()
+  }
+  func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
+    let menu = NSMenu()
+    for (id, title) in [("open-browser", "New Window"), ("command-palette", "Command Palette"), ("new-private-space", "New Private Space")] {
+      let item = NSMenuItem(title: title, action: #selector(applicationMenuCommand(_:)), keyEquivalent: "")
+      item.target = self; item.representedObject = id; menu.addItem(item)
+    }
+    return menu
+  }
+  @objc private func applicationMenuCommand(_ item: NSMenuItem) {
+    guard let command = item.representedObject as? String else { return }
+    performApplicationCommand(command)
+  }
+  func performApplicationCommand(_ command: String, preferredWindowID: String? = nil) {
+    enqueueApplicationIntent(.command(command), preferredWindowID: preferredWindowID)
+  }
+  /// Return true only when a direct sidebar/palette command can act on its
+  /// original live shell. Menu calls use the application queue even when live.
+  func permitWindowCommand(_ command: String, from owner: BrowserWindowCoordinator) -> Bool {
+    guard applicationReady, !engine.isTerminating, deletingProfileID == nil, owner.windowContext.isOpen,
+      !owner.windowContext.isClosing, drainingApplicationIntents || applicationIntents.count == 0 else {
+      enqueueApplicationIntent(.command(command), preferredWindowID: owner.windowContext.id)
+      return false
+    }
+    return true
+  }
+  private func enqueueApplicationIntent(_ action: ApplicationIntentQueue.Action, preferredWindowID: String? = nil) {
+    _ = applicationIntents.append(action, preferredWindowID: preferredWindowID ?? focusedCoordinator?.windowContext.id)
+    drainApplicationIntents()
+  }
+  /// Close callbacks and focus notifications can be reentrant with AppKit.
+  /// Resume on the next main-loop turn after their model transitions finish.
+  func resumeApplicationIntents() {
+    DispatchQueue.main.async { [weak self] in self?.drainApplicationIntents() }
+  }
+  private func applicationIntentWindow(_ id: String?) throws -> BrowserWindowCoordinator {
+    if let id, let owner = windows[id], owner.windowContext.isOpen, !owner.windowContext.isClosing {
+      repository.focusWindow(id)
+      presentApplicationIntentWindow(owner)
+      return owner
+    }
+    if let session = repository.savedWindows.first { return try reopenWindow(id: session.id) }
+    return try present(repository.makeWindow(), focused: true)
+  }
+  private func presentApplicationIntentWindow(_ owner: BrowserWindowCoordinator) {
+    let shell = owner.windowContext.window
+    var key = NSApp.keyWindow
+    var ownsKey = key.map { focused in
+      engine.extensionPopupOwner(focused) === owner.windowContext
+        || engine.pages.values.contains { $0.ownerWindowID == owner.windowContext.id && $0.nativeWindow === focused }
+    } ?? false
+    var seen = Set<ObjectIdentifier>()
+    while let current = key, seen.insert(ObjectIdentifier(current)).inserted {
+      if current === shell { ownsKey = true; break }
+      key = current.sheetParent ?? current.parent
+    }
+    if NSApp.isHidden { NSApp.unhide(nil) }
+    if shell.isMiniaturized { shell.deminiaturize(nil) }
+    // Chrome documents, palette text fields, and real extension popups have
+    // their own key window. Raising the parent here would steal their focus.
+    if !ownsKey || !shell.isVisible { owner.windowContext.show() }
+    if !NSApp.isActive { NSApp.activate(ignoringOtherApps: true) }
+  }
+  private func drainApplicationIntents() {
+    guard !drainingApplicationIntents, deletingProfileID == nil else { return }
+    drainingApplicationIntents = true
+    defer { drainingApplicationIntents = false }
+    while deletingProfileID == nil, let delivery = applicationIntents.next(ready: applicationReady, terminating: engine.isTerminating,
+      windows: engine.contexts.values.filter(\.isOpen).sorted { $0.nativeID < $1.nativeID }
+        .map { .init(id: $0.id, isClosing: $0.isClosing) },
+      focusedWindowID: focusedCoordinator?.windowContext.id) {
+      guard case .perform(let intent, let target) = delivery else { continue }
+      do {
+        switch intent.action {
+        case .command("open-browser"), .command("new-window"):
+          // These commands create exactly one window; do not ensure another first.
+          newWindow()
+        case .command("reopen-window"):
+          if let saved = repository.savedWindows.first { try reopenWindow(id: saved.id) }
+        case .showWindow:
+          _ = try applicationIntentWindow(target)
+        case .openURL(let address):
+          let selected = try applicationIntentWindow(target)
+          let owner = selected.isPopup ? try browsingWindow(profileID: selected.store.activeProfileID) : selected
+          owner.actions.newTab(address)
+        case .command(let command):
+          try applicationIntentWindow(target).runCommand(command)
+        }
+      } catch {
+        if let owner = focusedCoordinator { owner.showError(error.localizedDescription) }
+        else { fputs("Zacro could not open a browser window: \(error.localizedDescription)\n", stderr) }
+      }
     }
   }
-  func applicationDockMenu(_ sender: NSApplication) -> NSMenu? { focusedCoordinator?.applicationDockMenu(sender) }
 }

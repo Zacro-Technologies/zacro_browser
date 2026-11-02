@@ -38,6 +38,10 @@ final class BrowserIntegrationAcceptance {
     guard let firstWindow = first.window else { throw Failure("No application window presentation") }
     for (name, passed) in NativeSidebarDragAcceptance.check(in: firstWindow) { try require(passed, name) }
     for (name, passed) in NativeSpaceViewportAcceptance.check() { try require(passed, name) }
+    for (name, passed) in NativeThemeColorWellAcceptance.check() { try require(passed, name) }
+    for (name, passed) in await NativeWindowDialogOwnerAcceptance.check() { try require(passed, name) }
+    try await checkNativeWindowSheets(owner: firstWindow)
+    first.windowContext.show()
     first.actions.palette = false
     guard let tab = first.store.createTab(address: url.appendingPathComponent("first").absoluteString) else { throw Failure("First tab creation") }
     let page = try await first.ensurePageReady(tab)
@@ -291,6 +295,74 @@ final class BrowserIntegrationAcceptance {
       "webStoreUsesOneOrdinaryOwnedTab")
     second.store.selectTab(id: page.id)
     if nativeExtensions { try await checkProfileClear(url: url, survivor: page, owner: second) }
+    try await checkApplicationReopening(url: url, owner: second, page: page)
+  }
+
+  private func checkApplicationReopening(url: URL, owner: BrowserWindowCoordinator,
+    page: ChromiumPage) async throws {
+    owner.store.selectTab(id: page.id)
+    owner.actions.palette = false; owner.actions.library = nil
+    owner.windowContext.show(); owner.layoutPages(); page.focus()
+    try await wait("menuFixtureFocusesActualPage", record: false) { NSApp.keyWindow === page.nativeWindow }
+    application.performApplicationCommand("zoom-in", preferredWindowID: owner.windowContext.id)
+    try require(NSApp.keyWindow === page.nativeWindow && application.pendingApplicationIntentCount == 0,
+      "applicationMenuPreservesActualDocumentFocus")
+    page.resetZoom()
+    guard let windowMenu = NSApp.windowsMenu,
+      let minimize = windowMenu.items.first(where: { $0.representedObject as? String == "window-minimize" }),
+      let action = minimize.action, let shell = owner.window else { throw Failure("Logical-window menu fixture") }
+    try require(NSApp.sendAction(action, to: minimize.target, from: minimize),
+      "windowMenuDispatchesToLogicalBrowserOwner")
+    try await wait("documentFocusedMinimizeTargetsOwningShell") { shell.isMiniaturized }
+    application.performApplicationCommand("zoom-in", preferredWindowID: owner.windowContext.id)
+    try await wait("ownedCommandRestoresSameMiniaturizedBrowser") {
+      !shell.isMiniaturized && shell.isVisible && owner.windowContext.isOpen
+        && self.application.focusedCoordinator === owner
+    }
+    page.resetZoom()
+    let open = application.windows.values.filter { $0.windowContext.isOpen }
+      .sorted { $0.windowContext.nativeID < $1.windowContext.nativeID }
+    guard let closingOwner = open.first?.window else { throw Failure("Logical-close sheet owner") }
+    let closingAlert = NSAlert(); closingAlert.messageText = "Disposable logical-window closure fixture"
+    var closingResponse: NSApplication.ModalResponse?
+    let closingDialog = Task { closingResponse = await NativeWindowSheet.present(closingAlert, for: closingOwner) }
+    defer { closingDialog.cancel() }
+    try await wait("applicationCloseFixtureHasOwnedSheet", record: false) {
+      closingOwner.attachedSheet === closingAlert.window
+    }
+    for window in open {
+      window.actions.palette = false; window.actions.library = nil; window.actions.themeEditor = false
+      try require(await window.requestCloseWindow(), "appRoutingClosesWindow:\(window.windowContext.id)")
+    }
+    try await wait("applicationRemainsAliveWithNoBrowserWindows") {
+      !self.application.windows.values.contains { $0.windowContext.isOpen }
+    }
+    try await wait("logicalBrowserClosureCancelsItsNativeDialog") {
+      closingResponse == .cancel && closingOwner.attachedSheet == nil
+    }
+    guard let expected = application.repository.savedWindows.first?.id,
+      let dock = application.applicationDockMenu(NSApp) else { throw Failure("Closed-window Dock menu") }
+    try require(dock.items.compactMap { $0.representedObject as? String }
+      == ["open-browser", "command-palette", "new-private-space"], "dockActionsSurviveClosingLastWindow")
+    application.performApplicationCommand("command-palette")
+    try await wait("menuCommandReopensMostRecentSavedWindow") {
+      let windows = self.application.windows.values.filter { $0.windowContext.isOpen }
+      return windows.count == 1 && windows[0].windowContext.id == expected && windows[0].actions.palette
+    }
+    guard let reopened = application.focusedCoordinator else { throw Failure("Reopened command window") }
+    let destination = url.appendingPathComponent("external-application-link")
+    application.application(NSApp, open: [destination])
+    try await wait("externalLinkUsesOneLiveOwnedWindow") {
+      self.application.windows.values.filter { $0.windowContext.isOpen }.count == 1
+        && reopened.store.state.activeTab?.url == destination.absoluteString
+        && self.application.pendingApplicationIntentCount == 0
+    }
+    try require(await reopened.requestCloseWindow(), "applicationRouteWindowClosesCleanly")
+    application.performApplicationCommand("open-browser")
+    try await wait("newWindowCommandCreatesExactlyOneWindowAfterClosure") {
+      self.application.windows.values.filter { $0.windowContext.isOpen }.count == 1
+        && self.application.pendingApplicationIntentCount == 0
+    }
   }
 
   private func checkActionPreparationContext(owner: BrowserWindowCoordinator,
@@ -322,6 +394,54 @@ final class BrowserIntegrationAcceptance {
     try require(!authorized && Set(owner.store.state.tabs.map(\.id)) == before,
       "programmaticActionCannotActivateAnInactiveWindow")
     owner.windowContext.show()
+  }
+
+  private func checkNativeWindowSheets(owner: NSWindow) async throws {
+    let alert = NSAlert(); alert.messageText = "Disposable dialog cancellation fixture"
+    var response: NSApplication.ModalResponse?
+    let task = Task { response = await NativeWindowSheet.present(alert, for: owner) }
+    defer { task.cancel() }
+    try await wait("nativeDialogIsOwnedAndAsynchronous", record: false) {
+      owner.attachedSheet === alert.window && NSApp.modalWindow == nil
+    }
+    let duplicate = NSAlert(); duplicate.messageText = "Must not replace the existing sheet"
+    let duplicateResponse = await NativeWindowSheet.present(duplicate, for: owner)
+    try require(duplicateResponse == .cancel && owner.attachedSheet === alert.window && response == nil,
+      "nativeDialogCannotReplaceAnotherOwnedSheet")
+    task.cancel()
+    try await wait("nativeDialogTaskCancellationClosesItsSheet") {
+      response == .cancel && owner.attachedSheet == nil
+    }
+    let temporary = NSWindow(contentRect: CGRect(x: 0, y: 0, width: 300, height: 180),
+      styleMask: [.titled, .closable], backing: .buffered, defer: false)
+    temporary.isReleasedWhenClosed = false; temporary.orderFront(nil)
+    let closeAlert = NSAlert(); closeAlert.messageText = "Disposable owner-closure fixture"
+    var closeResponse: NSApplication.ModalResponse?
+    let closing = Task { closeResponse = await NativeWindowSheet.present(closeAlert, for: temporary) }
+    defer { closing.cancel(); temporary.close() }
+    try await wait("nativeDialogFixtureOwnsItsTemporarySheet", record: false) {
+      temporary.attachedSheet === closeAlert.window
+    }
+    temporary.close()
+    try await wait("nativeDialogOwnerClosureResolvesCancellation") {
+      closeResponse == .cancel && !temporary.isVisible
+    }
+    let child = NSPanel(contentRect: CGRect(x: 0, y: 0, width: 300, height: 180),
+      styleMask: [.titled], backing: .buffered, defer: false)
+    child.isReleasedWhenClosed = false
+    owner.addChildWindow(child, ordered: .above); child.orderFront(nil)
+    defer { owner.removeChildWindow(child); child.close() }
+    let nestedAlert = NSAlert(); nestedAlert.messageText = "Disposable descendant-sheet fixture"
+    var nestedResponse: NSApplication.ModalResponse?
+    let nested = Task { nestedResponse = await NativeWindowSheet.present(nestedAlert, for: child) }
+    defer { nested.cancel() }
+    try await wait("nativeDialogFixtureOwnsDescendantSheet", record: false) {
+      child.attachedSheet === nestedAlert.window
+    }
+    NativeWindowSheet.cancel(for: owner)
+    try await wait("nativeDialogLogicalOwnerCancellationIncludesDescendants") {
+      nestedResponse == .cancel && child.attachedSheet == nil && owner.isVisible
+    }
   }
 
   private func checkPermissionSheets(owner: BrowserWindowCoordinator,
@@ -1068,13 +1188,14 @@ final class BrowserIntegrationAcceptance {
     let limit = Date().addingTimeInterval(timeout)
     while Date() < limit {
       try Task.checkCancellation()
-      if try await condition() { if record { checks[name] = true }; return }
+      if try await condition() { if record { try require(true, name) }; return }
       try await Task.sleep(for: .milliseconds(80))
     }
     checks[name] = false; throw Failure(name)
   }
   private func require(_ value: Bool, _ name: String) throws {
     checks[name] = value
+    fputs("Native application check \(value ? "PASS" : "FAIL"): \(name)\n", stderr)
     if !value { throw Failure(name) }
   }
   private func finish(_ error: String?) {
