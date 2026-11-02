@@ -13,6 +13,8 @@ struct NativeSpacePalette {
   let secondary: Color
   let card: Color
   let surface: Color
+  let line: Color
+  let hover: Color
   let dark: Bool
   private static let cache = NSCache<NSString, CachedPalette>()
   private final class CachedPalette: NSObject {
@@ -84,6 +86,9 @@ struct NativeSpacePalette {
     self.secondary = Self.color(tintSecondary)
     self.card = Self.color(card)
     self.surface = Self.color(surface)
+    self.line = Self.color(increasedContrast ? ink.map { $0.rounded() } : dark ? Self.rgb("#454647")
+      : Self.mix(Self.rgb("#dbd9d4"), primary, 0.05))
+    self.hover = Self.color(hover)
     Self.cache.countLimit = 32
     Self.cache.setObject(CachedPalette(self), forKey: key)
   }
@@ -122,6 +127,30 @@ struct NativePressButtonStyle: ButtonStyle {
   }
 }
 
+/// The renderer's icon/Home controls retain their own hover surface while the
+/// pressed transform stays within the button's original layout rectangle.
+struct NativeHoverPressButtonStyle: ButtonStyle {
+  let hover: Color
+  var radius: CGFloat = 6
+  var scale = 0.97
+  var pressDuration = 0.14
+  var motionScale = 1.0
+  @State private var hovered = false
+  @Environment(\.isEnabled) private var enabled
+  @Environment(\.accessibilityReduceMotion) private var reduceMotion
+  func makeBody(configuration: Configuration) -> some View {
+    configuration.label
+      .background(hover.opacity(hovered && enabled ? 1 : 0), in: RoundedRectangle(cornerRadius: radius))
+      .scaleEffect(configuration.isPressed && enabled && !reduceMotion && motionScale > 0 ? scale : 1)
+      .opacity(enabled ? 1 : 0.38)
+      .animation(reduceMotion || motionScale <= 0 ? nil : .timingCurve(0.25, 0.1, 0.25, 1,
+        duration: 0.1 * motionScale), value: hovered)
+      .animation(reduceMotion || motionScale <= 0 ? nil : .timingCurve(0.16, 1, 0.3, 1,
+        duration: pressDuration * motionScale), value: configuration.isPressed)
+      .onHover { hovered = $0 }
+  }
+}
+
 /// The original interface only outlines selections when macOS requests more
 /// contrast. Ordinary and drag presentations keep their translucent fill.
 struct NativeSelectionContrast: ViewModifier {
@@ -142,6 +171,7 @@ struct NativeSelectionContrast: ViewModifier {
 private struct NativeThemeTint: View {
   var theme: SpaceTheme
   @Environment(\.colorScheme) private var colorScheme
+  @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
   var body: some View {
     let dark = theme.appearance == "dark" || (theme.appearance == "system" && colorScheme == .dark)
     let colors = NativeSpacePalette(theme: theme, dark: dark)
@@ -161,8 +191,10 @@ private struct NativeThemeTint: View {
         EllipticalGradient(colors: [colors.primary, .clear], center: .center, endRadiusFraction: 0.5)
           .frame(width: width * 0.95 * sqrt(2) * 0.68 * 2, height: height * 0.85 * sqrt(2) * 0.68 * 2)
           .position(x: width * 0.05, y: height * 0.15)
-        Rectangle().fill(ImagePaint(image: Image(nsImage: ThemeNoise.image), scale: 0.5))
-          .opacity(theme.grain * 0.18 * 0.7)
+        if !reduceTransparency {
+          Rectangle().fill(ImagePaint(image: Image(nsImage: ThemeNoise.image), scale: 0.5))
+            .opacity(theme.grain * 0.18 * 0.7)
+        }
       }.frame(width: width, height: height).clipped()
     }
   }
@@ -223,7 +255,8 @@ struct ThemeEditor: View {
   @State private var glassExpanded = false
   @State private var primaryValid = true
   @State private var secondaryValid = true
-  @State private var puckDrag: (primary: Bool, hue: CGFloat, saturation: CGFloat, brightness: CGFloat, detent: Int)?
+  @State private var puckDrag: (primary: Bool, hue: CGFloat, saturation: CGFloat, brightness: CGFloat, detent: Int, hasMoved: Bool)?
+  @GestureState private var puckIsDragging = false
   @FocusState private var focusedPuck: Bool?
   @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
   @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -268,6 +301,7 @@ struct ThemeEditor: View {
       .background { NativeControlSurface().overlay(colors.chrome.opacity(0.32)) }
       .background { NativeThemeScrollbars(onWindow: onPresentationWindow).frame(width: 0, height: 0) }
       .onAppear { if saveTitle != "Create Space" { focusedPuck = true } }
+      .onChange(of: puckIsDragging) { _, active in if !active { puckDrag = nil } }
   }
   private var controls: some View {
     ScrollView {
@@ -325,8 +359,8 @@ struct ThemeEditor: View {
         Divider()
         DisclosureGroup("Glass & transparency", isExpanded: $glassExpanded) {
           VStack(spacing: 12) {
-            ThemeSlider(title: "Window tint opacity", value: $theme.opacity, colors: colors).disabled(reduceTransparency)
-            ThemeSlider(title: "Background blur", value: $theme.blur, colors: colors, steps: 32).disabled(reduceTransparency)
+            ThemeSlider(title: "Window tint opacity", value: $theme.opacity, colors: colors)
+            ThemeSlider(title: "Background blur", value: $theme.blur, colors: colors, steps: 32)
           }.padding(.top, 10)
         }
         if saveTitle != "Create Space", let identity { Divider(); identity }
@@ -387,7 +421,8 @@ struct ThemeEditor: View {
     let span = CGSize(
       width: max(1, size.width - 2 * inset), height: max(1, size.height - 2 * inset))
     let other = ThemeColor.hsv(ThemeColor.nsColor(primary ? theme.secondaryColor : theme.primaryColor))
-    let overlaps = hypot((hsv.hue - other.hue) * span.width, (hsv.saturation - other.saturation) * span.height) < 64
+    let overlaps = hypot(ThemeColor.puckProgress(hue: hsv.hue - other.hue) * span.width,
+      (hsv.saturation - other.saturation) * span.height) < 64
     return Circle().fill(Color(nsColor: color))
       .overlay(Circle().strokeBorder(.white.opacity(0.79), lineWidth: 3))
       .overlay(
@@ -396,26 +431,28 @@ struct ThemeEditor: View {
       )
       .shadow(color: .black.opacity(0.13), radius: 5, y: 3)
       .frame(width: 58, height: 58)
-      .position(x: inset + hsv.hue * span.width, y: inset + (1 - hsv.saturation) * span.height)
+      .position(x: inset + ThemeColor.puckProgress(hue: hsv.hue) * span.width, y: inset + (1 - hsv.saturation) * span.height)
       .offset(x: overlaps ? (primary ? -22 : 22) : 0, y: overlaps ? (primary ? -16 : 16) : 0)
       .zIndex(selectedPrimary == primary ? 2 : 1)
       .gesture(
-        DragGesture(minimumDistance: 0, coordinateSpace: .named("themeColors")).onChanged { event in
+        DragGesture(minimumDistance: 0, coordinateSpace: .named("themeColors"))
+          .updating($puckIsDragging) { _, active, _ in active = true }
+          .onChanged { event in
           selectedPrimary = primary; focusedPuck = primary
           if puckDrag?.primary != primary {
-            puckDrag = (primary, hsv.hue, hsv.saturation, hsv.brightness > 0 ? hsv.brightness : 1, Int(((hsv.hue + hsv.saturation) * 5).rounded()))
+            puckDrag = (primary, hsv.hue, hsv.saturation, hsv.brightness > 0 ? hsv.brightness : 1, Int(((ThemeColor.puckProgress(hue: hsv.hue) + hsv.saturation) * 5).rounded()), false)
             ThemeHaptics.tick()
           }
-          guard let drag = puckDrag else { return }
-          let hue = min(1, max(0, drag.hue + event.translation.width / span.width))
-          let saturation = min(1, max(0, drag.saturation - event.translation.height / span.height))
-          let newColor = ThemeColor.color(hue: hue, saturation: saturation, brightness: drag.brightness)
+          guard let drag = puckDrag, let next = ThemeColor.puckAdjustment(hue: drag.hue,
+            saturation: drag.saturation, brightness: drag.brightness, translation: event.translation, span: span, hasMoved: drag.hasMoved) else { return }
+          puckDrag?.hasMoved = true
+          let newColor = ThemeColor.color(hue: next.hue, saturation: next.saturation, brightness: next.brightness)
           if primary {
             theme.primaryColor = ThemeColor.hex(newColor)
           } else {
             theme.secondaryColor = ThemeColor.hex(newColor)
           }
-          let detent = Int(((hue + saturation) * 5).rounded())
+          let detent = Int(((ThemeColor.puckProgress(hue: next.hue) + next.saturation) * 5).rounded())
           if detent != drag.detent { puckDrag?.detent = detent; ThemeHaptics.tick() }
         }.onEnded { _ in puckDrag = nil }
       )
@@ -439,7 +476,7 @@ struct ThemeEditor: View {
       .accessibilityAdjustableAction { direction in
         let change: CGFloat = direction == .increment ? 0.025 : -0.025
         let next = ThemeColor.hex(
-          ThemeColor.color(hue: min(1, max(0, hsv.hue + change)), saturation: hsv.saturation, brightness: hsv.brightness))
+          ThemeColor.color(hue: min(ThemeColor.puckMaximumHue, max(0, hsv.hue + change)), saturation: hsv.saturation, brightness: hsv.brightness))
         if primary { theme.primaryColor = next } else { theme.secondaryColor = next }
         ThemeHaptics.tick()
       }

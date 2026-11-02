@@ -8,7 +8,10 @@
 #include "chrome/browser/extensions/extension_commands_global_registry.h"
 #include "chrome/browser/ui/views/extensions/extension_keybinding_registry_views.h"
 #include "chrome/browser/ui/extensions/extension_side_panel_manager.h"
+#include "chrome/browser/ui/side_panel/side_panel_ui.h"
 #include "chrome/common/extensions/api/tabs.h"
+#include "chrome/common/extensions/api/tab_capture.h"
+#include "chrome/browser/extensions/api/tab_capture/tab_capture_api.h"
 #include "chrome/common/extensions/api/debugger.h"
 #include "extensions/common/api/scripting.h"
 #include "chrome/common/extensions/api/tab_groups.h"
@@ -86,6 +89,8 @@ std::optional<bool> ZacroValidateFunction(const std::string& method, const base:
   if (method == "scripting.insertCSS") return extensions::api::scripting::InsertCSS::Params::Create(args).has_value();
   if (method == "scripting.removeCSS") return extensions::api::scripting::RemoveCSS::Params::Create(args).has_value();
   if (method == "debugger.attach") return extensions::api::debugger::Attach::Params::Create(args).has_value();
+  if (method == "tabCapture.capture") return extensions::api::tab_capture::Capture::Params::Create(args).has_value();
+  if (method == "tabCapture.getMediaStreamId") return extensions::api::tab_capture::GetMediaStreamId::Params::Create(args).has_value();
   if (method == "sidePanel.open") return extensions::api::side_panel::Open::Params::Create(args).has_value();
   if (method == "sidePanel.close") return extensions::api::side_panel::Close::Params::Create(args).has_value();
   if (method == "sessions.getRecentlyClosed") return extensions::api::sessions::GetRecentlyClosed::Params::Create(args).has_value();
@@ -104,6 +109,19 @@ std::optional<bool> ZacroValidateFunction(const std::string& method, const base:
     return true;
   }
   return std::nullopt;
+}
+
+// The official API parses these arguments again when it resumes. capture()
+// has no target argument, so its narrow native setter retains the chosen ID.
+void ZacroSetTabCaptureTarget(ExtensionFunction* function, int target,
+                             base::ListValue& arguments) {
+  if (std::string(function->name()) == "tabCapture.capture") {
+    static_cast<extensions::TabCaptureCaptureFunction*>(function)->SetNativeTargetTabID(target);
+  } else {
+    if (arguments.empty()) arguments.Append(base::DictValue());
+    else if (arguments[0].is_none()) arguments[0] = base::Value(base::DictValue());
+    arguments[0].GetDict().Set("targetTabId", target);
+  }
 }
 
 bool ZacroPrepareNavigation(ExtensionFunction* function, base::ListValue& args, std::string& error) {
@@ -151,6 +169,9 @@ class ZacroNavigationApprovals : public base::SupportsUserData::Data {
 };
 bool ZacroValidateNavigation(content::BrowserContext* context, const std::string& extension_id,
     const std::string& incarnation, const std::string& url, std::string& error) {
+  if (context->IsOffTheRecord() && !ZacroIsPrivatePDFComponent(context, extension_id)) {
+    error = "Only the bundled PDF component can authorize private component navigation."; return false;
+  }
   if (url.empty() || url.size() > kZacroMaximumNavigationURLBytes) {
     error = "The native navigation address exceeds the supported size."; return false;
   }
@@ -184,6 +205,27 @@ class ZacroBrowserContext : public base::SupportsUserData::Data {
   }
   explicit ZacroBrowserContext(content::BrowserContext* context) : context_(context) {}
   static void InstallHooks() {
+    SidePanelUI::SetNativeHostedPanelPolicy(base::BindRepeating(
+        [](BrowserWindowInterface* browser, const SidePanelEntryKey& key) {
+          if (!browser || browser->GetProfile()->IsOffTheRecord() ||
+              key.id() != SidePanelEntryId::kExtension || !key.extension_id()) return false;
+          auto* context = browser->GetProfile();
+          auto* state = Find(context);
+          auto* registry = extensions::ExtensionRegistry::Get(context);
+          if (!state || !registry || !registry->enabled_extensions().GetByID(*key.extension_id())) return false;
+          auto* active = browser->GetActiveTabInterface();
+          auto* contents = active ? active->GetContents() : nullptr;
+          if (!contents || contents->IsBeingDestroyed() ||
+              contents->GetBrowserContext() != context) return false;
+          for (const auto& [id, tab] : state->tabs_) {
+            if (tab->web_contents() == contents && tab->window > 0 &&
+                !tab->closing && !tab->discarded) return true;
+          }
+          for (const auto& [window, parked] : state->panel_parking_) {
+            if (window > 0 && parked.get() == contents) return true;
+          }
+          return false;
+        }));
     extensions::RuntimeGetContextsFunction::SetNativeContextDecorator(base::BindRepeating(
         [](content::WebContents* contents, extensions::api::runtime::ExtensionContext* value) {
           auto* state = Get(contents->GetBrowserContext());
@@ -248,6 +290,10 @@ class ZacroBrowserContext : public base::SupportsUserData::Data {
         }));
     extensions::EventRouter::SetNativeEventFilter(base::BindRepeating(
         [](content::BrowserContext* context, extensions::Event& event, const std::string& extension_id) {
+          // Private logical metadata is available only to the real bundled PDF
+          // component. It never enters the regular extension or sync channel.
+          if (context->IsOffTheRecord() && ZacroBrowserEvent(event.event_name) &&
+              !ZacroIsPrivatePDFComponent(context, extension_id)) return false;
           if (event.event_name == "sidePanel.onOpened" || event.event_name == "sidePanel.onClosed") {
             auto* state = Get(context);
             if (event.args().size() != 1 || !event.args()[0].is_dict()) return false;
@@ -289,7 +335,10 @@ class ZacroBrowserContext : public base::SupportsUserData::Data {
   }
   void SetObserved(bool observed) {
     observed_ = observed;
-    if (!observed) return;
+    if (!observed) {
+      for (auto& [id, request] : pending_) request->dispatched = false;
+      return;
+    }
     // Extension workers can query their browser during profile startup, before
     // the Swift observer is attached. Queue those requests without revealing
     // physical implementation windows or spuriously failing initialization.
@@ -601,6 +650,7 @@ class ZacroBrowserContext : public base::SupportsUserData::Data {
     auto& request = *it->second;
     auto* registry = extensions::ExtensionRegistry::Get(context_);
     if (request.function->browser_context() != context_ || !registry ||
+        (context_->IsOffTheRecord() && !ZacroIsPrivatePDFComponent(context_, request.extension->id())) ||
         registry->enabled_extensions().GetByID(request.extension->id()) != request.extension.get() ||
         !ZacroExtensionContext::Get(context_)->IsCurrent(*request.extension, request.installation) || !request.function->HasPermission()) {
       error = "The extension caller or installation changed."; return false;
@@ -683,6 +733,14 @@ class ZacroBrowserContext : public base::SupportsUserData::Data {
             error = "The native popup target lost focus before presentation.";
           }
           arguments[0] = base::Value(base::DictValue().Set("windowId", ZacroTabUtil::GetWindowIdOfTab(tab->second->web_contents())));
+        } else if (request->tab_capture_document) {
+          if (tab->second->closing) error = "The capture target closed while restoring.";
+          if (request->tab_capture_consumer) {
+            auto consumer = tabs_.find(*request->tab_capture_consumer);
+            if (consumer == tabs_.end() || consumer->second->closing)
+              error = "The capture consumer closed while restoring.";
+          }
+          ZacroSetTabCaptureTarget(function.get(), *request->prepare_document, arguments);
         } else if (request->side_panel_document) {
           if (arguments[0].GetDict().contains("windowId")) arguments[0].GetDict().Set("windowId", ZacroTabUtil::GetWindowIdOfTab(tab->second->web_contents()));
         } else if (!request->document_arguments_unchanged) {
@@ -792,6 +850,8 @@ class ZacroBrowserContext : public base::SupportsUserData::Data {
     std::optional<int> prepare_document;
     std::optional<int> action_popup_window;
     bool capture_document = false;
+    bool tab_capture_document = false;
+    std::optional<int> tab_capture_consumer;
     bool side_panel_document = false;
     bool document_arguments_unchanged = false;
     scoped_refptr<ExtensionFunction> function;
@@ -809,6 +869,16 @@ class ZacroBrowserContext : public base::SupportsUserData::Data {
     const auto valid = ZacroValidateFunction(method, args);
     if (!valid) return false;
     if (!*valid) { function->SetBadMessage(); std::move(response).Run({}, "Invalid extension API arguments."); return true; }
+    if (context_->IsOffTheRecord()) {
+      const bool pdf_method = method == "tabs.get" || method == "tabs.getCurrent" ||
+          method == "tabs.getZoom" || method == "tabs.setZoom" ||
+          method == "tabs.getZoomSettings" || method == "tabs.setZoomSettings" ||
+          method == "tabs.create" || method == "tabs.update" ||
+          method == "tabs.reload" || method == "windows.create";
+      if (!pdf_method || !ZacroIsPrivatePDFComponent(context_, function->extension_id())) {
+        std::move(response).Run({}, "This extension cannot access the private browser model."); return true;
+      }
+    }
     if (method == "windows.create" && !args.empty() && args[0].is_dict() &&
         args[0].GetDict().FindBool("setSelfAsOpener").value_or(false) &&
         (function->is_from_service_worker() || !function->render_frame_host() ||
@@ -825,6 +895,8 @@ class ZacroBrowserContext : public base::SupportsUserData::Data {
     // the original ExtensionFunction after this native hook returns false.
     std::optional<int> prepare_document;
     bool capture_document = false;
+    bool tab_capture_document = false;
+    std::optional<int> tab_capture_consumer;
     bool side_panel_document = false;
     bool document_arguments_unchanged = false;
     std::optional<int> action_popup_window;
@@ -835,6 +907,36 @@ class ZacroBrowserContext : public base::SupportsUserData::Data {
         std::move(response).Run({}, "Cannot show an extension popup for an inactive window."); return true;
       }
       action_popup_window = window;
+    }
+    if (method == "tabCapture.capture" || method == "tabCapture.getMediaStreamId") {
+      const auto* options = !args.empty() && args[0].is_dict() ? &args[0].GetDict() : nullptr;
+      const auto requested = method == "tabCapture.getMediaStreamId" && options
+          ? options->FindInt("targetTabId") : std::nullopt;
+      int target = requested.value_or(-1);
+      // tabCapture's default is the last-active browser, not the caller's
+      // options/popup window. Match that rule in the logical window model.
+      const auto window = focused_window_ ? focused_window_ : last_focused_window_;
+      if (!requested && window) for (const auto& [id, tab] : tabs_) {
+        if (tab->window == *window && tab->active && !tab->closing) { target = id; break; }
+      }
+      auto tab = tabs_.find(target);
+      if (tab == tabs_.end() || tab->second->closing) {
+        std::move(response).Run({}, "The capture target does not exist in this profile."); return true;
+      }
+      if (method == "tabCapture.getMediaStreamId" && options) {
+        tab_capture_consumer = options->FindInt("consumerTabId");
+        if (tab_capture_consumer) {
+          auto consumer = tabs_.find(*tab_capture_consumer);
+          if (consumer == tabs_.end() || consumer->second->closing) {
+            std::move(response).Run({}, "The capture consumer does not exist in this profile."); return true;
+          }
+        }
+      }
+      if (tab->second->web_contents() && !tab->second->discarded) {
+        auto arguments = args.Clone(); ZacroSetTabCaptureTarget(function, target, arguments);
+        function->ReplaceNativeArguments(std::move(arguments)); return false;
+      }
+      prepare_document = target; tab_capture_document = true;
     }
     if (method.starts_with("scripting.") || method == "debugger.attach") {
       const auto& first = args[0].GetDict();
@@ -923,6 +1025,8 @@ class ZacroBrowserContext : public base::SupportsUserData::Data {
     if (auto* frame = function->render_frame_host()) request->source_document = frame->GetWeakDocumentPtr();
     request->arguments = arguments.Clone(); request->response = std::move(response);
     request->prepare_document = prepare_document; request->capture_document = capture_document;
+    request->tab_capture_document = tab_capture_document;
+    request->tab_capture_consumer = tab_capture_consumer;
     request->side_panel_document = side_panel_document;
     request->document_arguments_unchanged = document_arguments_unchanged;
     request->action_popup_window = action_popup_window;

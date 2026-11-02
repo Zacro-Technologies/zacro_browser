@@ -18,6 +18,8 @@ public final class ChromiumWindowContext: NSObject, NSWindowDelegate {
   public var onFocused: (() -> Void)?
   public var beforeClosingDocuments: (() async -> Bool)?
   weak var engine: ChromiumEngine?
+  var closingAttemptID: UUID?
+  var closingPreparationID: UUID?
   var closingPreparation: Task<Bool, Never>?
 
   init(id: String, nativeID: Int, engine: ChromiumEngine) {

@@ -146,7 +146,7 @@
 +        usingBlock:^(NSNotification*) { if (auto state = weak.lock()) state->Close(); }]);
 +    observers_.push_back([center addObserverForName:NSWindowDidBecomeKeyNotification object:nil queue:nil
 +        usingBlock:^(NSNotification* event) {
-+          if (auto state = weak.lock(); state && !Descendant(event.object, state->popup)) state->Close();
++          if (auto state = weak.lock(); state && state->popup.visible && !Descendant(event.object, state->popup)) state->Close();
 +        }]);
 +    monitor_ = [NSEvent addLocalMonitorForEventsMatchingMask:
 +        NSEventMaskLeftMouseDown | NSEventMaskRightMouseDown | NSEventMaskOtherMouseDown
@@ -284,22 +284,32 @@
    // the assumption in the logic to calculate max bounds.
 --- a/chrome/browser/ui/views/extensions/extension_action_delegate_desktop.cc
 +++ b/chrome/browser/ui/views/extensions/extension_action_delegate_desktop.cc
-@@ -13,6 +13,9 @@
+@@ -13,6 +13,11 @@
  #include "chrome/browser/ui/extensions/accelerator_priority.h"
  #include "chrome/browser/ui/extensions/extension_action_view_model.h"
  #include "chrome/browser/ui/views/extensions/extension_popup.h"
 +#if BUILDFLAG(IS_MAC)
 +#include "chrome/browser/ui/views/extensions/native_extension_popup_anchor.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
 +#endif
  #include "chrome/browser/ui/views/extensions/extensions_container_views.h"
  #include "extensions/common/api/extension_action/action_info.h"
  #include "extensions/common/command.h"
-@@ -58,6 +61,15 @@
+@@ -58,6 +63,23 @@
    popup_host_observation_.Observe(popup_host_.get());
    extensions_container_views_->SetPopupOwner(model_);
  
 +#if BUILDFLAG(IS_MAC)
-+  if (NativeExtensionPopupAnchor::HasPrepared(GetActiveWebContents())) {
++  // ExtensionsToolbarViewModel inherits the container's nullable default.
++  // Match ExtensionActionViewModel::GetCurrentWebContents: the actual browser
++  // tab is authoritative when the container does not override its target.
++  // Consume the prepared anchor synchronously before the native API returns.
++  auto* anchor_contents = GetActiveWebContents();
++  if (!anchor_contents) {
++    anchor_contents = browser_->GetTabStripModel()->GetActiveWebContents();
++  }
++  if (NativeExtensionPopupAnchor::HasPrepared(anchor_contents)) {
 +    // A hidden Chrome toolbar cannot complete its pop-out layout animation.
 +    // Keep the same popup owner, ExtensionViewHost and granted user action;
 +    // only skip the toolbar animation when a native shell supplied an anchor.

@@ -35,6 +35,9 @@ final class BrowserActions: ObservableObject {
   @Published var canGoBack = false
   @Published var canGoForward = false
   @Published var loading = false
+  @Published var aiConfigured = false
+  @Published var aiBusy = false
+  var askAI: (String) -> Void = { _ in }
   @Published var icons: [String: NSImage] = [:]
   @Published var iconColors: [String: Color] = [:]
   @Published var peekIcons: [String: NSImage] = [:]
@@ -150,12 +153,14 @@ struct BrowserShell<Content: View>: View {
   @State private var libraryReturnFocus: String?
   @State private var paletteReturnFocus: NativePaletteFocusContext?
   @Environment(\.accessibilityReduceMotion) private var reduceMotion
+  @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
   @Environment(\.colorScheme) private var colorScheme
   @Environment(\.colorSchemeContrast) private var contrast
   @State private var themeDraft: BrowserSpace?
   @State private var themeError: String?
   @State private var creatingSpace = false
   @State private var availableWindowWidth: CGFloat = 1280
+  @State private var availableWindowHeight: CGFloat = 800
   @State private var sidebarWidthDraft: Double?
   @State private var libraryWidthDraft: Double?
   @State private var offeredOnboarding = false
@@ -342,8 +347,9 @@ struct BrowserShell<Content: View>: View {
     .background { NativeWindowDialogAnchor(owner: dialogs).frame(width: 0, height: 0) }
     .background {
       GeometryReader { geometry in
-        Color.clear.onAppear { availableWindowWidth = geometry.size.width }
+        Color.clear.onAppear { availableWindowWidth = geometry.size.width; availableWindowHeight = geometry.size.height }
           .onChange(of: geometry.size.width) { _, width in availableWindowWidth = width }
+          .onChange(of: geometry.size.height) { _, height in availableWindowHeight = height }
       }
     }
     .background {
@@ -578,6 +584,11 @@ struct BrowserShell<Content: View>: View {
       spaceFooter
     }.padding(.horizontal, 8)
       .background {
+        // The renderer keeps the requested theme editable but gives this
+        // surface an opaque chrome fill under Reduce Transparency.
+        if reduceTransparency { colors.chrome }
+      }
+      .background {
         NativeSidebarDragHost(controller: drag.native, isEnabled: isOwnedWindowOpen, motionScale: effectiveMotion, canStart: { [weak store] id in
           guard let store else { return false }
           return NativeSidebarDragAuthority.capture(id: id, store: store) != nil
@@ -669,13 +680,15 @@ struct BrowserShell<Content: View>: View {
           NativeGlyph("folder").font(.system(size: 16)).foregroundStyle(accent).frame(width: 16)
           Text(folder.name).fontWeight(.semibold)
           Spacer()
-        }.padding(.horizontal, 8).frame(height: 36)
+        }.padding(.horizontal, 8).frame(height: tabHeight)
         if folder.isExpanded {
           VStack(spacing: 2) {
             ForEach(all.filter { $0.folderID == folder.id && !$0.isFavorite && !grouped.contains($0.id) }) { tab in
               previewRow(tab, selected: tab.id == space.lastActiveTabID)
             }
-          }.padding(.leading, 16)
+          }.padding(.leading, 8)
+            .overlay(alignment: .leading) { Rectangle().fill(accent.opacity(0.22)).frame(width: 1) }
+            .padding(.leading, 8)
         }
       }
       ForEach(all.filter { $0.isPinned && !$0.isFavorite && $0.folderID == nil && !grouped.contains($0.id) }) { tab in
@@ -738,21 +751,21 @@ struct BrowserShell<Content: View>: View {
       Button {
         toggleSidebar()
       } label: {
-        NativeGlyph("sidebar.left").font(.system(size: 16))
+        NativeGlyph("sidebar.left", size: 17)
           .frame(width: 26, height: 26)
-      }.help("Hide sidebar")
+      }.help("Hide sidebar").accessibilityLabel("Hide sidebar")
       Spacer(minLength: 0)
-      Button(action: actions.back) { NativeGlyph("arrow.left").frame(width: 26, height: 26) }.disabled(!actions.canGoBack)
-        .help("Back")
-      Button(action: actions.forward) { NativeGlyph("arrow.right").frame(width: 26, height: 26) }.disabled(
+      Button(action: actions.back) { NativeGlyph("arrow.left", size: 15).frame(width: 26, height: 26) }.disabled(!actions.canGoBack)
+        .help("Back").accessibilityLabel("Back")
+      Button(action: actions.forward) { NativeGlyph("arrow.right", size: 15).frame(width: 26, height: 26) }.disabled(
         !actions.canGoForward
-      ).help("Forward")
+      ).help("Forward").accessibilityLabel("Forward")
       Button(action: actions.reload) {
-        NativeGlyph(actions.loading ? "xmark" : "arrow.clockwise")
+        NativeGlyph(actions.loading ? "xmark" : "arrow.clockwise", size: 15)
           .frame(width: 26, height: 26)
-      }.help(actions.loading ? "Stop" : "Reload").disabled(!hasPage)
+      }.help(actions.loading ? "Stop" : "Reload").accessibilityLabel(actions.loading ? "Stop" : "Reload").disabled(!hasPage)
     }.font(.system(size: 14, weight: .regular)).foregroundStyle(accent)
-      .buttonStyle(.plain).frame(height: 36)
+      .buttonStyle(NativeHoverPressButtonStyle(hover: colors.hover, motionScale: effectiveMotion)).frame(height: 36)
   }
   private var addressButton: some View {
     HStack(spacing: 2) {
@@ -779,7 +792,8 @@ struct BrowserShell<Content: View>: View {
       }.buttonStyle(.plain).padding(.trailing, 4)
         .help("Site controls").accessibilityLabel("Site controls")
         .popover(isPresented: $showSiteControls, arrowEdge: .bottom) {
-          SiteControls(actions: actions.siteControls, accent: accent, palette: colors)
+          SiteControls(actions: actions.siteControls, accent: accent, palette: colors,
+            maximumHeight: max(160, availableWindowHeight - 16))
         }
         .popover(isPresented: $showBrowserMenu, arrowEdge: .bottom) {
           NativeActionPopover(title: "Browser menu", items: browserMenuItems, colors: colors, motionScale: effectiveMotion)
@@ -817,8 +831,9 @@ struct BrowserShell<Content: View>: View {
                 .animation(effectiveMotion > 0 ? .easeOut(duration: 0.12 * effectiveMotion) : nil, value: hoveredFolder == folder.id || sidebarFocus == "folder:\(folder.id)")
               Text(folder.name).font(.system(size: 13, weight: .semibold)).lineLimit(1)
               Spacer(minLength: 0)
-            }.padding(.horizontal, 8).frame(height: 36).contentShape(Rectangle())
-          }.buttonStyle(.plain).accessibilityLabel("\(folder.isExpanded ? "Collapse" : "Expand") \(folder.name)")
+            }.padding(.horizontal, 8).frame(height: tabHeight).contentShape(Rectangle())
+          }.buttonStyle(NativeHoverPressButtonStyle(hover: colors.hover, radius: 6, scale: 1, motionScale: effectiveMotion))
+            .accessibilityLabel("\(folder.isExpanded ? "Collapse" : "Expand") \(folder.name)")
             .focused($sidebarFocus, equals: "folder:\(folder.id)").id("folder:\(folder.id)")
             .onHover { if $0 { hoveredFolder = folder.id } else if hoveredFolder == folder.id { hoveredFolder = nil } }
           if folder.isExpanded {
@@ -852,9 +867,12 @@ struct BrowserShell<Content: View>: View {
           Text(NativeInterfaceEditors.keyLabel(BrowserShortcut.catalog(overrides: store.state.settings.shortcutOverrides)
             .first(where: { $0.id == "command-palette" })?.accelerator ?? ""))
             .font(.system(size: 10)).opacity(hoveredNewTab || sidebarFocus == "new-tab" ? 1 : 0)
+            .animation(effectiveMotion > 0 ? .timingCurve(0.25, 0.1, 0.25, 1, duration: 0.1 * effectiveMotion) : nil,
+              value: hoveredNewTab || sidebarFocus == "new-tab")
         }.frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 8).frame(height: 34)
       }
-      .buttonStyle(NativePressButtonStyle(motionScale: effectiveMotion)).foregroundStyle(colors.muted)
+      .buttonStyle(NativeHoverPressButtonStyle(hover: colors.hover, radius: 6, scale: 0.985,
+        pressDuration: 0.1, motionScale: effectiveMotion)).foregroundStyle(colors.muted)
         .focused($sidebarFocus, equals: "new-tab").onHover { hoveredNewTab = $0 }
         .background { NativeSidebarDropRegion(controller: drag.native, id: SidebarSection.regular.regionID(space: store.state.activeSpaceID)) }
         .onDrop(of: [.plainText], delegate: dropDelegate(section: .regular, before: todayTabs.first?.id))
@@ -1069,10 +1087,11 @@ struct BrowserShell<Content: View>: View {
       if !favorite && !grouped && tab.isPinned {
         Button { store.resetPinnedDestination(id: tab.id); actions.activate(tab.id) } label: {
           Group {
-            if hoveredPin == tab.id { NativeGlyph("arrow.left").frame(width: 16, height: 16) }
+            if hoveredPin == tab.id { NativeGlyph("arrow.left", size: 15).frame(width: 16, height: 16) }
             else { tabIcon(tab, size: 16) }
           }.frame(width: 28, height: 28)
-        }.buttonStyle(.plain).padding(.leading, 3).help("Reset to saved page")
+        }.buttonStyle(NativeHoverPressButtonStyle(hover: colors.hover, radius: 5, scale: 1, motionScale: effectiveMotion))
+          .padding(.leading, 3).help("Reset to saved page")
           .onHover { if $0 { hoveredPin = tab.id } else if hoveredPin == tab.id { hoveredPin = nil } }
       }
       Button { selectSidebarTab(tab) } label: {
@@ -1093,16 +1112,21 @@ struct BrowserShell<Content: View>: View {
           .shadow(color: .black.opacity(favorite && drag.id == nil ? (selected ? 0.07 : 0.05) : 0), radius: selected ? 1.5 : 2.5, y: selected ? 1 : 2)
           .overlay(alignment: .topTrailing) { if favorite { peekBadge(tab, favorite: true).padding(2) } }
       }.buttonStyle(NativePressButtonStyle(scale: favorite ? 0.96 : 0.985, motionScale: effectiveMotion))
+        .accessibilityLabel(favorite
+          ? "\(tab.displayTitle) — \(tab.isClosed ? "Closed" : actions.loadedTabIDs.contains(tab.id) ? "Loaded" : "Sleeping")"
+          : tab.displayTitle)
+        .accessibilityIdentifier("tab-activate:\(tab.id)")
         .focused($sidebarFocus, equals: tab.id).id(tab.id)
       if !favorite && (tab.isMuted || actions.audibleTabIDs.contains(tab.id)) {
         Button { performTabAction("tab:mute", tab: tab) } label: {
-          NativeGlyph(tab.isMuted ? "speaker.slash" : "speaker.wave.2").font(.system(size: 12)).frame(width: 24, height: 24)
-        }.buttonStyle(.plain).foregroundStyle(accent).help(tab.isMuted ? "Unmute tab" : "Mute tab")
+          NativeGlyph(tab.isMuted ? "speaker.slash" : "speaker.wave.2", size: 14).frame(width: 24, height: 24)
+        }.buttonStyle(NativeHoverPressButtonStyle(hover: colors.hover, radius: 8, motionScale: effectiveMotion)).foregroundStyle(accent).help(tab.isMuted ? "Unmute tab" : "Mute tab")
       }
       if !favorite && hovered {
         Button { actions.closeTab(tab.id) } label: {
-          NativeGlyph("xmark").font(.system(size: 11)).frame(width: grouped ? 20 : 24, height: 24)
-        }.buttonStyle(.plain).foregroundStyle(colors.muted).padding(.trailing, 3)
+          NativeGlyph("xmark", size: 13).frame(width: grouped ? 20 : 24, height: 24)
+        }.buttonStyle(NativeHoverPressButtonStyle(hover: colors.hover, radius: 8, motionScale: effectiveMotion))
+          .foregroundStyle(colors.muted).padding(.trailing, 3)
           .help(tab.isPinned ? "Close page · keep pin" : "Close tab").accessibilityLabel("Close \(tab.displayTitle)")
       }
     }.font(.system(size: 13, weight: selected ? .medium : .regular))

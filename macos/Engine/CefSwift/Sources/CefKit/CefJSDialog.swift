@@ -42,11 +42,11 @@ public struct CefJSDialog: Sendable, Equatable {
 
 /// Resolves a JavaScript dialog request. Call exactly one of ``continue(success:userInput:)``
 /// or ``cancel()`` to dismiss the dialog; the call may be made synchronously
-/// from the delegate or later from your own UI.
+/// from the delegate or later from your own UI on the CEF UI/main actor.
 public final class CefJSDialogCallback: @unchecked Sendable {
     private let raw: UnsafeMutablePointer<cef_jsdialog_callback_t>
     private var consumed = false
-    var onDecision: (@Sendable (Bool) -> Void)?
+    var onDecision: (@MainActor @Sendable (Bool) -> Void)?
 
     /// Takes ownership of a +1 `cef_jsdialog_callback_t` reference.
     init(raw: UnsafeMutablePointer<cef_jsdialog_callback_t>) {
@@ -61,7 +61,7 @@ public final class CefJSDialogCallback: @unchecked Sendable {
 
     /// Completes the dialog. `success` is whether OK (vs. Cancel) was pressed;
     /// `userInput` is the prompt field's contents (ignored for alert/confirm).
-    public func `continue`(success: Bool, userInput: String? = nil) {
+    @MainActor public func `continue`(success: Bool, userInput: String? = nil) {
         guard !consumed else { return }
         consumed = true
         onDecision?(success)
@@ -73,8 +73,18 @@ public final class CefJSDialogCallback: @unchecked Sendable {
     }
 
     /// Cancels the dialog (equivalent to `continue(success: false)`).
-    public func cancel() {
+    @MainActor public func cancel() {
         `continue`(success: false, userInput: nil)
+    }
+
+    /// The native dialog was reset, closed externally, or its document died.
+    /// Release our reference without reporting a new user decision. CEF owns
+    /// cancellation of any still-pending native callback when it is released.
+    @MainActor public func invalidate() {
+        guard !consumed else { return }
+        consumed = true
+        onDecision = nil
+        cefRelease(UnsafeMutableRawPointer(raw))
     }
 }
 

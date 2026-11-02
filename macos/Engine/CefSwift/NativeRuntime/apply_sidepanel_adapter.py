@@ -13,6 +13,7 @@ PIN = "d0c02bfad08ec92a6ffcf989e53cd995e6381a4c"
 REGISTRY_H = "chrome/browser/ui/side_panel/side_panel_registry.h"
 REGISTRY_CC = "chrome/browser/ui/side_panel/side_panel_registry.cc"
 UI_H = "chrome/browser/ui/side_panel/side_panel_ui.h"
+UI_CC = "chrome/browser/ui/side_panel/side_panel_ui.cc"
 VIEWS_H = "chrome/browser/ui/views/side_panel/side_panel_coordinator.h"
 VIEWS_CC = "chrome/browser/ui/views/side_panel/side_panel_coordinator.cc"
 COORDINATOR_H = "chrome/browser/ui/extensions/extension_side_panel_coordinator.h"
@@ -26,7 +27,7 @@ BROWSER_CC = "chrome/browser/ui/views/frame/browser_view.cc"
 SERVICE_H = "chrome/browser/extensions/api/side_panel/side_panel_service.h"
 SERVICE_CC = "chrome/browser/extensions/api/side_panel/side_panel_service.cc"
 SERVICE_TEST = "chrome/browser/extensions/api/side_panel/side_panel_apitest.cc"
-PATHS = (SERVICE_H, SERVICE_CC, SERVICE_TEST, REGISTRY_H, REGISTRY_CC, UI_H, VIEWS_H, VIEWS_CC, COORDINATOR_H,
+PATHS = (SERVICE_H, SERVICE_CC, SERVICE_TEST, REGISTRY_H, REGISTRY_CC, UI_H, UI_CC, VIEWS_H, VIEWS_CC, COORDINATOR_H,
          COORDINATOR_CC, MANAGER_H, MANAGER_CC, HOST_H, FACTORY_CC, BROWSER_H, BROWSER_CC)
 
 
@@ -66,6 +67,55 @@ def generated(originals):
   virtual void SetNativeEmptyContentHidden(bool hidden) {}
 
   // Close the side panel.""")
+    result[UI_H] = replace(result[UI_H], '  static SidePanelUI* From(BrowserWindowInterface* browser);', """  // The embedding registry must authorize the current exact document on each
+  // Show. A window kind alone does not confer extension presentation authority.
+  using NativeHostedPanelPolicy = base::RepeatingCallback<bool(
+      BrowserWindowInterface*, const SidePanelEntryKey&)>;
+  static void SetNativeHostedPanelPolicy(NativeHostedPanelPolicy policy);
+  static bool IsNativeHostedPanelAllowed(BrowserWindowInterface* browser,
+                                       const SidePanelEntryKey& key);
+
+  static SidePanelUI* From(BrowserWindowInterface* browser);""")
+    result[UI_CC] = replace(result[UI_CC], '#include "chrome/browser/ui/side_panel/side_panel_ui.h"',
+        '#include "chrome/browser/ui/side_panel/side_panel_ui.h"\n#include "base/no_destructor.h"\n#include <utility>')
+    result[UI_CC] = replace(result[UI_CC], 'DEFINE_USER_DATA(SidePanelUI);', """DEFINE_USER_DATA(SidePanelUI);
+
+namespace {
+SidePanelUI::NativeHostedPanelPolicy& NativePanelPolicy() {
+  static base::NoDestructor<SidePanelUI::NativeHostedPanelPolicy> policy;
+  return *policy;
+}
+}  // namespace
+
+void SidePanelUI::SetNativeHostedPanelPolicy(NativeHostedPanelPolicy policy) {
+  NativePanelPolicy() = std::move(policy);
+}
+
+bool SidePanelUI::IsNativeHostedPanelAllowed(BrowserWindowInterface* browser,
+                                           const SidePanelEntryKey& key) {
+  return NativePanelPolicy() && NativePanelPolicy().Run(browser, key);
+}""")
+    result[VIEWS_CC] = replace(result[VIEWS_CC], '#include "base/check.h"',
+        '#include "base/check.h"\n#if BUILDFLAG(ENABLE_CEF)\n#include "cef/libcef/browser/chrome/browser_util.h"\n#endif')
+    result[VIEWS_CC] = replace(result[VIEWS_CC], """  // Side panel is not supported for non-normal browsers.
+  if (browser_->GetType() != BrowserWindowInterface::Type::TYPE_NORMAL) {
+    return;
+  }""", """  // Ordinary Chrome popups retain their original restriction. Native hosted
+  // document views may present only a real extension entry whose current
+  // profile/document ownership is approved by the embedding registry.
+  bool native_extension_owner = false;
+#if BUILDFLAG(ENABLE_CEF)
+  if (input.key.id() == SidePanelEntryId::kExtension &&
+      input.key.extension_id().has_value()) {
+    auto* delegate = cef::BrowserForBWI(&*browser_)->cef_delegate();
+    native_extension_owner = delegate && delegate->IsViewsHosted() &&
+        SidePanelUI::IsNativeHostedPanelAllowed(&*browser_, input.key);
+  }
+#endif
+  if (browser_->GetType() != BrowserWindowInterface::Type::TYPE_NORMAL &&
+      !native_extension_owner) {
+    return;
+  }""")
     result[VIEWS_H] = replace(result[VIEWS_H], "  // SidePanelUI:\n", """  // SidePanelUI:
   SidePanelNativeView TakeNativeGlobalView(const SidePanelEntryKey& key) override;
   void SetNativeEmptyContentHidden(bool hidden) override;

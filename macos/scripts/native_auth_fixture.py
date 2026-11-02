@@ -24,7 +24,7 @@ class NativeAuthFixture:
         mode = query.get("mode", ["load"])[0]
         with self.lock:
             now = time.monotonic()
-            self.sessions = {key: value for key, value in self.sessions.items() if now - value[0] < 60}
+            self.sessions = {key: value for key, value in self.sessions.items() if now - value[0] < 120}
         if request.path in ("/native-auth/redirect", "/native-auth/document"):
             try:
                 destination = urlsplit(callback)
@@ -51,6 +51,13 @@ class NativeAuthFixture:
             if mode not in ("load", "async", "hold", "timeout"):
                 handler.send_error(400, "Invalid fixture mode")
                 return True
+            hold_ms = query.get("hold_ms", ["20000"])[0]
+            if (not re.fullmatch(r"[0-9]{5}", hold_ms)
+                    or not 20000 <= int(hold_ms) <= 90000
+                    or ("hold_ms" in query and mode != "hold")):
+                handler.send_error(400, "Invalid bounded fixture hold duration")
+                return True
+            hold_ms = int(hold_ms)
             with self.lock:
                 if len(self.sessions) >= 256 and token not in self.sessions:
                     handler.send_error(429)
@@ -78,7 +85,7 @@ setTimeout(() => {{
   clearInterval(interval);
   const failure = new URL(callback); failure.searchParams.set('fixture_timeout','1');
   location.replace(failure.href);
-}}, 20000);
+}}, {hold_ms});
 """
             body = (f"<!doctype html><meta charset=utf-8><title>Zacro auth fixture {token}</title>"
                     "<h1>Synthetic authorization page</h1><p>No account or credentials are used.</p>"

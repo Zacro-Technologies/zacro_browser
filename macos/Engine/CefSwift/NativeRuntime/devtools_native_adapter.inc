@@ -4,8 +4,10 @@
 #include <algorithm>
 #include <cmath>
 #include "base/base64.h"
+#include "base/containers/flat_set.h"
 #include "base/functional/bind.h"
 #include "base/pickle.h"
+#include "base/scoped_multi_source_observation.h"
 #include "base/strings/string_number_conversions.h"
 #include "base/strings/utf_string_conversions.h"
 #include "base/timer/timer.h"
@@ -30,6 +32,7 @@
 #include "components/sessions/content/session_tab_helper.h"
 #include "components/sessions/core/serialized_navigation_entry.h"
 #include "components/sessions/core/serialized_navigation_driver.h"
+#include "content/browser/renderer_host/render_frame_host_impl.h"
 #include "content/public/browser/browser_context.h"
 #include "content/public/browser/browsing_data_remover.h"
 #include "content/public/browser/download_manager.h"
@@ -37,12 +40,17 @@
 #include "content/public/browser/navigation_entry.h"
 #include "content/public/browser/navigation_handle.h"
 #include "content/public/browser/restore_type.h"
+#include "content/public/browser/service_worker_context.h"
+#include "content/public/browser/service_worker_running_info.h"
+#include "content/public/browser/render_process_host.h"
+#include "content/public/browser/render_process_host_observer.h"
 #include "content/public/browser/web_contents.h"
 #include "content/public/browser/web_contents_observer.h"
 #include "content/public/browser/visibility.h"
 #include "crypto/aead.h"
 #include "crypto/random.h"
 #include "extensions/browser/extension_registry.h"
+#include "extensions/browser/extension_util.h"
 #include "extensions/browser/extension_action.h"
 #include "extensions/browser/extension_action_manager.h"
 #include "extensions/browser/unpacked_installer.h"
@@ -89,6 +97,17 @@ bool ZacroHasExtensionUI(content::WebContents* contents) {
     if (action && action->IsShowingPopup()) return true;
   }
   return false;
+}
+
+bool ZacroDocumentCanDiscard(content::WebContents* contents) {
+  return contents && contents->GetVisibility() == content::Visibility::HIDDEN &&
+      !contents->IsLoading() && !contents->IsCurrentlyAudible() &&
+      !contents->IsBeingCaptured() &&
+      !contents->NeedToFireBeforeUnloadOrUnloadEvents() &&
+      !contents->GetController().GetPendingEntry() &&
+      !DevToolsWindow::GetInstanceForInspectedWebContents(contents) &&
+      !ZacroHasExtensionUI(contents) &&
+      contents->GetBrowserContext()->GetDownloadManager()->InProgressCount() == 0;
 }
 
 bool ZacroHasSidePanel(content::WebContents* contents) {
@@ -288,6 +307,154 @@ void CefDevToolsController::FinishZacroNavigationCommit(int id, base::DictValue 
   ReplyZacro(id, error.empty() ? std::move(result) : base::DictValue(), error);
 }
 
+// PageState updates are delayed in hidden renderers, and the outgoing RFH's
+// update can arrive after a new primary document commits. Gather explicit
+// associated-channel acknowledgements from active and BFCache documents before
+// reading NavigationEntries. Renderer/document loss fails rather than saving a
+// snapshot which is merely assumed current.
+class ZacroNavigationCaptureOperation : public content::WebContentsObserver,
+    public content::RenderProcessHostObserver {
+ public:
+  ZacroNavigationCaptureOperation(content::WebContents* contents,
+      base::OnceCallback<void(bool, std::string)> completion)
+      : content::WebContentsObserver(contents), completion_(std::move(completion)),
+        primary_(contents->GetPrimaryMainFrame()->GetWeakDocumentPtr()) {}
+  void Start() {
+    auto& controller = web_contents()->GetController();
+    if (controller.GetPendingEntry()) {
+      Finish(false, "Navigation is still committing; retry history capture."); return;
+    }
+    selected_ = controller.GetLastCommittedEntryIndex();
+    for (int index = 0; index < controller.GetEntryCount(); ++index)
+      entries_.push_back(controller.GetEntryAtIndex(index)->GetUniqueID());
+    std::vector<content::WeakDocumentPtr> documents;
+    bool too_many = false;
+    bool dead = false;
+    // WebContents' traversal omits pending-deletion RFHs. Include them only to
+    // await an outgoing document's final UpdateState/unload ACK. Chromium sends
+    // state before the associated unload acknowledgement removes that frame.
+    auto gather = [&](content::RenderFrameHost* frame) {
+      if (content::WebContents::FromRenderFrameHost(frame) != web_contents()) return;
+      auto* host = static_cast<content::RenderFrameHostImpl*>(frame);
+      if (std::ranges::find(entries_, host->nav_entry_id()) == entries_.end()) return;
+      if (!frame->IsRenderFrameLive()) { dead = true; return; }
+      if (!host->IsPendingDeletion() && !frame->IsActive() && !frame->IsInLifecycleState(
+          content::RenderFrameHost::LifecycleState::kInBackForwardCache)) return;
+      if (!processes_.IsObservingSource(frame->GetProcess()))
+        processes_.AddObservation(frame->GetProcess());
+      if (pending_.size() >= 4096) { too_many = true; return; }
+      if (host->IsPendingDeletion()) {
+        pending_.insert(frame->GetGlobalId());
+        unloading_.insert(frame->GetGlobalId());
+        return;
+      }
+      if (documents.size() >= 4096) { too_many = true; return; }
+      documents.push_back(frame->GetWeakDocumentPtr());
+      pending_.insert(frame->GetGlobalId());
+    };
+    for (auto processes = content::RenderProcessHost::AllHostsIterator();
+         !processes.IsAtEnd(); processes.Advance()) {
+      auto* process = processes.GetCurrentValue();
+      if (process->GetBrowserContext() == web_contents()->GetBrowserContext())
+        process->ForEachRenderFrameHost(gather);
+    }
+    if (dead) {
+      Finish(false, "A history renderer stopped before confirming its state."); return;
+    }
+    if (too_many) { Finish(false, "Navigation history exceeds the supported frame count."); return; }
+    if (pending_.empty()) {
+      Finish(false, "No live document can confirm the current navigation state."); return;
+    }
+    timer_.Start(FROM_HERE, base::Seconds(10), base::BindOnce(
+        &ZacroNavigationCaptureOperation::Finish, weak_.GetWeakPtr(), false,
+        "The document did not confirm its current navigation state in time."));
+    for (const auto& document : documents) {
+      auto* frame = document.AsRenderFrameHostIfValid();
+      if (!frame) { Finish(false, "A history document changed before capture."); return; }
+      const auto alive = weak_.GetWeakPtr();
+      static_cast<content::RenderFrameHostImpl*>(frame)->FlushStateForNativeNavigation(
+          base::BindOnce(&ZacroNavigationCaptureOperation::Flushed, alive, frame->GetGlobalId()));
+      // An already-frozen frame can acknowledge synchronously. The final ACK
+      // deletes this operation through its completion callback.
+      if (!alive) return;
+    }
+  }
+  void DidStartNavigation(content::NavigationHandle*) override {
+    Finish(false, "The document navigated during history capture.");
+  }
+  void RenderFrameDeleted(content::RenderFrameHost* frame) override {
+    if (unloading_.erase(frame->GetGlobalId())) {
+      RemovePending(frame->GetGlobalId());
+      MaybeFinish();
+    } else if (pending_.contains(frame->GetGlobalId())) {
+      Finish(false, "A history document closed before confirming its state.");
+    }
+  }
+  void RenderProcessExited(content::RenderProcessHost*,
+      const content::ChildProcessTerminationInfo&) override {
+    Finish(false, "A history renderer stopped before confirming its state.");
+  }
+  void InProcessRendererExiting(content::RenderProcessHost*) override {
+    Finish(false, "A history renderer stopped before confirming its state.");
+  }
+  void RenderProcessHostDestroyed(content::RenderProcessHost* host) override {
+    processes_.RemoveObservation(host);
+    Finish(false, "A history renderer closed before confirming its state.");
+  }
+  void PrimaryMainFrameRenderProcessGone(base::TerminationStatus) override {
+    Finish(false, "The document renderer stopped during history capture.");
+  }
+  void WebContentsDestroyed() override { Finish(false, "The document closed during history capture."); }
+ private:
+  void Flushed(content::GlobalRenderFrameHostId frame, bool captured) {
+    if (!captured) { Finish(false, "A history document changed before confirming its state."); return; }
+    RemovePending(frame);
+    MaybeFinish();
+  }
+  void RemovePending(content::GlobalRenderFrameHostId frame) {
+    pending_.erase(frame);
+    if (std::ranges::any_of(pending_, [&](const auto& id) { return id.child_id == frame.child_id; })) return;
+    if (auto* process = content::RenderProcessHost::FromID(frame.child_id);
+        process && processes_.IsObservingSource(process)) {
+      // The last ordered ACK from this process is durable in the controller.
+      // Its later normal exit cannot invalidate other renderers' pending ACKs.
+      processes_.RemoveObservation(process);
+    }
+  }
+  void MaybeFinish() {
+    if (!pending_.empty()) return;
+    auto& controller = web_contents()->GetController();
+    bool unchanged = !controller.GetPendingEntry() &&
+        primary_.AsRenderFrameHostIfValid() == web_contents()->GetPrimaryMainFrame() &&
+        selected_ == controller.GetLastCommittedEntryIndex() &&
+        entries_.size() == static_cast<size_t>(controller.GetEntryCount());
+    for (int index = 0; unchanged && index < controller.GetEntryCount(); ++index)
+      unchanged = entries_[index] == controller.GetEntryAtIndex(index)->GetUniqueID();
+    Finish(unchanged, unchanged ? std::string() : "Navigation history changed during capture.");
+  }
+  void Finish(bool captured, std::string error) {
+    timer_.Stop(); Observe(nullptr); processes_.RemoveAllObservations(); weak_.InvalidateWeakPtrs();
+    // Completion deletes this observer. Never access members afterwards.
+    if (completion_) std::move(completion_).Run(captured, std::move(error));
+  }
+  base::OnceCallback<void(bool, std::string)> completion_;
+  content::WeakDocumentPtr primary_;
+  std::vector<int> entries_;
+  base::flat_set<content::GlobalRenderFrameHostId> pending_;
+  base::flat_set<content::GlobalRenderFrameHostId> unloading_;
+  base::ScopedMultiSourceObservation<content::RenderProcessHost,
+      content::RenderProcessHostObserver> processes_{this};
+  int selected_ = -1;
+  base::OneShotTimer timer_;
+  base::WeakPtrFactory<ZacroNavigationCaptureOperation> weak_{this};
+};
+
+void CefDevToolsController::FinishZacroNavigationCapture(int id, bool captured, std::string error) {
+  zacro_navigation_capture_.reset();
+  if (!captured) { ReplyZacro(id, {}, error); return; }
+  SerializeZacroNavigation(id);
+}
+
 class ZacroDiscardOperation : public content::WebContentsObserver {
  public:
   ZacroDiscardOperation(content::WebContents* contents,
@@ -338,6 +505,53 @@ class ZacroDiscardOperation : public content::WebContentsObserver {
   bool committed_blank_ = false;
   base::OnceCallback<void(int, const std::string&)> completion_;
 };
+
+void CefDevToolsController::FinishZacroDiscardCapture(int id, bool captured, std::string error) {
+  zacro_navigation_capture_.reset();
+  if (!captured) {
+    ReplyZacro(id, {}, error.empty() ? "The document did not confirm its current navigation state." : error);
+    return;
+  }
+  // Visibility, media, beforeunload, authentication-related loads, extension
+  // UI and downloads can change while renderer acknowledgements are pending.
+  // A failed preflight must leave the live page and older retained buffer alone.
+  if (zacro_navigation_commit_ || zacro_discard_ ||
+      !ZacroDocumentCanDiscard(inspected_contents_)) {
+    ReplyZacro(id, {}, "The document became active and cannot be put to sleep."); return;
+  }
+  auto& controller = inspected_contents_->GetController();
+  const int count = controller.GetEntryCount();
+  const int selected = controller.GetLastCommittedEntryIndex();
+  if (count < 1 || count > 500 || selected < 0 || selected >= count) {
+    ReplyZacro(id, {}, "The document history cannot be retained safely."); return;
+  }
+  std::vector<sessions::SerializedNavigationEntry> retained;
+  retained.reserve(count);
+  size_t retained_bytes = 0;
+  for (int index = 0; index < count; ++index) {
+    auto* entry = controller.GetEntryAtIndex(index);
+    std::string extension, incarnation;
+    if (!ZacroHistoryApproval(entry->GetVirtualURL(), inspected_contents_->GetBrowserContext(),
+                              extension, incarnation, inspected_contents_)) {
+      ReplyZacro(id, {}, "The document history contains an unsupported address."); return;
+    }
+    auto saved = sessions::ContentSerializedNavigationBuilder::FromNavigationEntry(index, entry);
+    const size_t bytes = sizeof(saved) + saved.EstimateMemoryUsage();
+    if (bytes > kZacroMaximumHistoryBytes - retained_bytes) {
+      ReplyZacro(id, {}, "The retained navigation state exceeds the supported size."); return;
+    }
+    retained_bytes += bytes;
+    retained.push_back(std::move(saved));
+  }
+  // No await or user callback separates this assignment from native discard.
+  // Nothing is exported or written to disk, including for private profiles.
+  zacro_dormant_history_ = std::move(retained);
+  zacro_dormant_selected_ = selected;
+  zacro_discard_ = std::make_unique<ZacroDiscardOperation>(inspected_contents_,
+      base::BindOnce(&CefDevToolsController::FinishZacroDiscard,
+                     weak_ptr_factory_.GetWeakPtr(), id));
+  zacro_discard_->Start();
+}
 
 void CefDevToolsController::ReplyZacro(int id, base::DictValue result,
                                       const std::string& error) {
@@ -443,15 +657,24 @@ bool CefDevToolsController::DispatchZacro(const std::string_view& message) {
     }
     const auto script = extensions::BackgroundInfo::GetBackgroundServiceWorkerScriptURL(extension);
     if (script.is_empty()) { ReplyZacro(*id, {}, "This extension does not have a service worker."); return true; }
-    std::string target;
-    for (const auto& host : content::DevToolsAgentHost::GetOrCreateAll()) {
-      if (host->GetBrowserContext() != context || host->GetType() != content::DevToolsAgentHost::kTypeServiceWorker ||
-          host->GetURL() != script) continue;
+    std::string target, worker_token;
+    // A DevTools target/context exists before ServiceWorkerGlobalScope has a
+    // URL. Evaluating then can fail inside Blink's promise rejection handler.
+    // OnStarted (and this running table) follows real script evaluation; do not
+    // infer readiness from target URL, Runtime.enable, or JavaScript probes.
+    auto* workers = extensions::util::GetServiceWorkerContextForExtensionId(
+        extension->id(), context);
+    if (workers) for (const auto& [version, info] : workers->GetRunningServiceWorkerInfos()) {
+      if (info.script_url != script || !workers->IsLiveRunningServiceWorker(version) ||
+          !workers->IsLiveServiceWorkerWithToken(version, info.token)) continue;
+      auto host = content::DevToolsAgentHost::GetForServiceWorker(workers, version);
+      if (!host || host->GetBrowserContext() != context ||
+          host->GetType() != content::DevToolsAgentHost::kTypeServiceWorker || host->GetURL() != script) continue;
       if (!target.empty()) { ReplyZacro(*id, {}, "The extension worker is changing; retry after it settles."); return true; }
-      target = host->GetId();
+      target = host->GetId(); worker_token = info.token.ToString();
     }
     auto result = base::DictValue().Set("installationID", ZacroExtensionContext::Get(context)->InstallationID(*extension));
-    if (!target.empty()) result.Set("targetID", target);
+    if (!target.empty()) { result.Set("targetID", target); result.Set("workerToken", worker_token); }
     ReplyZacro(*id, std::move(result)); return true;
   }
   if (*method == "Zacro.loadUnpackedExtension") {
@@ -714,40 +937,21 @@ bool CefDevToolsController::DispatchZacro(const std::string_view& message) {
     return true;
   }
   if (*method == "Zacro.discardDocument") {
-    if (zacro_discard_ || inspected_contents_->GetVisibility() != content::Visibility::HIDDEN || inspected_contents_->IsLoading() ||
-        inspected_contents_->IsCurrentlyAudible() || inspected_contents_->IsBeingCaptured() ||
-        inspected_contents_->NeedToFireBeforeUnloadOrUnloadEvents() ||
-        DevToolsWindow::GetInstanceForInspectedWebContents(inspected_contents_) || ZacroHasExtensionUI(inspected_contents_) ||
-        inspected_contents_->GetBrowserContext()->GetDownloadManager()->InProgressCount() > 0) {
+    if (zacro_navigation_capture_ || zacro_navigation_commit_ || zacro_discard_ ||
+        !ZacroDocumentCanDiscard(inspected_contents_)) {
       ReplyZacro(*id, {}, "The document is in use and cannot be put to sleep."); return true;
     }
-    // Private documents keep their history only in this native controller's
-    // memory. Nothing is exported, encrypted for storage, or written to disk.
-    auto& controller = inspected_contents_->GetController();
-    if (controller.GetEntryCount() < 1 || controller.GetEntryCount() > 500) {
+    const int count = inspected_contents_->GetController().GetEntryCount();
+    if (count < 1 || count > 500) {
       ReplyZacro(*id, {}, "The document history cannot be retained safely."); return true;
     }
-    zacro_dormant_history_.clear();
-    size_t retained_bytes = 0;
-    for (int index = 0; index < controller.GetEntryCount(); ++index) {
-      auto* entry = controller.GetEntryAtIndex(index);
-      std::string extension, incarnation;
-      if (!ZacroHistoryApproval(entry->GetVirtualURL(), inspected_contents_->GetBrowserContext(), extension, incarnation, inspected_contents_)) {
-        zacro_dormant_history_.clear(); ReplyZacro(*id, {}, "The document history contains an unsupported address."); return true;
-      }
-      auto saved = sessions::ContentSerializedNavigationBuilder::FromNavigationEntry(index, entry);
-      retained_bytes += sizeof(saved) + saved.EstimateMemoryUsage();
-      if (retained_bytes > kZacroMaximumHistoryBytes) {
-        zacro_dormant_history_.clear();
-        ReplyZacro(*id, {}, "The retained navigation state exceeds the supported size."); return true;
-      }
-      zacro_dormant_history_.push_back(std::move(saved));
-    }
-    zacro_dormant_selected_ = controller.GetLastCommittedEntryIndex();
-    zacro_discard_ = std::make_unique<ZacroDiscardOperation>(inspected_contents_,
-        base::BindOnce(&CefDevToolsController::FinishZacroDiscard,
+    // Private documents cannot use encrypted capture, but their in-memory
+    // back/forward history requires the same ordered renderer state barrier.
+    // Reuse the capture lane so concurrent capture/discard cannot overlap.
+    zacro_navigation_capture_ = std::make_unique<ZacroNavigationCaptureOperation>(inspected_contents_,
+        base::BindOnce(&CefDevToolsController::FinishZacroDiscardCapture,
                        weak_ptr_factory_.GetWeakPtr(), *id));
-    zacro_discard_->Start();
+    zacro_navigation_capture_->Start();
     return true;
   }
   if (*method == "Zacro.restoreDiscardedDocument") {
@@ -771,61 +975,16 @@ bool CefDevToolsController::DispatchZacro(const std::string_view& message) {
     if (inspected_contents_->GetBrowserContext()->IsOffTheRecord()) {
       ReplyZacro(*id, {}, "Private navigation state cannot be persisted."); return true;
     }
-    auto& controller = inspected_contents_->GetController();
-    const int count = controller.GetEntryCount();
+    if (zacro_navigation_capture_ || zacro_navigation_commit_ || zacro_discard_) {
+      ReplyZacro(*id, {}, "A native navigation operation is already in progress."); return true;
+    }
+    const int count = inspected_contents_->GetController().GetEntryCount();
     if (count < 1 || count > 500) {
       ReplyZacro(*id, {}, "Navigation history exceeds the supported entry count."); return true;
     }
-    base::Pickle pickle;
-    pickle.WriteInt(2);
-    pickle.WriteInt(controller.GetLastCommittedEntryIndex());
-    pickle.WriteInt(count);
-    for (int index = 0; index < count; ++index) {
-      std::string extension, incarnation;
-      if (!ZacroHistoryApproval(controller.GetEntryAtIndex(index)->GetVirtualURL(),
-                             inspected_contents_->GetBrowserContext(), extension, incarnation, inspected_contents_)) {
-        ReplyZacro(*id, {}, "This navigation contains a non-restorable browser URL."); return true;
-      }
-      auto entry = sessions::ContentSerializedNavigationBuilder::FromNavigationEntry(
-          index, controller.GetEntryAtIndex(index));
-      if (!ZacroWriteNavigationEntry(entry, &pickle)) {
-        ReplyZacro(*id, {}, "Navigation state exceeds the supported size; no partial history was saved."); return true;
-      }
-      pickle.WriteString(extension); pickle.WriteString(incarnation);
-      if (pickle.size() > kZacroMaximumHistoryBytes - 4096) {
-        ReplyZacro(*id, {}, "Navigation state exceeds the supported size."); return true;
-      }
-    }
-    auto* crypt = g_browser_process ? g_browser_process->os_crypt_async() : nullptr;
-    if (!crypt) { ReplyZacro(*id, {}, "Native navigation encryption is unavailable."); return true; }
-    crypt->GetInstance(base::BindOnce(
-        [](base::WeakPtr<CefDevToolsController> self, int id,
-           std::string plain, std::string binding,
-           scoped_refptr<os_crypt_async::Encryptor> encryptor) {
-          if (!self) return;
-          const auto key = crypto::RandBytesAsArray<32>();
-          const auto nonce = crypto::RandBytesAsArray<12>();
-          const auto wrapped_key = encryptor->EncryptString(
-              std::string(base::as_string_view(key)));
-          if (!wrapped_key) { self->ReplyZacro(id, {}, "Navigation encryption failed."); return; }
-          const auto sealed = crypto::aead::Seal(crypto::aead::AES_256_GCM, key,
-              base::as_bytes(base::span(plain)), nonce, base::as_bytes(base::span(binding)));
-          if (sealed.empty()) { self->ReplyZacro(id, {}, "Navigation encryption failed."); return; }
-          // OSCrypt wraps a fresh random AEAD key using the already configured
-          // Chromium OS/keychain provider. AES-GCM authenticates the entire
-          // history and profile binding even when the OS provider is legacy.
-          base::Pickle envelope;
-          envelope.WriteInt(2);
-          envelope.WriteString(base::as_string_view(*wrapped_key));
-          envelope.WriteString(base::as_string_view(nonce));
-          envelope.WriteString(base::as_string_view(sealed));
-          if (envelope.size() > kZacroMaximumHistoryBytes) {
-            self->ReplyZacro(id, {}, "Encrypted navigation state exceeds the supported size."); return;
-          }
-          self->ReplyZacro(id, base::DictValue().Set("version", 2)
-              .Set("state", base::Base64Encode(envelope.AsBytes())));
-        }, weak_ptr_factory_.GetWeakPtr(), *id,
-        std::string(pickle.AsStringView()), ZacroHistoryBinding(inspected_contents_)));
+    zacro_navigation_capture_ = std::make_unique<ZacroNavigationCaptureOperation>(inspected_contents_,
+        base::BindOnce(&CefDevToolsController::FinishZacroNavigationCapture, weak_ptr_factory_.GetWeakPtr(), *id));
+    zacro_navigation_capture_->Start();
     return true;
   }
   if (*method == "Zacro.restoreNavigation") {
@@ -918,4 +1077,65 @@ void CefDevToolsController::FinishZacroDiscard(int id, int entry_id, const std::
   if (!entry_id) zacro_dormant_history_.clear();
   ReplyZacro(id, base::DictValue().Set("discarded", entry_id > 0), error);
   zacro_discard_.reset();
+}
+
+void CefDevToolsController::SerializeZacroNavigation(int id) {
+    if (inspected_contents_->GetBrowserContext()->IsOffTheRecord()) {
+      ReplyZacro(id, {}, "Private navigation state cannot be persisted."); return;
+    }
+    auto& controller = inspected_contents_->GetController();
+    const int count = controller.GetEntryCount();
+    if (count < 1 || count > 500) {
+      ReplyZacro(id, {}, "Navigation history exceeds the supported entry count."); return;
+    }
+    base::Pickle pickle;
+    pickle.WriteInt(2);
+    pickle.WriteInt(controller.GetLastCommittedEntryIndex());
+    pickle.WriteInt(count);
+    for (int index = 0; index < count; ++index) {
+      std::string extension, incarnation;
+      if (!ZacroHistoryApproval(controller.GetEntryAtIndex(index)->GetVirtualURL(),
+                             inspected_contents_->GetBrowserContext(), extension, incarnation, inspected_contents_)) {
+        ReplyZacro(id, {}, "This navigation contains a non-restorable browser URL."); return;
+      }
+      auto entry = sessions::ContentSerializedNavigationBuilder::FromNavigationEntry(
+          index, controller.GetEntryAtIndex(index));
+      if (!ZacroWriteNavigationEntry(entry, &pickle)) {
+        ReplyZacro(id, {}, "Navigation state exceeds the supported size; no partial history was saved."); return;
+      }
+      pickle.WriteString(extension); pickle.WriteString(incarnation);
+      if (pickle.size() > kZacroMaximumHistoryBytes - 4096) {
+        ReplyZacro(id, {}, "Navigation state exceeds the supported size."); return;
+      }
+    }
+    auto* crypt = g_browser_process ? g_browser_process->os_crypt_async() : nullptr;
+    if (!crypt) { ReplyZacro(id, {}, "Native navigation encryption is unavailable."); return; }
+    crypt->GetInstance(base::BindOnce(
+        [](base::WeakPtr<CefDevToolsController> self, int id,
+           std::string plain, std::string binding,
+           scoped_refptr<os_crypt_async::Encryptor> encryptor) {
+          if (!self) return;
+          const auto key = crypto::RandBytesAsArray<32>();
+          const auto nonce = crypto::RandBytesAsArray<12>();
+          const auto wrapped_key = encryptor->EncryptString(
+              std::string(base::as_string_view(key)));
+          if (!wrapped_key) { self->ReplyZacro(id, {}, "Navigation encryption failed."); return; }
+          const auto sealed = crypto::aead::Seal(crypto::aead::AES_256_GCM, key,
+              base::as_bytes(base::span(plain)), nonce, base::as_bytes(base::span(binding)));
+          if (sealed.empty()) { self->ReplyZacro(id, {}, "Navigation encryption failed."); return; }
+          // OSCrypt wraps a fresh random AEAD key using the already configured
+          // Chromium OS/keychain provider. AES-GCM authenticates the entire
+          // history and profile binding even when the OS provider is legacy.
+          base::Pickle envelope;
+          envelope.WriteInt(2);
+          envelope.WriteString(base::as_string_view(*wrapped_key));
+          envelope.WriteString(base::as_string_view(nonce));
+          envelope.WriteString(base::as_string_view(sealed));
+          if (envelope.size() > kZacroMaximumHistoryBytes) {
+            self->ReplyZacro(id, {}, "Encrypted navigation state exceeds the supported size."); return;
+          }
+          self->ReplyZacro(id, base::DictValue().Set("version", 2)
+              .Set("state", base::Base64Encode(envelope.AsBytes())));
+        }, weak_ptr_factory_.GetWeakPtr(), id,
+        std::string(pickle.AsStringView()), ZacroHistoryBinding(inspected_contents_)));
 }

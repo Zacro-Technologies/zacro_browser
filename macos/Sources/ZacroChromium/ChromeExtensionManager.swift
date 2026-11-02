@@ -255,12 +255,23 @@ public struct ChromeTabMaterialization: Sendable {
 /// Logical Zacro tab/window grouping is a separate engine integration.
 @MainActor
 public final class ChromeExtensionManager {
+  /// Chromium's built-in PDF component. Private transport never hosts an
+  /// installed third-party extension or participates in extension sync.
+  public nonisolated static let bundledPDFExtensionID = "mhjfbmdgcfjbbpaeojofohoefgiehjai"
   public let profileID: String
+  public let isPrivate: Bool
   private unowned let engine: ChromiumEngine
   private var eventToken: UUID?
   private weak var observedBrowser: CefBrowser?
-  public init(engine: ChromiumEngine, profileID: String) {
-    self.engine = engine; self.profileID = profileID
+  private var privateTransportRetired = false
+  public init(engine: ChromiumEngine, profileID: String, isPrivate: Bool = false) {
+    self.engine = engine; self.profileID = profileID; self.isPrivate = isPrivate
+  }
+
+  public var isPrivateComponentObserverActive: Bool {
+    guard isPrivate, !privateTransportRetired, eventToken != nil, let browser = observedBrowser,
+      !browser.isClosed, let page = engine.pages[transportID] else { return false }
+    return page.isPrivate && page.profileID == profileID && page.browser === browser
   }
 
   public func snapshot() async throws -> ChromeExtensionSnapshot {
@@ -281,6 +292,22 @@ public final class ChromeExtensionManager {
   /// Native registry, action and storage observation does not depend on any
   /// extension renderer running or subscribing to JavaScript events.
   public func observeChanges(_ callback: @escaping (ChromeExtensionEvent) -> Void) async throws {
+    guard !isPrivate else { throw ChromeExtensionError.managementUnavailable }
+    try await observeNativeChanges(componentsOnly: false, callback)
+  }
+
+  /// A separate, memory-only channel for the built-in PDF viewer. Registry,
+  /// storage, downloads and cloud events are not subscribed or forwarded here.
+  public func observePrivateComponentRequests(_ callback: @escaping (ChromeExtensionHostRequest) -> Void) async throws {
+    guard isPrivate else { throw ChromeExtensionError.managementUnavailable }
+    try await observeNativeChanges(componentsOnly: true) { event in
+      if case .hostRequest(let request) = event, request.incognito,
+        request.extensionID == Self.bundledPDFExtensionID { callback(request) }
+    }
+  }
+
+  private func observeNativeChanges(componentsOnly: Bool,
+      _ callback: @escaping (ChromeExtensionEvent) -> Void) async throws {
     await close()
     let browser = try await nativeBrowser()
     let token = try browser.devTools.observeEvents { method, params in
@@ -318,7 +345,8 @@ public final class ChromeExtensionManager {
       }
     }
     do {
-      _ = try await browser.devTools.call("Zacro.observeExtensions", parameters: ["enabled": true])
+      _ = try await browser.devTools.call("Zacro.observeExtensions", parameters: [
+        "enabled": true, "componentsOnly": componentsOnly])
       eventToken = token; observedBrowser = browser
     } catch { browser.devTools.removeEventObserver(token); throw error }
   }
@@ -327,7 +355,29 @@ public final class ChromeExtensionManager {
     guard let browser = observedBrowser else { eventToken = nil; return }
     if let eventToken { browser.devTools.removeEventObserver(eventToken) }
     eventToken = nil; observedBrowser = nil
-    _ = try? await browser.devTools.call("Zacro.observeExtensions", parameters: ["enabled": false])
+    _ = try? await browser.devTools.call("Zacro.observeExtensions", parameters: [
+      "enabled": false, "componentsOnly": isPrivate])
+  }
+
+  /// Await the actual native close before releasing the ephemeral context.
+  /// This private transport has no model document, form state or unload veto.
+  public func closePrivateComponentTransport() async {
+    guard isPrivate else { return }
+    privateTransportRetired = true
+    await close()
+    guard let page = engine.pages[transportID], page.isPrivate,
+      page.profileID == profileID else { return }
+    await withCheckedContinuation { continuation in
+      let previous = page.onClosed
+      page.onClosed = {
+        previous?()
+        continuation.resume()
+      }
+      // CefChromeBrowser remembers closeRequested before its CEF window is
+      // created. Calling the raw CefBrowser host here would silently do
+      // nothing while that host is still pending.
+      page.close()
+    }
   }
 
   /// Rechecks the native caller and installation immediately before a host mutation.
@@ -506,13 +556,17 @@ public final class ChromeExtensionManager {
     while true {
       try Task.checkCancellation()
       let target = try await browser.devTools.call("Zacro.extensionWorkerTarget", parameters: ["id": identifier])
-      if let targetID = target["targetID"] as? String, let installation = target["installationID"] as? String {
+      if let targetID = target["targetID"] as? String, let installation = target["installationID"] as? String,
+        let workerToken = target["workerToken"] as? String {
         let parentSession = try await browser.devTools.browserSession()
         let response = try await browser.devTools.call("Target.attachToTarget",
           parameters: ["targetId": targetID, "flatten": true], sessionID: parentSession)
         guard let session = response["sessionId"] as? String else { throw ChromeExtensionError.invalidResponse }
-        return ChromeExtensionWorkerSession(browser: browser, extensionID: identifier,
-          installationID: installation, targetID: targetID, parentSessionID: parentSession, sessionID: session)
+        let worker = ChromeExtensionWorkerSession(browser: browser, extensionID: identifier,
+          installationID: installation, targetID: targetID, workerToken: workerToken,
+          parentSessionID: parentSession, sessionID: session)
+        do { try await worker.prepareExecutionContext(); return worker }
+        catch { await worker.close(); throw error }
       }
       guard Date() < deadline else { throw ChromeExtensionError.loadFailed("The extension worker has not started.") }
       try await Task.sleep(for: .milliseconds(100))
@@ -520,14 +574,18 @@ public final class ChromeExtensionManager {
   }
 
   func nativeBrowser() async throws -> CefBrowser {
-    guard !engine.isTerminating,
-      engine.pages["extensions:\(profileID)"] != nil || engine.contexts.values.contains(where: { $0.isOpen && !$0.isClosing })
+    guard !privateTransportRetired, !engine.isTerminating,
+      engine.pages[transportID] != nil || engine.contexts.values.contains(where: { $0.isOpen && !$0.isClosing })
     else { throw ChromeExtensionError.managementUnavailable }
-    let page = engine.pages["extensions:\(profileID)"] ?? engine.extensionsPage(profileID: profileID)
+    let page = engine.pages[transportID] ?? (isPrivate
+      ? engine.privateComponentsPage(profileID: profileID) : engine.extensionsPage(profileID: profileID))
     let browser = try await page.ready()
-    guard engine.pages[page.id] === page, !page.isPrivate, page.profileID == profileID else { throw ChromeExtensionError.managementUnavailable }
+    guard !privateTransportRetired, !engine.isTerminating,
+      engine.pages[page.id] === page, page.isPrivate == isPrivate, page.profileID == profileID else { throw ChromeExtensionError.managementUnavailable }
     return browser
   }
+
+  private var transportID: String { "\(isPrivate ? "private-components" : "extensions"):\(profileID)" }
 
   /// Clears Chromium's real HistoryService and history-backed suggestions for
   /// this profile, including visits visible through chrome.history.
@@ -773,6 +831,13 @@ public final class ChromeExtensionManager {
       const url = item.iconUrl;
       if (typeof url !== 'string' || !(url.startsWith('chrome://extension-icon/') || url.startsWith('data:image/')))
         throw new Error('Unsupported extension icon URL.');
+      // developerPrivate already returns encoded icon bytes on current Chrome.
+      // Fetching that data URL is blocked by the management page's own CSP.
+      if (url.startsWith('data:image/')) {
+        if (url.length > 349600 || !/^data:image\\/[a-z0-9.+-]+;base64,[a-z0-9+/]+={0,2}$/i.test(url))
+          throw new Error('Invalid encoded extension icon.');
+        return url;
+      }
       const response = await fetch(url);
       if (!response.ok) throw new Error('Extension icon could not be loaded.');
       const blob = await response.blob();
@@ -783,8 +848,9 @@ public final class ChromeExtensionManager {
         reader.readAsDataURL(blob);
       });
       """)
-    guard let encoded = value as? String, let comma = encoded.firstIndex(of: ","),
-      let data = Data(base64Encoded: String(encoded[encoded.index(after: comma)...])), data.count <= 262144
+    guard let encoded = value as? String, encoded.hasPrefix("data:image/"),
+      let comma = encoded.firstIndex(of: ","), encoded[..<comma].hasSuffix(";base64"),
+      let data = Data(base64Encoded: String(encoded[encoded.index(after: comma)...])), !data.isEmpty, data.count <= 262144
     else { throw ChromeExtensionError.invalidResponse }
     return data
   }
@@ -818,7 +884,7 @@ public final class ChromeExtensionManager {
   }
 
   private func evaluate(_ body: String, userGesture: Bool = false, timeout: TimeInterval = 20) async throws -> Any? {
-    guard !engine.isTerminating,
+    guard !isPrivate, !engine.isTerminating,
       engine.pages["extensions:\(profileID)"] != nil || engine.contexts.values.contains(where: { $0.isOpen && !$0.isClosing }) else {
       throw ChromeExtensionError.managementUnavailable
     }

@@ -66,7 +66,7 @@ public final class CefDevTools {
 
     public func call(
         _ method: String, parameters: [String: Any] = [:], timeout: TimeInterval = 15,
-        sessionID: String? = nil
+        sessionID: String? = nil, onSubmitted: (() -> Void)? = nil
     ) async throws -> [String: Any] {
         try Task.checkCancellation()
         guard !closed, let browser, browser.hasRawBrowser else { throw CefDevToolsError.browserClosed }
@@ -99,7 +99,12 @@ public final class CefDevTools {
                         (host.pointee.send_dev_tools_message?(host, bytes.baseAddress, bytes.count) ?? 0) != 0
                     }
                 }
-                if !sent { finish(identifier, with: .failure(CefDevToolsError.unavailable)) }
+                // Submission is distinct from the protocol response. A
+                // renderer-dependent command can remain pending until the
+                // initial document is created, while ordered native delivery
+                // must already be established before that navigation starts.
+                if sent { onSubmitted?() }
+                else { finish(identifier, with: .failure(CefDevToolsError.unavailable)) }
             }
         } onCancel: { [weak self] in
             Task { @MainActor in self?.finish(identifier, with: .failure(CancellationError())) }
@@ -147,12 +152,17 @@ public final class CefDevTools {
     /// exception is an error; it is never presented as an empty successful value.
     public func evaluate(
         _ expression: String, userGesture: Bool = false, timeout: TimeInterval = 15,
-        sessionID: String? = nil
+        sessionID: String? = nil, uniqueContextID: String? = nil
     ) async throws -> Any? {
-        let response = try await call("Runtime.evaluate", parameters: [
+        var parameters: [String: Any] = [
             "expression": expression, "returnByValue": true, "awaitPromise": true,
             "userGesture": userGesture,
-        ], timeout: timeout, sessionID: sessionID)
+        ]
+        // A unique context ID cannot be reused by a replacement renderer or
+        // restarted worker, unlike the default context or numeric context ID.
+        if let uniqueContextID { parameters["uniqueContextId"] = uniqueContextID }
+        let response = try await call("Runtime.evaluate", parameters: parameters,
+            timeout: timeout, sessionID: sessionID)
         return try value(from: response)
     }
 

@@ -11,6 +11,18 @@ struct NativeAIContextTab: Identifiable, Equatable {
   var isReadable: Bool = true
 }
 
+struct NativeAIContextReview: Identifiable, Equatable {
+  let id = UUID()
+  let profileID: String
+  let kind: String
+  let choices: [NativeAIContextTab]
+  let selectedIDs: Set<String>
+  let owner: NSWindow
+  let ownerIdentifier: NSUserInterfaceItemIdentifier?
+  let ownerNumber: Int
+  static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
+}
+
 struct NativeAIMessage: Identifiable {
   let id = UUID()
   var role: String
@@ -31,18 +43,26 @@ struct NativeAIMessage: Identifiable {
   @Published var grants: [NativeAIContextTab] = []
   @Published var context = "research"
   @Published var busy = false
+  @Published var submitting = false
+  @Published private(set) var contextChangeID: UUID?
   @Published var progress = ""
   @Published var notice = ""
-  @Published var pendingReview: String?
+  @Published var pendingReview: NativeAIContextReview?
   private(set) var profileID = ""
   private var requestID = ""
   private var lastResetRevision = 0
+  private(set) var generation = 0
   var sources: [ServiceJSON] { messages.last(where: { $0.role == "assistant" && !$0.error && !$0.incomplete })?.result["sources"].array ?? [] }
   func activate(profileID: String, isPrivate: Bool = false) {
     guard self.profileID != profileID || isPrivate else { return }
-    self.profileID = profileID; lastResetRevision = 0; draft = ""; savedQuestions = []; grants = []; context = "research"; pendingReview = nil; reset()
+    self.profileID = profileID; lastResetRevision = 0; submitting = false; contextChangeID = nil; draft = ""; savedQuestions = []; grants = []; context = "research"; pendingReview = nil; reset()
   }
-  func reset() { messages = []; requestID = ""; busy = false; progress = ""; notice = "" }
+  func reset() { generation += 1; messages = []; requestID = ""; busy = false; progress = ""; notice = "" }
+  func beginContextChange() -> UUID? {
+    guard !busy, !submitting, contextChangeID == nil else { return nil }
+    let token = UUID(); contextChangeID = token; return token
+  }
+  func endContextChange(_ token: UUID) { if contextChangeID == token { contextChangeID = nil } }
   func prepare(_ question: String) {
     let question = String(question.prefix(8000))
     if draft.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty { draft = question }
@@ -114,14 +134,12 @@ private struct NativeAIConversationView: View {
   @ObservedObject var conversation: NativeAIConversationState
   let palette: NativeSpacePalette
   @State private var connections = false
-  @State private var reviewing = false
-  @State private var changingContext = false
   @State private var candidates = Set<String>()
   @State private var reviewContext = "tabs"
   private var privateMode: Bool { model.ai["private"].bool }
   private var configured: Bool { model.ai["configured"].bool }
   private var stale: Bool { conversation.grants.contains { grant in !model.contextTabs.contains(where: { $0.id == grant.id && $0.url == grant.url && $0.profileID == grant.profileID }) } }
-  private var locked: Bool { conversation.busy || changingContext }
+  private var locked: Bool { conversation.busy || conversation.submitting || conversation.contextChangeID != nil || conversation.pendingReview != nil }
   private var pages: [NativeAIContextTab] { model.contextTabs.filter { $0.profileID == model.ai["profileId"].string && $0.isReadable && safeURL($0.url) != nil } }
   var body: some View {
     VStack(spacing:0) {
@@ -148,13 +166,13 @@ private struct NativeAIConversationView: View {
           ScrollView { NativeAIConnectionView(model:model,palette:palette) }
         }.padding(20).frame(width:400,height:580).background(palette.chrome)
       }
-      .sheet(isPresented:$reviewing) { contextReview }
+      .sheet(item:$conversation.pendingReview) { _ in contextReview }
       .onAppear { conversation.activate(profileID:model.ai["profileId"].string,isPrivate:privateMode) }
       .onChange(of:model.ai["profileId"]) { _,value in
-        conversation.activate(profileID:value.string,isPrivate:privateMode); reviewing = false; connections = false
+        conversation.activate(profileID:value.string,isPrivate:privateMode); connections = false
       }
       .onChange(of:conversation.pendingReview,initial:true) { _,value in
-        guard let value else { return }; reviewContext = value; candidates = Set(conversation.grants.map(\.id)); reviewing = true; conversation.pendingReview = nil
+        guard let value else { return }; reviewContext = value.kind; candidates = value.selectedIDs
       }
   }
   private var welcome: some View {
@@ -260,13 +278,13 @@ private struct NativeAIConversationView: View {
         Image(systemName:"checkmark.shield").foregroundStyle(palette.muted)
         Picker("Content to share",selection:Binding(get:{ conversation.context },set:{ value in
           if value == "research" { changeContext("research",grants:[]) }
-          else { reviewContext = value; candidates = Set(conversation.grants.map(\.id)); reviewing = true }
+          else { openContextReview(value, selected: Set(conversation.grants.map(\.id))) }
         })) {
           Text(model.ai["researchSupported"] == false ? "Chat · no page sharing" : "Web research · no page sharing").tag("research")
           Text("One page").tag("page"); Text("Selected tabs").tag("tabs")
         }.labelsHidden().controlSize(.small).disabled(locked)
         if conversation.context != "research" {
-          Button { reviewContext = conversation.context; candidates = Set(conversation.grants.map(\.id)); reviewing = true } label: { Image(systemName:"plus") }.buttonStyle(.plain).help("Choose pages").disabled(locked)
+          Button { openContextReview(conversation.context, selected: Set(conversation.grants.map(\.id))) } label: { Image(systemName:"plus") }.buttonStyle(.plain).help("Choose pages").disabled(locked)
           Button { changeContext("research",grants:[]) } label: { Image(systemName:"xmark") }.buttonStyle(.plain).help("Clear shared context and conversation").disabled(locked)
         }
       }.font(.system(size:10))
@@ -287,7 +305,7 @@ private struct NativeAIConversationView: View {
         Text(model.ai["researchSupported"] == false ? "No web search on this connection. No open-page text is shared." : "Searches the web for supporting sources. No open-page text is shared.").font(.system(size:10)).foregroundStyle(palette.muted)
       }
       if stale {
-        HStack { Text("A selected page changed or closed.").font(.system(size:10)); Button("Review again") { reviewContext = conversation.context; candidates = Set(conversation.grants.map(\.id)); reviewing = true }.buttonStyle(.plain) }.foregroundStyle(.red)
+        HStack { Text("A selected page changed or closed.").font(.system(size:10)); Button("Review again") { openContextReview(conversation.context, selected: Set(conversation.grants.map(\.id))) }.buttonStyle(.plain) }.foregroundStyle(.red)
       }
       HStack(alignment:.bottom,spacing:5) {
         NativeAIComposer(text:$conversation.draft,placeholder:conversation.messages.isEmpty ? "Ask a question…" : "Ask a follow-up…",color:NSColor(palette.ink),send:submit)
@@ -312,7 +330,7 @@ private struct NativeAIConversationView: View {
       Text("Choose up to six pages. These exact addresses and their readable text will be shared only when you send a question.").font(.system(size:12)).foregroundStyle(palette.muted)
       ScrollView {
         VStack(spacing:8) {
-          ForEach(pages) { page in
+          ForEach(conversation.pendingReview?.choices ?? []) { page in
             Toggle(isOn:Binding(get:{ candidates.contains(page.id) },set:{ chosen in
               if chosen { if reviewContext == "page" { candidates = [page.id] } else if candidates.count < 6 { candidates.insert(page.id) } }
               else { candidates.remove(page.id) }
@@ -320,10 +338,21 @@ private struct NativeAIConversationView: View {
               VStack(alignment:.leading,spacing:3) { Text(page.title).fontWeight(.medium); Text(page.url).font(.system(size:10)).foregroundStyle(palette.muted).textSelection(.enabled) }
             }.toggleStyle(.checkbox).padding(8).background(palette.card.opacity(0.5),in:RoundedRectangle(cornerRadius:8))
           }
-          if pages.isEmpty { Text("Open a web page or text PDF first.").foregroundStyle(palette.muted) }
+          if conversation.pendingReview?.choices.isEmpty != false { Text("Open a web page or text PDF first.").foregroundStyle(palette.muted) }
         }
       }
-      HStack { Button("Cancel") { reviewing = false }; Spacer(); Button("Use selected pages") { changeContext(reviewContext,grants:pages.filter { candidates.contains($0.id) }); reviewing = false }.disabled(candidates.isEmpty) }
+      HStack {
+        Button("Cancel") { conversation.pendingReview = nil }
+        Spacer()
+        Button("Use selected pages") {
+          guard let review = conversation.pendingReview else { return }
+          let selected = candidates, profile = conversation.profileID
+          Task {
+            do { try await model.confirmAIContextReview(reviewID:review.id, selectedIDs:selected) }
+            catch { if conversation.profileID == profile { conversation.notice = error.localizedDescription } }
+          }
+        }.disabled(candidates.isEmpty || conversation.contextChangeID != nil)
+      }
         .buttonStyle(NativeServiceButtonStyle(palette:palette))
     }.padding(20).frame(width:460,height:420).background(palette.chrome).foregroundStyle(palette.ink)
   }
@@ -337,16 +366,24 @@ private struct NativeAIConversationView: View {
     if conversation.draft.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty { conversation.draft = prompts[intent] ?? "" }
     if intent == "research" { changeContext("research",grants:[]) }
     else {
-      reviewContext = intent == "compare" ? "tabs" : "page"
-      candidates = intent == "compare" ? [] : Set(pages.prefix(1).map(\.id)); reviewing = true
+      openContextReview(intent == "compare" ? "tabs" : "page", selected:intent == "compare" ? [] : Set(pages.prefix(1).map(\.id)))
     }
   }
+  private func openContextReview(_ kind: String, selected: Set<String>) {
+    do { try model.requestAIContextReview(kind, selectedIDs:selected) }
+    catch { conversation.notice = error.localizedDescription }
+  }
   private func changeContext(_ kind: String, grants: [NativeAIContextTab]) {
-    guard !locked else { return }; changingContext = true
+    guard let token = conversation.beginContextChange() else { return }
+    let profile = conversation.profileID
     Task {
-      defer { changingContext = false }
-      do { _ = try await model.aiAction("ai:reset"); conversation.reset(); conversation.context = grants.isEmpty ? "research" : kind; conversation.grants = grants }
-      catch { conversation.notice = error.localizedDescription }
+      defer { conversation.endContextChange(token) }
+      do {
+        guard conversation.profileID == profile, conversation.contextChangeID == token else { return }
+        _ = try await model.aiAction("ai:reset")
+        guard conversation.profileID == profile, conversation.contextChangeID == token else { return }
+        conversation.reset(); conversation.context = grants.isEmpty ? "research" : kind; conversation.grants = grants
+      } catch { if conversation.profileID == profile, conversation.contextChangeID == token { conversation.notice = error.localizedDescription } }
     }
   }
   private func review(_ message: NativeAIMessage, retry: Bool = false) {
@@ -359,26 +396,27 @@ private struct NativeAIConversationView: View {
       conversation.notice = "Your unfinished question was kept. Clear it before editing an earlier question."; return
     }
     let context = grants.isEmpty ? "research" : grants.count == 1 ? "page" : "tabs", profile = conversation.profileID
-    changingContext = true
+    guard let token = conversation.beginContextChange() else { return }
     Task {
-      defer { changingContext = false }
+      defer { conversation.endContextChange(token) }
       do {
+        guard conversation.profileID == profile, conversation.contextChangeID == token else { return }
         if !retry || conversation.context != context || conversation.grants != grants { _ = try await model.aiAction("ai:reset") }
-        guard conversation.profileID == profile else { return }
-        conversation.grants = grants; conversation.context = context; changingContext = false
+        guard conversation.profileID == profile, conversation.contextChangeID == token else { return }
+        conversation.grants = grants; conversation.context = context; conversation.endContextChange(token)
         if retry { submitQuestion(message.text) } else { conversation.draft = message.text }
-      } catch { conversation.notice = error.localizedDescription }
+      } catch { if conversation.profileID == profile, conversation.contextChangeID == token { conversation.notice = error.localizedDescription } }
     }
   }
   private func submit() { submitQuestion(conversation.draft) }
   private func submitQuestion(_ value: String) {
     let question = value.trimmingCharacters(in:.whitespacesAndNewlines)
     guard !question.isEmpty, !locked, !stale, configured, !privateMode else { return }
-    let request: ServiceJSON = ["question":.string(question),"requestId":.string(UUID().uuidString),
-      "tabIds":.array(conversation.grants.map { .string($0.id) }),
-      "contextTabs":.array(conversation.grants.map { ["id":.string($0.id),"url":.string($0.url),"title":.string($0.title)] })]
-    conversation.begin(question:question,request:request)
-    Task { do { let answer = try await model.aiAction("ai:ask",payload:request); conversation.receive(answer) } catch { conversation.fail(error,request:request["requestId"].string) } }
+    let profile = conversation.profileID
+    Task {
+      do { _ = try await model.submitAIQuestion(question, expectedProfileID:profile) }
+      catch { if conversation.profileID == profile { conversation.notice = error.localizedDescription } }
+    }
   }
   private func action(_ name: String) { Task { do { _ = try await model.aiAction(name) } catch { conversation.notice = error.localizedDescription } } }
   private func openSource(_ source: ServiceJSON) { Task { do { _ = try await model.aiAction("ai:open-source",payload:source) } catch { conversation.notice = error.localizedDescription } } }

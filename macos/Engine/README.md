@@ -13,9 +13,20 @@ the native shell. Pages are never converted to Alloy. Coordinates are converted
 from the parent content view to screen coordinates. Fullscreen transitions,
 native dialogs and layering above page windows require explicit acceptance.
 
-Build from the repository root using `macos/scripts/build-app.sh`. The CEF plugin verifies the archive
-against its pinned digest, bundles the framework and five helpers, and signs
-inside-out. Ad hoc builds are development artifacts, not notarized releases.
+After preparing the pinned Chromium/CEF source with the official `automate-git.py`,
+build the custom framework from the repository root:
+
+```sh
+python3 -B macos/Engine/CefSwift/NativeRuntime/build_runtime.py --download-dir /path/to/zacro-chromium --jobs 4
+macos/scripts/build-app.sh --runtime-build /path/to/zacro-chromium/chromium/src/out/Release_GN_arm64/zacro-runtime-build.json
+```
+
+The driver verifies source revisions, applies the native integration and writes a
+receipt only after a successful build. Packaging verifies that receipt against the
+current adapters and framework, bundles the required helpers, and signs inside-out. Use
+`--skip-generation` only to resume an already generated pinned build. See the
+[runtime verification record](../../docs/native-parity/engine-extensions.md).
+Ad hoc bundles are development artifacts, not notarized releases.
 
 Zacro explicitly enables the Chromium sandbox and real Keychain cookie
 protection. No privileged page-to-Swift bridge handlers are registered.

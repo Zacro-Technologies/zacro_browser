@@ -110,7 +110,7 @@ class NativeExtensionPopupAnchor::Impl {
         usingBlock:^(NSNotification*) { if (auto state = weak.lock()) state->Close(); }]);
     observers_.push_back([center addObserverForName:NSWindowDidBecomeKeyNotification object:nil queue:nil
         usingBlock:^(NSNotification* event) {
-          if (auto state = weak.lock(); state && !Descendant(event.object, state->popup)) state->Close();
+          if (auto state = weak.lock(); state && state->popup.visible && !Descendant(event.object, state->popup)) state->Close();
         }]);
     monitor_ = [NSEvent addLocalMonitorForEventsMatchingMask:
         NSEventMaskLeftMouseDown | NSEventMaskRightMouseDown | NSEventMaskOtherMouseDown

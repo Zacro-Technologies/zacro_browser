@@ -1,0 +1,136 @@
+--- a/content/common/frame.mojom
++++ b/content/common/frame.mojom
+@@ -492,6 +492,11 @@
+   GetInterfaceProvider(
+       pending_receiver<service_manager.mojom.InterfaceProvider> interfaces);
+ 
++  // Flush current history/form state using the normal FrameHost.UpdateState
++  // security path. The response follows UpdateState on the same associated
++  // channel, so browser persistence need not guess the hidden-page timer.
++  FlushStateForNativeNavigation() => (bool captured);
++
+   // Requests a one-time snapshot of the accessibility tree without enabling
+   // accessibility if it wasn't already enabled.
+   SnapshotAccessibilityTree(SnapshotAccessibilityTreeParams params)
+--- a/content/renderer/render_frame_impl.h
++++ b/content/renderer/render_frame_impl.h
+@@ -904,6 +904,8 @@
+   void GetInterfaceProvider(
+       mojo::PendingReceiver<service_manager::mojom::InterfaceProvider> receiver)
+       override;
++  void FlushStateForNativeNavigation(
++      FlushStateForNativeNavigationCallback callback) override;
+   void SnapshotAccessibilityTree(
+       mojom::SnapshotAccessibilityTreeParamsPtr params,
+       SnapshotAccessibilityTreeCallback callback) override;
+--- a/content/renderer/render_frame_impl.cc
++++ b/content/renderer/render_frame_impl.cc
+@@ -6712,6 +6712,20 @@
+   }
+ }
+ 
++void RenderFrameImpl::FlushStateForNativeNavigation(
++    FlushStateForNativeNavigationCallback callback) {
++  if (!GetWebFrame() || GetWebFrame()->GetCurrentHistoryItem().IsNull()) {
++    std::move(callback).Run(false);
++    return;
++  }
++  // This cancels the timer and uses Chromium's existing PageState generation
++  // and browser-side file-access/document-sequence validation. Both messages
++  // are associated with the same frame IPC channel: the ACK cannot overtake
++  // the state update. Frozen documents use the existing lifecycle ACK instead.
++  SendUpdateState();
++  std::move(callback).Run(true);
++}
++
+ void RenderFrameImpl::SendUpdateState() {
+   // Since we are sending immediately we can cancel any pending delayed sync
+   // timer.
+--- a/content/browser/renderer_host/render_frame_host_impl.h
++++ b/content/browser/renderer_host/render_frame_host_impl.h
+@@ -1073,6 +1073,10 @@
+   // Allows overriding the last committed origin in tests.
+   void SetLastCommittedOriginForTesting(const url::Origin& origin);
+ 
++  // Browser-owned session persistence barrier. False means the renderer or
++  // document changed; callers must not persist an assumed current snapshot.
++  void FlushStateForNativeNavigation(base::OnceCallback<void(bool)> callback);
++
+   // Get HTML data for this RenderFrame by serializing contents on the renderer
+   // side and replacing all links to both same-site and cross-site resources
+   // with paths to local copies as specified by |url_map| and |frame_token_map|.
+--- a/content/browser/renderer_host/render_frame_host_impl.cc
++++ b/content/browser/renderer_host/render_frame_host_impl.cc
+@@ -13729,6 +13729,28 @@
+   }
+ }
+ 
++void RenderFrameHostImpl::FlushStateForNativeNavigation(
++    base::OnceCallback<void(bool)> callback) {
++  if (!IsRenderFrameLive()) {
++    std::move(callback).Run(false);
++    return;
++  }
++  auto validated = base::BindOnce(
++      [](WeakDocumentPtr document, base::OnceCallback<void(bool)> callback,
++         bool captured) {
++        auto* frame = document.AsRenderFrameHostIfValid();
++        std::move(callback).Run(captured && frame && frame->IsRenderFrameLive());
++      }, GetWeakDocumentPtr(), std::move(callback));
++  auto* lifecycle = render_view_host()->GetPageLifecycleStateManager();
++  if (lifecycle->CalculatePageLifecycleState()->is_frozen) {
++    // Frame's queue is frozen too. WillFreezePage sent UpdateState before the
++    // lifecycle ACK; await that existing ordered path without thawing the page.
++    lifecycle->ConfirmFrozenStateForNativeHistory(std::move(validated));
++    return;
++  }
++  GetMojomFrameInRenderer()->FlushStateForNativeNavigation(std::move(validated));
++}
++
+ void RenderFrameHostImpl::RequestAXTreeSnapshot(
+     AXTreeSnapshotCallback callback,
+     mojom::SnapshotAccessibilityTreeParamsPtr params) {
+--- a/content/browser/renderer_host/page_lifecycle_state_manager.h
++++ b/content/browser/renderer_host/page_lifecycle_state_manager.h
+@@ -39,6 +39,10 @@
+       RenderViewHostImpl* render_view_host_impl,
+       blink::mojom::PageVisibilityState frame_tree_visibility);
+   ~PageLifecycleStateManager();
++
++  // Native persistence uses the existing freeze ACK because Frame IPCs cannot
++  // run on a frozen document. Never changes the page's desired frozen state.
++  void ConfirmFrozenStateForNativeHistory(base::OnceCallback<void(bool)> callback);
+ 
+   void SetIsFrozen(bool frozen);
+   void SetFrameTreeVisibility(
+--- a/content/browser/renderer_host/page_lifecycle_state_manager.cc
++++ b/content/browser/renderer_host/page_lifecycle_state_manager.cc
+@@ -62,6 +62,28 @@
+ PageLifecycleStateManager::~PageLifecycleStateManager() {
+   if (test_delegate_)
+     test_delegate_->OnDeleted();
++}
++
++void PageLifecycleStateManager::ConfirmFrozenStateForNativeHistory(
++    base::OnceCallback<void(bool)> callback) {
++  if (!CalculatePageLifecycleState()->is_frozen ||
++      !render_view_host_impl_->GetAssociatedPageBroadcast()) {
++    std::move(callback).Run(false);
++    return;
++  }
++  if (last_acknowledged_state_->is_frozen) {
++    std::move(callback).Run(true);
++    return;
++  }
++  // This is the same associated PageBroadcast lifecycle message Chromium uses
++  // to enter BFCache. Its response is ordered after WillFreezePage/UpdateState.
++  SendUpdatesToRendererIfNeeded(nullptr, base::BindOnce(
++      [](base::WeakPtr<PageLifecycleStateManager> manager,
++         base::OnceCallback<void(bool)> callback) {
++        std::move(callback).Run(manager &&
++            manager->CalculatePageLifecycleState()->is_frozen &&
++            manager->last_acknowledged_state_->is_frozen);
++      }, weak_ptr_factory_.GetWeakPtr(), std::move(callback)));
+ }
+ 
+ void PageLifecycleStateManager::SetIsFrozen(bool frozen) {

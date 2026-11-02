@@ -9,10 +9,10 @@ Requires Xcode, Swift 6, and macOS 14 or later. The current tested target is App
 ```sh
 swift build --package-path macos
 swift test --package-path macos
-bash macos/scripts/build-app.sh
+bash macos/scripts/build-app.sh --runtime-build /path/to/Release_GN_arm64/zacro-runtime-build.json
 ```
 
-The bundle is `macos/dist/Zacro Native.app`. The build plugin downloads the pinned CEF archive and verifies its digest. Binaries/build products are ignored by Git. Development bundles are ad hoc signed, not notarized. Normal browsing uses the Chromium sandbox and macOS Keychain; no mock-keychain fallback is permitted for real profiles.
+The bundle is `macos/dist/Zacro Native.app`. Packaging requires a completed custom Chromium framework and its matching build receipt; it verifies the pinned revisions, native adapters, framework and resources. See the [engine build instructions](Engine/README.md). `--stock-runtime` creates a diagnostic app without the native extension integration. Binaries/build products are ignored by Git. Development bundles are ad hoc signed, not notarized. Normal browsing uses the Chromium sandbox and macOS Keychain; no mock-keychain fallback is permitted for real profiles.
 
 Native state is stored separately in `~/Library/Application Support/Zacro Native`. Import Electron collection JSON explicitly through Library → Settings. The importer does not modify the original profile or copy cookies, passwords, extension storage, or authentication tokens.
 
@@ -21,15 +21,16 @@ Native state is stored separately in `~/Library/Application Support/Zacro Native
 - `ZacroCore`: validated state, atomic persistence, profile privacy boundaries, saved tabs, Spaces, folders, splits, Peek, navigation stacks, Library records, settings, and explicit legacy import.
 - `ZacroApp`: SwiftUI/AppKit interface, native palette and Peek overlay panels, gestures, theme controls, haptics, site controls, menu/shortcut handling, and browser lifecycle coordination.
 - `ZacroChromium`: Chrome-runtime-only CEF integration. Each page retains an independent native Chromium child window because CEF permits only one Chrome-style browser view per window. No Alloy or WebKit fallback.
+- `ZacroServices`: AI connections, selected page/PDF context, account sync, durable extension-sync review and navigation-history storage. The app coordinates native downloads, permissions and extension management with the engine.
 - `Engine/CefSwift`: pinned third-party source with documented Zacro patches and original licenses. Website content has no privileged application bridge.
 
 ## Validation and remaining work
 
-Core persistence tests and upstream profile/handler tests pass. Native source builds and the ad hoc app signature verify. The disposable packaged engine test passes four independent Chrome documents, shared same-profile storage, separate/private profile isolation, and retained hidden-page state. Broader packaged runtime acceptance is still incomplete: ordinary persistent profiles encounter a macOS Keychain authorization prompt. UI lifecycle, fullscreen, physical trackpad behavior, extension installation/actions/service workers, and retained page state require packaged acceptance.
+Completed suites include 263 Core/Services tests, 51 custom-engine checks, 28 Peek checks, 33 navigation checks, 11 real tab-capture checks, 11 scoped renderer accessibility checks, seven sidebar accessibility checks, nine window-transfer checks, and sixteen download-retirement checks. The latest packaged popup ownership checks pass, but an open popup exposed a shutdown lifetime defect. Side panels now open in the correct logical window; retention when the page fails still needs correction. Full custom application/extension acceptance and new live tab-recovery cases remain incomplete. The earlier stock-engine checkpoint passed all 243 application checks, but does not validate native extension support. See the verification record for exact builds, partial runs and failures.
 
-The custom installed/pinned extension interface is not implemented: the current CEF API does not expose the needed extension enumeration to this host. The current native controls open Chromium's real extension manager, store, and native extension menu. This is not evidence that every Chrome extension works.
+The native Extensions Library, pinned actions, settings synchronization, browser API adapters and Chromium consent integration are implemented in source. The complete custom framework has built and passed receipt validation; its packaged real-extension fixtures must still pass before the integration can be accepted. Google token APIs and third-party native hosts also have [external compatibility requirements](../docs/native-parity/compatibility-boundaries.md); universal extension compatibility is not established.
 
-The native AI providers, account sync, full download controls, sleep policy, advanced permissions persistence, and complete extension lifecycle/settings migration have not yet been ported. The existing Electron implementation remains the feature reference. Do not remove it or mark the rewrite complete while these requirements remain open.
+Desktop pointer/trackpad, VoiceOver, visual animation and performance review, production Keychain behavior, signed distribution and notarization remain required. The Electron implementation remains the feature reference. See the [current verification record](../docs/native-parity/verification.md) and [parity contract](../docs/SWIFT-REWRITE.md).
 
 ## Disposable engine acceptance
 
@@ -41,4 +42,11 @@ Set `ZACRO_NATIVE_DATA`, `ZACRO_NATIVE_SMOKE_URL`, and `ZACRO_ACCEPTANCE_OUTPUT`
 
 The same isolated mode accepts `--native-ui-review` to exercise the full Swift interface against the local fixture. Native input review confirmed command-palette opening, new-tab submission, retained tab results, and theme editor presentation/dismissal. It does not waive the remaining parity or production Keychain requirements.
 
-Run `python3 macos/scripts/check-app.py` after bundling to exercise the packaged engine with a disposable profile and local fixture. This check requires both a successful native report and a clean process exit, so a shutdown crash fails validation. Reports are saved under `macos/dist/acceptance`.
+After bundling, run the engine check and full custom-runtime application check:
+
+```sh
+python3 -B macos/scripts/check-app.py
+python3 -B macos/scripts/check-app.py --integration --require-extensions
+```
+
+Both require a successful native report and a clean process exit, so a shutdown crash fails validation. Reports are saved under `macos/dist/acceptance`. AppKit view renders verify their captured native views only; they do not capture composed Chromium windows or establish physical-input acceptance.

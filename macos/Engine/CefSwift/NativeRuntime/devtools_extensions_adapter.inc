@@ -10,12 +10,22 @@
 #include "extensions/browser/extension_prefs.h"
 #include "extensions/browser/install_prefs_helper.h"
 #include "extensions/common/permissions/permissions_data.h"
+#include "extensions/common/constants.h"
 
 void ZacroObserveProfileDownloads(content::BrowserContext* context);
 
 void ZacroSetTopologyObserved(content::BrowserContext* context, bool observed);
 void ZacroPanelPresentationChanged(content::BrowserContext* context, const std::string& extension,
     int window_id, std::optional<int> tab_id, bool visible);
+
+bool ZacroIsPrivatePDFComponent(content::BrowserContext* context,
+                                const std::string& extension_id) {
+  if (!context || !context->IsOffTheRecord() ||
+      extension_id != extension_misc::kPdfExtensionId) return false;
+  auto* registry = extensions::ExtensionRegistry::Get(context);
+  const auto* extension = registry ? registry->enabled_extensions().GetByID(extension_id) : nullptr;
+  return extension && extension->location() == extensions::mojom::ManifestLocation::kComponent;
+}
 
 class ZacroExtensionContext : public base::SupportsUserData::Data,
                               public extensions::ExtensionRegistryObserver,
@@ -53,6 +63,7 @@ class ZacroExtensionContext : public base::SupportsUserData::Data,
     }
   }
   ~ZacroExtensionContext() override {
+    weak_.InvalidateWeakPtrs();
     if (registry_) registry_->RemoveObserver(this);
     if (dispatcher_) dispatcher_->RemoveObserver(this);
     if (commands_) commands_->RemoveObserver(this);
@@ -80,6 +91,13 @@ class ZacroExtensionContext : public base::SupportsUserData::Data,
     return extension.id() + ":" + base::NumberToString(first.ToDeltaSinceWindowsEpoch().InMicroseconds());
   }
   base::CallbackListSubscription Observe(Events::CallbackType callback) { return events_.Add(std::move(callback)); }
+  base::ScopedClosureRunner ObserveHost() {
+    if (++host_observers_ == 1) ZacroSetTopologyObserved(context_, true);
+    return base::ScopedClosureRunner(base::BindOnce(
+        [](base::WeakPtr<ZacroExtensionContext> state) {
+          if (state && --state->host_observers_ == 0) ZacroSetTopologyObserved(state->context_, false);
+        }, weak_.GetWeakPtr()));
+  }
   void NotifyNative(const std::string& method, const base::DictValue& params) { events_.Notify(method, params); }
   void NotifyHost(const base::DictValue& request) { events_.Notify("Zacro.extensionHostRequest", request); }
   void OnExtensionLoaded(content::BrowserContext*, const extensions::Extension* extension) override {
@@ -146,6 +164,8 @@ class ZacroExtensionContext : public base::SupportsUserData::Data,
   Events events_;
   base::CallbackListSubscription storage_observer_;
   base::CallbackListSubscription command_listener_observer_;
+  size_t host_observers_ = 0;
+  base::WeakPtrFactory<ZacroExtensionContext> weak_{this};
 };
 
 void CefDevToolsController::EmitZacro(const std::string& method, const base::DictValue& params) {
@@ -162,14 +182,28 @@ bool CefDevToolsController::DispatchZacroExtensions(int id, const std::string& m
   auto* context = inspected_contents_->GetBrowserContext();
   auto* state = ZacroExtensionContext::Get(context);
   if (method == "Zacro.observeExtensions") {
+    const bool components_only = params && params->FindBool("componentsOnly").value_or(false);
+    if (context->IsOffTheRecord() != components_only) {
+      ReplyZacro(id, {}, "Private profiles require the bundled-component-only transport."); return true;
+    }
     zacro_extension_subscription_ = {};
+    zacro_topology_observation_.RunAndReset();
     bool enabled = params && params->FindBool("enabled").value_or(false);
     if (enabled) {
       zacro_extension_subscription_ = state->Observe(base::BindRepeating(
-          &CefDevToolsController::EmitZacro, weak_ptr_factory_.GetWeakPtr()));
+          [](base::WeakPtr<CefDevToolsController> self, content::BrowserContext* context,
+             bool components_only, const std::string& method, const base::DictValue& params) {
+            if (!self) return;
+            if (components_only) {
+              const auto* extension = params.FindString("extensionID");
+              if (method != "Zacro.extensionHostRequest" || !extension ||
+                  !ZacroIsPrivatePDFComponent(context, *extension)) return;
+            }
+            self->EmitZacro(method, params);
+          }, weak_ptr_factory_.GetWeakPtr(), context, components_only));
     }
-    if (enabled) ZacroObserveProfileDownloads(context);
-    ZacroSetTopologyObserved(context, enabled);
+    if (enabled && !components_only) ZacroObserveProfileDownloads(context);
+    if (enabled) zacro_topology_observation_ = state->ObserveHost();
     ReplyZacro(id, {}); return true;
   }
   if (context->IsOffTheRecord()) { ReplyZacro(id, {}, "Private extension storage cannot be synchronized."); return true; }

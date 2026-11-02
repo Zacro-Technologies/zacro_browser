@@ -23,6 +23,19 @@ struct NativeExtensionWindowRequest {
   let authorize: @MainActor () async throws -> Void
 }
 
+/// Defense in depth around the native installed-component gate. This policy is
+/// not an extension permission grant; Chromium still validates every request.
+enum NativePrivateComponentPolicy {
+  private static let methods: Set<String> = [
+    "native.prepareDocument", "tabs.get", "tabs.getCurrent", "tabs.create", "tabs.update", "tabs.reload",
+    "tabs.getZoom", "tabs.setZoom", "tabs.getZoomSettings", "tabs.setZoomSettings", "windows.create"
+  ]
+  static func permits(isPrivate: Bool, request: ChromeExtensionHostRequest) -> Bool {
+    guard request.incognito == isPrivate else { return false }
+    return !isPrivate || (request.extensionID == ChromeExtensionManager.bundledPDFExtensionID && methods.contains(request.method))
+  }
+}
+
 /// The authoritative Zacro tab/window model behind Chromium's native extension
 /// dispatcher. Chromium owns API schemas, permission checks, URL preparation,
 /// response redaction and query filtering. This object never injects an API shim.
@@ -80,13 +93,22 @@ final class NativeExtensionBrowser {
   private var publishedWindows = Set<String>()
   private var reconcileAgain = false
   private var stopped = false
+  private var privateComponents: [String: PrivateComponentProfile] = [:]
+  private var retiringPrivateProfiles = Set<String>()
+
+  private final class PrivateComponentProfile {
+    let manager: ChromeExtensionManager
+    var observation: (id: UUID, task: Task<Void, Error>)?
+    init(manager: ChromeExtensionManager) { self.manager = manager }
+  }
 
   private final class Identity {
     weak var page: ChromiumPage?
     let id: Int
+    let profile: String
     var signature: String
-    init(_ page: ChromiumPage?, id: Int, signature: String) {
-      self.page = page; self.id = id; self.signature = signature
+    init(_ page: ChromiumPage?, id: Int, profile: String, signature: String) {
+      self.page = page; self.id = id; self.profile = profile; self.signature = signature
     }
   }
   private struct Snapshot { let profile: String; let value: [String: Any] }
@@ -105,6 +127,98 @@ final class NativeExtensionBrowser {
 
   init(repository: BrowserRepository, engine: ChromiumEngine) {
     self.repository = repository; self.engine = engine
+  }
+
+  private func isPrivateProfile(_ id: String) -> Bool {
+    store.state.profiles.first(where: { $0.id == id })?.isPrivate == true
+  }
+
+  private func manager(for profile: String) -> ChromeExtensionManager {
+    if retiringPrivateProfiles.contains(profile) {
+      // A previously captured publication may resume after retirement. It is
+      // rejected by checkProfile before any transport call and must not cache
+      // a replacement manager or reinterpret the removed private ID as public.
+      return ChromeExtensionManager(engine: engine, profileID: profile, isPrivate: true)
+    }
+    guard isPrivateProfile(profile) else { return ChromeExtensionManager(engine: engine, profileID: profile) }
+    if let existing = privateComponents[profile] { return existing.manager }
+    let value = PrivateComponentProfile(manager: ChromeExtensionManager(engine: engine, profileID: profile, isPrivate: true))
+    privateComponents[profile] = value
+    return value.manager
+  }
+
+  /// Chromium's bundled PDF viewer is a browser component, not an installed
+  /// private extension. Its observer carries host requests only; it never joins
+  /// the public registry, storage, installation or cloud synchronization paths.
+  private func observePrivateComponent(_ profile: String) async throws {
+    guard isPrivateProfile(profile) else { return }
+    try checkProfile(profile)
+    let manager = manager(for: profile)
+    guard let component = privateComponents[profile] else { throw CancellationError() }
+    if manager.isPrivateComponentObserverActive { return }
+    if component.observation == nil {
+      let token = UUID()
+      let task = Task { @MainActor [weak self, weak component] in
+        guard let self, let component else { throw CancellationError() }
+        try await manager.observePrivateComponentRequests { [weak self, weak component] request in
+          guard let self, let component, self.privateComponents[profile] === component,
+            !self.stopped, !self.retiringPrivateProfiles.contains(profile) else { return }
+          Task { [weak self] in await self?.handle(profileID: profile, request: request) }
+        }
+        try self.checkProfile(profile)
+        guard self.privateComponents[profile] === component else { throw CancellationError() }
+        // Data clearing can destroy only the broker while leaving the private
+        // profile alive. Reconnect its observer and republish native topology.
+        self.catalogKeys.removeValue(forKey: profile); self.groupKeys.removeValue(forKey: profile)
+        self.focusSnapshots.removeValue(forKey: profile); self.lastFocusSnapshots.removeValue(forKey: profile)
+      }
+      component.observation = (token, task)
+    }
+    guard let operation = component.observation else { throw CancellationError() }
+    defer { if component.observation?.id == operation.id { component.observation = nil } }
+    try await operation.task.value
+    try checkProfile(profile)
+  }
+
+  func hasPrivateComponentObserver(profileID: String) -> Bool {
+    privateComponents[profileID]?.manager.isPrivateComponentObserverActive == true
+  }
+
+  /// Called before the engine releases its OTR context. Private catalog state
+  /// lives only in memory and cannot survive the last owning window's closure.
+  func retirePrivateProfile(_ profile: String) async throws {
+    retiringPrivateProfiles.insert(profile)
+    // The model has removed the final owner. Keep the private observer and
+    // native context retained on failure, so cleanup can retry safely.
+    try await engine.retireProfileDownloads(profileID: profile, isPrivate: true)
+    await disposePrivateProfileMetadata(profile)
+  }
+
+  /// At global shutdown every native browser is already closed. Dispose only
+  /// the retained observers/catalog; never recreate a transport from that host.
+  private func disposePrivateProfileMetadata(_ profile: String) async {
+    let component = privateComponents.removeValue(forKey: profile)
+    component?.observation?.task.cancel()
+    tails.removeValue(forKey: profile)?.cancel()
+    catalogTasks.removeValue(forKey: profile)?.task.cancel()
+    let documents = (catalogMembers.removeValue(forKey: profile) ?? [])
+      .union(snapshots.filter { $0.value.profile == profile }.map(\.key))
+      .union(identities.filter { $0.value.profile == profile }.map(\.key))
+    for id in documents { identities.removeValue(forKey: id); creationOpeners.removeValue(forKey: id) }
+    snapshots = snapshots.filter { $0.value.profile != profile }
+    catalogKeys.removeValue(forKey: profile); catalogRevisions.removeValue(forKey: profile)
+    for id in groupMembers.removeValue(forKey: profile) ?? [] { groupIdentities.removeValue(forKey: id) }
+    groupKeys.removeValue(forKey: profile); groupRevisions.removeValue(forKey: profile)
+    groupSnapshots = groupSnapshots.filter { $0.value.profile != profile }
+    splitIdentities = splitIdentities.filter { !$0.key.hasPrefix(profile + ":") }
+    sessionSnapshots.removeValue(forKey: profile); focusSnapshots.removeValue(forKey: profile)
+    lastFocusSnapshots.removeValue(forKey: profile); lastFocusedWindows.removeValue(forKey: profile)
+    publishedWindows = publishedWindows.filter { !$0.hasPrefix(profile + ":") }
+    windowSnapshots = windowSnapshots.filter { !$0.key.hasPrefix(profile + ":") }
+    highlightSnapshots = highlightSnapshots.filter { !$0.key.hasPrefix(profile + ":") }
+    pending = pending.filter { !$0.hasPrefix(profile + ":") }
+    _ = await component?.observation?.task.result
+    await component?.manager.closePrivateComponentTransport()
   }
 
   /// Peek has its own real WebContents identity, projected from the source's
@@ -181,6 +295,7 @@ final class NativeExtensionBrowser {
   /// Both the Library and runtime.openOptionsPage use a registered, profile-owned
   /// browser window. The hidden management document never opens visible pages.
   func openOptions(profileID: String, extensionID: String, sourceWindowID: Int? = nil) async throws {
+    guard !isPrivateProfile(profileID) else { throw Failure("Extension options are unavailable in private browsing.") }
     try await openOptions(profileID: profileID, extensionID: extensionID,
       sourceWindowID: sourceWindowID, request: nil)
   }
@@ -272,9 +387,10 @@ final class NativeExtensionBrowser {
   func preparePageCreation(tabID: String) async throws -> ChromeTabMaterialization? {
     guard enabled, let tab = documentTab(tabID), !tab.isClosed,
       let profile = store.profileID(for: tab),
-      store.state.profiles.contains(where: { $0.id == profile && !$0.isPrivate }) else { return nil }
+      store.state.profiles.contains(where: { $0.id == profile }) else { return nil }
     try await synchronizeCatalog(profile)
-    let ticket = try await ChromeExtensionManager(engine: engine, profileID: profile).prepareTabMaterialization(tabID, openerRequestID: creationOpeners[tabID])
+    try checkProfile(profile)
+    let ticket = try await manager(for: profile).prepareTabMaterialization(tabID, openerRequestID: creationOpeners[tabID])
     try checkProfile(profile)
     guard documentTab(tabID)?.isClosed == false, identities[tabID]?.id == ticket.nativeID,
       ticket.logicalID == tabID, ticket.profileID == profile else { throw Failure("The tab changed before its document could load.") }
@@ -285,8 +401,9 @@ final class NativeExtensionBrowser {
   /// Adopts an existing real popup/startup page, or verifies that a newly
   /// materialized page received its reserved ID before any document script runs.
   func prepareInitialNavigation(_ page: ChromiumPage) async throws {
-    guard enabled, !page.isPrivate, let tab = documentTab(page.id), !tab.isClosed,
+    guard enabled, let tab = documentTab(page.id), !tab.isClosed,
       store.profileID(for: tab) == page.profileID else { return }
+    try await observePrivateComponent(page.profileID)
     try await registerMaterialized(page, profile: page.profileID)
     catalogKeys.removeValue(forKey: page.profileID)
   }
@@ -294,6 +411,9 @@ final class NativeExtensionBrowser {
   /// Requests remain ordered within their originating profile. A later request
   /// cannot overtake an earlier beforeunload decision or native-ID reservation.
   func handle(profileID: String, request: ChromeExtensionHostRequest) async {
+    guard !stopped, !retiringPrivateProfiles.contains(profileID),
+      let profile = store.state.profiles.first(where: { $0.id == profileID }) else { return }
+    let manager = manager(for: profileID), isPrivate = profile.isPrivate
     let key = profileID + ":" + request.requestID
     guard pending.insert(key).inserted else { return }
     let previous = tails[profileID]
@@ -304,7 +424,6 @@ final class NativeExtensionBrowser {
         self.pending.remove(key)
         self.creationOpeners = self.creationOpeners.filter { $0.value != request.requestID }
       }
-      let manager = ChromeExtensionManager(engine: self.engine, profileID: profileID)
       do {
         try self.checkProfile(profileID, request: request)
         guard request.argumentsJSON.count <= 1_048_576,
@@ -313,7 +432,12 @@ final class NativeExtensionBrowser {
         let result = try await self.perform(request, profile: profileID, arguments: arguments, manager: manager)
         try await manager.completeHostRequest(request.requestID, results: result)
       } catch {
-        try? await manager.completeHostRequest(request.requestID, error: error.localizedDescription)
+        // Do not recreate an OTR transport merely to reply to a request whose
+        // owning profile/context was already retired. Native teardown cancels it.
+        if !isPrivate || (!self.retiringPrivateProfiles.contains(profileID)
+          && self.privateComponents[profileID]?.manager === manager) {
+          try? await manager.completeHostRequest(request.requestID, error: error.localizedDescription)
+        }
       }
       self.reconcile()
     }
@@ -346,7 +470,7 @@ final class NativeExtensionBrowser {
   }
 
   func windowFocusChanged() {
-    for profile in store.state.profiles where !profile.isPrivate {
+    for profile in store.state.profiles {
       if let window = windows(profile.id).first(where: { isWindowFocused($0.id, profile: profile.id) }) {
         lastFocusedWindows[profile.id] = window.id
       }
@@ -376,13 +500,22 @@ final class NativeExtensionBrowser {
     // A pending windows.remove can itself be awaiting this shutdown. Chromium
     // owns revocation of its request; do not deadlock termination on that wait.
     tails.removeAll(); identities.removeAll(); snapshots.removeAll(); pending.removeAll(); creationOpeners.removeAll()
+    for profile in Set(privateComponents.keys).union(retiringPrivateProfiles) {
+      await disposePrivateProfileMetadata(profile)
+    }
   }
 
   private func checkProfile(_ profile: String, request: ChromeExtensionHostRequest? = nil) throws {
     guard enabled, !stopped, !Task.isCancelled else { throw Failure("The native browser extension bridge is unavailable.") }
     guard !engine.isTerminating else { throw Failure("The browser is closing.") }
-    guard store.state.profiles.contains(where: { $0.id == profile && !$0.isPrivate }), request?.incognito != true else {
+    guard let record = store.state.profiles.first(where: { $0.id == profile }),
+      !retiringPrivateProfiles.contains(profile) else {
       throw Failure("This extension cannot access this browsing profile.")
+    }
+    if let request {
+      guard NativePrivateComponentPolicy.permits(isPrivate: record.isPrivate, request: request) else {
+        throw Failure("This extension cannot access this browsing profile.")
+      }
     }
     guard profileAvailable(profile) else { throw Failure("This browsing profile is being updated.") }
   }
@@ -474,6 +607,7 @@ final class NativeExtensionBrowser {
   /// One atomic catalog synchronization per changed profile snapshot; no page
   /// factory is called here. Concurrent callers share the same in-flight work.
   private func synchronizeCatalog(_ profile: String) async throws {
+    try await observePrivateComponent(profile)
     while true {
       try checkProfile(profile)
       if let pending = catalogTasks[profile] {
@@ -498,7 +632,7 @@ final class NativeExtensionBrowser {
         let entries = try self.registrations(profile), key = try self.catalogKey(entries)
         let revision = (self.catalogRevisions[profile] ?? 0) + 1
         self.catalogRevisions[profile] = revision
-        let values = try await ChromeExtensionManager(engine: self.engine, profileID: profile)
+        let values = try await self.manager(for: profile)
           .synchronizeTabs(entries, revision: revision)
         try self.checkProfile(profile)
         guard generation == self.epoch else { throw CancellationError() }
@@ -514,7 +648,7 @@ final class NativeExtensionBrowser {
         for value in values {
           let old = self.identities[value.logicalID]
           if let old, old.id == value.nativeID { continue }
-          self.identities[value.logicalID] = Identity(nil, id: value.nativeID, signature: "")
+          self.identities[value.logicalID] = Identity(nil, id: value.nativeID, profile: profile, signature: "")
         }
         for removed in (self.catalogMembers[profile] ?? []).subtracting(expected) { self.identities.removeValue(forKey: removed) }
         self.catalogMembers[profile] = expected; self.catalogKeys[profile] = key
@@ -529,7 +663,7 @@ final class NativeExtensionBrowser {
   private func registerMaterialized(_ page: ChromiumPage, profile: String) async throws {
     try checkProfile(profile)
     let logicalID = page.id
-    guard page.profileID == profile, !page.isPrivate, engine.pages[logicalID] === page else {
+    guard page.profileID == profile, page.isPrivate == isPrivateProfile(profile), engine.pages[logicalID] === page else {
       throw Failure("The tab closed before its document could load.")
     }
     let browser = try await page.ready()
@@ -551,7 +685,7 @@ final class NativeExtensionBrowser {
     guard page.id == logicalID else { return }
     guard engine.pages[logicalID] === page, documentTab(logicalID)?.isClosed == false,
       page.reservedNativeTabID.map({ $0 == nativeID }) ?? true else { throw Failure("The native tab identity changed.") }
-    identities[logicalID] = Identity(page, id: nativeID, signature: signature)
+    identities[logicalID] = Identity(page, id: nativeID, profile: profile, signature: signature)
   }
 
   private func tabData(_ logicalID: String, profile: String, synchronize: Bool = true) async throws -> [String: Any] {
@@ -572,7 +706,7 @@ final class NativeExtensionBrowser {
     let muted = page?.browser?.isAudioMuted ?? tab.isMuted
     var value: [String: Any] = [
       "id": identity.id, "windowId": context.nativeID, "index": index,
-      "active": active, "highlighted": highlighted, "pinned": tab.isPinned, "incognito": false,
+      "active": active, "highlighted": highlighted, "pinned": tab.isPinned, "incognito": isPrivateProfile(profile),
       "selected": active, "groupId": nativeGroupID(tab), "splitViewId": try splitIdentity(tab.id, profile: profile), "frozen": false,
       "lastAccessed": tab.lastAccessedAt.timeIntervalSince1970 * 1_000,
       "url": tab.url, "title": tab.title, "status": page?.isLoading == true ? "loading" : "complete",
@@ -621,11 +755,12 @@ final class NativeExtensionBrowser {
     }, options: [.sortedKeys])
   }
   private func synchronizeGroups(_ profile: String) async throws {
+    try checkProfile(profile)
     let key = try groupCatalogKey(profile)
     if groupKeys[profile] == key { return }
     let entries = groupRegistrations(profile), revision = (groupRevisions[profile] ?? 0) + 1
     groupRevisions[profile] = revision
-    let identities = try await ChromeExtensionManager(engine: engine, profileID: profile).synchronizeGroups(entries, revision: revision)
+    let identities = try await manager(for: profile).synchronizeGroups(entries, revision: revision)
     try checkProfile(profile)
     let expected = Set(entries.map(\.logicalID))
     guard identities.count == expected.count, Set(identities.map(\.logicalID)) == expected,
@@ -1129,11 +1264,11 @@ final class NativeExtensionBrowser {
       let target = try targetWindow(arg(0), profile: profile, request: request)
       let props = try properties(arg(1), allowed: ["focused", "state", "left", "top", "width", "height", "drawAttention"])
       try validateWindow(props)
-      if props["focused"] as? Bool == true { try canActivate(profile, in: target.id) }
+      try canActivate(profile, in: target.id)
       try await authorize(request, profile: profile, manager: manager)
       guard let context = engine.context(id: target.id), context.isOpen, !context.isClosing else { throw Failure("Browser window is closed.") }
       let window = context.window
-      if props["focused"] as? Bool == true { try canActivate(profile, in: target.id) }
+      try canActivate(profile, in: target.id)
       if let state = props["state"] as? String {
         if state == "normal" {
           if window.styleMask.contains(.fullScreen) { window.toggleFullScreen(nil) }
@@ -1170,7 +1305,9 @@ final class NativeExtensionBrowser {
     case "windows.create":
       let props = try properties(arg(0), allowed: ["url", "tabId", "left", "top", "width", "height", "focused", "incognito", "type", "state", "setSelfAsOpener"])
       try validateWindow(props)
-      guard props["incognito"] as? Bool != true else { throw Failure("This extension cannot access private browsing.") }
+      if let incognito = props["incognito"] as? Bool, incognito != isPrivateProfile(profile) {
+        throw Failure("A component cannot change this browsing profile's privacy mode.")
+      }
       let kind = NativeExtensionWindowRequest.Kind(rawValue: props["type"] as? String ?? "normal")
       guard let kind else { throw Failure("Unsupported browser window type.") }
       var urls: [String] = []
@@ -1269,6 +1406,7 @@ final class NativeExtensionBrowser {
     "zacro:" + kind + ":" + id + ":" + String(date.timeIntervalSince1970.bitPattern)
   }
   private func closedSessions(_ profile: String) -> [ClosedSession] {
+    guard !isPrivateProfile(profile) else { return [] }
     var entries = store.state.archive.filter { store.profileID(for: $0.tab) == profile }.map { item in
       ClosedSession(kind: .tab, id: item.id, token: sessionToken("tab", id: item.id, date: item.archivedAt),
         date: item.archivedAt, tabs: [item.tab], window: nil)
@@ -1364,8 +1502,11 @@ final class NativeExtensionBrowser {
       return [["lastModified": now, "window": try await windowData(id, profile: profile, info: ["populate": true])]]
     }
     let target: BrowserWindowSession
-    if let retained = documentTab(entry.id), retained.isClosed,
-      let existing = windows(profile).first(where: { $0.id == retained.windowID }) {
+    // Chrome restores an individual closed tab into its original browser when
+    // that browser still exists (TabRestoreServiceHelper::RestoreTab, UNKNOWN).
+    // Archived tabs retain this ownership even though no live tab record remains.
+    let originalOwnerID = entry.tabs.first?.windowID
+    if let existing = windows(profile).first(where: { $0.id == originalOwnerID }) {
       target = existing
     } else { target = try currentWindow(profile, request: request) }
     try canActivate(profile, in: target.id)
@@ -1395,7 +1536,7 @@ final class NativeExtensionBrowser {
     let window = context.window
     let bounds = window.frame, top = (NSScreen.screens.first?.frame.maxY ?? 0) - bounds.maxY
     var data: [String: Any] = ["id": context.nativeID, "type": session.kind.rawValue,
-      "focused": isWindowFocused(id, profile: profile), "incognito": false,
+      "focused": isWindowFocused(id, profile: profile), "incognito": isPrivateProfile(profile),
       "alwaysOnTop": window.level.rawValue > NSWindow.Level.normal.rawValue,
       "state": window.styleMask.contains(.fullScreen) ? "fullscreen" : window.isMiniaturized ? "minimized" : window.isZoomed ? "maximized" : "normal",
       "left": Int(bounds.minX.rounded()), "top": Int(top.rounded()), "width": Int(bounds.width.rounded()), "height": Int(bounds.height.rounded())]
@@ -1408,18 +1549,26 @@ final class NativeExtensionBrowser {
   private func publishChanges() async {
     let revision = epoch
     var next: [String: Snapshot] = [:]
-    let profiles = store.state.profiles.filter({ !$0.isPrivate }).map(\.id)
+    let profiles = store.state.profiles.filter { !retiringPrivateProfiles.contains($0.id)
+      && (!$0.isPrivate || !windows($0.id).isEmpty) }.map(\.id)
     // A failed topology refresh must not leave another profile's global
     // shortcut registry active. Clear inactive focus before any catalog await.
     for profile in profiles where !windows(profile).contains(where: { isWindowFocused($0.id, profile: profile) }) {
       guard revision == epoch, !Task.isCancelled else { return }
-      await publishFocus(profile, manager: ChromeExtensionManager(engine: engine, profileID: profile))
+      await publishFocus(profile, manager: manager(for: profile))
     }
     for profile in profiles {
-      let manager = ChromeExtensionManager(engine: engine, profileID: profile)
+      let manager = manager(for: profile)
       do { try await synchronizeCatalog(profile) }
       catch {
         for (id, previous) in snapshots where previous.profile == profile { next[id] = previous }
+        continue
+      }
+      guard (try? checkProfile(profile)) != nil else { continue }
+      if isPrivateProfile(profile) {
+        // PDF consumes its own native zoom events. Private topology needs no
+        // public extension registry, session history or browser event mirror.
+        await publishFocus(profile, manager: manager)
         continue
       }
       let closed = closedSessions(profile).map(\.signature)
@@ -1525,15 +1674,18 @@ final class NativeExtensionBrowser {
   }
 
   private func publishFocus(_ profile: String, manager: ChromeExtensionManager) async {
+    guard (try? checkProfile(profile)) != nil else { return }
     let focused = windows(profile).first(where: { isWindowFocused($0.id, profile: profile) })
       .flatMap { engine.context(id: $0.id)?.nativeID }
     let lastFocused = lastFocusedWindow(profile).flatMap { engine.context(id: $0.id)?.nativeID }
     guard focusSnapshots[profile] != (focused ?? -1) || lastFocusSnapshots[profile] != (lastFocused ?? -1) else { return }
     do {
       try await manager.setFocusedWindow(focused, lastFocusedID: lastFocused)
+      try checkProfile(profile)
       if focusSnapshots[profile] != (focused ?? -1) {
         try await manager.publishBrowserEvent("windows.onFocusChanged", arguments: [focused ?? -1])
       }
+      try checkProfile(profile)
       focusSnapshots[profile] = focused ?? -1; lastFocusSnapshots[profile] = lastFocused ?? -1
     } catch { }
   }

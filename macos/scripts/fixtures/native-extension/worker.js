@@ -3,6 +3,7 @@ importScripts('peek.js');
 importScripts('network.js');
 importScripts('identity.js');
 importScripts('native-messaging.js');
+importScripts('download-retirement.js');
 const events = [];
 const record = (name, ...args) => {
   events.push({ name, args });
@@ -29,13 +30,20 @@ chrome.commands.onCommand.addListener((name, tab) => {
   });
 });
 let nativeActionMode = "record";
+let nativePanelAttempt = null;
 const panelEventObservers = Object.fromEntries(["onOpened", "onClosed"].map(name =>
   [name, info => record(`sidePanel.${name}`, info)]));
 for (const [name, listener] of Object.entries(panelEventObservers)) chrome.sidePanel[name].addListener(listener);
 chrome.action.onClicked.addListener(async tab => {
+  const attempt = { mode: nativeActionMode, tab, receivedAt: Date.now(), open: "not-requested" };
+  nativePanelAttempt = attempt;
   // Invoke in the real action event's user-gesture scope before awaiting work.
   if (nativeActionMode === "panel") {
-    chrome.sidePanel.open({ windowId: tab.windowId }).catch(error => {
+    attempt.open = "pending";
+    chrome.sidePanel.open({ windowId: tab.windowId }).then(() => {
+      attempt.open = "resolved";
+    }).catch(error => {
+      attempt.open = "rejected"; attempt.error = String(error);
       chrome.storage.local.set({ nativePanelError: String(error) });
     });
   }
@@ -87,6 +95,7 @@ globalThis.zacroAcceptance = {
   async configureAction(mode = "record") {
     assert(["record", "popup", "panel"].includes(mode), "Unknown action fixture mode");
     nativeActionMode = mode;
+    nativePanelAttempt = null;
     await chrome.storage.local.remove(["nativePopupResult", "nativePanelError"]);
     await chrome.action.setPopup({ popup: mode === "popup" ? "popup.html" : "" });
     await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: false });
@@ -132,19 +141,33 @@ globalThis.zacroAcceptance = {
   },
   async panelState(draft) {
     const end = Date.now() + 10000;
+    let lastContexts = [], lastMessageError = null, lastResponse = null;
     while (Date.now() < end) {
       const { nativePanelError } = await chrome.storage.local.get("nativePanelError");
       assert(!nativePanelError, nativePanelError);
       const contexts = await chrome.runtime.getContexts({ contextTypes: ["SIDE_PANEL"] });
+      lastContexts = contexts;
       if (contexts.length) {
         assert(contexts.length === 1, "Global panel was recreated in another physical window");
         try {
-          return { ...await chrome.runtime.sendMessage({ type: "zacro-native-panel", draft }), contexts };
-        } catch { /* The first load may not have installed the listener yet. */ }
+          const response = await chrome.runtime.sendMessage({ type: "zacro-native-panel", draft });
+          lastResponse = response ?? null;
+          // The native context exists before its document installs the message
+          // listener. No response can resolve as undefined instead of throwing.
+          if (typeof response?.instance === "string" && typeof response?.draft === "string"
+              && Number.isInteger(response?.windowID)) return { ...response, contexts };
+        } catch (error) {
+          // The first load may not have installed the listener yet. Retain
+          // the real error for a causal failure report if it never does.
+          lastMessageError = String(error);
+        }
       }
       await wait(40);
     }
-    throw new Error("Native side panel did not load");
+    throw new Error("Native side panel did not load: " + JSON.stringify({
+      configuredMode: nativeActionMode, action: nativePanelAttempt, contexts: lastContexts, lastMessageError, lastResponse,
+      events: events.filter(event => event.name.startsWith("sidePanel.")).slice(-8),
+    }));
   },
   async closePanel(windowID) { await chrome.sidePanel.close({ windowId: windowID }); return true; },
   async seedDownload(baseURL) {
@@ -234,16 +257,30 @@ globalThis.zacroAcceptance = {
     });
     if (groups) await check("nativeTabGroups", async () => {
       assert(first && second && other, "Tab prerequisite failed");
-      group = await chrome.tabs.group({ tabIds: [first.id, second.id] });
-      await chrome.tabGroups.update(group, { title: "Zacro α group", color: "purple", collapsed: true });
-      const matching = await chrome.tabGroups.query({ windowId: other.id, title: "Zacro ? group", color: "purple", collapsed: true });
-      assert(matching.length === 1 && matching[0].id === group && matching[0].shared === false, "Group identity/filter mismatch");
-      assert((await chrome.tabs.get(first.id)).groupId === group, "Tab group decoration missing");
-      const moved = await chrome.tabGroups.move(group, { windowId: sourceWindowID, index: -1 });
-      assert(moved.id === group && moved.windowId === sourceWindowID, "Group transfer changed identity");
-      assert((await chrome.tabs.get(second.id)).windowId === sourceWindowID, "Group member did not transfer");
-      await chrome.tabs.ungroup([first.id, second.id]);
-      assert((await chrome.tabs.get(first.id)).groupId === -1, "Ungroup left stale metadata");
+      try {
+        // Without createProperties Chrome moves members into the current window,
+        // which need not be the window that currently owns these two tabs.
+        group = await chrome.tabs.group({ tabIds: [first.id, second.id], createProperties: { windowId: other.id } });
+        await chrome.tabGroups.update(group, { title: "Zacro α group", color: "purple", collapsed: true });
+        const matching = await chrome.tabGroups.query({ windowId: other.id, title: "Zacro ? group", color: "purple", collapsed: true });
+        assert(matching.length === 1 && matching[0].id === group && matching[0].shared === false,
+          `Group identity/filter mismatch: ${JSON.stringify({ group, windowID: other.id, matching })}`);
+        assert((await chrome.tabs.get(first.id)).groupId === group, "Tab group decoration missing");
+        const moved = await chrome.tabGroups.move(group, { windowId: sourceWindowID, index: -1 });
+        assert(moved.id === group && moved.windowId === sourceWindowID, "Group transfer changed identity");
+        assert((await chrome.tabs.get(second.id)).windowId === sourceWindowID, "Group member did not transfer");
+        await chrome.tabs.ungroup([first.id, second.id]);
+        assert((await chrome.tabs.get(first.id)).groupId === -1, "Ungroup left stale metadata");
+        const current = await chrome.windows.getCurrent();
+        const defaultGroup = await chrome.tabs.group({ tabIds: [first.id, second.id] });
+        assert((await chrome.tabGroups.get(defaultGroup)).windowId === current.id,
+          "A new group without a window override ignored the current window");
+      } finally {
+        // A failed group assertion must not leave a collapsed group affecting
+        // later document/discard tests in this aggregate fixture.
+        await chrome.tabs.ungroup([first.id, second.id]);
+        await chrome.tabs.move([first.id, second.id], { windowId: sourceWindowID, index: -1 });
+      }
     });
     await check("nativeZoomController", async () => {
       assert(first, "Tab prerequisite failed");
@@ -253,6 +290,37 @@ globalThis.zacroAcceptance = {
       const settings = await chrome.tabs.getZoomSettings(first.id);
       assert(settings.mode === "automatic", "Missing native zoom settings");
       await chrome.tabs.setZoom(first.id, 0);
+    });
+    await check("siteUnloadHandlersStillProtectDiscard", async () => {
+      assert(first, "Tab prerequisite failed");
+      const tab = await chrome.tabs.create({ windowId: sourceWindowID,
+        url: new URL("native-protected-sleeper", origin).href, active: true });
+      created.push(tab.id); await loaded(tab.id);
+      await chrome.tabs.update(first.id, { active: true });
+      for (const event of ["pagehide", "beforeunload"]) {
+        await chrome.scripting.executeScript({ target: { tabId: tab.id }, args: [event], func: kind => {
+          globalThis.__ownedDiscardHandler = () => {};
+          window.addEventListener(kind, globalThis.__ownedDiscardHandler);
+        }});
+        try {
+          let refused = false;
+          try { await chrome.tabs.discard(tab.id); } catch (_) { refused = true; }
+          assert(refused, `A site's ${event} handler was ignored`);
+          const retained = await chrome.tabs.get(tab.id);
+          assert(retained.id === tab.id && !retained.discarded && retained.url === tab.url,
+            `Rejected ${event} discard changed the retained document`);
+        } finally {
+          await chrome.scripting.executeScript({ target: { tabId: tab.id }, args: [event], func: kind => {
+            window.removeEventListener(kind, globalThis.__ownedDiscardHandler);
+            delete globalThis.__ownedDiscardHandler;
+          }});
+        }
+      }
+      const sleeping = await chrome.tabs.discard(tab.id);
+      assert(sleeping.id === tab.id && sleeping.discarded,
+        "Clean retry remained blocked by the restored browser-owned adapter");
+      const restored = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => location.href });
+      assert(restored[0].result === tab.url, "Protected discard retry did not restore the original document");
     });
     await check("dormantNativeDocumentAPI", async () => {
       assert(first, "Tab prerequisite failed");
@@ -298,16 +366,25 @@ globalThis.zacroAcceptance = {
       assert(events.slice(start).some(event => event.name === "storage.onChanged"), "Storage events did not reach worker");
     });
     await check("logicalClosedSessions", async () => {
+      assert(other, "Window prerequisite failed");
       const url = new URL("native-closed-session", origin).href;
       const tab = await chrome.tabs.create({ windowId: sourceWindowID, url, active: false });
       await chrome.tabs.remove(tab.id);
       const closed = await chrome.sessions.getRecentlyClosed({ maxResults: 25 });
       const session = closed.find(value => value.tab?.url === url);
       assert(session?.tab?.sessionId && session.tab.id === undefined, "Closed session leaked a live/physical tab identity");
+      await chrome.windows.update(other.id, { focused: true });
+      assert((await chrome.windows.getCurrent()).id === other.id, "Session restore requires a different current window");
       const restored = await chrome.sessions.restore(session.tab.sessionId);
+      if (restored.tab?.id !== undefined) created.push(restored.tab.id);
       assert(restored.tab?.id && restored.tab.url === url && restored.tab.windowId === sourceWindowID,
-        "Session restored outside the authoritative model");
-      created.push(restored.tab.id);
+        `Session restored outside its original authoritative owner: ${JSON.stringify({ sourceWindowID, restored })}`);
+      const queried = await chrome.tabs.get(restored.tab.id);
+      assert(queried.url === url && queried.windowId === sourceWindowID &&
+        (await chrome.tabs.query({ windowId: sourceWindowID })).some(value => value.id === queried.id),
+        "Restored session response disagrees with the live tab catalog");
+      assert(!(await chrome.sessions.getRecentlyClosed({ maxResults: 25 })).some(value => value.tab?.sessionId === session.tab.sessionId),
+        "Restored session remained available as a duplicate closed entry");
     });
     await check("approvedNativeNavigation", async () => {
       const url = "data:text/html,%3Ctitle%3EZacro%20approved%3C/title%3E%3Cp%3Enative%3C/p%3E";

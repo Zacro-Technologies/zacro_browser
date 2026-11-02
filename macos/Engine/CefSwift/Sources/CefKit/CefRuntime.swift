@@ -120,9 +120,25 @@ public final class CefRuntime {
     private var appContext: CefAppContext?
     private var settings: MappedCefSettings?
     private var browsers: [Int32: CefBrowser] = [:]
+    private var auxiliaryBrowserIDs: Set<Int32> = []
+    private final class AuxiliaryWindow {
+        weak var window: NSWindow?
+        let context: CefExistingRequestContext?
+        var observer: NSObjectProtocol?
+        var waiters: [UUID: CheckedContinuation<Void, Error>] = [:]
+        init(window: NSWindow, context: CefExistingRequestContext?) {
+            self.window = window; self.context = context
+        }
+    }
+    private var auxiliaryWindows: [ObjectIdentifier: AuxiliaryWindow] = [:]
+    private var closedAuxiliaryWindows: [ObjectIdentifier: AuxiliaryWindow] = [:]
+    private var auxiliaryWindowIDs: [Int32: ObjectIdentifier] = [:]
     private var isTerminationRequested = false
-    private var isTerminationScheduled = false
+    private var scheduledTerminationAttemptID: UUID?
     private var isPreparingTermination = false
+    private var terminationAttemptID: UUID?
+    private var finalTerminationAttemptID: UUID?
+    private var finalTerminationCompletion: (attempt: UUID, run: () -> Void)?
 
     private init() {}
 
@@ -242,7 +258,7 @@ public final class CefRuntime {
     /// be closed. Call once, at process exit.
     public func shutdown() {
         guard isInitialized else { return }
-        precondition(browsers.isEmpty && !CefChromeBrowser.hasLiveWindows,
+        precondition(browsers.isEmpty && !CefChromeBrowser.hasLiveWindows && !hasLiveAuxiliaryWindows,
                      "Close all Chromium browsers and windows before shutdown")
         messagePump?.stop()
         messagePump = nil
@@ -250,6 +266,12 @@ public final class CefRuntime {
         onReadyToTerminate = nil
         onTerminationChanged = nil
         beforeClosingDocuments = nil
+        terminationAttemptID = nil
+        finalTerminationAttemptID = nil
+        finalTerminationCompletion = nil
+        scheduledTerminationAttemptID = nil
+        isPreparingTermination = false
+        isTerminationRequested = false
         cef_shutdown()
         ccef_unload_framework()
         appContext = nil
@@ -408,12 +430,13 @@ public final class CefRuntime {
     func registerBrowser(_ browser: CefBrowser) {
         guard browser.id >= 0 else { return }
         browsers[browser.id] = browser
-        if isTerminationRequested {
+        if isTerminationRequested, let attempt = terminationAttemptID {
             // A profile may finish initializing after Quit was requested.
             // Wait until creation attaches the child to its parent, then apply
             // the same child-before-root close ordering to the new browser.
             DispatchQueue.main.async { [self] in
-                guard isInitialized, isTerminationRequested else { return }
+                guard isInitialized, isTerminationRequested, !isPreparingTermination,
+                      terminationAttemptID == attempt else { return }
                 _ = handleTerminationRequest()
             }
         }
@@ -421,9 +444,119 @@ public final class CefRuntime {
 
     /// All live browsers registered with the runtime. Used by ``CefBridge``
     /// to broadcast events to every page.
-    var activeBrowsers: [CefBrowser] { Array(browsers.values) }
+    var activeBrowsers: [CefBrowser] { browsers.values.filter { !auxiliaryBrowserIDs.contains($0.id) } }
+
+    /// Chrome-created auth, developer and other native windows. They participate
+    /// in lifecycle/termination, without becoming application document tabs.
+    public var auxiliaryBrowsers: [CefBrowser] {
+        auxiliaryBrowserIDs.compactMap { browsers[$0] }
+    }
+
+    /// Closes only this exact registered Chrome-created browser. Ordinary
+    /// beforeunload remains authoritative; callers await closure before releasing
+    /// its request context or committing a profile deletion.
+    public func closeAuxiliaryBrowser(_ browser: CefBrowser) async throws {
+        guard auxiliaryBrowserIDs.contains(browser.id), browsers[browser.id] === browser else {
+            if browser.isClosed { return }
+            throw CefDevToolsError.rejected("The native auxiliary browser is no longer owned by this runtime.")
+        }
+        observeAuxiliaryWindow(browser)
+        try await browser.closeAndWait()
+    }
+
+    public func hasAuxiliaryWindows(in profile: CefProfile) -> Bool {
+        pruneReleasedAuxiliaryWindows()
+        return auxiliaryBrowsers.contains { $0.belongs(to: profile) }
+            || auxiliaryWindows.values.contains { $0.window != nil && $0.context?.belongs(to: profile) == true }
+    }
+
+    public func closeAuxiliaryBrowsers(in profile: CefProfile) async throws {
+        // A site can open another window during close. Reconcile that native
+        // identity, but fail safely rather than running an unbounded close loop.
+        for _ in 0..<128 {
+            try Task.checkCancellation()
+            guard let browser = auxiliaryBrowsers.first(where: { $0.belongs(to: profile) }) else {
+                let windows = auxiliaryWindows.compactMap { key, value in
+                    value.context?.belongs(to: profile) == true ? key : nil
+                }
+                for window in windows { try await waitForAuxiliaryWindow(window) }
+                if !hasAuxiliaryWindows(in: profile) { return }
+                continue
+            }
+            try await closeAuxiliaryBrowser(browser)
+        }
+        throw CefDevToolsError.rejected("The profile keeps opening native windows. Close them before deleting its data.")
+    }
+
+    private var hasLiveAuxiliaryWindows: Bool {
+        pruneReleasedAuxiliaryWindows()
+        return !auxiliaryWindows.isEmpty
+    }
+
+    private func pruneReleasedAuxiliaryWindows() {
+        for id in auxiliaryWindows.keys.filter({ auxiliaryWindows[$0]?.window == nil }) {
+            auxiliaryWindowDidClose(id)
+        }
+        closedAuxiliaryWindows = closedAuxiliaryWindows.filter { $0.value.window != nil }
+    }
+
+    func observeAuxiliaryWindow(_ browser: CefBrowser) {
+        guard auxiliaryBrowserIDs.contains(browser.id), let window = browser.nativeView?.window else { return }
+        let id = ObjectIdentifier(window)
+        closedAuxiliaryWindows = closedAuxiliaryWindows.filter { $0.value.window != nil }
+        guard closedAuxiliaryWindows[id]?.window !== window else { return }
+        auxiliaryWindowIDs[browser.id] = id
+        guard auxiliaryWindows[id] == nil else { return }
+        let entry = AuxiliaryWindow(window: window, context: browser.existingRequestContext())
+        auxiliaryWindows[id] = entry
+        entry.observer = NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification,
+                                                               object: nil, queue: nil) { [weak self] notification in
+            guard let window = notification.object as? NSWindow, ObjectIdentifier(window) == id else { return }
+            MainActor.assumeIsolated { self?.auxiliaryWindowDidClose(id) }
+        }
+    }
+
+    private func auxiliaryWindowDidClose(_ id: ObjectIdentifier) {
+        guard let entry = auxiliaryWindows.removeValue(forKey: id) else { return }
+        if let observer = entry.observer { NotificationCenter.default.removeObserver(observer) }
+        // A later browser-close callback can still expose the same NSWindow.
+        // Remember it weakly without retaining its native request context.
+        if let window = entry.window {
+            closedAuxiliaryWindows[id] = AuxiliaryWindow(window: window, context: nil)
+        }
+        auxiliaryWindowIDs = auxiliaryWindowIDs.filter { $0.value != id }
+        for waiter in entry.waiters.values { waiter.resume() }
+        scheduleTerminationIfReady()
+    }
+
+    private func waitForAuxiliaryWindow(_ id: ObjectIdentifier) async throws {
+        guard let entry = auxiliaryWindows[id] else { return }
+        if entry.window == nil { auxiliaryWindowDidClose(id); return }
+        let token = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { entry.waiters[token] = $0 }
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                self?.auxiliaryWindows[id]?.waiters.removeValue(forKey: token)?.resume(throwing: CancellationError())
+            }
+        }
+    }
+
+    func registerAuxiliaryBrowser(_ browser: CefBrowser) {
+        guard browser.id >= 0 else { return }
+        auxiliaryBrowserIDs.insert(browser.id)
+        registerBrowser(browser)
+        observeAuxiliaryWindow(browser)
+        // CEF calls OnAfterCreated before SetBrowser/TabStripModel insertion.
+        // Read the resulting exact window after that native stack completes.
+        DispatchQueue.main.async { [weak self, weak browser] in
+            guard let browser, !browser.isClosed else { return }
+            self?.observeAuxiliaryWindow(browser)
+        }
+    }
 
     func unregisterBrowser(id: Int32) {
+        auxiliaryBrowserIDs.remove(id)
         browsers[id] = nil
         scheduleTerminationIfReady()
     }
@@ -431,12 +564,16 @@ public final class CefRuntime {
     func chromeWindowDidClose() {
         // Keep the native shell alive until every child document accepts its
         // close. A beforeunload "Stay" must leave a usable parent window.
-        if isTerminationRequested && !CefChromeBrowser.hasHostedWindows {
+        if isTerminationRequested, !isPreparingTermination, let attempt = terminationAttemptID,
+           !CefChromeBrowser.hasHostedWindows {
             DispatchQueue.main.async { [self] in
-                guard isTerminationRequested, !CefChromeBrowser.hasHostedWindows else { return }
+                guard isInitialized, isTerminationRequested, !isPreparingTermination,
+                      terminationAttemptID == attempt, !CefChromeBrowser.hasHostedWindows else { return }
                 let roots = CefChromeBrowser.rootBrowserIDs
                 for browser in Array(browsers.values)
                     where roots.contains(browser.id) && !browser.closingForTermination {
+                    guard isTerminationRequested, !isPreparingTermination,
+                          terminationAttemptID == attempt else { return }
                     browser.closingForTermination = true
                     browser.close(force: false)
                 }
@@ -447,18 +584,30 @@ public final class CefRuntime {
     }
 
     private func scheduleTerminationIfReady() {
-        guard isTerminationRequested, !isPreparingTermination, browsers.isEmpty, !CefChromeBrowser.hasLiveWindows,
-              !isTerminationScheduled else { return }
+        guard isTerminationRequested, !isPreparingTermination, let attempt = terminationAttemptID,
+              browsers.isEmpty, !CefChromeBrowser.hasLiveWindows, !hasLiveAuxiliaryWindows,
+              scheduledTerminationAttemptID == nil else { return }
         // on_before_close is still on CEF's message-loop stack. Calling
         // cef_shutdown synchronously here destroys objects that the enclosing
         // close callback still needs. Let that callback and work slice return
         // before re-entering AppKit termination.
-        isTerminationScheduled = true
+        scheduledTerminationAttemptID = attempt
         DispatchQueue.main.async { [self] in
-            isTerminationScheduled = false
-            guard isInitialized, isTerminationRequested, !isPreparingTermination, browsers.isEmpty,
-                  !CefChromeBrowser.hasLiveWindows else { return }
-            if let onReadyToTerminate {
+            // An older queued callback cannot clear a replacement attempt's
+            // scheduled flag, even if cancellation and retry share one turn.
+            guard scheduledTerminationAttemptID == attempt else { return }
+            scheduledTerminationAttemptID = nil
+            guard isInitialized, isTerminationRequested, !isPreparingTermination,
+                  terminationAttemptID == attempt, browsers.isEmpty,
+                  !CefChromeBrowser.hasLiveWindows, !hasLiveAuxiliaryWindows else { return }
+            if let final = finalTerminationCompletion, final.attempt == attempt {
+                finalTerminationCompletion = nil
+                // This final check and the event-loop stop are synchronous on
+                // the native UI actor. No late browser can enter between them.
+                final.run()
+            } else if finalTerminationAttemptID == attempt {
+                return // The exact final completion already ran.
+            } else if let onReadyToTerminate {
                 onReadyToTerminate()
             } else {
                 shutdown()
@@ -467,33 +616,68 @@ public final class CefRuntime {
         }
     }
 
+    /// Capture this exact Quit attempt before awaiting application cleanup.
+    /// Invoke the returned closure afterward: it drains any Chrome-created
+    /// browsers/windows admitted during that await before calling completion.
+    /// Cancellation or a replacement Quit makes the old closure a no-op.
+    public func deferredTerminationCompletion(_ completion: @escaping () -> Void) -> (() -> Void)? {
+        guard isInitialized, isTerminationRequested, !isPreparingTermination,
+              let attempt = terminationAttemptID else { return nil }
+        return { [weak self] in self?.completeTermination(attempt: attempt, completion: completion) }
+    }
+
+    private func completeTermination(attempt: UUID, completion: @escaping () -> Void) {
+        guard isInitialized, isTerminationRequested, !isPreparingTermination,
+              terminationAttemptID == attempt, finalTerminationAttemptID != attempt else { return }
+        finalTerminationAttemptID = attempt
+        finalTerminationCompletion = (attempt, completion)
+        // registerBrowser normally queues this close. Reconcile here too so a
+        // completion cannot depend on the relative order of the two callbacks.
+        _ = handleTerminationRequest()
+        scheduleTerminationIfReady()
+    }
+
     /// Called from CEFApplication's terminate:. Returns true when the app
     /// may terminate immediately.
     func handleTerminationRequest() -> Bool {
         guard isInitialized else { return true }
         if !isTerminationRequested {
+            let attempt = UUID()
+            let prepare = beforeClosingDocuments
+            terminationAttemptID = attempt
             isTerminationRequested = true
+            // Publish the preparation gate before invoking client callbacks:
+            // a reentrant Quit must not start unloading ahead of this barrier.
+            isPreparingTermination = prepare != nil
             onTerminationChanged?(true)
-            if let prepare = beforeClosingDocuments {
-                isPreparingTermination = true
+            guard isInitialized, isTerminationRequested, terminationAttemptID == attempt else { return false }
+            if let prepare {
                 Task { @MainActor [weak self] in
+                    guard let self, self.isInitialized, self.isTerminationRequested,
+                          self.terminationAttemptID == attempt else { return }
                     let accepted = await prepare()
-                    guard let self else { return }
+                    // Cancellation can be followed by another Quit while a
+                    // native snapshot drains. Its predecessor may not clear
+                    // either flag or veto the replacement attempt.
+                    guard self.isInitialized, self.isTerminationRequested,
+                          self.terminationAttemptID == attempt else { return }
                     self.isPreparingTermination = false
-                    guard self.isInitialized, self.isTerminationRequested else { return }
                     if accepted { _ = self.handleTerminationRequest() }
                     else {
+                        self.terminationAttemptID = nil
                         self.isTerminationRequested = false
                         self.onTerminationChanged?(false)
                     }
                 }
             }
         }
-        guard !isPreparingTermination else { return false }
+        guard !isPreparingTermination, let attempt = terminationAttemptID else { return false }
         let roots = CefChromeBrowser.rootBrowserIDs
         let hasChildren = CefChromeBrowser.hasHostedWindows
         for browser in Array(browsers.values)
             where !browser.closingForTermination && (!hasChildren || !roots.contains(browser.id)) {
+            guard isTerminationRequested, !isPreparingTermination,
+                  terminationAttemptID == attempt else { return false }
             browser.closingForTermination = true
             browser.close(force: false)
         }
@@ -504,6 +688,11 @@ public final class CefRuntime {
     func cancelTerminationRequest(for browser: CefBrowser) {
         browser.closingForTermination = false
         guard isTerminationRequested else { return }
+        terminationAttemptID = nil
+        finalTerminationAttemptID = nil
+        finalTerminationCompletion = nil
+        scheduledTerminationAttemptID = nil
+        isPreparingTermination = false
         isTerminationRequested = false
         onTerminationChanged?(false)
     }

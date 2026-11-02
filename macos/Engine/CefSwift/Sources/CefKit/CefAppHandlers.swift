@@ -33,6 +33,12 @@ final class CefAppContext: @unchecked Sendable {
     func makeApp() -> UnsafeMutablePointer<cef_app_t> {
         let bp = cefAllocate(cef_browser_process_handler_t.self, owner: self)
         bp.pointee.on_context_initialized = { _ in }
+        bp.pointee.get_default_client = { _ in
+            // CEF guarantees its UI thread here. Carry only the address out of
+            // assumeIsolated; the pointer is not transferred to another actor.
+            let address = MainActor.assumeIsolated { UInt(bitPattern: CefAuxiliaryBrowserClient().makeClient()) }
+            return UnsafeMutablePointer<cef_client_t>(bitPattern: address)
+        }
         bp.pointee.on_schedule_message_pump_work = { handlerSelf, delayMS in
             guard let owner = cefOwner(CefAppContext.self, handlerSelf.map(UnsafeMutableRawPointer.init)) else { return }
             owner.pump.scheduleWork(delayMilliseconds: delayMS)

@@ -67,6 +67,24 @@ class RuntimeReceiptTests(unittest.TestCase):
         self.assertEqual(receipt["symlinks"], {"Resources/link": "icudtl.dat"})
         self.assertEqual(receipt["chromiumCommit"], build.CHROMIUM_COMMIT)
 
+    def test_runtime_preparation_applies_hosted_extension_toolbar(self):
+        with mock.patch.object(build, "run") as execute:
+            build.apply_inputs(self.source, {})
+        commands = [call.args[0] for call in execute.call_args_list]
+        self.assertIn([build.sys.executable,
+                       str(self.inputs / "apply_extension_toolbar_adapter.py"),
+                       "--chromium-root", str(self.source)], commands)
+
+    def test_resumed_release_disables_developer_fieldtrial_matrix(self):
+        args = self.out / "args.gn"
+        args.write_text('target_cpu="arm64"\ndisable_fieldtrial_testing_config=false\nsymbol_level=0\n')
+        builds, receipt = self.run_build()
+        self.assertEqual(len(builds), 1)
+        self.assertEqual(args.read_text().count("disable_fieldtrial_testing_config="), 1)
+        self.assertIn("disable_fieldtrial_testing_config=true\n", args.read_text())
+        self.assertIn("symbol_level=0\n", args.read_text())
+        self.assertEqual(receipt["gnArgsSha256"], build.digest(args))
+
     def test_changed_native_inputs_require_another_successful_build(self):
         def change(count):
             if count == 1:

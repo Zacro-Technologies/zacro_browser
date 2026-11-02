@@ -503,18 +503,8 @@ public final class BrowserStore: ObservableObject {
       state.tabs[i].navigation = Array(state.tabs[i].navigation.suffix(100))
       state.tabs[i].navigationIndex = state.tabs[i].navigation.count - 1
     }
-    if recordHistory, BrowserAddress.webURL(value) != nil,
-      let profile = profileID(for: state.tabs[i]),
-      !state.profiles.contains(where: { $0.id == profile && $0.isPrivate })
-    {
-      if let recent = state.history.firstIndex(where: { $0.profileID == profile }),
-        state.history[recent].url == value, Date().timeIntervalSince(state.history[recent].visitedAt) < 60 {
-        if !title.isEmpty { state.history[recent].title = title }
-        state.history[recent].visitedAt = Date()
-      } else {
-        state.history.insert(HistoryEntry(profileID: profile, url: value, title: title), at: 0)
-      }
-      state.history = Array(state.history.prefix(20_000))
+    if recordHistory, let profile = profileID(for: state.tabs[i]) {
+      Self.appendHistoryVisit(to: &state, profileID: profile, address: value, title: title, visitedAt: Date())
     }
     save()
   }

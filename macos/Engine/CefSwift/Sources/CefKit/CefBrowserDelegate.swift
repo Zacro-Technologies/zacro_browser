@@ -25,6 +25,9 @@ public protocol CefBrowserDelegate: AnyObject {
     func browser(_ b: CefBrowser, didChangeTitle title: String)
     /// The main-frame URL changed.
     func browser(_ b: CefBrowser, didChangeURL url: URL?)
+    /// A main-frame document navigation committed successfully. Excludes
+    /// same-document changes and requests that failed or were cancelled before commit.
+    func browser(_ b: CefBrowser, didCommitNavigation url: URL)
     /// Loading started/stopped, or history availability changed.
     func browser(_ b: CefBrowser, didChangeLoading isLoading: Bool, canGoBack: Bool, canGoForward: Bool)
     /// Estimated load progress changed (0.0 ... 1.0).
@@ -86,6 +89,10 @@ public protocol CefBrowserDelegate: AnyObject {
     /// `callback` (`success: true` = leave). Return `true` to present your own
     /// dialog; `false` for the native one.
     func browser(_ b: CefBrowser, runBeforeUnloadDialog message: String, isReload: Bool, callback: CefJSDialogCallback) -> Bool
+
+    /// Chromium reset or externally closed its active JavaScript dialog.
+    /// Dismiss application UI and invalidate its callback without a new choice.
+    func browserResetJavaScriptDialog(_ b: CefBrowser)
 
     // MARK: Context menu
 
@@ -176,6 +183,7 @@ public protocol CefBrowserDelegate: AnyObject {
 extension CefBrowserDelegate {
     public func browser(_ b: CefBrowser, didChangeTitle title: String) {}
     public func browser(_ b: CefBrowser, didChangeURL url: URL?) {}
+    public func browser(_ b: CefBrowser, didCommitNavigation url: URL) {}
     public func browser(_ b: CefBrowser, didChangeLoading isLoading: Bool, canGoBack: Bool, canGoForward: Bool) {}
     public func browser(_ b: CefBrowser, didChangeProgress progress: Double) {}
     public func browser(_ b: CefBrowser, didFailLoad code: Int, errorText: String, failedURL: String) {}
@@ -198,6 +206,7 @@ extension CefBrowserDelegate {
 
     public func browser(_ b: CefBrowser, runJSDialog dialog: CefJSDialog, callback: CefJSDialogCallback) -> Bool { false }
     public func browser(_ b: CefBrowser, runBeforeUnloadDialog message: String, isReload: Bool, callback: CefJSDialogCallback) -> Bool { false }
+    public func browserResetJavaScriptDialog(_ b: CefBrowser) {}
 
     public func browser(_ b: CefBrowser, configureContextMenu menu: CefMenuModel, params: CefContextMenuParams) {}
     public func browser(_ b: CefBrowser, contextMenuCommand commandID: Int, params: CefContextMenuParams) -> Bool { false }

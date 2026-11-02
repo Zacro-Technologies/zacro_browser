@@ -433,15 +433,10 @@ private struct ShortcutCapture: NSViewRepresentable {
     override func keyDown(with event: NSEvent) {
       guard !event.isARepeat else { return }
       let flags = event.modifierFlags.intersection([.command, .control, .option, .shift])
-      if event.keyCode == 53 && flags.isEmpty { receive(.cancel); return }
+      if event.keyCode == 53 { receive(.cancel); return }
       if [51, 117].contains(event.keyCode) && flags.isEmpty { receive(.value("")); return }
-      let special: [UInt16: String] = [36: "Enter", 76: "Enter", 48: "Tab", 49: "Space", 51: "Backspace", 53: "Escape", 117: "Delete", 123: "Left", 124: "Right", 125: "Down", 126: "Up", 115: "Home", 119: "End", 116: "PageUp", 121: "PageDown", 122: "F1", 120: "F2", 99: "F3", 118: "F4", 96: "F5", 97: "F6", 98: "F7", 100: "F8", 101: "F9", 109: "F10", 103: "F11", 111: "F12"]
-      guard var key = special[event.keyCode] ?? event.charactersIgnoringModifiers?.uppercased(), !key.isEmpty else { return }
-      if key == "+" { key = "=" }
-      var parts = [String]()
-      if flags.contains(.control) { parts.append("Ctrl") }; if flags.contains(.command) { parts.append("Mod") }
-      if flags.contains(.option) { parts.append("Alt") }; if flags.contains(.shift) { parts.append("Shift") }
-      parts.append(key); receive(.value(parts.joined(separator: "+")))
+      guard let accelerator = NativeShortcutEvent.recordedAccelerator(event) else { return }
+      receive(.value(accelerator))
     }
   }
 }

@@ -367,6 +367,14 @@ public final class CefChromeBrowser {
     public func setPageVisible(_ visible: Bool) {
         guard manualVisible != visible else {
             if !visible, windowOwner != nil { hide() }
+            else if visible, windowOwner != nil, nsWindow?.isVisible == false,
+                    let parent = presentationParent ?? hostingWindow,
+                    parent.isVisible, !parent.isMiniaturized {
+                // Reparenting/error overlays can hide the AppKit child after
+                // Views accepted visibility. Repair only that discrepancy;
+                // unchanged visible pages and minimized owners stay untouched.
+                show()
+            }
             return
         }
         manualVisible = visible
@@ -443,6 +451,14 @@ public final class CefChromeBrowser {
     public func hide() {
         guard let rawWindow else { return }
         rawWindow.pointee.hide?(rawWindow)
+        if windowOwner != nil, let view = rawBrowserView {
+            // Match show(): the Views hierarchy and native widget have
+            // independent visibility. An asynchronously created OTR document
+            // can attach after its widget was already hidden; hiding that
+            // widget again need not deliver a WebContents visibility change.
+            let base = UnsafeMutableRawPointer(view).assumingMemoryBound(to: cef_view_t.self)
+            base.pointee.set_visible?(base, 0)
+        }
         if let window = nsWindow { window.parent?.removeChildWindow(window) }
     }
 

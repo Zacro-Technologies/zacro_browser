@@ -1,0 +1,65 @@
+--- a/chrome/browser/extensions/api/tab_capture/tab_capture_api.h
++++ b/chrome/browser/extensions/api/tab_capture/tab_capture_api.h
+@@ -7,6 +7,8 @@
+ 
+ #ifndef CHROME_BROWSER_EXTENSIONS_API_TAB_CAPTURE_TAB_CAPTURE_API_H_
+ #define CHROME_BROWSER_EXTENSIONS_API_TAB_CAPTURE_TAB_CAPTURE_API_H_
++
++#include <optional>
+ 
+ #include "chrome/browser/extensions/api/tab_capture/tab_capture_registry.h"
+ #include "chrome/common/extensions/api/tab_capture.h"
+@@ -21,8 +23,14 @@
+  public:
+   DECLARE_EXTENSION_FUNCTION("tabCapture.capture", TABCAPTURE_CAPTURE)
+ 
++  // Trusted browser-process topology dispatcher only. No public API argument
++  // or renderer binding can set this target; Run retains all capture grants,
++  // origin/consumer restrictions and TabCaptureRegistry policy.
++  void SetNativeTargetTabID(int tab_id) { native_target_tab_id_ = tab_id; }
++
+  private:
+   ~TabCaptureCaptureFunction() final {}
++  std::optional<int> native_target_tab_id_;
+ 
+   // ExtensionFunction:
+   ResponseAction Run() final;
+--- a/chrome/browser/extensions/api/tab_capture/tab_capture_api.cc
++++ b/chrome/browser/extensions/api/tab_capture/tab_capture_api.cc
+@@ -136,16 +136,26 @@
+       TabCapture::Capture::Params::Create(args());
+   EXTENSION_FUNCTION_VALIDATE(params);
+ 
+-  Profile* profile = Profile::FromBrowserContext(browser_context());
+-  const bool match_incognito_profile = include_incognito_information();
+-  BrowserWindowInterface* target_browser =
+-      browser_window_util::GetLastActiveBrowserWithProfile(
+-          *profile, match_incognito_profile);
+-  if (!target_browser) {
+-    return RespondNow(Error(tab_capture_errors::kFindingTabError));
+-  }
+-
+-  content::WebContents* target_contents = GetActiveWebContents(target_browser);
++  content::WebContents* target_contents = nullptr;
++  if (native_target_tab_id_) {
++    // Resolve the immutable session identity again at execution time. This
++    // does not grant capture; the unchanged checks below remain authoritative.
++    if (!ExtensionTabUtil::GetTabById(*native_target_tab_id_, browser_context(),
++                                    include_incognito_information(),
++                                    &target_contents)) {
++      return RespondNow(Error(tab_capture_errors::kFindingTabError));
++    }
++  } else {
++    Profile* profile = Profile::FromBrowserContext(browser_context());
++    const bool match_incognito_profile = include_incognito_information();
++    BrowserWindowInterface* target_browser =
++        browser_window_util::GetLastActiveBrowserWithProfile(
++            *profile, match_incognito_profile);
++    if (!target_browser) {
++      return RespondNow(Error(tab_capture_errors::kFindingTabError));
++    }
++    target_contents = GetActiveWebContents(target_browser);
++  }
+   if (!target_contents) {
+     return RespondNow(Error(tab_capture_errors::kFindingTabError));
+   }

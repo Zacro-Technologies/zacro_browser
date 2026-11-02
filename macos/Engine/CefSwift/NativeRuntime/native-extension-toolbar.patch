@@ -1,0 +1,28 @@
+--- a/chrome/browser/ui/views/toolbar/toolbar_view.cc
++++ b/chrome/browser/ui/views/toolbar/toolbar_view.cc
+@@ -396,6 +396,25 @@
+     initialized_ = true;
+     return;
+   } else if (display_mode_ == DisplayMode::kLocation) {
++#if BUILDFLAG(ENABLE_CEF)
++    // CefBrowserView uses a trusted popup Browser and therefore location mode.
++    // Its early return otherwise omits the real extension action model entirely.
++    // Keep Chromium's normal model, observers and action/popup delegates owned
++    // by this toolbar, without presenting a second toolbar in the native shell.
++    auto* cef_delegate = cef::BrowserForBWI(browser_)->cef_delegate();
++    if (cef_delegate && cef_delegate->IsViewsHosted() &&
++        !browser_->GetProfile()->IsGuestSession()) {
++      auto* native_action_host = AddChildView(std::make_unique<views::View>());
++      native_action_host->SetVisible(false);
++      extensions_container_ = native_action_host->AddChildView(
++          std::make_unique<ExtensionsToolbarDesktop>(browser_));
++      extensions_toolbar_coordinator_ =
++          std::make_unique<ExtensionsToolbarCoordinator>(extensions_container_);
++      // ExtensionsToolbarDesktop may change its own visibility as extensions
++      // load or a popup opens. Its parent stays hidden, takes no layout space,
++      // and prevents toolbar controls from entering paint, hit-test or AX trees.
++    }
++#endif
+     // Add the pinned toolbar actions container so that downloads can be shown
+     // in popups.
+     pinned_toolbar_actions_container_ = AddChildView(

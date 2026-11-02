@@ -35,9 +35,9 @@ struct NativeCommandPalette: View {
     return NativeSpacePalette(theme: theme, dark: colorScheme == .dark, increasedContrast: contrast == .increased)
   }
   private let scopes = [("all", "All"), ("tab", "Tabs"), ("space", "Spaces"), ("folder", "Folders"), ("bookmark", "Bookmarks"), ("history", "History"), ("action", "Actions")]
-  private var raw: String { actions.query.trimmingCharacters(in: .whitespacesAndNewlines) }
+  private var raw: String { NativeCommandSearchMatching.trimmedQuery(actions.query) }
   private var prefix: String? { [">": "action", "/": "action", "@": "tab", "#": "space"][String(raw.prefix(1))] }
-  private var query: String { (prefix == nil ? raw : String(raw.dropFirst())).trimmingCharacters(in: .whitespacesAndNewlines) }
+  private var query: String { NativeCommandSearchMatching.trimmedQuery(prefix == nil ? raw : String(raw.dropFirst())) }
   private var filter: String { prefix ?? scope }
   private var isNested: Bool { context != nil || site != nil }
   private var profileTabs: [BrowserTab] {
@@ -262,9 +262,12 @@ struct NativeCommandPalette: View {
       }
     }
     for command in actions.runtimeCommands where command.available {
+      guard NativePalettePolicy.showsCommand(command.id,
+        hasVisibleSplit: actions.runtimeCommands.contains { $0.id == "unsplit" && $0.available }) else { continue }
       if query.isEmpty && filter != "action" && !["new-folder", "new-space", "preferences", "shortcuts"].contains(command.id) { continue }
       add(Entry(id: "action:\(command.id)", kind: "action", title: command.id == "command-palette" ? "New tab" : command.title,
-        icon: command.icon, type: command.shortcut.map(NativeInterfaceEditors.keyLabel) ?? "Action", keywords: "\(command.id.replacingOccurrences(of: "-", with: " ")) \(command.keywords)") {
+        icon: command.icon, type: command.shortcut.map(NativeInterfaceEditors.keyLabel) ?? "Action",
+        keywords: NativePalettePolicy.commandKeywords(id: command.id, additional: command.keywords)) {
           if command.id == "split", let tab = store.state.activeTab, store.split(for: tab.id) == nil { enter(.split) }
           else if command.id == "move-tab", let tab = store.state.activeTab { enter(.move(tabID: tab.id, pin: false)) }
           else if command.id == "site-searches" { enter(.siteSearches) }
@@ -293,6 +296,18 @@ struct NativeCommandPalette: View {
           var entry = Entry(id: "navigation", kind: "navigation", title: query, icon: address ? "globe" : "magnifyingglass",
             type: address ? actions.paletteEditsAddress ? "Go to address" : "Open page" : "Search \(store.state.settings.searchEngine.rawValue.capitalized)", url: query) { navigate(query) }
           entry.score = address ? 220 : 45; candidates.append(entry)
+        }
+        if let question = NativePalettePolicy.askQuery(query, scope: filter, configured: actions.aiConfigured,
+          isPrivate: store.state.activeProfile?.isPrivate != false, busy: actions.aiBusy) {
+          let profileID = store.activeProfileID
+          var entry = Entry(id: "ask", kind: "action", title: "Ask Zacro: \(question)", icon: "sparkle",
+            type: actions.runtimeCommands.first(where: { $0.id == "ai" })?.shortcut.map(NativeInterfaceEditors.keyLabel) ?? "Ask AI") {
+            guard store.activeProfileID == profileID,
+              NativePalettePolicy.askQuery(question, scope: filter, configured: actions.aiConfigured,
+                isPrivate: store.state.activeProfile?.isPrivate != false, busy: actions.aiBusy) != nil else { return }
+            close { actions.askAI(question) }
+          }
+          entry.score = 10; candidates.append(entry)
         }
       }
     }
@@ -483,26 +498,7 @@ struct NativeCommandPalette: View {
     }.textFieldStyle(.roundedBorder).padding(20).frame(width: 410)
   }
   private static func fuzzy(_ query: String, _ value: String) -> Double {
-    func normalize(_ value: String) -> String { value.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: .current) }
-    let q = normalize(query), text = normalize(value)
-    guard !q.isEmpty else { return 0 }
-    if text == q { return 160 }
-    if text.hasPrefix(q) { return 125 - min(15, Double(text.count - q.count) / 8) }
-    let chars = Array(text)
-    func boundary(_ index: Int) -> Bool { index == 0 || chars[index - 1].isWhitespace || "./:_-".contains(chars[index - 1]) }
-    if let range = text.range(of: q) { let at = text.distance(from: text.startIndex, to: range.lowerBound); return (boundary(at) ? 105 : 82) - min(20, Double(at) / 3) }
-    let words = q.split(whereSeparator: \.isWhitespace)
-    var total = 0.0
-    for word in words {
-      var cursor = 0, previous = -2; var score = 0.0
-      for char in word {
-        guard cursor < chars.count, let found = chars[cursor...].firstIndex(of: char) else { return -1 }
-        score += found == previous + 1 ? 9 : boundary(found) ? 8 : 2
-        score -= min(5, Double(found - cursor) / 5); previous = found; cursor = found + 1
-      }
-      total += min(70, 35 + score - Double(text.count - word.count) / 12)
-    }
-    return total / Double(max(1, words.count))
+    NativeCommandSearchMatching.score(query, value)
   }
   private struct Entry: Identifiable {
     let id: String

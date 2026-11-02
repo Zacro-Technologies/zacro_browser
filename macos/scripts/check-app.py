@@ -43,7 +43,26 @@ class Fixture(http.server.BaseHTTPRequestHandler):
         body = b'<!doctype html><title>Zacro Native acceptance</title><link rel="icon" type="image/svg+xml" href="/favicon.svg"><p>Local engine check</p>'
         mime = "text/html; charset=utf-8"
         if route == "/native-history-form":
-            body = b'<!doctype html><title>Native retained form</title><form><textarea id="retained" name="retained"></textarea></form>'
+            # Exercise exact form-state bytes and document lifetime without
+            # making the multi-megabyte value a separate text-layout/AX stress test.
+            body = b'<!doctype html><title>Native retained form</title><form><textarea id="retained" name="retained" style="display:none"></textarea></form>'
+        if route == "/native-peek-first-inline":
+            # This parser-inline listener runs before the body exists. A
+            # post-load Peek injection loses capture priority to it; the actual
+            # owned document-start session must register first.
+            body = b'''<!doctype html><html><head><title>Native first-inline Peek</title>
+<script>
+window.__peekFirstInlineCalls = 0;
+window.addEventListener('click', event => {
+  if (event.isTrusted && (event.shiftKey || event.altKey)) {
+    window.__peekFirstInlineCalls++;
+    event.preventDefault(); event.stopImmediatePropagation();
+  }
+}, true);
+</script></head><body style="margin:0;min-height:300px;background:white">
+<input id="peekSourceDraft" value="first-inline retained draft" style="position:absolute;left:24px;top:14px;width:220px;height:24px">
+<a id="peekFixtureLink" href="/native-peek-link-target" style="position:absolute;left:24px;top:64px;display:block;width:180px;height:44px;line-height:44px">Open preview</a>
+</body></html>'''
         if self.path == "/favicon.svg":
             body = b'<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><rect width="32" height="32" rx="6" fill="#7e5bef"/><circle cx="16" cy="16" r="8" fill="white"/></svg>'
             mime = "image/svg+xml"
@@ -168,17 +187,24 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--ui", action="store_true", help="Exercise native mouse and keyboard input (requires Accessibility access)")
     mode.add_argument("--integration", action="store_true", help="Exercise the full Swift application owners in an isolated profile")
+    mode.add_argument("--accessibility", action="store_true", help="Run the separate passive scoped AX causal check without the global renderer AX fallback")
+    parser.add_argument("--suite", choices=("all", "extensions", "extension-actions", "extension-services", "download-retirement", "windows", "peek", "navigation", "capture", "sidebar"), default="all",
+                        help="Run one application fixture group; focused reports do not establish full-app acceptance")
     parser.add_argument("--require-extensions", action="store_true", help="Require the custom native extension protocol and real MV3 integration fixture")
     args = parser.parse_args()
     if args.require_extensions and not args.integration:
         parser.error("--require-extensions requires --integration")
+    if args.suite != "all" and not args.integration:
+        parser.error("--suite requires --integration")
+    if args.require_extensions and args.suite not in ("all", "extensions"):
+        parser.error("--require-extensions requires the all or extensions suite")
     executable = args.app.resolve() / "Contents/MacOS/Zacro Native"
     if not executable.is_file():
         parser.error(f"Build the application first: {executable}")
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     native_host = build_host(output / "native-messaging-host") if args.integration else None
-    name = "application" if args.integration else "ui" if args.ui else "engine"
+    name = "application" if args.integration else "ui" if args.ui else "accessibility" if args.accessibility else "engine"
     report = output / (name + ".json")
     report.unlink(missing_ok=True)
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Fixture)
@@ -198,6 +224,7 @@ def main():
                 MallocNanoZone="0",
                 ZACRO_NATIVE_EXTENSION_FIXTURE=str(native_root / "scripts/fixtures/native-extension"),
                 ZACRO_REQUIRE_NATIVE_EXTENSIONS="1" if args.require_extensions else "0",
+                ZACRO_NATIVE_ACCEPTANCE_SUITE=args.suite,
                 ZACRO_RENDER_EVIDENCE="1" if args.integration else "0",
             )
             if native_host:
@@ -208,6 +235,8 @@ def main():
                     arguments.append("--native-ui-review")
                 elif args.integration:
                     arguments.append("--native-integration-acceptance")
+                elif args.accessibility:
+                    arguments.append("--native-accessibility-acceptance")
                 process = subprocess.Popen(
                     arguments,
                     env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
@@ -241,6 +270,20 @@ def main():
             result = json.loads(report.read_text())
             if result.get("passed") is not True:
                 raise SystemExit(f"FAIL: {result.get('error', 'engine acceptance failed')}")
+            if args.integration and result.get("suite", "all") != args.suite:
+                raise SystemExit("FAIL: the executable did not run the requested application suite")
+            if args.require_extensions and (result.get("nativeExtensionProtocol") is not True
+                                           or result.get("extensionFixturePassed") is not True):
+                raise SystemExit("FAIL: the requested real extension fixture did not pass")
+            if args.accessibility:
+                if result.get("suite") != "accessibility" or result.get("fullEngineSuitePassed") is not False:
+                    raise SystemExit("FAIL: the executable did not run the separate scoped AX causal fixture")
+                print("PASS: scoped native AX positive/control retention and clean shutdown (no desktop input or full engine suite)")
+                print(f"Report: {report}")
+                return
+            if args.integration and args.suite != "all":
+                print(f"PASS: focused {args.suite} fixture and clean shutdown (full application suite not run)")
+                return
             print("PASS: application ownership, retained documents, and clean shutdown" if args.integration else
                   "PASS: native mouse/keyboard controls and clean shutdown" if args.ui else
                   "PASS: four Chrome documents, profile isolation, retained state, and clean shutdown")

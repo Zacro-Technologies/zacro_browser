@@ -69,6 +69,7 @@ public final class CefBrowser: Identifiable {
     public private(set) var creationFailed = false
     private var readyWaiters: [UUID: CheckedContinuation<Void, Error>] = [:]
     private var readyDeadlines: [UUID: Task<Void, Never>] = [:]
+    private var closeWaiters: [UUID: CheckedContinuation<Void, Error>] = [:]
     var resourceFetches: [UUID: CefResourceFetch] = [:]
     let client: BrowserClient?
 
@@ -287,6 +288,47 @@ public final class CefBrowser: Identifiable {
         withHost { $0.pointee.close_browser?($0, force ? 1 : 0) }
     }
 
+    /// Requests ordinary native close and waits for its actual completion. A
+    /// beforeunload veto rejects; no timer may accept a delayed close decision.
+    func closeAndWait() async throws {
+        try Task.checkCancellation()
+        if isClosed { return }
+        let token = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                closeWaiters[token] = continuation
+                close(force: false)
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                self?.closeWaiters.removeValue(forKey: token)?.resume(throwing: CancellationError())
+            }
+        }
+    }
+
+    func auxiliaryCloseWasCancelled() {
+        let waiters = closeWaiters.values
+        closeWaiters.removeAll()
+        for waiter in waiters { waiter.resume(throwing: CancellationError()) }
+        onCloseCancelled?()
+        CefRuntime.shared.cancelTerminationRequest(for: self)
+    }
+
+    /// Actual native profile identity, including isolated private contexts.
+    public func belongs(to profile: CefProfile) -> Bool {
+        withHost { host in
+            guard let context = host.pointee.get_request_context?(host) else { return false }
+            defer { cefRelease(UnsafeMutableRawPointer(context)) }
+            return profile.matchesExistingContext(context)
+        } ?? false
+    }
+
+    func existingRequestContext() -> CefExistingRequestContext? {
+        withHost { host in
+            host.pointee.get_request_context?(host).map(CefExistingRequestContext.init(raw:))
+        } ?? nil
+    }
+
     /// The NSView CEF created for this browser, once available. Add it to
     /// your view hierarchy is not required (CEF parents it automatically);
     /// use it for sizing/focus.
@@ -389,6 +431,9 @@ public final class CefBrowser: Identifiable {
         }
         raw = nil
         CefRuntime.shared.unregisterBrowser(id: id)
+        let waiters = closeWaiters.values
+        closeWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
     }
 
     func failCreation(_ message: String) {

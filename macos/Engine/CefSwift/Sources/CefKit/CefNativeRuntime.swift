@@ -104,9 +104,12 @@ extension CefBrowser {
     }
 
     /// Sleeps the document by navigating to an empty page and pruning history,
-    /// retaining its native tab identity. Capture navigation state first.
+    /// retaining its native tab identity. Native discard first flushes current
+    /// renderer history into its memory-only buffer. Public durable restoration
+    /// still requires a separate encrypted capture before this operation.
     public func discardDocument() async throws {
-        let response = try await devTools.call("Zacro.discardDocument", timeout: 20)
+        // Native bounds: 10 seconds for state ACKs, then 15 for blank commit.
+        let response = try await devTools.call("Zacro.discardDocument", timeout: 30)
         guard response["discarded"] as? Bool == true else { throw CefDevToolsError.invalidMessage }
     }
 

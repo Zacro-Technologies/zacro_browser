@@ -15,6 +15,8 @@ final class NativeServicesModel: ObservableObject {
   let aiService: NativeAIService
   let syncService: NativeSyncClient?
   var sourceAction: ((String, ServiceJSON) async throws -> ServiceJSON)?
+  /// Supplied by the owning window coordinator; never infer a global key window.
+  var dialogWindow: () -> NSWindow? = { nil }
   var syncLibraryEvent: ((ServiceJSON) async -> Void)?
   var syncStorageEvent: ((ServiceJSON) async -> Void)?
   var portableLibrary: ((String) async throws -> [ServiceJSON])? {
@@ -26,6 +28,8 @@ final class NativeServicesModel: ObservableObject {
   var prepareNativeSync: ((String) async throws -> Void)?
   var nativeSyncAction: ((String, String, ServiceJSON, String?) async throws -> Void)?
   private var nativeSyncTasks: [UUID: Task<Void, Error>] = [:]
+  private var syncExportTasks: [UUID: Task<ServiceJSON, Error>] = [:]
+  var pendingSyncExportCount: Int { syncExportTasks.count }
   @Published private var nativeSyncState: [String: ServiceJSON] = [:]
   private var sharedBackend: NativeServicesModel?
   private var backendSubscription: AnyCancellable?
@@ -36,13 +40,15 @@ final class NativeServicesModel: ObservableObject {
   private var tasks: [Task<Void, Never>] = []
   private var profileTask: Task<Void, Never>?
   private var aiContextReset: Task<Void, Never>?
+  private var aiSubmissionID: UUID?
   private var profileID: String?
   private var syncStartupError: String?
   private var cleanupError: String?
   private var started = false
   private var shutdownTask: Task<Void, Never>?
 
-  init(store: BrowserStore, directory: URL, conversationProfile: NativeAIService.ConversationProfileReader? = nil, context: @escaping NativeAIService.ContextReader) {
+  init(store: BrowserStore, directory: URL, conversationProfile: NativeAIService.ConversationProfileReader? = nil,
+    aiTransport: any ServiceHTTPTransport = NativeServiceHTTPTransport(), context: @escaping NativeAIService.ContextReader) {
     self.store = store
     let libraryFeed = NativePortableLibraryReader(); self.libraryFeed = libraryFeed
     let active: NativeAIService.ProfileReader = { [store] in
@@ -51,7 +57,7 @@ final class NativeServicesModel: ObservableObject {
         return AIProfileScope(id: profile.id, isPrivate: profile.isPrivate)
       }
     }
-    aiService = NativeAIService(directory: directory, currentProfile: active, conversationProfile: conversationProfile, context: context)
+    aiService = NativeAIService(directory: directory, currentProfile: active, conversationProfile: conversationProfile, context: context, transport:aiTransport)
     do {
       syncService = try NativeSyncClient(directory: directory, getProfile: { [store] id in
         await MainActor.run {
@@ -61,10 +67,13 @@ final class NativeServicesModel: ObservableObject {
     } catch { syncService = nil; syncStartupError = error.localizedDescription }
   }
   /// Window presentation shares actors and durable storage with the application backend.
-  init(store: BrowserStore, sharing backend: NativeServicesModel) {
+  init(store: BrowserStore, sharing backend: NativeServicesModel, predecessor: Task<Void, Never>? = nil) {
     self.store = store; sharedBackend = backend.backend
     aiService = backend.aiService; syncService = backend.syncService
     libraryFeed = backend.libraryFeed; syncStartupError = backend.syncStartupError
+    // A reopened logical window reuses its conversation ID. Its first reset,
+    // status read, and request must follow every previous model's final clear.
+    aiContextReset = predecessor
   }
   private func observeBackend() {
     guard let sharedBackend, backendSubscription == nil else { return }
@@ -85,12 +94,13 @@ final class NativeServicesModel: ObservableObject {
     }
   }
   private func requireAIProfile(_ id: String) throws {
-    guard shutdownTask == nil, store.activeProfileID == id, store.state.activeProfile?.isPrivate == false else {
+    guard shutdownTask == nil, store.activeProfileID == id, store.state.activeProfile?.isPrivate == false,
+      store.owningWindowID == nil || store.state.windowSessions?.contains(where: { $0.id == store.owningWindowID && $0.isOpen }) == true else {
       throw ServiceError("PROFILE_CHANGED", "This window's profile changed. Review the request again.")
     }
   }
   func start() {
-    guard !started else { return }; started = true
+    guard !started, shutdownTask == nil else { return }; started = true
     observeBackend()
     tasks.append(Task { [weak self, aiService] in
       let stream = await aiService.events()
@@ -128,6 +138,7 @@ final class NativeServicesModel: ObservableObject {
     refreshContext()
   }
   func refreshContext() {
+    guard shutdownTask == nil else { return }
     let current = store.activeProfileID
     let isPrivate = store.state.activeProfile?.isPrivate ?? true
     let spaces = Set(store.state.spaces.filter { $0.profileID == current }.map(\.id))
@@ -142,6 +153,8 @@ final class NativeServicesModel: ObservableObject {
     if contextTabs != nextTabs { contextTabs = nextTabs }
     guard profileID != current else { return }
     cancelNativeSyncActions()
+    cancelSyncExports()
+    aiSubmissionID = nil
     let previousProfile = profileID ?? current, conversation = conversationID
     let precedingReset = aiContextReset
     aiContextReset = Task { [aiService] in
@@ -177,6 +190,7 @@ final class NativeServicesModel: ObservableObject {
     if status["latestReset"] != .null { aiConversation.receive(status["latestReset"]) }
   }
   func resetAIConversations(profileID: String) async {
+    guard shutdownTask == nil else { return }
     await aiService.clearProfileConversations(profileID: profileID)
     if store.activeProfileID == profileID {
       applyAI(await aiService.status(for: scope, conversationID: conversationID))
@@ -206,13 +220,123 @@ final class NativeServicesModel: ObservableObject {
     nativeSyncState[profileID] = ["pending":.array(pending), "errors":.array(errors)]
     if profileID == store.activeProfileID { applySync(sync) }
   }
+  var canSubmitAIQuestion: Bool {
+    (try? requireAIProfile(store.activeProfileID)) != nil && dialogWindow()?.isVisible == true &&
+      ai["profileId"].string == store.activeProfileID && ai["configured"].bool && !ai["busy"].bool &&
+      !aiConversation.busy && !aiConversation.submitting && aiConversation.contextChangeID == nil && aiConversation.pendingReview == nil
+  }
+  /// Shared by the Library composer and the explicit palette Ask action. Merely
+  /// opening the Library never invokes this method or shares page context.
+  func submitAIQuestion(_ value: String, expectedProfileID: String? = nil) async throws -> ServiceJSON {
+    let profile = expectedProfileID ?? store.activeProfileID
+    try requireAIProfile(profile)
+    guard let window = dialogWindow(), window.isVisible, !window.isMiniaturized else {
+      throw ServiceError("CANCELLED", "The question's browser window is unavailable.")
+    }
+    let identifier = window.identifier, number = window.windowNumber
+    let question = value.trimmingCharacters(in:.whitespacesAndNewlines)
+    guard !question.isEmpty, question.utf16.count <= 8000 else {
+      throw ServiceError("INPUT", "Enter a question of 1–8000 characters.")
+    }
+    guard ai["configured"].bool else { throw ServiceError("NOT_CONFIGURED", "Connect the selected provider in Settings first.") }
+    guard canSubmitAIQuestion, aiSubmissionID == nil else { throw ServiceError("BUSY", "Wait for the current answer or context change to finish.") }
+    let token = UUID(), conversation = aiConversation, generation = aiConversation.generation
+    let kind = conversation.context, grants = conversation.grants
+    let provider = ai["provider"], model = ai["model"], endpoint = ai["baseUrl"]
+    aiSubmissionID = token; conversation.submitting = true
+    defer { if aiSubmissionID == token { aiSubmissionID = nil; conversation.submitting = false } }
+    func validateOwner() throws {
+      try Task.checkCancellation(); try requireAIProfile(profile)
+      guard dialogWindow() === window, window.identifier == identifier, window.windowNumber == number else {
+        throw ServiceError("CANCELLED", "The question's browser window changed.")
+      }
+    }
+    func validate() throws {
+      try validateOwner()
+      guard aiSubmissionID == token, conversation.profileID == profile, conversation.generation == generation,
+        conversation.context == kind, conversation.grants == grants, conversation.contextChangeID == nil, conversation.pendingReview == nil else {
+        throw ServiceError("CONTEXT_CHANGED", "The browsing context changed. Review the selected pages before sending.")
+      }
+      guard kind == "research" || !grants.isEmpty else { throw ServiceError("CONTEXT", "Choose a page to share, or switch to web research.") }
+      for grant in grants {
+        guard grant.profileID == profile, grant.isReadable,
+          let tab = store.tab(grant.id), !tab.isClosed, tab.url == grant.url,
+          store.state.spaces.first(where: { $0.id == tab.spaceID })?.profileID == profile,
+          BrowserAddress.webURL(tab.url) != nil else {
+          throw ServiceError("CONTEXT_CHANGED", "A shared page changed or closed. Review the context before asking again.")
+        }
+      }
+    }
+    await aiContextReset?.value
+    try validate()
+    let status = try await aiService.handle("ai:status", expectedProfileID:profile, conversationID:conversationID)
+    try validate()
+    guard status["configured"].bool, !status["private"].bool else { throw ServiceError("NOT_CONFIGURED", "Connect the selected provider in Settings first.") }
+    guard !status["busy"].bool else { throw ServiceError("BUSY", "The previous request is still stopping. Try again in a moment.") }
+    guard status["provider"] == provider, status["model"] == model, status["baseUrl"] == endpoint else {
+      throw ServiceError("CONTEXT_CHANGED", "The AI connection changed. Review the request again.")
+    }
+    applyAI(status)
+    try validate()
+    let selected = kind == "research" ? [] : grants
+    let request: ServiceJSON = ["question":.string(question),"requestId":.string(UUID().uuidString),
+      "tabIds":.array(selected.map { .string($0.id) }),
+      "contextTabs":.array(selected.map { ["id":.string($0.id),"url":.string($0.url),"title":.string($0.title)] })]
+    conversation.begin(question:question, request:request)
+    do {
+      let answer = try await aiAction("ai:ask", payload:request)
+      try validateOwner()
+      conversation.receive(answer); return answer
+    } catch {
+      if conversation.profileID == profile { conversation.fail(error, request:request["requestId"].string) }
+      throw error
+    }
+  }
+  func requestAIContextReview(_ kind: String, selectedIDs: Set<String>) throws {
+    let profile = store.activeProfileID
+    try requireAIProfile(profile)
+    guard ["page", "tabs"].contains(kind), !aiConversation.busy, !aiConversation.submitting,
+      aiConversation.contextChangeID == nil, aiConversation.pendingReview == nil, let owner = dialogWindow(), owner.isVisible else {
+      throw ServiceError("BUSY", "Finish the current request before reviewing pages.")
+    }
+    let choices = contextTabs.filter { $0.profileID == profile && $0.isReadable }
+    aiConversation.pendingReview = NativeAIContextReview(profileID:profile, kind:kind, choices:choices,
+      selectedIDs:selectedIDs.intersection(choices.map(\.id)), owner:owner,
+      ownerIdentifier:owner.identifier, ownerNumber:owner.windowNumber)
+  }
+  func confirmAIContextReview(reviewID: UUID, selectedIDs: Set<String>) async throws {
+    guard let review = aiConversation.pendingReview, review.id == reviewID,
+      let token = aiConversation.beginContextChange() else { throw ServiceError("CANCELLED", "The page review changed.") }
+    defer { aiConversation.endContextChange(token) }
+    let grants = review.choices.filter { selectedIDs.contains($0.id) }
+    func validate() throws {
+      try Task.checkCancellation(); try requireAIProfile(review.profileID)
+      guard aiConversation.pendingReview?.id == reviewID, aiConversation.contextChangeID == token,
+        dialogWindow() === review.owner, review.owner.identifier == review.ownerIdentifier,
+        review.owner.windowNumber == review.ownerNumber, review.owner.isVisible,
+        !grants.isEmpty, grants.count == selectedIDs.count, grants.count <= (review.kind == "page" ? 1 : 6) else {
+        throw ServiceError("CANCELLED", "The page review or its browser window changed.")
+      }
+      for grant in grants {
+        guard let tab = store.tab(grant.id), !tab.isClosed, tab.url == grant.url,
+          store.state.spaces.first(where: { $0.id == tab.spaceID })?.profileID == review.profileID else {
+          throw ServiceError("CONTEXT_CHANGED", "A selected page changed. Review its new address before sharing.")
+        }
+      }
+    }
+    try validate()
+    _ = try await aiAction("ai:reset")
+    try validate()
+    aiConversation.context = review.kind; aiConversation.grants = grants; aiConversation.pendingReview = nil
+  }
   func aiAction(_ action: String, payload: ServiceJSON = [:]) async throws -> ServiceJSON {
     let profile = store.activeProfileID
+    try requireAIProfile(profile)
     await aiContextReset?.value
     try requireAIProfile(profile)
     if action == "ai:prepare" {
       guard store.state.activeProfile?.isPrivate == false else { throw ServiceError("PRIVATE","AI is unavailable in private profiles.") }
-      guard !aiConversation.busy else { throw ServiceError("BUSY","Stop the current response before changing context.") }
+      guard !aiConversation.busy, !aiConversation.submitting, aiConversation.contextChangeID == nil else { throw ServiceError("BUSY","Stop the current response before changing context.") }
       let intent = payload["intent"].string
       let prompts = [
         "summarize":"Summarize this page in five concise points. Highlight the main conclusion, useful details, and any important caveats. Cite the page.",
@@ -221,16 +345,19 @@ final class NativeServicesModel: ObservableObject {
         "research":"Research "
       ]
       aiConversation.prepare(payload["question"].string.isEmpty ? prompts[intent] ?? "" : payload["question"].string)
-      if ["summarize","explain","compare","research"].contains(intent) {
-        _ = try await aiService.handle("ai:reset", expectedProfileID: profile, conversationID: conversationID)
-        guard store.activeProfileID == profile, store.state.activeProfile?.isPrivate == false else {
-          throw ServiceError("PROFILE_CHANGED","The active profile changed.")
-        }
+      if ["summarize","explain","compare"].contains(intent) {
         let ids = payload["tabIds"].array.map(\.string)
         let tabs = contextTabs.filter { $0.profileID == profile && $0.isReadable }
-        aiConversation.grants = intent == "research" ? [] : ids.isEmpty ? Array(tabs.prefix(intent == "compare" ? 0 : 1)) : tabs.filter { ids.contains($0.id) }
-        aiConversation.context = intent == "research" ? "research" : intent == "compare" ? "tabs" : "page"
-        if intent != "research" { aiConversation.pendingReview = aiConversation.context }
+        let selected = ids.isEmpty ? Set(tabs.prefix(intent == "compare" ? 0 : 1).map(\.id)) : Set(ids)
+        try requestAIContextReview(intent == "compare" ? "tabs" : "page", selectedIDs:selected)
+      } else if intent == "research" {
+        guard let token = aiConversation.beginContextChange() else { throw ServiceError("BUSY", "Finish changing context first.") }
+        defer { aiConversation.endContextChange(token) }
+        let reset = try await aiService.handle("ai:reset", expectedProfileID:profile, conversationID:conversationID)
+        try requireAIProfile(profile)
+        guard aiConversation.contextChangeID == token else { throw ServiceError("CONTEXT_CHANGED", "The browsing context changed.") }
+        aiConversation.receive(reset)
+        aiConversation.grants = []; aiConversation.context = "research"; aiConversation.pendingReview = nil
       }
       return ["prepared":true]
     }
@@ -258,6 +385,23 @@ final class NativeServicesModel: ObservableObject {
     guard let syncService else { throw ServiceError("STORAGE", syncStartupError ?? "Synchronization is unavailable.") }
     let profile = payload.contains("profileId") ? payload["profileId"].string : store.activeProfileID
     try requireFocusedProfile(profile)
+    if action == "sync:export" {
+      // Capture the actual owner and displayed account/link before any service
+      // await. A delayed task cannot borrow a newer window or account.
+      guard let window = dialogWindow(), window.isVisible, !window.isMiniaturized else {
+        throw ServiceError("cancelled", "The export's browser window is unavailable.")
+      }
+      let identifier = window.identifier, number = window.windowNumber
+      let identity = syncExportIdentity(sync, profile:profile), token = UUID()
+      let task = Task { [weak self] () throws -> ServiceJSON in
+        guard let self else { throw CancellationError() }
+        return try await self.exportSyncRecovery(payload, profile:profile, window:window,
+          identifier:identifier, number:number, identity:identity, service:syncService)
+      }
+      syncExportTasks[token] = task
+      defer { syncExportTasks.removeValue(forKey:token) }
+      return try await withTaskCancellationHandler(operation: { try await task.value }, onCancel: { task.cancel() })
+    }
     if action == "sync:finish-profile-cleanup" {
       guard store.state.activeProfile?.isPrivate == false else { throw ServiceError("PRIVATE", "Profile cleanup is unavailable in private browsing.") }
       try await backend.recoverProfileDeletions(); applySync(await syncService.status(profileID: profile)); return ["complete":true]
@@ -281,21 +425,48 @@ final class NativeServicesModel: ObservableObject {
     }
     let result = try await syncService.handle(action, payload: payload, expectedProfileID: profile)
     applySync(await syncService.status(profileID: profile))
-    if action == "sync:export" {
-      let owner = sync["account"]["id"], endpoint = sync["endpoint"]
-      let panel = NSSavePanel(); panel.nameFieldStringValue = "Zacro Sync Recovery.json"
-      guard await panel.begin() == .OK, let url = panel.url else { return ["saved":false] }
-      let status = await syncService.status()
-      try requireFocusedProfile(profile)
-      guard owner == status["account"]["id"], endpoint == status["endpoint"] else { throw ServiceError("cancelled","The synchronization context changed.") }
-      // Re-resolve the rejected operation after the dialog so discarded or remapped changes cannot be exported.
-      let current = try await syncService.exportRejected(profile,id:payload["id"].string)
-      guard current == result else { throw ServiceError("cancelled","This unsynced change is no longer available.") }
-      try current.encoded().write(to:url,options:.atomic)
-      try FileManager.default.setAttributes([.posixPermissions:0o600],ofItemAtPath:url.path)
-      return ["saved":true]
-    }
     return result
+  }
+  private func syncExportIdentity(_ status: ServiceJSON, profile: String) -> ServiceJSON {
+    let link = status["profiles"].array.first { $0["profileId"].string == profile } ?? .null
+    return ["account":status["account"]["id"], "endpoint":status["endpoint"], "link":link["linkId"]]
+  }
+  private func requireSyncExportOwner(_ window: NSWindow, identifier: NSUserInterfaceItemIdentifier?,
+    number: Int, profile: String) throws {
+    try Task.checkCancellation()
+    try requireFocusedProfile(profile)
+    guard dialogWindow() === window, window.isVisible, !window.isMiniaturized,
+      window.identifier == identifier, window.windowNumber == number else {
+      throw ServiceError("cancelled", "The export's browser window changed.")
+    }
+  }
+  private func exportSyncRecovery(_ payload: ServiceJSON, profile: String, window: NSWindow,
+    identifier: NSUserInterfaceItemIdentifier?, number: Int, identity: ServiceJSON,
+    service: NativeSyncClient) async throws -> ServiceJSON {
+    func validate() async throws {
+      try requireSyncExportOwner(window, identifier:identifier, number:number, profile:profile)
+      let status = await service.status(profileID:profile)
+      try requireSyncExportOwner(window, identifier:identifier, number:number, profile:profile)
+      guard syncExportIdentity(status, profile:profile) == identity else {
+        throw ServiceError("cancelled", "The synchronization account or profile link changed.")
+      }
+    }
+    try await validate()
+    let result = try await service.handle("sync:export", payload:payload, expectedProfileID:profile)
+    try await validate()
+    let panel = NSSavePanel(); panel.nameFieldStringValue = "Zacro Sync Recovery.json"
+    guard await NativeWindowSheet.present(panel, for:window) == .OK, let url = panel.url else {
+      return ["saved":false]
+    }
+    try await validate()
+    // The rejected operation itself can be discarded/remapped while the sheet
+    // is open. Resolve it again, then recheck every owner before writing.
+    let current = try await service.exportRejected(profile, id:payload["id"].string)
+    try await validate()
+    guard current == result else { throw ServiceError("cancelled", "This unsynced change is no longer available.") }
+    try current.encoded().write(to:url,options:.atomic)
+    try FileManager.default.setAttributes([.posixPermissions:0o600],ofItemAtPath:url.path)
+    return ["saved":true]
   }
   func forgetProfile(_ id: String) async throws {
     if let sharedBackend { try await sharedBackend.forgetProfile(id); return }
@@ -342,29 +513,44 @@ final class NativeServicesModel: ObservableObject {
     for task in nativeSyncTasks.values { task.cancel() }
     nativeSyncTasks.removeAll()
   }
-  func shutdown() async {
-    if let shutdownTask { await shutdownTask.value; return }
+  private func cancelSyncExports() {
+    for task in syncExportTasks.values { task.cancel() }
+    syncExportTasks.removeAll()
+  }
+  /// Invalidate synchronously when detaching a window model. The returned task
+  /// is retained and can be passed to its replacement as a startup barrier.
+  @discardableResult func beginShutdown() -> Task<Void, Never> {
+    if let shutdownTask { return shutdownTask }
+    let precedingReset = aiContextReset
+    let retiringProfile = profileID ?? store.activeProfileID, retiringConversation = conversationID
+    let presentationOnly = sharedBackend != nil
+    let shutdown = Task { [self, aiService, syncService] in
+      if presentationOnly {
+        await precedingReset?.value
+        await aiService.clearConversation(profileID:retiringProfile, conversationID:retiringConversation)
+        aiContextReset = nil
+        started = false; profileID = nil
+        aiConversation.activate(profileID:"", isPrivate:true)
+        contextTabs = []; ai = [:]; sync = [:]
+      } else {
+        async let ai: Void = aiService.close()
+        async let sync: Void = syncService?.close() ?? ()
+        _ = await (ai, sync)
+      }
+    }
+    // No suspension occurs before this assignment, so old controls, repeated
+    // close calls and start()/refreshContext() can never revive this model.
+    shutdownTask = shutdown
     cancelNativeSyncActions()
+    cancelSyncExports()
+    aiSubmissionID = nil; aiConversation.submitting = false
     profileTask?.cancel(); profileTask = nil
     tasks.forEach { $0.cancel() }; tasks.removeAll()
     backendSubscription?.cancel(); backendSubscription = nil
-    if sharedBackend != nil {
-      await aiContextReset?.value
-      await aiService.clearConversation(profileID: profileID ?? store.activeProfileID, conversationID: conversationID)
-      aiContextReset = nil
-      started = false; profileID = nil
-      aiConversation.activate(profileID: "", isPrivate: true)
-      contextTabs = []; ai = [:]; sync = [:]
-      return
-    }
-    let shutdown = Task { [aiService, syncService] in
-      async let ai: Void = aiService.close()
-      async let sync: Void = syncService?.close() ?? ()
-      _ = await (ai, sync)
-    }
-    shutdownTask = shutdown
-    await shutdown.value
+    return shutdown
   }
+  func shutdown() async { await beginShutdown().value }
+
   func close() async { await shutdown() }
 }
 

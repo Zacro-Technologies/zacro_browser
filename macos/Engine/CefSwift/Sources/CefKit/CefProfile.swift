@@ -1,6 +1,15 @@
 import CCef
 import Foundation
 
+/// A retained native identity, used only while a Chrome-owned window outlives
+/// its tab's close callback. It never initializes or names a profile.
+final class CefExistingRequestContext: @unchecked Sendable {
+    let raw: UnsafeMutablePointer<cef_request_context_t>
+    init(raw: UnsafeMutablePointer<cef_request_context_t>) { self.raw = raw }
+    deinit { cefRelease(UnsafeMutableRawPointer(raw)) }
+    @MainActor func belongs(to profile: CefProfile) -> Bool { profile.matchesExistingContext(raw) }
+}
+
 /// An isolated browsing profile — a CEF request context with its own cookies,
 /// `localStorage`, cache, and HTTP state.
 ///
@@ -109,6 +118,17 @@ public final class CefProfile {
             cefAddRef(UnsafeMutableRawPointer(raw))
             return raw
         }
+    }
+
+    /// Compares an existing native context without materializing a new profile.
+    /// CEF can return another wrapper for the same BrowserContext; pointer or
+    /// cache-path equality is not the context identity contract.
+    func matchesExistingContext(_ context: UnsafeMutablePointer<cef_request_context_t>) -> Bool {
+        if kind == .global { return (context.pointee.is_global?(context) ?? 0) != 0 }
+        guard let raw, let compare = context.pointee.is_same else { return false }
+        // The C++ wrapper consumes the argument's transferred reference.
+        cefAddRef(UnsafeMutableRawPointer(raw))
+        return compare(context, raw) != 0
     }
 
     /// Chrome BrowserViews require a fully initialized request context.

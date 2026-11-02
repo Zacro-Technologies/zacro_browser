@@ -11,7 +11,7 @@
       "Identity acceptance requires loopback");
     return url;
   };
-  const input = ({ baseURL, token = "zacro-auth-" + crypto.randomUUID() }, mode) => {
+  const input = ({ baseURL, token = "zacro-auth-" + crypto.randomUUID(), holdMilliseconds }, mode) => {
     assert(/^[A-Za-z0-9_-]{1,96}$/.test(token), "Invalid identity fixture token");
     const base = origin(baseURL);
     const callback = new URL(chrome.identity.getRedirectURL("zacro-native/" + token));
@@ -19,6 +19,11 @@
     const url = new URL(mode === "redirect" ? "/native-auth/redirect" : "/native-auth/document", base);
     url.searchParams.set("callback", callback.href); url.searchParams.set("token", token);
     if (mode !== "redirect") url.searchParams.set("mode", mode);
+    if (holdMilliseconds !== undefined) {
+      assert(mode === "hold" && Number.isInteger(holdMilliseconds) && holdMilliseconds >= 20000 && holdMilliseconds <= 90000,
+        "Invalid bounded identity fixture hold duration");
+      url.searchParams.set("hold_ms", String(holdMilliseconds));
+    }
     return { token, baseURL: base.href, callback: callback.href, url: url.href };
   };
   const failure = async operation => {

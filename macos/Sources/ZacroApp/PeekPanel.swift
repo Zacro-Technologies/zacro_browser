@@ -43,6 +43,11 @@ final class PeekPanelController {
     error: String? = nil, url: String = "", retry: (() -> Void)? = nil
   ) {
     guard let content = parent.contentView else { return }
+    // A failed document is explicitly hidden while this retained tint/card
+    // keeps its geometry. Recovery (or an asynchronously arriving native
+    // window) must restore presentation even if rounding already reached the
+    // final animation frame and no further geometry callback will fire.
+    let needsPreviewPresentation = preview.map { orderedPreview !== $0 || !$0.isVisible } ?? false
     let replacesSnapshot = closingSnapshot
     if closingSnapshot {
       cancelMotion(); closingSnapshot = false; model.snapshot = nil
@@ -90,6 +95,9 @@ final class PeekPanelController {
     } else {
       applyPresentation()
       if !panel.isVisible { panel.alphaValue = 1; panel.orderFront(nil) }
+    }
+    if needsPreviewPresentation, presentationFrame.width > 0, presentationFrame.height > 0 {
+      updatePreview?(presentationFrame)
     }
     if let preview, orderedPreview !== preview {
       preview.order(.above, relativeTo: panel.windowNumber); orderedPreview = preview

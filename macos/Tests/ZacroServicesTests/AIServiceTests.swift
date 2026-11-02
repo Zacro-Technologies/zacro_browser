@@ -295,6 +295,50 @@ final class AIServiceTests: XCTestCase {
     try await vault.set(id,key:"session-secret",storage:"session")
     expectEqual(try await vault.get(id),"session-secret")
   }
+  func testCorruptCredentialIndexCannotAcknowledgeProtectedKeyDeletion() async throws {
+    let root = try directory(), secrets = MemorySecrets()
+    let original = AICredentialVault(directory: root, store: secrets)
+    let own = AICredentialVault.id(profile: "removed", provider: .openai, endpoint: NativeAIProvider.openai.endpoint)
+    let other = AICredentialVault.id(profile: "retained", provider: .openai, endpoint: NativeAIProvider.openai.endpoint)
+    try await original.set(own, key: "fixture-deleted-profile", storage: "encrypted")
+    try await original.set(other, key: "fixture-other-profile", storage: "encrypted")
+    let file = root.appendingPathComponent("ai-credentials-index.json")
+    let valid = try Data(contentsOf: file)
+    let key = "ai:" + ServiceFiles.hash(root.standardizedFileURL.path) + ":" + own
+    let protected = try secrets.read(key)
+    for invalid in ["not JSON", #"{"version":1,"keys":{}}"#, #"{"version":1,"keys":["invalid"]}"#, #"{"version":1,"keys":[false]}"#] {
+      let corrupted = Data(invalid.utf8)
+      try corrupted.write(to: file)
+      let reopened = AICredentialVault(directory: root, store: secrets)
+      do { try await reopened.remove(own); XCTFail("An unreadable index cannot confirm disconnect") } catch { }
+      do { try await reopened.forgetProfile("removed"); XCTFail("An unreadable index cannot confirm profile cleanup") } catch { }
+      do { try await reopened.set(own, key: "replacement", storage: "encrypted"); XCTFail("An unreadable index must not be overwritten") } catch { }
+      XCTAssertEqual(try secrets.read(key), protected)
+      XCTAssertEqual(try Data(contentsOf: file), corrupted)
+    }
+    // Recovery makes the same cleanup retry succeed without deleting another
+    // profile's protected key. No real Keychain item is involved.
+    try valid.write(to: file)
+    let recovered = AICredentialVault(directory: root, store: secrets)
+    try await recovered.forgetProfile("removed")
+    XCTAssertNil(try secrets.read(key))
+    expectEqual(try await recovered.get(other), "fixture-other-profile")
+  }
+  func testCorruptCredentialIndexStillAllowsEphemeralConnectionWithoutStorageAccess() async throws {
+    let root = try directory(), secrets = MemorySecrets()
+    let file = root.appendingPathComponent("ai-credentials-index.json"), corrupted = Data("unreadable".utf8)
+    try corrupted.write(to: file)
+    secrets.unavailable = true
+    let vault = AICredentialVault(directory: root, store: secrets)
+    let id = AICredentialVault.id(profile: "session", provider: .openai, endpoint: NativeAIProvider.openai.endpoint)
+    try await vault.set(id, key: "ephemeral-fixture", storage: "session")
+    expectEqual(try await vault.get(id), "ephemeral-fixture")
+    expectEqual(await vault.status(id)["credentialStorage"], "session")
+    XCTAssertEqual(secrets.reads, 0)
+    XCTAssertEqual(try Data(contentsOf: file), corrupted)
+    await vault.close()
+    expectEqual(await vault.status(id)["configured"], false)
+  }
   func testOfficialRequestBodiesAndNoFallback() async throws {
     let transport = FixtureTransport(["status":"completed","output":[["type":"message","content":[["type":"output_text","text":"Answer"]]]]])
     let client = NativeAPIClient(transport:transport)

@@ -21,6 +21,9 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
       if let oldValue { engine.setProfileMaintenance(oldValue, active: false) }
       if let deletingProfileID { engine.setProfileMaintenance(deletingProfileID, active: true) }
       else { resumeApplicationIntents() }
+      for owner in windows.values { owner.peekOpening.cancel() }
+      peekLinks.refresh()
+      webDialogs.refresh()
     }
   }
   var clearingHistoryProfiles: Set<String> = []
@@ -29,6 +32,10 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
   lazy var downloads = NativeDownloads(store: store, engine: engine)
   lazy var bookmarks = NativeBookmarkSync(engine: engine, store: store)
   lazy var navigation = NativeNavigationCoordinator(engine: engine, store: store)
+  lazy var peekLinks = NativePeekLinkCoordinator(application: self)
+  lazy var webDialogs = NativeWebDialogCoordinator(application: self)
+  lazy var historyVisits = NativeHistoryCoordinator(application: self)
+  lazy var pageRetirements = NativePageRetirementCoordinator(application: self)
   lazy var services = NativeServicesModel(store: store, directory: engine.dataDirectory,
     conversationProfile: { [weak self] identifier in
       guard let coordinator = self else { return nil }
@@ -50,6 +57,9 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
   private var runtimeCapabilities: CefNativeCapabilities?
   private var observedNativeProfiles: Set<String> = []
   private var libraryStatus: [String: [String: String]] = [:]
+  private var privateProfileCleanup: [String: Task<Void, Never>] = [:]
+  private var retiredPrivateProfileIDs: Set<String> = []
+  private var privateProfileCleanupErrors: [String: Error] = [:]
   private var applicationIntents = ApplicationIntentQueue()
   private var applicationReady = false
   private var drainingApplicationIntents = false
@@ -190,10 +200,15 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
       self?.resumeApplicationIntents()
     }
     navigation.beforeRestore = { [weak self] page in
-      guard let self, !page.isPrivate, self.store.document(id: page.id) != nil else { return }
+      guard let self, self.store.document(id: page.id) != nil else { return }
       self.inspectRuntimeCapabilities()
       await self.runtimeCapabilityTask?.value
       if self.extensionBrowser.enabled { try await self.extensionBrowser.prepareInitialNavigation(page) }
+      try await self.peekLinks.prepareBootstrap(page)
+    }
+    navigation.afterRestore = { [weak self] page in
+      guard let self, self.store.document(id: page.id) != nil else { return }
+      try await self.peekLinks.prepare(page)
     }
     navigation.didFailPreparation = { [weak self] id, message in
       guard let self, let owner = self.owner(tabID: id), owner.selectedDocumentID == id,
@@ -207,19 +222,27 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
     }
     engine.onTerminationChanged = { [weak self] terminating in
       guard let self else { return }
+      self.peekLinks.refresh()
       if terminating {
         self.store.save()
         do { try self.store.flush() } catch { self.focusedCoordinator?.showError(error.localizedDescription) }
-      } else { self.scheduleAllWindows(); self.resumeApplicationIntents() }
+      } else {
+        for id in self.retiredPrivateProfileIDs { self.scheduleRetiredPrivateProfileCleanup(id) }
+        self.scheduleAllWindows(); self.resumeApplicationIntents()
+      }
     }
     engine.beforeTermination = { [weak self] in
       guard let self else { return }
       self.applicationReady = false
       self.applicationIntents.removeAll()
       for owner in self.windows.values { owner.prepareTermination() }
+      await self.peekLinks.close()
+      self.historyVisits.close()
+      await self.webDialogs.close()
       for owner in self.windows.values { await owner.closeServicesPresentation() }
       await self.downloads.close()
       await self.bookmarks.close()
+      for cleanup in Array(self.privateProfileCleanup.values) { await cleanup.value }
       await self.extensionBrowser.close()
       await self.extensionSync.close()
       await self.services.close()
@@ -335,8 +358,8 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
     }
   }
   private func windowForManagedPage(_ page: ChromiumPage, foreground: Bool) throws -> BrowserWindowCoordinator {
-    guard !page.isPrivate, deletingProfileID != page.profileID, !engine.isTerminating,
-      store.state.profiles.contains(where: { $0.id == page.profileID && !$0.isPrivate }) else { throw CancellationError() }
+    guard deletingProfileID != page.profileID, !engine.isTerminating,
+      store.state.profiles.contains(where: { $0.id == page.profileID && $0.isPrivate == page.isPrivate }) else { throw CancellationError() }
     let matching = windows.values.filter { $0.windowContext.isOpen && !$0.windowContext.isClosing && $0.store.activeProfileID == page.profileID }
     if let owner = matching.first(where: { $0 === focusedCoordinator }) ?? matching.first {
       if foreground { repository.focusWindow(owner.windowContext.id); owner.windowContext.show() }
@@ -352,8 +375,8 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
     for id in privateProfiles {
       downloads.removeProfile(id)
       favicons.clear(profile: id)
-      do { try engine.releasePrivateProfile(id) }
-      catch { fputs("Zacro could not release a private context: \(error.localizedDescription)\n", stderr) }
+      retiredPrivateProfileIDs.insert(id)
+      scheduleRetiredPrivateProfileCleanup(id)
     }
     Task { [weak self] in await self?.extensionBrowser.didCloseWindow(owner.windowContext.id) }
     scheduleAllWindows()
@@ -361,6 +384,39 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
     // its hidden session. Routes below rebind every action at invocation time.
     (focusedCoordinator ?? owner).installMenus()
     resumeApplicationIntents()
+  }
+
+  private func scheduleRetiredPrivateProfileCleanup(_ id: String) {
+    guard retiredPrivateProfileIDs.contains(id), privateProfileCleanup[id] == nil,
+      !engine.isTerminating else { return }
+    privateProfileCleanupErrors.removeValue(forKey: id)
+    privateProfileCleanup[id] = Task { [weak self] in
+      guard let self else { return }
+      defer { self.privateProfileCleanup.removeValue(forKey: id) }
+      do {
+        try await self.extensionBrowser.retirePrivateProfile(id)
+        try self.engine.releasePrivateProfile(id)
+        self.retiredPrivateProfileIDs.remove(id)
+      } catch {
+        self.privateProfileCleanupErrors[id] = error
+        fputs("Zacro could not release a private context: \(error.localizedDescription)\n", stderr)
+      }
+    }
+  }
+  /// Call only after Core removes the last private owner/profile. The retained
+  /// ID survives an overlapping Quit and is retried if that Quit is cancelled.
+  func retirePrivateProfileAfterModelRemoval(_ id: String) async throws {
+    retiredPrivateProfileIDs.insert(id)
+    scheduleRetiredPrivateProfileCleanup(id)
+    try await waitForPrivateProfileCleanup(id)
+  }
+  /// Read-only completion seam: never creates a context or starts cleanup.
+  func waitForPrivateProfileCleanup(_ id: String) async throws {
+    if let task = privateProfileCleanup[id] { await task.value }
+    guard !retiredPrivateProfileIDs.contains(id) else {
+      throw privateProfileCleanupErrors[id]
+        ?? CefDevToolsError.rejected("Private context cleanup remains pending runtime shutdown or retry.")
+    }
   }
 
   func newWindow() {
@@ -405,10 +461,13 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
     guard !engine.isTerminating, deletingProfileID != request.profileID else { throw CancellationError() }
     let moving = expandedTabIDs(request.movingTabID.map { [$0] } ?? [])
     let oldOwners = Dictionary(uniqueKeysWithValues: moving.compactMap { id in owner(tabID: id).map { (id, $0) } })
+    guard oldOwners.count == moving.count else { throw CancellationError() }
+    let originals = Dictionary(uniqueKeysWithValues: moving.compactMap { id in store.tab(id).map { (id, $0) } })
     for id in moving { try await oldOwners[id]?.prepareTabTransfer(id) }
     try await request.authorize()
     guard !engine.isTerminating, deletingProfileID != request.profileID,
       oldOwners.values.allSatisfy({ $0.windowContext.isOpen && !$0.windowContext.isClosing }) else { throw CancellationError() }
+    try validatePreparedTransfers(moving, originals: originals, sources: oldOwners)
     var bounds = BrowserWindowBounds()
     bounds.sizeKind = "window"
     if let value = request.left { bounds.x = Double(value) }
@@ -467,13 +526,38 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
       !destination.windowContext.isClosing, !engine.isTerminating else { throw CancellationError() }
     let sources = Dictionary(uniqueKeysWithValues: ids.compactMap { id in owner(tabID: id).map { (id, $0) } })
     guard sources.count == ids.count else { throw CancellationError() }
+    let originals = Dictionary(uniqueKeysWithValues: ids.compactMap { id in store.tab(id).map { (id, $0) } })
     for id in ids { try await sources[id]?.prepareTabTransfer(id) }
     try await authorize()
     guard destination.windowContext.isOpen, !destination.windowContext.isClosing,
       !engine.isTerminating, sources.values.allSatisfy({ $0.windowContext.isOpen && !$0.windowContext.isClosing }) else { throw CancellationError() }
+    try validatePreparedTransfers(ids, originals: originals, sources: sources)
     try repository.moveTabs(ids, toWindowID: id, index: index)
     for id in ids where sources[id] !== destination { transferPresentation(id, from: sources[id], to: destination) }
     scheduleAllWindows()
+  }
+
+  /// Authorization can suspend after preparation. Recheck the exact owners
+  /// immediately before the synchronous model commit and native reparenting.
+  private func validatePreparedTransfers(_ ids: [String], originals: [String: BrowserTab],
+    sources: [String: BrowserWindowCoordinator]) throws {
+    try Task.checkCancellation()
+    for id in ids {
+      guard let source = sources[id], owner(tabID: id) === source,
+        let original = originals[id], let tab = store.tab(id), !tab.isClosed,
+        tab.createdAt == original.createdAt, tab.windowID == original.windowID,
+        let profile = store.profileID(for: tab), profile == store.profileID(for: original),
+        deletingProfileID != profile,
+        !source.hasPendingLiveNavigation(id), !source.hasPendingLiveNavigation("peek:" + id) else {
+        throw CancellationError()
+      }
+      for key in [id, "peek:" + id] {
+        if let page = engine.pages[key] {
+          guard page.id == key, page.ownerWindowID == source.windowContext.id,
+            page.profileID == profile else { throw CancellationError() }
+        }
+      }
+    }
   }
 
   func inspectRuntimeCapabilities() {

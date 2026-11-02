@@ -7,7 +7,8 @@ import ZacroCore
 import ZacroServices
 
 /// Exercises the real application owners in a gated, disposable profile. This
-/// supplements desktop acceptance; it does not synthesize mouse/keyboard input.
+/// supplements desktop acceptance. Any renderer input uses the owned loopback
+/// fixture's DevTools session; it does not dispatch desktop input.
 @MainActor
 final class BrowserIntegrationAcceptance {
   private let application: ApplicationCoordinator
@@ -17,6 +18,7 @@ final class BrowserIntegrationAcceptance {
   private var finished = false
   private var nativeExtensions = false
   private var extensionFixturePassed = false
+  private let suite = ProcessInfo.processInfo.environment["ZACRO_NATIVE_ACCEPTANCE_SUITE"] ?? "all"
   init(application: ApplicationCoordinator) { self.application = application }
 
   func run(url: URL) {
@@ -26,14 +28,93 @@ final class BrowserIntegrationAcceptance {
     }
     task = Task { [weak self] in
       guard let self else { return }
-      do { try await self.checkApplication(url: url); self.finish(nil) }
+      do {
+        if self.suite == "all" { try await self.checkApplication(url: url) }
+        else { try await self.checkFocusedSuite(url: url) }
+        self.finish(nil)
+      }
       catch { self.finish(error.localizedDescription) }
+    }
+  }
+
+  /// Focused runs use the same production fixtures and disposable application
+  /// owners. Their report names the suite and never claims full-app acceptance.
+  private func checkFocusedSuite(url: URL) async throws {
+    guard ["extensions", "extension-actions", "extension-services", "download-retirement", "windows", "peek", "navigation", "capture", "sidebar"].contains(suite),
+      let owner = application.focusedCoordinator else { throw Failure("Unknown acceptance suite or missing owner") }
+    let engine = application.engine
+    nativeExtensions = try await engine.nativeCapabilities().extensionBrowser == true
+    try require(nativeExtensions, "focusedSuiteUsesCustomNativeRuntime")
+    let directory = engine.dataDirectory.appendingPathComponent("AcceptanceDownloads", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,
+      attributes: [.posixPermissions: 0o700])
+    application.downloads.destinationDirectory = directory
+    owner.windowContext.show(); owner.actions.palette = false
+    try await wait("focusedSuiteShellReady") { owner.actions.contentFrame.width > 400 }
+    guard let tab = owner.store.createTab(address: url.appendingPathComponent("focused-suite-source").absoluteString) else {
+      throw Failure("Focused suite source creation")
+    }
+    let page = try await owner.ensurePageReady(tab)
+    try await application.navigation.waitForRestore(page)
+    try await loaded(page)
+    try await page.ready().setDownloadDirectory(directory)
+    if suite == "sidebar" {
+      for name in try await NativeSidebarAccessibilityAcceptance.run(application: application, url: url, originalOwner: owner) {
+        try require(true, name)
+      }
+    } else if suite == "windows" {
+      for name in try await NativeWindowTransferAcceptance.run(application: application, url: url, originalOwner: owner) {
+        try require(true, name)
+      }
+    } else if suite == "extension-actions" {
+      try await checkExtensionFixture(url: url, owner: owner, page: page, includeProtocolFixtures: false)
+    } else if suite == "extension-services" {
+      try await checkExtensionFixture(url: url, owner: owner, page: page,
+        includeProtocolFixtures: false, servicesOnly: true)
+    } else if suite == "download-retirement" {
+      for name in try await NativeDownloadRetirementAcceptance.run(application: application, owner: owner, url: url) {
+        try require(true, name)
+      }
+    } else if suite == "extensions" {
+      try await checkPrivateNativePDF(url: url, owner: owner)
+      try await checkExtensionFixture(url: url, owner: owner, page: page)
+    } else if suite == "peek" {
+      for name in try await NativePeekBootstrapAcceptance.run(application: application, url: url, originalOwner: owner) {
+        try require(true, name)
+      }
+      for name in try await NativePeekLinkRuntimeAcceptance.run(application: application, url: url, originalOwner: owner) {
+        try require(true, name)
+      }
+      for name in try await NativePeekReplacementAcceptance.run(application: application, url: url, originalOwner: owner) {
+        try require(true, name)
+      }
+    } else if suite == "capture" {
+      for name in try await NativeTabCaptureAcceptance.run(application: application, url: url, originalOwner: owner) {
+        try require(true, name)
+      }
+    } else {
+      for name in try await NativeNavigationCloseAcceptance.run(application: application, url: url, originalOwner: owner) {
+        try require(true, name)
+      }
+      for name in try await NativeNavigationVetoAcceptance.run(application: application, url: url, originalOwner: owner) {
+        try require(true, name)
+      }
+      for name in try await NativeNavigationPromotionAcceptance.run(application: application, url: url, originalOwner: owner) {
+        try require(true, name)
+      }
+      for name in try await NativeRetirementRuntimeAcceptance.run(application: application, url: url, originalOwner: owner) {
+        try require(true, name)
+      }
     }
   }
 
   private func checkApplication(url: URL) async throws {
     try checkAIResetOrdering()
     let engine = application.engine
+    let downloadDirectory = engine.dataDirectory.appendingPathComponent("AcceptanceDownloads", isDirectory: true)
+    try FileManager.default.createDirectory(at: downloadDirectory, withIntermediateDirectories: false,
+      attributes: [.posixPermissions: 0o700])
+    application.downloads.destinationDirectory = downloadDirectory
     guard let first = application.focusedCoordinator else { throw Failure("No application window") }
     try await wait("initialShellLayout") { first.actions.contentFrame.width > 400 }
     guard let firstWindow = first.window else { throw Failure("No application window presentation") }
@@ -41,15 +122,28 @@ final class BrowserIntegrationAcceptance {
     for (name, passed) in NativeSpaceViewportAcceptance.check() { try require(passed, name) }
     for (name, passed) in NativeThemeColorWellAcceptance.check() { try require(passed, name) }
     for (name, passed) in NativeThemeColorAcceptance.check() { try require(passed, name) }
+    for (name, passed) in await NativeCommandInterfaceAcceptance.check() { try require(passed, name) }
+    for (name, passed) in NativePageContextMenuAcceptance.check() { try require(passed, name) }
+    for (name, passed) in NativePeekLinkAcceptance.check() { try require(passed, name) }
     for (name, passed) in await NativeWindowDialogOwnerAcceptance.check() { try require(passed, name) }
     try await checkNativeWindowSheets(owner: firstWindow)
     first.windowContext.show()
+    for name in try await NativeAIModelAcceptance.run(window: firstWindow) { try require(true, name) }
+    for name in try await NativeSidebarAccessibilityAcceptance.run(application: application, url: url, originalOwner: first) {
+      try require(true, name)
+    }
     first.actions.palette = false
     guard let tab = first.store.createTab(address: url.appendingPathComponent("first").absoluteString) else { throw Failure("First tab creation") }
     let page = try await first.ensurePageReady(tab)
     try await application.navigation.waitForRestore(page)
     try await loaded(page)
+    try await wait("loadedPageOffersSplitButNotStop") {
+      first.actions.runtimeCommands.first(where: { $0.id == "split" })?.available == true
+        && first.actions.runtimeCommands.first(where: { $0.id == "stop" })?.available == false
+    }
     let browser = try await page.ready(), nativeID = browser.id
+    try browser.setDownloadDirectory(downloadDirectory)
+    try require(true, "downloadDestinationUsesExactBrowserRequestContext")
     var permissionOrigin = URLComponents()
     permissionOrigin.scheme = url.scheme; permissionOrigin.host = url.host; permissionOrigin.port = url.port
     guard let origin = permissionOrigin.url?.absoluteString else { throw Failure("Fixture origin") }
@@ -78,6 +172,14 @@ final class BrowserIntegrationAcceptance {
     first.actions.palette = false
     let paletteDraft = try await browser.devTools.evaluate("document.querySelector('#draft').value") as? String
     try require(engine.pages[tab.id] === page && paletteDraft == "keep this draft", "paletteRetainsLiveDocument")
+    guard !first.services.ai["configured"].bool else { throw Failure("Acceptance requires an unconfigured AI profile") }
+    first.actions.openPalette()
+    first.actions.query = "Keep this question until AI is connected"
+    first.runCommand("ai")
+    try require(!first.actions.palette && first.actions.library == "AI"
+      && first.services.aiConversation.draft == "Keep this question until AI is connected"
+      && !first.services.aiConversation.busy, "disconnectedAIShortcutPreservesQuestionWithoutSending")
+    first.actions.library = nil
     let savedTheme = first.store.state.activeSpace?.theme
     try require(first.actions.performInterfaceCommand("space-theme"), "themeEditorCommandOpensOwnedPresentation")
     try await wait("themeEditorHasOwnedVisibleView", record: false) {
@@ -87,6 +189,7 @@ final class BrowserIntegrationAcceptance {
     guard let themeWindow = first.actions.themeEditorWindow else { throw Failure("Theme editor presentation") }
     try await Task.sleep(for: .milliseconds(220))
     try NativeViewRenderEvidence.capture("theme-editor", window: themeWindow)
+    try await NativeHomePageRenderEvidence.capture(directory: engine.dataDirectory)
     for (name, passed) in NativeThemeColorWellAcceptance.checkHosted(in: themeWindow) { try require(passed, name) }
     first.actions.themeEditor = false
     try await wait("themeEditorDismissesItsOwnedView", record: false) {
@@ -194,9 +297,12 @@ final class BrowserIntegrationAcceptance {
     first.store.selectSpace(id: originalSpace)
     first.store.selectTab(id: tab.id)
 
+    let windowsBeforeSecond = Set(application.windows.keys)
     application.newWindow()
     try await wait("secondApplicationShell") { application.windows.values.filter { $0.windowContext.isOpen }.count == 2 }
-    guard let second = application.windows.values.first(where: { $0 !== first }) else { throw Failure("Second window") }
+    guard let second = application.windows.values.first(where: {
+      !windowsBeforeSecond.contains($0.windowContext.id) && $0.windowContext.isOpen && !$0.windowContext.isClosing
+    }) else { throw Failure("Second window") }
     try await application.moveTabs([tab.id], toWindowID: second.windowContext.id, index: 0, authorize: {})
     second.store.selectTab(id: tab.id)
     second.layoutPages()
@@ -222,8 +328,11 @@ final class BrowserIntegrationAcceptance {
     ])
     try require(context.count == 1 && context[0].text.contains("Approved context from its owning window."),
       "approvedContextUsesTabOwnerAcrossSameProfileWindows")
+    let windowsBeforeThird = Set(application.windows.keys)
     application.newWindow()
-    guard let third = application.windows.values.first(where: { $0 !== first && $0 !== second }) else {
+    guard let third = application.windows.values.first(where: {
+      !windowsBeforeThird.contains($0.windowContext.id) && $0.windowContext.isOpen && !$0.windowContext.isClosing
+    }) else {
       throw Failure("Saved window setup")
     }
     try await checkActionPreparationContext(owner: third, other: first)
@@ -236,9 +345,12 @@ final class BrowserIntegrationAcceptance {
     let savedIDs = Set(third.store.state.tabs.map(\.id)), closedNativeID = third.windowContext.nativeID
     guard let savedSplit = third.store.split(for: savedLeft.id) else { throw Failure("Saved window split") }
     _ = try await third.ensurePageReady(savedLeft)
+    let closingServices = third.services
     let didClose = await third.requestCloseWindow()
     try require(didClose && application.repository.savedWindows.contains(where: { $0.id == third.windowContext.id }),
       "closedWindowAppearsInSavedWindows")
+    try require(closingServices.dialogWindow() == nil && closingServices.pendingSyncExportCount == 0,
+      "closedWindowCannotOwnServiceDialogs")
     let reopened = try application.reopenWindow(id: third.windowContext.id)
     try require(reopened === third && reopened.windowContext.nativeID != closedNativeID
       && Set(reopened.store.state.tabs.map(\.id)) == savedIDs
@@ -256,6 +368,11 @@ final class BrowserIntegrationAcceptance {
     try require(first.services.aiService === second.services.aiService
       && first.services.aiService === application.services.aiService
       && first.services.syncService === second.services.syncService, "windowServicesShareOneBackend")
+    try require(first.services.dialogWindow() === first.window
+      && second.services.dialogWindow() === second.window, "serviceDialogsRetainTheirOwnWindow")
+    let capturedSyncProfile = first.store.activeProfileID, capturedSyncModel = first.services
+    guard let syncService = capturedSyncModel.syncService else { throw Failure("Synchronization service missing") }
+    let previousSyncEndpoint = await syncService.status()["endpoint"]
     let otherProfile = first.store.profileID(for: other)!
     first.store.selectSpace(id: other.spaceID)
     first.services.refreshContext(); second.services.refreshContext()
@@ -265,6 +382,22 @@ final class BrowserIntegrationAcceptance {
     }
     first.windowContext.show()
     try await wait("differentProfileWindowGainsFocus", record: false) { application.focusedCoordinator === first }
+    var rejectedStaleSyncForm = false
+    do {
+      _ = try await capturedSyncModel.syncAction("sync:configure", payload: [
+        "profileId": .string(capturedSyncProfile), "endpoint": "https://sync-should-not-change.invalid",
+      ])
+    } catch let error as ServiceError { rejectedStaleSyncForm = error.code == "PROFILE_CHANGED" }
+    let currentSyncEndpoint = await syncService.status()["endpoint"]
+    try require(rejectedStaleSyncForm && currentSyncEndpoint == previousSyncEndpoint,
+      "staleSyncFormCannotConfigureAnotherProfile")
+    let unownedServices = NativeServicesModel(store: first.store, sharing: application.services)
+    var rejectedUnownedExport = false
+    do {
+      _ = try await unownedServices.syncAction("sync:export", payload: ["id": "fixture-missing-change"])
+    } catch let error as ServiceError { rejectedUnownedExport = error.code == "cancelled" }
+    try require(rejectedUnownedExport && unownedServices.pendingSyncExportCount == 0
+      && first.window?.attachedSheet == nil, "syncExportCannotBorrowTheKeyWindow")
     let backgroundContext = try await application.readContext([
       AIContextGrant(id: tab.id, url: URL(string: tab.url)!, profileID: page.profileID,
         conversationID: second.windowContext.id)
@@ -286,15 +419,50 @@ final class BrowserIntegrationAcceptance {
     try await checkFailedDocuments(url: url, owner: second, survivor: page)
     do { nativeExtensions = try await engine.nativeCapabilities().extensionBrowser == true }
     catch let error as CefDevToolsError where error.isUnsupportedMethod { nativeExtensions = false }
+    for name in try await NativeHistoryRuntimeAcceptance.run(application: application, url: url, originalOwner: second) {
+      try require(true, name)
+    }
+    if nativeExtensions {
+      for name in try await NativePeekBootstrapAcceptance.run(application: application, url: url, originalOwner: second) {
+        try require(true, name)
+      }
+    }
+    for name in try await NativePeekLinkRuntimeAcceptance.run(application: application, url: url, originalOwner: second) {
+      try require(true, name)
+    }
+    for name in try await NativePeekReplacementAcceptance.run(application: application, url: url, originalOwner: second) {
+      try require(true, name)
+    }
+    if nativeExtensions {
+      for name in try await NativeNavigationCloseAcceptance.run(application: application, url: url, originalOwner: second) {
+        try require(true, name)
+      }
+      for name in try await NativeNavigationVetoAcceptance.run(application: application, url: url, originalOwner: second) {
+        try require(true, name)
+      }
+      for name in try await NativeNavigationPromotionAcceptance.run(application: application, url: url, originalOwner: second) {
+        try require(true, name)
+      }
+      for name in try await NativeRetirementRuntimeAcceptance.run(application: application, url: url, originalOwner: second) {
+        try require(true, name)
+      }
+    }
+    try await checkNativePDF(url: url, owner: second)
+    try await checkPrivateNativePDF(url: url, owner: second)
     if nativeExtensions {
       try await checkHostedSelection(url: url, owner: second, survivor: page)
       try await checkExtensionFixture(url: url, owner: second, page: page)
+      for name in try await NativeTabCaptureAcceptance.run(application: application, url: url, originalOwner: second) {
+        try require(true, name)
+      }
       try await checkNativeMedia(url: url, owner: second)
+      for name in try await NativeDownloadRetirementAcceptance.run(application: application, owner: second, url: url) {
+        try require(true, name)
+      }
     }
     else if ProcessInfo.processInfo.environment["ZACRO_REQUIRE_NATIVE_EXTENSIONS"] == "1" {
       throw Failure("The packaged runtime does not implement the native extension protocol")
     }
-    try await checkNativePDF(url: url, owner: second)
     second.store.selectTab(id: page.id)
     second.openExtensions(store: false)
     try require(second.actions.library == "Extensions" && second.activePage === page,
@@ -734,28 +902,196 @@ final class BrowserIntegrationAcceptance {
     try require(await owner.requestCloseTab(pdfTab.id), "pdfFixtureClosesCleanly")
   }
 
-  private func checkExtensionFixture(url: URL, owner: BrowserWindowCoordinator, page: ChromiumPage) async throws {
+  private func checkPrivateNativePDF(url: URL, owner: BrowserWindowCoordinator) async throws {
+    owner.windowContext.show()
+    application.repository.focusWindow(owner.windowContext.id)
+    application.newWindow()
+    guard let privateOwner = application.focusedCoordinator, privateOwner !== owner else {
+      throw Failure("Private PDF acceptance window")
+    }
+    privateOwner.actions.palette = false
+    // makeWindow starts with a public blank tab. This fixture needs an
+    // exclusively private window, not a mixed window that still legitimately
+    // owns a public tab in its other profile.
+    for initial in privateOwner.store.state.tabs where !initial.isClosed {
+      guard initial.url == "about:blank", application.engine.pages[initial.id] == nil else {
+        throw Failure("Private PDF fixture inherited a nonempty document")
+      }
+      privateOwner.store.closeTab(id: initial.id)
+    }
+    let profile = try privateOwner.store.createProfileDurably(name: "Private PDF acceptance", isPrivate: true)
+    guard let tab = privateOwner.store.createTab(address: url.appendingPathComponent("media/synthetic.pdf").absoluteString) else {
+      throw Failure("Private PDF acceptance tab")
+    }
+    let page = try await privateOwner.ensurePageReady(tab)
+    try await loaded(page)
+    try require(privateOwner.store.state.tabs.filter { !$0.isClosed }.allSatisfy {
+      privateOwner.store.profileID(for: $0) == profile.id
+    }, "privatePDFWindowContainsOnlyPrivateDocuments")
+    if !nativeExtensions {
+      try require(try await NativePDFAcceptance.check(page), "privatePDFViewerLoadsActualDocument")
+      try require(await privateOwner.requestCloseWindow(), "privatePDFWindowClosesCleanly")
+      try require(!application.store.state.profiles.contains(where: { $0.id == profile.id }),
+        "privatePDFProfileRetiresWithItsLastWindow")
+      owner.windowContext.show()
+      return
+    }
+    guard let nativeTabID = page.reservedNativeTabID else { throw Failure("Private PDF native identity") }
+    try require(application.extensionBrowser.hasPrivateComponentObserver(profileID: profile.id),
+      "privatePDFUsesSeparateComponentOnlyObservation")
+    let probeDirectory = application.engine.dataDirectory.appendingPathComponent("PrivateBoundaryProbeExtension", isDirectory: true)
+    try FileManager.default.createDirectory(at: probeDirectory, withIntermediateDirectories: false,
+      attributes: [.posixPermissions: 0o700])
+    let probeManifest: [String: Any] = ["manifest_version": 3, "name": "Private boundary acceptance",
+      "version": "1.0.0", "permissions": ["tabs"], "background": ["service_worker": "worker.js"]]
+    try JSONSerialization.data(withJSONObject: probeManifest).write(to: probeDirectory.appendingPathComponent("manifest.json"), options: .atomic)
+    try Data("self.zacroPrivateBoundaryProbe = true;\n".utf8).write(to: probeDirectory.appendingPathComponent("worker.js"), options: .atomic)
+    let publicManager = ChromeExtensionManager(engine: application.engine, profileID: owner.store.activeProfileID)
+    try await publicManager.setDeveloperMode(true)
+    let probeID = try await publicManager.loadUnpackedExtension(at: probeDirectory)
+    try require(try await publicManager.snapshot().extensions.first(where: { $0.id == probeID })?.isEnabled == true,
+      "privateBoundaryProbeRespectsNativeDeveloperModePolicy")
+    let probe = try await publicManager.workerSession(probeID)
+    do {
+      try require(try await probe.evaluate("self.zacroPrivateBoundaryProbe") as? Bool == true,
+        "extensionWorkerInspectionWaitsForTopLevelEvaluation")
+      var rejectedNormally = false
+      do { _ = try await probe.evaluate("Promise.reject(new Error('owned-worker-rejection'))") }
+      catch CefDevToolsError.rejected(let message) { rejectedNormally = message.contains("owned-worker-rejection") }
+      try require(rejectedNormally, "extensionWorkerRejectedPromiseReturnsJavaScriptError")
+      try require(try await probe.evaluate("self.zacroPrivateBoundaryProbe") as? Bool == true,
+        "extensionWorkerSurvivesRejectedPromiseInspection")
+      let boundary = try await probe.evaluate("""
+        (async () => {
+          let tabDenied = false, windowDenied = false;
+          try { await chrome.tabs.get(\(nativeTabID)); } catch { tabDenied = true; }
+          try { await chrome.windows.get(\(privateOwner.windowContext.nativeID)); } catch { windowDenied = true; }
+          const tabs = await chrome.tabs.query({});
+          return {tabDenied, windowDenied, tabs: tabs.map(tab => ({id:tab.id, windowId:tab.windowId, incognito:tab.incognito})),
+            queryDenied: tabs.every(tab => !tab.incognito && tab.id !== \(nativeTabID))};
+        })()
+        """) as? [String: Any]
+      if let boundary, let data = try? JSONSerialization.data(withJSONObject: boundary, options: [.sortedKeys]) {
+        fputs("Private extension boundary: privateTab=\(nativeTabID) privateWindow=\(privateOwner.windowContext.nativeID) \(String(decoding: data, as: UTF8.self))\n", stderr)
+      }
+      try require(boundary?["tabDenied"] as? Bool == true && boundary?["windowDenied"] as? Bool == true
+        && boundary?["queryDenied"] as? Bool == true, "ordinaryExtensionsCannotSeePrivatePDFTabsOrWindows")
+      await probe.close()
+    } catch { await probe.close(); throw error }
+    let linkURL = url.appendingPathComponent("private-pdf-link").absoluteString
+    let windowURL = url.appendingPathComponent("private-pdf-window").absoluteString
+    var child: BrowserWindowCoordinator?
+    let documentLoaded = try await NativePDFAcceptance.check(page) { tools, session in
+      let script = """
+        (async () => {
+          const tab = await chrome.tabs.get(\(nativeTabID));
+          const settings = await chrome.tabs.getZoomSettings(tab.id);
+          await chrome.tabs.setZoomSettings(tab.id, {mode: 'manual', scope: 'per-tab'});
+          const currentSettings = await chrome.tabs.getZoomSettings(tab.id);
+          const before = await chrome.tabs.getZoom(tab.id);
+          await chrome.tabs.setZoom(tab.id, 1.1);
+          const zoom = await chrome.tabs.getZoom(tab.id);
+          await chrome.tabs.setZoom(tab.id, before);
+          await chrome.tabs.setZoomSettings(tab.id, {mode: settings.mode, scope: settings.scope});
+          const link = await chrome.tabs.create({url: \(try self.literal(linkURL)), windowId: tab.windowId, active: false});
+          const created = await chrome.windows.create({url: \(try self.literal(windowURL)), focused: false});
+          return {tab, link, created, zoom, settings: currentSettings};
+        })()
+        """
+      guard let result = try await tools.evaluate(script, userGesture: true, sessionID: session) as? [String: Any],
+        let metadata = result["tab"] as? [String: Any], let link = result["link"] as? [String: Any],
+        let created = result["created"] as? [String: Any], let createdID = created["id"] as? Int,
+        let zoom = result["zoom"] as? Double, let settings = result["settings"] as? [String: Any] else {
+        throw Failure("Private PDF component actions")
+      }
+      try self.require(metadata["incognito"] as? Bool == true
+        && metadata["windowId"] as? Int == privateOwner.windowContext.nativeID,
+        "privatePDFSeesItsExactIncognitoTabAndWindow")
+      try self.require(abs(zoom - 1.1) < 0.01 && settings["mode"] as? String == "manual"
+        && settings["scope"] as? String == "per-tab", "privatePDFUsesRealNativeZoom")
+      guard let linked = privateOwner.store.state.tabs.first(where: { $0.url == linkURL }),
+        let createdWindow = self.application.windows.values.first(where: { $0.windowContext.nativeID == createdID }) else {
+        throw Failure("Private PDF actions did not create managed documents")
+      }
+      child = createdWindow
+      try self.require(link["incognito"] as? Bool == true && privateOwner.store.profileID(for: linked) == profile.id
+        && linked.windowID == privateOwner.windowContext.id, "privatePDFLinksStayInTheirPrivateWindow")
+      try self.require(created["incognito"] as? Bool == true && createdWindow.store.activeProfileID == profile.id
+        && createdWindow.store.state.tabs.contains(where: { $0.url == windowURL }),
+        "privatePDFNewWindowsKeepTheSamePrivateProfile")
+    }
+    try require(page.isPrivate && page.profileID == profile.id && documentLoaded,
+      "privatePDFViewerLoadsActualDocument")
+    try require(await privateOwner.requestCloseWindow(), "privatePDFWindowClosesCleanly")
+    guard let child else { throw Failure("Private PDF child window missing") }
+    try require(application.store.state.profiles.contains(where: { $0.id == profile.id }),
+      "privatePDFProfileSurvivesWhileItsNewWindowRemains")
+    try require(await child.requestCloseWindow(), "privatePDFChildWindowClosesCleanly")
+    try require(!application.store.state.profiles.contains(where: { $0.id == profile.id }),
+      "privatePDFProfileRetiresWithItsLastWindow")
+    try await wait("privatePDFRetirementClosesItsComponentTransport") {
+      !self.application.engine.pages.values.contains(where: { $0.profileID == profile.id })
+        && !self.application.extensionBrowser.hasPrivateComponentObserver(profileID: profile.id)
+    }
+    owner.windowContext.show()
+  }
+
+  private func checkExtensionFixture(url: URL, owner: BrowserWindowCoordinator, page: ChromiumPage,
+    includeProtocolFixtures: Bool = true, servicesOnly: Bool = false) async throws {
     guard let fixture = ProcessInfo.processInfo.environment["ZACRO_NATIVE_EXTENSION_FIXTURE"] else {
       throw Failure("Missing real-extension acceptance fixture")
     }
     let copy = application.engine.dataDirectory.appendingPathComponent("AcceptanceExtension", isDirectory: true)
     try FileManager.default.copyItem(at: URL(fileURLWithPath: fixture), to: copy)
     let manager = ChromeExtensionManager(engine: application.engine, profileID: page.profileID)
+    try await manager.setDeveloperMode(true)
     let identifier = try await manager.loadUnpackedExtension(at: copy)
+    try require(try await manager.snapshot().extensions.first(where: { $0.id == identifier })?.isEnabled == true,
+      "extensionFixtureRespectsNativeDeveloperModePolicy")
+    let icon = try await manager.iconData(identifier)
+    try require(NSImage(data: icon) != nil, "extensionToolbarIconDecodesWithoutBlockedDataURLFetch")
     let worker = try await manager.workerSession(identifier)
     do {
-      let config: [String: Any] = ["baseURL": url.absoluteString,
-        "sourceWindowID": owner.windowContext.nativeID, "groups": true]
-      let encoded = String(decoding: try JSONSerialization.data(withJSONObject: config), as: UTF8.self)
-      guard let result = try await worker.evaluate("zacroAcceptance.run(\(encoded))", timeout: 120) as? [String: Any],
-        let fixtureChecks = result["checks"] as? [String: Bool] else { throw Failure("Invalid extension fixture result") }
-      for (name, passed) in fixtureChecks { checks["extension:" + name] = passed }
-      guard result["passed"] as? Bool == true else { throw Failure("Native extension fixture: \(result["errors"] ?? "failed")") }
-      guard let network = try await worker.evaluate("zacroNetworkAcceptance.run(\(encoded))", timeout: 90) as? [String: Any],
-        let networkChecks = network["checks"] as? [String: Bool] else { throw Failure("Invalid extension network fixture result") }
-      for (name, passed) in networkChecks { checks["extension-network:" + name] = passed }
-      guard network["passed"] as? Bool == true else { throw Failure("Native extension network fixture: \(network["errors"] ?? "failed")") }
-      try await checkNativeIdentity(worker: worker, baseURL: url)
+      // A separate, explicitly partial suite reaches services independently of
+      // action-popup acceptance. Full/extensions keep their original sequence
+      // and strict popup gate below; this path cannot mark that fixture passed.
+      if servicesOnly {
+        owner.store.selectTab(id: page.id)
+        owner.windowContext.show()
+        try await application.extensionBrowser.prepareInitialNavigation(page)
+        await application.extensionBrowser.waitForTopologyPublication()
+        try await checkNativeBookmarkMigration(manager: manager, profileID: page.profileID, url: url)
+        try await checkNativeDownload(worker: worker, page: page, url: url)
+        _ = try await worker.evaluate("zacroAcceptance.setPanelEventObservation(false)")
+        try await checkNativeSidePanel(manager: manager, identifier: identifier, worker: worker,
+          owner: owner, source: page, url: url)
+        try await checkParkedSidePanel(manager: manager, identifier: identifier, worker: worker,
+          owner: owner, url: url)
+        _ = try await worker.evaluate("zacroAcceptance.setPanelEventObservation(true)")
+        for (name, passed) in try await NativeManagementAcceptance.check(
+          manager: manager, identifier: identifier, owner: owner.windowContext) {
+          try require(passed, name)
+        }
+        extensionFixturePassed = false
+        await worker.close()
+        return
+      }
+      if includeProtocolFixtures {
+        let config: [String: Any] = ["baseURL": url.absoluteString,
+          "sourceWindowID": owner.windowContext.nativeID, "groups": true]
+        let encoded = String(decoding: try JSONSerialization.data(withJSONObject: config), as: UTF8.self)
+        guard let result = try await worker.evaluate("zacroAcceptance.run(\(encoded))", timeout: 120) as? [String: Any],
+          let fixtureChecks = result["checks"] as? [String: Bool] else { throw Failure("Invalid extension fixture result") }
+        for (name, passed) in fixtureChecks { checks["extension:" + name] = passed }
+        guard result["passed"] as? Bool == true else { throw Failure("Native extension fixture: \(result["errors"] ?? "failed")") }
+        guard let network = try await worker.evaluate("zacroNetworkAcceptance.run(\(encoded))", timeout: 90) as? [String: Any],
+          let networkChecks = network["checks"] as? [String: Bool] else { throw Failure("Invalid extension network fixture result") }
+        for (name, passed) in networkChecks { checks["extension-network:" + name] = passed }
+        guard network["passed"] as? Bool == true else { throw Failure("Native extension network fixture: \(network["errors"] ?? "failed")") }
+        try await checkNativeIdentity(worker: worker, baseURL: url, profileID: page.profileID)
+        for name in try await NativeAuxiliaryBrowserAcceptance.run(application: application,
+          url: url, owner: owner, worker: worker) { checks[name] = true }
+      }
       try await checkNativeMessaging(worker: worker, identifier: identifier)
       owner.store.selectTab(id: page.id)
       owner.windowContext.show()
@@ -772,7 +1108,7 @@ final class BrowserIntegrationAcceptance {
       try await checkNativeHistory(manager: manager, worker: worker, owner: owner, url: url)
       try await checkProgrammaticActionPopup(worker: worker, owner: owner, source: page, url: url)
       try await checkNativeBookmarkMigration(manager: manager, profileID: page.profileID, url: url)
-      try await checkNativeDownload(worker: worker, profileID: page.profileID, url: url)
+      try await checkNativeDownload(worker: worker, page: page, url: url)
       try await checkNativePeek(manager: manager, identifier: identifier, worker: worker, owner: owner, source: page, url: url)
       guard let blank = owner.store.createTab(address: "about:blank") else { throw Failure("Blank action tab") }
       let blankPage = try await owner.extensionActionPage(profileID: page.profileID)
@@ -806,7 +1142,7 @@ final class BrowserIntegrationAcceptance {
         manager: manager, identifier: identifier, owner: owner.windowContext) {
         try require(passed, name)
       }
-      extensionFixturePassed = true
+      extensionFixturePassed = includeProtocolFixtures
       await worker.close()
     } catch {
       await worker.close()
@@ -826,7 +1162,10 @@ final class BrowserIntegrationAcceptance {
     }
     let page = try await owner.ensurePageReady(tab)
     try await application.navigation.waitForRestore(page)
-    try await loaded(page)
+    try await wait("programmaticPopupFixtureLoadsUnpermittedOrigin", record: false) {
+      page.browser != nil && !page.isLoading && page.url == destination
+        && page.title == "Unpermitted fixture origin"
+    }
     try await application.extensionBrowser.prepareInitialNavigation(page)
     await application.extensionBrowser.waitForTopologyPublication()
     guard let nativeID = page.reservedNativeTabID else { throw Failure("Popup fixture document identity") }
@@ -842,10 +1181,18 @@ final class BrowserIntegrationAcceptance {
     try require(result["windowID"] as? Int == owner.windowContext.nativeID
       && (result["tabIDs"] as? [Int]) == [nativeID],
       "programmaticPopupUsesSelectedLogicalDocumentWithoutActiveTabGrant")
-    try await wait("programmaticPopupHasExactOwnerAboveOwnedControls") {
-      guard let popup = NSApp.keyWindow else { return false }
-      return self.application.engine.extensionPopupOwner(popup) === owner.windowContext
-        && popup.level.rawValue >= controls.level.rawValue && popup.isVisible
+    do {
+      try await wait("programmaticPopupHasExactOwnerAboveOwnedControls") {
+        guard let popup = NSApp.keyWindow else { return false }
+        return self.application.engine.extensionPopupOwner(popup) === owner.windowContext
+          && popup.level.rawValue >= controls.level.rawValue && popup.isVisible
+      }
+    } catch {
+      for window in NSApp.windows where window.isVisible || window.isKeyWindow {
+        let popupOwner = application.engine.extensionPopupOwner(window)?.id ?? "none"
+        fputs("Native programmatic popup diagnostic window=\(window.windowNumber) identifier=\(window.identifier?.rawValue ?? "none") visible=\(window.isVisible) key=\(window.isKeyWindow) level=\(window.level.rawValue) parent=\(window.parent?.windowNumber ?? -1) popupOwner=\(popupOwner) expectedOwner=\(owner.windowContext.id) controls=\(controls.windowNumber) controlsLevel=\(controls.level.rawValue)\n", stderr)
+      }
+      throw error
     }
     _ = try await worker.evaluate("zacroAcceptance.closePopup()")
     try await wait("programmaticPopupReleasesNativeOwnership") {
@@ -942,7 +1289,7 @@ final class BrowserIntegrationAcceptance {
     try require(after?["nativeCommandCount"] as? Int == count + 1, "suspendedShortcutDoesNotDeliverDuplicateCommand")
   }
 
-  private func checkNativeIdentity(worker: ChromeExtensionWorkerSession, baseURL: URL) async throws {
+  private func checkNativeIdentity(worker: ChromeExtensionWorkerSession, baseURL: URL, profileID: String) async throws {
     guard let result = try await worker.evaluate("zacroIdentityAcceptance.run({baseURL:\(try literal(baseURL.absoluteString))})", timeout: 90) as? [String: Any],
       let identityChecks = result["checks"] as? [String: Bool], identityChecks.count == 6 else {
       throw Failure("Invalid native identity fixture result")
@@ -956,11 +1303,41 @@ final class BrowserIntegrationAcceptance {
       guard let flow = try await worker.evaluate("zacroIdentityAcceptance.startInteractive({baseURL:\(try literal(baseURL.absoluteString)),token:\(encoded)})") as? [String: Any],
         let title = flow["title"] as? String else { throw Failure("Interactive native auth start") }
       var window: NSWindow?
-      try await wait("nativeAuthPresentsOwnedWindow", record: false) {
-        window = NSApp.windows.first { !before.contains(ObjectIdentifier($0)) && $0.title == title && $0.isVisible }
-        return window != nil
+      var authBrowser: CefBrowser?
+      do {
+        try await wait("nativeAuthPresentsOwnedWindow", record: false) {
+          authBrowser = self.application.engine.auxiliaryBrowsers(profileID: profileID, isPrivate: false).first { browser in
+            guard let address = browser.url,
+              address.scheme == baseURL.scheme, address.host == baseURL.host, address.port == baseURL.port,
+              address.path == "/native-auth/document" else { return false }
+            return URLComponents(url: address, resolvingAgainstBaseURL: false)?.queryItems?
+              .contains(where: { $0.name == "token" && $0.value == token }) == true
+          }
+          window = authBrowser?.nativeView?.window
+          guard let window, !before.contains(ObjectIdentifier(window)), window.isVisible else { return false }
+          return true
+        }
+      } catch {
+        // Only this disposable acceptance flow is inspected. Chrome may add a
+        // product suffix to a window title; record actual ownership/visibility
+        // before deciding whether presentation or the title assertion failed.
+        let windows = NSApp.windows.map { candidate -> [String: Any] in
+          ["number": candidate.windowNumber, "class": String(describing: type(of: candidate)),
+           "title": candidate.title, "visible": candidate.isVisible, "key": candidate.isKeyWindow,
+           "newSinceAuthStart": !before.contains(ObjectIdentifier(candidate))]
+        }
+        if let data = try? JSONSerialization.data(withJSONObject: windows, options: [.sortedKeys]),
+          let diagnostic = String(data: data, encoding: .utf8) {
+          NSLog("Native auth presentation diagnostic expected=%@ windows=%@", title, diagnostic)
+        }
+        if let status = try? await worker.evaluate("zacroIdentityAcceptance.status(\(encoded))"),
+          let data = try? JSONSerialization.data(withJSONObject: status, options: [.sortedKeys]),
+          let diagnostic = String(data: data, encoding: .utf8) {
+          NSLog("Native auth flow diagnostic %@", diagnostic)
+        }
+        throw error
       }
-      guard let window else { throw Failure("Native auth window") }
+      guard let window, let authBrowser else { throw Failure("Native auth window") }
       let pending = try await worker.evaluate("zacroIdentityAcceptance.status(\(encoded))") as? [String: Any]
       try require(pending?["state"] as? String == "pending"
         && (pending?["logicalAuthTabIDs"] as? [Int])?.isEmpty == true
@@ -975,7 +1352,7 @@ final class BrowserIntegrationAcceptance {
       }
       try await wait(cancel ? "nativeAuthCancellationRejectsAndCloses" : "nativeAuthCallbackResolvesAndCloses") {
         let status = try await worker.evaluate("zacroIdentityAcceptance.status(\(encoded))") as? [String: Any]
-        return !window.isVisible && status?["state"] as? String == (cancel ? "rejected" : "resolved")
+        return authBrowser.isClosed && !window.isVisible && status?["state"] as? String == (cancel ? "rejected" : "resolved")
           && (cancel || status?["exactCallback"] as? Bool == true)
       }
       _ = try await worker.evaluate("zacroIdentityAcceptance.finish(\(encoded))")
@@ -1209,7 +1586,10 @@ final class BrowserIntegrationAcceptance {
     try await manager.acknowledgeBookmarkImports(replay)
   }
 
-  private func checkNativeDownload(worker: ChromeExtensionWorkerSession, profileID: String, url: URL) async throws {
+  private func checkNativeDownload(worker: ChromeExtensionWorkerSession, page: ChromiumPage, url: URL) async throws {
+    let profileID = page.profileID
+    let directory = application.engine.dataDirectory.appendingPathComponent("AcceptanceDownloads", isDirectory: true)
+    try await page.ready().setDownloadDirectory(directory)
     guard let seed = try await worker.evaluate("zacroAcceptance.seedDownload(\(try literal(url.absoluteString)))") as? [String: Any],
       let nativeID = seed["id"] as? Int, let filename = seed["filename"] as? String else { throw Failure("Worker download setup") }
     do {
@@ -1218,6 +1598,8 @@ final class BrowserIntegrationAcceptance {
       }
       guard let record = application.store.state.downloads.first(where: { $0.profileID == profileID && $0.filename == filename }),
         let guid = record.nativeGUID else { throw Failure("Worker download identity") }
+      try require(record.path.map { URL(fileURLWithPath: $0).deletingLastPathComponent().standardizedFileURL == directory.standardizedFileURL } == true,
+        "nativeDownloadStaysInsideDisposableProfile")
       try await application.downloads.perform("download:pause", id: record.id, profileID: profileID)
       try await wait("swiftLibraryPausesWorkerDownload") {
         let state = try await worker.evaluate("zacroAcceptance.downloadState(\(nativeID))") as? [String: Any]
@@ -1276,6 +1658,7 @@ final class BrowserIntegrationAcceptance {
   private func finish(_ error: String?) {
     guard !finished else { return }; finished = true; deadline?.cancel()
     let report: [String: Any] = ["passed": error == nil, "error": error ?? "", "checks": checks,
+      "suite": suite, "fullApplicationSuitePassed": suite == "all" && error == nil,
       "nativeExtensionProtocol": nativeExtensions, "extensionCompatibilityVerified": false,
       "extensionFixturePassed": extensionFixturePassed,
       "desktopInputVerified": false, "windows": application.windows.count]

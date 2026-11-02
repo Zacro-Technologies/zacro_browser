@@ -17,6 +17,9 @@ final class NativeDownloads {
   private var profileEpochs: [String: Int] = [:]
   private var stopped = false
   var enabled = false
+  /// The acceptance harness supplies a directory inside its disposable profile.
+  /// Ordinary browsing retains the user's Downloads directory.
+  var destinationDirectory: URL?
   var onStarted: (String) -> Void = { _ in }
   var onStatus: ((String, String?) -> Void)?
   init(store: BrowserStore, engine: ChromiumEngine) { self.store = store; self.engine = engine }
@@ -25,7 +28,8 @@ final class NativeDownloads {
   }
   func decide(_ download: CefDownload, suggested: String, source: BrowserTab, profile: String) -> CefDownloadDecision {
     let safe = (try? Self.filename(suggested)) ?? "download-\(Int(Date().timeIntervalSince1970))"
-    guard let directory = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first else { return .deny }
+    guard let directory = destinationDirectory
+      ?? FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first else { return .deny }
     let name = safe as NSString, ext = name.pathExtension
     let stem = name.deletingPathExtension
     for number in 0..<10_000 {

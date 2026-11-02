@@ -80,10 +80,15 @@ extension BrowserStore {
       throw ShortcutError("This Peek is no longer available, or the tab limit has been reached.")
     }
     promoted.id = UUID().uuidString; promoted.lastAccessedAt = Date()
+    let profile = profileID(for: source)
     try commit { state in
       guard let index = state.tabs.firstIndex(where: { $0.id == tabID }) else { return }
       state.tabs[index].peek = nil
       state.tabs.insert(promoted, at: index + 1)
+      if let profile {
+        Self.appendHistoryVisit(to: &state, profileID: profile, address: promoted.url,
+          title: promoted.displayTitle, visitedAt: promoted.lastAccessedAt)
+      }
       for i in state.tabs.indices where state.tabs[i].openerTabID == "peek:" + tabID {
         state.tabs[i].openerTabID = promoted.id
       }

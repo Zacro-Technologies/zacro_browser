@@ -23,9 +23,15 @@ class ZacroDownloadContext : public base::SupportsUserData::Data,
     if (manager_) manager_->RemoveObserver(this);
     for (const auto& item : items_) item->RemoveObserver(this);
   }
-  void OnDownloadCreated(content::DownloadManager*, download::DownloadItem* item) override { Watch(item); Updated(item); }
-  void OnDownloadUpdated(download::DownloadItem* item) override { Updated(item); }
+  void OnDownloadCreated(content::DownloadManager*, download::DownloadItem* item) override {
+    Watch(item);
+    if (retiring_) CancelForRetirement(item); else Updated(item);
+  }
+  void OnDownloadUpdated(download::DownloadItem* item) override {
+    if (retiring_) CancelForRetirement(item); else Updated(item);
+  }
   void OnDownloadRemoved(download::DownloadItem* item) override {
+    if (retiring_ || context_->IsOffTheRecord()) return;
     ZacroExtensionContext::Get(context_)->NotifyNative("Zacro.downloadRemoved", base::DictValue().Set("guid", item->GetGuid()));
   }
   void OnDownloadDestroyed(download::DownloadItem* item) override { item->RemoveObserver(this); items_.erase(item); }
@@ -36,6 +42,7 @@ class ZacroDownloadContext : public base::SupportsUserData::Data,
   }
   void OnManagerInitialized() override {
     if (!manager_) return;
+    if (retiring_) { std::string error; RetirementStatus(error); return; }
     download::SimpleDownloadManager::DownloadVector items; manager_->GetAllDownloads(&items);
     for (const auto& item : items) { Watch(item); Updated(item); }
   }
@@ -53,7 +60,39 @@ class ZacroDownloadContext : public base::SupportsUserData::Data,
     return base::DictValue().Set("downloads", std::move(values)).Set("total", static_cast<double>(ordered.size()))
         .Set("complete", limit == ordered.size());
   }
+  // Terminal for this native BrowserContext. Call only after authoritative
+  // profile deletion/private-owner retirement commits, never before a close
+  // veto can still leave the profile active. The fence outlives this transport.
+  base::DictValue RetirementStatus(std::string& error) {
+    retiring_ = true;
+    if (!manager_) { error = "The native download manager closed before retirement settled."; return {}; }
+    download::SimpleDownloadManager::DownloadVector items;
+    manager_->GetAllDownloads(&items);
+    manager_->GetUninitializedActiveDownloadsIfAny(&items);
+    std::set<std::string> guids;
+    for (const auto& item : items) guids.insert(item->GetGuid());
+    // Cancel can synchronously notify observers/remove items. Retain identities
+    // rather than raw DownloadItem pointers across any such callback.
+    for (const auto& guid : guids) {
+      if (!manager_) { error = "The native download manager closed during retirement."; return {}; }
+      if (auto* item = manager_->GetDownloadByGuid(guid)) { Watch(item); CancelForRetirement(item); }
+    }
+    if (!manager_) { error = "The native download manager closed during retirement."; return {}; }
+    // Cancellation observers may have created another item. Count a fresh
+    // snapshot, including restored entries that have not initialized yet.
+    items.clear(); manager_->GetAllDownloads(&items);
+    manager_->GetUninitializedActiveDownloadsIfAny(&items);
+    std::set<std::string> pending;
+    for (const auto& item : items) {
+      if (item->GetState() != download::DownloadItem::COMPLETE &&
+          item->GetState() != download::DownloadItem::CANCELLED) pending.insert(item->GetGuid());
+    }
+    const bool initialized = manager_->IsManagerInitialized();
+    return base::DictValue().Set("retiring", true).Set("initialized", initialized)
+        .Set("pending", static_cast<double>(pending.size())).Set("settled", initialized && pending.empty());
+  }
   base::DictValue Control(const base::DictValue* params, std::string& error) {
+    if (retiring_) { error = "This native profile is being retired."; return {}; }
     const auto* guid = params ? params->FindString("guid") : nullptr;
     const auto* action = params ? params->FindString("action") : nullptr;
     auto* item = manager_ && guid ? manager_->GetDownloadByGuid(*guid) : nullptr;
@@ -68,8 +107,19 @@ class ZacroDownloadContext : public base::SupportsUserData::Data,
     return base::DictValue().Set("accepted", true);
   }
  private:
+  void CancelForRetirement(download::DownloadItem* item) {
+    const auto state = item->GetState();
+    if (state == download::DownloadItem::COMPLETE || state == download::DownloadItem::CANCELLED) return;
+    const std::string guid = item->GetGuid();
+    if (!cancelling_.insert(guid).second) return;
+    // COMPLETING_INTERNAL may ignore Cancel but still synchronously notify
+    // observers. Guard reentrancy and report pending until actual completion.
+    item->Cancel(true);
+    cancelling_.erase(guid);
+  }
   void Watch(download::DownloadItem* item) { if (items_.insert(item).second) item->AddObserver(this); }
   void Updated(download::DownloadItem* item) {
+    if (context_->IsOffTheRecord()) return;
     ZacroExtensionContext::Get(context_)->NotifyNative("Zacro.downloadChanged", Describe(item));
   }
   base::DictValue Describe(download::DownloadItem* item) {
@@ -91,6 +141,8 @@ class ZacroDownloadContext : public base::SupportsUserData::Data,
     }
     return value;
   }
+  bool retiring_ = false;
+  std::set<std::string> cancelling_;
   raw_ptr<content::BrowserContext> context_;
   raw_ptr<content::DownloadManager> manager_ = nullptr;
   std::set<raw_ptr<download::DownloadItem>> items_;
@@ -99,7 +151,15 @@ class ZacroDownloadContext : public base::SupportsUserData::Data,
 void ZacroObserveProfileDownloads(content::BrowserContext* context) { ZacroDownloadContext::Get(context); }
 
 bool CefDevToolsController::DispatchZacroDownloads(int id, const std::string& method, const base::DictValue* params) {
-  if (method != "Zacro.downloadSnapshot" && method != "Zacro.controlDownload" && method != "Zacro.renameDownload") return false;
+  if (method != "Zacro.downloadSnapshot" && method != "Zacro.controlDownload" &&
+      method != "Zacro.renameDownload" && method != "Zacro.retireProfileDownloads") return false;
+  if (method == "Zacro.retireProfileDownloads") {
+    // This is a browser-process transport command, not an extension API. It
+    // requires no extension registry/sync observer and works for OTR contexts.
+    std::string error;
+    auto result = ZacroDownloadContext::Get(inspected_contents_->GetBrowserContext())->RetirementStatus(error);
+    ReplyZacro(id, std::move(result), error); return true;
+  }
   if (method == "Zacro.renameDownload") {
     const auto* guid = params ? params->FindString("guid") : nullptr;
     const auto* name = params ? params->FindString("name") : nullptr;

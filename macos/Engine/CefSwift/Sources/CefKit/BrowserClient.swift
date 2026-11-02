@@ -213,6 +213,19 @@ final class BrowserClient {
         findPointer = find
 
         let load = cefAllocate(cef_load_handler_t.self, owner: self)
+        load.pointee.on_load_start = { handlerSelf, browser, frame, _ in
+            let callbackBrowserID = browser.map { $0.pointee.get_identifier?($0) ?? -1 }
+            cefRelease(browser.map(UnsafeMutableRawPointer.init))
+            defer { cefRelease(frame.map(UnsafeMutableRawPointer.init)) }
+            guard let frame, frame.pointee.is_main?(frame) != 0,
+                  let value = CefStringUtil.takingUserFree(frame.pointee.get_url?(frame)),
+                  let url = URL(string: value),
+                  let client = BrowserClient.owner(handlerSelf.map(UnsafeMutableRawPointer.init), browserID: callbackBrowserID) else { return }
+            MainActor.assumeIsolated {
+                guard let cefBrowser = client.browser else { return }
+                cefBrowser.delegate?.browser(cefBrowser, didCommitNavigation: url)
+            }
+        }
         load.pointee.on_loading_state_change = { handlerSelf, browser, isLoading, canGoBack, canGoForward in
             let callbackBrowserID = browser.map { $0.pointee.get_identifier?($0) ?? -1 }
             cefRelease(browser.map(UnsafeMutableRawPointer.init))
@@ -629,12 +642,11 @@ extension BrowserClient {
             let wrapper = CefJSDialogCallback(raw: callback)
             return BrowserClientCallbacks.run(handlerSelf, browserID: callbackBrowserID, default: Int32(0)) { _, cefBrowser in
                 wrapper.onDecision = { [weak cefBrowser] leave in
-                    guard !leave, !reload else { return }
-                    DispatchQueue.main.async {
-                        guard let cefBrowser else { return }
-                        cefBrowser.onCloseCancelled?()
-                        CefRuntime.shared.cancelTerminationRequest(for: cefBrowser)
-                    }
+                    guard !leave, !reload, let cefBrowser else { return }
+                    // Decisions run on the native UI actor. Do not defer this
+                    // veto into a later, potentially replacement close/Quit.
+                    cefBrowser.onCloseCancelled?()
+                    CefRuntime.shared.cancelTerminationRequest(for: cefBrowser)
                 }
                 if cefBrowser.delegate?.browser(cefBrowser, runBeforeUnloadDialog: message, isReload: reload, callback: wrapper) == true {
                     return 1
@@ -643,11 +655,19 @@ extension BrowserClient {
                 return 1
             }
         }
-        handler.pointee.on_reset_dialog_state = { _, browser in
+        handler.pointee.on_reset_dialog_state = { handlerSelf, browser in
+            let callbackBrowserID = browser.map { $0.pointee.get_identifier?($0) ?? -1 }
             cefRelease(browser.map(UnsafeMutableRawPointer.init))
+            BrowserClientCallbacks.run(handlerSelf, browserID: callbackBrowserID, default: ()) { _, cefBrowser in
+                cefBrowser.delegate?.browserResetJavaScriptDialog(cefBrowser)
+            }
         }
-        handler.pointee.on_dialog_closed = { _, browser in
+        handler.pointee.on_dialog_closed = { handlerSelf, browser in
+            let callbackBrowserID = browser.map { $0.pointee.get_identifier?($0) ?? -1 }
             cefRelease(browser.map(UnsafeMutableRawPointer.init))
+            BrowserClientCallbacks.run(handlerSelf, browserID: callbackBrowserID, default: ()) { _, cefBrowser in
+                cefBrowser.delegate?.browserResetJavaScriptDialog(cefBrowser)
+            }
         }
         jsDialogPointer = handler
     }

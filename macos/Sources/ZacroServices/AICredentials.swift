@@ -12,8 +12,12 @@ actor AICredentialVault {
     namespace = "ai:" + ServiceFiles.hash(directory.standardizedFileURL.path) + ":"
     do {
       if let saved = try ServiceFiles.read(file, maximum: 256 * 1024) {
-        guard saved["version"] == 1 else { throw ServiceError("AUTH_STORAGE", "The credential index is unreadable and has been preserved.") }
-        durable = Set(saved["keys"].array.map(\.string))
+        guard saved["version"] == 1, case let .array(keys) = saved["keys"],
+          keys.allSatisfy({ value in
+            guard case let .string(id) = value else { return false }
+            return id.range(of: #"^[a-f0-9]{64}:[a-f0-9]{64}$"#, options: .regularExpression) != nil
+          }) else { throw ServiceError("AUTH_STORAGE", "The credential index is unreadable and has been preserved.") }
+        durable = Set(keys.map(\.string))
       }
     } catch { readError = error }
   }
@@ -38,6 +42,8 @@ actor AICredentialVault {
     }
     guard ["encrypted","session"].contains(storage) else { throw ServiceError("INPUT", "Choose Keychain or this session only.") }
     if storage == "session" {
+      // An ephemeral connection can still work without reading durable keys.
+      // It neither repairs the damaged index nor claims old keys were removed.
       if durable.contains(id) { try remove(id) }
       session[id] = key; return
     }
@@ -53,14 +59,18 @@ actor AICredentialVault {
     durable = next; session.removeValue(forKey: id)
   }
   func remove(_ id: String) throws {
+    // An empty in-memory set after a failed load is not evidence that the
+    // protected store has no key. Keep deletion retryable instead of reporting
+    // success and letting profile retirement acknowledge incomplete cleanup.
+    if let readError { throw readError }
     if durable.contains(id) {
-      if let readError { throw readError }
       try store.remove(namespace + id)
       var next = durable; next.remove(id); try save(next); durable = next
     }
     session.removeValue(forKey: id)
   }
   func forgetProfile(_ profile: String) throws {
+    if let readError { throw readError }
     let prefix = ServiceFiles.hash(profile) + ":"
     for key in Set(durable).union(session.keys) where key.hasPrefix(prefix) { try remove(key) }
   }

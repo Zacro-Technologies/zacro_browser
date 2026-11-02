@@ -5,7 +5,8 @@ import ZacroChromium
 /// frame. A PDF MIME response or navigator.pdfViewerEnabled alone is insufficient.
 @MainActor
 enum NativePDFAcceptance {
-  static func check(_ page: ChromiumPage) async throws -> Bool {
+  static func check(_ page: ChromiumPage,
+    onLoaded: (@MainActor (CefDevTools, String) async throws -> Void)? = nil) async throws -> Bool {
     let browser = try await page.ready()
     let tools = browser.devTools
     let origin = "chrome-extension://mhjfbmdgcfjbbpaeojofohoefgiehjai"
@@ -74,6 +75,7 @@ enum NativePDFAcceptance {
           window.postMessage({type: 'initialize'}, origin);
         })
         """#, sessionID: session) as? Bool
+      if loaded == true { try await onLoaded?(tools, session) }
       _ = try await tools.call("Target.setAutoAttach", parameters: ["autoAttach": false, "waitForDebuggerOnStart": false, "flatten": true])
       return loaded == true
     } catch {

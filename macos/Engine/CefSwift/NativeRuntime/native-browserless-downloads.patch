@@ -1,0 +1,68 @@
+--- a/cef/libcef/browser/download_manager_delegate_impl.h
++++ b/cef/libcef/browser/download_manager_delegate_impl.h
+@@ -24,7 +24,9 @@
+       public cef::DownloadManagerDelegate,
+       public CefBrowserHostBase::Observer {
+  public:
+-  explicit CefDownloadManagerDelegateImpl(content::DownloadManager* manager);
++  explicit CefDownloadManagerDelegateImpl(
++      content::DownloadManager* manager,
++      bool chrome_owns_browserless_downloads = false);
+ 
+   CefDownloadManagerDelegateImpl(const CefDownloadManagerDelegateImpl&) =
+       delete;
+@@ -57,6 +59,10 @@
+ 
+   void ResetManager();
+ 
++  // Enabled only by the factory embedded in ChromeDownloadManagerDelegate.
++  // A missing CEF callback owner is not a reason to reject a valid MV3 or
++  // restored profile download owned by Chromium's original download delegate.
++  const bool chrome_owns_browserless_downloads_;
+   raw_ptr<content::DownloadManager> manager_;
+   base::WeakPtrFactory<content::DownloadManager> manager_ptr_factory_;
+ 
+--- a/cef/libcef/browser/download_manager_delegate_impl.cc
++++ b/cef/libcef/browser/download_manager_delegate_impl.cc
+@@ -310,8 +310,10 @@
+ }  // namespace
+ 
+ CefDownloadManagerDelegateImpl::CefDownloadManagerDelegateImpl(
+-    DownloadManager* manager)
+-    : manager_(manager), manager_ptr_factory_(manager) {
++    DownloadManager* manager,
++    bool chrome_owns_browserless_downloads)
++    : chrome_owns_browserless_downloads_(chrome_owns_browserless_downloads),
++      manager_(manager), manager_ptr_factory_(manager) {
+   DCHECK(manager);
+   manager->AddObserver(this);
+ 
+@@ -379,6 +381,13 @@
+   // This callback may arrive after DetermineDownloadTarget, so we allow
+   // association from either method.
+   CefRefPtr<CefBrowserHostBase> browser = GetOrAssociateBrowser(item);
++  if (!browser && chrome_owns_browserless_downloads_) {
++    // The outer ChromeDownloadManagerDelegate owns target determination,
++    // extension permission checks, filename conflicts and danger handling.
++    // Service workers and restored downloads legitimately have no WebContents.
++    // Do not attach a fake browser or convert those downloads to cancellation.
++    return;
++  }
+   if (!browser) {
+     // If the download is rejected (e.g. ALT+click on an invalid protocol link)
+     // then an "interrupted" download will be started via DownloadManagerImpl::
+--- a/cef/libcef/browser/download_manager_delegate.cc
++++ b/cef/libcef/browser/download_manager_delegate.cc
+@@ -11,7 +11,11 @@
+ // static
+ std::unique_ptr<cef::DownloadManagerDelegate> DownloadManagerDelegate::Create(
+     content::DownloadManager* download_manager) {
+-  return std::make_unique<CefDownloadManagerDelegateImpl>(download_manager);
++  // This factory is used only by ChromeDownloadManagerDelegate. Alloy
++  // browser callbacks and their existing unhandled-target cancellation remain
++  // unchanged; only the Chrome owner can retain a browserless profile item.
++  return std::make_unique<CefDownloadManagerDelegateImpl>(
++      download_manager, /*chrome_owns_browserless_downloads=*/true);
+ }
+ 
+ }  // namespace cef

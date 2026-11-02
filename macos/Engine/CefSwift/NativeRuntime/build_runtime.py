@@ -217,7 +217,7 @@ def apply_inputs(source, environment):
     for _ in range(8):
         before = native_inputs()
         run([sys.executable, str(HERE / "apply_adapter.py"), "--cef-root", str(source / "cef")], source, environment)
-        for name in ["storage_adapter", "bookmark_adapter", "sidepanel_adapter", "popup_anchor", "topology_adapter", "tab_reservation", "native_messaging_adapter", "install_lease_adapter", "management_prompt_adapter", "management_adapter"]:
+        for name in ["storage_adapter", "bookmark_adapter", "sidepanel_adapter", "popup_anchor", "topology_adapter", "tab_reservation", "native_messaging_adapter", "install_lease_adapter", "management_prompt_adapter", "management_adapter", "gpu_cache_cleanup", "history_flush_adapter", "tab_capture_adapter", "download_adapter", "extension_toolbar_adapter"]:
             run([sys.executable, str(HERE / ("apply_" + name + ".py")), "--chromium-root", str(source)], source, environment)
         if before == native_inputs():
             return before
@@ -297,7 +297,8 @@ def main():
     environment["GN_OUT_CONFIGS"] = "Release_GN_arm64"
     environment["GN_DEFINES"] = " ".join([
         'target_cpu="arm64"', "is_debug=false", "is_component_build=false",
-        "is_official_build=false", "symbol_level=0", "blink_symbol_level=0",
+        "is_official_build=false", "disable_fieldtrial_testing_config=true",
+        "symbol_level=0", "blink_symbol_level=0",
         "v8_symbol_level=0", "chrome_pgo_phase=0",
         "proprietary_codecs=true", 'ffmpeg_branding="Chrome"',
     ])
@@ -307,14 +308,16 @@ def main():
     elif not (source / "out/Release_GN_arm64/build.ninja").is_file():
         raise SystemExit("Generate the pinned Release build before using --skip-generation.")
     else:
-        # A resumed build may predate the explicit H.264/AAC parity settings.
+        # A resumed build may predate the explicit media/release settings.
         # Preserve every other generated CEF option and let Ninja regenerate
         # only the graph/objects affected by these required media features.
         argument_file = source / "out/Release_GN_arm64/args.gn"
         previous = argument_file.read_text()
         lines = [line for line in previous.splitlines()
-                 if line.split("=", 1)[0].strip() not in {"proprietary_codecs", "ffmpeg_branding"}]
-        current = "\n".join(lines + ["proprietary_codecs=true", 'ffmpeg_branding="Chrome"']) + "\n"
+                 if line.split("=", 1)[0].strip() not in {
+                     "proprietary_codecs", "ffmpeg_branding", "disable_fieldtrial_testing_config"}]
+        current = "\n".join(lines + ["proprietary_codecs=true", 'ffmpeg_branding="Chrome"',
+                                     "disable_fieldtrial_testing_config=true"]) + "\n"
         if previous != current:
             argument_file.write_text(current)
     if args.generate_only:

@@ -59,10 +59,18 @@ def generated(originals):
   }
 #endif""")
     result[DELEGATE] = replace(result[DELEGATE], '#include "chrome/browser/ui/views/extensions/extension_popup.h"',
-                              '#include "chrome/browser/ui/views/extensions/extension_popup.h"\n#if BUILDFLAG(IS_MAC)\n#include "chrome/browser/ui/views/extensions/native_extension_popup_anchor.h"\n#endif')
+                              '#include "chrome/browser/ui/views/extensions/extension_popup.h"\n#if BUILDFLAG(IS_MAC)\n#include "chrome/browser/ui/views/extensions/native_extension_popup_anchor.h"\n#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"\n#include "chrome/browser/ui/tabs/tab_strip_model.h"\n#endif')
     result[DELEGATE] = replace(result[DELEGATE], """  extensions_container_views_->PopOutAction(
 """, """#if BUILDFLAG(IS_MAC)
-  if (NativeExtensionPopupAnchor::HasPrepared(GetActiveWebContents())) {
+  // ExtensionsToolbarViewModel inherits the container's nullable default.
+  // Match ExtensionActionViewModel::GetCurrentWebContents: the actual browser
+  // tab is authoritative when the container does not override its target.
+  // Consume the prepared anchor synchronously before the native API returns.
+  auto* anchor_contents = GetActiveWebContents();
+  if (!anchor_contents) {
+    anchor_contents = browser_->GetTabStripModel()->GetActiveWebContents();
+  }
+  if (NativeExtensionPopupAnchor::HasPrepared(anchor_contents)) {
     // A hidden Chrome toolbar cannot complete its pop-out layout animation.
     // Keep the same popup owner, ExtensionViewHost and granted user action;
     // only skip the toolbar animation when a native shell supplied an anchor.

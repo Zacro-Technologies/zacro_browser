@@ -1,0 +1,40 @@
+--- a/components/viz/host/gpu_host_impl.cc
++++ b/components/viz/host/gpu_host_impl.cc
+@@ -9,6 +9,7 @@
+ #include "base/feature_list.h"
+ #include "base/functional/bind.h"
+ #include "base/functional/callback_helpers.h"
++#include "base/memory/scoped_refptr.h"
+ #include "base/no_destructor.h"
+ #include "base/process/process_handle.h"
+ #include "base/strings/strcat.h"
+@@ -499,17 +500,27 @@
+       persistent_cache_file_factory->CreateFilesAsync(
+           GetGpuDiskCacheSubdir(gpu::GetHandleType(handle)), cache_version,
+           base::BindOnce(
+-              [](base::WeakPtr<GpuHostImpl> gpu_host,
++              [](scoped_refptr<PersistentCacheSandboxedFileFactory> file_factory,
++                 base::WeakPtr<GpuHostImpl> gpu_host,
+                  gpu::GpuDiskCacheHandle handle,
+                  std::optional<persistent_cache::PendingBackend>
+                      pending_backend) {
+-                if (!gpu_host || !pending_backend) {
++                if (!pending_backend) {
++                  return;
++                }
++                if (!gpu_host) {
++                  // The GPU may exit while its cache files are being opened.
++                  // Closing these handles may block; use the retained original
++                  // factory even if the global instance has since changed.
++                  file_factory->DeletePendingBackendAsync(
++                      std::move(*pending_backend));
+                   return;
+                 }
+ 
+                 gpu_host->OnPersistentCacheFilesCreated(
+                     handle, std::move(*pending_backend));
+               },
++              base::WrapRefCounted(persistent_cache_file_factory),
+               weak_ptr_factory_.GetWeakPtr(), handle),
+           /*extra_opts=*/
+           {.retries = 30, .retry_delay = base::Milliseconds(100)});

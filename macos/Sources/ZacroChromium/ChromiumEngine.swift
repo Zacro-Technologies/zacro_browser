@@ -16,6 +16,8 @@ public final class ChromiumEngine: NSObject {
   private var retiredProfiles: Set<String> = []
   private var profilesUnderMaintenance: Set<String> = []
   private var profileMaintenanceEpochs: [String: UInt64] = [:]
+  private var profileDownloadRetirements: [String: Task<Void, Error>] = [:]
+  private var retirementPhase = ChromiumRetirementPhase()
   private var shuttingDown = false
   private var host: CefChromeBrowser?
   private var capabilities: CefNativeCapabilities?
@@ -37,7 +39,11 @@ public final class ChromiumEngine: NSObject {
   public var beforeTermination: (() async -> Void)?
   public var beforeClosingDocuments: (() async -> Bool)?
   private var closingPreparation: Task<Bool, Never>?
+  private var closingPreparationID: UUID?
+  private var terminationAttemptID: UUID?
   private var terminationDrainStarted = false
+  private var terminationCleanup: Task<Void, Never>?
+  private var terminationCompletionAttemptID: UUID?
   public var onDownload: ((String, Bool, CefDownload) -> Void)?
   public var onPageClosed: ((String) -> Void)?
   public var onPageCloseCancelled: ((String) -> Void)?
@@ -138,32 +144,51 @@ public final class ChromiumEngine: NSObject {
       configuration.safeStorage = .mockKeychain
     }
     configuration.persistSessionCookies = true
-    // Stock CEF's per-document AX state can be lost when retained native
-    // windows change visibility. Keep real renderer accessibility enabled
-    // until the custom scoped accessibility lease is packaged and verified.
-    configuration.extraCommandLineSwitches.updateValue(nil, forKey: "force-renderer-accessibility")
+    // Match official CEF release behavior. Unbranded Chromium otherwise applies
+    // its developer field-trial test matrix, including helper architectures
+    // that CEF does not package. This leaves production defaults and sandbox
+    // enforcement intact, including in a diagnostic non-official build.
+    configuration.extraCommandLineSwitches.updateValue(nil, forKey: "disable-field-trial-config")
+    // The native scoped lease follows actual document visibility. Its fresh
+    // process acceptance proves retained trees without enabling hidden brokers
+    // or never-shown documents through a process-wide renderer switch.
+    let scopedAccessibilityAcceptance = CommandLine.arguments.contains("--native-accessibility-acceptance")
+    if scopedAccessibilityAcceptance {
+      guard CommandLine.arguments.contains("--engine-acceptance"),
+        !CommandLine.arguments.contains("--native-integration-acceptance"),
+        !CommandLine.arguments.contains("--native-ui-review") else {
+        throw NSError(domain: "ZacroEngine", code: 1, userInfo: [NSLocalizedDescriptionKey:
+          "Scoped accessibility acceptance requires its own fresh disposable engine launch."])
+      }
+    }
     configuration.defaultRuntimeStyle = .chrome
     configuration.logFile = dataDirectory.appendingPathComponent("chromium.log")
     try CefRuntime.shared.initialize(configuration: configuration)
     CefRuntime.shared.onTerminationChanged = { [weak self] terminating in
-      self?.isTerminating = terminating
-      if !terminating, let self {
-        for context in self.contexts.values where context.isClosing {
-          self.cancelWindowClose(context, vetoedBy: nil)
+      guard let self else { return }
+      self.isTerminating = terminating
+      if terminating {
+        let attempt = UUID(); self.terminationAttemptID = attempt
+        self.retirementPhase.prepare(attempt)
+      } else {
+        if let attempt = self.terminationAttemptID { self.retirementPhase.cancel(attempt) }
+        self.terminationAttemptID = nil
+        self.closingPreparationID = nil
+        let preparation = self.closingPreparation; self.closingPreparation = nil
+        preparation?.cancel()
+        for context in self.contexts.values {
+          if let attempt = context.closingAttemptID {
+            self.cancelWindowClose(context, vetoedBy: nil, attemptID: attempt)
+          } else { self.cancelWindowPreparation(context) }
         }
       }
-      self?.onTerminationChanged?(terminating)
+      self.onTerminationChanged?(terminating)
     }
     CefRuntime.shared.beforeClosingDocuments = { [weak self] in
       await self?.prepareToCloseDocuments() ?? true
     }
     CefRuntime.shared.onReadyToTerminate = { [weak self] in
-      guard let self, !self.terminationDrainStarted else { return }
-      self.terminationDrainStarted = true
-      Task { @MainActor in
-        // Documents have accepted unload. Finish provider/credential/storage
-        // work while AppKit's run loop can still deliver its completions.
-        await self.beforeTermination?()
+      self?.finishTerminationAfterCleanup {
         NSApp.stop(nil)
         if let wake = NSEvent.otherEvent(
           with: .applicationDefined, location: .zero, modifierFlags: [], timestamp: 0,
@@ -212,7 +237,7 @@ public final class ChromiumEngine: NSObject {
     precondition(host != nil, "Start Chromium before creating pages")
     precondition(ownerWindowID == nil || contexts[ownerWindowID!]?.isOpen == true,
       "A document requires an open owning window")
-    precondition(nativeReservation == nil || (!isPrivate && nativeReservation?.profileID == profileID && nativeReservation?.logicalID == id),
+    precondition(nativeReservation == nil || (nativeReservation?.profileID == profileID && nativeReservation?.logicalID == id),
       "A native tab reservation belongs to its original profile and logical tab")
     let key = (isPrivate ? "private:" : "persistent:") + profileID
     let profile: CefProfile
@@ -269,16 +294,44 @@ public final class ChromiumEngine: NSObject {
     chrome.beforeClose = { [weak self, weak page] in
       guard let self, let page else { return true }
       if self.isTerminating || page.ownerWindowID.flatMap({ self.contexts[$0]?.isClosing }) == true { return true }
-      guard await page.beforeClose?() ?? true else { return false }
-      return await self.prepareRetainedPanelBeforeClosing(page)
+      guard await page.beforeClose?() ?? true else {
+        page.preparationVetoPending = true; return false
+      }
+      let accepted = await self.prepareRetainedPanelBeforeClosing(page)
+      if !accepted { page.preparationVetoPending = true }
+      return accepted
     }
     chrome.browser.onCloseCancelled = { [weak self, weak page] in
       page?.chrome?.cancelPreparedClose()
-      if let self, let owner = page?.ownerWindowID, let context = self.contexts[owner] {
-        self.cancelWindowClose(context, vetoedBy: page)
+      // An older tab preparation can be cancelled by a newer window-close
+      // attempt. Its callback is not a beforeunload veto for that new attempt.
+      let preparationVeto = page?.preparationVetoPending == true
+      page?.preparationVetoPending = false
+      if !preparationVeto, let self, let page, let attempt = page.windowCloseAttemptID,
+        let owner = page.ownerWindowID, let context = self.contexts[owner] {
+        self.cancelWindowClose(context, vetoedBy: page, attemptID: attempt)
       }
       page?.onCloseCancelled?()
       if let page { self?.onPageCloseCancelled?(page.id) }
+      if preparationVeto, let self, let page {
+        // CEF keeps one closePreparation task. A newer close() may have met
+        // that old task instead of starting native beforeunload; retry only
+        // once its rejection has drained, under the newer accepted scope.
+        let windowAttempt = page.windowCloseAttemptID
+        let terminationAttempt = self.terminationAttemptID
+        DispatchQueue.main.async { [weak self, weak page] in
+          guard let self, let page, self.pages[page.id] === page else { return }
+          if let terminationAttempt, self.isTerminating,
+            self.terminationAttemptID == terminationAttempt, page.browser?.closingForTermination == true {
+            page.close()
+          } else if !self.isTerminating, let windowAttempt,
+            let owner = page.ownerWindowID, let context = self.contexts[owner],
+            context.isOpen, context.isClosing, context.closingAttemptID == windowAttempt,
+            context.closingPreparation == nil, page.windowCloseAttemptID == windowAttempt {
+            page.close()
+          }
+        }
+      }
     }
     page.onClosedInternal = { [weak self, weak page] in
       guard let self, let page else { return }
@@ -418,8 +471,67 @@ public final class ChromiumEngine: NSObject {
     return page
   }
   public func close(id: String) { pages[id]?.close() }
+  /// Chrome-owned auth/developer windows retain the actual request context but
+  /// are deliberately absent from the application tab catalog.
+  public func auxiliaryBrowsers(profileID: String, isPrivate: Bool) -> [CefBrowser] {
+    let key = (isPrivate ? "private:" : "persistent:") + profileID
+    guard let profile = profiles[key] else { return [] }
+    return CefRuntime.shared.auxiliaryBrowsers.filter { $0.belongs(to: profile) }
+  }
+  public func closeAuxiliaryBrowsers(profileID: String, isPrivate: Bool) async throws {
+    let key = (isPrivate ? "private:" : "persistent:") + profileID
+    guard let profile = profiles[key] else { return }
+    try await CefRuntime.shared.closeAuxiliaryBrowsers(in: profile)
+  }
+  private func hasAuxiliaryWindows(profileID: String, isPrivate: Bool) -> Bool {
+    let key = (isPrivate ? "private:" : "persistent:") + profileID
+    guard let profile = profiles[key] else { return false }
+    return CefRuntime.shared.hasAuxiliaryWindows(in: profile)
+  }
+  /// Core must already have committed profile deletion or last-private-owner
+  /// retirement. Keep the existing context alive until Chromium has cancelled
+  /// every transfer, including worker downloads with no browser callback.
+  public func retireProfileDownloads(profileID: String, isPrivate: Bool) async throws {
+    let key = (isPrivate ? "private:" : "persistent:") + profileID
+    if let pending = profileDownloadRetirements[key] { try await pending.value; return }
+    guard retirementPhase.canBeginTask, !shuttingDown, !terminationDrainStarted else {
+      throw CefDevToolsError.rejected("Profile retirement is deferred to runtime shutdown or a cancelled-Quit retry.")
+    }
+    // Startup replay and profiles never opened in this process have no native
+    // transfers. Do not create a request context merely to remove one.
+    guard profiles[key] != nil else { return }
+    let task = Task { @MainActor in
+      try await self.closeAuxiliaryBrowsers(profileID: profileID, isPrivate: isPrivate)
+      guard self.retirementPhase.canCreateForExistingTask, !self.shuttingDown,
+        !self.terminationDrainStarted, self.host?.browser.isClosed == false else { throw CefDevToolsError.browserClosed }
+      do {
+        guard try await self.nativeCapabilities().downloads == true else { return }
+      } catch let error as CefDevToolsError where error.isUnsupportedMethod {
+        // Explicit stock-runtime diagnostics have no native extension download
+        // manager. Their CEF callback controls are cancelled during release.
+        return
+      }
+      guard self.retirementPhase.canCreateForExistingTask, !self.shuttingDown,
+        !self.terminationDrainStarted, self.host?.browser.isClosed == false else { throw CefDevToolsError.browserClosed }
+      let transport = self.page(id: "maintenance:retire:" + key, profileID: profileID,
+        isPrivate: isPrivate, url: URL(string: "about:blank")!, ownerWindowID: nil)
+      transport.hide()
+      try await transport.ready().retireProfileDownloads()
+      // A failed fence retains this exact transport and context for retry. The
+      // durable Core receipt must not be acknowledged until this succeeds.
+      await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+        let previous = transport.onClosed
+        transport.onClosed = { previous?(); continuation.resume() }
+        transport.close()
+      }
+    }
+    profileDownloadRetirements[key] = task
+    defer { profileDownloadRetirements.removeValue(forKey: key) }
+    try await task.value
+  }
   public func releasePrivateProfile(_ profileID: String) throws {
-    guard !pages.values.contains(where: { $0.profileID == profileID && $0.isPrivate }) else {
+    guard !pages.values.contains(where: { $0.profileID == profileID && $0.isPrivate }),
+      !hasAuxiliaryWindows(profileID: profileID, isPrivate: true) else {
       throw CefDevToolsError.rejected("Close the private profile's documents before releasing it.")
     }
     profiles.removeValue(forKey: "private:" + profileID)
@@ -433,7 +545,9 @@ public final class ChromiumEngine: NSObject {
   /// completed with no live Chromium context, including after an interrupted quit.
   public func retireProfile(_ profileID: String) throws {
     guard ChromiumProfileRetirementJournal.validID(profileID) else { throw POSIXError(.EINVAL) }
-    guard !pages.values.contains(where: { $0.profileID == profileID }) else {
+    guard !pages.values.contains(where: { $0.profileID == profileID }),
+      !hasAuxiliaryWindows(profileID: profileID, isPrivate: false),
+      !hasAuxiliaryWindows(profileID: profileID, isPrivate: true) else {
       throw NSError(domain: "ZacroEngine", code: 2, userInfo: [NSLocalizedDescriptionKey:
         "Close this profile's documents before deleting it."])
     }
@@ -544,14 +658,17 @@ public final class ChromiumEngine: NSObject {
   public func closeWindow() { if let primaryWindow { closeWindow(id: primaryWindow.id) } }
   public func closeWindow(id: String) {
     guard let context = contexts[id], context.isOpen, !context.isClosing, !isTerminating else { return }
+    let attempt = UUID()
+    context.closingAttemptID = attempt
     context.isClosing = true
     Task { @MainActor [weak self, weak context] in
       guard let self, let context else { return }
       let accepted = await self.prepareToCloseDocuments(in: context)
-      guard context.isClosing, !self.isTerminating else { return }
-      guard accepted else { self.cancelWindowClose(context, vetoedBy: nil); return }
+      guard context.isClosing, context.closingAttemptID == attempt, !self.isTerminating else { return }
+      guard accepted else { self.cancelWindowClose(context, vetoedBy: nil, attemptID: attempt); return }
       for page in Array(self.pages.values) where page.ownerWindowID == context.id {
         page.closedForWindow = true
+        page.windowCloseAttemptID = attempt
         page.close()
       }
       self.finishWindowCloseIfReady(context)
@@ -559,51 +676,113 @@ public final class ChromiumEngine: NSObject {
   }
 
   private func prepareToCloseDocuments(in context: ChromiumWindowContext) async -> Bool {
-    if let existing = context.closingPreparation { return await existing.value }
+    if let existing = context.closingPreparation, let token = context.closingPreparationID {
+      let accepted = await existing.value
+      return accepted && !Task.isCancelled && context.closingPreparationID == token
+    }
+    let token = UUID()
+    context.closingPreparationID = token
     let task = Task { @MainActor [weak self, weak context] in
-      guard let self, let context else { return true }
+      guard let self, let context, !Task.isCancelled,
+        context.closingPreparationID == token else { return false }
       if let prepare = context.beforeClosingDocuments { return await prepare() }
       if context === self.primaryWindow { return await self.beforeClosingDocuments?() ?? true }
       return true
     }
     context.closingPreparation = task
     let accepted = await task.value
+    guard context.closingPreparationID == token else { return false }
     context.closingPreparation = nil
-    return accepted
+    return accepted && !Task.isCancelled && !task.isCancelled
   }
 
   private func prepareToCloseDocuments() async -> Bool {
-    if let closingPreparation { return await closingPreparation.value }
+    guard isTerminating, let attempt = terminationAttemptID else { return false }
+    // A late Chrome-created document can veto after application cleanup began.
+    // A later Quit must still negotiate that document without rerunning closed
+    // services or reopening retirement admission. Owned documents were already
+    // drained; an unexpected new one keeps the retry safely blocked.
+    if terminationDrainStarted { return pages.isEmpty }
+    if let closingPreparation, let token = closingPreparationID {
+      let accepted = await closingPreparation.value
+      return accepted && !Task.isCancelled && terminationAttemptID == attempt && closingPreparationID == token
+    }
+    let token = UUID()
+    closingPreparationID = token
     let task = Task { @MainActor [weak self] in
-      guard let self else { return true }
+      guard let self else { return false }
       // Prepare every live shell before CEF asks any document to unload. A veto
       // leaves all native windows intact and permits another attempt later.
       for context in self.contexts.values.sorted(by: { $0.nativeID < $1.nativeID }) where context.isOpen {
+        guard !Task.isCancelled, self.terminationAttemptID == attempt,
+          self.closingPreparationID == token else { return false }
         if !(await self.prepareToCloseDocuments(in: context)) { return false }
       }
-      return true
+      // New per-profile tasks have been blocked since Quit began. Existing
+      // authorized retirements keep their broker until they settle; failures
+      // retain cleanup authority for shutdown/startup or a cancelled-Quit retry.
+      for retirement in Array(self.profileDownloadRetirements.values) {
+        _ = await retirement.result
+        guard !Task.isCancelled, self.terminationAttemptID == attempt,
+          self.closingPreparationID == token else { return false }
+      }
+      guard !Task.isCancelled, self.terminationAttemptID == attempt,
+        self.closingPreparationID == token else { return false }
+      return self.retirementPhase.beginNativeClose(attempt)
     }
     closingPreparation = task
     let accepted = await task.value
+    guard closingPreparationID == token else { return false }
     closingPreparation = nil
-    return accepted
+    return accepted && !Task.isCancelled && !task.isCancelled && terminationAttemptID == attempt
   }
 
-  private func cancelWindowClose(_ context: ChromiumWindowContext, vetoedBy page: ChromiumPage?) {
-    page?.closedForWindow = false
-    guard context.isClosing else { return }
+  private func finishTerminationAfterCleanup(_ completion: @escaping () -> Void) {
+    guard let attempt = terminationAttemptID,
+      terminationCompletionAttemptID != attempt,
+      let finish = CefRuntime.shared.deferredTerminationCompletion(completion) else { return }
+    terminationCompletionAttemptID = attempt
+    if terminationCleanup == nil {
+      terminationDrainStarted = true
+      retirementPhase.beginDrain()
+      // Keep one cleanup task across late native vetoes. A replacement Quit
+      // waits for this same task and binds its own exact runtime completion.
+      terminationCleanup = Task { @MainActor in await self.beforeTermination?() }
+    }
+    guard let cleanup = terminationCleanup else { return }
+    Task { @MainActor in
+      await cleanup.value
+      finish()
+    }
+  }
+
+  private func cancelWindowPreparation(_ context: ChromiumWindowContext) {
+    context.closingPreparationID = nil
+    let preparation = context.closingPreparation; context.closingPreparation = nil
+    preparation?.cancel()
+  }
+
+  private func cancelWindowClose(_ context: ChromiumWindowContext, vetoedBy page: ChromiumPage?, attemptID: UUID) {
+    if page?.windowCloseAttemptID == attemptID {
+      page?.closedForWindow = false; page?.windowCloseAttemptID = nil
+    }
+    guard context.isClosing, context.closingAttemptID == attemptID else { return }
+    context.closingAttemptID = nil
     context.isClosing = false
+    cancelWindowPreparation(context)
     // Accepted siblings retain their origin flag until native didClose so the
     // model can restore them when another document vetoes the close.
     context.onCloseCancelled?()
   }
 
   private func finishWindowCloseIfReady(_ context: ChromiumWindowContext) {
-    guard context.isClosing, context.closingPreparation == nil,
+    guard context.isClosing, let attempt = context.closingAttemptID, context.closingPreparation == nil,
       !pages.values.contains(where: { $0.ownerWindowID == context.id }) else { return }
     DispatchQueue.main.async { [weak self, weak context] in
-      guard let self, let context, context.isClosing,
+      guard let self, let context, context.isClosing, context.closingAttemptID == attempt,
         !self.pages.values.contains(where: { $0.ownerWindowID == context.id }) else { return }
+      context.closingAttemptID = nil
+      context.closingPreparationID = nil
       context.isClosing = false; context.isOpen = false
       context.window.orderOut(nil)
       if self.focusedWindowID == context.id { self.focusedWindowID = nil }
@@ -637,8 +816,11 @@ public final class ChromiumEngine: NSObject {
     onUnownedOpenURL = nil
     for control in downloadControls.values { control.invalidate() }
     downloadControls.removeAll()
+    terminationAttemptID = nil; closingPreparationID = nil
+    closingPreparation?.cancel(); closingPreparation = nil
     for context in contexts.values {
-      context.closingPreparation?.cancel()
+      cancelWindowPreparation(context)
+      context.closingAttemptID = nil
       context.window.delegate = nil
       context.window.orderOut(nil)
       context.window.contentView = nil
@@ -692,8 +874,14 @@ public final class ChromiumPage: CefBrowserDelegate {
   public private(set) var faviconDocumentURL: URL?
   public fileprivate(set) var reservedNativeTabID: Int?
   public var onChange: (() -> Void)?
+  /// Actual cross-document commit, including a reload or restored history entry.
+  public var onCommittedNavigation: ((URL) -> Void)?
+  /// Emitted only by Chromium's title callback, never a general state refresh.
+  public var onTitleChanged: ((String) -> Void)?
   public var onOpenURL: ((URL, Bool) -> Void)?
-  public var onPeek: ((URL) -> Void)?
+  /// A context-menu invocation includes its original root-document point.
+  /// Other native navigation gestures may omit a point.
+  public var onPeek: ((URL, CGPoint?) -> Void)?
   public var onSearchSelection: ((String) -> Void)?
   public var onMutedChanged: ((Bool) -> Void)?
   public var onFocused: (() -> Void)?
@@ -710,9 +898,14 @@ public final class ChromiumPage: CefBrowserDelegate {
   public var onPermission: ((CefPermissionRequest) -> CefPermissionDecision)?
   public var onPermissionRequest: ((CefPermissionRequest, CefPermissionCallback) -> Bool)?
   public var onPermissionDismissed: ((UUID) -> Void)?
+  public var onJavaScriptDialog: ((CefJSDialog, CefJSDialogCallback) -> Void)?
+  public var onBeforeUnloadDialog: ((String, Bool, CefJSDialogCallback) -> Void)?
+  public var onJavaScriptDialogReset: (() -> Void)?
   public var onClosed: (() -> Void)?
   public private(set) var closedForTermination = false
   public fileprivate(set) var closedForWindow = false
+  fileprivate var windowCloseAttemptID: UUID?
+  fileprivate var preparationVetoPending = false
   public var onFindResult: ((Int, Int, Bool) -> Void)? {
     get { browser?.onFindResult }
     set { browser?.onFindResult = newValue }
@@ -839,9 +1032,23 @@ public final class ChromiumPage: CefBrowserDelegate {
   public func setPresentationParent(_ window: NSWindow?) { chrome?.setPresentationParent(window) }
   public func focus() {
     guard let browser, let view = browser.nativeView else { return }
+    let tracing = CommandLine.arguments.contains("--native-integration-acceptance")
+    @MainActor func trace(_ phase: String) {
+      guard tracing else { return }
+      let window = view.window
+      let responder = (window?.firstResponder).map { String(reflecting: type(of: $0)) } ?? "nil"
+      fputs("Native document focus \(phase) id=\(id) appActive=\(NSApp.isActive) window=\(window?.windowNumber ?? -1) key=\(window?.isKeyWindow == true) canKey=\(window?.canBecomeKey == true) appKey=\(NSApp.keyWindow?.windowNumber ?? -1) view=\(String(reflecting: type(of: view))) responder=\(responder) parent=\(window?.parent?.windowNumber ?? -1)\n", stderr)
+    }
+    trace("before")
     view.window?.makeKey()
-    view.window?.makeFirstResponder(view)
+    // Chrome Views returns its Widget root as the CEF window handle, not the
+    // document's RenderWidgetHostViewCocoa. Making that generic root the Cocoa
+    // responder can undo the WebView focus restored when the window became
+    // key. Views still remembers the same WebView, so its later RequestFocus
+    // then exits without restoring actual document focus. Let CEF's genuine
+    // WebView/FocusManager path select the native document responder instead.
     browser.setFocus(true)
+    trace("after")
   }
   public func find(_ text: String, forward: Bool = true, findNext: Bool = true) {
     browser?.find(text, forward: forward, matchCase: false,
@@ -861,7 +1068,12 @@ public final class ChromiumPage: CefBrowserDelegate {
 
   public func browser(_ b: CefBrowser, didChangeTitle title: String) {
     self.title = title
+    onTitleChanged?(title)
     onChange?()
+  }
+  public func browser(_ b: CefBrowser, didCommitNavigation url: URL) {
+    guard browser === b else { return }
+    onCommittedNavigation?(url)
   }
   public func browser(_ b: CefBrowser, didChangeURL url: URL?) {
     if self.url != url {
@@ -914,7 +1126,7 @@ public final class ChromiumPage: CefBrowserDelegate {
     guard popupTimes.count < 4 else { return .deny }
     popupTimes.append(now)
     if request.disposition == .newWindow, request.userGesture, let url = request.targetURL,
-      NSEvent.modifierFlags.contains(.shift), let onPeek { onPeek(url); return .handled }
+      NSEvent.modifierFlags.contains(.shift), let onPeek { onPeek(url, nil); return .handled }
     // Never replace a Chromium-created popup with a GET of its URL: the live
     // document carries POST bodies, named-window identity and its opener.
     return onPopupCreated != nil || canAdoptPopupInternally?() == true ? .allowNativePopup : .deny
@@ -938,7 +1150,7 @@ public final class ChromiumPage: CefBrowserDelegate {
   }
   public func browser(_ b: CefBrowser, didRequestNewTab url: URL?, disposition: CefWindowOpenDisposition, userGesture: Bool) -> Bool {
     guard let url, allowedNewDocumentURL(url) else { return true }
-    if disposition == .newWindow, userGesture, NSEvent.modifierFlags.contains(.shift), let onPeek { onPeek(url); return true }
+    if disposition == .newWindow, userGesture, NSEvent.modifierFlags.contains(.shift), let onPeek { onPeek(url, nil); return true }
     if let onOpenURL { onOpenURL(url, disposition.prefersForeground); return true }
     return openURLInternally?(url, disposition.prefersForeground) ?? false
   }
@@ -961,6 +1173,7 @@ public final class ChromiumPage: CefBrowserDelegate {
     return .cancel
   }
   public func browserDidClose(_ b: CefBrowser) {
+    onJavaScriptDialogReset?()
     creationFailed = b.creationFailed
     documentObservation?.cancel(); documentObservation = nil
     if let documentEventToken { b.devTools.removeEventObserver(documentEventToken) }
@@ -986,12 +1199,12 @@ public final class ChromiumPage: CefBrowserDelegate {
       "IDC_CONTENT_CONTEXT_INSPECTELEMENT_WITH_DEVTOOLS"] {
       menu.removeChromeCommand(named: name)
     }
-    if params.linkURL != nil {
-      menu.insertItem(at: 0, commandID: CefMenuModel.userCommandIDFirst, title: "Peek at link")
-      menu.insertItem(at: 1, commandID: CefMenuModel.userCommandIDFirst + 1, title: "Open link in new tab")
-      menu.insertItem(at: 2, commandID: CefMenuModel.userCommandIDFirst + 2, title: "Open link in background")
-      menu.insertItem(at: 3, commandID: CefMenuModel.userCommandIDFirst + 3, title: "Copy link address")
-      menu.insertSeparator(at: 4)
+    let links = ChromiumPageContextMenuPolicy.linkCommands(params)
+    if !links.isEmpty {
+      for (index, command) in links.enumerated() {
+        menu.insertItem(at: index, commandID: command.commandID, title: command.title)
+      }
+      menu.insertSeparator(at: links.count)
     }
     if !params.selectionText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !params.isEditable {
       menu.addItem(commandID: CefMenuModel.userCommandIDFirst + 4, title: "Search selection")
@@ -1013,9 +1226,9 @@ public final class ChromiumPage: CefBrowserDelegate {
   ) -> Bool {
     switch commandID - CefMenuModel.userCommandIDFirst {
     case 0, 1, 2, 3:
-      guard let url = params.linkURL, Self.webURL(url) else { return true }
+      guard let url = ChromiumPageContextMenuPolicy.webLink(params) else { return true }
       switch commandID - CefMenuModel.userCommandIDFirst {
-      case 0: onPeek?(url)
+      case 0: onPeek?(url, ChromiumPageContextMenuPolicy.invocationPoint(params))
       case 1: onOpenURL?(url, true)
       case 2: onOpenURL?(url, false)
       default: NSPasteboard.general.clearContents(); NSPasteboard.general.setString(url.absoluteString, forType: .string)
@@ -1080,6 +1293,24 @@ public final class ChromiumPage: CefBrowserDelegate {
     if let onPermission { return onPermission(request) }
     return .deny
   }
+  public func browser(_ b: CefBrowser, runJSDialog dialog: CefJSDialog,
+                      callback: CefJSDialogCallback) -> Bool {
+    guard browser === b else { callback.cancel(); return true }
+    if let onJavaScriptDialog { onJavaScriptDialog(dialog, callback) }
+    else { callback.cancel() }
+    return true
+  }
+  public func browser(_ b: CefBrowser, runBeforeUnloadDialog message: String,
+                      isReload: Bool, callback: CefJSDialogCallback) -> Bool {
+    guard browser === b else { callback.cancel(); return true }
+    if let onBeforeUnloadDialog { onBeforeUnloadDialog(message, isReload, callback) }
+    else { callback.cancel() }
+    return true
+  }
+  public func browserResetJavaScriptDialog(_ b: CefBrowser) {
+    guard browser === b else { return }
+    onJavaScriptDialogReset?()
+  }
   public func browser(_ b: CefBrowser, requestsPermission request: CefPermissionRequest,
                       callback: CefPermissionCallback) -> Bool {
     if request.kinds.contains(.screenCapture) || request.kinds.contains(.systemAudioCapture)
@@ -1103,6 +1334,15 @@ public final class ChromiumPage: CefBrowserDelegate {
 }
 
 extension ChromiumEngine {
+  /// Hidden native transport for bundled component APIs in an ephemeral
+  /// profile. It never loads the extension manager or a persistent profile.
+  func privateComponentsPage(profileID: String) -> ChromiumPage {
+    let identifier = "private-components:\(profileID)"
+    if let existing = pages[identifier] { return existing }
+    return page(id: identifier, profileID: profileID, isPrivate: true,
+      url: URL(string: "about:blank")!, ownerWindowID: nil)
+  }
+
   /// Chromium's real extension manager, including unpacked install, enable,
   /// disable and removal. It runs inside the selected profile's Chrome runtime.
   public func extensionsPage(profileID: String) -> ChromiumPage {

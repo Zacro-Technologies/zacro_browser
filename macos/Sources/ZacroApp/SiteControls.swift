@@ -203,14 +203,48 @@ struct SiteControls: View {
   let actions: SiteControlActions
   var accent: Color = .accentColor
   var palette: NativeSpacePalette? = nil
+  var maximumHeight: CGFloat = 600
   @Environment(\.dismiss) private var dismiss
   @Environment(\.colorScheme) private var colorScheme
   @State private var copied = false
   @State private var hoveredExtension: String?
   @FocusState private var focus: String?
+  @State private var measuredHeight: CGFloat = 0
   private var colors: NativeSpacePalette { palette ?? NativeSpacePalette(theme: SpaceTheme(), dark: colorScheme == .dark) }
 
   var body: some View {
+    ScrollViewReader { reader in
+      ScrollView {
+        content.background {
+          GeometryReader { geometry in
+            Color.clear.preference(key: NativeSiteControlsHeight.self, value: geometry.size.height)
+          }
+        }
+      }.scrollIndicators(.hidden)
+        .frame(width: 304, height: NativeSiteControlsLayout.height(content: measuredHeight, maximum: maximumHeight))
+        .onPreferenceChange(NativeSiteControlsHeight.self) { height in
+          if height > 0, abs(height - measuredHeight) > 0.5 { measuredHeight = height }
+        }
+        .onChange(of: focus) { _, id in if let id { reader.scrollTo(id) } }
+    }
+      .foregroundStyle(colors.ink).font(.system(size: 13)).tint(accent)
+      .background { NativeControlSurface().overlay(colors.chrome.opacity(0.32)) }
+      .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+      .accessibilityElement(children: .contain).accessibilityLabel("Site controls")
+      .onAppear { focus = focusIDs.first }
+      .onKeyPress(keys: [.upArrow, .downArrow, .home, .end]) { key in
+        guard key.modifiers.intersection([.command, .control, .option, .shift]).isEmpty else { return .ignored }
+        let ids = focusIDs
+        guard !ids.isEmpty else { return .handled }
+        let current = focus.flatMap { ids.firstIndex(of: $0) } ?? (key.key == .upArrow ? 0 : -1)
+        if key.key == .home { focus = ids.first }
+        else if key.key == .end { focus = ids.last }
+        else { focus = ids[(current + (key.key == .downArrow ? 1 : -1) + ids.count) % ids.count] }
+        return .handled
+      }
+      .onKeyPress(.escape) { dismiss(); return .handled }
+  }
+  private var content: some View {
     VStack(alignment: .leading, spacing: 0) {
       HStack(spacing: 8) {
         quick(copied ? "checkmark" : "copy", label: copied ? "Address copied" : "Copy link", focusID: "copy") {
@@ -228,6 +262,7 @@ struct SiteControls: View {
         Button { perform(actions.manageExtensions) } label: { NativeGlyph("plus").frame(width: 16, height: 16).frame(width: 26, height: 26) }
           .buttonStyle(.plain).foregroundStyle(accent).help("Manage extensions").accessibilityLabel("Manage extensions").disabled(actions.isPrivate)
           .focused($focus, equals: "extensions")
+          .id("extensions")
           .padding(.top, 8)
       }
       if actions.isPrivate {
@@ -257,27 +292,11 @@ struct SiteControls: View {
             NativeGlyph(actions.url?.scheme == "https" && !actions.pageError ? "lock" : "globe").frame(width: 15, height: 15).foregroundStyle(accent)
             Text(NativePageIdentity.securityLabel(actions.url, failed: actions.pageError))
           }.padding(.horizontal, 9).padding(.vertical, 7).background(colors.ink.opacity(0.045), in: RoundedRectangle(cornerRadius: 8))
-        }.buttonStyle(.plain).disabled(!actions.hasWebPage).help(actions.origin).focused($focus, equals: "security")
+        }.buttonStyle(.plain).disabled(!actions.hasWebPage).help(actions.origin).focused($focus, equals: "security").id("security")
         Spacer()
         moreActions
       }.padding(.top, 12).padding(.horizontal, 2)
     }.padding(12).frame(width: 304)
-      .foregroundStyle(colors.ink).font(.system(size: 13)).tint(accent)
-      .background { NativeControlSurface().overlay(colors.chrome.opacity(0.32)) }
-      .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-      .accessibilityElement(children: .contain).accessibilityLabel("Site controls")
-      .onAppear { focus = focusIDs.first }
-      .onKeyPress(keys: [.upArrow, .downArrow, .home, .end]) { key in
-        guard key.modifiers.intersection([.command, .control, .option, .shift]).isEmpty else { return .ignored }
-        let ids = focusIDs
-        guard !ids.isEmpty else { return .handled }
-        let current = focus.flatMap { ids.firstIndex(of: $0) } ?? (key.key == .upArrow ? 0 : -1)
-        if key.key == .home { focus = ids.first }
-        else if key.key == .end { focus = ids.last }
-        else { focus = ids[(current + (key.key == .downArrow ? 1 : -1) + ids.count) % ids.count] }
-        return .handled
-      }
-      .onKeyPress(.escape) { dismiss(); return .handled }
   }
   private var focusIDs: [String] {
     var result = actions.hasDocument ? ["copy"] : []
@@ -304,6 +323,7 @@ struct SiteControls: View {
         .shadow(color: .black.opacity(0.08), radius: 1.5, y: 1)
     }.buttonStyle(.plain).foregroundStyle(accent).disabled(!(enabled ?? actions.hasDocument))
       .focused($focus, equals: focusID ?? glyph)
+      .id(focusID ?? glyph)
       .help(label).accessibilityLabel(label).accessibilityAddTraits(selected ? [.isSelected] : [])
   }
   private func sectionHeading(_ title: String) -> some View {
@@ -321,6 +341,7 @@ struct SiteControls: View {
         }
     }.buttonStyle(.plain).help(item.name + (item.enabled ? "" : " · Disabled")).accessibilityLabel(item.name)
       .focused($focus, equals: "extension:\(item.id)")
+      .id("extension:\(item.id)")
       .overlay(alignment: .bottomTrailing) {
         Button(action: item.togglePin) {
           NativeGlyph("pin").frame(width: 13, height: 13).frame(width: 19, height: 19)
@@ -330,6 +351,7 @@ struct SiteControls: View {
         }.buttonStyle(.plain).offset(x: 4, y: 4).disabled(!item.canPin)
           .opacity(item.pinned || hoveredExtension == item.id || focus == "pin:\(item.id)" || focus == "extension:\(item.id)" ? 1 : 0)
           .focused($focus, equals: "pin:\(item.id)")
+          .id("pin:\(item.id)")
           .help((item.pinned ? "Unpin " : "Pin ") + item.name)
           .accessibilityLabel((item.pinned ? "Unpin " : "Pin ") + item.name)
       }.onHover { if $0 { hoveredExtension = item.id } else if hoveredExtension == item.id { hoveredExtension = nil } }
@@ -345,12 +367,12 @@ struct SiteControls: View {
         }
         Spacer(minLength: 0)
       }.padding(10).contentShape(RoundedRectangle(cornerRadius: 9))
-    }.buttonStyle(.plain).disabled(disabled).focused($focus, equals: title)
+    }.buttonStyle(.plain).disabled(disabled).focused($focus, equals: title).id(title)
   }
   private var moreActions: some View {
     Button { perform(actions.pageActions) } label: {
       NativeGlyph("more").frame(width: 18, height: 18).frame(width: 32, height: 32).background(colors.ink.opacity(0.045), in: Circle())
-    }.buttonStyle(.plain).foregroundStyle(accent).help("More page actions").accessibilityLabel("More page actions").focused($focus, equals: "more")
+    }.buttonStyle(.plain).foregroundStyle(accent).help("More page actions").accessibilityLabel("More page actions").focused($focus, equals: "more").id("more")
   }
   private func badge(_ item: SiteExtensionItem, small: Bool) -> some View {
     Text(String(item.badgeText.prefix(4))).font(.system(size: small ? 8 : 9)).lineLimit(1)
@@ -360,6 +382,17 @@ struct SiteControls: View {
   }
   private func perform(_ action: @escaping () -> Void) {
     dismiss(); DispatchQueue.main.async(execute: action)
+  }
+}
+
+private struct NativeSiteControlsHeight: PreferenceKey {
+  static let defaultValue: CGFloat = 0
+  static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
+}
+enum NativeSiteControlsLayout {
+  static func height(content: CGFloat, maximum: CGFloat) -> CGFloat {
+    let limit = maximum.isFinite ? max(1, maximum) : 600
+    return min(limit, content.isFinite && content > 0 ? content : 360)
   }
 }
 

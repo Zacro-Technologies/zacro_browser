@@ -20,6 +20,11 @@ final class EngineAcceptance {
   func run(url: URL) {
     task = Task { @MainActor [self] in
       do {
+        if CommandLine.arguments.contains("--native-accessibility-acceptance") {
+          checks = try await NativeAccessibilityRuntimeAcceptance.run(engine: engine, url: url)
+          finish(error: nil)
+          return
+        }
         let probeStarted = Date()
         do { _ = try await engine.nativeCapabilities() }
         catch let error as CefDevToolsError where error.isUnsupportedMethod { /* Stock runtime. */ }
@@ -276,6 +281,92 @@ final class EngineAcceptance {
         "navigationCommitRejectsFailedDocument")
     }
     try await checkLargeNativeHistory(url: url)
+    try await checkPrivateDiscardHistory(url: url)
+  }
+
+  private func checkPrivateDiscardHistory(url: URL) async throws {
+    var components = URLComponents(url: url, resolvingAgainstBaseURL: false)!
+    components.path = "/native-history-form"; components.query = nil
+    let formURL = components.url!
+    let page = engine.page(id: "acceptance-private-discard-history",
+      profileID: "acceptance-private-discard", isPrivate: true, url: nil)
+    let browser = try await page.ready()
+    defer { page.close() }
+    func waitFor(_ expression: String) async throws -> Bool {
+      let deadline = Date().addingTimeInterval(5)
+      repeat {
+        if (try? await browser.devTools.evaluate(expression)) as? Bool == true { return true }
+        try await Task.sleep(for: .milliseconds(20))
+      } while Date() < deadline
+      return false
+    }
+    func finishLoading() async throws {
+      let deadline = Date().addingTimeInterval(5)
+      while browser.isLoading && Date() < deadline { try await Task.sleep(for: .milliseconds(10)) }
+      guard !browser.isLoading else { throw Failure(message: "Private form navigation did not finish loading") }
+    }
+    func fill(_ expression: String) async throws {
+      _ = try await browser.devTools.evaluate("(() => { const field=document.getElementById('retained'); field.value=\(expression); field.dispatchEvent(new Event('input',{bubbles:true})); field.dispatchEvent(new Event('change',{bubbles:true})); })()")
+    }
+    try await browser.loadAndWaitForNavigationCommit(formURL)
+    guard try await waitFor("!!document.getElementById('retained')") else {
+      throw Failure(message: "Private history form did not load")
+    }
+    // This is a dormant document fixture, not a request to evict visible
+    // content. Explicitly hide its actual hosted Views surface before capture.
+    page.hide()
+    let previous = "'Private old-frame state · '.repeat(30000)"
+    try await fill(previous)
+    try await browser.loadAndWaitForNavigationCommit(url)
+    try await finishLoading()
+    // No encrypted capture and no arbitrary wait for the hidden old RFH to
+    // publish its delayed state: discard itself must provide that barrier.
+    let discardState = try await browser.devTools.call("Zacro.getDocumentState")
+    let rendererVisibility = try await browser.devTools.evaluate("document.visibilityState") as? String
+    if let data = try? JSONSerialization.data(withJSONObject: discardState, options: [.sortedKeys]) {
+      fputs("Private discard preflight: \(String(decoding: data, as: UTF8.self)); rendererVisibility=\(rendererVisibility ?? "unknown")\n", stderr)
+    }
+    try require(rendererVisibility == "hidden", "privateDiscardFixtureUsesActuallyHiddenRenderer")
+    try await browser.discardDocument()
+    try require(try await browser.devTools.evaluate("location.href") as? String == "about:blank",
+      "privateDiscardRetainsNativeIdentityAtBlank")
+    try await browser.restoreDiscardedDocument()
+    browser.goBack()
+    try require(try await waitFor("document.getElementById('retained')?.value === \(previous)"),
+      "privateDiscardFlushesPreviousLargeFormState")
+    try await finishLoading()
+    let current = "'Private current-frame state · '.repeat(25000)"
+    try await fill(current)
+    try await browser.discardDocument()
+    try await browser.restoreDiscardedDocument()
+    try require(try await waitFor("document.getElementById('retained')?.value === \(current)"),
+      "privateDiscardFlushesCurrentFormState")
+    try await finishLoading()
+    let excessive = "'oversized-private-form-'.repeat(600000)"
+    try await fill(excessive)
+    do {
+      try await browser.discardDocument()
+      throw Failure(message: "Oversized private history was silently discarded")
+    } catch let error as CefDevToolsError {
+      try require(error.localizedDescription.contains("supported size"),
+        "privateDiscardRejectsOversizedRetainedHistory")
+    }
+    let retainedAddress = try await browser.devTools.evaluate("location.href") as? String
+    let retainedForm = try await browser.devTools.evaluate("document.getElementById('retained')?.value === \(excessive)") as? Bool
+    try require(retainedAddress == formURL.absoluteString && retainedForm == true,
+      "rejectedPrivateDiscardPreservesLiveForm")
+    try await fill("'recoverable-private-value'")
+    try await browser.discardDocument()
+    try await browser.restoreDiscardedDocument()
+    try require(try await waitFor("document.getElementById('retained')?.value === 'recoverable-private-value'"),
+      "privateDiscardCanRetryAfterRejectedSnapshot")
+    do {
+      _ = try await browser.serializedNavigationState()
+      throw Failure(message: "Private discard enabled persistent navigation export")
+    } catch let error as CefDevToolsError {
+      try require(error.localizedDescription.contains("Private navigation"),
+        "privateDiscardNeverEnablesPersistentExport")
+    }
   }
 
   private func checkLargeNativeHistory(url: URL) async throws {
@@ -424,6 +515,9 @@ final class EngineAcceptance {
     timer = nil
     let result: [String: Any] = [
       "passed": error == nil, "error": error ?? "", "documents": pages.count,
+      "suite": CommandLine.arguments.contains("--native-accessibility-acceptance") ? "accessibility" : "engine",
+      "fullEngineSuitePassed": error == nil && !CommandLine.arguments.contains("--native-accessibility-acceptance"),
+      "desktopInputVerified": false,
       "chromeRuntime": pages.allSatisfy { $0.browser?.isChromeRuntime == true },
       "extensionCompatibilityVerified": false,
       "checks": checks,

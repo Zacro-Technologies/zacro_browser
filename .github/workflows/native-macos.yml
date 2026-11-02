@@ -6,6 +6,8 @@ on:
     paths:
       [
         'macos/**',
+        'src/renderer/app.js',
+        'src/main/guest-preload.cjs',
         'package.json',
         'package-lock.json',
         'assets/icon.icns',
@@ -16,6 +18,8 @@ on:
     paths:
       [
         'macos/**',
+        'src/renderer/app.js',
+        'src/main/guest-preload.cjs',
         'package.json',
         'package-lock.json',
         'assets/icon.icns',
@@ -36,13 +40,20 @@ jobs:
           cache: npm
       - name: Install pinned native provider executable
         run: npm ci --omit=dev --ignore-scripts
+      - name: Test native command parity and termination ownership
+        run: |
+          node macos/scripts/check-command-search-reference.cjs --native
+          node macos/scripts/check-peek-link-bridge.cjs --check
+          python3 -B macos/scripts/check-runtime-termination.py
       - name: Native state and application tests
         run: |
           swift build --package-path macos --product ZacroTextExtractor
           native_bin_path="$(swift build --package-path macos --show-bin-path)"
           ZACRO_TEST_PDF_HELPER="$native_bin_path/ZacroTextExtractor" swift test --package-path macos
-      - name: Bundle Chromium development application
-        run: bash macos/scripts/build-app.sh
+      # Hosted CI does not build the custom Chromium framework. Keep this
+      # diagnostic artifact explicit; release packaging requires its receipt.
+      - name: Bundle stock Chromium diagnostic application
+        run: bash macos/scripts/build-app.sh --stock-runtime
       - name: Verify application signatures
         run: codesign --verify --deep --strict 'macos/dist/Zacro Native.app'
       - name: Test packaged native provider and PDF helper
@@ -50,9 +61,9 @@ jobs:
           ZACRO_TEST_PDF_HELPER: ${{ github.workspace }}/macos/dist/Zacro Native.app/Contents/Resources/Providers/ZacroTextExtractor
           ZACRO_TEST_CODEX_EXECUTABLE: ${{ github.workspace }}/macos/dist/Zacro Native.app/Contents/Resources/Providers/codex
         run: swift test --package-path macos --filter "PDFServiceTests|AIServiceTests/testBundledCodexSessionHandshakeAndShutdownWithoutSignInOrInference"
-      - name: Archive development bundle
-        run: ditto -c -k --keepParent 'macos/dist/Zacro Native.app' macos/dist/Zacro-Native-development.zip
+      - name: Archive stock diagnostic bundle
+        run: ditto -c -k --keepParent 'macos/dist/Zacro Native.app' macos/dist/Zacro-Native-stock-diagnostic.zip
       - uses: actions/upload-artifact@v4
         with:
-          name: Zacro-Native-development
-          path: macos/dist/Zacro-Native-development.zip
+          name: Zacro-Native-stock-diagnostic
+          path: macos/dist/Zacro-Native-stock-diagnostic.zip
