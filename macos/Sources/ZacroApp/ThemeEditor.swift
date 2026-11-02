@@ -409,9 +409,7 @@ struct ThemeEditor: View {
           guard let drag = puckDrag else { return }
           let hue = min(1, max(0, drag.hue + event.translation.width / span.width))
           let saturation = min(1, max(0, drag.saturation - event.translation.height / span.height))
-          let newColor = NSColor(
-            calibratedHue: hue, saturation: saturation, brightness: drag.brightness,
-            alpha: 1)
+          let newColor = ThemeColor.color(hue: hue, saturation: saturation, brightness: drag.brightness)
           if primary {
             theme.primaryColor = ThemeColor.hex(newColor)
           } else {
@@ -429,7 +427,7 @@ struct ThemeEditor: View {
         if press.key == .leftArrow || press.key == .rightArrow {
           hue = (hue + (press.key == .rightArrow ? step : -step) / 360 + 1).truncatingRemainder(dividingBy: 1)
         } else { saturation = min(1, max(0, saturation + (press.key == .upArrow ? step : -step) / 100)) }
-        let next = ThemeColor.hex(NSColor(calibratedHue: hue, saturation: saturation, brightness: hsv.brightness, alpha: 1))
+        let next = ThemeColor.hex(ThemeColor.color(hue: hue, saturation: saturation, brightness: hsv.brightness))
         if primary { theme.primaryColor = next } else { theme.secondaryColor = next }
         ThemeHaptics.tick(); return .handled
       }
@@ -441,9 +439,7 @@ struct ThemeEditor: View {
       .accessibilityAdjustableAction { direction in
         let change: CGFloat = direction == .increment ? 0.025 : -0.025
         let next = ThemeColor.hex(
-          NSColor(
-            calibratedHue: min(1, max(0, hsv.hue + change)), saturation: hsv.saturation,
-            brightness: hsv.brightness, alpha: 1))
+          ThemeColor.color(hue: min(1, max(0, hsv.hue + change)), saturation: hsv.saturation, brightness: hsv.brightness))
         if primary { theme.primaryColor = next } else { theme.secondaryColor = next }
         ThemeHaptics.tick()
       }
@@ -640,28 +636,6 @@ private struct ThemeDial: View {
   }
 }
 
-private enum ThemeColor {
-  static func valid(_ value: String) -> Bool {
-    value.range(of: "^#[0-9A-Fa-f]{6}$", options: .regularExpression) != nil
-  }
-  static func nsColor(_ value: String) -> NSColor {
-    let number =
-      UInt64(value.trimmingCharacters(in: CharacterSet(charactersIn: "#")), radix: 16) ?? 0x9D4460
-    return NSColor(
-      srgbRed: CGFloat((number >> 16) & 255) / 255, green: CGFloat((number >> 8) & 255) / 255,
-      blue: CGFloat(number & 255) / 255, alpha: 1)
-  }
-  static func hex(_ value: NSColor) -> String {
-    guard let rgb = value.usingColorSpace(.sRGB) else { return "#9D4460" }
-    return String(
-      format: "#%02X%02X%02X", Int(rgb.redComponent * 255), Int(rgb.greenComponent * 255),
-      Int(rgb.blueComponent * 255))
-  }
-  static func hsv(_ color: NSColor) -> (hue: CGFloat, saturation: CGFloat, brightness: CGFloat) {
-    let rgb = color.usingColorSpace(.sRGB) ?? color
-    return (rgb.hueComponent, rgb.saturationComponent, rgb.brightnessComponent)
-  }
-}
 
 private enum ThemeNoise {
   static let image: NSImage = {

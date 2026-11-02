@@ -4,6 +4,30 @@ import AppKit
 /// interaction remains separate from these native-contract/render checks.
 @MainActor
 enum NativeThemeColorWellAcceptance {
+  /// Run against the real editor's hosting window after its layout settles.
+  /// A raw NSColorWell frame alone does not test SwiftUI's fitting proposals.
+  static func checkHosted(in window: NSWindow) -> [String: Bool] {
+    guard let root = window.contentView else { return ["theme_well_hosted_layout_is_27_points": false] }
+    root.layoutSubtreeIfNeeded()
+    var wells: [NativeThemeColorWellControl] = []
+    func collect(_ view: NSView) {
+      if let well = view as? NativeThemeColorWellControl { wells.append(well) }
+      view.subviews.forEach(collect)
+    }
+    collect(root)
+    func exact(_ size: NSSize) -> Bool { abs(size.width - 27) < 0.01 && abs(size.height - 27) < 0.01 }
+    let geometry = wells.map { "frame=\($0.frame) bounds=\($0.bounds) fitting=\($0.fittingSize) insets=\($0.alignmentRectInsets) root=\($0.convert($0.bounds, to: root))" }.joined(separator: "; ")
+    fputs("[Theme well acceptance] visible=\(window.isVisible) key=\(window.isKeyWindow) wells=\(wells.count) \(geometry)\n", stderr)
+    return [
+      "theme_well_hosted_layout_is_27_points": !wells.isEmpty && wells.allSatisfy {
+        exact($0.frame.size) && exact($0.bounds.size) && exact($0.convert($0.bounds, to: root).size)
+      },
+      "theme_well_hosted_fitting_preserves_native_control": !wells.isEmpty && wells.allSatisfy {
+        exact($0.fittingSize) && $0.isBordered && $0.accessibilityRole() == .colorWell
+      },
+    ]
+  }
+
   static func check() -> [String: Bool] {
     let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 72, height: 60),
       styleMask: [.borderless], backing: .buffered, defer: false)

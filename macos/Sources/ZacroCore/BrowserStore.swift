@@ -26,16 +26,18 @@ public final class BrowserStore: ObservableObject {
     file = directory.appendingPathComponent("native-state.json")
     persistence = SessionPersistence(file: file)
     state = initialState ?? BrowserState()
-    if initialState == nil, FileManager.default.fileExists(atPath: file.path) {
+    let primaryExists = FileManager.default.fileExists(atPath: file.path)
+    if initialState == nil, primaryExists || FileManager.default.fileExists(atPath: file.appendingPathExtension("bak").path) {
       do {
         state = try readState(file)
         repair()
       } catch {
-        lastError =
-          "Could not load the saved browser session. The original file has been preserved: \(error.localizedDescription)"
+        lastError = primaryExists
+          ? "Could not load the saved browser session. The original file has been preserved: \(error.localizedDescription)"
+          : "Could not load the saved browser session: \(error.localizedDescription)"
         loadingFailed = true
-        persistence.preserveUnreadablePrimary()
-        if let recovered = try? readState(file.appendingPathExtension("bak")) {
+        if primaryExists { persistence.preserveUnreadablePrimary() }
+        if let data = try? SessionPersistence.recoveryData(for: file), let recovered = try? readState(data) {
           state = recovered
           repair()
           lastError = "Recovered your session from its last backup."
@@ -128,7 +130,10 @@ public final class BrowserStore: ObservableObject {
   private func readState(_ url: URL) throws -> BrowserState {
     let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
     guard size <= 32 * 1024 * 1024 else { throw ShortcutError("Browser data exceeds its safety limit.") }
-    let data = try Data(contentsOf: url)
+    return try readState(Data(contentsOf: url))
+  }
+  private func readState(_ data: Data) throws -> BrowserState {
+    guard data.count <= 32 * 1024 * 1024 else { throw ShortcutError("Browser data exceeds its safety limit.") }
     guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
       root["version"] as? Int == 1, root["profiles"] is [[String: Any]], root["spaces"] is [[String: Any]]
     else { throw LegacyImportError.invalidState }
@@ -676,11 +681,21 @@ public final class BrowserStore: ObservableObject {
   public func deleteProfileDurably(id: String) throws {
     if let repository { return try repository.mutateDurably(windowID: owningWindowID) { try $0.deleteProfileDurably(id: id) } }
 
-    guard state.profiles.contains(where: { $0.id == id }) else { return }
+    guard let profile = state.profiles.first(where: { $0.id == id }) else { return }
     guard state.profiles.contains(where: { !$0.isPrivate && $0.id != id }) else {
       throw ShortcutError("Keep at least one non-private browsing profile.")
     }
+    if !profile.isPrivate {
+      guard NativeProfileRetirement.validID(id) else { throw ShortcutError("This profile has an invalid native storage identifier.") }
+      guard state.pendingNativeProfileRetirements.count < 1_000
+        || state.pendingNativeProfileRetirements.contains(id) else {
+        throw ShortcutError("Finish pending profile cleanup before deleting another profile.")
+      }
+    }
     try commit(purgeRecovery: true) { state in
+      if !profile.isPrivate, !state.pendingNativeProfileRetirements.contains(id) {
+        state.pendingNativeProfileRetirements.append(id)
+      }
       state.profiles.removeAll { $0.id == id }
       state.spaces.removeAll { $0.profileID == id }
       state.history.removeAll { $0.profileID == id }

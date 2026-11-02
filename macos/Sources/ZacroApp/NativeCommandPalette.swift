@@ -60,6 +60,23 @@ struct NativeCommandPalette: View {
     }
   }
 
+  private var inputLabel: String {
+    if case .result(_, _, let title, _) = context { return "Actions for \(title)" }
+    return isNested ? placeholder : "Search tabs, history, Spaces and actions, or enter a URL"
+  }
+  private var resultStatus: String {
+    guard let selectedEntry else {
+      return inputLabel + ". " + (site.map { raw.count > 8000
+        ? "Use a search of up to 8,000 characters" : "Type to search \($0.name)" } ?? "No matches in this scope")
+    }
+    return "\(inputLabel). \(results.count) results. \(selectedEntry.title), \(selectedEntry.type). Result \(selection + 1) of \(results.count)."
+  }
+  private func resultImage(_ item: Entry) -> NSImage? {
+    guard item.kind != "navigation", let url = item.url else { return nil }
+    if item.kind == "tab", let image = actions.icons[String(item.id.dropFirst(4))] { return image }
+    return actions.iconForURL(url)
+  }
+
   var body: some View {
     GeometryReader { geometry in
       let available = max(200, geometry.size.width)
@@ -116,7 +133,7 @@ struct NativeCommandPalette: View {
   private var input: some View {
     HStack(spacing: 10) {
       NativeGlyph("magnifyingglass").font(.system(size: 16)).foregroundStyle(colors.muted)
-      CommandSearchField(text: $actions.query, placeholder: placeholder, textColor: NSColor(colors.ink), placeholderColor: NSColor(colors.muted), focusRequest: focusRequest, selectAllRequest: actions.paletteSession,
+      CommandSearchField(text: $actions.query, placeholder: placeholder, accessibilityLabel: inputLabel, resultStatus: resultStatus, textColor: NSColor(colors.ink), placeholderColor: NSColor(colors.muted), focusRequest: focusRequest, selectAllRequest: actions.paletteSession,
         submit: { activate(separate: $0) }, move: moveSelection,
         cancel: { if !back() { actions.palette = false } }, tab: enterSelected,
         backward: back, backspace: { raw.isEmpty && back() })
@@ -127,7 +144,7 @@ struct NativeCommandPalette: View {
           .font(.system(size: 10, weight: .medium)).foregroundStyle(colors.muted)
           .padding(.horizontal, 6).padding(.vertical, 5)
           .background(colors.ink.opacity(0.05), in: RoundedRectangle(cornerRadius: 5))
-      }.buttonStyle(.plain).accessibilityLabel(isNested ? "Back to previous command step" : "Change navigation destination")
+      }.buttonStyle(.plain).accessibilityLabel(isNested ? "Back to previous command step" : "Destination: \(actions.paletteEditsAddress ? "current tab" : "new tab"). Change destination")
     }.frame(height: 48).padding(.horizontal, 12)
       .background(colors.ink.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
   }
@@ -159,9 +176,9 @@ struct NativeCommandPalette: View {
             Button { run(item) } label: {
               HStack(spacing: 8) {
                 Group {
-                  if item.kind == "tab", let image = actions.icons[String(item.id.dropFirst(4))] {
+                  if let image = resultImage(item) {
                     Image(nsImage: image).resizable().scaledToFit().frame(width: 16, height: 16)
-                  } else { NativeGlyph(item.icon).font(.system(size: 14)) }
+                  } else { NativeGlyph(item.url != nil && item.kind != "navigation" ? "globe" : item.icon).font(.system(size: 14)) }
                 }.frame(width: 22, height: 24).foregroundStyle(selection == index ? colors.ink : colors.muted)
                 VStack(alignment: .leading, spacing: 2) {
                   Text(item.title).lineLimit(1)
@@ -327,7 +344,7 @@ struct NativeCommandPalette: View {
       if kind == "tab" && (tab == nil || store.profileID(for: tab!) != store.activeProfileID) { return [] }
       let pageURL = tab?.url ?? url
       var items = [task("result:open", tab == nil ? "Open page" : "Switch to tab", "arrow.right") {
-        if let tab { close { store.selectTab(id: tab.id); actions.activate(tab.id) } } else { navigate(pageURL) }
+        if let tab { close { store.selectTab(id: tab.id); actions.activate(tab.id) } } else { activateURL(pageURL) }
       }]
       if BrowserAddress.webURL(pageURL) != nil {
         items.append(task("result:newtab", "Open in new tab", "plus") { navigate(pageURL, separate: true) })
@@ -508,6 +525,8 @@ struct NativeCommandPalette: View {
 private struct CommandSearchField: NSViewRepresentable {
   @Binding var text: String
   var placeholder: String
+  var accessibilityLabel: String
+  var resultStatus: String
   var textColor: NSColor
   var placeholderColor: NSColor
   var focusRequest: Int
@@ -519,14 +538,15 @@ private struct CommandSearchField: NSViewRepresentable {
   var backward: () -> Bool
   var backspace: () -> Bool
   func makeCoordinator() -> Coordinator { Coordinator(self) }
-  func makeNSView(context: Context) -> NSTextField {
-    let field = NSTextField(); field.focusRingType = .none; field.isBordered = false; field.drawsBackground = false
+  func makeNSView(context: Context) -> NativeCommandSearchControl {
+    let field = NativeCommandSearchControl(); field.focusRingType = .none; field.isBordered = false; field.drawsBackground = false
     field.font = .systemFont(ofSize: 15); field.delegate = context.coordinator
-    field.setAccessibilityLabel("Search tabs, history, Spaces and actions, or enter a URL")
+    field.updateSearchAccessibility(label: accessibilityLabel, status: resultStatus)
     DispatchQueue.main.async { field.window?.makeFirstResponder(field); field.selectText(nil) }
     return field
   }
-  func updateNSView(_ field: NSTextField, context: Context) {
+  func updateNSView(_ field: NativeCommandSearchControl, context: Context) {
+    field.updateSearchAccessibility(label: accessibilityLabel, status: resultStatus)
     context.coordinator.parent = self; field.placeholderString = placeholder
     field.textColor = textColor
     (field.currentEditor() as? NSTextView)?.insertionPointColor = textColor
@@ -541,6 +561,7 @@ private struct CommandSearchField: NSViewRepresentable {
       field.selectText(nil)
     }
   }
+  static func dismantleNSView(_ field: NativeCommandSearchControl, coordinator: Coordinator) { field.cancelSearchAnnouncement() }
   final class Coordinator: NSObject, NSTextFieldDelegate {
     var parent: CommandSearchField
     var lastFocusRequest = 0
@@ -549,6 +570,7 @@ private struct CommandSearchField: NSViewRepresentable {
     func controlTextDidBeginEditing(_ notification: Notification) {
       guard let field = notification.object as? NSTextField else { return }
       (field.currentEditor() as? NSTextView)?.insertionPointColor = parent.textColor
+      (field as? NativeCommandSearchControl)?.announceSearchStatus()
     }
     func controlTextDidChange(_ notification: Notification) { if let field = notification.object as? NSTextField { parent.text = field.stringValue } }
     func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {

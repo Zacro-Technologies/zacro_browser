@@ -182,6 +182,12 @@ final class BrowserWindowCoordinator: NSObject {
   }
   func prepareTermination() {
     collectionPanelTask?.cancel(); collectionPanelTask = nil
+    actions.cancelWindowInteractions()
+    actions.resetWindowPresentation()
+    if let window {
+      NativeWindowSheet.cancel(for: window)
+      NativeResizeHandle.cancel(in: window)
+    }
     cancelPermissionPrompts()
     loadingStrips.hide()
     documentErrorPanels.hide()
@@ -398,6 +404,7 @@ final class BrowserWindowCoordinator: NSObject {
       self.collectionPanelTask?.cancel()
       if let window = self.window { NativeWindowSheet.cancel(for: window) }
       self.deferredWindowError = nil
+      self.actions.resetWindowPresentation()
       self.cancelPermissionPrompts()
       self.hidePeekPresentation(immediately: true)
       self.loadingStrips.hide()
@@ -434,6 +441,8 @@ final class BrowserWindowCoordinator: NSObject {
       }
       self.collectionPanelTask?.cancel()
       if let window = self.window { NativeWindowSheet.cancel(for: window) }
+      self.actions.cancelWindowInteractions()
+      if let window = self.window { NativeResizeHandle.cancel(in: window) }
       for task in self.pageCreations.values { task.cancel() }
       self.cancelPermissionPrompts()
       for task in self.dormantNavigations.values { task.cancel() }
@@ -1666,7 +1675,7 @@ final class BrowserWindowCoordinator: NSObject {
       return
     }
     if let space { store.deleteSpace(id: space); return }
-    guard let profile, store.state.profiles.contains(where: { $0.id == profile }) else { return }
+    guard let profile, let profileRecord = store.state.profiles.first(where: { $0.id == profile }) else { return }
     let ids = Set(engine.pages.values.filter { $0.profileID == profile }.map(\.id))
     deletingProfileID = profile
     let completion = { [weak self] in
@@ -1682,7 +1691,8 @@ final class BrowserWindowCoordinator: NSObject {
           committed = true
           self.application.bookmarks.removeProfile(profile)
           self.downloads.removeProfile(profile)
-          try self.engine.retireProfile(profile)
+          if profileRecord.isPrivate { try self.engine.releasePrivateProfile(profile) }
+          else { try self.engine.retireProfile(profile) }
           self.favicons.clear(profile: profile)
           try await self.navigation.removeProfile(profile)
           await self.extensionSync.removeProfile(profile)
@@ -1693,6 +1703,10 @@ final class BrowserWindowCoordinator: NSObject {
             }
           }
           try await self.services.didDeleteProfile(profile)
+          if !profileRecord.isPrivate {
+            try NativeProfileArtifacts.remove(directory: self.engine.dataDirectory, profileID: profile)
+            try self.store.acknowledgeNativeProfileRetirement(profile)
+          }
         } catch {
           if !committed { try? await self.services.cancelProfileDeletion(profile) }
           self.showError(error.localizedDescription)

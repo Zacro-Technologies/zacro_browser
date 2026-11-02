@@ -9,10 +9,14 @@ final class NativeSidebarDragController {
   var canStart: (String) -> Bool = { _ in false }
   var began: (String) -> Void = { _ in }
   var ended: () -> Void = {}
+  var projectedRegion: () -> String? = { nil }
+  var exitedRegion: () -> Void = {}
   var motionScale = 1.0
-  var isDragging: Bool { lease != nil }
+  var isDragging: Bool { lease != nil && lease?.isInvalidated == false }
+  private var isEnabled = true
   private weak var host: NSView?
   private var anchors: [ObjectIdentifier: WeakAnchor] = [:]
+  private var regions: [ObjectIdentifier: WeakAnchor] = [:]
   private var monitor: Any?
   private var windowClose: NSObjectProtocol?
   private var pressed: Press?
@@ -31,6 +35,7 @@ final class NativeSidebarDragController {
 
   func attach(_ view: NSView) {
     guard let window = view.window else { detach(view); return }
+    guard isEnabled else { host = view; return }
     if host === view, monitor != nil { return }
     host = view
     if let monitor { NSEvent.removeMonitor(monitor) }
@@ -55,11 +60,58 @@ final class NativeSidebarDragController {
     anchors[ObjectIdentifier(view)] = WeakAnchor(view: view, id: id)
   }
   func unregister(_ view: NSView) { anchors.removeValue(forKey: ObjectIdentifier(view)) }
+  func registerRegion(_ view: NSView, id: String) { regions[ObjectIdentifier(view)] = WeakAnchor(view: view, id: id) }
+  func unregisterRegion(_ view: NSView) { regions.removeValue(forKey: ObjectIdentifier(view)) }
+
+  /// Region geometry belongs to the whole section, not a row that moves under
+  /// the pointer during reflow. Multiple Today anchors include its New Tab row.
+  func regionContains(_ id: String, screenPoint: NSPoint) -> Bool? {
+    guard let window = host?.window else { return nil }
+    regions = regions.filter { $0.value.view != nil }
+    let bounds = regions.values.compactMap { anchor -> NSRect? in
+      guard anchor.id == id, let view = anchor.view, view.window === window,
+        !view.isHiddenOrHasHiddenAncestor else { return nil }
+      let visible = view.visibleRect.intersection(view.bounds)
+      guard !visible.isEmpty else { return nil }
+      return view.convert(visible, to: nil)
+    }
+    guard let first = bounds.first else { return nil }
+    let union = bounds.dropFirst().reduce(first) { $0.union($1) }
+    return union.contains(window.convertPoint(fromScreen: screenPoint))
+  }
+  private func moved() {
+    // AppKit reports the drag image origin here; use the pointer's synchronous
+    // position so a click offset inside the image cannot change the destination.
+    guard isDragging, let id = projectedRegion(), regionContains(id, screenPoint: NSEvent.mouseLocation) == false else { return }
+    exitedRegion()
+  }
+
+  func setEnabled(_ value: Bool) {
+    if value { isEnabled = true }
+    else { suspend() }
+  }
+  func cancel() {
+    pressed = nil
+    guard let lease, !lease.isInvalidated else { return }
+    lease.invalidate()
+    session?.animatesToStartingPositionsOnCancelOrFail = false
+    session?.enumerateDraggingItems(options: [], for: nil, classes: [NSString.self], searchOptions: [:]) { item, _, _ in
+      item.setDraggingFrame(item.draggingFrame, contents: nil)
+    }
+    // AppKit has no public NSDraggingSession.cancel(). Stop model work now,
+    // but retain the inert source until AppKit delivers its terminal callback.
+    ended()
+  }
+  func suspend() {
+    isEnabled = false
+    cancel()
+    removeObservers()
+  }
 
   private func receive(_ event: NSEvent) -> NSEvent? {
     if event.type == .leftMouseUp { pressed = nil; return event }
     guard lease == nil else { return event }
-    guard let window = host?.window, event.window === window, window.attachedSheet == nil,
+    guard isEnabled, let window = host?.window, window.isVisible, event.window === window, window.attachedSheet == nil,
       NSApp.modalWindow == nil else { pressed = nil; return event }
     if event.type == .leftMouseDown {
       pressed = nil
@@ -83,6 +135,7 @@ final class NativeSidebarDragController {
     guard frame.width > 1, frame.height > 1, let image = snapshot(view: parent, frame: frame) else { return event }
     pressed = nil
     let next = NativeSidebarDragLease(parent: parent) { [self] _ in finish() }
+    next.source.didMove = { [weak self] _ in self?.moved() }
     lease = next
     let item = NSDraggingItem(pasteboardWriter: press.id as NSString)
     item.setDraggingFrame(next.source.convert(frame, from: parent), contents: image)
@@ -104,13 +157,13 @@ final class NativeSidebarDragController {
     return image
   }
   private func finish() {
-    guard lease != nil else { return }
+    guard let previous = lease else { return }
     lease = nil; session = nil; pressed = nil
-    ended()
-    if host?.window == nil { removeObservers() }
+    if !previous.isInvalidated { ended() }
+    if !isEnabled || host?.window == nil { removeObservers() }
   }
   private func close() {
-    host = nil; pressed = nil; anchors.removeAll()
+    host = nil; pressed = nil; anchors.removeAll(); regions.removeAll()
     lease?.finish(operation: [])
     removeObservers()
   }
@@ -125,6 +178,7 @@ final class NativeSidebarDragController {
 @MainActor
 final class NativeSidebarDragLease {
   let source = NativeSidebarDragSource()
+  private(set) var isInvalidated = false
   private var completion: ((NSDragOperation) -> Void)?
   init(parent: NSView, completion: @escaping (NSDragOperation) -> Void) {
     self.completion = completion
@@ -138,31 +192,41 @@ final class NativeSidebarDragLease {
     guard let completion else { return }
     self.completion = nil
     source.didEnd = nil
+    source.didMove = nil
     source.removeFromSuperview()
-    completion(operation)
+    completion(isInvalidated ? [] : operation)
   }
+  func invalidate() { isInvalidated = true; source.permittedOperation = [] }
 }
 
 final class NativeSidebarDragSource: NSView, NSDraggingSource {
   var didEnd: ((NSDragOperation) -> Void)?
+  var didMove: ((NSPoint) -> Void)?
+  var permittedOperation: NSDragOperation = .move
   override func hitTest(_ point: NSPoint) -> NSView? { nil }
-  func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation { .move }
+  func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation { permittedOperation }
   func ignoreModifierKeys(for session: NSDraggingSession) -> Bool { true }
+  func draggingSession(_ session: NSDraggingSession, movedTo screenPoint: NSPoint) { didMove?(screenPoint) }
   func draggingSession(_ session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) { didEnd?(operation) }
 }
 
 struct NativeSidebarDragHost: NSViewRepresentable {
   let controller: NativeSidebarDragController
+  let isEnabled: Bool
   let motionScale: Double
   let canStart: (String) -> Bool
   let began: (String) -> Void
   let ended: () -> Void
+  let projectedRegion: () -> String?
+  let exitedRegion: () -> Void
   func makeNSView(context: Context) -> HostView {
     let view = HostView(); view.controller = controller; return view
   }
   func updateNSView(_ view: HostView, context: Context) {
+    controller.setEnabled(isEnabled)
     controller.motionScale = motionScale
     controller.canStart = canStart; controller.began = began; controller.ended = ended
+    controller.projectedRegion = projectedRegion; controller.exitedRegion = exitedRegion
     controller.attach(view)
   }
   static func dismantleNSView(_ view: HostView, coordinator: ()) { view.controller?.detach(view) }
@@ -170,6 +234,23 @@ struct NativeSidebarDragHost: NSViewRepresentable {
     weak var controller: NativeSidebarDragController?
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
     override func viewDidMoveToWindow() { super.viewDidMoveToWindow(); controller?.attach(self) }
+  }
+}
+
+struct NativeSidebarDropRegion: NSViewRepresentable {
+  let controller: NativeSidebarDragController
+  let id: String
+  func makeNSView(context: Context) -> RegionView {
+    let view = RegionView(); view.controller = controller; controller.registerRegion(view, id: id); return view
+  }
+  func updateNSView(_ view: RegionView, context: Context) { controller.registerRegion(view, id: id) }
+  static func dismantleNSView(_ view: RegionView, coordinator: ()) { view.controller?.unregisterRegion(view) }
+  func sizeThatFits(_ proposal: ProposedViewSize, nsView: RegionView, context: Context) -> CGSize? {
+    CGSize(width: proposal.width ?? 0, height: proposal.height ?? 0)
+  }
+  final class RegionView: NSView {
+    weak var controller: NativeSidebarDragController?
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
   }
 }
 

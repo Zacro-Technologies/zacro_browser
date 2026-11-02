@@ -204,11 +204,14 @@ final class NativeDownloads {
     onStatus = nil
   }
   func removeProfile(_ id: String) {
+    func belongsToProfile(_ key: String) -> Bool {
+      key.lastIndex(of: ":").map { String(key[..<$0]) == id } ?? false
+    }
     profileEpochs[id, default: 0] += 1
     snapshotTasks.removeValue(forKey: id)?.cancel()
-    nativeRevision = nativeRevision.filter { !$0.key.hasPrefix(id + ":") }
-    let removed = Set(identifiers.filter { $0.key.hasPrefix(id + ":") }.map(\.value))
-    identifiers = identifiers.filter { !$0.key.hasPrefix(id + ":") }
+    nativeRevision = nativeRevision.filter { !belongsToProfile($0.key) }
+    let removed = Set(identifiers.filter { belongsToProfile($0.key) }.map(\.value))
+    identifiers = identifiers.filter { !belongsToProfile($0.key) }
     nativeIDs = nativeIDs.filter { !removed.contains($0.key) }
     sourceTabs = sourceTabs.filter { !removed.contains($0.key) }
     publication = publication.filter { !removed.contains($0.key) }

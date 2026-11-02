@@ -177,6 +177,16 @@ Five native color-well checks and four dialog-owner lifetime checks pass. The ac
 
 Evidence: `macos/.build/verification/integrated-release-21-retry2.log`, `application-21-retry2/application.json`, `application-21-retry2/application.log`, `application-21-retry2/view-renders`, and `core-services-post21-full.log`. The initial fixture failure and interrupted close-hang run remain under `application-21` and `application-21-retry` respectively. Custom framework, physical interaction, material composition, signing/notarization and final distribution remain release gates.
 
+## 2026-11-02: integrated build 22
+
+The final release retry compiled in **94.14 seconds**, without warnings. The internal bundle passed deep/strict signature verification and all **133 application checks**, with clean shutdown. The complete **236 Core/Services tests** passed (155 Core and 81 Services), without failures or skips. The unchanged engine implementation separately passed **31 stock-engine checks** and clean shutdown before the final UI-only retry.
+
+The first presented theme-editor check exposed actual native color-well frames of 33×31 points with lazy AppKit bezel alignment insets, despite 27-point SwiftUI proposals. A permanent zero-inset override preserves genuine AppKit color-panel activation while fixing the layout. The final presented controls measure 27×27 after drawing, with matching fitting sizes and zero insets; owned-view pixel inspection confirms the 27-point swatches. Palette dismissal also checks whether focus may be restored before making the parent key, so it cannot take focus from a newly opened editor.
+
+New lifecycle checks verify real private cookies survive an unrelated window closing, while explicit private retirement clears them. A still-retired public profile ID cannot reopen native documents; unopened profiles replay their durable deletion receipts, and replay rejects already-opened profiles. The native journal has 21 passing standalone filesystem checks. Core recovery tests ensure an uncommitted privacy backup cannot authorize profile retirement, while startup cleanup keeps its receipt until native and application artifacts are durably removed.
+
+Evidence: `macos/.build/verification/integrated-release-22-assisted-retry2.log`, `application-22-assisted-retry2/application.json`, `application-22-assisted-retry2/application.log`, `application-22-assisted-retry2/view-renders`, `acceptance-22-assisted/engine.json`, `core-services-post22-full.log`, and `profile-retirement-journal-check.log`. Earlier failing hosted-control measurements remain under `application-22` and `application-22-assisted-retry`. The custom Chromium framework is still compiling; its extension fixtures, physical interaction, final material composition and distribution signing/notarization remain release gates.
+
 ## Required release evidence
 
 - Successful custom Chromium build and package provenance; native protocol capability checks.

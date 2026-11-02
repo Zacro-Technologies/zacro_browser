@@ -386,6 +386,9 @@ public struct BrowserState: Codable, Equatable, Sendable {
   public var history: [HistoryEntry] = []
   public var bookmarks: [Bookmark] = []
   public var bookmarkImportAcknowledgements: [NativeBookmarkImportAcknowledgement] = []
+  // Browser-owned deletion authority. Collection import/export and sync must
+  // never author this metadata; only the durable profile deletion transaction.
+  var pendingNativeProfileRetirements: [String] = []
   public var archive: [ArchivedTab] = []
   public var downloads: [DownloadRecord] = []
   public var permissions: [WebsitePermission] = []
@@ -404,7 +407,7 @@ public struct BrowserState: Codable, Equatable, Sendable {
     activeSpaceID = "home"
   }
   private enum CodingKeys: String, CodingKey {
-    case version, profiles, spaces, tabs, folders, splits, tabGroups, history, bookmarks, bookmarkImportAcknowledgements, archive, downloads,
+    case version, profiles, spaces, tabs, folders, splits, tabGroups, history, bookmarks, bookmarkImportAcknowledgements, pendingNativeProfileRetirements, archive, downloads,
       permissions, settings, windowBounds, windowSessions, focusedWindowID, activeSpaceID, activeTabID
   }
   public init(from decoder: Decoder) throws {
@@ -421,6 +424,12 @@ public struct BrowserState: Codable, Equatable, Sendable {
     history = try c.decodeIfPresent([HistoryEntry].self, forKey: .history) ?? []
     bookmarks = try c.decodeIfPresent([Bookmark].self, forKey: .bookmarks) ?? []
     bookmarkImportAcknowledgements = try c.decodeIfPresent([NativeBookmarkImportAcknowledgement].self, forKey: .bookmarkImportAcknowledgements) ?? []
+    let retirements = try c.decodeIfPresent([String].self, forKey: .pendingNativeProfileRetirements) ?? []
+    guard retirements.count <= 1_000, retirements.allSatisfy(NativeProfileRetirement.validID) else {
+      throw DecodingError.dataCorruptedError(forKey: .pendingNativeProfileRetirements, in: c,
+        debugDescription: "Invalid native profile retirement receipts")
+    }
+    pendingNativeProfileRetirements = Array(Set(retirements)).sorted()
     archive = try c.decodeIfPresent([ArchivedTab].self, forKey: .archive) ?? []
     downloads = try c.decodeIfPresent([DownloadRecord].self, forKey: .downloads) ?? []
     permissions = try c.decodeIfPresent([WebsitePermission].self, forKey: .permissions) ?? []

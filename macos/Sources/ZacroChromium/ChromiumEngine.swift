@@ -9,6 +9,7 @@ public final class ChromiumEngine: NSObject {
   public let dataDirectory: URL
   public private(set) var pages: [String: ChromiumPage] = [:]
   private var profiles: [String: CefProfile] = [:]
+  private var openedPersistentProfiles: Set<String> = []
   private var extensionAccess: [String: Set<String>] = [:]
   private var privateExtensionAccess: [String: Set<String>] = [:]
   private var downloadControls: [String: CefDownloadControl] = [:]
@@ -196,6 +197,12 @@ public final class ChromiumEngine: NSObject {
   public func page(id: String, profileID: String, isPrivate: Bool, url: URL?,
                    nativeReservation: ChromeTabMaterialization? = nil,
                    ownerWindowID: String?) -> ChromiumPage {
+    if !isPrivate && retiredProfiles.contains(profileID) {
+      let rejected = ChromiumPage(id: id, profileID: profileID, isPrivate: false)
+      rejected.ownerWindowID = ownerWindowID
+      rejected.rejectCreation("This profile is still being removed. Import it as a new profile or restart after removal completes.")
+      return rejected
+    }
     if let page = pages[id] {
       precondition(
         page.profileID == profileID && page.isPrivate == isPrivate,
@@ -218,6 +225,7 @@ public final class ChromiumEngine: NSObject {
       profiles[key] = profile
     }
     let page = ChromiumPage(id: id, profileID: profileID, isPrivate: isPrivate)
+    if !isPrivate { openedPersistentProfiles.insert(profileID) }
     page.ownerWindowID = ownerWindowID
     page.reservedNativeTabID = nativeReservation?.nativeID
     let chrome = host!.createPage(
@@ -385,6 +393,9 @@ public final class ChromiumEngine: NSObject {
     privateExtensionAccess[profileID] = Set(snapshot.extensions.filter { $0.isEnabled && $0.incognitoAccess.isActive }.map(\.id))
   }
   public func clearNetworkData(profileID: String, isPrivate: Bool, selected: CefNetworkData = .all) async throws {
+    guard isPrivate || !retiredProfiles.contains(profileID) else {
+      throw CefDevToolsError.rejected("This profile is still being removed.")
+    }
     let key = (isPrivate ? "private:" : "persistent:") + profileID
     let profile: CefProfile
     if let existing = profiles[key] { profile = existing }
@@ -393,6 +404,7 @@ public final class ChromiumEngine: NSObject {
       profile = isPrivate ? .incognito() : .persistent(name: safeID)
       profiles[key] = profile
     }
+    if !isPrivate { openedPersistentProfiles.insert(profileID) }
     try await profile.clearNetworkData(selected)
   }
   /// Reparents the same retained Chromium document when promoting a Peek.
@@ -412,7 +424,7 @@ public final class ChromiumEngine: NSObject {
     }
     profiles.removeValue(forKey: "private:" + profileID)
     privateExtensionAccess.removeValue(forKey: profileID)
-    for key in downloadControls.keys.filter({ $0.hasPrefix(profileID + ":") }) {
+    for key in downloadControls.keys.filter({ Self.downloadProfileID($0) == profileID }) {
       if let control = downloadControls.removeValue(forKey: key) { _ = control.cancel(); control.invalidate() }
     }
   }
@@ -420,33 +432,58 @@ public final class ChromiumEngine: NSObject {
   /// Chromium owns profile databases until shutdown; deletion is journaled and
   /// completed with no live Chromium context, including after an interrupted quit.
   public func retireProfile(_ profileID: String) throws {
+    guard ChromiumProfileRetirementJournal.validID(profileID) else { throw POSIXError(.EINVAL) }
     guard !pages.values.contains(where: { $0.profileID == profileID }) else {
       throw NSError(domain: "ZacroEngine", code: 2, userInfo: [NSLocalizedDescriptionKey:
         "Close this profile's documents before deleting it."])
     }
     retiredProfiles.insert(profileID)
-    try JSONEncoder().encode(Array(retiredProfiles)).write(to: retirementJournal, options: .atomic)
+    try profileRetirementJournal.write(retiredProfiles)
     profiles.removeValue(forKey: "persistent:" + profileID)
     profiles.removeValue(forKey: "private:" + profileID)
     extensionAccess.removeValue(forKey: profileID)
     privateExtensionAccess.removeValue(forKey: profileID)
-    for key in downloadControls.keys.filter({ $0.hasPrefix(profileID + ":") }) {
+    for key in downloadControls.keys.filter({ Self.downloadProfileID($0) == profileID }) {
       if let control = downloadControls.removeValue(forKey: key) { _ = control.cancel(); control.invalidate() }
     }
   }
 
   private var retirementJournal: URL { dataDirectory.appendingPathComponent("retired-chromium-profiles.json") }
-  private func removeRetiredProfileData() throws {
-    if FileManager.default.fileExists(atPath: retirementJournal.path) {
-      retiredProfiles.formUnion(try JSONDecoder().decode([String].self, from: Data(contentsOf: retirementJournal)))
+  private static func downloadProfileID(_ key: String) -> String? {
+    key.lastIndex(of: ":").map { String(key[..<$0]) }
+  }
+  private var profileRetirementJournal: ChromiumProfileRetirementJournal {
+    ChromiumProfileRetirementJournal(file: retirementJournal)
+  }
+
+  /// Replays an authoritative Core deletion receipt before this runtime has
+  /// opened the profile. A live or previously opened context stays deferred.
+  public func replayProfileRetirement(_ profileID: String) throws {
+    guard !openedPersistentProfiles.contains(profileID),
+      !pages.values.contains(where: { $0.profileID == profileID }) else {
+      throw CefDevToolsError.rejected("Replay profile retirement before opening its native documents.")
     }
+    try retireProfile(profileID)
+    try removeProfileDirectory(profileID)
+    var remaining = retiredProfiles
+    remaining.remove(profileID)
+    try profileRetirementJournal.write(remaining)
+    retiredProfiles = remaining
+  }
+
+  private func removeProfileDirectory(_ identifier: String) throws {
     let root = dataDirectory.appendingPathComponent("Chromium", isDirectory: true)
+    let safeID = SHA256.hash(data: Data(identifier.utf8)).map { String(format: "%02x", $0) }.joined()
+    try ChromiumProfileRetirementJournal.removeProfileDirectory(root: root, hash: safeID)
+  }
+  private func removeRetiredProfileData() throws {
+    let existing = FileManager.default.fileExists(atPath: retirementJournal.path)
+    retiredProfiles.formUnion(try profileRetirementJournal.read())
+    guard existing || !retiredProfiles.isEmpty else { return }
     for identifier in retiredProfiles {
-      let safeID = SHA256.hash(data: Data(identifier.utf8)).map { String(format: "%02x", $0) }.joined()
-      let directory = root.appendingPathComponent(safeID, isDirectory: true)
-      if FileManager.default.fileExists(atPath: directory.path) { try FileManager.default.removeItem(at: directory) }
+      try removeProfileDirectory(identifier)
     }
-    if FileManager.default.fileExists(atPath: retirementJournal.path) { try FileManager.default.removeItem(at: retirementJournal) }
+    try profileRetirementJournal.write([])
     retiredProfiles.removeAll()
   }
   public func context(id: String) -> ChromiumWindowContext? { contexts[id] }
@@ -570,13 +607,8 @@ public final class ChromiumEngine: NSObject {
       context.isClosing = false; context.isOpen = false
       context.window.orderOut(nil)
       if self.focusedWindowID == context.id { self.focusedWindowID = nil }
-      // A private context can be shared by documents in another window.
-      for key in self.profiles.keys.filter({ $0.hasPrefix("private:") }) {
-        let profileID = String(key.dropFirst("private:".count))
-        if !self.pages.values.contains(where: { $0.isPrivate && $0.profileID == profileID }) {
-          try? self.releasePrivateProfile(profileID)
-        }
-      }
+      // Core owns private-session lifetime, including empty windows and
+      // dormant tabs. Only its authoritative retired IDs may release a profile.
       context.onClosed?()
     }
   }
@@ -654,6 +686,7 @@ public final class ChromiumPage: CefBrowserDelegate {
   public private(set) var error: String?
   public private(set) var documentError: ChromiumDocumentError?
   public private(set) var creationFailed = false
+  private var creationFailure: String?
   public private(set) var faviconURL: URL?
   /// The committed document that supplied `faviconURL`; never the pinned home URL.
   public private(set) var faviconDocumentURL: URL?
@@ -782,10 +815,14 @@ public final class ChromiumPage: CefBrowserDelegate {
     _ = try await ready().devTools.call("Zacro.navigateApproved", parameters: approval.parameters, timeout: 50)
   }
   public func ready() async throws -> CefBrowser {
+    if let creationFailure { throw CefDevToolsError.rejected(creationFailure) }
     guard let browser else { throw CefDevToolsError.browserClosed }
     try await browser.waitUntilReady()
     guard self.browser === browser else { throw CefDevToolsError.browserClosed }
     return browser
+  }
+  fileprivate func rejectCreation(_ message: String) {
+    creationFailed = true; creationFailure = message; error = message
   }
   public func goBack() { browser?.goBack() }
   public func goForward() { browser?.goForward() }

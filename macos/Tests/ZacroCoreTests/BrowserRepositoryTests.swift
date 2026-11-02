@@ -51,7 +51,7 @@ import XCTest
     XCTAssertEqual(recovered.store(for: secondID)?.lastError, recovered.canonicalStore.lastError)
     // Weakly held facades may be recreated when a parked window is opened.
     var transient = recovered.store(for: secondID)
-    weak var released = transient
+    weak let released = transient
     transient = nil
     XCTAssertNil(released)
     XCTAssertNotNil(recovered.store(for: secondID)?.lastError)
@@ -323,6 +323,25 @@ import XCTest
     XCTAssertFalse(repository.canonicalStore.state.profiles.contains { $0.id == profile.id })
     XCTAssertNil(repository.canonicalStore.tab(tab.id))
     XCTAssertTrue(repository.windows.contains { $0.id == publicWindow.owningWindowID && $0.isOpen })
+  }
+
+  func testEmptyPrivateWindowAndDormantTabsRetainSessionAcrossOtherWindowCloses() throws {
+    let repository = BrowserRepository(directory: try directory()), emptyOwner = repository.focusedStore
+    let profile = try emptyOwner.createProfileDurably(name: "Private", isPrivate: true)
+    XCTAssertNil(emptyOwner.state.activeTabID)
+    let dormantOwner = try repository.makeWindow(profileID: profile.id)
+    let secret = try XCTUnwrap(dormantOwner.createTab(address: "https://private.example"))
+    dormantOwner.selectSpace(id: "home") // The private document remains owned but is not selected.
+    let unrelated = try repository.makeWindow(profileID: "default")
+    XCTAssertTrue(repository.closeWindow(unrelated.owningWindowID!).isEmpty)
+    XCTAssertTrue(repository.canonicalStore.state.profiles.contains { $0.id == profile.id })
+    XCTAssertTrue(repository.closeWindow(emptyOwner.owningWindowID!).isEmpty)
+    XCTAssertNotNil(repository.canonicalStore.tab(secret.id))
+    XCTAssertTrue(repository.canonicalStore.state.profiles.contains { $0.id == profile.id })
+    XCTAssertEqual(repository.closeWindow(dormantOwner.owningWindowID!), [profile.id])
+    XCTAssertFalse(repository.canonicalStore.state.profiles.contains { $0.id == profile.id })
+    XCTAssertNil(repository.canonicalStore.tab(secret.id))
+    XCTAssertTrue(repository.canonicalStore.pendingNativeProfileRetirements.isEmpty)
   }
 
   func testStaleDirectFacadeSnapshotCannotReplaceAuthoritativeTabs() throws {

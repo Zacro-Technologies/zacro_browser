@@ -113,6 +113,7 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
   }
 
   func install() {
+    let retirementRecoveryError = recoverNativeProfileRetirements()
     store.enableDebouncedPersistence()
     let first = repository.windows.first { $0.id == repository.startupWindowID }
     if let first {
@@ -144,6 +145,24 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
     }
     applicationReady = true
     drainApplicationIntents()
+    if let retirementRecoveryError { focusedCoordinator?.showError(retirementRecoveryError) }
+  }
+
+  /// Core's durable deletion receipt is the authority; absence from a recovered
+  /// session alone must never cause a Chromium profile directory to be removed.
+  func recoverNativeProfileRetirements() -> String? {
+    var failure: String?
+    for profileID in store.pendingNativeProfileRetirements {
+      do {
+        try engine.replayProfileRetirement(profileID)
+        try NativeProfileArtifacts.remove(directory: engine.dataDirectory, profileID: profileID)
+        try store.acknowledgeNativeProfileRetirement(profileID)
+      } catch {
+        failure = "Some deleted profile data could not be removed. Zacro will retry at the next start. "
+          + error.localizedDescription
+      }
+    }
+    return failure
   }
 
   private func installRuntimeCallbacks() {
@@ -331,6 +350,7 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
   func didCloseWindow(_ owner: BrowserWindowCoordinator) {
     let privateProfiles = repository.closeWindow(owner.windowContext.id)
     for id in privateProfiles {
+      downloads.removeProfile(id)
       favicons.clear(profile: id)
       do { try engine.releasePrivateProfile(id) }
       catch { fputs("Zacro could not release a private context: \(error.localizedDescription)\n", stderr) }

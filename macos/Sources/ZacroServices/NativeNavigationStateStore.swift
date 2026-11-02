@@ -53,13 +53,9 @@ public actor NativeNavigationStateStore {
     try removeFile(file)
   }
   public func removeProfile(profileID: String) throws {
-    try validateID(profileID)
+    try NativeProfileArtifacts.validateProfileID(profileID)
     profileRevisions[profileID, default: 0] &+= 1
-    guard try existingDirectory(root) else { return }
-    let directory = root.appendingPathComponent(ServiceFiles.hash(profileID), isDirectory: true)
-    guard FileManager.default.fileExists(atPath: directory.path) else { return }
-    try FileManager.default.removeItem(at: directory)
-    try synchronizeDirectory(root)
+    try NativeProfileArtifacts.removeNavigation(directory: root.deletingLastPathComponent(), profileID: profileID)
   }
   @discardableResult public func promotePeek(profileID: String, fromTabID: String,
                                              toTabID: String, address: String) async throws -> Bool {

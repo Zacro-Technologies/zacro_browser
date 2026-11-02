@@ -4,6 +4,16 @@ import SwiftUI
 /// A native separator keeps an in-progress resize separate from durable settings.
 /// Keyboard handling precedes browser shortcuts while this view owns focus.
 struct NativeResizeHandle: NSViewRepresentable {
+  @MainActor static func cancel(in window: NSWindow) {
+    guard let root = window.contentView else { return }
+    var handles: [NativeResizeHandleView] = []
+    func collect(_ view: NSView) {
+      if let handle = view as? NativeResizeHandleView { handles.append(handle) }
+      view.subviews.forEach(collect)
+    }
+    collect(root)
+    handles.forEach { $0.finish(commit: false) }
+  }
   var value: Double
   var range: ClosedRange<Double>
   var direction: Double = 1

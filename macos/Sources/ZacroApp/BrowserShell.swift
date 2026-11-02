@@ -67,6 +67,9 @@ final class BrowserActions: ObservableObject {
   var performInterfaceCommand: (String) -> Bool = { _ in false }
   var handlePaletteEscape: () -> Bool = { false }
   var handleInterfaceEscape: () -> Bool = { false }
+  var cancelWindowInteractions: () -> Void = {}
+  var resetWindowPresentation: () -> Void = {}
+  var interfacePresentationState: () -> Set<String> = { [] }
   var libraryContent: (String) -> AnyView? = { _ in nil }
   var settingsContent: () -> AnyView? = { nil }
   var pinnedExtensionsContent: () -> AnyView? = { nil }
@@ -201,6 +204,10 @@ struct BrowserShell<Content: View>: View {
         || (tab.isFavorite && store.profileID(for: tab) == store.activeProfileID)
     }
   }
+  private var todayTabs: [BrowserTab] {
+    tabs.filter { !$0.isPinned && !$0.isFavorite && !$0.isClosed && $0.folderID == nil && $0.groupID == nil
+      && store.split(for: $0.id) == nil && ($0.url != "about:blank" || $0.homePage == true) }
+  }
   private var hasPage: Bool {
     store.state.activeTab.map { !$0.isClosed && currentAddress != "about:blank" } ?? false
   }
@@ -267,6 +274,7 @@ struct BrowserShell<Content: View>: View {
       .background {
         NativePalettePresenter(
           isPresented: $actions.findVisible,
+          ownerIsOpen: isOwnedWindowOpen,
           content: AnyView(NativeFindBar(actions: actions, colors: colors)), motionScale: effectiveMotion,
           frame: CGRect(x: max(actions.contentFrame.minX + 8, actions.contentFrame.maxX - 326),
             y: 4, width: min(310, max(200, actions.contentFrame.width - 24)), height: 32),
@@ -274,6 +282,7 @@ struct BrowserShell<Content: View>: View {
           .frame(width: 0, height: 0).allowsHitTesting(false)
       }
       .onAppear {
+        installPresentationHooks()
         actions.performInterfaceCommand = { _ in false }
         actions.handleInterfaceEscape = { false }
       }
@@ -338,6 +347,7 @@ struct BrowserShell<Content: View>: View {
     .background {
       NativePalettePresenter(
         isPresented: $actions.palette,
+        ownerIsOpen: isOwnedWindowOpen,
         content: AnyView(
           palette.tint(accent).environment(\.presentedSpaceTheme, theme)
             .preferredColorScheme(
@@ -353,12 +363,14 @@ struct BrowserShell<Content: View>: View {
     .background {
       NativePalettePresenter(
         isPresented: Binding(get: { canDropSplit }, set: { if !$0 { drag.cancel() } }),
+        ownerIsOpen: isOwnedWindowOpen,
         content: AnyView(NativeSplitDropOverlay(store: store, actions: actions, drag: drag, colors: colors)),
         motionScale: effectiveMotion, frame: actions.contentFrame.insetBy(dx: store.state.settings.pageGutter, dy: store.state.settings.pageGutter),
         takesKey: false, dismissOnOutsideClick: false, dismissOnResign: true)
         .frame(width: 0, height: 0).allowsHitTesting(false)
       NativePalettePresenter(
         isPresented: $actions.findVisible,
+        ownerIsOpen: isOwnedWindowOpen,
         content: AnyView(NativeFindBar(actions: actions, colors: colors)), motionScale: effectiveMotion,
         frame: CGRect(x: max(actions.contentFrame.minX + 8, actions.contentFrame.maxX - 326), y: 4,
           width: min(310, max(200, actions.contentFrame.width - 24)), height: 32),
@@ -368,6 +380,7 @@ struct BrowserShell<Content: View>: View {
         let items = showPageActions ? pageMenuItems : browserMenuItems
         NativePalettePresenter(
           isPresented: Binding(get: { showBrowserMenu || showPageActions }, set: { if !$0 { showBrowserMenu = false; showPageActions = false } }),
+          ownerIsOpen: isOwnedWindowOpen,
           content: AnyView(NativeActionPopover(title: showPageActions ? "Page actions" : "Browser menu", items: items, colors: colors,
             compactZoom: showPageActions, motionScale: effectiveMotion,
             onDismiss: { showBrowserMenu = false; showPageActions = false })),
@@ -394,6 +407,7 @@ struct BrowserShell<Content: View>: View {
       if drag.id != nil && !drag.native.isDragging && NSEvent.pressedMouseButtons == 0 { drag.cancel() }
     }
     .onAppear {
+      installPresentationHooks()
       synchronizeSpaces()
       rowMotionSpaceID = store.state.activeSpaceID
       actions.performInterfaceCommand = performInterfaceCommand
@@ -426,7 +440,10 @@ struct BrowserShell<Content: View>: View {
     .onChange(of: spaces.map(\.id)) { _, _ in synchronizeSpaces() }
     .onChange(of: effectiveMotion) { _, _ in synchronizeSpaces() }
     .onDisappear { dialogs.cancel(); spaceViewport.stop() }
-    .onChange(of: isOwnedWindowOpen) { _, open in if !open { dialogs.cancel() } }
+    .onChange(of: isOwnedWindowOpen) { _, open in
+      if !open { resetWindowPresentation() }
+      else { maybeOpenBlankPalette() }
+    }
     .onChange(of: store.activeProfileID) { _, _ in dialogs.cancel(); drag.cancel() }
     .onChange(of: store.state.tabs) { _, _ in drag.reconcile(store: store) }
     .onChange(of: store.state.activeTabID) { _, _ in maybeOpenBlankPalette() }
@@ -559,13 +576,14 @@ struct BrowserShell<Content: View>: View {
       spaceFooter
     }.padding(.horizontal, 8)
       .background {
-        NativeSidebarDragHost(controller: drag.native, motionScale: effectiveMotion, canStart: { [weak store] id in
+        NativeSidebarDragHost(controller: drag.native, isEnabled: isOwnedWindowOpen, motionScale: effectiveMotion, canStart: { [weak store] id in
           guard let store, let tab = store.tab(id) else { return false }
           return store.profileID(for: tab) == store.activeProfileID && store.split(for: id) == nil
         }, began: { [weak drag, weak store] id in
           guard let store else { return }
           drag?.start(id, tabs: store.state.tabs)
-        }, ended: { [weak drag] in drag?.cancel() })
+        }, ended: { [weak drag] in drag?.cancel() }, projectedRegion: { [weak drag] in drag?.projectionRegionID },
+          exitedRegion: { [weak drag, weak store] in if let store { drag?.resetReflow(store: store) } })
       }
       .overlay(alignment: .leading) { spaceEdge(-1) }
       .overlay(alignment: .trailing) { spaceEdge(1) }
@@ -811,12 +829,15 @@ struct BrowserShell<Content: View>: View {
         }
         .contextMenu { NativeMenuCommands(items: folderMenuItems(folder)) }
         .background { menuAnchor(id: "folder:\(folder.id)", items: folderMenuItems(folder)) }
+        .background { NativeSidebarDropRegion(controller: drag.native, id: SidebarSection.folder(folder.id).regionID(space: store.state.activeSpaceID)) }
         .onDrop(of: [.plainText], delegate: dropDelegate(section: .folder(folder.id)))
       }
       VStack(spacing: 2) {
         rows(tabs.filter { $0.isPinned && !$0.isFavorite && $0.folderID == nil }, section: .pinned)
         Color.clear.frame(height: drag.id == nil ? 0 : 14)
-      }.contentShape(Rectangle()).onDrop(of: [.plainText], delegate: dropDelegate(section: .pinned))
+      }.contentShape(Rectangle())
+        .background { NativeSidebarDropRegion(controller: drag.native, id: SidebarSection.pinned.regionID(space: store.state.activeSpaceID)) }
+        .onDrop(of: [.plainText], delegate: dropDelegate(section: .pinned))
       Rectangle().fill(colors.ink.opacity(0.12)).frame(height: 1)
         .padding(.horizontal, 7).padding(.vertical, 10)
       Button {
@@ -833,15 +854,16 @@ struct BrowserShell<Content: View>: View {
       }
       .buttonStyle(NativePressButtonStyle(motionScale: effectiveMotion)).foregroundStyle(colors.muted)
         .focused($sidebarFocus, equals: "new-tab").onHover { hoveredNewTab = $0 }
+        .background { NativeSidebarDropRegion(controller: drag.native, id: SidebarSection.regular.regionID(space: store.state.activeSpaceID)) }
+        .onDrop(of: [.plainText], delegate: dropDelegate(section: .regular, before: todayTabs.first?.id))
       VStack(spacing: 2) {
         tabGroupRows
         splitRows
-        rows(
-          tabs.filter { !$0.isPinned && !$0.isFavorite && !$0.isClosed && $0.folderID == nil && ($0.url != "about:blank" || $0.homePage == true) },
-          section: .regular)
+        rows(todayTabs, section: .regular)
         Color.clear.frame(height: 28)
-      }.contentShape(Rectangle()).onDrop(
-        of: [.plainText], delegate: dropDelegate(section: .regular))
+      }.contentShape(Rectangle())
+        .background { NativeSidebarDropRegion(controller: drag.native, id: SidebarSection.regular.regionID(space: store.state.activeSpaceID)) }
+        .onDrop(of: [.plainText], delegate: dropDelegate(section: .regular))
     }.animation(rowAnimation, value: sidebarKeyboardItems)
       .transaction { if !allowsRowMotion && drag.id == nil { $0.animation = nil } }
   }
@@ -867,6 +889,7 @@ struct BrowserShell<Content: View>: View {
     }.padding(.bottom, favorites.isEmpty && drag.id == nil ? 0 : 8).contentShape(Rectangle())
       .animation(rowAnimation, value: favorites.map(\.id))
       .transaction { if !allowsRowMotion && drag.id == nil { $0.animation = nil } }
+      .background { NativeSidebarDropRegion(controller: drag.native, id: SidebarSection.favorite.regionID(space: store.state.activeSpaceID)) }
       .onDrop(of: [.plainText], delegate: dropDelegate(section: .favorite))
   }
   private var visibleTabGroups: [BrowserTabGroup] {
@@ -1368,6 +1391,52 @@ struct BrowserShell<Content: View>: View {
     else { return false }
     return true
   }
+  private func installPresentationHooks() {
+    actions.cancelWindowInteractions = cancelWindowInteractions
+    actions.resetWindowPresentation = resetWindowPresentation
+    actions.interfacePresentationState = {
+      var state = Set<String>()
+      if actions.findVisible { state.insert("find") }
+      if actions.palette { state.insert("palette") }
+      if actions.library != nil { state.insert("library") }
+      if actions.themeEditor || themeDraft != nil { state.insert("theme") }
+      if showSiteControls { state.insert("site-controls") }
+      if showBrowserMenu { state.insert("browser-menu") }
+      if showPageActions { state.insert("page-actions") }
+      if contextMenuRequest != nil { state.insert("context-menu") }
+      if editingGroupColor != nil { state.insert("group-color") }
+      if editor != nil { state.insert("editor") }
+      if creation != nil { state.insert("creation") }
+      if renameTarget != nil { state.insert("rename") }
+      if pendingEditorNavigation != nil { state.insert("editor-navigation") }
+      if actions.recordingShortcut { state.insert("shortcut-recording") }
+      if themeError != nil || nameError != nil || operationError != nil || actions.interfaceError != nil { state.insert("error") }
+      if drag.id != nil || drag.native.isDragging { state.insert("drag") }
+      return state
+    }
+  }
+  private func cancelWindowInteractions() {
+    drag.native.cancel()
+    drag.cancel()
+    spaceViewport.stop()
+    sidebarWidthDraft = nil; libraryWidthDraft = nil
+  }
+  private func resetWindowPresentation() {
+    cancelWindowInteractions()
+    drag.native.suspend()
+    dialogs.cancel()
+    actions.findVisible = false; actions.palette = false; actions.library = nil
+    actions.findQuery = ""; actions.findMatchCount = 0; actions.findActiveMatch = 0
+    actions.paletteRequest = nil; actions.interfaceError = nil
+    actions.themeEditor = false; actions.themeEditorWindow = nil; actions.recordingShortcut = false
+    actions.shortcutCaptureReady = false; actions.shortcutCaptureError = nil
+    showSiteControls = false; showBrowserMenu = false; showPageActions = false; contextMenuRequest = nil
+    pendingEditorNavigation = nil; editor = nil; creation = nil; renameTarget = nil; editingGroupColor = nil
+    themeDraft = nil; creatingSpace = false; themeError = nil; nameError = nil; operationError = nil
+    libraryReturnFocus = nil; paletteReturnFocus = nil; sidebarFocus = nil; blankPaletteContext = nil
+    name = ""; hoveredTab = nil; hoveredFolder = nil; hoveredPin = nil; hoveredNewTab = false
+    actions.query = ""; actions.homeQuery = ""
+  }
   private func saveRailWidth(_ proposed: Double, sidebar: Bool) {
     let range = sidebar ? sidebarResizeRange : libraryResizeRange
     let value = min(range.upperBound, max(range.lowerBound, proposed.rounded()))
@@ -1717,6 +1786,16 @@ private enum SidebarSection: Equatable {
     return nil
   }
   var pinned: Bool { self != .regular }
+  func regionID(space: String) -> String {
+    let section: String
+    switch self {
+    case .favorite: section = "favorites"
+    case .pinned: section = "pins"
+    case .regular: section = "today"
+    case .folder(let id): section = "folder:" + id
+    }
+    return space + ":" + section
+  }
 }
 @MainActor private final class SidebarDragSession: ObservableObject {
   let native = NativeSidebarDragController()
@@ -1725,6 +1804,7 @@ private enum SidebarSection: Equatable {
   private var hover: DispatchWorkItem?
   private var projectedGroupID: String?
   private var projection: Projection?
+  var projectionRegionID: String? { projection.map { $0.section.regionID(space: $0.space) } }
   private struct Projection {
     let space: String
     let section: SidebarSection
@@ -1919,6 +1999,7 @@ extension NSColor {
 /// or taking snapshots of any browser documents.
 private struct NativePalettePresenter: NSViewRepresentable {
   @Binding var isPresented: Bool
+  var ownerIsOpen: Bool
   var content: AnyView
   var motionScale: Double
   var frame: CGRect? = nil
@@ -1962,9 +2043,9 @@ private struct NativePalettePresenter: NSViewRepresentable {
         hide(restoreFocus: false)
         parent = window
       }
-      guard presenter.isPresented, let parent else {
+      guard presenter.isPresented, presenter.ownerIsOpen, let parent, parent.isVisible else {
         if presenter.isPresented { trace("awaiting parent") }
-        hide()
+        hide(restoreFocus: presenter.ownerIsOpen)
         return
       }
       if let hosting, let panel {
@@ -2088,7 +2169,8 @@ private struct NativePalettePresenter: NSViewRepresentable {
       hosting = nil
       self.panel = nil
       lastPresentationID = nil
-      if restoreFocus, restoreKey, let parent, parent.isVisible, parent.attachedSheet == nil, NSApp.isActive {
+      if restoreFocus, restoreKey, !presenter.restoresResponder || presenter.canRestoreFocus(),
+        let parent, parent.isVisible, parent.attachedSheet == nil, NSApp.isActive {
         parent.makeKey()
         if presenter.restoresResponder, presenter.canRestoreFocus(), !returnFocus.restore(in: parent) { presenter.onRestoreFocus() }
       }

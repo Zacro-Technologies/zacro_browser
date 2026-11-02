@@ -34,6 +34,38 @@ enum NativeSidebarDragAcceptance {
     moved.finish(operation: .move)
     result["nativeDragDropReleasesSourceExactlyOnce"] = completionCount == 2 && completedOperation == .move
       && moved.source.superview == nil
+    let invalidated = NativeSidebarDragLease(parent: root) { operation in
+      completionCount += 1; completedOperation = operation
+    }
+    invalidated.invalidate()
+    result["nativeDragLogicalCloseRetainsInertSourceUntilTerminalCallback"] = invalidated.isInvalidated
+      && invalidated.source.permittedOperation.isEmpty && invalidated.source.superview === root
+      && invalidated.source.window === window && completionCount == 2
+    invalidated.finish(operation: .move)
+    invalidated.finish(operation: .move)
+    result["nativeDragLogicalCloseCannotCompleteMove"] = completionCount == 3 && completedOperation.isEmpty
+      && invalidated.source.superview == nil && invalidated.source.didEnd == nil
+    let controller = NativeSidebarDragController()
+    let host = NSView(frame: root.bounds)
+    let section = NSView(frame: NSRect(x: 40, y: 40, width: 100, height: 80))
+    let newTab = NSView(frame: NSRect(x: 40, y: 122, width: 100, height: 30))
+    root.addSubview(host); host.addSubview(section); host.addSubview(newTab)
+    controller.attach(host)
+    controller.registerRegion(section, id: "today")
+    controller.registerRegion(newTab, id: "today")
+    func contains(_ point: NSPoint) -> Bool? {
+      controller.regionContains("today", screenPoint: window.convertPoint(toScreen: host.convert(point, to: nil)))
+    }
+    let row = NSView(frame: section.bounds); section.addSubview(row)
+    let beforeReplacement = contains(NSPoint(x: 80, y: 70))
+    row.removeFromSuperview(); section.addSubview(NSView(frame: section.bounds))
+    result["nativeDragContainerSurvivesChildRowReplacement"] = beforeReplacement == true
+      && contains(NSPoint(x: 80, y: 70)) == true
+    result["nativeDragContainerIncludesNewTabAndItsGap"] = contains(NSPoint(x: 80, y: 140)) == true
+      && contains(NSPoint(x: 80, y: 121)) == true
+      && contains(NSPoint(x: 141, y: 70)) == false
+      && contains(NSPoint(x: 80, y: 153)) == false
+    controller.setEnabled(false); host.removeFromSuperview()
     let pasteboard = NSPasteboard.withUniqueName()
     defer { pasteboard.releaseGlobally() }
     let identifier = "tab:東京:é"

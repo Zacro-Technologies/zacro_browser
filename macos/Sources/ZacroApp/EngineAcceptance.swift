@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import Foundation
 import ZacroChromium
 
@@ -346,6 +347,15 @@ final class EngineAcceptance {
     let closingPage = engine.page(id: "acceptance-window-close", profileID: "a", isPrivate: false,
       url: url, ownerWindowID: secondary.id)
     _ = try await closingPage.ready()
+    let privateID = "acceptance-empty-private-session"
+    let privatePage = engine.page(id: "acceptance-empty-private-before", profileID: privateID,
+      isPrivate: true, url: url, ownerWindowID: primary.id)
+    let privateBrowser = try await privatePage.ready()
+    _ = try await privateBrowser.devTools.call("Network.setCookie", parameters: [
+      "name": "zacro-empty-private", "value": "retained", "url": url.absoluteString
+    ])
+    privatePage.close()
+    try await waitForPageClose(privatePage)
     let manager = engine.extensionsPage(profileID: "a")
     secondary.beforeClosingDocuments = { true }
     secondary.close()
@@ -354,11 +364,59 @@ final class EngineAcceptance {
     try require(!secondary.isOpen && closingPage.browser == nil && primary.isOpen &&
       page.browser === browser && pages[3].browser != nil && manager.browser != nil && manager.ownerWindowID == nil,
       "windowClosePreservesOtherDocumentsAndManager")
+    let retainedPrivate = engine.page(id: "acceptance-empty-private-after", profileID: privateID,
+      isPrivate: true, url: url, ownerWindowID: primary.id)
+    let retainedBrowser = try await retainedPrivate.ready()
+    let retainedCookies = try await retainedBrowser.devTools.call("Network.getCookies", parameters: ["urls": [url.absoluteString]])
+    try require((retainedCookies["cookies"] as? [[String: Any]])?.contains {
+      $0["name"] as? String == "zacro-empty-private" && $0["value"] as? String == "retained"
+    } == true, "unrelatedWindowClosePreservesEmptyPrivateSession")
+    retainedPrivate.close()
+    try await waitForPageClose(retainedPrivate)
+    try engine.releasePrivateProfile(privateID)
+    let freshPrivate = engine.page(id: "acceptance-empty-private-fresh", profileID: privateID,
+      isPrivate: true, url: url, ownerWindowID: primary.id)
+    let freshBrowser = try await freshPrivate.ready()
+    let freshCookies = try await freshBrowser.devTools.call("Network.getCookies", parameters: ["urls": [url.absoluteString]])
+    try require((freshCookies["cookies"] as? [[String: Any]])?.contains {
+      $0["name"] as? String == "zacro-empty-private"
+    } == false, "explicitPrivateRetirementClearsItsCookies")
+    freshPrivate.close()
+    try await waitForPageClose(freshPrivate)
+    try engine.releasePrivateProfile(privateID)
+    try await checkProfileRetirement(primary: primary, url: url)
     let reopened = engine.createWindow(id: secondary.id)
     try require(reopened === secondary && reopened.isOpen && reopened.nativeID != firstWindowID,
       "windowReopenGetsFreshNativeIdentity")
     reopened.show()
     page.focus()
+  }
+  private func waitForPageClose(_ page: ChromiumPage) async throws {
+    let deadline = Date().addingTimeInterval(5)
+    while engine.pages[page.id] != nil, Date() < deadline { try await Task.sleep(for: .milliseconds(20)) }
+    guard engine.pages[page.id] == nil, page.browser == nil else { throw Failure(message: "Native profile document did not close") }
+  }
+  private func checkProfileRetirement(primary: ChromiumWindowContext, url: URL) async throws {
+    let identifier = "acceptance-retirement-receipt"
+    let name = SHA256.hash(data: Data(identifier.utf8)).map { String(format: "%02x", $0) }.joined()
+    let directory = engine.dataDirectory.appendingPathComponent("Chromium").appendingPathComponent(name)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let marker = directory.appendingPathComponent("receipt-fixture")
+    try Data("retained until confirmed cleanup".utf8).write(to: marker)
+    try engine.retireProfile(identifier)
+    let rejected = engine.page(id: "acceptance-retired-reuse", profileID: identifier,
+      isPrivate: false, url: url, ownerWindowID: primary.id)
+    var rejectedCleanly = false
+    do { _ = try await rejected.ready() } catch { rejectedCleanly = rejected.creationFailed }
+    try require(rejectedCleanly && engine.pages[rejected.id] == nil && FileManager.default.fileExists(atPath: marker.path),
+      "pendingRetirementCannotReopenAProfileIdentity")
+    try engine.replayProfileRetirement(identifier)
+    try require(!FileManager.default.fileExists(atPath: directory.path), "unopenedProfileRetirementReplaysDurably")
+    do {
+      try engine.replayProfileRetirement("a")
+      throw Failure(message: "Replay accepted an already opened profile")
+    } catch is Failure { throw Failure(message: "Replay accepted an already opened profile") }
+    catch { checks["retirementReplayRejectsOpenedProfiles"] = true }
   }
   private func finish(error: String?) {
     guard !finished else { return }; finished = true

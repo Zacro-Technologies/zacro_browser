@@ -81,12 +81,16 @@ extension BrowserStore {
       try importLegacy(from: url)
     } else if root["activeSpaceID"] != nil {
       guard root["version"] as? Int == 1 else { throw LegacyImportError.invalidState }
-      try mergeCollection(JSONDecoder().decode(BrowserState.self, from: data))
+      var collection = root
+      collection.removeValue(forKey: "pendingNativeProfileRetirements")
+      try mergeCollection(JSONDecoder().decode(BrowserState.self,
+        from: JSONSerialization.data(withJSONObject: collection)))
     } else { throw LegacyImportError.invalidState }
   }
 
   func mergeCollection(_ source: BrowserState, includeHistory: Bool = false) throws {
     var sanitized = source
+    sanitized.pendingNativeProfileRetirements = []
     for i in sanitized.tabs.indices {
       sanitized.tabs[i].nativeNavigation = nil; sanitized.tabs[i].savedNativeNavigation = nil
       sanitized.tabs[i].peek?.nativeNavigation = nil
@@ -114,7 +118,13 @@ extension BrowserStore {
       state.spaces.count + source.spaces.count <= 500, state.folders.count + source.folders.count <= 1000,
       state.bookmarks.count + source.bookmarks.count <= 20_000 else { throw ShortcutError("This import would exceed the browser’s collection limits.") }
     func mapping<T: Identifiable>(_ values: [T]) -> [String: String] where T.ID == String {
-      Dictionary(uniqueKeysWithValues: values.map { ($0.id, UUID().uuidString) })
+      var reserved = Set(state.pendingNativeProfileRetirements).union(state.profiles.map(\.id))
+      return Dictionary(uniqueKeysWithValues: values.map {
+        var id = UUID().uuidString
+        while reserved.contains(id) { id = UUID().uuidString }
+        reserved.insert(id)
+        return ($0.id, id)
+      })
     }
     let profilesMap = mapping(source.profiles), spacesMap = mapping(source.spaces), tabsMap = mapping(source.tabs), foldersMap = mapping(source.folders)
     let groupsMap = mapping(source.tabGroups)

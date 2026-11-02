@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import Darwin
 import Foundation
 import ZacroChromium
@@ -39,6 +40,7 @@ final class BrowserIntegrationAcceptance {
     for (name, passed) in NativeSidebarDragAcceptance.check(in: firstWindow) { try require(passed, name) }
     for (name, passed) in NativeSpaceViewportAcceptance.check() { try require(passed, name) }
     for (name, passed) in NativeThemeColorWellAcceptance.check() { try require(passed, name) }
+    for (name, passed) in NativeThemeColorAcceptance.check() { try require(passed, name) }
     for (name, passed) in await NativeWindowDialogOwnerAcceptance.check() { try require(passed, name) }
     try await checkNativeWindowSheets(owner: firstWindow)
     first.windowContext.show()
@@ -61,6 +63,18 @@ final class BrowserIntegrationAcceptance {
     first.actions.openPalette()
     try await Task.sleep(for: .milliseconds(220))
     try NativeViewRenderEvidence.capture("palette", window: firstWindow)
+    try await wait("paletteExposesCurrentResultsToNativeAccessibility") {
+      guard let field = self.commandSearchControl(in: firstWindow) else { return false }
+      return field.accessibilityLabel() == "Search tabs, history, Spaces and actions, or enter a URL"
+        && field.accessibilityHelp()?.contains("results.") == true
+        && field.accessibilityHelp()?.contains("Result 1 of") == true
+    }
+    try require(first.actions.performInterfaceCommand("site-searches"), "paletteOpensNativeNestedSearchScope")
+    try await wait("paletteAccessibilityLabelTracksItsNestedScope") {
+      guard let field = self.commandSearchControl(in: firstWindow) else { return false }
+      return field.accessibilityLabel() == "Site Search"
+        && field.accessibilityHelp()?.hasPrefix("Site Search.") == true
+    }
     first.actions.palette = false
     let paletteDraft = try await browser.devTools.evaluate("document.querySelector('#draft').value") as? String
     try require(engine.pages[tab.id] === page && paletteDraft == "keep this draft", "paletteRetainsLiveDocument")
@@ -73,6 +87,7 @@ final class BrowserIntegrationAcceptance {
     guard let themeWindow = first.actions.themeEditorWindow else { throw Failure("Theme editor presentation") }
     try await Task.sleep(for: .milliseconds(220))
     try NativeViewRenderEvidence.capture("theme-editor", window: themeWindow)
+    for (name, passed) in NativeThemeColorWellAcceptance.checkHosted(in: themeWindow) { try require(passed, name) }
     first.actions.themeEditor = false
     try await wait("themeEditorDismissesItsOwnedView", record: false) {
       first.actions.themeEditorWindow == nil && !themeWindow.isVisible
@@ -295,7 +310,50 @@ final class BrowserIntegrationAcceptance {
       "webStoreUsesOneOrdinaryOwnedTab")
     second.store.selectTab(id: page.id)
     if nativeExtensions { try await checkProfileClear(url: url, survivor: page, owner: second) }
+    try checkRetirementReplay(owner: second, page: page)
     try await checkApplicationReopening(url: url, owner: second, page: page)
+  }
+
+  private func commandSearchControl(in owner: NSWindow) -> NativeCommandSearchControl? {
+    func search(_ view: NSView) -> NativeCommandSearchControl? {
+      if let field = view as? NativeCommandSearchControl, !field.isHiddenOrHasHiddenAncestor { return field }
+      return view.subviews.lazy.compactMap(search).first
+    }
+    for window in [owner] + (owner.childWindows ?? []) where window.isVisible {
+      if let view = window.contentView, let field = search(view) { return field }
+    }
+    return nil
+  }
+
+  private func checkRetirementReplay(owner: BrowserWindowCoordinator, page: ChromiumPage) throws {
+    let originalSpace = owner.store.state.activeSpaceID
+    defer { owner.store.selectSpace(id: originalSpace) }
+    // This entire fixture is synchronous on the main actor: its temporary
+    // profile never materializes a native context before the deletion replay.
+    let profile = try owner.store.createProfileDurably(name: "Disposable retirement fixture")
+    let hash = SHA256.hash(data: Data(profile.id.utf8)).map { String(format: "%02x", $0) }.joined()
+    let root = application.engine.dataDirectory
+    let chromium = root.appendingPathComponent("Chromium/" + hash, isDirectory: true)
+    let navigation = root.appendingPathComponent("Navigation/" + hash, isDirectory: true)
+    let icons = root.appendingPathComponent("Icons", isDirectory: true)
+    for directory in [chromium, navigation, icons] {
+      try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    }
+    let icon = icons.appendingPathComponent(hash + "-" + String(repeating: "0", count: 64) + ".png")
+    try Data("retired fixture".utf8).write(to: chromium.appendingPathComponent("fixture"))
+    try Data("retired fixture".utf8).write(to: navigation.appendingPathComponent("fixture"))
+    try Data("retired fixture".utf8).write(to: icon)
+    try owner.store.deleteProfileDurably(id: profile.id)
+    try require(application.store.pendingNativeProfileRetirements.contains(profile.id),
+      "profileDeletionHasDurableNativeCleanupReceipt")
+    try require(application.recoverNativeProfileRetirements() == nil
+      && !application.store.pendingNativeProfileRetirements.contains(profile.id)
+      && !FileManager.default.fileExists(atPath: chromium.path)
+      && !FileManager.default.fileExists(atPath: navigation.path)
+      && !FileManager.default.fileExists(atPath: icon.path),
+      "nativeRetirementReplayCleansAllOwnedArtifactsBeforeAcknowledging")
+    try require(application.engine.pages[page.id] === page && page.browser?.isClosed == false,
+      "retirementReplayPreservesAnotherProfilesLiveDocument")
   }
 
   private func checkApplicationReopening(url: URL, owner: BrowserWindowCoordinator,
@@ -332,7 +390,18 @@ final class BrowserIntegrationAcceptance {
     }
     for window in open {
       window.actions.palette = false; window.actions.library = nil; window.actions.themeEditor = false
+      window.actions.openFind()
+      try require(window.actions.performInterfaceCommand("browser-menu")
+        && window.actions.interfacePresentationState().contains("find")
+        && window.actions.interfacePresentationState().contains("browser-menu"),
+        "closeFixtureHasTransientControls:\(window.windowContext.id)")
       try require(await window.requestCloseWindow(), "appRoutingClosesWindow:\(window.windowContext.id)")
+      try await wait("acceptedCloseResetsAllTransientControls:\(window.windowContext.id)") {
+        window.actions.interfacePresentationState().isEmpty
+          && !(window.window?.childWindows ?? []).contains {
+            $0.identifier == NSUserInterfaceItemIdentifier("ZacroBrowserControls") && $0.isVisible
+          }
+      }
     }
     try await wait("applicationRemainsAliveWithNoBrowserWindows") {
       !self.application.windows.values.contains { $0.windowContext.isOpen }
@@ -350,6 +419,8 @@ final class BrowserIntegrationAcceptance {
       return windows.count == 1 && windows[0].windowContext.id == expected && windows[0].actions.palette
     }
     guard let reopened = application.focusedCoordinator else { throw Failure("Reopened command window") }
+    try require(reopened.actions.interfacePresentationState().subtracting(["palette"]).isEmpty,
+      "reopenedWindowDoesNotRestoreStaleMenusOrFind")
     let destination = url.appendingPathComponent("external-application-link")
     application.application(NSApp, open: [destination])
     try await wait("externalLinkUsesOneLiveOwnedWindow") {

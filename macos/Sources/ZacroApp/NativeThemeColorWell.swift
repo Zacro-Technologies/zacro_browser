@@ -24,6 +24,10 @@ struct NativeThemeColorWell: NSViewRepresentable {
     well.onChange = onChange
   }
 
+  func sizeThatFits(_ proposal: ProposedViewSize, nsView: NativeThemeColorWellControl, context: Context) -> CGSize? {
+    NSSize(width: 27, height: 27)
+  }
+
   static func dismantleNSView(_ well: NativeThemeColorWellControl, coordinator: ()) {
     well.deactivate()
     well.onSelect = {}
@@ -44,6 +48,10 @@ final class NativeThemeColorWellControl: NSColorWell {
     isBordered = true
     supportsAlpha = false
     isContinuous = true
+    setContentHuggingPriority(.required, for: .horizontal)
+    setContentHuggingPriority(.required, for: .vertical)
+    setContentCompressionResistancePriority(.required, for: .horizontal)
+    setContentCompressionResistancePriority(.required, for: .vertical)
     target = self
     action = #selector(colorChanged)
   }
@@ -51,6 +59,10 @@ final class NativeThemeColorWellControl: NSColorWell {
   required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
   override var intrinsicContentSize: NSSize { NSSize(width: 27, height: 27) }
+  // Presented NSColorWell restores native bezel insets (3px horizontal, 2px
+  // vertical). Our swatch has no bezel, so its visual and alignment bounds
+  // must agree without disabling AppKit's bordered-well activation behavior.
+  override var alignmentRectInsets: NSEdgeInsets { NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0) }
   override var isOpaque: Bool { false }
   override var focusRingMaskBounds: NSRect { bounds }
 
