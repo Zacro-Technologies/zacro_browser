@@ -47,6 +47,7 @@ struct NativeInterfaceEditors: View {
   @ObservedObject var store: BrowserStore
   @ObservedObject var actions: BrowserActions
   let destination: NativeInterfaceEditor
+  var navigate: (String) -> Void = { _ in }
   @Environment(\.dismiss) private var dismiss
   @Environment(\.colorScheme) private var colorScheme
   @Environment(\.colorSchemeContrast) private var contrast
@@ -215,8 +216,7 @@ struct NativeInterfaceEditors: View {
     if alert.runModal() == .alertFirstButtonReturn { actions.deleteSpace(space.id) }
   }
   private func showInterface(_ command: String) {
-    dismiss()
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { _ = actions.performInterfaceCommand(command) }
+    navigate(command)
   }
   private var profiles: some View {
     VStack(alignment: .leading, spacing: 12) {

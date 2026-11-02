@@ -675,6 +675,8 @@ public final class ChromiumPage: CefBrowserDelegate {
   public var onDownload: ((CefDownload) -> Void)?
   public var onDownloadDecision: ((CefDownload, String) -> CefDownloadDecision)?
   public var onPermission: ((CefPermissionRequest) -> CefPermissionDecision)?
+  public var onPermissionRequest: ((CefPermissionRequest, CefPermissionCallback) -> Bool)?
+  public var onPermissionDismissed: ((UUID) -> Void)?
   public var onClosed: (() -> Void)?
   public private(set) var closedForTermination = false
   public fileprivate(set) var closedForWindow = false
@@ -1039,24 +1041,19 @@ public final class ChromiumPage: CefBrowserDelegate {
       return .useDefault
     }
     if let onPermission { return onPermission(request) }
-    guard let origin = URL(string: request.origin),
-      ["https", "http"].contains(origin.scheme?.lowercased() ?? ""),
-      !request.kinds.contains(.other)
-    else { return .deny }
-    let names: [(CefPermissionKind, String)] = [
-      (.camera, "camera"), (.microphone, "microphone"), (.geolocation, "location"),
-      (.notifications, "notifications"), (.clipboard, "clipboard"), (.midi, "MIDI devices"),
-      (.pointerLock, "pointer lock"), (.storageAccess, "site storage"), (.sensors, "sensors"),
-      (.windowManagement, "window management"), (.downloads, "multiple downloads"),
-    ]
-    let requested = names.filter { request.kinds.contains($0.0) }.map { $0.1 }.joined(
-      separator: ", ")
-    let alert = NSAlert()
-    alert.messageText = "Allow \(origin.host ?? request.origin) to use \(requested)?"
-    alert.informativeText = "This decision applies to this request in the current browser profile."
-    alert.addButton(withTitle: "Don’t Allow")
-    alert.addButton(withTitle: "Allow")
-    return alert.runModal() == .alertSecondButtonReturn ? .allow : .deny
+    return .deny
+  }
+  public func browser(_ b: CefBrowser, requestsPermission request: CefPermissionRequest,
+                      callback: CefPermissionCallback) -> Bool {
+    if request.kinds.contains(.screenCapture) || request.kinds.contains(.systemAudioCapture)
+      || URL(string: request.origin)?.scheme?.lowercased() == "chrome-extension" { return false }
+    if let onPermissionRequest { return onPermissionRequest(request, callback) }
+    let choice = browser(b, requestsPermission: request)
+    guard choice != .useDefault else { return false }
+    callback.resolve(choice); return true
+  }
+  public func browser(_ b: CefBrowser, dismissedPermission requestID: UUID) {
+    onPermissionDismissed?(requestID)
   }
   public func browser(
     _ b: CefBrowser, renderProcessDidTerminate reason: CefTerminationReason, errorCode: Int

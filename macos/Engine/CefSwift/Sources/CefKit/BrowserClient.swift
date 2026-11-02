@@ -45,6 +45,7 @@ final class BrowserClient {
     nonisolated(unsafe) var jsDialogPointer: UnsafeMutablePointer<cef_jsdialog_handler_t>?
     nonisolated(unsafe) var contextMenuPointer: UnsafeMutablePointer<cef_context_menu_handler_t>?
     nonisolated(unsafe) var permissionPointer: UnsafeMutablePointer<cef_permission_handler_t>?
+    nonisolated(unsafe) var framePointer: UnsafeMutablePointer<cef_frame_handler_t>?
     nonisolated(unsafe) var requestPointer: UnsafeMutablePointer<cef_request_handler_t>?
     nonisolated(unsafe) var keyboardPointer: UnsafeMutablePointer<cef_keyboard_handler_t>?
     nonisolated(unsafe) var focusPointer: UnsafeMutablePointer<cef_focus_handler_t>?
@@ -63,6 +64,12 @@ final class BrowserClient {
     // and replayed to the command/dismiss callbacks (which also receive params,
     // but keeping the snapshot avoids re-reading the borrowed struct).
     private var lastContextMenuParams = CefContextMenuParams()
+    private struct PendingPermission {
+        let promptID: UInt64?
+        let frameID: String?
+        let callback: CefPermissionCallback
+    }
+    private var pendingPermissions: [UUID: PendingPermission] = [:]
 
     func attach(_ browser: CefBrowser) {
         self.browser = browser
@@ -132,6 +139,7 @@ final class BrowserClient {
             cefRelease(browser.map(UnsafeMutableRawPointer.init))
             guard let client = BrowserClient.owner(handlerSelf.map(UnsafeMutableRawPointer.init), browserID: callbackBrowserID) else { return }
             MainActor.assumeIsolated {
+                client.cancelPermissions()
                 client.browser?.handleBeforeClose()
             }
         }
@@ -433,6 +441,7 @@ final class BrowserClient {
             displayPointer.map(UnsafeMutableRawPointer.init), downloadPointer.map(UnsafeMutableRawPointer.init),
             findPointer.map(UnsafeMutableRawPointer.init), jsDialogPointer.map(UnsafeMutableRawPointer.init),
             contextMenuPointer.map(UnsafeMutableRawPointer.init), permissionPointer.map(UnsafeMutableRawPointer.init),
+            framePointer.map(UnsafeMutableRawPointer.init),
             requestPointer.map(UnsafeMutableRawPointer.init), keyboardPointer.map(UnsafeMutableRawPointer.init),
             focusPointer.map(UnsafeMutableRawPointer.init), renderPointer.map(UnsafeMutableRawPointer.init)
         ].compactMap { $0 }
@@ -488,6 +497,12 @@ final class BrowserClient {
         client.pointee.get_permission_handler = { clientSelf in
             guard let me = BrowserClient.owner(clientSelf.map(UnsafeMutableRawPointer.init)),
                   let handler = me.permissionPointer else { return nil }
+            cefAddRef(UnsafeMutableRawPointer(handler))
+            return handler
+        }
+        client.pointee.get_frame_handler = { clientSelf in
+            guard let me = BrowserClient.owner(clientSelf.map(UnsafeMutableRawPointer.init)),
+                  let handler = me.framePointer else { return nil }
             cefAddRef(UnsafeMutableRawPointer(handler))
             return handler
         }
@@ -721,53 +736,93 @@ extension BrowserClient {
 
     // MARK: Permissions
 
+    private func handlePermission(_ request: CefPermissionRequest, callback: CefPermissionCallback,
+                                  promptID: UInt64? = nil, frameID: String? = nil, browser: CefBrowser) -> Int32 {
+        pendingPermissions[request.id] = .init(promptID: promptID, frameID: frameID, callback: callback)
+        callback.didResolve = { [weak self] in self?.pendingPermissions.removeValue(forKey: request.id) }
+        let handled = browser.delegate?.browser(browser, requestsPermission: request, callback: callback) == true
+        // A synchronous callback consumes the native request even if a faulty
+        // delegate returns false. Never dispatch the same decision twice.
+        if !callback.isPending { return 1 }
+        if handled { return 1 }
+        callback.invalidate()
+        return 0
+    }
+    private func cancelPermissions(frameID: String? = nil, promptID: UInt64? = nil, nativeDismissed: Bool = false) {
+        let matching = pendingPermissions.filter { _, pending in
+            (frameID == nil || pending.frameID == frameID)
+                && (promptID == nil || pending.promptID == promptID)
+        }
+        for (id, pending) in matching {
+            pendingPermissions.removeValue(forKey: id)
+            if nativeDismissed { pending.callback.invalidate() } else { pending.callback.cancel() }
+            if let browser { browser.delegate?.browser(browser, dismissedPermission: id) }
+        }
+    }
+
     private func makePermissionHandler() {
         let handler = cefAllocate(cef_permission_handler_t.self, owner: self)
         handler.pointee.on_request_media_access_permission = {
             handlerSelf, browser, frame, requestingOrigin, requestedPermissions, callback in
             let callbackBrowserID = browser.map { $0.pointee.get_identifier?($0) ?? -1 }
             cefRelease(browser.map(UnsafeMutableRawPointer.init))
+            let frameID = frame.flatMap { CefStringUtil.takingUserFree($0.pointee.get_identifier?($0)) }
             cefRelease(frame.map(UnsafeMutableRawPointer.init))
             guard let callback else { return 0 }
-            defer { cefRelease(UnsafeMutableRawPointer(callback)) }
             let origin = CefStringUtil.string(from: requestingOrigin)
             let kinds = CefPermissionKind.fromMediaTypes(requestedPermissions)
             let request = CefPermissionRequest(kinds: kinds, origin: origin)
-            return BrowserClientCallbacks.run(handlerSelf, browserID: callbackBrowserID, default: Int32(0)) { _, cefBrowser in
-                let decision = cefBrowser.delegate?.browser(cefBrowser, requestsPermission: request) ?? .deny
-                switch decision {
-                case .useDefault:
-                    // In Chrome runtime this continues into the native source
-                    // chooser and permission policy without granting a mask.
-                    return 0
-                case .allow:
-                    callback.pointee.cont?(callback, kinds.mediaMask(within: requestedPermissions))
-                case .deny, .dismiss:
-                    callback.pointee.cancel?(callback)
+            return MainActor.assumeIsolated {
+                let wrapper = CefPermissionCallback(media: callback, kinds: kinds, mask: requestedPermissions)
+                return BrowserClientCallbacks.run(handlerSelf, browserID: callbackBrowserID, default: Int32(0)) { client, cefBrowser in
+                    client.handlePermission(request, callback: wrapper, frameID: frameID, browser: cefBrowser)
                 }
-                return 1
             }
         }
         handler.pointee.on_show_permission_prompt = {
-            handlerSelf, browser, _, requestingOrigin, requestedPermissions, callback in
+            handlerSelf, browser, promptID, requestingOrigin, requestedPermissions, callback in
             let callbackBrowserID = browser.map { $0.pointee.get_identifier?($0) ?? -1 }
             cefRelease(browser.map(UnsafeMutableRawPointer.init))
             guard let callback else { return 0 }
-            defer { cefRelease(UnsafeMutableRawPointer(callback)) }
             let origin = CefStringUtil.string(from: requestingOrigin)
             let kinds = CefPermissionKind.fromRequestTypes(requestedPermissions)
             let request = CefPermissionRequest(kinds: kinds, origin: origin)
-            return BrowserClientCallbacks.run(handlerSelf, browserID: callbackBrowserID, default: Int32(0)) { _, cefBrowser in
-                let decision = cefBrowser.delegate?.browser(cefBrowser, requestsPermission: request) ?? .deny
-                if decision == .useDefault { return 0 }
-                callback.pointee.cont?(callback, decision.cefResult)
-                return 1
+            return MainActor.assumeIsolated {
+                let wrapper = CefPermissionCallback(prompt: callback)
+                return BrowserClientCallbacks.run(handlerSelf, browserID: callbackBrowserID, default: Int32(0)) { client, cefBrowser in
+                    client.handlePermission(request, callback: wrapper, promptID: promptID, browser: cefBrowser)
+                }
             }
         }
-        handler.pointee.on_dismiss_permission_prompt = { _, browser, _, _ in
+        handler.pointee.on_dismiss_permission_prompt = { handlerSelf, browser, promptID, _ in
+            let callbackBrowserID = browser.map { $0.pointee.get_identifier?($0) ?? -1 }
             cefRelease(browser.map(UnsafeMutableRawPointer.init))
+            BrowserClientCallbacks.run(handlerSelf, browserID: callbackBrowserID, default: ()) { client, _ in
+                client.cancelPermissions(promptID: promptID, nativeDismissed: true)
+            }
         }
         permissionPointer = handler
+        let frames = cefAllocate(cef_frame_handler_t.self, owner: self)
+        frames.pointee.on_frame_detached = { handlerSelf, browser, frame in
+            let callbackBrowserID = browser.map { $0.pointee.get_identifier?($0) ?? -1 }
+            cefRelease(browser.map(UnsafeMutableRawPointer.init))
+            let id = frame.flatMap { CefStringUtil.takingUserFree($0.pointee.get_identifier?($0)) }
+            cefRelease(frame.map(UnsafeMutableRawPointer.init))
+            guard let id else { return }
+            BrowserClientCallbacks.run(handlerSelf, browserID: callbackBrowserID, default: ()) { client, _ in
+                client.cancelPermissions(frameID: id)
+            }
+        }
+        frames.pointee.on_main_frame_changed = { handlerSelf, browser, old, new in
+            let callbackBrowserID = browser.map { $0.pointee.get_identifier?($0) ?? -1 }
+            cefRelease(browser.map(UnsafeMutableRawPointer.init))
+            cefRelease(old.map(UnsafeMutableRawPointer.init)); cefRelease(new.map(UnsafeMutableRawPointer.init))
+            guard old != nil else { return }
+            BrowserClientCallbacks.run(handlerSelf, browserID: callbackBrowserID, default: ()) { client, _ in
+                client.cancelPermissions()
+            }
+        }
+        framePointer = frames
     }
 
     // MARK: Navigation / requests
@@ -778,6 +833,7 @@ extension BrowserClient {
             let callbackBrowserID = browser.map { $0.pointee.get_identifier?($0) ?? -1 }
             cefRelease(browser.map(UnsafeMutableRawPointer.init))
             let mainFrame = frame.map { ($0.pointee.is_main?($0) ?? 0) != 0 } ?? false
+            let frameID = frame.flatMap { CefStringUtil.takingUserFree($0.pointee.get_identifier?($0)) }
             cefRelease(frame.map(UnsafeMutableRawPointer.init))
             var urlString = ""
             if let request {
@@ -787,10 +843,14 @@ extension BrowserClient {
             let url = URL(string: urlString)
             let gesture = userGesture != 0
             let redirect = isRedirect != 0
-            return BrowserClientCallbacks.run(handlerSelf, browserID: callbackBrowserID, default: Int32(0)) { _, cefBrowser in
+            return BrowserClientCallbacks.run(handlerSelf, browserID: callbackBrowserID, default: Int32(0)) { client, cefBrowser in
                 let decision = cefBrowser.delegate?.browser(
                     cefBrowser, decidePolicyForNavigation: url, isMainFrame: mainFrame, isRedirect: redirect, userGesture: gesture
                 ) ?? .allow
+                if decision != .cancel {
+                    if mainFrame { client.cancelPermissions() }
+                    else if let frameID { client.cancelPermissions(frameID: frameID) }
+                }
                 return decision == .cancel ? 1 : 0
             }
         }
@@ -857,7 +917,8 @@ extension BrowserClient {
             cefRelease(browser.map(UnsafeMutableRawPointer.init))
             let reason = CefTerminationReason(cefValue: status)
             let code = Int(errorCode)
-            BrowserClientCallbacks.run(handlerSelf, browserID: callbackBrowserID, default: ()) { _, cefBrowser in
+            BrowserClientCallbacks.run(handlerSelf, browserID: callbackBrowserID, default: ()) { client, cefBrowser in
+                client.cancelPermissions()
                 cefBrowser.delegate?.browser(cefBrowser, renderProcessDidTerminate: reason, errorCode: code)
             }
         }

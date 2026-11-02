@@ -22,7 +22,10 @@ PATHS = ("extensions/browser/extension_function.h", "extensions/browser/extensio
          "chrome/browser/extensions/api/messaging/chrome_messaging_delegate.cc",
          "chrome/browser/extensions/api/debugger/debugger_api.cc",
          "components/download/internal/common/download_utils.cc",
-         "extensions/browser/api/runtime/runtime_api.h", "extensions/browser/api/runtime/runtime_api.cc")
+         "extensions/browser/api/runtime/runtime_api.h", "extensions/browser/api/runtime/runtime_api.cc",
+         "chrome/browser/extensions/api/extension_action/extension_action_api.cc",
+         "chrome/browser/extensions/api/extension_action/BUILD.gn",
+         "chrome/browser/ui/views/extensions/extensions_toolbar_desktop.cc")
 
 def replace(text, old, new):
     if text.count(old) != 1:
@@ -211,7 +214,46 @@ RuntimeGetContextsFunction::RuntimeGetContextsFunction() = default;""")
     runtime_c = replace(runtime_c, "    results.push_back(std::move(context));", """    auto& native = NativeRuntimeContextDecorator();
     if (native && !native.Run(web_contents, &context)) continue;
     results.push_back(std::move(context));""")
-    return dict(zip(PATHS, (h, c, eh, ec, th, tc, messaging, debugger, downloads, runtime_h, runtime_c)))
+    action_c = replace(originals[PATHS[11]], '#include "components/tabs/public/tab_interface.h"',
+        '#include "components/tabs/public/tab_interface.h"\n#if BUILDFLAG(IS_MAC)\n#include "chrome/browser/ui/views/extensions/native_extension_popup_anchor.h"\n#endif')
+    action_c = replace(action_c, "bool OpenPopupInBrowser(BrowserWindowInterface& browser,", """bool HasActiveNativePopupAnchor(BrowserWindowInterface& browser) {
+#if BUILDFLAG(IS_MAC)
+  if (auto* tab = browser.GetActiveTabInterface()) {
+    return NativeExtensionPopupAnchor::IsPreparedOwnerActive(tab->GetContents());
+  }
+#endif
+  return false;
+}
+
+bool OpenPopupInBrowser(BrowserWindowInterface& browser,""")
+    action_c = replace(action_c, """  if (!WindowFeatureController::From(&browser)->SupportsWindowFeature(
+          WindowFeatureController::WindowFeature::kFeatureToolbar) ||
+      !BrowserWindow::FromBrowser(&browser)->IsToolbarVisible()) {""", """  if (!HasActiveNativePopupAnchor(browser) &&
+      (!WindowFeatureController::From(&browser)->SupportsWindowFeature(
+          WindowFeatureController::WindowFeature::kFeatureToolbar) ||
+       !BrowserWindow::FromBrowser(&browser)->IsToolbarVisible())) {""")
+    action_c = replace(action_c, "  if (!browser->GetWindow()->IsActive()) {", """  bool native_owner_active = false;
+  // The selected native shell can own focus while its physical document
+  // widget is intentionally inactive. Only a short-lived browser-process
+  // anchor, validated for this exact document, can represent that active owner.
+  native_owner_active = HasActiveNativePopupAnchor(*browser);
+  if (!browser->GetWindow()->IsActive() && !native_owner_active) {""")
+    action_build = replace(originals[PATHS[12]], "  if (!is_android) {", """  if (is_mac) {
+    deps += [ "//chrome/browser/ui/views/extensions:extension_popup" ]
+  }
+
+  if (!is_android) {""")
+    desktop = replace(originals[PATHS[13]], '#include "build/build_config.h"',
+        '#include "build/build_config.h"\n#if BUILDFLAG(IS_MAC)\n#include "chrome/browser/ui/views/extensions/native_extension_popup_anchor.h"\n#endif')
+    desktop = replace(desktop, "  return !popped_out_action_ && browser_->GetWindow()->IsActive();", """  bool native_owner_active = false;
+#if BUILDFLAG(IS_MAC)
+  if (auto* tab = browser_->GetActiveTabInterface()) {
+    native_owner_active = NativeExtensionPopupAnchor::IsPreparedOwnerActive(tab->GetContents());
+  }
+#endif
+  return !popped_out_action_ && (browser_->GetWindow()->IsActive() || native_owner_active);""")
+    return dict(zip(PATHS, (h, c, eh, ec, th, tc, messaging, debugger, downloads, runtime_h, runtime_c,
+                           action_c, action_build, desktop)))
 
 def digest(s):
     return hashlib.sha256(s.encode()).hexdigest()

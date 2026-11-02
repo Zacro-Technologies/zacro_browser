@@ -14,6 +14,28 @@ import XCTest
     try FileManager.default.createDirectory(at: file, withIntermediateDirectories: true)
   }
 
+  func testColdLaunchChoosesMostRecentlyClosedWindowAndPreservesLiveFocus() throws {
+    let repository = BrowserRepository(directory: try directory()), first = repository.focusedStore
+    _ = first.createTab(address: "https://first.example")
+    let second = try repository.makeWindow(addresses: ["https://last.example"])
+    let firstID = try XCTUnwrap(first.owningWindowID), secondID = try XCTUnwrap(second.owningWindowID)
+    repository.focusWindow(secondID)
+    XCTAssertEqual(repository.startupWindowID, secondID)
+    _ = repository.closeWindow(firstID)
+    XCTAssertEqual(repository.startupWindowID, secondID)
+    _ = repository.closeWindow(secondID)
+    try repository.updateWindow(firstID) { $0.closedAt = Date(timeIntervalSince1970: 100) }
+    try repository.updateWindow(secondID) { $0.closedAt = Date(timeIntervalSince1970: 200) }
+    repository.focusWindow(firstID) // A stale menu target must not override close order.
+    let restarted = BrowserRepository(directory: repository.directory)
+    XCTAssertEqual(restarted.startupWindowID, secondID)
+    XCTAssertFalse(restarted.windows.contains(where: \.isOpen))
+    XCTAssertEqual(restarted.store(for: secondID)?.state.activeTab?.url, "https://last.example/")
+    _ = try restarted.reopenWindow(id: firstID)
+    XCTAssertEqual(restarted.startupWindowID, firstID)
+    XCTAssertEqual(restarted.savedWindows.map(\.id), [secondID])
+  }
+
   func testDisabledSessionRestoreKeepsSavedDocumentsDormantInEveryWindow() throws {
     let repository = BrowserRepository(directory: try directory()), first = repository.focusedStore
     let a = try XCTUnwrap(first.createTab(address: "https://split.example/a"))

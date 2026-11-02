@@ -33,7 +33,7 @@
 +#endif
 --- /dev/null
 +++ b/chrome/browser/ui/views/extensions/native_extension_popup_anchor_mac.mm
-@@ -0,0 +1,185 @@
+@@ -0,0 +1,190 @@
 +#import <AppKit/AppKit.h>
 +
 +#include "chrome/browser/ui/views/extensions/native_extension_popup_anchor.h"
@@ -128,6 +128,10 @@
 +  }
 +  views::View* view() const { return widget_->GetContentsView(); }
 +  void Attach(views::Widget* popup, base::RepeatingClosure close) {
++    // The Swift shell's command palette uses a floating native panel. Keep
++    // this genuine, owner-authorized action popup above that panel, while
++    // native menus and modal sheets retain their higher system ordering.
++    popup->SetZOrderLevel(ui::ZOrderLevel::kFloatingWindow);
 +    state_->popup = popup->GetNativeWindow().GetNativeNSWindow();
 +    state_->close = std::move(close);
 +    std::weak_ptr<PopupState> weak = state_;
@@ -202,6 +206,7 @@
 +  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
 +  auto* pending = contents ? static_cast<PendingAnchor*>(contents->GetUserData(kPendingAnchor)) : nullptr;
 +  return pending && pending->valid() && NSApp.active && !NSApp.hidden &&
++         !NSApp.modalWindow && !pending->owner.attachedSheet && !NSApp.keyWindow.sheetParent &&
 +         Descendant(NSApp.keyWindow, pending->owner);
 +}
 +void NativeExtensionPopupAnchor::CancelPrepared(content::WebContents* contents) {
@@ -334,3 +339,11 @@
      "//ui/gfx/geometry",
      "//ui/views",
    ]
+@@ -948,6 +952,7 @@
+   ]
+   deps = [
+     ":extension_action_delegate_desktop",
++    ":extension_popup",
+     ":extensions_menu_coordinator",
+     ":extensions_menu_view",
+     ":extensions_request_access_button",

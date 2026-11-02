@@ -625,11 +625,16 @@ struct NativeLibrary: View {
     do { try store.exportData(to: url) } catch { self.error = error.localizedDescription }
   }
   private func importData(legacy: Bool) {
+    let profileID = store.activeProfileID
     let panel = NSOpenPanel(); panel.allowedContentTypes = [.json, .html]; panel.allowsMultipleSelection = false
     guard panel.runModal() == .OK, let url = panel.url else { return }
     do {
       if url.pathExtension.lowercased() == "html", let operation = actions.performLibraryAction {
-        Task { @MainActor in do { try await operation("data:import-bookmarks", ["path": url.path, "profileId": store.activeProfileID]) } catch { self.error = error.localizedDescription } }
+        guard profileID == store.activeProfileID else { return }
+        Task { @MainActor in
+          do { try await operation("data:import-bookmarks", ["path": url.path, "profileId": profileID]) }
+          catch { if profileID == store.activeProfileID { self.error = error.localizedDescription } }
+        }
       } else if legacy { try store.importLegacy(from: url) } else { try store.importData(from: url) }
     } catch { self.error = error.localizedDescription }
   }

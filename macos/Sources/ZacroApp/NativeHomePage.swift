@@ -8,6 +8,7 @@ struct NativeHomePage: View {
   @ObservedObject var actions: BrowserActions
   let colors: NativeSpacePalette
   let sidebarVisible: Bool
+  @FocusState private var searchFocused: Bool
   private var query: String { actions.homeQuery }
   private struct Link: Identifiable { let url: String; let title: String; var tabID: String? = nil; var id: String { url } }
   private var saved: [Link] {
@@ -29,6 +30,7 @@ struct NativeHomePage: View {
         homeContents.frame(maxWidth: .infinity, minHeight: geometry.size.height)
       }.scrollIndicators(.hidden)
     }
+    .onChange(of: actions.homeFocusSession) { _, _ in searchFocused = true }
   }
   private var homeContents: some View {
     VStack(spacing: 20) {
@@ -42,6 +44,7 @@ struct NativeHomePage: View {
       HStack(spacing: 10) {
         NativeGlyph("magnifyingglass").foregroundStyle(colors.muted)
         TextField("Search or enter a URL", text: $actions.homeQuery).textFieldStyle(.plain)
+          .focused($searchFocused)
           .accessibilityLabel("Search the web or enter a URL")
           .onSubmit { navigate(query) }
         Button { navigate(query) } label: { NativeGlyph("arrow.right").frame(width: 24, height: 26) }

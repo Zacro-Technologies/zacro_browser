@@ -30,6 +30,7 @@ struct NativeExtensionWindowRequest {
 final class NativeExtensionBrowser {
   var enabled = false
   var materializePage: ((BrowserTab) async throws -> ChromiumPage)?
+  var prepareActionPopupDocument: ((String, String, @MainActor () async throws -> Void) async throws -> ChromiumPage)?
   var closeTab: (String) async -> Bool = { _ in false }
   var promotePeek: ((String, Bool, @MainActor () async throws -> Void) async throws -> BrowserTab)?
   var navigateTab: (BrowserTab, String) -> Void = { _, _ in }
@@ -829,6 +830,34 @@ final class NativeExtensionBrowser {
       try await authorize(request, profile: profile, manager: manager)
       guard documentTab(tab.id)?.isClosed == false else { throw Failure("The tab closed before its document could load.") }
       return []
+    case "native.prepareActionPopup":
+      guard arguments.count == 1, let prepareActionPopupDocument else { throw Failure("Extension popup preparation is unavailable.") }
+      let nativeWindowID = try integer(arg(0))
+      let target = try targetWindow(nativeWindowID, profile: profile, request: request)
+      let windowID = target.id
+      let validate: @MainActor () async throws -> Void = { [weak self] in
+        guard let self else { throw CancellationError() }
+        try await self.authorize(request, profile: profile, manager: manager)
+        guard let context = self.engine.context(id: windowID), context.isOpen, !context.isClosing,
+          context.nativeID == nativeWindowID, self.isWindowFocused(windowID, profile: profile) else {
+          throw Failure("The extension popup requires its focused browser window.")
+        }
+      }
+      try await validate()
+      let page = try await prepareActionPopupDocument(windowID, profile, validate)
+      try await prepareInitialNavigation(page)
+      try await synchronizeCatalog(profile)
+      try await validate()
+      guard let current = windows(profile).first(where: { $0.id == windowID }),
+        let scope = repository.store(for: windowID), let context = engine.context(id: windowID),
+        activeDocumentID(current) == page.id, page.ownerWindowID == windowID,
+        engine.pages[page.id] === page, !page.isPrivate, page.profileID == profile,
+        let content = context.window.contentView else { throw Failure("The active document changed before its extension popup opened.") }
+      let sidebar = current.kind == .popup || !scope.state.settings.sidebarVisible ? 0 : scope.state.settings.sidebarWidth
+      let anchor = context.window.convertToScreen(NSRect(x: max(8, sidebar - 34), y: content.bounds.height - 68, width: 26, height: 26))
+      try await manager.prepareActionPopup(requestID: request.requestID, on: page,
+        anchorWindow: context.window, anchorRect: anchor)
+      return []
     case "sessions.getRecentlyClosed", "sessions.getDevices", "sessions.restore":
       return try await performSession(request, profile: profile, arguments: arguments, manager: manager)
     case "tabs.group", "tabs.ungroup", "tabGroups.get", "tabGroups.query", "tabGroups.update", "tabGroups.move":
@@ -1518,7 +1547,7 @@ final class NativeExtensionBrowser {
       let context = engine.context(id: id), context.isOpen else { return false }
     var candidate = NSApp.keyWindow
     while let window = candidate { if window === context.window { return true }; candidate = window.parent }
-    return false
+    return NSApp.keyWindow.map { engine.extensionPopupOwner($0)?.id == id } ?? false
   }
   private func lastFocusedWindow(_ profile: String) -> BrowserWindowSession? {
     let available = windows(profile)

@@ -109,11 +109,11 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
 
   func install() {
     store.enableDebouncedPersistence()
-    let sessions = repository.windows.filter(\.isOpen)
-    let first = sessions.first ?? repository.windows.first
+    let first = repository.windows.first { $0.id == repository.startupWindowID }
     if let first {
       engine.bindPrimaryWindow(id: first.id)
-      if !first.isOpen { try? repository.updateWindow(first.id) { $0.isOpen = true } }
+      if !first.isOpen { try? repository.updateWindow(first.id) { $0.isOpen = true; $0.closedAt = nil } }
+      repository.focusWindow(first.id)
     }
     installRuntimeCallbacks()
     for session in repository.windows where session.isOpen {
@@ -204,6 +204,12 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
       try await self.navigation.waitForRestore(page)
       guard self.engine.pages[tab.id] === page else { throw CancellationError() }
       return page
+    }
+    extensionBrowser.prepareActionPopupDocument = { [weak self] windowID, profileID, authorize in
+      guard let self, let owner = self.windows[windowID], self.focusedCoordinator === owner else {
+        throw CancellationError()
+      }
+      return try await owner.extensionActionPage(profileID: profileID, requireFocused: true, authorize: authorize)
     }
     extensionBrowser.closeTab = { [weak self] id in await self?.owner(tabID: id)?.requestCloseTab(id) ?? false }
     extensionBrowser.navigateTab = { [weak self] tab, address in self?.owner(tabID: tab.id)?.navigateExtensionTab(tab, address: address) }

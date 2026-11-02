@@ -19,6 +19,15 @@ import Foundation
   public var focusedWindowID: String { writer.state.focusedWindowID ?? windows[0].id }
   public var defaultWindowID: String { windows.first?.id ?? "main" }
   public var focusedStore: BrowserStore { store(for: focusedWindowID)! }
+  /// Preserve the live session on restart; if every window was closed, reopen
+  /// the most recently parked public window instead of the oldest created one.
+  public var startupWindowID: String? {
+    if windows.contains(where: { $0.id == focusedWindowID && $0.isOpen }) { return focusedWindowID }
+    if let open = windows.first(where: \.isOpen) { return open.id }
+    return savedWindows.first?.id
+      ?? windows.first(where: { $0.id == focusedWindowID })?.id
+      ?? windows.first?.id
+  }
   public var savedWindows: [BrowserSavedWindow] {
     windows.compactMap { window -> BrowserSavedWindow? in
       guard !window.isOpen else { return nil }

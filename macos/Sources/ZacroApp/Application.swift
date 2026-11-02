@@ -116,7 +116,21 @@ final class BrowserWindowCoordinator: NSObject {
   private var windowCloseWaiters: [CheckedContinuation<Bool, Never>] = []
   private var discardingPages = Set<String>()
   private var mediaPermissionPages = Set<String>()
-  private var permissionPrompts = Set<String>()
+  private struct PendingSitePermission {
+    let pageID: String
+    let profileID: String
+    let address: URL?
+    let key: String
+    let request: CefPermissionRequest
+    let originKey: String
+    let permissionKeys: [String]
+    let alert: NSAlert
+    let callback: CefPermissionCallback
+    var presented = false
+  }
+  private var permissionPrompts: [UUID: PendingSitePermission] = [:]
+  private var permissionQueue: [UUID] = []
+  var pendingPermissionRequestCount: Int { permissionPrompts.count }
   private var idleSweep: Task<Void, Never>?
   private lazy var extensions = NativeExtensionsModel(store: store, engine: engine, actions: actions)
   private var siteControlsInitialized = false
@@ -165,6 +179,7 @@ final class BrowserWindowCoordinator: NSObject {
     scheduleLayout()
   }
   func prepareTermination() {
+    cancelPermissionPrompts()
     loadingStrips.hide()
     documentErrorPanels.hide()
     cancelSelectionFocus()
@@ -377,6 +392,7 @@ final class BrowserWindowCoordinator: NSObject {
     windowContext.onLayout = { [weak self] in self?.scheduleLayout() }
     windowContext.onClosed = { [weak self] in
       guard let self else { return }
+      self.cancelPermissionPrompts()
       self.hidePeekPresentation(immediately: true)
       self.loadingStrips.hide()
       self.documentErrorPanels.hide()
@@ -407,6 +423,7 @@ final class BrowserWindowCoordinator: NSObject {
         return false
       }
       for task in self.pageCreations.values { task.cancel() }
+      self.cancelPermissionPrompts()
       for task in self.dormantNavigations.values { task.cancel() }
       for task in Array(self.discardOperations.values) { _ = try? await task.value }
       for task in Array(self.dormantNavigations.values) { _ = try? await task.value }
@@ -455,10 +472,17 @@ final class BrowserWindowCoordinator: NSObject {
       }.store(in: &observations)
     }
     NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification).sink { [weak self] event in
+      self?.schedulePermissionPresentation()
       guard let self, self.selectionFocusIntent.phase == .pending,
         !self.ownsDocumentFocusWindow(event.object as? NSWindow) else { return }
       self.abandonSelectionFocus()
     }.store(in: &observations)
+    for name in [NSApplication.didBecomeActiveNotification, NSWindow.didEndSheetNotification,
+      NSWindow.didDeminiaturizeNotification] {
+      NotificationCenter.default.publisher(for: name).sink { [weak self] _ in
+        self?.schedulePermissionPresentation()
+      }.store(in: &observations)
+    }
     installServices()
     services.start()
     refreshDefaultBrowser()
@@ -1034,10 +1058,15 @@ final class BrowserWindowCoordinator: NSObject {
       guard let self, let page, self.owns(page, tabID: tabID), let tab = self.store.document(id: page.id) else { return .deny }
       return self.downloads.decide(download, suggested: suggested, source: tab, profile: page.profileID)
     }
+    page.onPermissionRequest = { [weak self, weak page] request, callback in
+      guard let self, let page, self.owns(page, tabID: tabID) else { callback.resolve(.deny); return true }
+      return self.requestPermission(request, page: page, callback: callback)
+    }
     page.onPermission = { [weak self, weak page] request in
       guard let self, let page, self.owns(page, tabID: tabID) else { return .deny }
-      return self.requestPermission(request, page: page)
+      return self.immediatePermissionDecision(request, page: page) ?? .dismiss
     }
+    page.onPermissionDismissed = { [weak self] id in self?.cancelPermissionPrompt(id) }
     page.onFindResult = { [weak self, weak page] count, ordinal, _ in
       guard let self, let page, self.owns(page, tabID: tabID), self.activePage === page else { return }
       if self.actions.findMatchCount != count { self.actions.findMatchCount = count }
@@ -1169,6 +1198,12 @@ final class BrowserWindowCoordinator: NSObject {
     refreshCommands()
   }
   func layoutPages() {
+    for (id, prompt) in permissionPrompts {
+      guard let page = engine.pages[prompt.pageID], page.url == prompt.address,
+        page.profileID == prompt.profileID, mayRequestPermission(page) else {
+        cancelPermissionPrompt(id); continue
+      }
+    }
     guard !engine.isTerminating, !windowContext.isClosing, windowContext.isOpen else { return }
     defer { if deletingProfileID == nil { extensionBrowser.reconcile() } }
     refreshCommands()
@@ -2046,21 +2081,50 @@ extension BrowserWindowCoordinator {
       .map { (id: $0.id, date: $0.closedAt ?? .distantPast) }
     return (archived + pinned).max(by: { $0.date < $1.date })?.id
   }
-  func extensionActionPage(profileID: String) async throws -> ChromiumPage {
-    guard store.activeProfileID == profileID, store.state.activeProfile?.isPrivate == false,
-      windowContext.isOpen, !windowContext.isClosing, !engine.isTerminating else { throw CancellationError() }
-    let page: ChromiumPage
-    if let active = activePage { page = active }
-    else {
-      guard let tab = store.state.activeTab ?? store.createTab(address: "about:blank"),
-        store.profileID(for: tab) == profileID else { throw ChromeExtensionError.managementUnavailable }
-      page = try await ensurePageReady(tab)
+  func extensionActionPage(profileID: String, requireFocused: Bool = false,
+    authorize: @MainActor () async throws -> Void = {}) async throws -> ChromiumPage {
+    func available() -> Bool {
+      guard store.activeProfileID == profileID, store.state.activeProfile?.isPrivate == false,
+        deletingProfileID != profileID, windowContext.isOpen, !windowContext.isClosing,
+        !engine.isTerminating else { return false }
+      guard requireFocused else { return true }
+      let keyWindow = NSApp.keyWindow
+      let ownsControls = keyWindow.map {
+        ($0.identifier == NSUserInterfaceItemIdentifier("ZacroBrowserControls") && $0.parent === window)
+          || documentErrorPanels.owns($0) || $0 === peekPanel.presentationWindow
+          || engine.extensionPopupOwner($0) === windowContext
+      } ?? false
+      return NSApp.isActive && application.focusedCoordinator === self
+        && window?.isVisible == true && window?.isMiniaturized == false
+        && (ownsDocumentFocusWindow(keyWindow) || ownsControls) && NSApp.modalWindow == nil
+        && window?.attachedSheet == nil && keyWindow?.sheetParent == nil
     }
+    guard available() else { throw CancellationError() }
+    let originalSelection = selectedDocumentID
+    try await authorize()
+    try Task.checkCancellation()
+    guard available(), selectedDocumentID == originalSelection else { throw CancellationError() }
+    let tab: BrowserTab
+    if let id = originalSelection {
+      guard let selected = store.document(id: id), !selected.isClosed else { throw CancellationError() }
+      tab = selected
+    } else {
+      // The native request has been authorized immediately before this model
+      // mutation. An empty window gains a real tab, never a hidden catalog entry.
+      guard let created = store.createTab(address: "about:blank") else {
+        throw ChromeExtensionError.managementUnavailable
+      }
+      tab = created
+    }
+    guard store.profileID(for: tab) == profileID else { throw CancellationError() }
+    let page = try await ensurePageReady(tab)
     try await navigation.waitForRestore(page)
     guard page.profileID == profileID, page.ownerWindowID == windowContext.id,
-      store.activeProfileID == profileID, activePage === page,
-      windowContext.isOpen, !windowContext.isClosing, !engine.isTerminating else { throw CancellationError() }
+      available(), selectedDocumentID == tab.id, activePage === page else { throw CancellationError() }
     try await extensionBrowser.prepareInitialNavigation(page)
+    try Task.checkCancellation()
+    guard available(), selectedDocumentID == tab.id, activePage === page,
+      engine.pages[tab.id] === page else { throw CancellationError() }
     return page
   }
   private func installServices() {
@@ -2191,28 +2255,54 @@ extension BrowserWindowCoordinator {
     }
     return results
   }
-  private func requestPermission(_ request: CefPermissionRequest, page: ChromiumPage) -> CefPermissionDecision {
-    guard mayRequestPermission(page) else { return .deny }
-    // Extension permission policy and screen/source selection belong to Chromium.
-    // A saved camera or microphone choice must never authorize screen sharing.
-    if URL(string: request.origin)?.scheme?.lowercased() == "chrome-extension"
-      || !request.kinds.intersection([.screenCapture, .systemAudioCapture]).isEmpty {
-      return .useDefault
-    }
-    guard let url = BrowserAddress.webURL(request.origin), !request.kinds.contains(.other), !request.kinds.isEmpty else { return .deny }
+  private func cancelPermissionPrompt(_ id: UUID) {
+    guard let pending = permissionPrompts.removeValue(forKey: id) else { return }
+    permissionQueue.removeAll { $0 == id }
+    pending.callback.cancel()
+    pending.alert.window.sheetParent?.endSheet(pending.alert.window, returnCode: .cancel)
+    schedulePermissionPresentation()
+  }
+  private func cancelPermissionPrompts() {
+    for id in Array(permissionPrompts.keys) { cancelPermissionPrompt(id) }
+  }
+  private static let permissionKinds: [(CefPermissionKind, String, String)] = [
+    (.camera,"camera","camera"),(.microphone,"microphone","microphone"),(.geolocation,"geolocation","location"),
+    (.notifications,"notifications","notifications"),(.clipboard,"clipboard","clipboard"),(.midi,"midi","MIDI devices"),
+    (.pointerLock,"pointer-lock","pointer lock"),(.storageAccess,"storage-access","site storage"),(.sensors,"sensors","sensors"),
+    (.windowManagement,"window-management","window management"),(.downloads,"downloads","multiple downloads")]
+  private func permissionDetails(_ request: CefPermissionRequest) -> (URL, String, [(CefPermissionKind, String, String)])? {
+    guard let url = BrowserAddress.webURL(request.origin), !request.kinds.contains(.other), !request.kinds.isEmpty else { return nil }
     var origin = URLComponents(); origin.scheme = url.scheme; origin.host = url.host; origin.port = url.port
-    guard let key = origin.url?.absoluteString else { return .deny }
-    let kinds: [(CefPermissionKind,String,String)] = [(.camera,"camera","camera"),(.microphone,"microphone","microphone"),(.geolocation,"geolocation","location"),(.notifications,"notifications","notifications"),(.clipboard,"clipboard","clipboard"),(.midi,"midi","MIDI devices"),(.pointerLock,"pointer-lock","pointer lock"),(.storageAccess,"storage-access","site storage"),(.sensors,"sensors","sensors"),(.windowManagement,"window-management","window management"),(.downloads,"downloads","multiple downloads")]
-    let requested = kinds.filter { request.kinds.contains($0.0) }
-    guard !requested.isEmpty else { return .deny }
+    guard let key = origin.url?.absoluteString else { return nil }
+    let requested = Self.permissionKinds.filter { request.kinds.contains($0.0) }
+    return requested.isEmpty ? nil : (url, key, requested)
+  }
+  /// A noninteractive policy result; nil means a new request requires user UI.
+  private func immediatePermissionDecision(_ request: CefPermissionRequest, page: ChromiumPage) -> CefPermissionDecision? {
+    guard mayRequestPermission(page) else { return .deny }
+    if URL(string: request.origin)?.scheme?.lowercased() == "chrome-extension"
+      || !request.kinds.intersection([.screenCapture, .systemAudioCapture]).isEmpty { return .useDefault }
+    guard let (_, key, requested) = permissionDetails(request) else { return .deny }
     if requested.contains(where: { store.savedPermission(profileID: page.profileID, origin: key, permission: $0.1) == false }) { return .deny }
     if requested.allSatisfy({ store.savedPermission(profileID: page.profileID, origin: key, permission: $0.1) == true }) {
       if !request.kinds.intersection([.camera, .microphone]).isEmpty { mediaPermissionPages.insert(page.id) }
       return .allow
     }
+    return nil
+  }
+  private func requestPermission(_ request: CefPermissionRequest, page: ChromiumPage,
+                                 callback: CefPermissionCallback) -> Bool {
+    func finish(_ choice: CefPermissionDecision) -> Bool { callback.resolve(choice); return true }
+    guard callback.isPending else { return true }
+    // Extension permission policy and screen/source selection belong to Chromium.
+    // A saved camera or microphone choice must never authorize screen sharing.
+    if let choice = immediatePermissionDecision(request, page: page) {
+      return choice == .useDefault ? false : finish(choice)
+    }
+    guard let (url, key, requested) = permissionDetails(request) else { return finish(.deny) }
     let promptID = "\(page.profileID):\(key):\(request.kinds.rawValue)"
-    guard permissionPrompts.insert(promptID).inserted else { return .deny }
-    defer { permissionPrompts.remove(promptID) }
+    guard !permissionPrompts.values.contains(where: { $0.key == promptID }), permissionPrompts.count < 16
+      else { return finish(.dismiss) }
     let originalURL = page.url
     let alert = NSAlert(); alert.messageText = "Allow \(url.host ?? request.origin) to use \(requested.map { $0.2 }.joined(separator: ", "))?"
     alert.informativeText = "Profile: \(store.state.profiles.first(where: { $0.id == page.profileID })?.name ?? "Personal")"
@@ -2220,17 +2310,54 @@ extension BrowserWindowCoordinator {
     alert.suppressionButton?.title = "Remember for this site"
     alert.suppressionButton?.state = .off
     alert.addButton(withTitle: "Don’t Allow"); alert.addButton(withTitle: "Allow")
-    let allowed = alert.runModal() == .alertSecondButtonReturn
-    guard mayRequestPermission(page), page.url == originalURL, engine.pages[page.id] === page,
-      store.state.profiles.contains(where: { $0.id == page.profileID }) else { return .deny }
-    if alert.suppressionButton?.state == .on {
-      for kind in requested { store.setPermission(profileID: page.profileID, origin: key, permission: kind.1, allowed: allowed) }
+    permissionPrompts[request.id] = .init(pageID: page.id, profileID: page.profileID,
+      address: originalURL, key: promptID, request: request, originKey: key,
+      permissionKeys: requested.map { $0.1 }, alert: alert, callback: callback)
+    permissionQueue.append(request.id)
+    presentQueuedPermission()
+    return true
+  }
+  private func schedulePermissionPresentation() {
+    guard !permissionPrompts.isEmpty else { return }
+    DispatchQueue.main.async { [weak self] in self?.presentQueuedPermission() }
+  }
+  private func presentQueuedPermission() {
+    guard let window, windowContext.isOpen, !windowContext.isClosing, !engine.isTerminating,
+      window.isVisible, !window.isMiniaturized, window.attachedSheet == nil,
+      NSApp.modalWindow == nil, NSApp.isActive, ownsDocumentFocusWindow(NSApp.keyWindow),
+      !permissionPrompts.values.contains(where: \.presented),
+      let id = permissionQueue.first, var pending = permissionPrompts[id] else { return }
+    guard let page = engine.pages[pending.pageID], page.profileID == pending.profileID,
+      page.url == pending.address, pending.callback.isPending, mayRequestPermission(page) else {
+      cancelPermissionPrompt(id); return
     }
-    if allowed && !request.kinds.intersection([.camera, .microphone]).isEmpty { mediaPermissionPages.insert(page.id) }
-    return allowed ? .allow : .deny
+    pending.presented = true; permissionPrompts[id] = pending
+    let alert = pending.alert, callback = pending.callback, request = pending.request
+    let originalURL = pending.address
+    alert.beginSheetModal(for: window) { [weak self, weak page] response in
+      guard let self, let pending = self.permissionPrompts.removeValue(forKey: request.id),
+        pending.callback === callback, callback.isPending else { callback.cancel(); return }
+      self.permissionQueue.removeAll { $0 == request.id }
+      defer { self.schedulePermissionPresentation() }
+      guard let page, self.mayRequestPermission(page), page.url == originalURL,
+        self.engine.pages[page.id] === page,
+        self.store.state.profiles.contains(where: { $0.id == page.profileID }) else { callback.cancel(); return }
+      guard response == .alertFirstButtonReturn || response == .alertSecondButtonReturn else {
+        callback.cancel(); return
+      }
+      let allowed = response == .alertSecondButtonReturn
+      if alert.suppressionButton?.state == .on {
+        for permission in pending.permissionKeys {
+          self.store.setPermission(profileID: page.profileID, origin: pending.originKey, permission: permission, allowed: allowed)
+        }
+      }
+      if allowed && !request.kinds.intersection([.camera, .microphone]).isEmpty { self.mediaPermissionPages.insert(page.id) }
+      callback.resolve(allowed ? .allow : .deny)
+    }
   }
   private func mayRequestPermission(_ page: ChromiumPage) -> Bool {
     windowContext.isOpen && !windowContext.isClosing && !engine.isTerminating
+      && deletingProfileID != page.profileID
       && engine.pages[page.id] === page && page.ownerWindowID == windowContext.id
       && store.activeProfileID == page.profileID
       && (activePage === page || visiblePageFrames[page.id] != nil)

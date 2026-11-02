@@ -106,8 +106,13 @@ public protocol CefBrowserDelegate: AnyObject {
 
     /// The page requested one or more permissions. Return how to resolve it.
     /// The default is ``CefPermissionDecision/deny`` (apps that want the
-    /// system prompt should override and return `.allow`).
+    /// native Chromium chooser should override and return `.useDefault`).
     func browser(_ b: CefBrowser, requestsPermission request: CefPermissionRequest) -> CefPermissionDecision
+    /// Return true after accepting the callback (a synchronous decision is also
+    /// permitted). False leaves Chromium's native chooser/policy in control.
+    func browser(_ b: CefBrowser, requestsPermission request: CefPermissionRequest, callback: CefPermissionCallback) -> Bool
+    /// Native prompt cancellation, navigation or browser teardown invalidated UI.
+    func browser(_ b: CefBrowser, dismissedPermission requestID: UUID)
 
     // MARK: Navigation / requests
 
@@ -199,6 +204,12 @@ extension CefBrowserDelegate {
     public func browserContextMenuDidClose(_ b: CefBrowser) {}
 
     public func browser(_ b: CefBrowser, requestsPermission request: CefPermissionRequest) -> CefPermissionDecision { .deny }
+    public func browser(_ b: CefBrowser, requestsPermission request: CefPermissionRequest, callback: CefPermissionCallback) -> Bool {
+        let choice = browser(b, requestsPermission: request)
+        guard choice != .useDefault else { return false }
+        callback.resolve(choice); return true
+    }
+    public func browser(_ b: CefBrowser, dismissedPermission requestID: UUID) {}
 
     public func browser(_ b: CefBrowser, decidePolicyForNavigation url: URL?, isRedirect: Bool, userGesture: Bool) -> CefNavigationDecision { .allow }
     public func browser(_ b: CefBrowser, decidePolicyForNavigation url: URL?, isMainFrame: Bool, isRedirect: Bool, userGesture: Bool) -> CefNavigationDecision {

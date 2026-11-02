@@ -84,6 +84,12 @@ def generated(originals):
     popup_target = replace(popup_target, '    "//ui/gfx/geometry",',
                            '    "//ui/gfx",\n    "//ui/gfx/geometry",')
     result[BUILD] = result[BUILD][:popup_start] + popup_target + result[BUILD][popup_end:]
+    toolbar_start = result[BUILD].index('source_set("extensions_toolbar_desktop")')
+    toolbar_end = result[BUILD].index('\n}', toolbar_start) + 2
+    toolbar_target = result[BUILD][toolbar_start:toolbar_end]
+    toolbar_target = replace(toolbar_target, '    ":extension_action_delegate_desktop",',
+                             '    ":extension_action_delegate_desktop",\n    ":extension_popup",')
+    result[BUILD] = result[BUILD][:toolbar_start] + toolbar_target + result[BUILD][toolbar_end:]
     return result
 
 

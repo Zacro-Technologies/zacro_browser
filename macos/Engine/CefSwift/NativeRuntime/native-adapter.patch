@@ -1441,7 +1441,7 @@
 +}
 --- /dev/null
 +++ b/libcef/browser/devtools/zacro_topology_adapter.inc
-@@ -0,0 +1,1211 @@
+@@ -0,0 +1,1289 @@
 +// The Swift shell owns logical tabs and windows. Chromium still owns the
 +// extension caller, schema, permission grants and real WebContents identities.
 +#include "base/strings/pattern.h"
@@ -1537,6 +1537,16 @@
 +  if (method == "sessions.restore") return extensions::api::sessions::Restore::Params::Create(args).has_value();
 +  if (method == "tabs.getCurrent") return args.empty();
 +  if (method == "runtime.openOptionsPage") return args.empty();
++  // The pinned action API has no generated C++ Params type. Match the native
++  // binding's single optional options object without accepting hidden targets.
++  if (method == "action.openPopup") {
++    if (args.size() != 1 || (!args[0].is_none() && !args[0].is_dict())) return false;
++    if (args[0].is_dict()) {
++      const auto* window = args[0].GetDict().Find("windowId");
++      if (window && !window->is_int()) return false;
++    }
++    return true;
++  }
 +  return std::nullopt;
 +}
 +
@@ -2061,12 +2071,43 @@
 +    if (!ZacroValidateNavigation(context_, request.extension->id(), incarnation, url, error)) return {};
 +    return base::DictValue().Set("extensionID", request.extension->id()).Set("incarnationID", incarnation).Set("url", url);
 +  }
++  bool PrepareActionPopup(const std::string& id, content::WebContents* contents,
++                         const base::DictValue& anchor, std::string& error) {
++    if (!Validate(id, error)) return false;
++    auto& request = *pending_.at(id);
++    const auto tab_id = sessions::SessionTabHelper::IdForTab(contents).id();
++    auto tab = tabs_.find(tab_id);
++    if (!request.action_popup_window || std::string(request.function->name()) != "action.openPopup" ||
++        tab == tabs_.end() || tab->second->web_contents() != contents || tab->second->discarded ||
++        !tab->second->active || tab->second->window != *request.action_popup_window ||
++        focused_window_ != request.action_popup_window) {
++      error = "The popup target is no longer the selected document in the focused window."; return false;
++    }
++    const auto number = anchor.FindInt("windowNumber");
++    const auto x = anchor.FindDouble("x"), y = anchor.FindDouble("y");
++    const auto width = anchor.FindDouble("width"), height = anchor.FindDouble("height");
++    if (!number || !x || !y || !width || !height || !std::isfinite(*x) || !std::isfinite(*y) ||
++        !std::isfinite(*width) || !std::isfinite(*height) || std::abs(*x) > 1000000 || std::abs(*y) > 1000000 ||
++        *width <= 0 || *height <= 0 || *width > 512 || *height > 512 ||
++        !NativeExtensionPopupAnchor::Prepare(contents, *number, gfx::RectF(*x, *y, *width, *height))) {
++      error = "The native popup anchor is unavailable."; return false;
++    }
++    if (!NativeExtensionPopupAnchor::IsPreparedOwnerActive(contents)) {
++      NativeExtensionPopupAnchor::CancelPrepared(contents);
++      error = "Cannot show an extension popup for an inactive or blocked window."; return false;
++    }
++    request.prepare_document = tab_id;
++    return true;
++  }
 +  void Complete(const std::string& id, base::ListValue results, std::string error) {
 +    auto it = pending_.find(id); if (it == pending_.end()) return;
 +    std::string validation;
 +    if (!Validate(id, validation)) error = validation;
 +    auto request = std::move(it->second); pending_.erase(it);
 +    request->timer.Stop();
++    if (error.empty() && request->action_popup_window && !request->prepare_document) {
++      error = "The native popup document and anchor were not prepared.";
++    }
 +    if (error.empty() && request->prepare_document) {
 +      auto tab = tabs_.find(*request->prepare_document);
 +      if (tab == tabs_.end() || !tab->second->web_contents() || tab->second->discarded || !results.empty()) {
@@ -2075,7 +2116,14 @@
 +        auto function = request->function;
 +        auto arguments = request->arguments.Clone();
 +        const int target = request->capture_document ? ZacroTabUtil::GetWindowIdOfTab(tab->second->web_contents()) : *request->prepare_document;
-+        if (request->side_panel_document) {
++        if (request->action_popup_window) {
++          if (!tab->second->active || tab->second->window != *request->action_popup_window ||
++              focused_window_ != request->action_popup_window ||
++              !NativeExtensionPopupAnchor::IsPreparedOwnerActive(tab->second->web_contents())) {
++            error = "The native popup target lost focus before presentation.";
++          }
++          arguments[0] = base::Value(base::DictValue().Set("windowId", ZacroTabUtil::GetWindowIdOfTab(tab->second->web_contents())));
++        } else if (request->side_panel_document) {
 +          if (arguments[0].GetDict().contains("windowId")) arguments[0].GetDict().Set("windowId", ZacroTabUtil::GetWindowIdOfTab(tab->second->web_contents()));
 +        } else if (!request->document_arguments_unchanged) {
 +          if (arguments.empty()) arguments.Append(target); else arguments[0] = base::Value(target);
@@ -2084,14 +2132,21 @@
 +        // RunWithValidation was already entered when this request was
 +        // deferred. Recheck its public validation hook, then enter Run exactly
 +        // once with the resolved native target and the original caller.
-+        if (!function->HasPermission() || !function->PreRunValidation(&error)) {
++        if (!error.empty() || !function->HasPermission() || !function->PreRunValidation(&error)) {
 +          if (error.empty()) error = "The extension permission changed while restoring the document.";
 +        } else {
++          const auto contents = tab->second->web_contents()->GetWeakPtr();
 +          request->response.Reset();
 +          function->Run().Execute();
++          if (request->action_popup_window && contents) NativeExtensionPopupAnchor::CancelPrepared(contents.get());
 +          return;
 +        }
 +      }
++    }
++    if (request->action_popup_window && request->prepare_document) {
++      auto tab = tabs_.find(*request->prepare_document);
++      if (tab != tabs_.end() && tab->second->web_contents())
++        NativeExtensionPopupAnchor::CancelPrepared(tab->second->web_contents());
 +    }
 +    if (error.empty()) {
 +      if (!SanitizeResults(*request, results)) { results.clear(); error = "The native tab response is invalid."; }
@@ -2175,6 +2230,7 @@
 +  }
 +  struct Request {
 +    std::optional<int> prepare_document;
++    std::optional<int> action_popup_window;
 +    bool capture_document = false;
 +    bool side_panel_document = false;
 +    bool document_arguments_unchanged = false;
@@ -2211,6 +2267,15 @@
 +    bool capture_document = false;
 +    bool side_panel_document = false;
 +    bool document_arguments_unchanged = false;
++    std::optional<int> action_popup_window;
++    if (method == "action.openPopup") {
++      auto window = args[0].is_dict() ? args[0].GetDict().FindInt("windowId") : std::nullopt;
++      if (!window || *window == -2) window = focused_window_;
++      if (!window || *window < 1 || window != focused_window_) {
++        std::move(response).Run({}, "Cannot show an extension popup for an inactive window."); return true;
++      }
++      action_popup_window = window;
++    }
 +    if (method.starts_with("scripting.") || method == "debugger.attach") {
 +      const auto& first = args[0].GetDict();
 +      const auto target = method == "debugger.attach" ? first.FindInt("tabId")
@@ -2300,6 +2365,7 @@
 +    request->prepare_document = prepare_document; request->capture_document = capture_document;
 +    request->side_panel_document = side_panel_document;
 +    request->document_arguments_unchanged = document_arguments_unchanged;
++    request->action_popup_window = action_popup_window;
 +    // A beforeunload decision has no arbitrary deadline. Do not report failure
 +    // and then perform a delayed close after the user finally makes a choice.
 +    if (method != "tabs.remove" && method != "windows.remove") {
@@ -2309,7 +2375,10 @@
 +    auto event = base::DictValue().Set("requestID", id).Set("extensionID", function->extension_id())
 +        .Set("method", method).Set("arguments", std::move(arguments)).Set("userGesture", function->user_gesture())
 +        .Set("incognito", context_->IsOffTheRecord());
-+    if (prepare_document) {
++    if (action_popup_window) {
++      event.Set("method", "native.prepareActionPopup");
++      event.Set("arguments", base::ListValue().Append(*action_popup_window));
++    } else if (prepare_document) {
 +      event.Set("method", "native.prepareDocument"); event.Set("arguments", base::ListValue().Append(*prepare_document));
 +    }
 +    if (auto* sender = function->GetSenderWebContents()) {
@@ -2569,10 +2638,19 @@
 +      method != "Zacro.setFocusedWindow" && method != "Zacro.synchronizeGroups" &&
 +      method != "Zacro.authorizeHostNavigation" && method != "Zacro.validateNavigation" &&
 +      method != "Zacro.hasOwnedGlobalPanel" && method != "Zacro.registerPanelParking" &&
++      method != "Zacro.prepareExtensionActionPopup" &&
 +      method != "Zacro.navigateApproved") return false;
 +  if (!params) { ReplyZacro(id, {}, "The native browser parameters are missing."); return true; }
 +  auto* state = ZacroBrowserContext::Get(inspected_contents_->GetBrowserContext());
 +  std::string error;
++  if (method == "Zacro.prepareExtensionActionPopup") {
++    const auto* request = params->FindString("requestID");
++    const auto* anchor = params->FindDict("anchor");
++    const bool prepared = request && anchor && state->PrepareActionPopup(*request, inspected_contents_, *anchor, error);
++    ReplyZacro(id, base::DictValue().Set("prepared", prepared),
++        !prepared && error.empty() ? "The native popup request or anchor is missing." : error);
++    return true;
++  }
 +  if (method == "Zacro.hasOwnedGlobalPanel" || method == "Zacro.registerPanelParking") {
 +    const auto window = params->FindInt("windowID");
 +    if (!window || *window <= 0) { ReplyZacro(id, {}, "The logical window is invalid."); return true; }

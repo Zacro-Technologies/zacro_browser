@@ -153,6 +153,18 @@ The build retains pinned extension layout during asynchronous metadata refresh, 
 
 Evidence: `macos/.build/verification/integrated-release-19.log`, `application-19/application.json`, `engine-19/engine.json`, `core-services-post19-full.log`, `document-focus-intent-19.log`, and `popup-owner-objects-19/object-check.json`. Own-view render artifacts retain the same explicit limitations as build18. Custom-framework acceptance, desktop input, material composition and final distribution remain release gates.
 
+## 2026-11-02: integrated build 20
+
+The first release build completed in **125.42 seconds**. Its signed internal bundle passed **87 application checks** and exited 0. A single implicit-capture warning in the theme editor's weak window-reporting callback was corrected with an explicit weak capture binding; the warning-free rebuild completed in **97.88 seconds**. That final executable passed deep/strict signature verification and **26 stock-engine checks**, with clean shutdown. The complete **213 Core/Services tests** passed (136 Core and 77 Services), without failures or skips.
+
+Actual loopback `Notification.requestPermission()` requests now verify window-owned asynchronous sheets, continued use of another browser window, navigation cancellation without persisting a choice, background queuing without activation, presentation when the owner gains focus, and cancellation when its source tab closes. Eight focused CEF callback/lifetime tests also passed, covering retained decisions, exact native dismissal, late-response rejection and native chooser deferral. A repository regression verifies that cold startup chooses the most recently saved window when every window was closed.
+
+Application checks verify that action preparation materializes the selected Peek, rejects a changed profile before creating an empty tab, and cannot activate an inactive window. The actual `chrome.action.openPopup` path now prepares an authorized owner and resumes Chromium's original implementation without granting activeTab. Native dispatcher, ActionAPI, ExtensionsToolbarDesktop and popup-anchor object checks passed. A real-worker fixture is authored for logical popup identity, native owner, floating placement above browser controls, no unintended scripting grant and cleanup; this custom-runtime branch is still unexecuted.
+
+The theme editor's actual owned view was rendered and inspected for layout and readable controls. Capture of its exact popover window, dismissal, unchanged saved theme and retained page draft passed. The image does not include desktop material composition. A discrepancy in native color-swatch presentation remains under review. Editor-to-editor navigation now waits for sheet dismissal and validates its owner/profile/Space; HTML bookmark import retains its originating profile; palette dismissal uses guarded shell responder restoration.
+
+Evidence: `macos/.build/verification/integrated-release-20.log`, `integrated-release-20-retry.log`, `application-20-engine-assisted/application.json`, `application-20-engine-assisted.log`, `application-20-engine-assisted/view-renders/theme-editor-0.png`, `engine-20/engine.json`, `core-services-post20-full.log`, `permission-callbacks-20.log`, `startup-window-20.log`, `action-open-popup-objects-20/object-check.json`, and `popup-owner-objects-20/object-check.json`. Stock extension compatibility, desktop input and material composition remain explicitly unverified.
+
 ## Required release evidence
 
 - Successful custom Chromium build and package provenance; native protocol capability checks.

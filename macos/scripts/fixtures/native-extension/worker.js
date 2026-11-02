@@ -105,6 +105,31 @@ globalThis.zacroAcceptance = {
     }
     throw new Error("Native action popup did not load");
   },
+  async openPopup(windowID, deniedTabID = null) {
+    await this.configureAction("popup");
+    if (windowID == null) await chrome.action.openPopup();
+    else await chrome.action.openPopup({ windowId: windowID });
+    const result = await this.popupResult();
+    if (deniedTabID != null) {
+      let granted = false;
+      try {
+        await chrome.scripting.executeScript({ target: { tabId: deniedTabID }, func: () => location.href });
+        granted = true;
+      } catch { /* A public openPopup call is not a toolbar user action. */ }
+      assert(!granted, "action.openPopup incorrectly granted activeTab on an unauthorized origin");
+    }
+    return result;
+  },
+  async closePopup() {
+    const result = await chrome.runtime.sendMessage({ type: "zacro-native-close-popup" });
+    assert(result?.closing === true, "The real popup did not acknowledge closing");
+    const end = Date.now() + 5000;
+    while (Date.now() < end) {
+      if (!(await chrome.runtime.getContexts({ contextTypes: ["POPUP"] })).length) return true;
+      await wait(30);
+    }
+    throw new Error("The real action popup did not close");
+  },
   async panelState(draft) {
     const end = Date.now() + 10000;
     while (Date.now() < end) {

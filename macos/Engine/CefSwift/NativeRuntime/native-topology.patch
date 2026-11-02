@@ -369,3 +369,98 @@
      results.push_back(std::move(context));
    }
  
+--- a/chrome/browser/extensions/api/extension_action/extension_action_api.cc
++++ b/chrome/browser/extensions/api/extension_action/extension_action_api.cc
+@@ -28,6 +28,9 @@
+ #include "chrome/browser/ui/extensions/extensions_container.h"
+ #include "chrome/browser/ui/toolbar/toolbar_actions_model.h"
+ #include "components/tabs/public/tab_interface.h"
++#if BUILDFLAG(IS_MAC)
++#include "chrome/browser/ui/views/extensions/native_extension_popup_anchor.h"
++#endif
+ #include "content/public/common/color_parser.h"
+ #include "extensions/browser/api/constants.h"
+ #include "extensions/browser/api/declarative_net_request/constants.h"
+@@ -136,6 +139,15 @@
+ 
+ // Attempts to open `extension`'s popup in the given `browser`. Returns true on
+ // success; otherwise, populates `error` and returns false.
++bool HasActiveNativePopupAnchor(BrowserWindowInterface& browser) {
++#if BUILDFLAG(IS_MAC)
++  if (auto* tab = browser.GetActiveTabInterface()) {
++    return NativeExtensionPopupAnchor::IsPreparedOwnerActive(tab->GetContents());
++  }
++#endif
++  return false;
++}
++
+ bool OpenPopupInBrowser(BrowserWindowInterface& browser,
+                         const Extension& extension,
+                         std::string* error,
+@@ -145,9 +157,10 @@
+   // exists, so the check below is sufficient.
+   // On other platforms, ExtensionsContainer is always constructed except for
+   // guest sessions, so we need more detailed checks.
+-  if (!WindowFeatureController::From(&browser)->SupportsWindowFeature(
++  if (!HasActiveNativePopupAnchor(browser) &&
++      (!WindowFeatureController::From(&browser)->SupportsWindowFeature(
+           WindowFeatureController::WindowFeature::kFeatureToolbar) ||
+-      !BrowserWindow::FromBrowser(&browser)->IsToolbarVisible()) {
++       !BrowserWindow::FromBrowser(&browser)->IsToolbarVisible())) {
+     *error = "Browser window has no toolbar.";
+     return false;
+   }
+@@ -557,7 +570,12 @@
+     return RespondNow(Error(std::move(error)));
+   }
+ 
+-  if (!browser->GetWindow()->IsActive()) {
++  bool native_owner_active = false;
++  // The selected native shell can own focus while its physical document
++  // widget is intentionally inactive. Only a short-lived browser-process
++  // anchor, validated for this exact document, can represent that active owner.
++  native_owner_active = HasActiveNativePopupAnchor(*browser);
++  if (!browser->GetWindow()->IsActive() && !native_owner_active) {
+     return RespondNow(Error(kOpenPopupInactiveWindow));
+   }
+ 
+--- a/chrome/browser/extensions/api/extension_action/BUILD.gn
++++ b/chrome/browser/extensions/api/extension_action/BUILD.gn
+@@ -36,6 +36,10 @@
+     "//url",
+   ]
+ 
++  if (is_mac) {
++    deps += [ "//chrome/browser/ui/views/extensions:extension_popup" ]
++  }
++
+   if (!is_android) {
+     deps += [
+       "//chrome/browser/ui:browser_window_header",
+--- a/chrome/browser/ui/views/extensions/extensions_toolbar_desktop.cc
++++ b/chrome/browser/ui/views/extensions/extensions_toolbar_desktop.cc
+@@ -14,6 +14,9 @@
+ #include "base/scoped_observation.h"
+ #include "base/time/time.h"
+ #include "build/build_config.h"
++#if BUILDFLAG(IS_MAC)
++#include "chrome/browser/ui/views/extensions/native_extension_popup_anchor.h"
++#endif
+ #include "chrome/app/vector_icons/vector_icons.h"
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/extensions/extension_tab_util.h"
+@@ -944,7 +947,13 @@
+ 
+ bool ExtensionsToolbarDesktop::CanShowToolbarActionPopupForAPICall(
+     const ToolbarActionsModel::ActionId& action_id) {
+-  return !popped_out_action_ && browser_->GetWindow()->IsActive();
++  bool native_owner_active = false;
++#if BUILDFLAG(IS_MAC)
++  if (auto* tab = browser_->GetActiveTabInterface()) {
++    native_owner_active = NativeExtensionPopupAnchor::IsPreparedOwnerActive(tab->GetContents());
++  }
++#endif
++  return !popped_out_action_ && (browser_->GetWindow()->IsActive() || native_owner_active);
+ }
+ 
+ void ExtensionsToolbarDesktop::ToggleExtensionsMenu() {

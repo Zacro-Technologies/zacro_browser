@@ -27,8 +27,10 @@ final class BrowserActions: ObservableObject {
   @Published private(set) var paletteEditsAddress = false
   @Published var query = ""
   @Published var homeQuery = ""
+  @Published var homeFocusSession: UInt64 = 0
   @Published var library: String?
   @Published var themeEditor = false
+  weak var themeEditorWindow: NSWindow?
   @Published var siteControls = SiteControlActions()
   @Published var canGoBack = false
   @Published var canGoForward = false
@@ -104,6 +106,18 @@ final class BrowserActions: ObservableObject {
   func setPaletteDestination(editsAddress: Bool) { paletteEditsAddress = editsAddress }
 }
 
+private struct NativeEditorNavigation {
+  let command: String
+  let windowID: String?
+  let profileID: String
+  let spaceID: String
+}
+private struct NativePaletteFocusContext {
+  let windowID: String?
+  let profileID: String
+  let sidebarKey: String?
+}
+
 struct BrowserShell<Content: View>: View {
   @ObservedObject var store: BrowserStore
   @ObservedObject var actions: BrowserActions
@@ -119,6 +133,7 @@ struct BrowserShell<Content: View>: View {
   @State private var showPageActions = false
   @State private var contextMenuRequest: String?
   @State private var editor: NativeInterfaceEditor?
+  @State private var pendingEditorNavigation: NativeEditorNavigation?
   @State private var hoveredTab: String?
   @State private var hoveredFolder: String?
   @State private var hoveredPin: String?
@@ -129,6 +144,7 @@ struct BrowserShell<Content: View>: View {
   @State private var nameError: String?
   @FocusState private var sidebarFocus: String?
   @State private var libraryReturnFocus: String?
+  @State private var paletteReturnFocus: NativePaletteFocusContext?
   @Environment(\.accessibilityReduceMotion) private var reduceMotion
   @Environment(\.colorScheme) private var colorScheme
   @Environment(\.colorSchemeContrast) private var contrast
@@ -165,6 +181,9 @@ struct BrowserShell<Content: View>: View {
   }
   private var isPopup: Bool {
     store.state.windowSessions?.first(where: { $0.id == store.owningWindowID })?.kind == .popup
+  }
+  private var isOwnedWindowOpen: Bool {
+    store.owningWindowID.map { id in store.state.windowSessions?.contains { $0.id == id && $0.isOpen } == true } ?? true
   }
   private var colors: NativeSpacePalette {
     NativeSpacePalette(theme: theme, dark: theme.appearance == "dark"
@@ -323,7 +342,9 @@ struct BrowserShell<Content: View>: View {
               theme.appearance == "dark" ? .dark : theme.appearance == "light" ? .light : nil)),
         motionScale: effectiveMotion,
         frame: actions.contentFrame.width > 0 ? actions.contentFrame : nil,
-        presentationID: actions.paletteSession
+        presentationID: actions.paletteSession, restoresResponder: true,
+        canRestoreFocus: { canRestorePaletteFocus },
+        onRestoreFocus: restorePaletteFocus
       )
       .frame(width: 0, height: 0).allowsHitTesting(false)
     }
@@ -379,8 +400,8 @@ struct BrowserShell<Content: View>: View {
         offeredOnboarding = true; editor = .onboarding
       } else { maybeOpenBlankPalette() }
     }
-    .sheet(item: $editor) { destination in
-      NativeInterfaceEditors(store: store, actions: actions, destination: destination)
+    .sheet(item: $editor, onDismiss: finishEditorNavigation) { destination in
+      NativeInterfaceEditors(store: store, actions: actions, destination: destination, navigate: navigateFromEditor)
     }
     .onChange(of: actions.themeEditor) { _, presented in
       themeError = nil
@@ -391,7 +412,7 @@ struct BrowserShell<Content: View>: View {
           themeDraft = BrowserSpace(profileID: store.activeProfileID, name: "", theme: initial)
         }
         else { themeDraft = store.state.activeSpace; themeDraft?.theme = savedTheme }
-      } else { themeDraft = nil; creatingSpace = false }
+      } else { themeDraft = nil; creatingSpace = false; actions.themeEditorWindow = nil }
     }
     .onChange(of: store.state.activeSpaceID) { _, _ in
       synchronizeSpaces()
@@ -406,8 +427,15 @@ struct BrowserShell<Content: View>: View {
     .onChange(of: store.activeProfileID) { _, _ in drag.cancel() }
     .onChange(of: store.state.tabs) { _, _ in drag.reconcile(store: store) }
     .onChange(of: store.state.activeTabID) { _, _ in maybeOpenBlankPalette() }
-    .onChange(of: actions.palette) { _, presented in if presented { discardThemePreview() } }
-    .onChange(of: editor) { _, value in if value == nil { maybeOpenBlankPalette() } else { discardThemePreview() } }
+    .onChange(of: actions.palette) { _, presented in
+      if presented {
+        paletteReturnFocus = .init(windowID: store.owningWindowID, profileID: store.activeProfileID, sidebarKey: sidebarFocus)
+        discardThemePreview()
+      }
+    }
+    .onChange(of: editor) { _, value in
+      if value != nil { pendingEditorNavigation = nil; discardThemePreview() }
+    }
     .onChange(of: actions.library) { previous, value in
       if value == nil {
         restoreLibraryFocus()
@@ -1166,6 +1194,7 @@ struct BrowserShell<Content: View>: View {
           errorMessage: themeError,
           saveTitle: creatingSpace ? "Create Space" : "Save changes",
           motionScale: effectiveMotion,
+          onPresentationWindow: { [weak actions = actions] window in if actions?.themeEditor == true { actions?.themeEditorWindow = window } },
           onSave: saveTheme, onCancel: { actions.themeEditor = false })
       }
   }
@@ -1226,6 +1255,22 @@ struct BrowserShell<Content: View>: View {
   }
 
   private var palette: some View { NativeCommandPalette(store: store, actions: actions) }
+  private func navigateFromEditor(_ command: String) {
+    guard editor != nil else { return }
+    pendingEditorNavigation = .init(command: command, windowID: store.owningWindowID,
+      profileID: store.activeProfileID, spaceID: store.state.activeSpaceID)
+    editor = nil
+  }
+  private func finishEditorNavigation() {
+    guard let intent = pendingEditorNavigation else { maybeOpenBlankPalette(); return }
+    pendingEditorNavigation = nil
+    guard editor == nil, intent.windowID == store.owningWindowID,
+      intent.profileID == store.activeProfileID, intent.spaceID == store.state.activeSpaceID,
+      isOwnedWindowOpen,
+      !actions.palette, !actions.themeEditor, creation == nil, renameTarget == nil,
+      !showSiteControls, !showBrowserMenu, !showPageActions else { return }
+    _ = performInterfaceCommand(intent.command)
+  }
   private func toggleSidebar() {
     if store.state.settings.sidebarVisible && sidebarWidth == 0 { actions.library = nil }
     else { store.updateSettings { $0.sidebarVisible.toggle() } }
@@ -1241,6 +1286,23 @@ struct BrowserShell<Content: View>: View {
       || sidebarKeyboardItems.contains(requested)
       || spaces.contains { "space:\($0.id)" == requested }
     sidebarFocus = exists ? requested : "library"
+  }
+  private func restorePaletteFocus() {
+    let previous = paletteReturnFocus
+    paletteReturnFocus = nil
+    guard canRestorePaletteFocus, previous?.windowID == store.owningWindowID else { return }
+    if sidebarWidth > 0, previous?.profileID == store.activeProfileID, let requested = previous?.sidebarKey,
+      requested == "address" || requested == "library" || sidebarKeyboardItems.contains(requested)
+        || spaces.contains(where: { "space:\($0.id)" == requested }) {
+      sidebarFocus = requested
+    } else if store.state.activeTab?.homePage == true, store.state.activeTab?.url == "about:blank", !actions.nativePageVisible {
+      actions.homeFocusSession &+= 1
+    } else if sidebarWidth > 0 { sidebarFocus = "address" }
+  }
+  private var canRestorePaletteFocus: Bool {
+    isOwnedWindowOpen && !actions.palette && !actions.themeEditor && actions.library == nil && editor == nil
+      && pendingEditorNavigation == nil && creation == nil && renameTarget == nil
+      && !showSiteControls && !showBrowserMenu && !showPageActions && !actions.findVisible
   }
   private func showPalette(_ request: NativePaletteRequest) {
     actions.openPalette()
@@ -1384,18 +1446,18 @@ struct BrowserShell<Content: View>: View {
   }
   private func maybeOpenBlankPalette() {
     let tab = store.state.activeTab
-    guard (tab == nil || (tab?.url == "about:blank" && tab?.homePage != true)),
+    guard isOwnedWindowOpen, (tab == nil || (tab?.url == "about:blank" && tab?.homePage != true)),
       !actions.palette, actions.library == nil, !actions.themeEditor, editor == nil,
       !showBrowserMenu, !showPageActions, !showSiteControls,
-      creation == nil, renameTarget == nil, drag.id == nil else { return }
+      creation == nil, renameTarget == nil, pendingEditorNavigation == nil, drag.id == nil else { return }
     let context = "\(store.state.activeSpaceID):\(store.state.activeTabID ?? "empty")"
     guard blankPaletteContext != context else { return }
     blankPaletteContext = context
     DispatchQueue.main.async {
-      guard "\(store.state.activeSpaceID):\(store.state.activeTabID ?? "empty")" == context,
+      guard isOwnedWindowOpen, "\(store.state.activeSpaceID):\(store.state.activeTabID ?? "empty")" == context,
         editor == nil, actions.library == nil, !actions.themeEditor, !actions.palette,
         !showBrowserMenu, !showPageActions, !showSiteControls,
-        creation == nil, renameTarget == nil, drag.id == nil,
+        creation == nil, renameTarget == nil, pendingEditorNavigation == nil, drag.id == nil,
         store.state.activeTab?.homePage != true,
         store.state.activeTab == nil || store.state.activeTab?.url == "about:blank" else { return }
       actions.openPalette()
@@ -1838,6 +1900,9 @@ private struct NativePalettePresenter: NSViewRepresentable {
   var takesKey = true
   var dismissOnOutsideClick = true
   var dismissOnResign = true
+  var restoresResponder = false
+  var canRestoreFocus: () -> Bool = { true }
+  var onRestoreFocus: () -> Void = {}
 
   func makeCoordinator() -> Coordinator { Coordinator(self) }
   func makeNSView(context: Context) -> PaletteAnchorView {
@@ -1852,7 +1917,7 @@ private struct NativePalettePresenter: NSViewRepresentable {
     context.coordinator.attach(to: view.window)
   }
   static func dismantleNSView(_ view: PaletteAnchorView, coordinator: Coordinator) {
-    coordinator.hide()
+    coordinator.hide(restoreFocus: false)
   }
 
   @MainActor final class Coordinator {
@@ -1863,11 +1928,12 @@ private struct NativePalettePresenter: NSViewRepresentable {
     private var observers: [NSObjectProtocol] = []
     private var mouseMonitor: Any?
     private var lastPresentationID: UInt64?
+    private let returnFocus = NativeFocusRestoration()
     init(_ presenter: NativePalettePresenter) { self.presenter = presenter }
 
     func attach(to window: NSWindow?) {
       if parent !== window {
-        hide()
+        hide(restoreFocus: false)
         parent = window
       }
       guard presenter.isPresented, let parent else {
@@ -1907,6 +1973,7 @@ private struct NativePalettePresenter: NSViewRepresentable {
       self.hosting = hosting
       self.panel = panel
       lastPresentationID = presenter.presentationID
+      if presenter.restoresResponder { returnFocus.capture(in: parent) }
       parent.addChildWindow(panel, ordered: .above)
       panel.alphaValue = presenter.motionScale > 0 ? 0 : 1
       if presenter.takesKey { panel.makeKeyAndOrderFront(nil) } else { panel.orderFront(nil) }
@@ -1977,16 +2044,16 @@ private struct NativePalettePresenter: NSViewRepresentable {
     private func dismiss(reason: String) {
       trace("dismiss \(reason)")
       presenter.isPresented = false
-      hide()
+      hide(restoreFocus: reason != "parent closed" && reason != "application resigned")
     }
-    func hide() {
+    func hide(restoreFocus: Bool = true) {
       for observer in observers { NotificationCenter.default.removeObserver(observer) }
       observers.removeAll()
       if let mouseMonitor {
         NSEvent.removeMonitor(mouseMonitor)
         self.mouseMonitor = nil
       }
-      guard let panel else { return }
+      guard let panel else { returnFocus.clear(); return }
       trace("hide panel \(panel.windowNumber)")
       let restoreKey = NSApp.keyWindow === panel
       parent?.removeChildWindow(panel)
@@ -1995,7 +2062,11 @@ private struct NativePalettePresenter: NSViewRepresentable {
       hosting = nil
       self.panel = nil
       lastPresentationID = nil
-      if restoreKey, parent?.isVisible == true { parent?.makeKey() }
+      if restoreFocus, restoreKey, let parent, parent.isVisible, parent.attachedSheet == nil, NSApp.isActive {
+        parent.makeKey()
+        if presenter.restoresResponder, presenter.canRestoreFocus(), !returnFocus.restore(in: parent) { presenter.onRestoreFocus() }
+      }
+      returnFocus.clear()
     }
     private func trace(_ message: String) {
       guard ProcessInfo.processInfo.environment["ZACRO_NATIVE_LAYOUT_TRACE"] == "1" else { return }

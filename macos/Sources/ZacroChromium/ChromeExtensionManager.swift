@@ -536,6 +536,21 @@ public final class ChromeExtensionManager {
     _ = try await browser.devTools.call("Zacro.performExtensionAction", parameters: parameters)
   }
 
+  /// Supplies an anchor for an already validated chrome.action.openPopup
+  /// request. Chromium resumes that original API; this never synthesizes a
+  /// user action, dispatches onClicked or grants activeTab.
+  public func prepareActionPopup(requestID: String, on page: ChromiumPage,
+                                 anchorWindow: NSWindow, anchorRect: NSRect? = nil) async throws {
+    guard !requestID.isEmpty, requestID.utf8.count <= 128, !page.isPrivate,
+      page.profileID == profileID, engine.pages[page.id] === page,
+      let browser = page.browser else { throw ChromeExtensionError.managementUnavailable }
+    let anchor = try nativeAnchor(on: page, window: anchorWindow, rect: anchorRect)
+    let response = try await browser.devTools.call("Zacro.prepareExtensionActionPopup", parameters: [
+      "requestID": requestID, "anchor": anchor
+    ])
+    guard response["prepared"] as? Bool == true else { throw ChromeExtensionError.invalidResponse }
+  }
+
   public func shortcuts() async throws -> [ChromeExtensionShortcut] {
     let response = try await nativeBrowser().devTools.call("Zacro.getExtensionShortcuts")
     guard let values = response["shortcuts"] as? [[String: Any]] else { throw ChromeExtensionError.invalidResponse }
@@ -562,19 +577,23 @@ public final class ChromeExtensionManager {
                                 anchorWindow: NSWindow?, anchorRect: NSRect?) throws -> [String: Any] {
     var parameters: [String: Any] = ["id": identifier]
     if let anchorWindow {
-      guard let ownerID = page.ownerWindowID, let owner = engine.context(id: ownerID),
-        owner.isOpen, owner.window === anchorWindow else { throw ChromeExtensionError.managementUnavailable }
-      let rect = anchorRect ?? anchorWindow.convertToScreen(NSRect(
-        x: max(0, anchorWindow.contentLayoutRect.width - 40),
-        y: max(0, anchorWindow.contentLayoutRect.height - 48), width: 20, height: 20))
-      guard [rect.minX, rect.minY, rect.width, rect.height].allSatisfy({ $0.isFinite }),
-        rect.width > 0, rect.height > 0, rect.width <= 4096, rect.height <= 4096 else {
-        throw ChromeExtensionError.invalidResponse
-      }
-      parameters["anchor"] = ["windowNumber": anchorWindow.windowNumber,
-        "x": rect.minX, "y": rect.minY, "width": rect.width, "height": rect.height]
+      parameters["anchor"] = try nativeAnchor(on: page, window: anchorWindow, rect: anchorRect)
     }
     return parameters
+  }
+
+  private func nativeAnchor(on page: ChromiumPage, window: NSWindow, rect: NSRect?) throws -> [String: Any] {
+    guard let ownerID = page.ownerWindowID, let owner = engine.context(id: ownerID),
+      owner.isOpen, !owner.isClosing, owner.window === window else { throw ChromeExtensionError.managementUnavailable }
+    let rect = rect ?? window.convertToScreen(NSRect(
+      x: max(0, window.contentLayoutRect.width - 40),
+      y: max(0, window.contentLayoutRect.height - 48), width: 20, height: 20))
+    guard [rect.minX, rect.minY, rect.width, rect.height].allSatisfy({ $0.isFinite }),
+      rect.width > 0, rect.height > 0, rect.width <= 512, rect.height <= 512 else {
+      throw ChromeExtensionError.invalidResponse
+    }
+    return ["windowNumber": window.windowNumber,
+      "x": rect.minX, "y": rect.minY, "width": rect.width, "height": rect.height]
   }
 
   public func setEnabled(_ identifier: String, enabled: Bool) async throws {

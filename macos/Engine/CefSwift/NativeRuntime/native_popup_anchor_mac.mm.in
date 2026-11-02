@@ -92,6 +92,10 @@ class NativeExtensionPopupAnchor::Impl {
   }
   views::View* view() const { return widget_->GetContentsView(); }
   void Attach(views::Widget* popup, base::RepeatingClosure close) {
+    // The Swift shell's command palette uses a floating native panel. Keep
+    // this genuine, owner-authorized action popup above that panel, while
+    // native menus and modal sheets retain their higher system ordering.
+    popup->SetZOrderLevel(ui::ZOrderLevel::kFloatingWindow);
     state_->popup = popup->GetNativeWindow().GetNativeNSWindow();
     state_->close = std::move(close);
     std::weak_ptr<PopupState> weak = state_;
@@ -166,6 +170,7 @@ bool NativeExtensionPopupAnchor::IsPreparedOwnerActive(content::WebContents* con
   DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
   auto* pending = contents ? static_cast<PendingAnchor*>(contents->GetUserData(kPendingAnchor)) : nullptr;
   return pending && pending->valid() && NSApp.active && !NSApp.hidden &&
+         !NSApp.modalWindow && !pending->owner.attachedSheet && !NSApp.keyWindow.sheetParent &&
          Descendant(NSApp.keyWindow, pending->owner);
 }
 void NativeExtensionPopupAnchor::CancelPrepared(content::WebContents* contents) {

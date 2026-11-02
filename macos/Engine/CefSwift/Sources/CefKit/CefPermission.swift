@@ -116,14 +116,65 @@ public enum CefPermissionDecision: Sendable, Equatable {
 /// A permission request delivered to
 /// ``CefBrowserDelegate/browser(_:requestsPermission:)``.
 public struct CefPermissionRequest: Sendable, Equatable {
+    /// Unique for this request, including requests sharing an origin and kinds.
+    public let id: UUID
     /// The permission classes requested (may combine several).
     public var kinds: CefPermissionKind
     /// The origin (scheme + host) requesting permission.
     public var origin: String
 
-    public init(kinds: CefPermissionKind, origin: String) {
-        self.kinds = kinds
+    public init(kinds: CefPermissionKind, origin: String, id: UUID = UUID()) {
+        self.id = id; self.kinds = kinds
         self.origin = origin
+    }
+}
+
+/// A retained, exactly-once decision. Resolve it on the CEF UI/main actor after
+/// presenting window-owned UI. Chromium may invalidate it before the user acts.
+@MainActor public final class CefPermissionCallback {
+    public private(set) var isPending = true
+    var didResolve: (() -> Void)?
+    private var decision: ((CefPermissionDecision?) -> Void)?
+    init(media: UnsafeMutablePointer<cef_media_access_callback_t>, kinds: CefPermissionKind, mask: UInt32) {
+        let reference = CefPermissionReference(media: media)
+        decision = { choice in
+            guard let choice else { return }
+            if choice == .allow { reference.media?.pointee.cont?(reference.media, kinds.mediaMask(within: mask)) }
+            else { reference.media?.pointee.cancel?(reference.media) }
+        }
+    }
+    init(prompt: UnsafeMutablePointer<cef_permission_prompt_callback_t>) {
+        let reference = CefPermissionReference(prompt: prompt)
+        decision = { choice in
+            if let choice { reference.prompt?.pointee.cont?(reference.prompt, choice.cefResult) }
+        }
+    }
+    public func resolve(_ choice: CefPermissionDecision) {
+        // Default native handling can only be chosen before accepting a request.
+        finish(choice == .useDefault ? .dismiss : choice)
+    }
+    public func cancel() { finish(.dismiss) }
+    func invalidate() { finish(nil) }
+    private func finish(_ choice: CefPermissionDecision?) {
+        guard isPending else { return }
+        isPending = false
+        let action = decision; decision = nil
+        let completed = didResolve; didResolve = nil
+        completed?()
+        action?(choice)
+    }
+}
+
+/// Owns the transferred CEF reference even when native handling is selected.
+/// Releasing a CEF reference is thread safe; executing it stays on the UI actor.
+private final class CefPermissionReference: @unchecked Sendable {
+    let media: UnsafeMutablePointer<cef_media_access_callback_t>?
+    let prompt: UnsafeMutablePointer<cef_permission_prompt_callback_t>?
+    init(media: UnsafeMutablePointer<cef_media_access_callback_t>) { self.media = media; prompt = nil }
+    init(prompt: UnsafeMutablePointer<cef_permission_prompt_callback_t>) { self.prompt = prompt; media = nil }
+    deinit {
+        cefRelease(media.map(UnsafeMutableRawPointer.init))
+        cefRelease(prompt.map(UnsafeMutableRawPointer.init))
     }
 }
 

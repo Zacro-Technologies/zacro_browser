@@ -214,6 +214,7 @@ struct ThemeEditor: View {
   var errorMessage: String?
   var saveTitle = "Save changes"
   var motionScale = 1.0
+  var onPresentationWindow: (NSWindow) -> Void = { _ in }
   var onSave: () -> Void = {}
   var onCancel: () -> Void = {}
   @State private var presetPage = 0
@@ -265,7 +266,7 @@ struct ThemeEditor: View {
       }.padding(.horizontal, 14).padding(.vertical, 12)
     }.foregroundStyle(colors.ink).tint(colors.accent)
       .background { NativeControlSurface().overlay(colors.chrome.opacity(0.32)) }
-      .background { NativeThemeScrollbars().frame(width: 0, height: 0) }
+      .background { NativeThemeScrollbars(onWindow: onPresentationWindow).frame(width: 0, height: 0) }
       .onAppear { if saveTitle != "Create Space" { focusedPuck = true } }
   }
   private var controls: some View {
@@ -342,13 +343,14 @@ struct ThemeEditor: View {
   private var colorField: some View {
     GeometryReader { geometry in
       ZStack {
-        NativeThemeBackground(theme: theme)
+        colors.chrome
+        NativeThemeTint(theme: theme).opacity(reduceTransparency || contrast == .increased ? 1 : theme.opacity)
         Canvas { context, size in
           for x in stride(from: 7.0, through: size.width, by: 8) {
             for y in stride(from: 7.0, through: size.height, by: 8) {
               context.fill(
                 Path(ellipseIn: CGRect(x: x, y: y, width: 1, height: 1)),
-                with: .color(.primary.opacity(0.17)))
+                with: .color(colors.ink.opacity(0.22)))
             }
           }
         }.allowsHitTesting(false)
@@ -389,7 +391,7 @@ struct ThemeEditor: View {
     return Circle().fill(Color(nsColor: color))
       .overlay(Circle().strokeBorder(.white.opacity(0.79), lineWidth: 3))
       .overlay(
-        Circle().stroke(.primary.opacity(selectedPrimary == primary ? 0.45 : 0), lineWidth: 2)
+        Circle().stroke(colors.ink.opacity(selectedPrimary == primary ? 0.45 : 0), lineWidth: 2)
           .padding(-2)
       )
       .shadow(color: .black.opacity(0.13), radius: 5, y: 3)
@@ -725,10 +727,12 @@ struct NativeSpaceIdentity: View {
 }
 
 private struct NativeThemeScrollbars: NSViewRepresentable {
-  func makeNSView(context: Context) -> Anchor { Anchor() }
-  func updateNSView(_ view: Anchor, context: Context) { view.suppress() }
+  var onWindow: (NSWindow) -> Void
+  func makeNSView(context: Context) -> Anchor { let view = Anchor(); view.onWindow = onWindow; return view }
+  func updateNSView(_ view: Anchor, context: Context) { view.onWindow = onWindow; if let window = view.window { onWindow(window) }; view.suppress() }
   final class Anchor: NSView {
-    override func viewDidMoveToWindow() { super.viewDidMoveToWindow(); suppress() }
+    var onWindow: (NSWindow) -> Void = { _ in }
+    override func viewDidMoveToWindow() { super.viewDidMoveToWindow(); if let window { onWindow(window) }; suppress() }
     override func layout() { super.layout(); suppress() }
     func suppress() {
       DispatchQueue.main.async { [weak self] in
