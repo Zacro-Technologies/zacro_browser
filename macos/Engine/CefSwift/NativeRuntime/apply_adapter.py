@@ -2,6 +2,8 @@
 """Apply the native protocol adapter to the exact pinned CEF source checkout."""
 import argparse
 import difflib
+import hashlib
+import json
 import pathlib
 import subprocess
 import tempfile
@@ -45,6 +47,7 @@ def main():
   bool DispatchZacroTopology(int id, const std::string& method, const base::DictValue* params);
   bool DispatchZacroBookmarks(int id, const std::string& method, const base::DictValue* params);
   bool DispatchZacroDownloads(int id, const std::string& method, const base::DictValue* params);
+  bool DispatchZacroManagement(int id, const std::string& method, const base::DictValue* params);
   base::CallbackListSubscription zacro_extension_subscription_;
   void FinishZacroDataRemoval(int id, uint64_t failed_types);
   void FinishZacroDiscard(int id, int entry_id, const std::string& error);
@@ -173,9 +176,16 @@ namespace throttle {""")
     downloads_path = "libcef/browser/devtools/zacro_downloads_adapter.inc"
     originals[downloads_path] = ""
     output[downloads_path] = (ROOT / "devtools_downloads_adapter.inc").read_text()
+    management_path = "libcef/browser/devtools/zacro_management_adapter.inc"
+    originals[management_path] = ""
+    output[management_path] = (ROOT / "devtools_management_adapter.inc").read_text()
     diff = "".join("".join(difflib.unified_diff(originals[path].splitlines(True), contents.splitlines(True),
         fromfile="a/" + path if originals[path] else "/dev/null", tofile="b/" + path)) for path, contents in output.items())
     previous = {}
+    receipt_path = cef.parent / "out/zacro-cef-adapter.json"
+    receipt = json.loads(receipt_path.read_text()) if receipt_path.exists() else {}
+    if receipt.get("revision") != revision:
+        receipt = {}
     patch_path = ROOT / "native-adapter.patch"
     if patch_path.exists():
         # Reconstruct only our previous generated outputs. Comparing exact
@@ -190,17 +200,38 @@ namespace throttle {""")
             applied = subprocess.run(["git", "apply", str(patch_path)], cwd=staging, capture_output=True)
             if applied.returncode == 0:
                 previous = {path: (staging / path).read_text() for path in output if (staging / path).exists()}
+    # Older --check versions rewrote the review patch without applying it.
+    # The committed, pinned patch is another exact known generated baseline;
+    # never accept arbitrary current source merely because it is modified.
+    committed = {}
+    saved = subprocess.run(["git", "show", "HEAD:macos/Engine/CefSwift/NativeRuntime/native-adapter.patch"],
+                           cwd=ROOT, capture_output=True, text=True)
+    if saved.returncode == 0:
+        with tempfile.TemporaryDirectory(prefix="zacro-cef-committed-") as temporary:
+            staging = pathlib.Path(temporary)
+            for path, contents in originals.items():
+                if contents:
+                    destination = staging / path
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    destination.write_text(contents)
+            applied = subprocess.run(["git", "apply", "-"], input=saved.stdout,
+                                     cwd=staging, text=True, capture_output=True)
+            if applied.returncode == 0:
+                committed = {path: (staging / path).read_text() for path in output if (staging / path).exists()}
     for path, contents in output.items():
         target = cef / path
         current = target.read_text() if target.exists() else ""
-        if current not in (originals[path], contents, previous.get(path)):
+        if current not in (originals[path], contents, previous.get(path), committed.get(path)) and hashlib.sha256(current.encode()).hexdigest() != receipt.get("files", {}).get(path):
             raise SystemExit(f"Refusing to overwrite unrelated changes in {target}")
     if not args.check:
         for path, contents in output.items():
             destination = cef / path
             if not destination.exists() or destination.read_text() != contents:
                 destination.write_text(contents)
-    patch_path.write_text(diff)
+        patch_path.write_text(diff)
+        receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        receipt_path.write_text(json.dumps({"revision": revision, "files": {
+            path: hashlib.sha256(contents.encode()).hexdigest() for path, contents in output.items()}}, indent=2) + "\n")
     print(f"{'Checked' if args.check else 'Applied'} CEF {revision[:12]} adapter; patch: {ROOT / 'native-adapter.patch'}")
 
 

@@ -24,7 +24,8 @@ final class NativeServicesModel: ObservableObject {
   var nativeSyncStatusChanged: (() -> Void)?
   private var nativeSyncStatusContext: ServiceJSON = .null
   var prepareNativeSync: ((String) async throws -> Void)?
-  var nativeSyncAction: ((String, String, String) async throws -> Void)?
+  var nativeSyncAction: ((String, String, ServiceJSON, String?) async throws -> Void)?
+  private var nativeSyncTasks: [UUID: Task<Void, Error>] = [:]
   @Published private var nativeSyncState: [String: ServiceJSON] = [:]
   private var sharedBackend: NativeServicesModel?
   private var backendSubscription: AnyCancellable?
@@ -77,7 +78,8 @@ final class NativeServicesModel: ObservableObject {
     AIProfileScope(id: store.activeProfileID, isPrivate: store.state.activeProfile?.isPrivate ?? true)
   }
   private func requireFocusedProfile(_ id: String) throws {
-    guard store.activeProfileID == id, backend.store.activeProfileID == id,
+    guard shutdownTask == nil, store.activeProfileID == id, backend.store.activeProfileID == id,
+      store.owningWindowID == nil || store.state.windowSessions?.contains(where: { $0.id == store.owningWindowID && $0.isOpen }) == true,
       store.state.activeProfile?.isPrivate == false else {
       throw ServiceError("PROFILE_CHANGED", "Activate this window's profile before using these controls.")
     }
@@ -139,6 +141,7 @@ final class NativeServicesModel: ObservableObject {
     }
     if contextTabs != nextTabs { contextTabs = nextTabs }
     guard profileID != current else { return }
+    cancelNativeSyncActions()
     let previousProfile = profileID ?? current, conversation = conversationID
     let precedingReset = aiContextReset
     aiContextReset = Task { [aiService] in
@@ -182,7 +185,7 @@ final class NativeServicesModel: ObservableObject {
   private func applySync(_ status: ServiceJSON) {
     if sharedBackend == nil, status["state"] != "private" {
       let context: ServiceJSON = ["account":status["account"]["id"], "endpoint":status["endpoint"],
-        "profiles":.array(status["profiles"].array.map { ["profileId":$0["profileId"], "datasetId":$0["datasetId"],
+        "profiles":.array(status["profiles"].array.map { ["profileId":$0["profileId"], "linkId":$0["linkId"], "datasetId":$0["datasetId"],
           "librarySync":$0["librarySync"], "settingsSync":$0["settingsSync"]] })]
       let changed = context != nativeSyncStatusContext
       nativeSyncStatusContext = context
@@ -253,17 +256,21 @@ final class NativeServicesModel: ObservableObject {
   }
   func syncAction(_ action: String, payload: ServiceJSON = [:]) async throws -> ServiceJSON {
     guard let syncService else { throw ServiceError("STORAGE", syncStartupError ?? "Synchronization is unavailable.") }
-    let profile = store.activeProfileID
+    let profile = payload.contains("profileId") ? payload["profileId"].string : store.activeProfileID
     try requireFocusedProfile(profile)
     if action == "sync:finish-profile-cleanup" {
       guard store.state.activeProfile?.isPrivate == false else { throw ServiceError("PRIVATE", "Profile cleanup is unavailable in private browsing.") }
       try await backend.recoverProfileDeletions(); applySync(await syncService.status(profileID: profile)); return ["complete":true]
     }
-    if ["sync:native-retry", "sync:native-install", "sync:native-keep-local", "sync:native-use-remote"].contains(action) {
+    if ["sync:native-retry", "sync:native-review", "sync:native-keep-local", "sync:native-use-remote"].contains(action) {
       guard store.state.activeProfile?.isPrivate == false, let nativeSyncAction = backend.nativeSyncAction else {
         throw ServiceError("EXTENSION_SYNC", "Extension synchronization is unavailable in this profile.")
       }
-      try await nativeSyncAction(action, profile, payload["id"].string)
+      let token = UUID(), owner = store.owningWindowID
+      let task = Task { try await nativeSyncAction(action, profile, payload, owner) }
+      nativeSyncTasks[token] = task
+      defer { nativeSyncTasks.removeValue(forKey: token) }
+      try await withTaskCancellationHandler(operation: { try await task.value }, onCancel: { task.cancel() })
       try requireFocusedProfile(profile)
       return ["complete":true]
     }
@@ -331,8 +338,13 @@ final class NativeServicesModel: ObservableObject {
     cleanupError = nil
   }
   /// Idempotent shutdown barrier. Await before destroying Chromium or exiting the app.
+  func cancelNativeSyncActions() {
+    for task in nativeSyncTasks.values { task.cancel() }
+    nativeSyncTasks.removeAll()
+  }
   func shutdown() async {
     if let shutdownTask { await shutdownTask.value; return }
+    cancelNativeSyncActions()
     profileTask?.cancel(); profileTask = nil
     tasks.forEach { $0.cancel() }; tasks.removeAll()
     backendSubscription?.cancel(); backendSubscription = nil

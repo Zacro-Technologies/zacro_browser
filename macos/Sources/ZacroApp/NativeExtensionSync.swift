@@ -20,6 +20,8 @@ final class NativeExtensionSync {
     var seededThrough: [String: Int] = [:]
     var processedThrough: [String: Int] = [:]
     var pending: [ServiceJSON] = []
+    var reviewRequired: [String: NativeExtensionReview] = [:]
+    var remoteRegistryTargets: [String: NativePortableExtension.State] = [:]
     var errors: [String: String] = [:]
     var failedContexts: [String: ServiceJSON] = [:]
     var recoveryNeeded = Set<String>()
@@ -38,6 +40,7 @@ final class NativeExtensionSync {
   private var refreshQueued = Set<String>()
   private var refreshAgain = Set<String>()
   private var cancellations: [UUID: (profile: String, cancel: () -> Void)] = [:]
+  private let reviews = NativeExtensionReviewLeases()
   private var started = false
   private var closed = false
 
@@ -59,17 +62,25 @@ final class NativeExtensionSync {
     }
     services.nativeSyncStatusChanged = { [weak self] in
       guard let self else { return }
+      self.invalidateReviews()
       self.refreshProfiles()
       for id in self.services.linkedSyncProfileIDs { self.requestRefresh(id) }
       if self.store.state.activeProfile?.isPrivate == false { self.requestRefresh(self.store.activeProfileID) }
     }
-    services.syncLibraryEvent = { [weak self] event in self?.requestRefresh(event["profileId"].string) }
+    services.syncLibraryEvent = { [weak self] event in
+      self?.invalidateReviews(); self?.requestRefresh(event["profileId"].string)
+    }
     services.syncStorageEvent = { [weak self] event in self?.requestRefresh(event["profileId"].string) }
-    services.nativeSyncAction = { [weak self] action, id, extensionID in
+    services.nativeSyncAction = { [weak self] action, id, payload, owner in
       guard let self else { throw CancellationError() }
+      if action == "sync:native-review" {
+        guard let owner else { throw ServiceError("EXTENSION_SYNC", "Open this review in a browser window.") }
+        try await self.reviewChange(id, payload["review"], owner:owner)
+        return
+      }
       try await self.ordered(id) { profile in
         if ["sync:native-keep-local", "sync:native-use-remote"].contains(action) {
-          try await self.resolveRecovery(id, profile, extensionID, useLocal:action == "sync:native-keep-local")
+          try await self.resolveRecovery(id, profile, payload["id"].string, useLocal:action == "sync:native-keep-local")
         }
         profile.errors = profile.errors.filter { profile.pendingNative[$0.key] != nil || profile.recoveryNeeded.contains($0.key) }
         profile.failedContexts.removeAll()
@@ -80,13 +91,13 @@ final class NativeExtensionSync {
               self.object(pending.changes), profile.nativeRevision[ext, default: 0], retry: true)
           }
         }
-        if action == "sync:native-install" { try await self.reviewInstallation(id, profile, extensionID) }
         try await self.reconcile(id, profile)
       }
     }
     refreshProfiles()
   }
   func refreshProfiles() {
+    invalidateReviewOwners()
     guard started, !closed, !engine.isTerminating,
       engine.contexts.values.contains(where: { $0.isOpen && !$0.isClosing }) else { return }
     let ids = Set(store.state.profiles.filter { !$0.isPrivate }.map(\.id))
@@ -111,6 +122,7 @@ final class NativeExtensionSync {
     }
   }
   func removeProfile(_ id: String) async {
+    reviews.cancel(profileID:id)
     epochs[id, default: 0] += 1
     let removalEpoch = epochs[id, default: 0]
     for item in cancellations.values where item.profile == id { item.cancel() }
@@ -132,6 +144,7 @@ final class NativeExtensionSync {
   }
   func close() async {
     guard !closed else { return }; closed = true
+    reviews.cancelAll()
     services.portableLibrary = nil; services.prepareNativeSync = nil; services.nativeSyncStatusChanged = nil
     services.syncLibraryEvent = nil; services.syncStorageEvent = nil; services.nativeSyncAction = nil; nativeEvent = nil; nativeObservationReady = nil
     for id in Array(profiles.keys) { await removeProfile(id) }
@@ -145,6 +158,28 @@ final class NativeExtensionSync {
     guard !closed, !pausedProfiles.contains(id), !Task.isCancelled, profiles[id] === profile,
       store.state.profiles.contains(where: { $0.id == id && !$0.isPrivate }) else { throw CancellationError() }
   }
+  private func reviewOwnerIsCurrent(_ owner: String, profileID: String) -> Bool {
+    guard !closed, !engine.isTerminating, let context = engine.contexts[owner], context.isOpen, !context.isClosing,
+      let session = store.state.windowSessions?.first(where: { $0.id == owner && $0.isOpen }),
+      store.state.spaces.first(where: { $0.id == session.activeSpaceID })?.profileID == profileID,
+      store.state.profiles.contains(where: { $0.id == profileID && !$0.isPrivate }) else { return false }
+    return true
+  }
+  private func invalidateReviewOwners() {
+    reviews.invalidateOwners { self.reviewOwnerIsCurrent($0, profileID:$1) }
+  }
+  /// This must run outside the per-profile queue: that queue can be awaiting
+  /// Chrome's consent widget, which must close when its cloud intent is revoked.
+  private func invalidateReviews() {
+    invalidateReviewOwners()
+    Task { [weak self] in
+      guard let self else { return }
+      await self.reviews.invalidateIntents { [weak self] intent in
+        await self?.currentIntent(intent) ?? false
+      }
+    }
+  }
+
   private func enqueue<T>(_ id: String, operation: @escaping (Profile) async throws -> T) -> Task<T, Error> {
     let epoch = epochs[id, default: 0], previous = tails[id], token = UUID()
     let task = Task { @MainActor [weak self] () throws -> T in
@@ -269,8 +304,11 @@ final class NativeExtensionSync {
         userMayModify: record.userMayModify, mustRemainInstalled: record.mustRemainInstalled) else { return nil }
       return (record.id, portable)
     })
+    let acceptedTargets = Set(profile.remoteRegistryTargets.compactMap { ext, target in
+      (next[ext]?.state ?? .removed) == target ? ext : nil
+    })
     if profile.baseline, let sync = services.syncService {
-      for key in Set(next.keys).union(profile.portable.keys).sorted() where !suppress.contains(key) {
+      for key in Set(next.keys).union(profile.portable.keys).sorted() where !suppress.contains(key) && !acceptedTargets.contains(key) {
         guard next[key] != profile.portable[key] else { continue }
         if let change = next[key] ?? profile.portable[key]?.removed() { try await sync.queueExtension(profileID: id, item: change.descriptor) }
         try check(id, profile)
@@ -291,6 +329,7 @@ final class NativeExtensionSync {
     }
     profile.records = Dictionary(uniqueKeysWithValues: snapshot.extensions.map { ($0.id, $0) })
     profile.portable = next; profile.baseline = true
+    profile.remoteRegistryTargets.removeAll()
     for ext in profile.pendingNative.keys where next[ext] == nil {
       profile.pendingNative.removeValue(forKey: ext)
       profile.errors.removeValue(forKey: ext); profile.failedContexts.removeValue(forKey: ext); profile.recoveryNeeded.remove(ext)
@@ -300,7 +339,7 @@ final class NativeExtensionSync {
     try check(id,profile)
     guard let sync = services.syncService else { return }
     if kind == "uninstalled" {
-      if let previous = profile.portable[ext] {
+      if let previous = profile.portable[ext], profile.remoteRegistryTargets[ext] != .removed {
         try await sync.queueExtension(profileID:id,item:previous.removed().descriptor)
         try check(id,profile)
       }
@@ -381,25 +420,41 @@ final class NativeExtensionSync {
     }
     let intents = try await sync.extensionIntents(profileID: id)
     profile.pending = []
+    var stillRequired: [String: NativeExtensionReview] = [:]
     for intent in intents {
       try check(id, profile)
       let ext = intent["extension"]["extensionId"].string, state = intent["extension"]["state"].string
+      guard await currentIntent(intent) else { continue }
+      try check(id, profile)
       guard let record = profile.records[ext] else {
-        if state != "removed" { profile.pending.append(intent["extension"]) }; continue
+        if state != "removed" {
+          profile.pending.append(try NativeExtensionReview(intent:intent, action:.install).value)
+        }
+        continue
       }
       guard profile.portable[ext] != nil else { continue }
-      let action = state == "removed" ? "remove" : state == "disabled" && record.isUserEnabled ? "disable" :
-        state == "enabled" && record.state == "DISABLED" ? "enable" : nil
-      guard let action, profile.errors[ext] == nil, await currentIntent(intent) else { continue }
-      try check(id, profile)
+      let action: NativeExtensionReview.Action? = state == "removed" ? .remove :
+        state == "disabled" && record.isUserEnabled ? .disable : state == "enabled" && record.state == "DISABLED" ? .enable : nil
+      guard let action else { continue }
+      let review = try NativeExtensionReview(intent:intent, action:action, name:record.name)
+      if action == .remove || profile.reviewRequired[ext]?.matches(review) == true {
+        profile.pending.append(review.value); stillRequired[ext] = review; continue
+      }
+      guard profile.errors[ext] == nil else { continue }
       do {
-        if action == "remove" { try await profile.manager.uninstall(ext) }
-        else { try await profile.manager.setEnabled(ext, enabled: action == "enable") }
+        // No owner and no user gesture. Chromium may allow a simple state
+        // change, but any real consent requirement becomes an explicit review.
+        profile.remoteRegistryTargets[ext] = action == .enable ? .enabled : .disabled
+        try await profile.manager.setEnabled(ext, enabled:action == .enable)
         try check(id, profile)
-        guard await currentIntent(intent) else { throw ServiceError("cancelled", "The library changed while this action was being reviewed.") }
+        guard await currentIntent(intent) else { throw CancellationError() }
         profile.errors.removeValue(forKey: ext)
-      } catch {
+      } catch ChromeExtensionError.reviewRequired(_) {
         if await currentIntent(intent) {
+          profile.pending.append(review.value); stillRequired[ext] = review
+        }
+      } catch {
+        if await currentIntent(intent), !(error is CancellationError) {
           profile.errors[ext] = String(error.localizedDescription.prefix(500)); profile.failedContexts[ext] = intent
         }
       }
@@ -407,6 +462,7 @@ final class NativeExtensionSync {
       // become another local library mutation. Other local changes still count.
       try await refreshRegistry(id, profile, suppress: [ext])
     }
+    profile.reviewRequired = stillRequired
     for projection in try await sync.nativeStorageProjections(profileID: id) {
       let ext = projection["extensionId"].string
       guard profile.portable[ext] != nil, profile.records[ext]?.isUserEnabled == true,
@@ -456,22 +512,50 @@ final class NativeExtensionSync {
     profile.recoveryNeeded.remove(ext); profile.pendingNative.removeValue(forKey:ext)
     profile.errors.removeValue(forKey:ext); profile.failedContexts.removeValue(forKey:ext)
   }
-  private func reviewInstallation(_ id: String, _ profile: Profile, _ ext: String) async throws {
-    guard let sync = services.syncService, store.activeProfileID == id,
-      let intent = try await sync.extensionIntents(profileID: id).first(where: { $0["extension"]["extensionId"].string == ext && $0["extension"]["state"] != "removed" }),
-      await currentIntent(intent) else { throw ServiceError("cancelled", "This remote installation request changed. Review the library again.") }
-    try check(id, profile)
-    guard store.activeProfileID == id else { throw CancellationError() }
-    try await profile.manager.installWebStoreExtension(ext)
-    try check(id, profile)
-    try await refreshRegistry(id, profile, suppress: [ext])
-    guard await currentIntent(intent) else { throw ServiceError("cancelled", "The sync library changed during installation. The extension you approved remains installed locally.") }
+  private func reviewChange(_ id: String, _ value: ServiceJSON, owner: String) async throws {
+    let review = try NativeExtensionReview(value:value)
+    guard review.profileID == id, reviewOwnerIsCurrent(owner, profileID:id), await currentIntent(review.intent) else {
+      throw ServiceError("cancelled", "This extension change or its browser window changed. Review it again.")
+    }
+    let task = Task { @MainActor in
+      try await self.ordered(id) { profile in
+        try await self.prepare(id, profile)
+        let ext = review.extensionID
+        guard self.reviewOwnerIsCurrent(owner, profileID:id), await self.currentIntent(review.intent),
+          profile.pending.contains(where: { (try? NativeExtensionReview(value:$0).matches(review)) == true }) else {
+          throw ServiceError("cancelled", "This extension change is no longer awaiting review.")
+        }
+        try self.check(id, profile)
+        guard self.reviewOwnerIsCurrent(owner, profileID:id) else { throw CancellationError() }
+        let record = profile.records[ext]
+        switch review.action {
+        case .install: guard record == nil else { throw CancellationError() }
+        case .remove: guard record != nil, profile.portable[ext] != nil else { throw CancellationError() }
+        case .enable: guard record?.state == "DISABLED", profile.portable[ext] != nil else { throw CancellationError() }
+        case .disable: guard record?.isUserEnabled == true, profile.portable[ext] != nil else { throw CancellationError() }
+        }
+        do {
+          profile.remoteRegistryTargets[ext] = review.action == .remove ? .removed : review.action == .disable ? .disabled : .enabled
+          switch review.action {
+          case .install: try await profile.manager.installWebStoreExtension(ext, ownerWindowID:owner)
+          case .remove: try await profile.manager.uninstall(ext, ownerWindowID:owner)
+          case .enable, .disable: try await profile.manager.setEnabled(ext, enabled:review.action == .enable, ownerWindowID:owner)
+          }
+        } catch ChromeExtensionError.operationCancelled { throw CancellationError() }
+        try self.check(id, profile)
+        try await self.refreshRegistry(id, profile, suppress:[ext])
+        profile.errors.removeValue(forKey:ext); profile.failedContexts.removeValue(forKey:ext)
+        profile.reviewRequired.removeValue(forKey:ext)
+        try await self.reconcile(id, profile)
+      }
+    }
+    let token = reviews.begin(review, owner:owner) { task.cancel() }
+    defer { reviews.finish(token); requestRefresh(id) }
+    try await withTaskCancellationHandler(operation: { try await task.value }, onCancel: { task.cancel() })
   }
   private func currentIntent(_ intent: ServiceJSON) async -> Bool {
-    guard let sync = services.syncService, await sync.isCurrentLink(intent),
-      let current = try? await sync.extensionIntents(profileID: intent["profileId"].string) else { return false }
-    return current.contains { $0["extension"]["extensionId"] == intent["extension"]["extensionId"] &&
-      $0["extension"]["generation"] == intent["extension"]["generation"] && $0["extension"]["state"] == intent["extension"]["state"] }
+    guard let sync = services.syncService else { return false }
+    return await sync.isCurrentExtensionIntent(intent)
   }
   private func publish(_ id: String, _ profile: Profile) {
     services.updateNativeSync(profileID: id, pending: profile.pending.sorted { $0["extensionId"].string < $1["extensionId"].string },

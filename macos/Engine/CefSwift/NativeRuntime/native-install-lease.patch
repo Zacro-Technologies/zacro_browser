@@ -1,0 +1,118 @@
+--- a/extensions/browser/install_approval.h
++++ b/extensions/browser/install_approval.h
+@@ -8,6 +8,7 @@
+ #include <memory>
+ #include <string>
+ 
++#include "base/functional/callback.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/scoped_refptr.h"
+ #include "base/supports_user_data.h"
+@@ -102,6 +103,12 @@
+   // the user has enabled Enhanced Protection.
+   bool bypassed_safebrowsing_friction = false;
+ 
++  // Optional authority for a browser-owned native installation. Invoked only
++  // on the UI thread; false revokes the operation before permissions or native
++  // registration. Ordinary Chromium installs leave this empty. The callback
++  // must not grant permissions, present UI, or retain its owning window.
++  base::RepeatingCallback<bool()> native_install_authorized;
++
+   // Whether to withhold permissions at installation. By default, permissions
+   // are granted at installation.
+   bool withhold_permissions = false;
+--- a/extensions/browser/crx_installer.h
++++ b/extensions/browser/crx_installer.h
+@@ -13,6 +13,7 @@
+ 
+ #include "base/callback_list.h"
+ #include "base/files/file_path.h"
++#include "base/functional/callback.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/scoped_refptr.h"
+ #include "base/scoped_observation.h"
+@@ -291,6 +292,12 @@
+                const InstallApproval* approval);
+   ~CrxInstaller() override;
+ 
++  // Revalidates an optional native lease on the UI thread, including after
++  // unpacking and shared-file work. Rejection completes the installer once.
++  bool CheckNativeInstallAuthorization();
++  base::RepeatingCallback<bool()> native_install_authorized_;
++  bool native_install_aborted_ = false;
++
+   // Called after OnUnpackSuccess check to see whether the install expectations
+   // are met and the install process should continue.
+   std::optional<CrxInstallError> CheckExpectations(const Extension* extension);
+--- a/extensions/browser/crx_installer.cc
++++ b/extensions/browser/crx_installer.cc
+@@ -199,6 +199,7 @@
+ 
+   CHECK(ExtensionsBrowserClient::Get()->IsSameContext(
+       browser_context(), approval->browser_context));
++  native_install_authorized_ = approval->native_install_authorized;
+   if (client_) {
+     client_->SetUseAppInstalledBubble(approval->use_app_installed_bubble);
+     client_->SetSkipPostInstallUI(approval->skip_post_install_ui);
+@@ -627,9 +628,25 @@
+   ReportInstallationStage(stage);
+ }
+ 
++bool CrxInstaller::CheckNativeInstallAuthorization() {
++  DCHECK_CURRENTLY_ON(BrowserThread::UI);
++  if (!browser_context_ || native_install_aborted_) {
++    return false;
++  }
++  if (!native_install_authorized_ || native_install_authorized_.Run()) {
++    return true;
++  }
++  // Failure callbacks may re-enter or release the last external reference.
++  // Mark terminal first, and touch no members after reporting the rejection.
++  native_install_aborted_ = true;
++  ReportFailureFromUIThread(CrxInstallError(
++      CrxInstallErrorType::OTHER, CrxInstallErrorDetail::USER_ABORTED));
++  return false;
++}
++
+ void CrxInstaller::CheckInstall() {
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
+-  if (!browser_context_) {
++  if (!CheckNativeInstallAuthorization()) {
+     return;
+   }
+ 
+@@ -913,6 +930,9 @@
+ 
+ void CrxInstaller::UpdateCreationFlagsAndCompleteInstall(
+     WithholdingBehavior withholding_behavior) {
++  if (!CheckNativeInstallAuthorization()) {
++    return;
++  }
+   creation_flags_ = extension()->creation_flags() | Extension::REQUIRE_KEY;
+   // If the extension was already installed and had file access, also grant file
+   // access to the updated extension.
+@@ -1052,7 +1072,9 @@
+ void CrxInstaller::ReportSuccessFromUIThread() {
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
+ 
+-  if (!browser_context_) {
++  // Shared-file work can finish after the owner closes or approval is revoked.
++  // Check before success UI, permissions grants, or registrar installation.
++  if (!CheckNativeInstallAuthorization()) {
+     return;
+   }
+ 
+--- a/extensions/browser/webstore_installer.cc
++++ b/extensions/browser/webstore_installer.cc
+@@ -395,6 +395,11 @@
+     // We are downloading a shared module. We need create an approval for it.
+     std::unique_ptr<InstallApproval> approval =
+         InstallApproval::CreateForSharedModule(browser_context_);
++    // Dependencies belong to the same reviewed operation. Revoking the main
++    // install must also prevent a delayed shared module from being registered.
++    if (approval_) {
++      approval->native_install_authorized = approval_->native_install_authorized;
++    }
+     const SharedModuleInfo::ImportInfo& info = pending_modules_.front();
+     approval->extension_id = info.extension_id;
+     const base::Version version_required(info.minimum_version);

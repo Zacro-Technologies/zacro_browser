@@ -19,6 +19,7 @@ final class NativeExtensionsModel: ObservableObject {
   private let actions: BrowserActions
   private var scope: String?
   private var request: Task<Void,Never>?
+  private var managementRequests: [UUID: Task<Void, Never>] = [:]
   private var generation = 0
   private var refreshPending = false
   private var shortcuts: [ChromeExtensionShortcut] = []
@@ -54,6 +55,7 @@ final class NativeExtensionsModel: ObservableObject {
     NativeShortcutSuspension.noteProfile(engine: engine, owner: suspensionToken,
       profile: isPrivate ? nil : store.activeProfileID)
     guard scope != store.activeProfileID else { return }
+    cancelManagementRequests()
     if actions.recordingShortcut { recordShortcut(nil) }
     request?.cancel(); generation += 1; scope = store.activeProfileID
     actionRequest?.cancel(); actionGeneration += 1
@@ -221,6 +223,8 @@ final class NativeExtensionsModel: ObservableObject {
   func perform(_ operation: String, id: String = "", value: String? = nil, expectedProfile: String? = nil) {
     guard !isPrivate, expectedProfile.map({ $0 == store.activeProfileID }) ?? true else { return }
     let profile = store.activeProfileID, revision = generation
+    let ownerWindowID = store.owningWindowID
+    let managementID = ["enable", "disable", "remove"].contains(operation) ? UUID() : nil
     let actionAnchor: NSRect?
     if operation == "action", let event = NSApp.currentEvent,
       [.leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp, .otherMouseDown, .otherMouseUp].contains(event.type),
@@ -228,14 +232,19 @@ final class NativeExtensionsModel: ObservableObject {
       actionAnchor = eventWindow.convertToScreen(NSRect(x: event.locationInWindow.x - 10,
         y: event.locationInWindow.y - 10, width: 20, height: 20))
     } else { actionAnchor = nil }
-    Task { [weak self] in
+    let operationTask = Task { [weak self] in
       guard let self, self.valid(profile,revision) else { return }
+      defer { if let managementID { self.managementRequests.removeValue(forKey: managementID) } }
       let manager = ChromeExtensionManager(engine: self.engine, profileID: profile)
       do {
         switch operation {
         case "pin", "unpin": try await manager.setPinned(id, pinned: operation == "pin")
-        case "enable", "disable": try await manager.setEnabled(id, enabled: operation == "enable")
-        case "remove": try await manager.uninstall(id)
+        case "enable", "disable":
+          guard let ownerWindowID else { throw ChromeExtensionError.managementUnavailable }
+          try await manager.setEnabled(id, enabled: operation == "enable", ownerWindowID: ownerWindowID)
+        case "remove":
+          guard let ownerWindowID else { throw ChromeExtensionError.managementUnavailable }
+          try await manager.uninstall(id, ownerWindowID: ownerWindowID)
         case "reload":
           try await manager.reload(id)
           if self.valid(profile, revision) { self.icons.removeValue(forKey: id) }
@@ -267,6 +276,8 @@ final class NativeExtensionsModel: ObservableObject {
         }
         guard self.valid(profile,revision) else { return }
         self.refresh()
+      } catch is CancellationError {
+      } catch ChromeExtensionError.operationCancelled {
       } catch {
         if self.valid(profile,revision) {
           self.error = error.localizedDescription
@@ -274,6 +285,12 @@ final class NativeExtensionsModel: ObservableObject {
         }
       }
     }
+    if let managementID { managementRequests[managementID] = operationTask }
+  }
+  private func cancelManagementRequests() {
+    let pending = managementRequests.values
+    managementRequests.removeAll()
+    for task in pending { task.cancel() }
   }
   func recordShortcut(_ identifier: String?) {
     recordingCommand = identifier; actions.recordingShortcut = identifier != nil
@@ -369,6 +386,7 @@ final class NativeExtensionsModel: ObservableObject {
     }
   }
   func close() {
+    cancelManagementRequests()
     if actions.recordingShortcut { recordShortcut(nil) }
     request?.cancel(); request = nil; generation += 1
     actionRequest?.cancel(); actionRequest = nil; actionGeneration += 1

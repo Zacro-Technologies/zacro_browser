@@ -217,7 +217,7 @@ def apply_inputs(source, environment):
     for _ in range(8):
         before = native_inputs()
         run([sys.executable, str(HERE / "apply_adapter.py"), "--cef-root", str(source / "cef")], source, environment)
-        for name in ["storage_adapter", "bookmark_adapter", "sidepanel_adapter", "popup_anchor", "topology_adapter", "tab_reservation", "native_messaging_adapter"]:
+        for name in ["storage_adapter", "bookmark_adapter", "sidepanel_adapter", "popup_anchor", "topology_adapter", "tab_reservation", "native_messaging_adapter", "install_lease_adapter", "management_prompt_adapter", "management_adapter"]:
             run([sys.executable, str(HERE / ("apply_" + name + ".py")), "--chromium-root", str(source)], source, environment)
         if before == native_inputs():
             return before

@@ -187,6 +187,16 @@ New lifecycle checks verify real private cookies survive an unrelated window clo
 
 Evidence: `macos/.build/verification/integrated-release-22-assisted-retry2.log`, `application-22-assisted-retry2/application.json`, `application-22-assisted-retry2/application.log`, `application-22-assisted-retry2/view-renders`, `acceptance-22-assisted/engine.json`, `core-services-post22-full.log`, and `profile-retirement-journal-check.log`. Earlier failing hosted-control measurements remain under `application-22` and `application-22-assisted-retry`. The custom Chromium framework is still compiling; its extension fixtures, physical interaction, final material composition and distribution signing/notarization remain release gates.
 
+## 2026-11-02: integrated build 23
+
+The release build completed in **126.88 seconds**, without warnings. Its internal bundle passed deep/strict signature verification, **149 application checks**, **31 stock-engine checks**, and clean shutdown. The complete **244 Core/Services tests** passed (155 Core and 89 Services), with zero failures, skips or compiler warnings, including the bundled Codex handshake and PDF helper.
+
+Sixteen added application checks cover standalone split Favorites, destination reflow and delayed Space navigation bound to the originating drag, profile, window and destination. These exercise actual native helpers and Core state; physical drag/trackpad acceptance remains outstanding. Sync now retains consent-required cloud intents for explicit review, validates the captured profile before mutation, and cancels stale reviews independently of its serialized profile queue. Eight additional Services regressions cover that durable intent authority.
+
+Native management operations now carry an individual owner/cancellation lease into Chromium's original install, enable and uninstall paths. The foreign Swift-window dialog parent is handled explicitly, and cancellation reaches shared-module and CRX commit checks. Twelve changed production Chromium objects compiled successfully, alongside the focused adapter/lifetime fixtures. A custom-only application fixture is authored to check real uninstall-dialog ownership, pre-consent installation preservation and cancellation. These paths have **not executed in the custom browser runtime** because its framework is still linking/building; object compilation does not establish extension compatibility.
+
+Evidence: `macos/.build/verification/integrated-release-23.log`, `application-23/application.json`, `application-23/application.log`, `acceptance-23/engine.json`, `core-services-post23-full.log`, `management-23-final-objects/object-check.json`, and `native-management-prompt-objects/object-check.json`. The stock report continues to mark native extension compatibility and desktop input as unverified. Final custom-runtime acceptance, desktop interaction, material composition and distribution signing/notarization remain required.
+
 ## Required release evidence
 
 - Successful custom Chromium build and package provenance; native protocol capability checks.

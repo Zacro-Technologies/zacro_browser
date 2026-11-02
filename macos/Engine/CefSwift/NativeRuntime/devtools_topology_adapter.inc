@@ -240,6 +240,10 @@ class ZacroBrowserContext : public base::SupportsUserData::Data {
     ExtensionFunction::SetNativeDispatcher(base::BindRepeating(
         [](ExtensionFunction* function, const base::ListValue& args, ZacroNativeResponse response) {
           if (!function->browser_context()) return false;
+          if (!extensions::NativeManagementOperation::BindCurrentInvocation(function)) {
+            std::move(response).Run({}, "The native extension operation was cancelled.");
+            return true;
+          }
           return Get(function->browser_context())->Dispatch(function, args, std::move(response));
         }));
     extensions::EventRouter::SetNativeEventFilter(base::BindRepeating(

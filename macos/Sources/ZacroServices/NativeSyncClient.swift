@@ -57,7 +57,7 @@ public actor NativeSyncClient {
   private func notify() { emit(["type":"sync:status","status":status()]) }
   public func status() -> ServiceJSON {
     let profiles: [ServiceJSON] = saved["links"].object.sorted(by: { $0.key < $1.key }).map { id,link in
-      ["profileId":.string(id),"datasetId":link["datasetId"],"name":link["name"],"librarySync":.bool(link["librarySync"] != false),"settingsSync":link["settingsSync"],"pending":.number(Double(link["outbox"].array.count)),
+      ["profileId":.string(id),"linkId":link["id"],"datasetId":link["datasetId"],"name":link["name"],"librarySync":.bool(link["librarySync"] != false),"settingsSync":link["settingsSync"],"pending":.number(Double(link["outbox"].array.count)),
        "rejected":.array(link["rejected"].array.map { ["id":$0["operation"]["id"],"extensionId":$0["operation"]["extensionId"],"kind":$0["operation"]["kind"],"code":$0["code"]] }),"lastSync":link["lastSync"]]
     }
     return ["endpoint":saved["endpoint"],"account":credentials == nil ? .null : saved["account"],"device":credentials?["device"] ?? .null,"state":.string(saved["endpoint"].string.isEmpty ? "setup-required" : connectionState),"profiles":.array(profiles)]
@@ -288,6 +288,13 @@ public actor NativeSyncClient {
     try await profile(profileID); let link = saved["links"][profileID]
     guard link != .null, link["librarySync"] != false, credentials != nil else { return [] }
     return SyncModel.library(link).object.values.map { identity(profileID,link).merging(["extension":$0]) }
+  }
+  public func isCurrentExtensionIntent(_ intent: ServiceJSON) -> Bool {
+    guard isCurrentLink(intent) else { return false }
+    let link = saved["links"][intent["profileId"].string], item = intent["extension"]
+    let current = SyncModel.library(link)[item["extensionId"].string]
+    return link["librarySync"] != false && current != .null &&
+      current["generation"] == item["generation"] && current["state"] == item["state"] && current["source"] == item["source"]
   }
   /// A full desired state is needed after restart or a missed native event. It
   /// also binds each apply to the reviewed link and current installation generation.

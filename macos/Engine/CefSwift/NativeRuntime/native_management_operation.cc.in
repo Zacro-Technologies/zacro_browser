@@ -1,0 +1,190 @@
+#include "chrome/browser/extensions/native_management_operation.h"
+
+#include <map>
+#include <utility>
+#include "base/auto_reset.h"
+#include "base/functional/bind.h"
+#include "base/no_destructor.h"
+#include "build/build_config.h"
+#include "chrome/browser/extensions/extension_install_prompt.h"
+#include "chrome/browser/extensions/extension_uninstall_dialog.h"
+#include "chrome/browser/profiles/profile.h"
+#include "content/public/browser/render_frame_host.h"
+#include "content/public/browser/web_contents.h"
+#include "extensions/browser/extension_function.h"
+#include "extensions/browser/extension_prefs.h"
+#include "extensions/browser/extension_registry.h"
+#include "extensions/browser/extension_web_contents_observer.h"
+#include "extensions/common/constants.h"
+#include "extensions/common/extension.h"
+#include "extensions/common/mojom/frame.mojom.h"
+#include "third_party/blink/public/common/service_worker/service_worker_types.h"
+#include "ui/native_window_tracker/native_window_tracker.h"
+
+namespace extensions {
+namespace {
+NativeManagementOperation* g_current_native_operation = nullptr;
+auto& NativeFunctionOperations() {
+  static base::NoDestructor<std::map<std::string, base::WeakPtr<NativeManagementOperation>>> values;
+  return *values;
+}
+}  // namespace
+
+#if !BUILDFLAG(IS_MAC)
+gfx::NativeWindow NativeManagementWindowForNumber(int, int) { return gfx::NativeWindow(); }
+#endif
+
+scoped_refptr<NativeManagementOperation> NativeManagementOperation::Create(
+    content::WebContents* manager, const std::string& target_id,
+    const std::string& action, int native_window_number, int logical_window_id, std::string& error) {
+  if (!manager || manager->GetBrowserContext()->IsOffTheRecord() ||
+      manager->GetLastCommittedURL() != GURL("chrome://extensions/")) {
+    error = "The trusted extension management document is unavailable."; return {};
+  }
+  auto* profile = Profile::FromBrowserContext(manager->GetBrowserContext());
+  auto* registry = ExtensionRegistry::Get(profile);
+  // This unbranded shell has no supervised-account owner implementation. The
+  // upstream supervised approval API accepts WebContents rather than a native
+  // parent; never attach that consent flow to the hidden transport document.
+  if (profile->IsChild()) {
+    error = "This supervised profile requires its browser's parental approval flow."; return {};
+  }
+  const auto* target = registry->GetExtensionById(target_id, ExtensionRegistry::EVERYTHING);
+  if ((action == "install" && target) || (action != "install" && !target)) {
+    error = "The installed extension changed before this operation began."; return {};
+  }
+  if (action != "install" && action != "uninstall" && action != "enable" && action != "disable") {
+    error = "The extension management operation is invalid."; return {};
+  }
+  gfx::NativeWindow parent;
+  if (native_window_number > 0) {
+    parent = NativeManagementWindowForNumber(native_window_number, logical_window_id);
+    if (!parent) { error = "The initiating browser window is unavailable or already has a dialog."; return {}; }
+  } else if (action == "install" || action == "uninstall") {
+    error = "This extension change requires an initiating browser window."; return {};
+  }
+  return base::WrapRefCounted(new NativeManagementOperation(manager, target, target_id, action, parent));
+}
+
+bool NativeManagementOperation::RequiresReview(Profile* profile, const Extension* target,
+                                               const std::string& action) {
+  if (action == "install" || action == "uninstall") return true;
+  // Chromium can start the supervised approval flow before its ordinary
+  // user-gesture test, including on a disable request. Never allow that UI
+  // from an ownerless cloud operation.
+  if (profile->IsChild()) return true;
+  return action == "enable" && target && ExtensionPrefs::Get(profile)->DidExtensionEscalatePermissions(target->id());
+}
+
+NativeManagementOperation::NativeManagementOperation(content::WebContents* manager,
+    const Extension* target, std::string target_id, std::string action,
+    gfx::NativeWindow parent)
+    : content::WebContentsObserver(manager),
+      profile_(Profile::FromBrowserContext(manager->GetBrowserContext())),
+      target_(target), target_id_(std::move(target_id)), action_(std::move(action)),
+      document_(manager->GetPrimaryMainFrame()->GetWeakDocumentPtr()), parent_(parent) {
+  if (parent_) window_tracker_ = ui::NativeWindowTracker::Create(parent_);
+  validity_timer_.Start(FROM_HERE, base::Milliseconds(100), base::BindRepeating(
+      [](base::WeakPtr<NativeManagementOperation> self) {
+        if (self && !self->IsValid()) self->Cancel();
+      }, weak_.GetWeakPtr()));
+}
+NativeManagementOperation::~NativeManagementOperation() { UnbindFunction(); }
+
+bool NativeManagementOperation::IsValid() const {
+  if (cancelled_ || completed_ || !profile_ || profile_->ShutdownStarted() ||
+      !web_contents() || !document_.AsRenderFrameHostIfValid() ||
+      (window_tracker_ && window_tracker_->WasNativeWindowDestroyed())) return false;
+  return ExtensionRegistry::Get(profile_)->GetExtensionById(target_id_, ExtensionRegistry::EVERYTHING) == target_.get();
+}
+
+bool NativeManagementOperation::BindCurrentInvocation(ExtensionFunction* function) {
+  auto* operation = g_current_native_operation;
+  if (!operation) return true;
+  if (!operation->function_uuid_.empty() ||
+      function->browser_context() != operation->profile_ ||
+      function->GetSenderWebContents() != operation->web_contents() || function->extension() ||
+      function->source_context_type() != mojom::ContextType::kWebUi ||
+      std::string(function->name()) != (operation->action_ == "uninstall" ? "management.uninstall" : "management.setEnabled")) return false;
+  operation->function_uuid_ = function->request_uuid().AsLowercaseString();
+  NativeFunctionOperations()[operation->function_uuid_] = operation->weak_.GetWeakPtr();
+  return operation->IsValid();
+}
+base::WeakPtr<NativeManagementOperation> NativeManagementOperation::ForFunction(const ExtensionFunction* function) {
+  if (!function) return {};
+  auto found = NativeFunctionOperations().find(function->request_uuid().AsLowercaseString());
+  return found == NativeFunctionOperations().end() ? base::WeakPtr<NativeManagementOperation>() : found->second;
+}
+bool NativeManagementOperation::FunctionIsValid(const ExtensionFunction* function) {
+  const auto found = NativeFunctionOperations().find(function->request_uuid().AsLowercaseString());
+  return found == NativeFunctionOperations().end() || (found->second && found->second->IsValid());
+}
+void NativeManagementOperation::FunctionCompleted(const ExtensionFunction* function) {
+  if (auto operation = ForFunction(function)) operation->UnbindFunction();
+}
+void NativeManagementOperation::UnbindFunction() {
+  if (!function_uuid_.empty()) {
+    NativeFunctionOperations().erase(function_uuid_); function_uuid_.clear();
+  }
+}
+base::RepeatingCallback<bool()> NativeManagementOperation::Validator() {
+  return base::BindRepeating([](base::WeakPtr<NativeManagementOperation> self) {
+    return self && self->IsValid();
+  }, weak_.GetWeakPtr());
+}
+NativeManagementOperation::CancelRegistration NativeManagementOperation::CancellationRegistration() {
+  return base::BindRepeating([](base::WeakPtr<NativeManagementOperation> self, base::OnceClosure cancellation) {
+    if (self) self->SetCancellation(std::move(cancellation));
+    else if (cancellation) std::move(cancellation).Run();
+  }, weak_.GetWeakPtr());
+}
+void NativeManagementOperation::ConfigurePrompt(ExtensionInstallPrompt* prompt) {
+  prompt->SetNativeOperationCallbacks(Validator(), CancellationRegistration());
+}
+void NativeManagementOperation::ConfigureUninstallDialog(ExtensionUninstallDialog* dialog) {
+  dialog->SetNativeOperationCallbacks(Validator(), CancellationRegistration());
+}
+void NativeManagementOperation::SetCompletion(Completion completion) {
+  CHECK(!completion_); completion_ = std::move(completion);
+}
+void NativeManagementOperation::Dispatch(const std::string& method, base::ListValue arguments) {
+  if (dispatched_ || !IsValid()) { Cancel(); return; }
+  dispatched_ = true;
+  auto* observer = ExtensionWebContentsObserver::GetForWebContents(web_contents());
+  auto* frame = document_.AsRenderFrameHostIfValid();
+  if (!observer || !frame) { Cancel(); return; }
+  auto params = mojom::RequestParams::New();
+  params->name = method; params->arguments = std::move(arguments);
+  params->source_url = frame->GetLastCommittedURL();
+  params->context_type = mojom::ContextType::kWebUi;
+  params->has_callback = true; params->user_gesture = !!parent_;
+  params->worker_thread_id = kMainThreadId;
+  params->service_worker_version_id = blink::mojom::kInvalidServiceWorkerVersionId;
+  base::AutoReset<NativeManagementOperation*> binding(&g_current_native_operation, this);
+  observer->dispatcher()->Dispatch(std::move(params), *frame,
+      base::BindOnce([](scoped_refptr<NativeManagementOperation> self, bool success,
+          base::ListValue, const std::string& error, mojom::ExtraResponseDataPtr) {
+        self->UnbindFunction();
+        self->Complete(success, error);
+      }, base::WrapRefCounted(this)));
+}
+void NativeManagementOperation::SetCancellation(base::OnceClosure cancellation) {
+  if (!IsValid()) { if (cancellation) std::move(cancellation).Run(); return; }
+  cancel_widget_ = std::move(cancellation);
+}
+void NativeManagementOperation::Complete(bool success, std::string error) {
+  if (completed_) return;
+  auto keep_alive = base::WrapRefCounted(this);
+  completed_ = true; validity_timer_.Stop(); cancel_widget_.Reset();
+  if (completion_) std::move(completion_).Run(success && !cancelled_, cancelled_, std::move(error));
+}
+void NativeManagementOperation::Cancel() {
+  if (completed_ || cancelled_) return;
+  auto keep_alive = base::WrapRefCounted(this);
+  cancelled_ = true; validity_timer_.Stop();
+  auto cancellation = std::move(cancel_widget_);
+  if (cancellation) std::move(cancellation).Run();
+  Complete(false, "The extension operation was cancelled.");
+}
+void NativeManagementOperation::WebContentsDestroyed() { Cancel(); profile_ = nullptr; }
+}  // namespace extensions

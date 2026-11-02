@@ -71,6 +71,7 @@ enum NativeSidebarDragAcceptance {
     let identifier = "tab:東京:é"
     let written = pasteboard.writeObjects([identifier as NSString])
     result["nativeDragWritesExactUTF8TabIdentifier"] = written && pasteboard.string(forType: .string) == identifier
+    result.merge(NativeSidebarReorderAcceptance.check(), uniquingKeysWith: { first, _ in first })
     return result
   }
 }

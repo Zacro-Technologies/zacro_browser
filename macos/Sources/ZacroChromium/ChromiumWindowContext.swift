@@ -6,7 +6,9 @@ import Foundation
 @MainActor
 public final class ChromiumWindowContext: NSObject, NSWindowDelegate {
   public internal(set) var id: String
-  public internal(set) var nativeID: Int
+  public internal(set) var nativeID: Int {
+    didSet { window.identifier = NSUserInterfaceItemIdentifier("ZacroBrowserWindow:\(nativeID)") }
+  }
   public let window: NSWindow
   public internal(set) var isOpen = true
   public internal(set) var isClosing = false
@@ -27,6 +29,7 @@ public final class ChromiumWindowContext: NSObject, NSWindowDelegate {
       styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
       backing: .buffered, defer: false)
     super.init()
+    window.identifier = NSUserInterfaceItemIdentifier("ZacroBrowserWindow:\(nativeID)")
     window.title = "Zacro"
     window.titleVisibility = .hidden
     window.titlebarAppearsTransparent = true

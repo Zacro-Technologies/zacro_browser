@@ -206,7 +206,9 @@ struct BrowserShell<Content: View>: View {
   }
   private var todayTabs: [BrowserTab] {
     tabs.filter { !$0.isPinned && !$0.isFavorite && !$0.isClosed && $0.folderID == nil && $0.groupID == nil
-      && store.split(for: $0.id) == nil && ($0.url != "about:blank" || $0.homePage == true) }
+      && (store.split(for: $0.id) == nil || drag.isProjectedSplitPlaceholder($0.id,
+        in: store.state.activeSpaceID, section: .regular, store: store))
+      && ($0.url != "about:blank" || $0.homePage == true) }
   }
   private var hasPage: Bool {
     store.state.activeTab.map { !$0.isClosed && currentAddress != "about:blank" } ?? false
@@ -577,11 +579,11 @@ struct BrowserShell<Content: View>: View {
     }.padding(.horizontal, 8)
       .background {
         NativeSidebarDragHost(controller: drag.native, isEnabled: isOwnedWindowOpen, motionScale: effectiveMotion, canStart: { [weak store] id in
-          guard let store, let tab = store.tab(id) else { return false }
-          return store.profileID(for: tab) == store.activeProfileID && store.split(for: id) == nil
+          guard let store else { return false }
+          return NativeSidebarDragAuthority.capture(id: id, store: store) != nil
         }, began: { [weak drag, weak store] id in
           guard let store else { return }
-          drag?.start(id, tabs: store.state.tabs)
+          drag?.start(id, store: store)
         }, ended: { [weak drag] in drag?.cancel() }, projectedRegion: { [weak drag] in drag?.projectionRegionID },
           exitedRegion: { [weak drag, weak store] in if let store { drag?.resetReflow(store: store) } })
       }
@@ -993,7 +995,10 @@ struct BrowserShell<Content: View>: View {
       .accessibilityElement(children: .contain).accessibilityLabel("Split view")
   }
   private func rows(_ candidates: [BrowserTab], section: SidebarSection) -> some View {
-    ForEach(candidates.filter { store.split(for: $0.id) == nil && $0.groupID == nil }) { tab in tabRow(tab, section: section) }
+    ForEach(candidates.filter { $0.groupID == nil && (store.split(for: $0.id) == nil
+      || drag.isProjectedSplitPlaceholder($0.id, in: store.state.activeSpaceID, section: section, store: store)) }) {
+      tabRow($0, section: section)
+    }
   }
   private var highlightedTabIDs: Set<String> {
     let id = store.owningWindowID ?? store.state.focusedWindowID
@@ -1117,13 +1122,19 @@ struct BrowserShell<Content: View>: View {
       .accessibilityElement(children: .contain).accessibilityAddTraits(selected ? [.isSelected] : [])
       .contextMenu { tabMenu(tab) }
       .background { menuAnchor(id: tab.id, items: tabMenuItems(tab)) }
-      .background { if !grouped { NativeSidebarDragAnchor(controller: drag.native, id: tab.id) } }
+      .background {
+        if !grouped && !drag.isProjectedSplitPlaceholder(tab.id, in: store.state.activeSpaceID, section: section, store: store) {
+          NativeSidebarDragAnchor(controller: drag.native, id: tab.id)
+        }
+      }
       .background {
         GeometryReader { geometry in
           Color.clear.onDrop(of: [.plainText], delegate: SidebarDropDelegate(store: store, drag: drag,
             section: section, spaceID: store.state.activeSpaceID, before: tab.id, extent: geometry.size))
         }
       }
+      .allowsHitTesting(!drag.isProjectedSplitPlaceholder(tab.id, in: store.state.activeSpaceID, section: section, store: store))
+      .accessibilityHidden(drag.isProjectedSplitPlaceholder(tab.id, in: store.state.activeSpaceID, section: section, store: store))
   }
   private func tabMenu(_ tab: BrowserTab) -> some View { NativeMenuCommands(items: tabMenuItems(tab)) }
   private func tabMenuItems(_ tab: BrowserTab) -> [NativeMenuAction] {
@@ -1267,12 +1278,7 @@ struct BrowserShell<Content: View>: View {
         of: [.plainText],
         delegate: SpaceHoverDropDelegate(
           store: store, drag: drag, repeatNavigation: true,
-          target: {
-            guard let current = spaces.firstIndex(where: { $0.id == store.state.activeSpaceID }),
-              spaces.indices.contains(current + offset)
-            else { return nil }
-            return spaces[current + offset].id
-          }))
+          target: { NativeSidebarDwell.neighbor(in: store, offset: offset) }))
   }
   private func dropDelegate(section: SidebarSection, before: String? = nil) -> SidebarDropDelegate {
     SidebarDropDelegate(
@@ -1778,129 +1784,6 @@ private enum SidebarNamedItem: Equatable {
     }
   }
 }
-private enum SidebarSection: Equatable {
-  case favorite, pinned, regular
-  case folder(String)
-  var folderID: String? {
-    if case .folder(let id) = self { return id }
-    return nil
-  }
-  var pinned: Bool { self != .regular }
-  func regionID(space: String) -> String {
-    let section: String
-    switch self {
-    case .favorite: section = "favorites"
-    case .pinned: section = "pins"
-    case .regular: section = "today"
-    case .folder(let id): section = "folder:" + id
-    }
-    return space + ":" + section
-  }
-}
-@MainActor private final class SidebarDragSession: ObservableObject {
-  let native = NativeSidebarDragController()
-  @Published var id: String?
-  @Published var preview: [BrowserTab]?
-  private var hover: DispatchWorkItem?
-  private var projectedGroupID: String?
-  private var projection: Projection?
-  var projectionRegionID: String? { projection.map { $0.section.regionID(space: $0.space) } }
-  private struct Projection {
-    let space: String
-    let section: SidebarSection
-    let before: String?
-    let after: Bool
-  }
-  func start(_ id: String, tabs: [BrowserTab]) {
-    cancel()
-    self.id = id
-    preview = tabs
-    projectedGroupID = tabs.first(where: { $0.id == id })?.groupID
-  }
-  func cancel() {
-    hover?.cancel()
-    hover = nil
-    id = nil
-    preview = nil
-    projectedGroupID = nil
-    projection = nil
-  }
-  func resetReflow(store: BrowserStore) {
-    guard id != nil else { return }
-    projection = nil
-    reconcile(store: store)
-  }
-  func reconcile(store: BrowserStore) {
-    guard let id else { return }
-    guard let source = store.tab(id), store.profileID(for: source) == store.activeProfileID else {
-      cancel(); return
-    }
-    if let projection {
-      project(store: store, space: projection.space, section: projection.section,
-        before: projection.before, after: projection.after)
-    } else {
-      projectedGroupID = source.groupID
-      preview = store.state.tabs
-    }
-  }
-  func stopHover() {
-    hover?.cancel()
-    hover = nil
-  }
-  func scheduleHover(_ action: @escaping () -> Void) {
-    stopHover()
-    let work = DispatchWorkItem(block: action)
-    hover = work
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.55, execute: work)
-  }
-  func project(store: BrowserStore, space: String, section: SidebarSection, before: String?, after: Bool = false) {
-    guard let id, let source = store.tab(id), before != id,
-      store.state.spaces.first(where: { $0.id == space })?.profileID == store.profileID(for: source)
-    else { return }
-    // Reflow is only a presentation of the latest model. A page can finish
-    // loading, open another tab, or close while a native drag is in progress.
-    // Reusing the previous projection would hide those changes until drop.
-    projection = Projection(space: space, section: section, before: before, after: after)
-    var projected = store.state.tabs
-    guard let index = projected.firstIndex(where: { $0.id == id }) else { return }
-    var moved = projected.remove(at: index)
-    projectedGroupID = before.flatMap { store.tab($0)?.groupID }
-    if section != .regular || projectedGroupID != source.groupID { moved.groupID = nil }
-    moved.spaceID = space; moved.folderID = section.folderID
-    moved.isFavorite = section == .favorite; moved.isPinned = section.pinned
-    moved.savedURL = section.pinned ? (moved.savedURL ?? moved.url) : nil
-    if !section.pinned { moved.isClosed = false }
-    let destination: Int
-    if let before, let target = projected.firstIndex(where: { $0.id == before }) {
-      destination = target + (after ? 1 : 0)
-    } else {
-      let last = projected.lastIndex { tab in
-        if section == .favorite { return tab.isFavorite && store.profileID(for: tab) == store.activeProfileID }
-        guard tab.spaceID == space, !tab.isFavorite else { return false }
-        if let folder = section.folderID { return tab.folderID == folder }
-        return tab.folderID == nil && tab.isPinned == section.pinned
-      }
-      destination = last.map { $0 + 1 } ?? projected.count
-    }
-    projected.insert(moved, at: min(projected.count, destination))
-    guard projected != preview else { return }
-    let duration = 0.14 * store.state.settings.motionScale
-    withAnimation(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? nil : .easeInOut(duration: duration)) {
-      preview = projected
-    }
-  }
-  func commit(store: BrowserStore, space: String, section: SidebarSection? = nil) -> Bool {
-    guard let id, let source = store.tab(id),
-      store.state.spaces.first(where: { $0.id == space })?.profileID == store.profileID(for: source)
-    else { cancel(); return false }
-    let index = section == nil ? nil : preview?.firstIndex(where: { $0.id == id })
-    store.moveTab(id: id, spaceID: space, folderID: section?.folderID, index: index,
-      pinned: section?.pinned, favorite: section.map { $0 == .favorite }, clearFolder: section != nil,
-      clearGroup: section == .regular && source.groupID != nil && projectedGroupID != source.groupID)
-    cancel(); return true
-  }
-
-}
 private struct NativeTabEntry: ViewModifier {
   let opacity: Double
   let offset: CGFloat
@@ -1971,11 +1854,7 @@ private struct SpaceHoverDropDelegate: DropDelegate {
   func validateDrop(info: DropInfo) -> Bool { drag.id != nil }
   func dropEntered(info: DropInfo) { schedule() }
   private func schedule() {
-    drag.scheduleHover {
-      guard drag.id != nil, let next = target() else { return }
-      store.selectSpace(id: next)
-      if repeatNavigation { schedule() }
-    }
+    drag.scheduleHover(store: store, target: target, repeatNavigation: repeatNavigation)
   }
   func dropExited(info: DropInfo) { drag.stopHover() }
   func dropUpdated(info: DropInfo) -> DropProposal? { DropProposal(operation: .move) }

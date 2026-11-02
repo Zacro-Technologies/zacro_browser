@@ -1,0 +1,417 @@
+--- a/chrome/browser/extensions/extension_install_prompt.h
++++ b/chrome/browser/extensions/extension_install_prompt.h
+@@ -125,11 +125,22 @@
+                          const extensions::Extension* extension,
+                          const SkBitmap* icon) override;
+ 
++  // Native browser operations retain Chrome's consent UI and result callback.
++  // Validation and cancellation registration run only on the UI thread. The
++  // registration replaces the prior pending-icon/widget cancellation closure.
++  void SetNativeOperationCallbacks(
++      base::RepeatingCallback<bool()> authorized,
++      base::RepeatingCallback<void(base::OnceClosure)> register_cancellation);
++
+   bool did_call_show_dialog() const { return did_call_show_dialog_; }
+ 
+   std::unique_ptr<extensions::InstallPromptData> GetPromptForTesting();
+ 
+  private:
++  void CancelNativeOperation();
++  base::RepeatingCallback<bool()> native_operation_authorized_;
++  base::RepeatingCallback<void(base::OnceClosure)> native_register_cancellation_;
++
+   // Sets the icon that will be used in any UI. If `icon` is NULL, or contains
+   // an empty bitmap, then a default icon will be used instead.
+   void SetIcon(const SkBitmap* icon);
+--- a/chrome/browser/extensions/extension_install_prompt.cc
++++ b/chrome/browser/extensions/extension_install_prompt.cc
+@@ -102,6 +102,27 @@
+ 
+ ExtensionInstallPrompt::~ExtensionInstallPrompt() = default;
+ 
++void ExtensionInstallPrompt::SetNativeOperationCallbacks(
++    base::RepeatingCallback<bool()> authorized,
++    base::RepeatingCallback<void(base::OnceClosure)> register_cancellation) {
++  DCHECK(ui_thread_checker_.CalledOnValidThread());
++  DCHECK(!done_callback_);
++  native_operation_authorized_ = std::move(authorized);
++  native_register_cancellation_ = std::move(register_cancellation);
++  show_params_->native_operation_authorized = native_operation_authorized_;
++  show_params_->native_register_cancellation = native_register_cancellation_;
++}
++
++void ExtensionInstallPrompt::CancelNativeOperation() {
++  DCHECK(ui_thread_checker_.CalledOnValidThread());
++  // An icon reply must not create a prompt after cancellation. Once ownership
++  // moves to Views, its registered weak widget closure performs cancellation.
++  weak_factory_.InvalidateWeakPtrs();
++  if (done_callback_) {
++    std::move(done_callback_).Run(DoneCallbackPayload(Result::ABORTED));
++  }
++}
++
+ void ExtensionInstallPrompt::ShowDialog(
+     DoneCallback done_callback,
+     const Extension* extension,
+@@ -122,7 +143,31 @@
+   CHECK_NE(InstallPromptData::UNSET_PROMPT_TYPE, prompt_->type());
+ 
+   extension_ = extension;
+-  done_callback_ = std::move(done_callback);
++  done_callback_ = base::BindOnce(
++      [](base::RepeatingCallback<bool()> authorized, DoneCallback completion,
++         DoneCallbackPayload payload) {
++        // Also covers theme/autoconfirm paths which never create a widget.
++        if (authorized && !authorized.Run()) {
++          std::move(completion).Run(DoneCallbackPayload(Result::ABORTED));
++          return;
++        }
++        std::move(completion).Run(std::move(payload));
++      }, native_operation_authorized_, std::move(done_callback));
++  if (native_operation_authorized_ && !native_operation_authorized_.Run()) {
++    CancelNativeOperation();
++    return;
++  }
++  if (native_register_cancellation_) {
++    auto weak_this = weak_factory_.GetWeakPtr();
++    auto register_cancellation = native_register_cancellation_;
++    register_cancellation.Run(base::BindOnce(
++        &ExtensionInstallPrompt::CancelNativeOperation, weak_this));
++    // Registration can immediately cancel an already-revoked operation and
++    // release this prompt through its original completion callback.
++    if (!weak_this || !weak_this->done_callback_) {
++      return;
++    }
++  }
+   if (icon && !icon->empty())
+     SetIcon(icon);
+   custom_permissions_ = std::move(custom_permissions);
+@@ -259,6 +304,13 @@
+ }
+ 
+ void ExtensionInstallPrompt::ShowConfirmation() {
++  if (!done_callback_) {
++    return;
++  }
++  if (native_operation_authorized_ && !native_operation_authorized_.Run()) {
++    CancelNativeOperation();
++    return;
++  }
+   std::unique_ptr<const PermissionSet> permissions_to_display;
+ 
+   if (custom_permissions_.get()) {
+@@ -284,8 +336,12 @@
+   g_last_prompt_type_for_tests = prompt_->type();
+   did_call_show_dialog_ = true;
+ 
+-  // Notify observers.
++  // Notify observers. Native cancellation can reenter during notification.
++  auto weak_this = weak_factory_.GetWeakPtr();
+   prompt_->OnDialogOpened();
++  if (!weak_this || !weak_this->done_callback_) {
++    return;
++  }
+ 
+   // If true, auto confirm is enabled and already handled the result.
+   if (AutoConfirmPromptIfEnabled())
+--- a/chrome/browser/extensions/extension_install_prompt_show_params.h
++++ b/chrome/browser/extensions/extension_install_prompt_show_params.h
+@@ -7,6 +7,7 @@
+ 
+ #include <memory>
+ 
++#include "base/functional/callback.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/weak_ptr.h"
+ #include "extensions/buildflags/buildflags.h"
+@@ -46,6 +47,9 @@
+       const ExtensionInstallPromptShowParams&) = delete;
+ 
+   virtual ~ExtensionInstallPromptShowParams();
++
++  base::RepeatingCallback<bool()> native_operation_authorized;
++  base::RepeatingCallback<void(base::OnceClosure)> native_register_cancellation;
+ 
+   Profile* profile() {
+     return profile_;
+--- a/chrome/browser/ui/views/extensions/extension_install_dialog_view.cc
++++ b/chrome/browser/ui/views/extensions/extension_install_dialog_view.cc
+@@ -87,6 +87,13 @@
+     ExtensionInstallPrompt::DoneCallback done_callback,
+     std::unique_ptr<InstallPromptData> prompt) {
+   DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  auto authorized = show_params->native_operation_authorized;
++  auto register_cancellation = show_params->native_register_cancellation;
++  if ((authorized && !authorized.Run()) || show_params->WasParentDestroyed()) {
++    std::move(done_callback).Run(ExtensionInstallPrompt::DoneCallbackPayload(
++        ExtensionInstallPrompt::Result::ABORTED));
++    return;
++  }
+ 
+   // If the dialog has to be parented to WebContents, force activate the
+   // contents. See crbug.com/40059470.
+@@ -104,9 +111,29 @@
+   gfx::NativeWindow parent_window = show_params->GetParentWindow();
+   auto dialog = std::make_unique<ExtensionInstallDialogView>(
+       std::move(show_params), std::move(done_callback), std::move(prompt));
+-  constrained_window::CreateBrowserModalDialogViews(std::move(dialog),
+-                                                    parent_window)
+-      ->Show();
++  auto* widget = constrained_window::CreateBrowserModalDialogViews(
++      std::move(dialog), parent_window);
++  auto weak_widget = widget->GetWeakPtr();
++  if (register_cancellation) {
++    register_cancellation.Run(base::BindOnce(
++        [](base::WeakPtr<views::Widget> widget) {
++          if (widget && !widget->IsClosed()) {
++            if (auto* dialog = widget->widget_delegate()->AsDialogDelegate()) {
++              dialog->CancelDialog();
++            }
++          }
++        }, weak_widget));
++  }
++  if (!weak_widget || weak_widget->IsClosed()) {
++    return;
++  }
++  if (authorized && !authorized.Run()) {
++    if (weak_widget && !weak_widget->IsClosed()) {
++      weak_widget->widget_delegate()->AsDialogDelegate()->CancelDialog();
++    }
++    return;
++  }
++  weak_widget->Show();
+ }
+ 
+ }  // namespace
+@@ -396,6 +423,11 @@
+ 
+ void ExtensionInstallDialogView::OnDialogAccepted() {
+   DCHECK(done_callback_);
++  if (show_params_->native_operation_authorized &&
++      !show_params_->native_operation_authorized.Run()) {
++    OnDialogCanceled();
++    return;
++  }
+ 
+   // The dialog will be closed, so stop observing for any extension changes
+   // that could potentially crop up during that process (like the extension
+--- a/chrome/browser/extensions/extension_uninstall_dialog.h
++++ b/chrome/browser/extensions/extension_uninstall_dialog.h
+@@ -8,6 +8,7 @@
+ #include <memory>
+ #include <string>
+ 
++#include "base/functional/callback.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/weak_ptr.h"
+ #include "base/scoped_observation.h"
+@@ -74,6 +75,13 @@
+ 
+   ~ExtensionUninstallDialog() override;
+ 
++  // Native browser operations retain Chrome's consent UI and result callback.
++  // Validation and cancellation registration run only on the UI thread. The
++  // registration replaces the prior pending-icon/widget cancellation closure.
++  void SetNativeOperationCallbacks(
++      base::RepeatingCallback<bool()> authorized,
++      base::RepeatingCallback<void(base::OnceClosure)> register_cancellation);
++
+   // This is called to verify whether the uninstallation should proceed.
+   // Starts the process of showing a confirmation UI, which is split into two.
+   // 1) Set off a 'load icon' task.
+@@ -117,6 +125,15 @@
+   gfx::NativeWindow parent() { return parent_; }
+ 
+  private:
++  void CancelNativeOperation();
++  bool NativeOperationIsAuthorized() const;
++  base::RepeatingCallback<bool()> native_operation_authorized_;
++  base::RepeatingCallback<void(base::OnceClosure)> native_register_cancellation_;
++  bool native_operation_cancelled_ = false;
++  bool native_operation_completed_ = false;
++  bool native_dialog_creating_ = false;
++  bool native_dialog_visible_ = false;
++
+   // Uninstalls the extension. Returns true on success, and populates `error` on
+   // failure.
+   bool Uninstall(std::u16string* error);
+--- a/chrome/browser/extensions/extension_uninstall_dialog.cc
++++ b/chrome/browser/extensions/extension_uninstall_dialog.cc
+@@ -81,6 +81,45 @@
+ 
+ ExtensionUninstallDialog::~ExtensionUninstallDialog() = default;
+ 
++void ExtensionUninstallDialog::SetNativeOperationCallbacks(
++    base::RepeatingCallback<bool()> authorized,
++    base::RepeatingCallback<void(base::OnceClosure)> register_cancellation) {
++  DCHECK(thread_checker_.CalledOnValidThread());
++  DCHECK(!extension_);
++  native_operation_authorized_ = std::move(authorized);
++  native_register_cancellation_ = std::move(register_cancellation);
++}
++
++bool ExtensionUninstallDialog::NativeOperationIsAuthorized() const {
++  if (native_operation_cancelled_ || !profile_) {
++    return false;
++  }
++  if (!native_operation_authorized_) {
++    return true;
++  }
++  return native_operation_authorized_.Run() && extension_ &&
++      ExtensionRegistry::Get(profile_)->GetExtensionById(
++          extension_->id(), ExtensionRegistry::EVERYTHING) == extension_.get();
++}
++
++void ExtensionUninstallDialog::CancelNativeOperation() {
++  DCHECK(thread_checker_.CalledOnValidThread());
++  if (native_operation_completed_) {
++    return;
++  }
++  native_operation_cancelled_ = true;
++  // Show() can reenter through native widget creation. Its dialog model has
++  // no host yet, so defer Close() until that handoff has completed.
++  if (native_dialog_creating_) {
++    return;
++  }
++  if (native_dialog_visible_) {
++    Close();
++    return;
++  }
++  OnDialogClosed(CLOSE_ACTION_CANCELED);
++}
++
+ void ExtensionUninstallDialog::ConfirmUninstallByExtension(
+     const scoped_refptr<const Extension>& extension,
+     const scoped_refptr<const Extension>& triggering_extension,
+@@ -102,6 +141,19 @@
+   extension_ = extension;
+   uninstall_reason_ = reason;
+ 
++  if (native_register_cancellation_) {
++    auto weak_this = weak_ptr_factory_.GetWeakPtr();
++    auto register_cancellation = native_register_cancellation_;
++    register_cancellation.Run(base::BindOnce(
++        &ExtensionUninstallDialog::CancelNativeOperation, weak_this));
++    if (!weak_this || weak_this->native_operation_completed_) {
++      return;
++    }
++  }
++  if (native_operation_authorized_ && !NativeOperationIsAuthorized()) {
++    CancelNativeOperation();
++    return;
++  }
+   if (!profile_)
+     return;
+ 
+@@ -127,7 +179,7 @@
+ 
+ void ExtensionUninstallDialog::OnIconUpdated(ChromeAppIcon* icon) {
+   // Ignore initial update.
+-  if (!icon_ || dialog_shown_)
++  if (!icon_ || dialog_shown_ || native_operation_completed_)
+     return;
+   DCHECK_EQ(icon, icon_.get());
+ 
+@@ -138,13 +190,31 @@
+     return;
+   }
+ 
++  auto weak_this = weak_ptr_factory_.GetWeakPtr();
+   if (g_on_will_show_callback != nullptr) {
+     g_on_will_show_callback->Run();
+   }
++  if (!weak_this || weak_this->native_operation_completed_) {
++    return;
++  }
++  if (native_operation_authorized_ && !NativeOperationIsAuthorized()) {
++    CancelNativeOperation();
++    return;
++  }
+ 
+   switch (ScopedTestDialogAutoConfirm::GetAutoConfirmValue()) {
+     case ScopedTestDialogAutoConfirm::NONE:
++      native_dialog_creating_ = true;
+       Show();
++      if (!weak_this || weak_this->native_operation_completed_) {
++        return;
++      }
++      native_dialog_creating_ = false;
++      native_dialog_visible_ = true;
++      if (native_operation_cancelled_ ||
++          (native_operation_authorized_ && !NativeOperationIsAuthorized())) {
++        CancelNativeOperation();
++      }
+       break;
+     case ScopedTestDialogAutoConfirm::ACCEPT_AND_OPTION:
+       OnDialogClosed(CLOSE_ACTION_UNINSTALL_AND_CHECKBOX_CHECKED);
+@@ -168,14 +238,14 @@
+     return;
+ 
+   extension_uninstalled_early_ = true;
+-  Close();
++  CancelNativeOperation();
+ }
+ 
+ void ExtensionUninstallDialog::OnProfileWillBeDestroyed(Profile* profile) {
+   DCHECK_EQ(profile_, profile);
+   profile_ = nullptr;
+   profile_observation_.Reset();
+-  OnDialogClosed(CLOSE_ACTION_CANCELED);
++  CancelNativeOperation();
+ }
+ 
+ bool ExtensionUninstallDialog::ShouldShowCheckbox() const {
+@@ -183,6 +253,18 @@
+ }
+ 
+ void ExtensionUninstallDialog::OnDialogClosed(CloseAction action) {
++  DCHECK(thread_checker_.CalledOnValidThread());
++  if (native_operation_completed_) {
++    return;
++  }
++  // Gate BEFORE Uninstall(), report-abuse navigation, and delegate callbacks.
++  // An updated/reinstalled object with the same ID is a different operation.
++  if (native_operation_cancelled_ || !profile_ ||
++      (native_operation_authorized_ && !NativeOperationIsAuthorized())) {
++    action = CLOSE_ACTION_CANCELED;
++  }
++  native_operation_completed_ = true;
++  native_dialog_visible_ = false;
+   // Ensure the dialog isn't notified of an uninstallation after the dialog was
+   // closed.
+   registry_observation_.Reset();
+--- a/components/constrained_window/constrained_window_views.cc
++++ b/components/constrained_window/constrained_window_views.cc
+@@ -199,11 +199,10 @@
+         parent ? CurrentBrowserModalClient()->GetDialogHostView(parent)
+                : gfx::NativeView();
+     // Use with CEF windowless rendering.
+-    gfx::AcceleratedWidget parent_widget =
+-        parent ? CurrentBrowserModalClient()
+-                     ->GetModalDialogHost(parent)
+-                     ->GetAcceleratedWidget()
+-               : gfx::kNullAcceleratedWidget;
++    auto* parent_host = parent
++        ? CurrentBrowserModalClient()->GetModalDialogHost(parent) : nullptr;
++    gfx::AcceleratedWidget parent_widget = parent_host
++        ? parent_host->GetAcceleratedWidget() : gfx::kNullAcceleratedWidget;
+ 
+     // TODO(crbug.com/41493925): Remove will_use_custom_frame once native frame
+     // dialogs support autosize.
+@@ -343,11 +342,11 @@
+   }
+ #endif
+   // Use with CEF windowless rendering.
+-  gfx::AcceleratedWidget parent_widget = parent
+-                                             ? CurrentBrowserModalClient()
+-                                                   ->GetModalDialogHost(parent)
+-                                                   ->GetAcceleratedWidget()
+-                                             : gfx::kNullAcceleratedWidget;
++  // Native AppKit owners have a host view but no Chrome ModalDialogHost.
++  auto* parent_host = parent
++      ? CurrentBrowserModalClient()->GetModalDialogHost(parent) : nullptr;
++  gfx::AcceleratedWidget parent_widget = parent_host
++      ? parent_host->GetAcceleratedWidget() : gfx::kNullAcceleratedWidget;
+   views::Widget* widget = views::DialogDelegate::CreateDialogWidget(
+       dialog, gfx::NativeWindow(), parent_view, parent_widget);
+   widget->SetNativeWindowProperty(

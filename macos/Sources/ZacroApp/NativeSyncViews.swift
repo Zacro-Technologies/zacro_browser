@@ -8,6 +8,8 @@ struct NativeSyncSettingsView: View {
   @State private var expanded = false
   @State private var presenting = false
   @State private var busy = false
+  @State private var operationTask: Task<Void, Never>?
+  @State private var operationID = UUID()
   @State private var mode = ""
   @State private var error = ""
   @State private var modalError = ""
@@ -61,9 +63,9 @@ struct NativeSyncSettingsView: View {
           ForEach(model.sync["native"]["pending"].array, id:\.text) { entry in
             HStack(spacing:8) {
               Image(systemName:"puzzlepiece.extension")
-              Text(entry["extensionId"].string).font(.system(size:10)).lineLimit(2)
+              Text(entry["name"].string.isEmpty ? entry["extensionId"].string : entry["name"].string).font(.system(size:10)).lineLimit(2)
               Spacer(minLength:0)
-              Button("Review & install") { perform("native-install",payload:["id":entry["extensionId"]]) }
+              Button(reviewLabel(entry["action"].string)) { perform("native-review",payload:["review":entry]) }
                 .buttonStyle(NativeServiceButtonStyle(palette:palette)).disabled(busy)
             }
           }
@@ -95,9 +97,10 @@ struct NativeSyncSettingsView: View {
         }
       }.padding(.top,12).padding(.bottom,8)
     }.font(.system(size:12,weight:.semibold)).foregroundStyle(palette.ink).tint(palette.accent)
-      .sheet(isPresented:$presenting,onDismiss:clearSecrets) { dialog }
-      .onChange(of:profileID) { _,_ in presenting = false; clearSecrets(); error = "" }
-      .onChange(of:model.sync["state"]) { _,state in if state == "private" { presenting = false; clearSecrets() } }
+      .sheet(isPresented:$presenting,onDismiss: { cancelOperation(); clearSecrets() }) { dialog }
+      .onChange(of:profileID) { _,_ in cancelOperation(); presenting = false; clearSecrets(); error = "" }
+      .onDisappear { cancelOperation() }
+      .onChange(of:model.sync["state"]) { _,state in if state == "private" { dismissDialog() } }
   }
   @ViewBuilder private var accountButtons: some View {
     Button("Create account") { open("register") }.buttonStyle(NativeServiceButtonStyle(palette:palette,prominent:true))
@@ -159,7 +162,7 @@ struct NativeSyncSettingsView: View {
       HStack {
         Text(title).font(.system(size:16,weight:.semibold))
         Spacer()
-        Button { presenting = false } label: { Image(systemName:"xmark").font(.system(size:12)).frame(width:24,height:24) }.buttonStyle(.plain).accessibilityLabel("Close")
+        Button { dismissDialog() } label: { Image(systemName:"xmark").font(.system(size:12)).frame(width:24,height:24) }.buttonStyle(.plain).accessibilityLabel("Close")
       }
       if !description.isEmpty { Text(description).font(.system(size:12)).foregroundStyle(palette.muted).lineSpacing(3) }
       ScrollView {
@@ -170,7 +173,7 @@ struct NativeSyncSettingsView: View {
       HStack {
         if busy { ProgressView().controlSize(.small) }
         Spacer()
-        Button(mode == "recovery" ? "I saved my recovery codes" : mode == "devices" ? "Done" : "Cancel") { presenting = false }
+        Button(mode == "recovery" ? "I saved my recovery codes" : mode == "devices" ? "Done" : "Cancel") { dismissDialog() }
           .buttonStyle(NativeServiceButtonStyle(palette:palette))
         if !["devices","recovery"].contains(mode) {
           Button(submitTitle) { submit() }.buttonStyle(NativeServiceButtonStyle(palette:palette,prominent:true)).disabled(busy || !valid)
@@ -316,75 +319,93 @@ struct NativeSyncSettingsView: View {
     if ["register","login","recover"].contains(mode) { username = "" }
     presenting = true
   }
-  private func call(_ action:String,payload:ServiceJSON = [:]) async throws -> ServiceJSON {
-    try await model.syncAction("sync:" + action,payload:payload.merging(["profileId":.string(formProfile.isEmpty ? profileID : formProfile)]))
-  }
-  private func perform(_ action:String,payload:ServiceJSON = [:]) {
-    guard !busy else { return }; busy = true; error = ""; formProfile = profileID
-    Task {
-      defer { busy = false }
-      do { _ = try await call(action,payload:payload) } catch { self.error = error.localizedDescription }
+  private func reviewLabel(_ action: String) -> String {
+    switch action {
+    case "remove": return "Review removal"
+    case "enable": return "Review enabling"
+    case "disable": return "Review disabling"
+    default: return "Review installation"
     }
   }
+  private func call(_ action:String, payload:ServiceJSON = [:], profile:String) async throws -> ServiceJSON {
+    try Task.checkCancellation()
+    return try await model.syncAction("sync:" + action,payload:payload.merging(["profileId":.string(profile)]))
+  }
+  private func dismissDialog() { cancelOperation(); presenting = false; clearSecrets() }
+  private func cancelOperation() {
+    operationID = UUID(); operationTask?.cancel(); operationTask = nil; busy = false
+  }
+  private func run(_ operation: @escaping (String) async throws -> Void) {
+    guard !busy else { return }
+    busy = true; error = ""; formProfile = profileID
+    let profile = profileID, token = UUID(); operationID = token
+    operationTask = Task {
+      defer { if operationID == token { busy = false; operationTask = nil } }
+      do { try Task.checkCancellation(); try await operation(profile) }
+      catch {
+        guard operationID == token, profileID == profile, !Task.isCancelled, !(error is CancellationError) else { return }
+        if presenting { modalError = error.localizedDescription } else { self.error = error.localizedDescription }
+      }
+    }
+  }
+  private func perform(_ action:String,payload:ServiceJSON = [:]) {
+    run { profile in _ = try await call(action,payload:payload,profile:profile) }
+  }
   private func loadDevices() {
-    guard !busy else { return }; busy = true; formProfile = profileID
-    Task {
-      defer { busy = false }
-      do { let result = try await call("devices"); guard formProfile == profileID else { return }; records = result.array; open("devices") }
-      catch { self.error = error.localizedDescription }
+    run { profile in
+      let result = try await call("devices",profile:profile)
+      guard profile == profileID, !Task.isCancelled else { return }; records = result.array; open("devices")
     }
   }
   private func loadDatasets() {
-    guard !busy else { return }; busy = true; formProfile = profileID
-    Task {
-      defer { busy = false }
-      do { let result = try await call("datasets"); guard formProfile == profileID else { return }; records = result.array; selectedID = records.first?["id"].string ?? ""; name = ""; open("link") }
-      catch { self.error = error.localizedDescription }
+    run { profile in
+      let result = try await call("datasets",profile:profile)
+      guard profile == profileID, !Task.isCancelled else { return }; records = result.array; selectedID = records.first?["id"].string ?? ""; name = ""; open("link")
     }
   }
   private func review(_ id:String,libraryOnly:Bool = false) {
-    guard !busy else { return }; busy = true; formProfile = profileID
-    Task {
-      defer { busy = false }
-      do {
-        let result = try await call("link-preview",payload:["datasetId":.string(id)])
-        guard formProfile == profileID else { return }; preview = result; selectedID = id; open(libraryOnly ? "library" : "review")
-      } catch { if presenting { modalError = error.localizedDescription } else { self.error = error.localizedDescription } }
+    run { profile in
+      let result = try await call("link-preview",payload:["datasetId":.string(id)],profile:profile)
+      guard profile == profileID, !Task.isCancelled else { return }; preview = result; selectedID = id; open(libraryOnly ? "library" : "review")
     }
   }
   private func submit() {
-    guard !busy, valid, formProfile == profileID else { return }; busy = true; modalError = ""
+    guard !busy, valid, formProfile == profileID else { return }; modalError = ""
     let originalMode = mode
-    Task {
-      defer { busy = false }
-      do {
-        let result: ServiceJSON
-        switch originalMode {
-        case "configure": result = try await call("configure",payload:["endpoint":.string(endpoint)])
-        case "register","login": result = try await call(originalMode,payload:["username":.string(username),"password":.string(password),"deviceName":.string(deviceName)])
-        case "recover": result = try await call("recover",payload:["username":.string(username),"recoveryCode":.string(recoveryCode),"newPassword":.string(newPassword),"deviceName":.string(deviceName)])
-        case "password": result = try await call("password",payload:["password":.string(password),"newPassword":.string(newPassword)])
-        case "codes": result = try await call("recovery-codes",payload:["password":.string(password)])
-        case "delete-account","delete-dataset": result = try await call(originalMode,payload:["id":.string(selectedID),"password":.string(password),"confirm":.bool(confirm)])
-        case "rename-device": result = try await call("rename-device",payload:["id":.string(selectedID),"name":.string(name)])
-        case "revoke-device": result = try await call("revoke-device",payload:["id":.string(selectedID)])
-        case "discard": result = try await call("discard",payload:["id":.string(selectedID)])
-        case "settings": result = try await call("settings",payload:["enabled":true,"settingsConsent":.bool(settingsEnabled),"settingsChoice":.string(settingsChoice)])
-        case "library": result = try await call("library",payload:["enabled":true,"libraryChoice":.string(libraryChoice)])
-        case "review": result = try await call("link",payload:["datasetId":.string(selectedID),"libraryChoice":.string(libraryChoice),"librarySync":.bool(libraryEnabled),"settingsSync":.bool(settingsEnabled),"settingsConsent":.bool(settingsEnabled),"settingsChoice":.string(settingsChoice)])
-        case "link":
-          let dataset = try await call("create-dataset",payload:["name":.string(name)])
-          let reviewed = try await call("link-preview",payload:["datasetId":dataset["id"]])
-          guard formProfile == profileID else { return }; preview = reviewed; selectedID = dataset["id"].string; mode = "review"; return
-        default: return
-        }
-        guard formProfile == profileID else { return }
-        password = ""; newPassword = ""; recoveryCode = ""
-        if !result["recoveryCodes"].array.isEmpty { recoveryCodes = result["recoveryCodes"].array.map(\.string); mode = "recovery" }
-        else if ["rename-device","revoke-device"].contains(originalMode), signedIn {
-          records = try await call("devices").array; mode = "devices"
-        } else { presenting = false }
-      } catch { if formProfile == profileID { modalError = error.localizedDescription } }
+    // Capture the submitted form before suspension. Dismissal clears secrets
+    // and later edits belong to a different request, never this one.
+    let request: (String, ServiceJSON)
+    switch originalMode {
+    case "configure": request = ("configure",["endpoint":.string(endpoint)])
+    case "register","login": request = (originalMode,["username":.string(username),"password":.string(password),"deviceName":.string(deviceName)])
+    case "recover": request = ("recover",["username":.string(username),"recoveryCode":.string(recoveryCode),"newPassword":.string(newPassword),"deviceName":.string(deviceName)])
+    case "password": request = ("password",["password":.string(password),"newPassword":.string(newPassword)])
+    case "codes": request = ("recovery-codes",["password":.string(password)])
+    case "delete-account","delete-dataset": request = (originalMode,["id":.string(selectedID),"password":.string(password),"confirm":.bool(confirm)])
+    case "rename-device": request = ("rename-device",["id":.string(selectedID),"name":.string(name)])
+    case "revoke-device": request = ("revoke-device",["id":.string(selectedID)])
+    case "discard": request = ("discard",["id":.string(selectedID)])
+    case "settings": request = ("settings",["enabled":true,"settingsConsent":.bool(settingsEnabled),"settingsChoice":.string(settingsChoice)])
+    case "library": request = ("library",["enabled":true,"libraryChoice":.string(libraryChoice)])
+    case "review": request = ("link",["datasetId":.string(selectedID),"libraryChoice":.string(libraryChoice),"librarySync":.bool(libraryEnabled),"settingsSync":.bool(settingsEnabled),"settingsConsent":.bool(settingsEnabled),"settingsChoice":.string(settingsChoice)])
+    case "link": request = ("create-dataset",["name":.string(name)])
+    default: return
+    }
+    run { profile in
+      let result = try await call(request.0,payload:request.1,profile:profile)
+      guard profile == profileID, !Task.isCancelled else { return }
+      if originalMode == "link" {
+        let reviewed = try await call("link-preview",payload:["datasetId":result["id"]],profile:profile)
+        guard profile == profileID, !Task.isCancelled else { return }
+        preview = reviewed; selectedID = result["id"].string; mode = "review"; return
+      }
+      password = ""; newPassword = ""; recoveryCode = ""
+      if !result["recoveryCodes"].array.isEmpty { recoveryCodes = result["recoveryCodes"].array.map(\.string); mode = "recovery" }
+      else if ["rename-device","revoke-device"].contains(originalMode), signedIn {
+        let devices = try await call("devices",profile:profile).array
+        guard profile == profileID, !Task.isCancelled else { return }
+        records = devices; mode = "devices"
+      } else { presenting = false }
     }
   }
 }

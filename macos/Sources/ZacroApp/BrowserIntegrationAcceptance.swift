@@ -802,6 +802,10 @@ final class BrowserIntegrationAcceptance {
       try await checkParkedSidePanel(manager: manager, identifier: identifier, worker: worker,
                                     owner: owner, url: url)
       _ = try await worker.evaluate("zacroAcceptance.setPanelEventObservation(true)")
+      for (name, passed) in try await NativeManagementAcceptance.check(
+        manager: manager, identifier: identifier, owner: owner.windowContext) {
+        try require(passed, name)
+      }
       extensionFixturePassed = true
       await worker.close()
     } catch {

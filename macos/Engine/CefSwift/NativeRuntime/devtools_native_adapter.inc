@@ -15,6 +15,7 @@
 #include "chrome/browser/devtools/devtools_window.h"
 #include "chrome/browser/browser_process.h"
 #include "chrome/browser/extensions/browser_window_util.h"
+#include "chrome/browser/extensions/native_management_operation.h"
 #include "chrome/browser/extensions/api/side_panel/side_panel_service.h"
 #include "chrome/browser/extensions/webstore_install_with_prompt.h"
 #include "chrome/browser/profiles/profile.h"
@@ -55,6 +56,7 @@ void ZacroRefreshSidePanelPresentation(content::WebContents* contents);
 #include "cef/libcef/browser/devtools/zacro_topology_adapter.inc"
 #include "cef/libcef/browser/devtools/zacro_bookmarks_adapter.inc"
 #include "cef/libcef/browser/devtools/zacro_downloads_adapter.inc"
+#include "cef/libcef/browser/devtools/zacro_management_adapter.inc"
 
 namespace {
 constexpr char kZacroBrowserSession[] = "zacro.native.browser.v1";
@@ -377,6 +379,7 @@ bool CefDevToolsController::DispatchZacro(const std::string_view& message) {
   if (DispatchZacroExtensions(*id, *method, request->FindDict("params"))) return true;
   if (DispatchZacroBookmarks(*id, *method, request->FindDict("params"))) return true;
   if (DispatchZacroDownloads(*id, *method, request->FindDict("params"))) return true;
+  if (DispatchZacroManagement(*id, *method, request->FindDict("params"))) return true;
   if (*method == "Zacro.getExtensionOptions") {
     const auto* params = request->FindDict("params");
     const auto* extension_id = params ? params->FindString("id") : nullptr;
@@ -472,27 +475,6 @@ bool CefDevToolsController::DispatchZacro(const std::string_view& message) {
               extension && error.empty() ? "" : (error.empty() ? "Chromium rejected the unpacked extension." : base::UTF16ToUTF8(error)));
         }, weak_ptr_factory_.GetWeakPtr(), *id));
     installer->Load(directory); return true;
-  }
-  if (*method == "Zacro.installWebStoreExtension") {
-    const auto* params = request->FindDict("params");
-    const auto* extension_id = params ? params->FindString("id") : nullptr;
-    auto* context = inspected_contents_->GetBrowserContext();
-    if (context->IsOffTheRecord() || !extension_id || extension_id->size() != 32 ||
-        !std::ranges::all_of(*extension_id, [](char ch) { return ch >= 'a' && ch <= 'p'; })) {
-      ReplyZacro(*id, {}, "Choose a valid Web Store extension in a persistent profile."); return true;
-    }
-    // This native installer verifies the store response, CRX signature, item
-    // identity and permissions. Its dialog is centered rather than attached to
-    // the deliberately hidden management document's native child window.
-    auto installer = base::MakeRefCounted<extensions::WebstoreInstallWithPrompt>(
-        *extension_id, Profile::FromBrowserContext(context), gfx::NativeWindow(),
-        base::BindOnce([](base::WeakPtr<CefDevToolsController> self, int id,
-            bool success, const std::string& error, extensions::webstore_install::Result) {
-          if (self) self->ReplyZacro(id, base::DictValue().Set("installed", success),
-              success ? "" : (error.empty() ? "The Web Store installation was cancelled." : error));
-        }, weak_ptr_factory_.GetWeakPtr(), *id));
-    installer->BeginInstall();
-    return true;
   }
   if (*method == "Zacro.getExtensionShortcuts") {
     auto* context = inspected_contents_->GetBrowserContext();

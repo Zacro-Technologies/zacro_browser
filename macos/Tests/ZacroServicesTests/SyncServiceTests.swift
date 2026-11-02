@@ -2,6 +2,47 @@ import XCTest
 @testable import ZacroServices
 
 final class SyncServiceTests: XCTestCase {
+  func testExtensionConsentIntentSurvivesRestartAndPendingReviewDoesNotConsumeIt() async throws {
+    let root = try directory(), server = FixtureSyncServer(), secrets = MemorySecrets()
+    let first = try client(root,server:server,secrets:secrets)
+    try await signIn(first); try await link(first)
+    let intents = try await first.extensionIntents(profileID:"personal")
+    let intent = try XCTUnwrap(intents.first), review = try NativeExtensionReview(intent:intent,action:.install)
+    let before = await first.status()
+    for _ in 0..<3 { expectTrue(await first.isCurrentExtensionIntent(review.intent)) }
+    expectEqual(await first.status(),before)
+    await first.close()
+    let reopened = try client(root,server:server,secrets:secrets); await reopened.start()
+    let restored = try await reopened.extensionIntents(profileID:"personal")
+    XCTAssertEqual(restored,[intent]); expectTrue(await reopened.isCurrentExtensionIntent(review.intent))
+    expectEqual(await reopened.status()["profiles"].array.first?["linkId"],intent["linkId"])
+    _ = try await reopened.setLibrarySync("personal",enabled:false,options:[:])
+    expectFalse(await reopened.isCurrentExtensionIntent(review.intent))
+    await reopened.close()
+  }
+  func testExtensionReviewRejectsChangedStateReinstallAndRelinkToSameDataset() async throws {
+    let client = try client(directory(),server:FixtureSyncServer())
+    try await signIn(client); try await link(client)
+    let original = try await client.extensionIntents(profileID:"personal")[0]
+    try await client.queueExtension(profileID:"personal",item:item.merging(["state":"disabled"]))
+    expectFalse(await client.isCurrentExtensionIntent(original))
+    let disabled = try await client.extensionIntents(profileID:"personal")[0]
+    expectTrue(await client.isCurrentExtensionIntent(disabled))
+    try await client.queueExtension(profileID:"personal",item:item.merging(["state":"removed"]))
+    expectFalse(await client.isCurrentExtensionIntent(disabled))
+    let removed = try await client.extensionIntents(profileID:"personal")[0]
+    _ = try NativeExtensionReview(intent:removed,action:.remove)
+    try await client.queueExtension(profileID:"personal",item:item)
+    expectFalse(await client.isCurrentExtensionIntent(removed))
+    expectFalse(await client.isCurrentExtensionIntent(original))
+    let installed = try await client.extensionIntents(profileID:"personal")[0]
+    _ = try await client.unlinkProfile("personal"); try await link(client)
+    let relinked = try await client.extensionIntents(profileID:"personal")[0]
+    expectFalse(await client.isCurrentExtensionIntent(installed))
+    XCTAssertNotEqual(installed["linkId"],relinked["linkId"])
+    expectEqual(await client.status()["profiles"].array[0]["linkId"],relinked["linkId"])
+    await client.close()
+  }
   func testWindowStatusDoesNotChangeFocusAndStaleControlsCannotMutateAccount() async throws {
     let root = try directory(), current = FixtureProfile(), server = FixtureSyncServer()
     let client = try NativeSyncClient(directory: root,

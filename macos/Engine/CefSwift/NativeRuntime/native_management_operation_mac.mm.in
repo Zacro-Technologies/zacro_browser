@@ -1,0 +1,13 @@
+#import <AppKit/AppKit.h>
+#include "chrome/browser/extensions/native_management_operation.h"
+
+namespace extensions {
+gfx::NativeWindow NativeManagementWindowForNumber(int number, int logical_window_id) {
+  if (number <= 0 || logical_window_id <= 0) return gfx::NativeWindow();
+  NSWindow* window = [NSApp windowWithWindowNumber:number];
+  NSString* identity = [NSString stringWithFormat:@"ZacroBrowserWindow:%d", logical_window_id];
+  if (!window || !window.visible || window.miniaturized || window.attachedSheet ||
+      NSApp.modalWindow || ![window.identifier isEqualToString:identity]) return gfx::NativeWindow();
+  return gfx::NativeWindow(window);
+}
+}  // namespace extensions

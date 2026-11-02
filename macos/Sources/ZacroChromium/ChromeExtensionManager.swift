@@ -1,6 +1,23 @@
 import AppKit
 import Foundation
 
+@MainActor private final class ChromeManagementCancellation {
+  let browser: CefBrowser
+  let operationID: String
+  private var task: Task<Void, Never>?
+  init(browser: CefBrowser, operationID: String) {
+    self.browser = browser; self.operationID = operationID
+  }
+  func cancel() {
+    guard task == nil else { return }
+    task = Task { [browser, operationID] in
+      _ = try? await browser.devTools.call("Zacro.cancelExtensionManagement",
+        parameters: ["operationID": operationID], timeout: 10)
+    }
+  }
+  func cancelAndWait() async { cancel(); await task?.value }
+}
+
 public struct ChromeExtension: Decodable, Identifiable, Sendable {
   public struct Permission: Decodable, Sendable {
     public let message: String
@@ -152,12 +169,15 @@ public enum ChromeExtensionEvent {
 public enum ChromeExtensionError: Error, LocalizedError {
   case invalidIdentifier, managementUnavailable, invalidResponse
   case loadFailed(String)
+  case reviewRequired(String), operationCancelled
   public var errorDescription: String? {
     switch self {
     case .invalidIdentifier: return "The extension identifier is invalid."
     case .managementUnavailable: return "Chromium's extension manager is unavailable in this profile."
     case .invalidResponse: return "Chromium returned an invalid extension response."
     case .loadFailed(let message): return message
+    case .reviewRequired(let message): return message
+    case .operationCancelled: return "The extension change was cancelled."
     }
   }
 }
@@ -459,9 +479,8 @@ public final class ChromeExtensionManager {
   }
 
   /// Uses Chromium's verified Web Store installer and native permission UI.
-  public func installWebStoreExtension(_ identifier: String) async throws {
-    try validate(identifier)
-    _ = try await nativeBrowser().devTools.call("Zacro.installWebStoreExtension", parameters: ["id": identifier], timeout: 120)
+  public func installWebStoreExtension(_ identifier: String, ownerWindowID: String) async throws {
+    try await performManagement("install", identifier: identifier, ownerWindowID: ownerWindowID)
   }
 
   /// The native installer uses this manager's real profile, including policy
@@ -596,15 +615,59 @@ public final class ChromeExtensionManager {
       "x": rect.minX, "y": rect.minY, "width": rect.width, "height": rect.height]
   }
 
-  public func setEnabled(_ identifier: String, enabled: Bool) async throws {
-    try validate(identifier)
-    try await invoke("management.setEnabled", [identifier, enabled], userGesture: true)
+  public func setEnabled(_ identifier: String, enabled: Bool, ownerWindowID: String? = nil) async throws {
+    try await performManagement(enabled ? "enable" : "disable", identifier: identifier, ownerWindowID: ownerWindowID)
   }
 
   /// Chromium presents its own uninstall confirmation and propagates Cancel.
-  public func uninstall(_ identifier: String) async throws {
+  public func uninstall(_ identifier: String, ownerWindowID: String) async throws {
+    try await performManagement("uninstall", identifier: identifier, ownerWindowID: ownerWindowID)
+  }
+
+  private func performManagement(_ operation: String, identifier: String, ownerWindowID: String?) async throws {
     try validate(identifier)
-    try await invoke("management.uninstall", [identifier, ["showConfirmDialog": true]], userGesture: true, timeout: 120)
+    let owner = ownerWindowID.flatMap { engine.context(id: $0) }
+    let nativeIdentity = owner?.nativeID
+    if ownerWindowID != nil {
+      guard let owner, owner.isOpen, !owner.isClosing, owner.window.isVisible else {
+        throw ChromeExtensionError.operationCancelled
+      }
+    }
+    let browser = try await nativeBrowser()
+    try Task.checkCancellation()
+    if let ownerWindowID {
+      guard let owner, engine.context(id: ownerWindowID) === owner, owner.isOpen,
+        !owner.isClosing, owner.nativeID == nativeIdentity, owner.window.isVisible else {
+        throw ChromeExtensionError.operationCancelled
+      }
+    }
+    let operationID = UUID().uuidString.lowercased()
+    var parameters: [String: Any] = ["operationID": operationID, "action": operation, "id": identifier]
+    if let owner {
+      parameters["windowNumber"] = owner.window.windowNumber
+      parameters["windowID"] = owner.nativeID
+    }
+    let cancellation = ChromeManagementCancellation(browser: browser, operationID: operationID)
+    do {
+      let response = try await withTaskCancellationHandler {
+        try await browser.devTools.call("Zacro.extensionManagement", parameters: parameters, timeout: 600)
+      } onCancel: {
+        Task { @MainActor in cancellation.cancel() }
+      }
+      if response["reviewRequired"] as? Bool == true {
+        throw ChromeExtensionError.reviewRequired(response["message"] as? String ?? "Review this extension change in its browser window.")
+      }
+      if response["cancelled"] as? Bool == true { throw ChromeExtensionError.operationCancelled }
+      guard response["completed"] as? Bool == true else { throw ChromeExtensionError.invalidResponse }
+      try Task.checkCancellation()
+    } catch {
+      // A lost/abandoned protocol reply is not authority for a later mutation.
+      // The token is known before dispatch, so cancellation can always revoke
+      // the exact native operation, including a still-open Chrome prompt.
+      await cancellation.cancelAndWait()
+      if Task.isCancelled { throw CancellationError() }
+      throw error
+    }
   }
 
   public func reload(_ identifier: String) async throws {

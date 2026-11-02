@@ -1,0 +1,88 @@
+// Native shell ownership for one genuine Chromium management invocation.
+#ifndef CHROME_BROWSER_EXTENSIONS_NATIVE_MANAGEMENT_OPERATION_H_
+#define CHROME_BROWSER_EXTENSIONS_NATIVE_MANAGEMENT_OPERATION_H_
+
+#include <memory>
+#include <string>
+#include "base/functional/callback.h"
+#include "base/memory/raw_ptr.h"
+#include "base/memory/ref_counted.h"
+#include "base/memory/weak_ptr.h"
+#include "base/timer/timer.h"
+#include "base/values.h"
+#include "content/public/browser/weak_document_ptr.h"
+#include "content/public/browser/web_contents_observer.h"
+#include "ui/gfx/native_ui_types.h"
+
+class ExtensionFunction;
+class ExtensionInstallPrompt;
+class Profile;
+namespace ui { class NativeWindowTracker; }
+namespace extensions {
+class Extension;
+class ExtensionUninstallDialog;
+
+class NativeManagementOperation final
+    : public base::RefCounted<NativeManagementOperation>,
+      public content::WebContentsObserver {
+ public:
+  using Completion = base::OnceCallback<void(bool, bool, std::string)>;
+  using CancelRegistration = base::RepeatingCallback<void(base::OnceClosure)>;
+  static scoped_refptr<NativeManagementOperation> Create(
+      content::WebContents* manager, const std::string& target_id,
+      const std::string& action, int native_window_number, int logical_window_id,
+      std::string& error);
+  static bool RequiresReview(Profile* profile, const Extension* target,
+                             const std::string& action);
+  // Called only while the native dispatcher synchronously constructs this
+  // operation's original function. Other renderer requests cannot claim it.
+  static bool BindCurrentInvocation(ExtensionFunction* function);
+  static base::WeakPtr<NativeManagementOperation> ForFunction(
+      const ExtensionFunction* function);
+  static bool FunctionIsValid(const ExtensionFunction* function);
+  static void FunctionCompleted(const ExtensionFunction* function);
+
+  bool IsValid() const;
+  bool cancelled() const { return cancelled_; }
+  gfx::NativeWindow parent() const { return parent_; }
+  base::WeakPtr<NativeManagementOperation> GetWeakPtr() { return weak_.GetWeakPtr(); }
+  base::RepeatingCallback<bool()> Validator();
+  CancelRegistration CancellationRegistration();
+  void ConfigurePrompt(ExtensionInstallPrompt* prompt);
+  void ConfigureUninstallDialog(ExtensionUninstallDialog* dialog);
+  void SetCompletion(Completion completion);
+  void Dispatch(const std::string& method, base::ListValue arguments);
+  void Complete(bool success, std::string error);
+  void Cancel();
+  void SetCancellation(base::OnceClosure cancellation);
+  void WebContentsDestroyed() override;
+
+ private:
+  friend class base::RefCounted<NativeManagementOperation>;
+  NativeManagementOperation(content::WebContents* manager,
+      const Extension* target, std::string target_id, std::string action,
+      gfx::NativeWindow parent);
+  ~NativeManagementOperation() override;
+  void UnbindFunction();
+  raw_ptr<Profile> profile_;
+  const scoped_refptr<const Extension> target_;
+  const std::string target_id_;
+  const std::string action_;
+  const content::WeakDocumentPtr document_;
+  const gfx::NativeWindow parent_;
+  std::unique_ptr<ui::NativeWindowTracker> window_tracker_;
+  std::string function_uuid_;
+  bool cancelled_ = false;
+  bool completed_ = false;
+  bool dispatched_ = false;
+  Completion completion_;
+  base::OnceClosure cancel_widget_;
+  base::RepeatingTimer validity_timer_;
+  base::WeakPtrFactory<NativeManagementOperation> weak_{this};
+};
+
+// Defined by the platform adapter. Only windows in the current native process
+// may be used; no raw pointer is accepted from the host protocol.
+gfx::NativeWindow NativeManagementWindowForNumber(int number, int logical_window_id);
+}  // namespace extensions
+#endif
