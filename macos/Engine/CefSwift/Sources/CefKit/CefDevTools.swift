@@ -132,12 +132,13 @@ public final class CefDevTools {
     /// Returns the evaluated value by copy. A rejected promise or JavaScript
     /// exception is an error; it is never presented as an empty successful value.
     public func evaluate(
-        _ expression: String, userGesture: Bool = false, timeout: TimeInterval = 15
+        _ expression: String, userGesture: Bool = false, timeout: TimeInterval = 15,
+        sessionID: String? = nil
     ) async throws -> Any? {
         let response = try await call("Runtime.evaluate", parameters: [
             "expression": expression, "returnByValue": true, "awaitPromise": true,
             "userGesture": userGesture,
-        ], timeout: timeout)
+        ], timeout: timeout, sessionID: sessionID)
         return try value(from: response)
     }
 

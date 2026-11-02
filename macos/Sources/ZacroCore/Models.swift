@@ -142,6 +142,9 @@ public struct SavedPeek: Codable, Equatable, Sendable {
 }
 public struct BrowserTab: Codable, Identifiable, Equatable, Sendable {
   public var id: String
+  /// Persistent logical shell identity. Native Chromium/window IDs are process-local.
+  public var windowID: String?
+  public var groupID: String?
   public var spaceID: String
   public var folderID: String?
   public var url: String
@@ -356,6 +359,7 @@ public struct BrowserState: Codable, Equatable, Sendable {
   public var tabs: [BrowserTab] = []
   public var folders: [BrowserFolder] = []
   public var splits: [SplitGroup] = []
+  public var tabGroups: [BrowserTabGroup] = []
   public var history: [HistoryEntry] = []
   public var bookmarks: [Bookmark] = []
   public var archive: [ArchivedTab] = []
@@ -363,6 +367,8 @@ public struct BrowserState: Codable, Equatable, Sendable {
   public var permissions: [WebsitePermission] = []
   public var settings = BrowserSettings()
   public var windowBounds = BrowserWindowBounds()
+  public var windowSessions: [BrowserWindowSession]?
+  public var focusedWindowID: String?
   public var activeSpaceID: String
   public var activeTabID: String?
   public var activeSpace: BrowserSpace? { spaces.first { $0.id == activeSpaceID } }
@@ -374,8 +380,8 @@ public struct BrowserState: Codable, Equatable, Sendable {
     activeSpaceID = "home"
   }
   private enum CodingKeys: String, CodingKey {
-    case version, profiles, spaces, tabs, folders, splits, history, bookmarks, archive, downloads,
-      permissions, settings, windowBounds, activeSpaceID, activeTabID
+    case version, profiles, spaces, tabs, folders, splits, tabGroups, history, bookmarks, archive, downloads,
+      permissions, settings, windowBounds, windowSessions, focusedWindowID, activeSpaceID, activeTabID
   }
   public init(from decoder: Decoder) throws {
     self.init()
@@ -387,6 +393,7 @@ public struct BrowserState: Codable, Equatable, Sendable {
     tabs = try c.decodeIfPresent([BrowserTab].self, forKey: .tabs) ?? []
     folders = try c.decodeIfPresent([BrowserFolder].self, forKey: .folders) ?? []
     splits = try c.decodeIfPresent([SplitGroup].self, forKey: .splits) ?? []
+    tabGroups = try c.decodeIfPresent([BrowserTabGroup].self, forKey: .tabGroups) ?? []
     history = try c.decodeIfPresent([HistoryEntry].self, forKey: .history) ?? []
     bookmarks = try c.decodeIfPresent([Bookmark].self, forKey: .bookmarks) ?? []
     archive = try c.decodeIfPresent([ArchivedTab].self, forKey: .archive) ?? []
@@ -394,6 +401,8 @@ public struct BrowserState: Codable, Equatable, Sendable {
     permissions = try c.decodeIfPresent([WebsitePermission].self, forKey: .permissions) ?? []
     settings = try c.decodeIfPresent(BrowserSettings.self, forKey: .settings) ?? settings
     windowBounds = try c.decodeIfPresent(BrowserWindowBounds.self, forKey: .windowBounds) ?? windowBounds
+    windowSessions = try c.decodeIfPresent([BrowserWindowSession].self, forKey: .windowSessions)
+    focusedWindowID = try c.decodeIfPresent(String.self, forKey: .focusedWindowID)
     activeSpaceID = try c.decodeIfPresent(String.self, forKey: .activeSpaceID) ?? activeSpaceID
     activeTabID = try c.decodeIfPresent(String.self, forKey: .activeTabID)
   }

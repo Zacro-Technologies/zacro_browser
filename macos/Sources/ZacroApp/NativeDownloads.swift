@@ -12,7 +12,7 @@ final class NativeDownloads {
   private var reservations = Set<String>()
   private var publication: [String: Date] = [:]
   private var sourceTabs: [String: String] = [:]
-  var onStarted: () -> Void = {}
+  var onStarted: (String) -> Void = { _ in }
   init(store: BrowserStore, engine: ChromiumEngine) { self.store = store; self.engine = engine }
   func install() {
     engine.onDownload = { [weak self] profile, isPrivate, download in self?.update(profile, isPrivate, download) }
@@ -31,7 +31,7 @@ final class NativeDownloads {
       sourceTabs[id] = source.id
       var record = DownloadRecord(id: id, profileID: profile, url: download.url?.absoluteString ?? "", filename: path.lastPathComponent, path: path.path)
       record.sourceURL = source.url; record.sourceTitle = source.displayTitle
-      store.recordDownload(record); onStarted()
+      store.recordDownload(record); onStarted(source.id)
       return .allow(destination: path)
     }
     return .deny
@@ -58,12 +58,12 @@ final class NativeDownloads {
       if let path = record.path { reservations.remove(path) }; nativeIDs.removeValue(forKey: id)
     }
   }
-  func record(_ id: String) throws -> DownloadRecord {
-    guard let value = store.state.downloads.first(where: { $0.id == id && $0.profileID == store.activeProfileID }) else { throw ShortcutError("This download is not available in this profile.") }
+  func record(_ id: String, profileID: String? = nil) throws -> DownloadRecord {
+    guard let value = store.state.downloads.first(where: { $0.id == id && $0.profileID == (profileID ?? store.activeProfileID) }) else { throw ShortcutError("This download is not available in this profile.") }
     return value
   }
-  func perform(_ action: String, id: String, name: String = "") throws {
-    var value = try record(id)
+  func perform(_ action: String, id: String, name: String = "", profileID: String? = nil) throws {
+    var value = try record(id, profileID: profileID)
     if ["download:pause", "download:resume", "download:cancel"].contains(action) {
       guard let native = nativeIDs[id] else { throw ShortcutError("This download is no longer running. Download it again from the source page.") }
       let success: Bool

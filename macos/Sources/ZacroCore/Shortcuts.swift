@@ -58,7 +58,7 @@ public struct BrowserShortcut: Equatable, Identifiable, Sendable {
     .init(id: "shortcuts", title: "Keyboard shortcuts", category: "Browser", accelerator: "Mod+Alt+K", aliases: []),
     .init(id: "browser-menu", title: "Browser menu", category: "Browser", accelerator: "", aliases: []),
     .init(id: "onboarding", title: "Welcome tour", category: "Browser", accelerator: "", aliases: []),
-    .init(id: "open-browser", title: "Open browser window", category: "Browser", accelerator: "Mod+N", aliases: []),
+    .init(id: "open-browser", title: "New window", category: "Browser", accelerator: "Mod+N", aliases: []),
     .init(id: "close-window", title: "Close window", category: "Browser", accelerator: "Mod+Shift+W", aliases: []),
     .init(id: "fullscreen", title: "Toggle full screen", category: "Browser", accelerator: "Ctrl+Mod+F", aliases: []),
     .init(id: "developer-tools", title: "Developer tools", category: "Browser", accelerator: "Mod+Alt+I", aliases: []),

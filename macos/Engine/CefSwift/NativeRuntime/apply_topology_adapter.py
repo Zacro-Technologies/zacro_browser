@@ -19,7 +19,8 @@ CEF_PIN = "4fa4ab516dac"
 PATHS = ("extensions/browser/extension_function.h", "extensions/browser/extension_function.cc",
          "extensions/browser/event_router.h", "extensions/browser/event_router.cc",
          "chrome/browser/extensions/extension_tab_util.h", "chrome/browser/extensions/extension_tab_util.cc",
-         "chrome/browser/extensions/api/messaging/chrome_messaging_delegate.cc")
+         "chrome/browser/extensions/api/messaging/chrome_messaging_delegate.cc",
+         "chrome/browser/extensions/api/debugger/debugger_api.cc")
 
 def replace(text, old, new):
     if text.count(old) != 1:
@@ -95,7 +96,7 @@ void EventRouter::DispatchEventImpl(const std::string& restrict_to_extension_id,
   if (native && !native.Run(browser_context_, *event)) return;
   event->dispatch_start_time = base::TimeTicks::Now();""")
     ec = replace(ec, "  copy->exclude_process_id = exclude_process_id;", "  copy->native_host_topology = native_host_topology;\n  copy->exclude_process_id = exclude_process_id;")
-    th, tc, messaging = (originals[p] for p in PATHS[4:])
+    th, tc, messaging = (originals[p] for p in PATHS[4:7])
     th = replace(th, '  static constexpr char kTabsKey[] = "tabs";', '''  static constexpr char kTabsKey[] = "tabs";
   using NativeTabDecorator = base::RepeatingCallback<bool(
       content::WebContents*, api::tabs::Tab*)>;
@@ -132,7 +133,31 @@ int ExtensionTabUtil::GetWindowId(BrowserWindowInterface* browser) {''')
   ScrubTabForExtension(extension, contents, &tab_object, scrub_tab_behavior);''')
     messaging = replace(messaging, "  if (web_contents && ExtensionTabUtil::GetTabId(web_contents) >= 0) {", '''  if (web_contents && ExtensionTabUtil::GetTabId(web_contents) >= 0 &&
       ExtensionTabUtil::IsVisibleToNativeBrowserModel(web_contents)) {''')
-    return dict(zip(PATHS, (h, c, eh, ec, th, tc, messaging)))
+    debugger = originals[PATHS[7]]
+    debugger = replace(debugger, """bool ExtensionMayAttachToWebContents(const Extension& extension,
+                                     Profile* extension_profile,
+                                     WebContents& web_contents,
+                                     std::string* error) {
+""", """bool ExtensionMayAttachToWebContents(const Extension& extension,
+                                     Profile* extension_profile,
+                                     WebContents& web_contents,
+                                     std::string* error) {
+  if (ExtensionTabUtil::GetTabId(&web_contents) >= 0 &&
+      !ExtensionTabUtil::IsVisibleToNativeBrowserModel(&web_contents)) {
+    *error = manifest_errors::kCannotAccessPage;
+    return false;
+  }
+""")
+    debugger = replace(debugger, """    result.Append(SerializeTarget(host));""", """    // Native host management/maintenance documents are implementation details,
+    // not extension-visible tabs. Real offscreen and extension popup contexts
+    // without a SessionTabID retain Chromium's original visibility checks.
+    if (auto* contents = host->GetWebContents(); contents &&
+        ExtensionTabUtil::GetTabId(contents) >= 0 &&
+        !ExtensionTabUtil::IsVisibleToNativeBrowserModel(contents)) {
+      continue;
+    }
+    result.Append(SerializeTarget(host));""")
+    return dict(zip(PATHS, (h, c, eh, ec, th, tc, messaging, debugger)))
 
 def digest(s):
     return hashlib.sha256(s.encode()).hexdigest()

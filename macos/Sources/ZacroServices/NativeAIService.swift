@@ -83,6 +83,13 @@ public actor NativeAIService {
   }
   public func status(refresh: Bool = false) async -> ServiceJSON {
     guard let profile = await currentProfile() else { return ["configured":false,"private":true,"profileId":"","providers":Self.providersJSON] }
+    return await status(for: profile, refresh: refresh)
+  }
+  /// Presentation for a particular browser window; reading it never changes focus.
+  public func status(for profile: AIProfileScope) async -> ServiceJSON {
+    await status(for: profile, refresh: false)
+  }
+  private func status(for profile: AIProfileScope, refresh: Bool) async -> ServiceJSON {
     guard !profile.isPrivate, !retiringProfiles.contains(profile.id) else { return ["configured":false,"private":true,"profileId":.string(profile.id),"providers":Self.providersJSON] }
     let provider = provider(profile.id), config = config(profile.id, provider)
     var state: ServiceJSON
@@ -103,9 +110,15 @@ public actor NativeAIService {
       "busy":.bool(request != nil || configuring),"profileId":.string(profile.id),"latest":conversations[profile.id]?["latest"] ?? .null])
   }
   private static var providersJSON: ServiceJSON { .array(NativeAIProvider.allCases.map { ["id":.string($0.rawValue),"name":.string($0.name),"kind":.string($0.isSubscription ? "subscription" : "api")] }) }
-  public func handle(_ action: String, payload: ServiceJSON = [:]) async throws -> ServiceJSON {
-    if action == "ai:status" { return await status(refresh: payload["refresh"].bool) }
-    let profile = try await scope()
+  public func handle(_ action: String, payload: ServiceJSON = [:], expectedProfileID: String? = nil) async throws -> ServiceJSON {
+    if action == "ai:status" {
+      if let expectedProfileID {
+        let profile = try await scope(expectedProfileID)
+        return await status(for: profile, refresh: payload["refresh"].bool)
+      }
+      return await status(refresh: payload["refresh"].bool)
+    }
+    let profile = try await scope(expectedProfileID)
     switch action {
     case "ai:configure": return try await configure(payload, profile: profile)
     case "ai:ask": return try await ask(payload, profile: profile)

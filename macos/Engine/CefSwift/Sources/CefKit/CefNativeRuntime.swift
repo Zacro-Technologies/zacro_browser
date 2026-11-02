@@ -43,15 +43,16 @@ extension CefBrowser {
     public func registerExtensionTab(logicalID: String, windowID: Int, index: Int,
                                      active: Bool, pinned: Bool, discarded: Bool,
                                      autoDiscardable: Bool = true, splitViewID: Int = -1,
-                                     openerTabID: Int? = nil) async throws -> Int {
+                                     openerTabID: Int? = nil, highlighted: Bool? = nil,
+                                     groupID: Int = -1) async throws -> Int {
         guard !logicalID.isEmpty, logicalID.utf8.count <= 256, windowID > 0, index >= 0 else {
             throw CefDevToolsError.invalidMessage
         }
-        guard splitViewID >= -1, openerTabID == nil || openerTabID! > 0 else { throw CefDevToolsError.invalidMessage }
+        guard splitViewID >= -1, groupID >= -1, openerTabID == nil || openerTabID! > 0 else { throw CefDevToolsError.invalidMessage }
         var parameters: [String: Any] = [
             "logicalID": logicalID, "windowID": windowID, "index": index,
-            "active": active, "pinned": pinned, "discarded": discarded,
-            "autoDiscardable": autoDiscardable, "splitViewID": splitViewID,
+            "active": active, "highlighted": highlighted ?? active, "pinned": pinned, "discarded": discarded,
+            "autoDiscardable": autoDiscardable, "splitViewID": splitViewID, "groupID": groupID,
         ]
         if let openerTabID { parameters["openerTabID"] = openerTabID }
         let response = try await devTools.call("Zacro.registerExtensionTab", parameters: parameters)

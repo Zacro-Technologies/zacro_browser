@@ -479,7 +479,7 @@ import XCTest
     s.updateSettings { $0.pageGutter = 6.8; $0.pageRadius = 10.1; $0.sidebarWidth = 224.6; $0.panelWidth = 400.2; $0.motionScale = 1.246 }
     XCTAssertEqual(s.state.downloads.last?.status, "downloading")
     let restored = BrowserStore(directory: s.directory)
-    XCTAssertEqual(restored.state.downloads.first?.status, "completed")
+    XCTAssertEqual(restored.state.downloads.first?.status, "complete")
     XCTAssertEqual(restored.state.downloads.last?.status, "interrupted")
     XCTAssertEqual(restored.state.settings.pageGutter, 7)
     XCTAssertEqual(restored.state.settings.pageRadius, 10)

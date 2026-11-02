@@ -201,3 +201,32 @@
      // Only the tab id is useful to platform apps for internal use. The
      // unnecessary bits will be stripped out in
      // MessagingBindings::DispatchOnConnect().
+--- a/chrome/browser/extensions/api/debugger/debugger_api.cc
++++ b/chrome/browser/extensions/api/debugger/debugger_api.cc
+@@ -367,6 +367,11 @@
+                                      Profile* extension_profile,
+                                      WebContents& web_contents,
+                                      std::string* error) {
++  if (ExtensionTabUtil::GetTabId(&web_contents) >= 0 &&
++      !ExtensionTabUtil::IsVisibleToNativeBrowserModel(&web_contents)) {
++    *error = manifest_errors::kCannotAccessPage;
++    return false;
++  }
+   security_interstitials::SecurityInterstitialTabHelper*
+       security_interstitial_tab_helper = security_interstitials::
+           SecurityInterstitialTabHelper::FromWebContents(&web_contents);
+@@ -1296,6 +1301,14 @@
+       continue;
+     }
+ #endif  // BUILDFLAG(ENABLE_PDF)
++    // Native host management/maintenance documents are implementation details,
++    // not extension-visible tabs. Real offscreen and extension popup contexts
++    // without a SessionTabID retain Chromium's original visibility checks.
++    if (auto* contents = host->GetWebContents(); contents &&
++        ExtensionTabUtil::GetTabId(contents) >= 0 &&
++        !ExtensionTabUtil::IsVisibleToNativeBrowserModel(contents)) {
++      continue;
++    }
+     result.Append(SerializeTarget(host));
+   }
+ 

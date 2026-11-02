@@ -44,7 +44,7 @@ final class NativeExtensionsModel: ObservableObject {
     if !isPrivate { refresh() }
   }
   func refresh() {
-    guard !isPrivate, engine.isWindowOpen else { return }
+    guard !isPrivate, engine.contexts.values.contains(where: { $0.isOpen && !$0.isClosing && (store.owningWindowID == nil || $0.id == store.owningWindowID) }) else { return }
     guard !loading else { refreshPending = true; return }
     let profile = store.activeProfileID, revision = generation
     scope = profile; loading = true; error = nil
@@ -101,7 +101,7 @@ final class NativeExtensionsModel: ObservableObject {
     actions.siteControls.extensionsReady = true; actions.siteControls.extensionError = nil
     if let index = store.state.profiles.firstIndex(where: { $0.id == profile }) {
       let pinned = entries.filter(\.isPinned).map(\.id)
-      if store.state.profiles[index].pinnedExtensionIDs != pinned { store.state.profiles[index].pinnedExtensionIDs = pinned; store.save() }
+      if store.state.profiles[index].pinnedExtensionIDs != pinned { store.updateProfile(profile) { $0.pinnedExtensionIDs = pinned } }
     }
   }
   func nativeEvent(profileID: String, event: ChromeExtensionEvent) {

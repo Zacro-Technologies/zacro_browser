@@ -4,6 +4,7 @@ extension BrowserStore {
   /// Portable collections intentionally exclude visited history, page state,
   /// permissions, downloads, extension registrations, and every private profile.
   public func exportData(to url: URL) throws {
+    if let repository { return try repository.exportData(to: url) }
     let profiles = state.profiles.filter { !$0.isPrivate }
     let ids = Set(profiles.map(\.id))
     let spaces = state.spaces.filter { ids.contains($0.profileID) }
@@ -30,6 +31,7 @@ extension BrowserStore {
       if let title = tab.customTitle { value["customTitle"] = title }
       if tab.homePage == true { value["homePage"] = true }
       if let autoDiscardable = tab.autoDiscardable { value["autoDiscardable"] = autoDiscardable }
+      if let group = tab.groupID { value["groupId"] = group }
       if let opener = tab.openerTabID, tabIDs.contains(opener) { value["openerTabId"] = opener }
       if let saved = tab.savedURL { value["pinnedUrl"] = saved }
       if let title = tab.savedTitle { value["pinnedTitle"] = title }
@@ -42,6 +44,10 @@ extension BrowserStore {
     let root: [String: Any] = ["format": "zacro-export", "version": 1,
       "exportedAt": ISO8601DateFormatter().string(from: Date()), "profiles": profilesJSON, "spaces": spacesJSON,
       "tabs": tabsJSON,
+      "tabGroups": state.tabGroups.filter { ids.contains($0.profileID) }.map {
+        ["id": $0.id, "profileId": $0.profileID, "windowId": $0.windowID,
+         "title": $0.title, "color": $0.color, "collapsed": $0.collapsed] as [String: Any]
+      },
       "folders": state.folders.filter { spaceIDs.contains($0.spaceID) }.map {
         ["id": $0.id, "spaceId": $0.spaceID, "name": $0.name, "parentId": $0.parentID as Any? ?? null, "collapsed": !$0.isExpanded] as [String: Any]
       },
@@ -56,6 +62,8 @@ extension BrowserStore {
   }
 
   public func importData(from url: URL) throws {
+    if let repository { return try repository.mutateDurably(windowID: owningWindowID) { try $0.importData(from: url) } }
+
     let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
     guard size <= 20 * 1024 * 1024 else { throw ShortcutError("Choose a browser export smaller than 20 MB.") }
     let data = try Data(contentsOf: url)
@@ -90,6 +98,8 @@ extension BrowserStore {
       Dictionary(uniqueKeysWithValues: values.map { ($0.id, UUID().uuidString) })
     }
     let profilesMap = mapping(source.profiles), spacesMap = mapping(source.spaces), tabsMap = mapping(source.tabs), foldersMap = mapping(source.folders)
+    let groupsMap = mapping(source.tabGroups)
+    let destinationWindow = creationWindowID ?? state.focusedWindowID ?? state.tabs.compactMap(\.windowID).first ?? "main"
     var merged = state
     for var profile in source.profiles {
       profile.id = profilesMap[profile.id]!
@@ -111,9 +121,15 @@ extension BrowserStore {
     for var tab in source.tabs {
       tab.id = tabsMap[tab.id]!; tab.spaceID = spacesMap[tab.spaceID]!
       tab.folderID = tab.folderID.flatMap { foldersMap[$0] }
+      tab.windowID = destinationWindow; tab.groupID = tab.groupID.flatMap { groupsMap[$0] }
       tab.openerTabID = tab.openerTabID.flatMap { tabsMap[$0] }
       if !includeHistory { tab.navigation = [NavigationEntry(url: tab.url, title: tab.title)]; tab.navigationIndex = 0 }
       merged.tabs.append(tab)
+    }
+    for var group in source.tabGroups {
+      guard let profile = profilesMap[group.profileID], let id = groupsMap[group.id] else { continue }
+      group.id = id; group.profileID = profile; group.windowID = destinationWindow
+      merged.tabGroups.append(group)
     }
     for group in source.splits {
       guard let space = spacesMap[group.spaceID], let left = tabsMap[group.leftTabID], let right = tabsMap[group.rightTabID] else { continue }

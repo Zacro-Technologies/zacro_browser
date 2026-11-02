@@ -71,6 +71,24 @@ The release-configuration build passed (62.46 seconds on the successful retry). 
 
 The coordinator coalesces dormant restores, awaits completion before extension document actions, and applies the latest committed URL when multiple navigation requests arrive during restoration. Its close barrier waits for in-flight discard/restore operations before capturing session history. Evidence: `macos/.build/verification/integrated-release-10-retry.log` and `macos/.build/verification/acceptance-10/engine.json`.
 
+## 2026-11-02: integrated build 11
+
+The multiwindow application compiled in release configuration (66.87 seconds on the successful retry). Its signed internal test bundle passed engine acceptance and exited 0. New runtime checks verified that moving a document between two native shell contexts retains its native browser ID and form value; a close veto affects only its own window; closing a window preserves other windows' documents and the hidden extension manager; and reopening the same model window assigns a fresh Chrome-facing window ID. These checks exercise the engine. The full application coordinator integration harness is being added separately.
+
+All 89 Core tests passed, including ten repository/window migration, ownership, selection, and rollback cases. A subsequent targeted regression verified that completed downloads remain completed after restart, bringing the Core catalog to 90 tests. Services and per-window UI presentation work after this build is not covered by these results.
+
+Evidence: `macos/.build/verification/integrated-release-11-retry.log`, `acceptance-11/engine.json`, `core-window-tests-fourth.log`, and `core-download-restart.log` beneath the same verification directory.
+
+## 2026-11-02: integrated build 12 and full application owners
+
+The integrated release build passed on its first attempt in 92.27 seconds, including window-scoped tab groups and service presentation. The Core/Services suite passed 162 tests (98 Core and 64 Services), with no failures or skips, including the real unauthenticated Codex handshake and bounded PDF subprocess cases.
+
+The signed packaged app then ran `check-app.py --integration` through the actual `ApplicationCoordinator` and two SwiftUI shells in a fresh, disposable profile. All 21 reported checks passed, and the process exited 0. Checks included palette document retention; visible source content beneath Peek; promotion retaining Peek's renderer and form; split ratio persistence and selection; real target-blank popup adoption; second-profile isolation; moving an entire persistent split to another window while keeping its native document and unsaved form; independent palettes/sidebar widths; persisted window ownership; shared service actor identity; per-window profile status; and closing a service presentation without stopping its sibling/backend. The actual popup remained alive through final application shutdown.
+
+This test creates the second profile through the application model. It does not replace the outstanding desktop-input/import-dialog reproduction or visual inspection. Its report explicitly records `desktopInputVerified: false`, `nativeExtensionProtocol: false`, and `extensionCompatibilityVerified: false` for the stock framework. The real MV3 fixture is wired behind `--integration --require-extensions` for the custom framework.
+
+Evidence: `macos/.build/verification/integrated-release-12.log`, `core-services-post11.log`, and `application-12/application.json` with `application-12/application.log` beneath the same verification directory.
+
 ## Required release evidence
 
 - Successful custom Chromium build and package provenance; native protocol capability checks.

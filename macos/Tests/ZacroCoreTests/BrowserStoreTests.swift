@@ -28,6 +28,21 @@ final class BrowserStoreTests: XCTestCase {
     XCTAssertEqual(BrowserState().settings.pageGutter, 4)
     XCTAssertEqual(BrowserState().settings.searchEngine, .google)
   }
+  func testDownloadRestartPreservesTerminalStatesAndMigratesLegacyCompletion() throws {
+    let dir = try directory()
+    let store = BrowserStore(directory: dir)
+    for status in ["complete", "completed", "cancelled", "interrupted", "downloading", "paused"] {
+      store.recordDownload(DownloadRecord(profileID: "default", url: "https://example.com/file", filename: status, status: status))
+    }
+    let reopened = BrowserStore(directory: dir)
+    let statuses = Dictionary(uniqueKeysWithValues: reopened.state.downloads.map { ($0.filename, $0.status) })
+    XCTAssertEqual(statuses["complete"], "complete")
+    XCTAssertEqual(statuses["completed"], "complete")
+    XCTAssertEqual(statuses["cancelled"], "cancelled")
+    XCTAssertEqual(statuses["interrupted"], "interrupted")
+    XCTAssertEqual(statuses["downloading"], "interrupted")
+    XCTAssertEqual(statuses["paused"], "interrupted")
+  }
   func testPersistentSplitsPeeksAndNavigationAcrossRestart() throws {
     let dir = try directory()
     let store = BrowserStore(directory: dir)

@@ -290,6 +290,7 @@ public final class CefChromeBrowser {
         pageOptions.showsWindowOnCreation = false
         pageOptions.initialBounds = CGRect(x: -16000, y: -16000, width: 600, height: 400)
         let page = Self.create(url: url, options: pageOptions, delegate: delegate)
+        guard !page.browser.isClosed else { return page }
         page.windowOwner = self
         page.hostingWindow = hostingWindow ?? nsWindow
         page.hide()
@@ -326,6 +327,19 @@ public final class CefChromeBrowser {
               let intended = parent ?? hostingWindow, window.parent !== intended else { return }
         window.parent?.removeChildWindow(window)
         intended.addChildWindow(window, ordered: .above)
+    }
+
+    /// Transfer a retained document between native shells without changing its
+    /// WebContents, SessionTabHelper identity or renderer state.
+    public func setHostingWindow(_ parent: NSWindow) {
+        guard hostingWindow !== parent else { return }
+        presentationParent = nil
+        hostingWindow = parent
+        if let window = nsWindow {
+            window.parent?.removeChildWindow(window)
+            if manualVisible { parent.addChildWindow(window, ordered: .above) }
+        }
+        applyPageFrame()
     }
 
     private func applyPageCornerRadius() {

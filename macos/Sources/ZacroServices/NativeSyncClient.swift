@@ -62,6 +62,14 @@ public actor NativeSyncClient {
     }
     return ["endpoint":saved["endpoint"],"account":credentials == nil ? .null : saved["account"],"device":credentials?["device"] ?? .null,"state":.string(saved["endpoint"].string.isEmpty ? "setup-required" : connectionState),"profiles":.array(profiles)]
   }
+  /// Window-scoped presentation without changing the shared account or active profile.
+  public func status(profileID: String) async -> ServiceJSON {
+    guard let profile = await profileReader(profileID), profile.id == profileID, !profile.isPrivate,
+      !saved["retiredProfiles"].array.contains(.string(profileID)), !closed else {
+      return ["endpoint":saved["endpoint"],"account":.null,"device":.null,"profiles":[],"state":"private"]
+    }
+    return status()
+  }
   private func transaction<T>(_ action: (inout ServiceJSON) throws -> T) throws -> T {
     var next = saved; let result = try action(&next)
     try ServiceFiles.write(next,file:file); saved = next; return result
@@ -210,13 +218,19 @@ public actor NativeSyncClient {
     for subscriber in subscribers.values { subscriber.finish() }; subscribers.removeAll()
   }
 
-  public func handle(_ action: String, payload: ServiceJSON = [:]) async throws -> ServiceJSON {
+  public func handle(_ action: String, payload: ServiceJSON = [:], expectedProfileID: String? = nil) async throws -> ServiceJSON {
     let active = await activeProfile()
+    guard expectedProfileID == nil || active?.id == expectedProfileID else {
+      throw ServiceError("cancelled", "The active profile changed. Open these controls again.")
+    }
     if action == "sync:status" {
       if active?.isPrivate != false { return ["endpoint":saved["endpoint"],"account":.null,"device":.null,"profiles":[],"state":"private"] }; return status()
     }
     guard let active, !active.isPrivate else { throw ServiceError("PRIVATE", "Account and synchronization controls are unavailable in private profiles.") }
     try await profile(active.id)
+    guard let current = await activeProfile(), current.id == active.id, !current.isPrivate else {
+      throw ServiceError("cancelled", "The active profile changed. Open these controls again.")
+    }
     guard !payload.contains("profileId") || payload["profileId"].string == active.id else { throw ServiceError("cancelled", "The active profile changed. Open these controls again.") }
     let result: ServiceJSON
     switch action {

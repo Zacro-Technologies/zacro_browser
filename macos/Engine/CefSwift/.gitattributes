@@ -3,3 +3,5 @@
 # language stats and collapsed in PR diffs by default.
 Sources/CCef/include/include/**     linguist-vendored=true
 Sources/CCef/include/LICENSE.CEF.txt linguist-vendored=true
+# Unified-diff blank context lines intentionally contain one space.
+NativeRuntime/*.patch -whitespace

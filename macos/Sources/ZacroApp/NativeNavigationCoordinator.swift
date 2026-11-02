@@ -116,11 +116,12 @@ final class NativeNavigationCoordinator {
     }
   }
 
-  func captureAll() async {
-    for task in captures.values { task.cancel() }
-    captures.removeAll()
+  func captureAll(windowID: String? = nil) async {
+    for id in Array(captures.keys) where windowID == nil || engine.pages[id]?.ownerWindowID == windowID {
+      captures.removeValue(forKey: id)?.cancel()
+    }
     // Bound concurrent native protocol traffic while preserving every live tab.
-    let pages = Array(engine.pages.values)
+    let pages = engine.pages.values.filter { windowID == nil || $0.ownerWindowID == windowID }
     for page in pages {
       let peek = page.id.hasPrefix("peek:")
       let tabID = peek ? String(page.id.dropFirst(5)) : page.id

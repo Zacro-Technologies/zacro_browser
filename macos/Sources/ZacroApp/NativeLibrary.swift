@@ -392,7 +392,9 @@ struct NativeLibrary: View {
   }
   private var archiveOptions: [(Double, String)] {
     var options: [(Double, String)] = [(12, "After 12 hours"), (24, "After 24 hours"), (72, "After 3 days"), (168, "After 7 days"), (720, "After 30 days"), (0, "Never")]
-    if store.activeProfileID != store.state.profiles.first(where: { !$0.isPrivate })?.id {
+    let defaultID = store.state.profiles.first(where: { $0.id == "default" && !$0.isPrivate })?.id
+      ?? store.state.profiles.first(where: { !$0.isPrivate })?.id
+    if store.activeProfileID != defaultID {
       options.insert((-1, "Use default"), at: 0)
     }
     let selected = archiveSetting.wrappedValue
@@ -434,14 +436,11 @@ struct NativeLibrary: View {
   private var archiveSetting: Binding<Double> {
     Binding(get: {
       guard let profile = store.state.profiles.first(where: { $0.id == store.activeProfileID }) else { return store.state.settings.archiveAfterHours }
-      return profile.id == store.state.profiles.first(where: { !$0.isPrivate })?.id ? store.state.settings.archiveAfterHours : (profile.archiveAfterHours ?? -1)
+      let defaultID = store.state.profiles.first(where: { $0.id == "default" && !$0.isPrivate })?.id
+        ?? store.state.profiles.first(where: { !$0.isPrivate })?.id
+      return profile.id == defaultID ? store.state.settings.archiveAfterHours : (profile.archiveAfterHours ?? -1)
     }, set: { value in
-      if store.activeProfileID == store.state.profiles.first(where: { !$0.isPrivate })?.id {
-        store.updateSettings { $0.archiveAfterHours = value }
-      } else if let index = store.state.profiles.firstIndex(where: { $0.id == store.activeProfileID }) {
-        store.state.profiles[index].archiveAfterHours = value < 0 ? nil : value
-        store.save()
-      }
+      store.setArchiveHours(profileID: store.activeProfileID, hours: value < 0 ? nil : value)
     })
   }
   private func setting<Value>(_ keyPath: WritableKeyPath<BrowserSettings, Value>) -> Binding<Value> {

@@ -24,7 +24,10 @@ final class NativeServicesModel: ObservableObject {
   private var nativeSyncStatusContext: ServiceJSON = .null
   var prepareNativeSync: ((String) async throws -> Void)?
   var nativeSyncAction: ((String, String, String) async throws -> Void)?
-  private var nativeSyncState: [String: ServiceJSON] = [:]
+  @Published private var nativeSyncState: [String: ServiceJSON] = [:]
+  private var sharedBackend: NativeServicesModel?
+  private var backendSubscription: AnyCancellable?
+  private var backend: NativeServicesModel { sharedBackend ?? self }
   private(set) var linkedSyncProfileIDs = Set<String>()
   private let libraryFeed: NativePortableLibraryReader
   private let store: BrowserStore
@@ -54,8 +57,32 @@ final class NativeServicesModel: ObservableObject {
       }, activeProfile: active, localLibrary: { id in try await libraryFeed.read(id) })
     } catch { syncService = nil; syncStartupError = error.localizedDescription }
   }
+  /// Window presentation shares actors and durable storage with the application backend.
+  init(store: BrowserStore, sharing backend: NativeServicesModel) {
+    self.store = store; sharedBackend = backend.backend
+    aiService = backend.aiService; syncService = backend.syncService
+    libraryFeed = backend.libraryFeed; syncStartupError = backend.syncStartupError
+  }
+  private func observeBackend() {
+    guard let sharedBackend, backendSubscription == nil else { return }
+    backendSubscription = sharedBackend.$nativeSyncState.sink { [weak self] state in
+      guard let self else { return }
+      self.nativeSyncState = state
+      self.applySync(self.sync)
+    }
+  }
+  private var scope: AIProfileScope {
+    AIProfileScope(id: store.activeProfileID, isPrivate: store.state.activeProfile?.isPrivate ?? true)
+  }
+  private func requireFocusedProfile(_ id: String) throws {
+    guard store.activeProfileID == id, backend.store.activeProfileID == id,
+      store.state.activeProfile?.isPrivate == false else {
+      throw ServiceError("PROFILE_CHANGED", "Activate this window's profile before using these controls.")
+    }
+  }
   func start() {
     guard !started else { return }; started = true
+    observeBackend()
     tasks.append(Task { [weak self, aiService] in
       let stream = await aiService.events()
       for await event in stream {
@@ -69,15 +96,17 @@ final class NativeServicesModel: ObservableObject {
     if let syncService {
       tasks.append(Task { [weak self] in
         let stream = await syncService.events()
-        await syncService.start()
-        do { try await self?.recoverProfileDeletions() } catch { self?.cleanupError = error.localizedDescription }
-        self?.applySync(await syncService.status())
+        if self?.sharedBackend == nil {
+          await syncService.start()
+          do { try await self?.recoverProfileDeletions() } catch { self?.cleanupError = error.localizedDescription }
+        }
+        if let profile = self?.scope { self?.applySync(await syncService.status(profileID: profile.id)) }
         for await event in stream {
           guard let self, !Task.isCancelled else { break }
           if event["type"].string == "sync:status" { self.applySync(event["status"]) }
-          else if event["type"].string == "library:changed", await syncService.isCurrentLink(event) {
+          else if self.sharedBackend == nil, event["type"].string == "library:changed", await syncService.isCurrentLink(event) {
             await self.syncLibraryEvent?(event)
-          } else if event["type"].string == "storage:changed" {
+          } else if self.sharedBackend == nil, event["type"].string == "storage:changed" {
             if !event["linkId"].string.isEmpty {
               guard await syncService.isCurrentLink(event) else { continue }
             }
@@ -109,14 +138,16 @@ final class NativeServicesModel: ObservableObject {
     profileTask?.cancel()
     profileTask = Task { [weak self, aiService, syncService] in
       guard !Task.isCancelled else { return }
-      await aiService.profileChanged()
-      guard !Task.isCancelled else { return }
-      await syncService?.profileChanged()
-      let status = await aiService.status()
+      if self?.sharedBackend == nil {
+        await aiService.profileChanged()
+        guard !Task.isCancelled else { return }
+        await syncService?.profileChanged()
+      }
+      let status = await aiService.status(for: AIProfileScope(id: current, isPrivate: isPrivate))
       guard !Task.isCancelled, self?.profileID == current else { return }
       self?.applyAI(status)
       if let syncService {
-        let syncStatus = await syncService.status()
+        let syncStatus = await syncService.status(profileID: current)
         if !Task.isCancelled, self?.profileID == current { self?.applySync(syncStatus) }
       }
     }
@@ -127,7 +158,7 @@ final class NativeServicesModel: ObservableObject {
     aiConversation.activate(profileID: status["profileId"].string, isPrivate: status["private"].bool)
   }
   private func applySync(_ status: ServiceJSON) {
-    if status["state"] != "private" {
+    if sharedBackend == nil, status["state"] != "private" {
       let context: ServiceJSON = ["account":status["account"]["id"], "endpoint":status["endpoint"],
         "profiles":.array(status["profiles"].array.map { ["profileId":$0["profileId"], "datasetId":$0["datasetId"],
           "librarySync":$0["librarySync"], "settingsSync":$0["settingsSync"]] })]
@@ -140,17 +171,19 @@ final class NativeServicesModel: ObservableObject {
       sync = ["endpoint":status["endpoint"],"account":.null,"device":.null,"profiles":[],"state":"private"]
     } else {
       sync = status
-      if let cleanupError { sync["cleanupError"] = .string(cleanupError) }
+      if let cleanupError = backend.cleanupError { sync["cleanupError"] = .string(cleanupError) }
       if let syncStartupError { sync["startupError"] = .string(syncStartupError) }
       sync["native"] = nativeSyncState[store.activeProfileID] ?? [:]
     }
   }
   func updateNativeSync(profileID: String, pending: [ServiceJSON], errors: [ServiceJSON]) {
+    if let sharedBackend { sharedBackend.updateNativeSync(profileID: profileID, pending: pending, errors: errors); return }
     nativeSyncState[profileID] = ["pending":.array(pending), "errors":.array(errors)]
     if profileID == store.activeProfileID { applySync(sync) }
   }
   func aiAction(_ action: String, payload: ServiceJSON = [:]) async throws -> ServiceJSON {
     let profile = store.activeProfileID
+    try requireFocusedProfile(profile)
     if action == "ai:prepare" {
       guard store.state.activeProfile?.isPrivate == false else { throw ServiceError("PRIVATE","AI is unavailable in private profiles.") }
       guard !aiConversation.busy else { throw ServiceError("BUSY","Stop the current response before changing context.") }
@@ -163,7 +196,7 @@ final class NativeServicesModel: ObservableObject {
       ]
       aiConversation.prepare(payload["question"].string.isEmpty ? prompts[intent] ?? "" : payload["question"].string)
       if ["summarize","explain","compare","research"].contains(intent) {
-        _ = try await aiService.handle("ai:reset")
+        _ = try await aiService.handle("ai:reset", expectedProfileID: profile)
         guard store.activeProfileID == profile, store.state.activeProfile?.isPrivate == false else {
           throw ServiceError("PROFILE_CHANGED","The active profile changed.")
         }
@@ -175,46 +208,48 @@ final class NativeServicesModel: ObservableObject {
       }
       return ["prepared":true]
     }
-    if ["ai:open-source", "ai:open-sources"].contains(action), let sourceAction {
+    if ["ai:open-source", "ai:open-sources"].contains(action), let sourceAction = sourceAction ?? backend.sourceAction {
       return try await sourceAction(action, payload)
     }
     do {
-      let result = try await aiService.handle(action, payload: payload)
-      guard store.activeProfileID == profile else { throw ServiceError("PROFILE_CHANGED","The active profile changed.") }
+      let result = try await aiService.handle(action, payload: payload, expectedProfileID: profile)
+      try requireFocusedProfile(profile)
       if ["ai:login", "ai:install"].contains(action), let url = BrowserAddress.webURL(result["url"].string) { NSWorkspace.shared.open(url) }
-      applyAI(await aiService.status()); return result
+      applyAI(await aiService.status(for: scope)); return result
     } catch {
-      applyAI(await aiService.status()); throw error
+      applyAI(await aiService.status(for: scope)); throw error
     }
   }
   func syncAction(_ action: String, payload: ServiceJSON = [:]) async throws -> ServiceJSON {
     guard let syncService else { throw ServiceError("STORAGE", syncStartupError ?? "Synchronization is unavailable.") }
+    let profile = store.activeProfileID
+    try requireFocusedProfile(profile)
     if action == "sync:finish-profile-cleanup" {
       guard store.state.activeProfile?.isPrivate == false else { throw ServiceError("PRIVATE", "Profile cleanup is unavailable in private browsing.") }
-      try await recoverProfileDeletions(); applySync(await syncService.status()); return ["complete":true]
+      try await backend.recoverProfileDeletions(); applySync(await syncService.status(profileID: profile)); return ["complete":true]
     }
-    let profile = store.activeProfileID
     if ["sync:native-retry", "sync:native-install", "sync:native-keep-local", "sync:native-use-remote"].contains(action) {
-      guard store.state.activeProfile?.isPrivate == false, let nativeSyncAction else {
+      guard store.state.activeProfile?.isPrivate == false, let nativeSyncAction = backend.nativeSyncAction else {
         throw ServiceError("EXTENSION_SYNC", "Extension synchronization is unavailable in this profile.")
       }
       try await nativeSyncAction(action, profile, payload["id"].string)
+      try requireFocusedProfile(profile)
       return ["complete":true]
     }
     if action == "sync:settings", payload["enabled"].bool {
-      guard let prepareNativeSync else { throw ServiceError("EXTENSION_SYNC", "Extension synchronization is not ready.") }
+      guard let prepareNativeSync = backend.prepareNativeSync else { throw ServiceError("EXTENSION_SYNC", "Extension synchronization is not ready.") }
       try await prepareNativeSync(profile)
-      guard store.activeProfileID == profile else { throw ServiceError("cancelled", "The active profile changed.") }
+      try requireFocusedProfile(profile)
     }
-    let result = try await syncService.handle(action, payload: payload)
-    applySync(await syncService.status())
+    let result = try await syncService.handle(action, payload: payload, expectedProfileID: profile)
+    applySync(await syncService.status(profileID: profile))
     if action == "sync:export" {
       let owner = sync["account"]["id"], endpoint = sync["endpoint"]
       let panel = NSSavePanel(); panel.nameFieldStringValue = "Zacro Sync Recovery.json"
       guard await panel.begin() == .OK, let url = panel.url else { return ["saved":false] }
       let status = await syncService.status()
-      guard store.activeProfileID == profile, store.state.activeProfile?.isPrivate == false,
-        owner == status["account"]["id"], endpoint == status["endpoint"] else { throw ServiceError("cancelled","The synchronization context changed.") }
+      try requireFocusedProfile(profile)
+      guard owner == status["account"]["id"], endpoint == status["endpoint"] else { throw ServiceError("cancelled","The synchronization context changed.") }
       // Re-resolve the rejected operation after the dialog so discarded or remapped changes cannot be exported.
       let current = try await syncService.exportRejected(profile,id:payload["id"].string)
       guard current == result else { throw ServiceError("cancelled","This unsynced change is no longer available.") }
@@ -225,10 +260,12 @@ final class NativeServicesModel: ObservableObject {
     return result
   }
   func forgetProfile(_ id: String) async throws {
+    if let sharedBackend { try await sharedBackend.forgetProfile(id); return }
     try await syncService?.deleteLocalProfile(id)
     try await aiService.forgetProfile(id)
   }
   func prepareProfileDeletion(_ id: String) async throws {
+    if let sharedBackend { try await sharedBackend.prepareProfileDeletion(id); return }
     try await aiService.prepareProfileDeletion(id)
     do {
       if store.state.profiles.first(where: { $0.id == id })?.isPrivate == false {
@@ -239,10 +276,12 @@ final class NativeServicesModel: ObservableObject {
     catch { await aiService.cancelProfileDeletion(id); throw error }
   }
   func cancelProfileDeletion(_ id: String) async throws {
+    if let sharedBackend { try await sharedBackend.cancelProfileDeletion(id); return }
     if store.state.profiles.first(where: { $0.id == id })?.isPrivate == false { try await syncService?.cancelLocalProfileDeletion(id) }
     await aiService.cancelProfileDeletion(id)
   }
   func didDeleteProfile(_ id: String) async throws {
+    if let sharedBackend { try await sharedBackend.didDeleteProfile(id); return }
     do {
       try await aiService.forgetProfile(id)
       try await syncService?.completeLocalProfileDeletion(id)
@@ -265,6 +304,13 @@ final class NativeServicesModel: ObservableObject {
     if let shutdownTask { await shutdownTask.value; return }
     profileTask?.cancel(); profileTask = nil
     tasks.forEach { $0.cancel() }; tasks.removeAll()
+    backendSubscription?.cancel(); backendSubscription = nil
+    if sharedBackend != nil {
+      started = false; profileID = nil
+      aiConversation.activate(profileID: "", isPrivate: true)
+      contextTabs = []; ai = [:]; sync = [:]
+      return
+    }
     let shutdown = Task { [aiService, syncService] in
       async let ai: Void = aiService.close()
       async let sync: Void = syncService?.close() ?? ()

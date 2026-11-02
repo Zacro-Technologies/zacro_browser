@@ -37,7 +37,9 @@
 #include "extensions/browser/extension_registry.h"
 #include "extensions/browser/extension_action.h"
 #include "extensions/browser/extension_action_manager.h"
+#include "extensions/browser/unpacked_installer.h"
 #include "extensions/common/extension.h"
+#include "extensions/common/manifest_handlers/background_info.h"
 #include "ui/gfx/image/image.h"
 #include "cef/libcef/browser/devtools/zacro_extensions_adapter.inc"
 #include "cef/libcef/browser/devtools/zacro_topology_adapter.inc"
@@ -205,6 +207,50 @@ bool CefDevToolsController::DispatchZacro(const std::string_view& message) {
         .Set("extensionActions", true).Set("legacyNavigation", true).Set("extensionStorage", true).Set("extensionBrowser", true)
         .Set("volatileDiscard", true));
     return true;
+  }
+  if (*method == "Zacro.extensionWorkerTarget") {
+    const auto* params = request->FindDict("params");
+    const auto* identifier = params ? params->FindString("id") : nullptr;
+    auto* context = inspected_contents_->GetBrowserContext();
+    auto* registry = extensions::ExtensionRegistry::Get(context);
+    const auto* extension = identifier && registry ? registry->enabled_extensions().GetByID(*identifier) : nullptr;
+    if (!extension || context->IsOffTheRecord()) {
+      ReplyZacro(*id, {}, "The extension is unavailable in this profile."); return true;
+    }
+    const auto script = extensions::BackgroundInfo::GetBackgroundServiceWorkerScriptURL(extension);
+    if (script.is_empty()) { ReplyZacro(*id, {}, "This extension does not have a service worker."); return true; }
+    std::string target;
+    for (const auto& host : content::DevToolsAgentHost::GetOrCreateAll()) {
+      if (host->GetBrowserContext() != context || host->GetType() != content::DevToolsAgentHost::kTypeServiceWorker ||
+          host->GetURL() != script) continue;
+      if (!target.empty()) { ReplyZacro(*id, {}, "The extension worker is changing; retry after it settles."); return true; }
+      target = host->GetId();
+    }
+    auto result = base::DictValue().Set("installationID", ZacroExtensionContext::Get(context)->InstallationID(*extension));
+    if (!target.empty()) result.Set("targetID", target);
+    ReplyZacro(*id, std::move(result)); return true;
+  }
+  if (*method == "Zacro.loadUnpackedExtension") {
+    const auto* params = request->FindDict("params");
+    const auto* path = params ? params->FindString("path") : nullptr;
+    auto* context = inspected_contents_->GetBrowserContext();
+    const auto directory = path ? base::FilePath::FromUTF8Unsafe(*path) : base::FilePath();
+    if (context->IsOffTheRecord() || !path || path->empty() || path->size() > 4096 ||
+        !directory.IsAbsolute() || directory.ReferencesParent()) {
+      ReplyZacro(*id, {}, "Choose an absolute extension directory in a persistent profile."); return true;
+    }
+    // Native caller only. Chromium still applies manifest validation, managed
+    // install policy and permissions. Never use CDP's default-profile installer.
+    auto installer = extensions::UnpackedInstaller::Create(context);
+    installer->set_be_noisy_on_failure(false);
+    installer->set_completion_callback(base::BindOnce(
+        [](base::WeakPtr<CefDevToolsController> self, int id, const extensions::Extension* extension,
+           const base::FilePath&, const std::u16string& error) {
+          if (!self) return;
+          self->ReplyZacro(id, extension ? base::DictValue().Set("id", extension->id()) : base::DictValue(),
+              extension && error.empty() ? "" : (error.empty() ? "Chromium rejected the unpacked extension." : base::UTF16ToUTF8(error)));
+        }, weak_ptr_factory_.GetWeakPtr(), *id));
+    installer->Load(directory); return true;
   }
   if (*method == "Zacro.installWebStoreExtension") {
     const auto* params = request->FindDict("params");

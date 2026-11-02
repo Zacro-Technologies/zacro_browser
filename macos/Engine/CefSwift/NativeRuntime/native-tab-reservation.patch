@@ -125,13 +125,22 @@
  #include "cef/libcef/browser/thread_util.h"
  #include "cef/libcef/browser/views/browser_view_impl.h"
  #include "cef/libcef/common/net/url_util.h"
-@@ -27,7 +30,32 @@
+@@ -23,11 +26,47 @@
+ #include "chrome/browser/ui/views/frame/contents_web_view.h"
+ #include "chrome/browser/ui/views/frame/multi_contents_view.h"
+ #include "chrome/common/pref_names.h"
++#include "content/public/browser/render_frame_host.h"
+ 
  // static
  CefRefPtr<ChromeBrowserHostImpl> ChromeBrowserHostImpl::Create(
      const CefBrowserCreateParams& params) {
 -  auto browser = CreateBrowser(params, std::nullopt);
 +  CefBrowserCreateParams create_params = params;
 +  base::ScopedClosureRunner abort_reservation;
++  content::BrowserContext* reservation_context = nullptr;
++  std::string reservation_token;
++  content::WeakDocumentPtr reserved_opener;
++  std::optional<url::Origin> reserved_initiator;
 +  if (params.extra_info && params.extra_info->HasKey("_zacroTabReservation")) {
 +    if (params.extra_info->GetType("_zacroTabReservation") != VTYPE_STRING) {
 +      return nullptr;
@@ -144,6 +153,12 @@
 +    }
 +    abort_reservation.ReplaceClosure(base::BindOnce(
 +        &ZacroAbortTabReservation, base::Unretained(context), token));
++    reservation_context = context;
++    reservation_token = token;
++    if (!ZacroResolveTabReservationOpener(context, token, &reserved_opener,
++                                          &reserved_initiator)) {
++      return nullptr;
++    }
 +    // Preserve the caller's dictionary, including a read-only input. Every
 +    // internal copy shares this writable dictionary until the token is removed
 +    // by OnWebContentsCreated, before BrowserInfo exposes extra_info.
@@ -159,6 +174,52 @@
  
    GURL url = url_util::MakeGURL(params.url, /*fixup=*/true);
    const bool url_is_empty = url.is_empty();
+@@ -41,12 +80,42 @@
+   // Add a new tab. This will indirectly create a new tab WebContents and
+   // call ChromeBrowserDelegate::OnWebContentsCreated to create the associated
+   // ChromeBrowserHostImpl.
+-  chrome::AddTabAt(browser, url, /*index=*/TabStripModel::kNoTab,
+-                   /*foreground=*/true);
++  // Creating the native Browser can invoke host callbacks. Revalidate the
++  // pending request, installation and original document before navigation.
++  if (reservation_context &&
++      !ZacroResolveTabReservationOpener(reservation_context, reservation_token,
++                                        &reserved_opener, &reserved_initiator)) {
++    browser->GetWindow()->Close();
++    return nullptr;
++  }
++  if (reserved_initiator) {
++    auto* opener = reserved_opener.AsRenderFrameHostIfValid();
++    if (!opener) {
++      browser->GetWindow()->Close();
++      return nullptr;
++    }
++    // Match WindowsCreateFunction: establish the original caller's browsing
++    // instance and opener when WebContents is created, never after navigation.
++    NavigateParams navigate_params(browser, url, ui::PAGE_TRANSITION_LINK);
++    navigate_params.disposition = WindowOpenDisposition::NEW_FOREGROUND_TAB;
++    navigate_params.tabstrip_index = TabStripModel::kNoTab;
++    navigate_params.initiator_origin = reserved_initiator;
++    navigate_params.opener = opener;
++    navigate_params.source_site_instance = opener->GetSiteInstance();
++    navigate_params.web_app_navigation_data.emplace();
++    navigate_params.web_app_navigation_data->SetNavigationCapturingForceOff(true);
++    ::Navigate(&navigate_params);
++  } else {
++    chrome::AddTabAt(browser, url, /*index=*/TabStripModel::kNoTab,
++                     /*foreground=*/true);
++  }
+ 
+   // The new tab WebContents.
+   auto web_contents = browser->tab_strip_model()->GetActiveWebContents();
+-  CHECK(web_contents);
++  if (!web_contents) {
++    browser->GetWindow()->Close();
++    return nullptr;
++  }
+ 
+   // The associated ChromeBrowserHostImpl.
+   auto browser_host =
 --- a/components/sessions/BUILD.gn
 +++ b/components/sessions/BUILD.gn
 @@ -218,6 +218,7 @@
@@ -171,12 +232,16 @@
      sources += [
 --- /dev/null
 +++ b/cef/libcef/browser/devtools/zacro_tab_reservation.h
-@@ -0,0 +1,25 @@
+@@ -0,0 +1,35 @@
 +// Native-only, profile-scoped dormant tab materialization.
 +#ifndef CEF_LIBCEF_BROWSER_DEVTOOLS_ZACRO_TAB_RESERVATION_H_
 +#define CEF_LIBCEF_BROWSER_DEVTOOLS_ZACRO_TAB_RESERVATION_H_
 +
++#include <optional>
 +#include <string>
++
++#include "content/public/browser/weak_document_ptr.h"
++#include "url/origin.h"
 +
 +namespace content {
 +class BrowserContext;
@@ -187,6 +252,12 @@
 +// Once claimed it cannot be canceled/replaced before synchronous consumption.
 +bool ZacroClaimTabReservation(content::BrowserContext* context,
 +                             const std::string& token);
++// Resolve only native-authorized windows.create opener requests. Normal tokens
++// return true with empty outputs. Recheck after any reentrant host callback;
++// false means creation must stop because authorization or document was lost.
++bool ZacroResolveTabReservationOpener(
++    content::BrowserContext* context, const std::string& token,
++    content::WeakDocumentPtr* opener, std::optional<url::Origin>* initiator);
 +// Consume binds the broker-allocated SessionID to these exact WebContents.
 +// SessionTabHelper reads that native-owned metadata once during construction.
 +bool ZacroConsumeTabReservation(content::WebContents* contents,

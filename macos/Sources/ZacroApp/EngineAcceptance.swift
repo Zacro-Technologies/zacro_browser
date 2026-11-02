@@ -186,6 +186,7 @@ final class EngineAcceptance {
     let closeDeadline = Date().addingTimeInterval(3)
     while popup.browser != nil, Date() < closeDeadline { try await Task.sleep(for: .milliseconds(30)) }
     try require(popup.browser == nil && closeAttempts == 2, "nativeClosePreparationRetry")
+    try await checkWindowContexts(page: page, browser: browser, url: url)
     // Keep a real native popup alive through multi-profile shutdown. Closing
     // it earlier missed the longer GUI sequence that exposed teardown hangs.
     self.popup = nil
@@ -195,6 +196,48 @@ final class EngineAcceptance {
       try await Task.sleep(for: .milliseconds(30))
     }
     try require(self.popup?.browser != nil, "retainedPopupForTermination")
+  }
+
+  private func checkWindowContexts(page: ChromiumPage, browser: CefBrowser, url: URL) async throws {
+    guard let primary = engine.primaryWindow else { throw Failure(message: "Missing primary window") }
+    let secondary = engine.createWindow(id: "acceptance-second-window")
+    let firstWindowID = secondary.nativeID
+    try require(firstWindowID != primary.nativeID && secondary !== primary, "independentWindowContexts")
+    let documentID = browser.id
+    try require(engine.movePage(id: page.id, toWindowID: secondary.id), "retainedDocumentWindowTransfer")
+    secondary.show()
+    page.show(frame: CGRect(x: 8, y: 8, width: 900, height: 650))
+    let draft = try await browser.devTools.evaluate("document.querySelector('input').value") as? String
+    try require(page.browser === browser && browser.id == documentID && draft == "unsaved-form-value" &&
+      page.ownerWindowID == secondary.id && page.nativeWindow?.parent === secondary.window,
+      "windowTransferRetainsIdentityAndForm")
+
+    var attempts = 0
+    secondary.beforeClosingDocuments = { attempts += 1; return false }
+    secondary.close()
+    let vetoDeadline = Date().addingTimeInterval(3)
+    while (attempts == 0 || secondary.isClosing), Date() < vetoDeadline { try await Task.sleep(for: .milliseconds(30)) }
+    try require(attempts == 1 && secondary.isOpen && !secondary.isClosing && page.browser === browser &&
+      primary.isOpen && pages[1].browser != nil, "windowCloseVetoIsScoped")
+
+    try require(engine.movePage(id: page.id, toWindowID: primary.id), "retainedDocumentWindowReturn")
+    page.show(frame: CGRect(x: 224, y: 4, width: 500, height: 700))
+    let closingPage = engine.page(id: "acceptance-window-close", profileID: "a", isPrivate: false,
+      url: url, ownerWindowID: secondary.id)
+    _ = try await closingPage.ready()
+    let manager = engine.extensionsPage(profileID: "a")
+    secondary.beforeClosingDocuments = { true }
+    secondary.close()
+    let closeDeadline = Date().addingTimeInterval(5)
+    while secondary.isOpen, Date() < closeDeadline { try await Task.sleep(for: .milliseconds(30)) }
+    try require(!secondary.isOpen && closingPage.browser == nil && primary.isOpen &&
+      page.browser === browser && pages[3].browser != nil && manager.browser != nil && manager.ownerWindowID == nil,
+      "windowClosePreservesOtherDocumentsAndManager")
+    let reopened = engine.createWindow(id: secondary.id)
+    try require(reopened === secondary && reopened.isOpen && reopened.nativeID != firstWindowID,
+      "windowReopenGetsFreshNativeIdentity")
+    reopened.show()
+    page.focus()
   }
   private func finish(error: String?) {
     guard !finished else { return }; finished = true

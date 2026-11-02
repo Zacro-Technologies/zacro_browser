@@ -8,6 +8,8 @@ public enum LegacyImportError: LocalizedError {
 extension BrowserStore {
   /// Reads an Electron JSON snapshot into a new native collection. The source is never modified.
   public func importLegacy(from url: URL) throws {
+    if let repository { return try repository.mutateDurably(windowID: owningWindowID) { try $0.importLegacy(from: url) } }
+
     guard (try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0) <= 32 * 1024 * 1024 else { throw LegacyImportError.invalidState }
     let data = try Data(contentsOf: url)
     guard data.count < 32 * 1024 * 1024,
@@ -58,6 +60,7 @@ extension BrowserStore {
         title: item["title"] as? String ?? "Imported",
         isFavorite: item["favorite"] as? Bool ?? false, isPinned: item["pinned"] as? Bool ?? false)
       tab.folderID = item["folderId"] as? String
+      tab.groupID = item["groupId"] as? String
       tab.customTitle = item["customTitle"] as? String
       tab.savedTitle = item["pinnedTitle"] as? String
       tab.isClosed = item["closed"] as? Bool ?? false
@@ -90,6 +93,17 @@ extension BrowserStore {
       return tab
     }
     imported.tabs = records("tabs").compactMap(convertTab)
+    imported.tabGroups = records("tabGroups").compactMap { item in
+      guard let id = item["id"] as? String, let profile = item["profileId"] as? String,
+        allowedProfiles.contains(profile) else { return nil }
+      return BrowserTabGroup(id: id, windowID: item["windowId"] as? String ?? "main", profileID: profile,
+        title: item["title"] as? String ?? "", color: item["color"] as? String ?? "grey", collapsed: item["collapsed"] as? Bool ?? false)
+    }
+    for index in imported.tabs.indices {
+      if let group = imported.tabGroups.first(where: { $0.id == imported.tabs[index].groupID }) {
+        imported.tabs[index].windowID = group.windowID
+      }
+    }
     imported.folders = records("folders").compactMap { item in
       guard let id = item["id"] as? String, let space = item["spaceId"] as? String else {
         return nil

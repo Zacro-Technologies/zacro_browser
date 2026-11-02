@@ -65,7 +65,8 @@ public final class CefBrowser: Identifiable {
     private var raw: UnsafeMutablePointer<cef_browser_t>?
     private var pendingNavigation: URL?
     private var protocolChannel: CefDevTools?
-    private var isClosed = false
+    public private(set) var isClosed = false
+    public private(set) var creationFailed = false
     private var readyWaiters: [UUID: CheckedContinuation<Void, Error>] = [:]
     private var readyDeadlines: [UUID: Task<Void, Never>] = [:]
     var resourceFetches: [UUID: CefResourceFetch] = [:]
@@ -392,6 +393,7 @@ public final class CefBrowser: Identifiable {
 
     func failCreation(_ message: String) {
         guard !isClosed, raw == nil else { return }
+        creationFailed = true
         delegate?.browser(self, didFailLoad: -2, errorText: message,
                           failedURL: pendingNavigation?.absoluteString ?? "")
         handleBeforeClose()

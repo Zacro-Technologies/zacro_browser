@@ -5,7 +5,7 @@ import Foundation
 
 /// Owns the Chromium runtime and native Chrome-style window. Never uses Alloy.
 @MainActor
-public final class ChromiumEngine: NSObject, NSWindowDelegate {
+public final class ChromiumEngine: NSObject {
   public let dataDirectory: URL
   public private(set) var pages: [String: ChromiumPage] = [:]
   private var profiles: [String: CefProfile] = [:]
@@ -19,9 +19,15 @@ public final class ChromiumEngine: NSObject, NSWindowDelegate {
   private var unsupportedNativeCapabilities = false
   private var capabilityProbe: Task<CefNativeCapabilities, Error>?
   private var capabilityProbeID: UUID?
-  private var nativeWindow: NSWindow?
-  public var window: NSWindow? { nativeWindow }
-  public var onLayout: (() -> Void)?
+  public private(set) var contexts: [String: ChromiumWindowContext] = [:]
+  public private(set) var primaryWindow: ChromiumWindowContext?
+  public private(set) var focusedWindowID: String?
+  private var nextWindowID = 1
+  public var window: NSWindow? { primaryWindow?.window }
+  public var onLayout: (() -> Void)? {
+    get { primaryWindow?.onLayout }
+    set { primaryWindow?.onLayout = newValue }
+  }
   public private(set) var isTerminating = false
   public var onTerminationChanged: ((Bool) -> Void)?
   public var beforeTermination: (() async -> Void)?
@@ -29,10 +35,22 @@ public final class ChromiumEngine: NSObject, NSWindowDelegate {
   private var closingPreparation: Task<Bool, Never>?
   private var terminationDrainStarted = false
   public var onDownload: ((String, Bool, CefDownload) -> Void)?
-  public private(set) var isWindowClosing = false
-  public private(set) var isWindowOpen = true
-  public var onWindowClosed: (() -> Void)?
-  public var onWindowCloseCancelled: (() -> Void)?
+  public var onPageClosed: ((String) -> Void)?
+  public var onPageCloseCancelled: ((String) -> Void)?
+  /// Fallback for engine-owned management documents with no window coordinator.
+  /// The host chooses a matching profile/window and adopts the live popup.
+  public var onUnownedPopupCreated: ((ChromiumPage, ChromiumPage, Bool) -> Void)?
+  public var onUnownedOpenURL: ((ChromiumPage, URL, Bool) -> Void)?
+  public var isWindowClosing: Bool { primaryWindow?.isClosing ?? false }
+  public var isWindowOpen: Bool { primaryWindow?.isOpen ?? false }
+  public var onWindowClosed: (() -> Void)? {
+    get { primaryWindow?.onClosed }
+    set { primaryWindow?.onClosed = newValue }
+  }
+  public var onWindowCloseCancelled: (() -> Void)? {
+    get { primaryWindow?.onCloseCancelled }
+    set { primaryWindow?.onCloseCancelled = newValue }
+  }
 
   public init(dataDirectory: URL) {
     self.dataDirectory = dataDirectory
@@ -118,7 +136,11 @@ public final class ChromiumEngine: NSObject, NSWindowDelegate {
     try CefRuntime.shared.initialize(configuration: configuration)
     CefRuntime.shared.onTerminationChanged = { [weak self] terminating in
       self?.isTerminating = terminating
-      if !terminating, self?.isWindowClosing == true { self?.cancelWindowClose(vetoedBy: nil) }
+      if !terminating, let self {
+        for context in self.contexts.values where context.isClosing {
+          self.cancelWindowClose(context, vetoedBy: nil)
+        }
+      }
       self?.onTerminationChanged?(terminating)
     }
     CefRuntime.shared.beforeClosingDocuments = { [weak self] in
@@ -144,18 +166,7 @@ public final class ChromiumEngine: NSObject, NSWindowDelegate {
     // SwiftUI subview placed over it can draw while its controls receive no
     // clicks. Keep the application chrome in a real AppKit window and attach
     // the independent Chrome document windows beneath that native parent.
-    let nativeWindow = NSWindow(
-      contentRect: CGRect(x: 80, y: 80, width: 1280, height: 820),
-      styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
-      backing: .buffered, defer: false)
-    nativeWindow.title = "Zacro"
-    nativeWindow.titleVisibility = .hidden
-    nativeWindow.titlebarAppearsTransparent = true
-    nativeWindow.isReleasedWhenClosed = false
-    nativeWindow.minSize = NSSize(width: 680, height: 480)
-    nativeWindow.collectionBehavior.insert(.fullScreenPrimary)
-    nativeWindow.delegate = self
-    self.nativeWindow = nativeWindow
+    primaryWindow = createWindow(id: "primary")
     var options = CefChromeBrowserOptions()
     options.initialBounds = CGRect(x: -16000, y: -16000, width: 800, height: 600)
     options.profile = .incognito()
@@ -168,6 +179,13 @@ public final class ChromiumEngine: NSObject, NSWindowDelegate {
   /// for authenticated native session restoration before its first load.
   public func page(id: String, profileID: String, isPrivate: Bool, url: URL?,
                    nativeReservation: ChromeTabMaterialization? = nil) -> ChromiumPage {
+    page(id: id, profileID: profileID, isPrivate: isPrivate, url: url,
+      nativeReservation: nativeReservation, ownerWindowID: primaryWindow?.id)
+  }
+
+  public func page(id: String, profileID: String, isPrivate: Bool, url: URL?,
+                   nativeReservation: ChromeTabMaterialization? = nil,
+                   ownerWindowID: String?) -> ChromiumPage {
     if let page = pages[id] {
       precondition(
         page.profileID == profileID && page.isPrivate == isPrivate,
@@ -175,6 +193,8 @@ public final class ChromiumEngine: NSObject, NSWindowDelegate {
       return page
     }
     precondition(host != nil, "Start Chromium before creating pages")
+    precondition(ownerWindowID == nil || contexts[ownerWindowID!]?.isOpen == true,
+      "A document requires an open owning window")
     precondition(nativeReservation == nil || (!isPrivate && nativeReservation?.profileID == profileID && nativeReservation?.logicalID == id),
       "A native tab reservation belongs to its original profile and logical tab")
     let key = (isPrivate ? "private:" : "persistent:") + profileID
@@ -188,15 +208,19 @@ public final class ChromiumEngine: NSObject, NSWindowDelegate {
       profiles[key] = profile
     }
     let page = ChromiumPage(id: id, profileID: profileID, isPrivate: isPrivate)
+    page.ownerWindowID = ownerWindowID
     page.reservedNativeTabID = nativeReservation?.nativeID
     let chrome = host!.createPage(
-      url: url, profile: profile, delegate: page, hostingWindow: nativeWindow,
+      url: url, profile: profile, delegate: page, hostingWindow: ownerWindowID.flatMap { contexts[$0]?.window },
       nativeTabReservation: nativeReservation?.token)
     attach(page, chrome: chrome)
     return page
   }
 
   private func attach(_ page: ChromiumPage, chrome: CefChromeBrowser) {
+    // A synchronous reservation/creation rejection can close before the
+    // factory returns. Never cache that document or retain it as a child.
+    guard !chrome.browser.isClosed else { return }
     let profileID = page.profileID, isPrivate = page.isPrivate
     chrome.browser.downloadObserver = { [weak self] download, control in
       guard let self, !self.shuttingDown else { control?.invalidate(); return }
@@ -219,34 +243,54 @@ public final class ChromiumEngine: NSObject, NSWindowDelegate {
     page.observeDocumentState()
     chrome.beforeClose = { [weak self, weak page] in
       guard let self, let page else { return true }
-      if self.isTerminating || self.isWindowClosing { return true }
+      if self.isTerminating || page.ownerWindowID.flatMap({ self.contexts[$0]?.isClosing }) == true { return true }
       return await page.beforeClose?() ?? true
     }
     chrome.browser.onCloseCancelled = { [weak self, weak page] in
       page?.chrome?.cancelPreparedClose()
-      self?.cancelWindowClose(vetoedBy: page)
+      if let self, let owner = page?.ownerWindowID, let context = self.contexts[owner] {
+        self.cancelWindowClose(context, vetoedBy: page)
+      }
       page?.onCloseCancelled?()
+      if let page { self?.onPageCloseCancelled?(page.id) }
     }
     page.onClosedInternal = { [weak self, weak page] in
       guard let self, let page else { return }
       if self.pages[page.id] === page { self.pages.removeValue(forKey: page.id) }
-      self.finishWindowCloseIfReady()
+      self.onPageClosed?(page.id)
+      if let owner = page.ownerWindowID, let context = self.contexts[owner] {
+        self.finishWindowCloseIfReady(context)
+      }
+    }
+    page.onFocusedInternal = { [weak self, weak page] in
+      guard let self, let owner = page?.ownerWindowID else { return }
+      self.windowDidFocus(id: owner)
+    }
+    page.canAdoptPopupInternally = { [weak self] in self?.onUnownedPopupCreated != nil }
+    page.openURLInternally = { [weak self, weak page] url, foreground in
+      guard let self, let page, let callback = self.onUnownedOpenURL else { return false }
+      callback(page, url, foreground); return true
     }
     pages[page.id] = page
     chrome.onPopupCreated = { [weak self, weak page] child, request in
-      guard let self, let page, self.pages[page.id] === page, !self.isTerminating, !self.isWindowClosing else {
+      guard let self, let page, self.pages[page.id] === page, !self.isTerminating,
+        page.ownerWindowID.flatMap({ self.contexts[$0]?.isClosing }) != true else {
         child.close(); return
       }
       let popup = ChromiumPage(id: "popup-" + UUID().uuidString, profileID: page.profileID, isPrivate: page.isPrivate)
       popup.openerID = page.id
+      popup.ownerWindowID = page.ownerWindowID
       child.browser.delegate = popup
       self.attach(popup, chrome: child)
       if let callback = page.onPopupCreated { callback(popup, request.disposition.prefersForeground) }
+      else if let callback = self.onUnownedPopupCreated { callback(page, popup, request.disposition.prefersForeground) }
       else { popup.close() }
     }
   }
 
-  public func hideAll() { for page in pages.values { page.hide() } }
+  public func hideAll(windowID: String? = nil) {
+    for page in pages.values where windowID == nil || page.ownerWindowID == windowID { page.hide() }
+  }
   func updateExtensionAccess(_ snapshot: ChromeExtensionSnapshot, profileID: String) {
     extensionAccess[profileID] = Set(snapshot.extensions.filter(\.isEnabled).map(\.id))
     privateExtensionAccess[profileID] = Set(snapshot.extensions.filter { $0.isEnabled && $0.incognitoAccess.isActive }.map(\.id))
@@ -315,74 +359,137 @@ public final class ChromiumEngine: NSObject, NSWindowDelegate {
     if FileManager.default.fileExists(atPath: retirementJournal.path) { try FileManager.default.removeItem(at: retirementJournal) }
     retiredProfiles.removeAll()
   }
-  public func showWindow() {
-    guard !isWindowClosing else { return }
-    isWindowOpen = true
-    nativeWindow?.makeKeyAndOrderFront(nil)
+  public func context(id: String) -> ChromiumWindowContext? { contexts[id] }
+
+  /// Bind the startup shell to the durable model before creating documents.
+  @discardableResult public func bindPrimaryWindow(id: String) -> ChromiumWindowContext? {
+    guard !id.isEmpty, let primaryWindow, pages.isEmpty,
+      contexts[id] == nil || contexts[id] === primaryWindow else { return nil }
+    contexts.removeValue(forKey: primaryWindow.id)
+    if focusedWindowID == primaryWindow.id { focusedWindowID = id }
+    primaryWindow.id = id
+    contexts[id] = primaryWindow
+    return primaryWindow
   }
-  /// Chromium asks every document about unsaved changes before closing.
-  public func closeWindow() {
-    guard isWindowOpen, !isWindowClosing, !isTerminating else { return }
-    isWindowClosing = true
-    Task { @MainActor [weak self] in
-      guard let self else { return }
-      let accepted = await self.prepareToCloseDocuments()
-      guard self.isWindowClosing, !self.isTerminating else { return }
-      guard accepted else { self.cancelWindowClose(vetoedBy: nil); return }
-      self.closeWindowDocuments()
+
+  @discardableResult public func createWindow(id: String = UUID().uuidString) -> ChromiumWindowContext {
+    precondition(!id.isEmpty && !shuttingDown, "A window requires a valid live engine")
+    if let existing = contexts[id] {
+      if !existing.isOpen {
+        existing.nativeID = nextWindowID; nextWindowID += 1
+        existing.isOpen = true; existing.isClosing = false
+      }
+      return existing
     }
+    let context = ChromiumWindowContext(id: id, nativeID: nextWindowID, engine: self)
+    nextWindowID += 1
+    contexts[id] = context
+    if primaryWindow == nil { primaryWindow = context }
+    return context
+  }
+
+  /// Move only the presentation owner; the Chromium document is never recreated.
+  @discardableResult public func movePage(id: String, toWindowID: String) -> Bool {
+    guard let page = pages[id], let target = contexts[toWindowID], target.isOpen,
+      !target.isClosing, !isTerminating,
+      page.ownerWindowID.flatMap({ contexts[$0]?.isClosing }) != true else { return false }
+    if page.ownerWindowID == toWindowID { return true }
+    page.hide()
+    page.ownerWindowID = toWindowID
+    page.chrome?.setHostingWindow(target.window)
+    return true
+  }
+
+  func windowDidFocus(id: String) {
+    guard let context = contexts[id], context.isOpen else { return }
+    focusedWindowID = id
+    context.onFocused?()
+  }
+
+  public func showWindow() { if let primaryWindow { showWindow(id: primaryWindow.id) } }
+  public func showWindow(id: String) {
+    guard let context = contexts[id], !context.isClosing, !isTerminating else { return }
+    if !context.isOpen { _ = createWindow(id: id) }
+    context.window.makeKeyAndOrderFront(nil)
+  }
+
+  /// Chromium asks only this shell's documents about unsaved changes.
+  public func closeWindow() { if let primaryWindow { closeWindow(id: primaryWindow.id) } }
+  public func closeWindow(id: String) {
+    guard let context = contexts[id], context.isOpen, !context.isClosing, !isTerminating else { return }
+    context.isClosing = true
+    Task { @MainActor [weak self, weak context] in
+      guard let self, let context else { return }
+      let accepted = await self.prepareToCloseDocuments(in: context)
+      guard context.isClosing, !self.isTerminating else { return }
+      guard accepted else { self.cancelWindowClose(context, vetoedBy: nil); return }
+      for page in Array(self.pages.values) where page.ownerWindowID == context.id {
+        page.closedForWindow = true
+        page.close()
+      }
+      self.finishWindowCloseIfReady(context)
+    }
+  }
+
+  private func prepareToCloseDocuments(in context: ChromiumWindowContext) async -> Bool {
+    if let existing = context.closingPreparation { return await existing.value }
+    let task = Task { @MainActor [weak self, weak context] in
+      guard let self, let context else { return true }
+      if let prepare = context.beforeClosingDocuments { return await prepare() }
+      if context === self.primaryWindow { return await self.beforeClosingDocuments?() ?? true }
+      return true
+    }
+    context.closingPreparation = task
+    let accepted = await task.value
+    context.closingPreparation = nil
+    return accepted
   }
 
   private func prepareToCloseDocuments() async -> Bool {
     if let closingPreparation { return await closingPreparation.value }
-    let task = Task { @MainActor [weak self] in await self?.beforeClosingDocuments?() ?? true }
+    let task = Task { @MainActor [weak self] in
+      guard let self else { return true }
+      // Prepare every live shell before CEF asks any document to unload. A veto
+      // leaves all native windows intact and permits another attempt later.
+      for context in self.contexts.values.sorted(by: { $0.nativeID < $1.nativeID }) where context.isOpen {
+        if !(await self.prepareToCloseDocuments(in: context)) { return false }
+      }
+      return true
+    }
     closingPreparation = task
     let accepted = await task.value
     closingPreparation = nil
     return accepted
   }
 
-  private func closeWindowDocuments() {
-    for page in Array(pages.values) {
-      if page.id.hasPrefix("extensions:") && !page.isPrivate { page.hide(); continue }
-      page.closedForWindow = true
-      page.close()
-    }
-    finishWindowCloseIfReady()
-  }
-
-  private func cancelWindowClose(vetoedBy page: ChromiumPage?) {
+  private func cancelWindowClose(_ context: ChromiumWindowContext, vetoedBy page: ChromiumPage?) {
     page?.closedForWindow = false
-    guard isWindowClosing else { return }
-    isWindowClosing = false
-    // Other documents may already have accepted close. Keep their origin flag
-    // until didClose so the host retains their model for window restoration.
-    onWindowCloseCancelled?()
+    guard context.isClosing else { return }
+    context.isClosing = false
+    // Accepted siblings retain their origin flag until native didClose so the
+    // model can restore them when another document vetoes the close.
+    context.onCloseCancelled?()
   }
 
-  private func finishWindowCloseIfReady() {
-    guard isWindowClosing, closingPreparation == nil, hasNoWindowDocuments else { return }
-    // Let CEF finish native child-window destruction before hiding the shell.
-    DispatchQueue.main.async { [weak self] in
-      guard let self, self.isWindowClosing, self.hasNoWindowDocuments else { return }
-      self.isWindowClosing = false
-      self.isWindowOpen = false
-      self.nativeWindow?.orderOut(nil)
-      let privateKeys = self.profiles.keys.filter { $0.hasPrefix("private:") }
-      for key in privateKeys { self.profiles.removeValue(forKey: key) }
-      self.onWindowClosed?()
+  private func finishWindowCloseIfReady(_ context: ChromiumWindowContext) {
+    guard context.isClosing, context.closingPreparation == nil,
+      !pages.values.contains(where: { $0.ownerWindowID == context.id }) else { return }
+    DispatchQueue.main.async { [weak self, weak context] in
+      guard let self, let context, context.isClosing,
+        !self.pages.values.contains(where: { $0.ownerWindowID == context.id }) else { return }
+      context.isClosing = false; context.isOpen = false
+      context.window.orderOut(nil)
+      if self.focusedWindowID == context.id { self.focusedWindowID = nil }
+      // A private context can be shared by documents in another window.
+      for key in self.profiles.keys.filter({ $0.hasPrefix("private:") }) {
+        let profileID = String(key.dropFirst("private:".count))
+        if !self.pages.values.contains(where: { $0.isPrivate && $0.profileID == profileID }) {
+          try? self.releasePrivateProfile(profileID)
+        }
+      }
+      context.onClosed?()
     }
   }
-
-  private var hasNoWindowDocuments: Bool {
-    !pages.values.contains { !$0.id.hasPrefix("extensions:") || $0.isPrivate }
-  }
-
-  public func windowShouldClose(_ sender: NSWindow) -> Bool {
-    closeWindow()
-    return false
-  }
-  public func windowDidResize(_ notification: Notification) { onLayout?() }
 
   @discardableResult public func pauseDownload(profileID: String, id: UInt32) -> Bool {
     downloadControls["\(profileID):\(id)"]?.pause() ?? false
@@ -402,12 +509,20 @@ public final class ChromiumEngine: NSObject, NSWindowDelegate {
     onLayout = nil
     onTerminationChanged = nil
     onDownload = nil
+    onPageClosed = nil
+    onPageCloseCancelled = nil
+    onUnownedPopupCreated = nil
+    onUnownedOpenURL = nil
     for control in downloadControls.values { control.invalidate() }
     downloadControls.removeAll()
-    nativeWindow?.delegate = nil
-    nativeWindow?.orderOut(nil)
-    nativeWindow?.contentView = nil
-    nativeWindow = nil
+    for context in contexts.values {
+      context.closingPreparation?.cancel()
+      context.window.delegate = nil
+      context.window.orderOut(nil)
+      context.window.contentView = nil
+      context.engine = nil
+    }
+    contexts.removeAll(); primaryWindow = nil; focusedWindowID = nil
     pages.removeAll()
     host = nil
     profiles.removeAll()
@@ -423,6 +538,10 @@ public final class ChromiumPage: CefBrowserDelegate {
   public fileprivate(set) var id: String
   public let profileID: String
   public let isPrivate: Bool
+  public fileprivate(set) var ownerWindowID: String?
+  fileprivate var onFocusedInternal: (() -> Void)?
+  fileprivate var canAdoptPopupInternally: (() -> Bool)?
+  fileprivate var openURLInternally: ((URL, Bool) -> Bool)?
   fileprivate var chrome: CefChromeBrowser?
   fileprivate var onClosedInternal: (() -> Void)?
   fileprivate var authorizeExtensionURL: ((URL) -> Bool)?
@@ -438,6 +557,7 @@ public final class ChromiumPage: CefBrowserDelegate {
   public private(set) var canGoForward = false
   public private(set) var progress = 0.0
   public private(set) var error: String?
+  public private(set) var creationFailed = false
   public private(set) var faviconURL: URL?
   /// The committed document that supplied `faviconURL`; never the pinned home URL.
   public private(set) var faviconDocumentURL: URL?
@@ -602,7 +722,7 @@ public final class ChromiumPage: CefBrowserDelegate {
       NSEvent.modifierFlags.contains(.shift), let onPeek { onPeek(url); return .handled }
     // Never replace a Chromium-created popup with a GET of its URL: the live
     // document carries POST bodies, named-window identity and its opener.
-    return onPopupCreated == nil ? .deny : .allowNativePopup
+    return onPopupCreated != nil || canAdoptPopupInternally?() == true ? .allowNativePopup : .deny
   }
   private static func webURL(_ url: URL) -> Bool {
     ["http", "https"].contains(url.scheme?.lowercased() ?? "") && url.host?.isEmpty == false && url.user == nil && url.password == nil
@@ -615,6 +735,7 @@ public final class ChromiumPage: CefBrowserDelegate {
     // A committed extension document is already authorized by Chromium for
     // this request context. Other extensions require a native registry snapshot.
     return (url?.scheme == "chrome-extension" && url?.host == identifier)
+      || (url?.scheme == "chrome" && url?.host == "extensions")
       || authorizeExtensionURL?(target) == true
   }
   public func browser(_ b: CefBrowser, didRequestNewTab url: URL?) -> Bool {
@@ -623,15 +744,15 @@ public final class ChromiumPage: CefBrowserDelegate {
   public func browser(_ b: CefBrowser, didRequestNewTab url: URL?, disposition: CefWindowOpenDisposition, userGesture: Bool) -> Bool {
     guard let url, allowedNewDocumentURL(url) else { return true }
     if disposition == .newWindow, userGesture, NSEvent.modifierFlags.contains(.shift), let onPeek { onPeek(url); return true }
-    guard let onOpenURL else { return false }
-    onOpenURL(url, disposition.prefersForeground)
-    return true
+    if let onOpenURL { onOpenURL(url, disposition.prefersForeground); return true }
+    return openURLInternally?(url, disposition.prefersForeground) ?? false
   }
   public func browser(_ b: CefBrowser, decidePolicyForNavigation url: URL?, isMainFrame: Bool, isRedirect: Bool, userGesture: Bool) -> CefNavigationDecision {
     guard isMainFrame else { return .allow }
     guard let url else { return .cancel }
     if Self.webURL(url) || url.absoluteString == "about:blank" { return .allow }
-    if url.scheme == "chrome", id.hasPrefix("extensions:"), url.host == "extensions" { return .allow }
+    if url.scheme == "chrome", (id.hasPrefix("extensions:") || id.hasPrefix("extension-settings:")),
+      url.host == "extensions" { return .allow }
     // Chromium still validates extension resource ownership and web-accessible
     // resources. No privileged native bridge exists in this document.
     if url.scheme == "chrome-extension", let host = url.host,
@@ -639,6 +760,7 @@ public final class ChromiumPage: CefBrowserDelegate {
     return .cancel
   }
   public func browserDidClose(_ b: CefBrowser) {
+    creationFailed = b.creationFailed
     documentObservation?.cancel(); documentObservation = nil
     if let documentEventToken { b.devTools.removeEventObserver(documentEventToken) }
     documentEventToken = nil
@@ -704,7 +826,7 @@ public final class ChromiumPage: CefBrowserDelegate {
     }
     return true
   }
-  public func browserDidGainFocus(_ b: CefBrowser) { onFocused?() }
+  public func browserDidGainFocus(_ b: CefBrowser) { onFocusedInternal?(); onFocused?() }
   public func browser(_ b: CefBrowser, didChangeStatusMessage message: String) { onStatusText?(message) }
   public func browser(_ b: CefBrowser, didReceiveAuthChallenge challenge: CefAuthChallenge, callback: CefAuthCallback) -> Bool {
     guard authentication == nil, let origin = URL(string: challenge.origin), Self.webURL(origin),
@@ -785,13 +907,22 @@ extension ChromiumEngine {
     if let existing = pages["extensions:\(profileID)"] { return existing }
     let page = page(
       id: "extensions:\(profileID)", profileID: profileID, isPrivate: false,
-      url: URL(string: "chrome://extensions/")!)
+      url: URL(string: "chrome://extensions/")!, ownerWindowID: nil)
     return page
   }
 
   public func extensionStorePage(profileID: String) -> ChromiumPage {
+    extensionStorePage(profileID: profileID, ownerWindowID: primaryWindow?.id)
+  }
+
+  public func extensionSettingsPage(profileID: String, ownerWindowID: String) -> ChromiumPage {
+    page(id: "extension-settings:\(profileID):\(ownerWindowID)", profileID: profileID,
+      isPrivate: false, url: URL(string: "chrome://extensions/")!, ownerWindowID: ownerWindowID)
+  }
+
+  public func extensionStorePage(profileID: String, ownerWindowID: String?) -> ChromiumPage {
     page(
-      id: "extension-store:\(profileID)", profileID: profileID, isPrivate: false,
-      url: URL(string: "https://chromewebstore.google.com/")!)
+      id: "extension-store:\(profileID):\(ownerWindowID ?? "unowned")", profileID: profileID, isPrivate: false,
+      url: URL(string: "https://chromewebstore.google.com/")!, ownerWindowID: ownerWindowID)
   }
 }

@@ -8,6 +8,11 @@ import ZacroServices
 @main
 enum ZacroApplication {
   @MainActor static func main() {
+    let integrationRequested = CommandLine.arguments.contains("--native-integration-acceptance")
+    guard !integrationRequested || CommandLine.arguments.contains("--engine-acceptance") else {
+      fputs("Application integration requires the disposable engine acceptance mode.\n", stderr)
+      exit(1)
+    }
     let base =
       ProcessInfo.processInfo.environment["ZACRO_NATIVE_DATA"].map { URL(fileURLWithPath: $0) }
       ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -18,6 +23,7 @@ enum ZacroApplication {
       defer { engine.shutdown() }
       if CommandLine.arguments.contains("--engine-acceptance"),
         !CommandLine.arguments.contains("--native-ui-review"),
+        !integrationRequested,
         ProcessInfo.processInfo.environment["ZACRO_NATIVE_DATA"] != nil,
         let raw = ProcessInfo.processInfo.environment["ZACRO_NATIVE_SMOKE_URL"],
         let url = URL(string: raw), url.host == "127.0.0.1"
@@ -28,11 +34,16 @@ enum ZacroApplication {
         withExtendedLifetime(acceptance) { NSApp.run() }
         return
       }
-      let coordinator = ApplicationCoordinator(engine: engine, store: BrowserStore(directory: base))
+      let coordinator = ApplicationCoordinator(engine: engine, repository: BrowserRepository(directory: base))
+      if integrationRequested { coordinator.store.updateSettings { $0.onboardingCompleted = true } }
       NSApplication.shared.delegate = coordinator
       NSApplication.shared.setActivationPolicy(.regular)
       coordinator.install()
-      withExtendedLifetime(coordinator) { NSApplication.shared.run() }
+      let integration = integrationRequested ? BrowserIntegrationAcceptance(application: coordinator) : nil
+      if let integration, let raw = ProcessInfo.processInfo.environment["ZACRO_NATIVE_SMOKE_URL"], let url = URL(string: raw) {
+        integration.run(url: url)
+      }
+      withExtendedLifetime((coordinator, integration)) { NSApplication.shared.run() }
       coordinator.store.save()
       try coordinator.store.flush()
     } catch {
@@ -44,8 +55,11 @@ enum ZacroApplication {
 }
 
 @MainActor
-final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
-  let engine: ChromiumEngine
+final class BrowserWindowCoordinator: NSObject {
+  unowned let application: ApplicationCoordinator
+  let windowContext: ChromiumWindowContext
+  var window: NSWindow? { windowContext.window }
+  var engine: ChromiumEngine { application.engine }
   let store: BrowserStore
   let actions = BrowserActions()
   private var observations: Set<AnyCancellable> = []
@@ -55,13 +69,12 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
   private var splitResizeDraft: (id: String, ratio: Double)?
   private var keyMonitor: Any?
   private let peekPanel = PeekPanelController()
-  private var pendingDeletion: (Set<String>, () -> Void)?
-  private var profileDeletionPageIDs = Set<String>()
-  private var deletingProfileID: String?
-  private var scopeCloseCancelled: (() -> Void)?
+  private var pendingDeletion: (Set<String>, () -> Void)? { get { application.pendingDeletion } set { application.pendingDeletion = newValue } }
+  private var profileDeletionPageIDs: Set<String> { get { application.profileDeletionPageIDs } set { application.profileDeletionPageIDs = newValue } }
+  private var deletingProfileID: String? { get { application.deletingProfileID } set { application.deletingProfileID = newValue } }
+  private var scopeCloseCancelled: (() -> Void)? { get { application.scopeCloseCancelled } set { application.scopeCloseCancelled = newValue } }
   private var internalPage: ChromiumPage?
-  private lazy var favicons = FaviconCache(
-    directory: engine.dataDirectory.appendingPathComponent("Icons"))
+  private var favicons: FaviconCache { application.favicons }
   private var peekFrames: [String: CGRect] = [:]
   private var peekOrigins: [String: CGRect] = [:]
   private var peekClosingSnapshots: [String: NSImage] = [:]
@@ -71,12 +84,12 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
   private var iconDestinations: [String: String] = [:]
   private var pendingHistory: [String: (source: String?, destination: String)] = [:]
   private var restoredHistoryPages = Set<String>()
-  private lazy var downloads = NativeDownloads(store: store, engine: engine)
-  private lazy var navigation = NativeNavigationCoordinator(engine: engine, store: store)
-  private lazy var extensionSync = NativeExtensionSync(engine: engine, store: store, services: services)
-  private lazy var extensionBrowser = NativeExtensionBrowser(store: store, engine: engine)
-  private var runtimeCapabilityTask: Task<Void, Never>?
-  private var runtimeCapabilitiesChecked = false
+  private var downloads: NativeDownloads { application.downloads }
+  private var navigation: NativeNavigationCoordinator { application.navigation }
+  private var extensionSync: NativeExtensionSync { application.extensionSync }
+  private var extensionBrowser: NativeExtensionBrowser { application.extensionBrowser }
+  private var runtimeCapabilityTask: Task<Void, Never>? { application.runtimeCapabilityTask }
+  private var runtimeCapabilitiesChecked: Bool { application.runtimeCapabilitiesChecked }
   private var dormantPages = Set<String>()
   private struct PagePreparation { let reservation: ChromeTabMaterialization? }
   private var pagePreparations: [String: PagePreparation] = [:]
@@ -97,13 +110,125 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
   private var recentTabCycle: [String]?
   private var recentTabIndex = 0
   private var recentModifiers: NSEvent.ModifierFlags = []
-  private lazy var services = NativeServicesModel(store: store, directory: engine.dataDirectory) { [weak self] grants in
-    guard let self else { throw ServiceError("CANCELLED", "The browser has closed.") }
-    return try await self.readContext(grants)
+  private var scopedServices: NativeServicesModel?
+  var services: NativeServicesModel {
+    if let scopedServices { return scopedServices }
+    let model = NativeServicesModel(store: store, sharing: application.services)
+    model.sourceAction = { [weak self] action, payload in
+      guard let self else { throw CancellationError() }
+      return try await self.openAISources(action: action, payload: payload)
+    }
+    scopedServices = model
+    return model
   }
-  init(engine: ChromiumEngine, store: BrowserStore) {
-    self.engine = engine
+  init(application: ApplicationCoordinator, store: BrowserStore, context: ChromiumWindowContext) {
+    self.application = application
     self.store = store
+    self.windowContext = context
+  }
+  var windowPages: [String: ChromiumPage] { engine.pages.filter { $0.value.ownerWindowID == windowContext.id } }
+  struct TabPresentationState {
+    var urls: [String: String] = [:]
+    var pending: [String: (source: String?, destination: String)] = [:]
+    var dormant: Set<String> = []
+    var restored: Set<String> = []
+  }
+  func isDiscarded(_ id: String) -> Bool { dormantPages.contains(id) || engine.pages[id] == nil }
+  func activateExtensionTab(_ id: String) {
+    guard store.tab(id) != nil else { return }
+    pageCreationFailures.removeValue(forKey: id)
+    store.selectTab(id: id)
+    internalPage = nil; actions.nativePageVisible = false
+    scheduleLayout()
+  }
+  func extensionEvent(profileID: String, event: ChromeExtensionEvent) {
+    extensions.nativeEvent(profileID: profileID, event: event)
+  }
+  func didRestorePage(_ id: String, restored: Bool) {
+    if restored { restoredHistoryPages.remove(id) }
+    updateNavigationState(activePage)
+    scheduleLayout()
+  }
+  func prepareTermination() {
+    extensions.close()
+    idleSweep?.cancel()
+    for task in pageCreations.values { task.cancel() }
+    for task in dormantNavigations.values { task.cancel() }
+    pagePreparations.removeAll()
+  }
+  func closeServicesPresentation() async {
+    let model = scopedServices; scopedServices = nil
+    await model?.close()
+  }
+  func reopen() {
+    actions.nativePageVisible = false
+    pageCreationFailures.removeAll()
+    extensions.refresh()
+    services.start()
+    scheduleLayout()
+  }
+  func prepareTabTransfer(_ id: String) async throws {
+    guard store.tab(id)?.isClosed == false, closeWaiters[id] == nil,
+      !windowContext.isClosing, !engine.isTerminating else { throw CancellationError() }
+    if let task = pageCreations[id] { task.cancel(); _ = try? await task.value }
+    try await discardOperations[id]?.value
+    try await dormantNavigations[id]?.value
+    for key in [id, "peek:" + id] {
+      if let page = engine.pages[key] { try await navigation.waitForRestore(page) }
+    }
+  }
+  func detachTab(_ id: String) -> TabPresentationState {
+    var saved = TabPresentationState()
+    if store.state.activeTabID == id || peekFrames[id] != nil { hidePeekPresentation(immediately: true) }
+    for key in [id, "peek:" + id] {
+      engine.pages[key]?.hide()
+      engine.pages[key]?.setPresentationParent(nil)
+      saved.urls[key] = modelURLs.removeValue(forKey: key)
+      saved.pending[key] = pendingHistory.removeValue(forKey: key)
+      if dormantPages.remove(key) != nil { saved.dormant.insert(key) }
+      if restoredHistoryPages.remove(key) != nil { saved.restored.insert(key) }
+      visiblePageFrames.removeValue(forKey: key)
+      pageCreationFailures.removeValue(forKey: key)
+    }
+    peekFrames.removeValue(forKey: id); peekOrigins.removeValue(forKey: id)
+    peekClosingSnapshots.removeValue(forKey: id)
+    actions.audibleTabIDs.remove(id)
+    return saved
+  }
+  func attachTab(_ id: String, state: TabPresentationState?) {
+    guard let tab = store.tab(id) else { return }
+    if let state {
+      modelURLs.merge(state.urls) { _, new in new }
+      pendingHistory.merge(state.pending) { _, new in new }
+      dormantPages.formUnion(state.dormant)
+      restoredHistoryPages.formUnion(state.restored)
+    }
+    for key in [id, "peek:" + id] {
+      guard let page = engine.pages[key] else { continue }
+      modelURLs[key] = modelURLs[key] ?? (key == id ? tab.url : tab.peek?.url)
+      wire(page, tabID: id, peek: key != id)
+    }
+    if let page = engine.pages[id] { updateIcon(page, tab: tab) }
+    scheduleLayout()
+  }
+  func adoptPopup(_ popup: ChromiumPage, spaceID: String? = nil, foreground: Bool) -> Bool {
+    let profileID = spaceID.flatMap { id in store.state.spaces.first { $0.id == id }?.profileID } ?? store.activeProfileID
+    guard engine.pages[popup.id] === popup, !popup.creationFailed,
+      popup.profileID == profileID, !windowContext.isClosing else { return false }
+    let address = popup.browser?.url?.absoluteString ?? "about:blank"
+    let destination = BrowserAddress.extensionURL(address) != nil
+      ? store.createExtensionTab(url: address, spaceID: spaceID, activate: false)
+      : store.createTab(address: address, spaceID: spaceID, activate: false)
+    guard let tab = destination else { return false }
+    guard engine.movePage(id: popup.id, toWindowID: windowContext.id),
+      engine.adoptPage(fromID: popup.id, toID: tab.id) != nil else {
+      store.closeTab(id: tab.id); return false
+    }
+    modelURLs[tab.id] = popup.browser?.url?.absoluteString ?? tab.url
+    wire(popup, tabID: tab.id, peek: false)
+    if foreground { store.selectTab(id: tab.id); popup.focus() }
+    scheduleLayout()
+    return true
   }
   var activePage: ChromiumPage? {
     if let internalPage, internalPage.profileID == store.activeProfileID { return internalPage }
@@ -135,13 +260,13 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
     scheduleLayout()
   }
   private func hidePeekPresentation(immediately: Bool = false) {
-    for page in engine.pages.values where page.id.hasPrefix("peek:") {
+    for page in windowPages.values where page.id.hasPrefix("peek:") {
       page.setPresentationParent(nil)
     }
     peekPanel.hide(immediately: immediately)
   }
-  func install() {
-    guard let window = engine.window, let parent = window.contentView else { return }
+  func install(show: Bool = true) {
+    guard let window = window, let parent = window.contentView else { return }
     store.enableDebouncedPersistence()
     window.titleVisibility = .hidden
     window.titlebarAppearsTransparent = true
@@ -214,8 +339,8 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
       self.scheduleLayout()
     }
     contentFrame = actions.contentFrame
-    engine.onLayout = { [weak self] in self?.scheduleLayout() }
-    engine.onWindowClosed = { [weak self] in
+    windowContext.onLayout = { [weak self] in self?.scheduleLayout() }
+    windowContext.onClosed = { [weak self] in
       guard let self else { return }
       self.hidePeekPresentation(immediately: true)
       self.internalPage = nil
@@ -224,20 +349,17 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
       self.peekFrames.removeAll()
       self.peekClosingSnapshots.removeAll()
       self.extensions.close()
-      for profile in self.store.state.profiles where profile.isPrivate {
-        self.store.discardPrivateProfile(id: profile.id)
-        self.favicons.clear(profile: profile.id)
-        do { try self.engine.releasePrivateProfile(profile.id) }
-        catch { fputs("Zacro could not release a private context: \(error.localizedDescription)\n", stderr) }
-      }
+      self.actions.palette = false; self.actions.library = nil; self.actions.themeEditor = false
+      let presentationServices = self.scopedServices; self.scopedServices = nil
+      Task { await presentationServices?.close() }
       self.finishWindowCloseWaiters(accepted: true)
-      Task { [weak self] in await self?.extensionBrowser.didCloseWindow() }
+      self.application.didCloseWindow(self)
     }
-    engine.onWindowCloseCancelled = { [weak self] in
+    windowContext.onCloseCancelled = { [weak self] in
       self?.finishWindowCloseWaiters(accepted: false)
       self?.scheduleLayout()
     }
-    engine.beforeClosingDocuments = { [weak self] in
+    windowContext.beforeClosingDocuments = { [weak self] in
       guard let self else { return true }
       guard self.deletingProfileID == nil else {
         self.showError("Wait for the current profile operation to finish before closing the browser.")
@@ -247,47 +369,10 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
       for task in self.dormantNavigations.values { task.cancel() }
       for task in Array(self.discardOperations.values) { _ = try? await task.value }
       for task in Array(self.dormantNavigations.values) { _ = try? await task.value }
-      await self.navigation.captureAll()
+      await self.navigation.captureAll(windowID: self.windowContext.id)
       self.store.save()
       do { try self.store.flush(); return true }
       catch { self.showError("Your session could not be saved: \(error.localizedDescription)"); return false }
-    }
-    navigation.beforeRestore = { [weak self] page in
-      guard let self, !page.isPrivate, self.store.tab(page.id) != nil else { return }
-      self.inspectRuntimeCapabilities(page)
-      await self.runtimeCapabilityTask?.value
-      if self.extensionBrowser.enabled { try await self.extensionBrowser.prepareInitialNavigation(page) }
-    }
-    navigation.didFailPreparation = { [weak self] id, message in
-      guard let self, self.store.state.activeTabID == id, self.deletingProfileID == nil,
-        self.engine.isWindowOpen, !self.engine.isWindowClosing, !self.engine.isTerminating else { return }
-      self.showError("This tab could not be opened: " + message)
-    }
-    navigation.didRestore = { [weak self] id, restored in
-      guard let self else { return }
-      if restored { self.restoredHistoryPages.remove(id) }
-      self.updateNavigationState(self.activePage)
-      self.scheduleLayout()
-    }
-    engine.onTerminationChanged = { [weak self] terminating in
-      guard let self else { return }
-      if terminating {
-        self.store.save()
-        do { try self.store.flush() } catch { self.showError("Your session could not be saved: \(error.localizedDescription)") }
-      } else { self.scheduleLayout() }
-    }
-    engine.beforeTermination = { [weak self] in
-      guard let self else { return }
-      self.extensions.close()
-      self.idleSweep?.cancel()
-      for task in self.pageCreations.values { task.cancel() }
-      for task in self.dormantNavigations.values { task.cancel() }
-      self.pagePreparations.removeAll()
-      await self.extensionBrowser.close()
-      await self.extensionSync.close()
-      await self.services.close()
-      self.store.save()
-      do { try self.store.flush() } catch { fputs("Zacro could not save its final session: \(error)\n", stderr) }
     }
     store.$state.dropFirst().sink { [weak self] _ in self?.scheduleLayout() }.store(
       in: &observations)
@@ -295,62 +380,18 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
       in: &observations)
     actions.$library.dropFirst().sink { [weak self] section in
       guard let self else { return }
-      if section != nil { self.engine.window?.makeKeyAndOrderFront(nil) }
+      if section != nil { self.window?.makeKeyAndOrderFront(nil) }
       self.scheduleLayout()
     }.store(in: &observations)
     installServices()
-    extensionBrowser.profileAvailable = { [weak self] profile in
-      guard let self else { return false }
-      return self.deletingProfileID != profile
-    }
-    extensionBrowser.materializePage = { [weak self] tab in
-      guard let self else { throw CancellationError() }
-      let page = try await self.ensurePageReady(tab)
-      try await self.navigation.waitForRestore(page)
-      guard self.engine.pages[tab.id] === page else { throw CancellationError() }
-      return page
-    }
-    extensionBrowser.closeTab = { [weak self] in await self?.requestCloseTab($0) ?? false }
-    extensionBrowser.navigateTab = { [weak self] tab, address in self?.navigateExtensionTab(tab, address: address) }
-    extensionBrowser.activateTab = { [weak self] id in
-      guard let self else { return }
-      self.store.selectTab(id: id); self.internalPage = nil; self.actions.nativePageVisible = false
-      if let tab = self.store.tab(id) { self.page(for: tab)?.focus() }
-      self.scheduleLayout()
-    }
-    extensionBrowser.discardTab = { [weak self] in try await self?.unloadInactiveTab($0) ?? false }
-    extensionBrowser.closeWindow = { [weak self] in await self?.requestCloseWindow() ?? false }
-    extensionBrowser.isDiscarded = { [weak self] id in
-      guard let self else { return true }
-      return self.dormantPages.contains(id) || self.reservedPages.contains(id) || self.engine.pages[id] == nil
-    }
-    extensionBrowser.isAudible = { [weak self] in self?.engine.pages[$0]?.isAudible ?? false }
-    extensionBrowser.didChange = { [weak self] in self?.scheduleLayout() }
-    extensionSync.nativeEvent = { [weak self] profile, event in
-      self?.extensions.nativeEvent(profileID: profile, event: event)
-      if case let .hostRequest(request) = event {
-        Task { [weak self] in await self?.extensionBrowser.handle(profileID: profile, request: request) }
-      }
-    }
-    for notification in [NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification,
-                         NSApplication.didBecomeActiveNotification, NSApplication.didResignActiveNotification] {
-      NotificationCenter.default.publisher(for: notification).sink { [weak self] _ in
-        self?.extensionBrowser.windowFocusChanged()
-      }.store(in: &observations)
-    }
+    services.start()
     refreshDefaultBrowser()
     refreshCommands()
     keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { [weak self] event in
       self?.handleKey(event) == true ? nil : event
     }
     scheduleLayout()
-    engine.showWindow()
-    extensionSync.start()
-    services.start()
-    NSApp.activate(ignoringOtherApps: true)
-    if ProcessInfo.processInfo.environment["ZACRO_NATIVE_SMOKE_URL"] != nil {
-      navigate(ProcessInfo.processInfo.environment["ZACRO_NATIVE_SMOKE_URL"]!)
-    }
+    if show { windowContext.show() } else { window.orderFront(nil) }
     Timer.publish(every: 30, on: .main, in: .common).autoconnect().sink { [weak self] _ in
       guard let self, self.idleSweep == nil else { return }
       self.idleSweep = Task { [weak self] in
@@ -385,7 +426,7 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
     }
     return contentFrame.contains(top)
   }
-  private func scheduleLayout() {
+  func scheduleLayout() {
     guard !engine.isTerminating, !layoutQueued else { return }
     layoutQueued = true
     DispatchQueue.main.async { [weak self] in
@@ -419,7 +460,7 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
     let page = engine.page(
       id: tab.id, profileID: profileID, isPrivate: profile.isPrivate,
       url: existed || profile.isPrivate ? (URL(string: tab.url) ?? URL(string: "about:blank")!) : nil,
-      nativeReservation: reservation)
+      nativeReservation: reservation, ownerWindowID: windowContext.id)
     if !existed || wasReserved {
       page.hide()
       if tab.navigation.count > 1 { restoredHistoryPages.insert(tab.id) }
@@ -465,18 +506,20 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
         let reservation = self.extensionBrowser.enabled
           ? try await self.extensionBrowser.preparePageCreation(tabID: tab.id) : nil
         try Task.checkCancellation()
-        guard self.engine.isWindowOpen, !self.engine.isWindowClosing, !self.engine.isTerminating,
+        guard self.windowContext.isOpen, !self.windowContext.isClosing, !self.engine.isTerminating,
           self.deletingProfileID != profileID,
           let current = self.store.tab(tab.id), !current.isClosed,
           self.store.profileID(for: current) == profileID else { throw CancellationError() }
         self.pagePreparations[tab.id] = PagePreparation(reservation: reservation)
         guard let page = self.page(for: current) else { throw CefDevToolsError.unavailable }
+        _ = try await page.ready()
+        guard self.engine.pages[tab.id] === page else { throw CancellationError() }
         return page
       } catch {
         if !(error is CancellationError), let current = self.store.tab(tab.id), !current.isClosed {
           self.pageCreationFailures[tab.id] = current.url
-          if self.store.state.activeTabID == tab.id, self.engine.isWindowOpen,
-            !self.engine.isWindowClosing, !self.engine.isTerminating, self.deletingProfileID == nil {
+          if self.store.state.activeTabID == tab.id, self.windowContext.isOpen,
+            !self.windowContext.isClosing, !self.engine.isTerminating, self.deletingProfileID == nil {
             self.showError("This tab could not be opened: " + error.localizedDescription)
           }
         }
@@ -484,7 +527,7 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
       }
     }
   }
-  private func ensurePageReady(_ tab: BrowserTab) async throws -> ChromiumPage {
+  func ensurePageReady(_ tab: BrowserTab) async throws -> ChromiumPage {
     pageCreationFailures.removeValue(forKey: tab.id)
     try await discardOperations[tab.id]?.value
     try await dormantNavigations[tab.id]?.value
@@ -508,7 +551,7 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
     _ = page(for: tab)
     scheduleLayout()
   }
-  private func requestCloseTab(_ id: String) async -> Bool {
+  func requestCloseTab(_ id: String) async -> Bool {
     guard store.tab(id) != nil else { return false }
     pageCreations[id]?.cancel()
     dormantNavigations[id]?.cancel()
@@ -519,7 +562,7 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
     store.closeTab(id: id)
     return true
   }
-  private func navigateExtensionTab(_ tab: BrowserTab, address: String) {
+  func navigateExtensionTab(_ tab: BrowserTab, address: String) {
     guard let url = URL(string: address) else { return }
     guard let page = engine.pages[tab.id] else {
       pageCreationFailures.removeValue(forKey: tab.id)
@@ -551,7 +594,7 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
           let browser = try await page.ready()
           try await browser.restoreDiscardedDocument()
           try Task.checkCancellation()
-          guard self.owns(page, tabID: tab.id), !self.engine.isWindowClosing, !self.engine.isTerminating,
+          guard self.owns(page, tabID: tab.id), !self.windowContext.isClosing, !self.engine.isTerminating,
             let destination = self.store.tab(tab.id)?.url, let target = URL(string: destination) else { throw CancellationError() }
           self.dormantPages.remove(tab.id)
           self.modelURLs[tab.id] = destination
@@ -576,8 +619,8 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
   private func finishCloseWaiters(_ id: String, accepted: Bool) {
     for continuation in closeWaiters.removeValue(forKey: id) ?? [] { continuation.resume(returning: accepted) }
   }
-  private func requestCloseWindow() async -> Bool {
-    guard engine.isWindowOpen, let window = engine.window else { return true }
+  func requestCloseWindow() async -> Bool {
+    guard windowContext.isOpen, let window = window else { return true }
     return await withCheckedContinuation { continuation in
       let pending = !windowCloseWaiters.isEmpty
       windowCloseWaiters.append(continuation)
@@ -600,10 +643,10 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
   private func wire(_ page: ChromiumPage, tabID: String, peek: Bool) {
     page.beforeClose = { [weak self, weak page] in
       guard let self, let page else { return true }
-      if !peek, !self.engine.isWindowClosing, !self.engine.isTerminating,
+      if !peek, !self.windowContext.isClosing, !self.engine.isTerminating,
         let preview = self.engine.pages["peek:" + tabID], !(await self.requestClosePage(preview)) { return false }
       self.peekClosingSnapshots.removeValue(forKey: tabID)
-      if peek, self.store.state.activeTabID == tabID, !self.engine.isWindowClosing,
+      if peek, self.store.state.activeTabID == tabID, !self.windowContext.isClosing,
         !self.engine.isTerminating, self.deletingProfileID == nil, let browser = page.browser {
         if let result = try? await browser.devTools.call("Page.captureScreenshot",
           parameters: ["format": "png", "captureBeyondViewport": false], timeout: 1),
@@ -707,20 +750,11 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
     }
     page.onPopupCreated = { [weak self, weak page] popup, foreground in
       guard let self, let page, self.owns(page, tabID: tabID), let source = self.store.tab(tabID) else { popup.close(); return }
-      let address = popup.browser?.url?.absoluteString ?? "about:blank"
-      let destination = BrowserAddress.extensionURL(address) != nil
-        ? self.store.createExtensionTab(url: address, spaceID: source.spaceID, activate: false)
-        : self.store.createTab(address: address, spaceID: source.spaceID, activate: false)
-      guard let tab = destination,
-        self.engine.adoptPage(fromID: popup.id, toID: tab.id) != nil else { popup.close(); return }
-      self.modelURLs[tab.id] = popup.browser?.url?.absoluteString ?? tab.url
-      self.wire(popup, tabID: tab.id, peek: false)
-      if foreground { self.store.selectTab(id: tab.id); popup.focus() }
-      self.scheduleLayout()
+      if !self.adoptPopup(popup, spaceID: source.spaceID, foreground: foreground) { popup.close() }
     }
     page.onPeek = { [weak self, weak page] url in
       guard let self, let page, self.owns(page, tabID: tabID) else { return }
-      if let window = self.engine.window, let content = window.contentView {
+      if let window = self.window, let content = window.contentView {
         let inWindow = window.convertPoint(fromScreen: NSEvent.mouseLocation)
         let point = content.convert(inWindow, from: nil)
         let y = content.isFlipped ? point.y : content.bounds.height - point.y
@@ -786,7 +820,7 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
         self.scheduleLayout()
         return
       }
-      if page.closedForTermination || page.closedForWindow {
+      if page.closedForTermination || page.closedForWindow || page.creationFailed {
         self.scheduleLayout()
         return
       }
@@ -804,7 +838,7 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
         if wasActive {
           DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            if let active = self.activePage { active.focus() } else { self.engine.window?.makeKey() }
+            if let active = self.activePage { active.focus() } else { self.window?.makeKey() }
           }
         }
       }
@@ -843,7 +877,7 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
     }
     engine.close(id: id)
   }
-  private func updateNavigationState(_ page: ChromiumPage?) {
+  func updateNavigationState(_ page: ChromiumPage?) {
     refreshSiteControls()
     let tab = store.state.activeTab
     let nativeHistory = internalPage != nil || tab?.peek != nil || (page != nil && !restoredHistoryPages.contains(page!.id))
@@ -856,7 +890,7 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
     refreshCommands()
   }
   func layoutPages() {
-    guard !engine.isTerminating, !engine.isWindowClosing, engine.isWindowOpen else { return }
+    guard !engine.isTerminating, !windowContext.isClosing, windowContext.isOpen else { return }
     defer { if deletingProfileID == nil { extensionBrowser.reconcile() } }
     refreshCommands()
     services.refreshContext()
@@ -864,7 +898,7 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
     refreshSiteControls()
     extensions.profileChanged()
     extensions.activePageChanged(activePage)
-    let persistentIcons: [(profile: String, url: URL)] = store.state.tabs.flatMap { tab -> [(profile: String, url: URL)] in
+    let persistentIcons: [(profile: String, url: URL)] = application.store.state.tabs.flatMap { tab -> [(profile: String, url: URL)] in
       guard let profile = store.profileID(for: tab),
         store.state.profiles.first(where: { $0.id == profile })?.isPrivate == false else { return [] }
       var addresses = [tab.peek?.url]
@@ -888,10 +922,11 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
     if actions.loadedTabIDs != loaded { actions.loadedTabIDs = loaded }
     if let pending = pendingDeletion, pending.0.allSatisfy({ engine.pages[$0] == nil }) {
       pendingDeletion = nil
+      profileDeletionPageIDs.subtract(pending.0)
       pending.1()
     }
     if store.state.activeTab?.peek == nil || internalPage != nil { hidePeekPresentation() }
-    if contentFrame.width <= 0, let bounds = engine.window?.contentView?.bounds {
+    if contentFrame.width <= 0, let bounds = window?.contentView?.bounds {
       let gutter = store.state.settings.pageGutter
       let sidebar = store.state.settings.sidebarVisible ? store.state.settings.sidebarWidth : 0
       contentFrame = CGRect(
@@ -937,7 +972,7 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
         } else if !retiringPageIDs.contains(previewID) {
           let wasLoaded = engine.pages[previewID] != nil
           let preview = engine.page(
-            id: previewID, profileID: source.profileID, isPrivate: source.isPrivate, url: wasLoaded || source.isPrivate ? url : nil)
+            id: previewID, profileID: source.profileID, isPrivate: source.isPrivate, url: wasLoaded || source.isPrivate ? url : nil, ownerWindowID: windowContext.id)
           if !wasLoaded { preview.hide() }
           wire(preview, tabID: current.id, peek: true)
           if !wasLoaded && !source.isPrivate { navigation.restore(preview, tabID: current.id, peek: true, address: peek.url) }
@@ -969,7 +1004,7 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
     }
     visiblePageFrames = desired.mapValues { $0.1 }
     if let id = store.state.activeTabID, let preview = desired["peek:" + id]?.0,
-      let parent = engine.window
+      let parent = window
     {
       peekPanel.show(
         parent: parent, contentFrame: contentFrame, preview: preview.browser?.nativeView?.window,
@@ -987,7 +1022,7 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
       preview.setPresentationParent(peekPanel.presentationWindow)
     }
     let ids = Set(store.state.tabs.filter { !$0.isClosed }.map(\.id))
-    for id in Array(engine.pages.keys) {
+    for id in Array(windowPages.keys) {
       if id.hasPrefix("extensions:") || id.hasPrefix("extension-store:") || id.hasPrefix("maintenance:") { continue }
       if id.hasPrefix("peek:") {
         let source = String(id.dropFirst(5))
@@ -1090,24 +1125,16 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
   func find() {
     actions.findVisible = true
   }
-  func applicationWillTerminate(_ notification: Notification) { store.save(); try? store.flush() }
-  func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
-  func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool { engine.showWindow(); scheduleLayout(); return true }
-  func application(_ application: NSApplication, open urls: [URL]) {
-    engine.showWindow()
-    for url in urls.prefix(32) {
-      if BrowserAddress.webURL(url.absoluteString) != nil { actions.newTab(url.absoluteString) }
-    }
-  }
   func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
     let menu = NSMenu()
-    for (id,title) in [("open-browser","Open Browser Window"),("command-palette","Command Palette"),("new-private-space","New Private Space")] {
+    for (id,title) in [("open-browser","New Window"),("command-palette","Command Palette"),("new-private-space","New Private Space")] {
       let item = NSMenuItem(title: title, action: #selector(menuCommand(_:)), keyEquivalent: "")
       item.target = self; item.representedObject = id; menu.addItem(item)
     }
     return menu
   }
   private func handleKey(_ event: NSEvent) -> Bool {
+    guard application.focusedCoordinator === self else { return false }
     let flags = event.modifierFlags.intersection([.command, .control, .option, .shift])
     if event.type == .flagsChanged {
       if !flags.isSuperset(of: recentModifiers) { recentTabCycle = nil; recentModifiers = [] }
@@ -1117,7 +1144,7 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
       resize.handleKey(event) { return true }
     guard !actions.recordingShortcut else { return false }
     if let text = NSApp.keyWindow?.firstResponder as? NSTextInputClient, text.hasMarkedText() { return false }
-    if NSApp.modalWindow != nil || NSApp.keyWindow?.sheetParent != nil || engine.window?.attachedSheet != nil { return false }
+    if NSApp.modalWindow != nil || NSApp.keyWindow?.sheetParent != nil || window?.attachedSheet != nil { return false }
     if flags == [.command], event.charactersIgnoringModifiers?.lowercased() == "q" {
       NSApp.terminate(nil); return true
     }
@@ -1129,8 +1156,8 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
       if actions.library != nil { actions.library = nil; return true }
       return false
     }
-    if let focusedWindow = NSApp.keyWindow, focusedWindow !== engine.window,
-      !engine.pages.values.contains(where: { $0.nativeWindow === focusedWindow }), !actions.palette {
+    if let focusedWindow = NSApp.keyWindow, focusedWindow !== window,
+      !windowPages.values.contains(where: { $0.nativeWindow === focusedWindow }), !actions.palette {
       return false
     }
     let keys = NativeKeyBinding.candidates(event)
@@ -1144,7 +1171,7 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
     runCommand(command.id)
     return true
   }
-  private func installMenus() {
+  func installMenus() {
     let catalog = BrowserShortcut.catalog(overrides: store.state.settings.shortcutOverrides)
     func command(_ id: String, _ title: String) -> NSMenuItem {
       let item = NSMenuItem(title: title, action: #selector(menuCommand(_:)), keyEquivalent: "")
@@ -1173,7 +1200,7 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
     let hideOthers = app.addItem(withTitle: "Hide Others", action: #selector(NSApplication.hideOtherApplications(_:)), keyEquivalent: "h"); hideOthers.keyEquivalentModifierMask = [.command,.option]
     app.addItem(withTitle: "Show All", action: #selector(NSApplication.unhideAllApplications(_:)), keyEquivalent: "")
     app.addItem(.separator()); app.addItem(withTitle: "Quit Zacro", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-    _ = append("File", [("command-palette","Command Palette…"),("new-tab","New Tab Page"),("open-browser","Open Browser Window"),("new-private-space","New Private Space"),("open-location","Open Location…"),("reopen-tab","Reopen Closed Tab"),("",""),("close-tab","Close Tab"),("close-window","Close Window"),("",""),("import","Import Browser Data…"),("export","Export Browser Data…"),("",""),("save-page","Save Page As…"),("print","Print…")])
+    _ = append("File", [("command-palette","Command Palette…"),("new-tab","New Tab Page"),("open-browser","New Window"),("new-private-space","New Private Space"),("open-location","Open Location…"),("reopen-tab","Reopen Closed Tab"),("",""),("close-tab","Close Tab"),("close-window","Close Window"),("",""),("import","Import Browser Data…"),("export","Export Browser Data…"),("",""),("save-page","Save Page As…"),("print","Print…")])
     let edit = append("Edit", [])
     for (id,title,key,flags): (String,String,String,NSEvent.ModifierFlags) in [
       ("undo","Undo","z",.command),("redo","Redo","z",[.command,.shift]),
@@ -1187,7 +1214,7 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
     speechMenu.addItem(withTitle: "Start Speaking", action: #selector(NSTextView.startSpeaking(_:)), keyEquivalent: "")
     speechMenu.addItem(withTitle: "Stop Speaking", action: #selector(NSTextView.stopSpeaking(_:)), keyEquivalent: "")
     speech.submenu = speechMenu; edit.addItem(speech)
-    _ = append("View", [("reload","Reload Page"),("force-reload","Reload Without Cache"),("",""),("sidebar-toggle","Toggle Sidebar"),("focus-sidebar","Focus Sidebar"),("reveal-tab","Reveal Tab in Sidebar"),("zoom-in","Zoom In"),("zoom-out","Zoom Out"),("zoom-reset","Actual Size"),("",""),("fullscreen", engine.window?.styleMask.contains(.fullScreen) == true ? "Exit Full Screen" : "Enter Full Screen"),("developer-tools","Developer Tools")])
+    _ = append("View", [("reload","Reload Page"),("force-reload","Reload Without Cache"),("",""),("sidebar-toggle","Toggle Sidebar"),("focus-sidebar","Focus Sidebar"),("reveal-tab","Reveal Tab in Sidebar"),("zoom-in","Zoom In"),("zoom-out","Zoom Out"),("zoom-reset","Actual Size"),("",""),("fullscreen", window?.styleMask.contains(.fullScreen) == true ? "Exit Full Screen" : "Enter Full Screen"),("developer-tools","Developer Tools")])
     _ = append("History", [("history-back","Back"),("history-forward","Forward"),("",""),("history","Show History"),("downloads","Downloads")])
     _ = append("Tabs", [("previous-tab","Previous Tab"),("next-tab","Next Tab"),("",""),("pin-tab","Pin / Unpin Tab"),("duplicate-tab","Duplicate Tab"),("rename-tab","Rename Tab…"),("move-tab","Move Tab…"),("mute-tab","Mute / Unmute Tab"),("split","Split View…"),("unsplit","Unsplit Tabs"),("",""),("previous-space","Previous Space"),("next-space","Next Space"),("new-space","New Space…"),("new-folder","New Folder…"),("",""),("bookmark","Bookmark This Page")])
     let window = append("Window", [])
@@ -1237,15 +1264,6 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
     }
     pendingDeletion = (ids, completion)
     profileDeletionPageIDs.formUnion(ids)
-    for id in ids where store.tab(id) == nil && !id.hasPrefix("peek:") {
-      engine.pages[id]?.onClosed = { [weak self] in
-        self?.profileDeletionPageIDs.remove(id); self?.scheduleLayout()
-      }
-      engine.pages[id]?.onCloseCancelled = { [weak self] in
-        self?.profileDeletionPageIDs.remove(id); self?.pendingDeletion = nil
-        self?.deletingProfileID = nil; self?.scheduleLayout()
-      }
-    }
     for id in ids { engine.close(id: id) }
   }
   private func refreshSiteControls() {
@@ -1314,8 +1332,8 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
     guard store.state.activeProfile?.isPrivate != true else { return }
     internalPage =
       showStore
-      ? engine.extensionStorePage(profileID: store.activeProfileID)
-      : engine.extensionsPage(profileID: store.activeProfileID)
+      ? engine.extensionStorePage(profileID: store.activeProfileID, ownerWindowID: windowContext.id)
+      : engine.extensionSettingsPage(profileID: store.activeProfileID, ownerWindowID: windowContext.id)
     actions.nativePageVisible = true
     scheduleLayout()
   }
@@ -1353,7 +1371,7 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
   }
 }
 
-extension ApplicationCoordinator {
+extension BrowserWindowCoordinator {
   private func refreshDefaultBrowser() {
     actions.defaultBrowser = ["https", "http"].allSatisfy { scheme in
       guard let url = URL(string: "\(scheme)://example.com"),
@@ -1379,7 +1397,7 @@ extension ApplicationCoordinator {
     if saved.maximized { window.zoom(nil) }
   }
   private func rememberWindowBounds(_ window: NSWindow) {
-    guard engine.isWindowOpen, !engine.isWindowClosing, !engine.isTerminating,
+    guard windowContext.isOpen, !windowContext.isClosing, !engine.isTerminating,
       !window.styleMask.contains(.fullScreen), !window.isMiniaturized, !window.inLiveResize else { return }
     var bounds = store.state.windowBounds
     bounds.maximized = window.isZoomed
@@ -1388,7 +1406,7 @@ extension ApplicationCoordinator {
       bounds.width = frame.width; bounds.height = frame.height; bounds.x = frame.minX
       bounds.y = (NSScreen.screens.first?.frame.maxY ?? 0) - frame.maxY; bounds.sizeKind = "window"
     }
-    if bounds != store.state.windowBounds { store.state.windowBounds = bounds; store.save() }
+    if bounds != store.state.windowBounds { store.updateWindowBounds(bounds) }
   }
   private var pageCommands: Set<String> {
     ["copy-url", "pin-tab", "duplicate-tab", "rename-tab", "move-tab", "mute-tab", "split", "reload", "force-reload", "stop", "find", "find-next", "find-previous", "bookmark", "save-page", "print", "zoom-in", "zoom-out", "zoom-reset", "developer-tools"]
@@ -1412,7 +1430,7 @@ extension ApplicationCoordinator {
         available: commandAvailable(entry.id)) { [weak self] in self?.runCommand(entry.id) }
     } + [BrowserRuntimeCommand(id: "unsplit", title: "Unsplit tabs", icon: "rectangle", keywords: "split separate", available: commandAvailable("unsplit")) { [weak self] in self?.runCommand("unsplit") },
       BrowserRuntimeCommand(id: "about", title: "About Zacro", icon: "info", keywords: "version browser", available: true) { [weak self] in self?.runCommand("about") }]
-    installMenus()
+    if application.focusedCoordinator === self { installMenus() }
   }
   private func commandIcon(_ id: String) -> String {
     NativeGlyph.commandName(id)
@@ -1444,7 +1462,7 @@ extension ApplicationCoordinator {
   func runCommand(_ id: String) {
     guard commandAvailable(id) else { return }
     if actions.performInterfaceCommand(id) {
-      if !actions.palette && !actions.themeEditor { engine.window?.makeKeyAndOrderFront(nil) }
+      if !actions.palette && !actions.themeEditor { window?.makeKeyAndOrderFront(nil) }
       return
     }
     switch id {
@@ -1522,11 +1540,12 @@ extension ApplicationCoordinator {
         actions.homeQuery = ""
       }
       actions.library = "AI"
-      engine.window?.makeKeyAndOrderFront(nil)
+      window?.makeKeyAndOrderFront(nil)
     case "preferences": actions.library = "Settings"
-    case "open-browser": engine.showWindow()
-    case "close-window": engine.window?.performClose(nil)
-    case "fullscreen": engine.window?.toggleFullScreen(nil)
+    case "new-window": application.newWindow()
+    case "open-browser": application.newWindow()
+    case "close-window": window?.performClose(nil)
+    case "fullscreen": window?.toggleFullScreen(nil)
     case "developer-tools": activePage?.showDevTools()
     case "import":
       let panel = NSOpenPanel(); panel.allowedContentTypes = [.json,.html]; panel.allowsMultipleSelection = false
@@ -1537,8 +1556,8 @@ extension ApplicationCoordinator {
     case "releases", "issues":
       if let url = URL(string: "https://github.com/Zacro-Technologies/zacro_browser/" + id) { NSWorkspace.shared.open(url) }
     case "focus-chrome":
-      if NSApp.keyWindow === engine.window { activePage?.focus() }
-      else { engine.window?.makeKeyAndOrderFront(nil); _ = actions.performInterfaceCommand("focus-sidebar") }
+      if NSApp.keyWindow === window { activePage?.focus() }
+      else { window?.makeKeyAndOrderFront(nil); _ = actions.performInterfaceCommand("focus-sidebar") }
     default:
       if id.hasPrefix("tab-"), let number = Int(id.dropFirst(4)) {
         let tabs = orderedTabs; let index = number == 9 ? tabs.count - 1 : number - 1
@@ -1549,9 +1568,9 @@ extension ApplicationCoordinator {
       }
     }
   }
-  private func showError(_ message: String) {
+  func showError(_ message: String) {
     let alert = NSAlert(); alert.messageText = message; alert.addButton(withTitle: "OK")
-    if let window = engine.window { alert.beginSheetModal(for: window) } else { alert.runModal() }
+    if let window = window { alert.beginSheetModal(for: window) } else { alert.runModal() }
   }
   private var servicePalette: NativeSpacePalette {
     let theme = presentationTheme
@@ -1571,10 +1590,6 @@ extension ApplicationCoordinator {
       }
       try await ChromeExtensionManager(engine: self.engine, profileID: profile).performAction(identifier, on: page)
     }
-    services.sourceAction = { [weak self] action, payload in
-      guard let self else { throw ServiceError("CANCELLED", "The browser has closed.") }
-      return try await self.openAISources(action: action, payload: payload)
-    }
     actions.libraryContent = { [weak self] section in
       guard let self else { return nil }
       if section == "AI" { return AnyView(NativeAIView(model: self.services, palette: self.servicePalette)) }
@@ -1591,15 +1606,13 @@ extension ApplicationCoordinator {
         NativeSyncSettingsView(model: self.services, palette: self.servicePalette)
       })
     }
-    downloads.onStarted = { [weak self] in self?.actions.library = "Downloads" }
-    downloads.install()
     actions.libraryCapabilities = ["download:pause", "download:resume", "download:cancel", "download:rename", "download:undo", "download:suggest", "peek:open", "tab:mute", "data:import-html", "history:clear", "archive:clear", "permission:list", "app:set-default-browser"]
     actions.performLibraryAction = { [weak self] action, payload in
       guard let self else { return }
       try await self.libraryAction(action, payload: payload)
     }
   }
-  private func openAISources(action: String, payload: ServiceJSON) async throws -> ServiceJSON {
+  func openAISources(action: String, payload: ServiceJSON) async throws -> ServiceJSON {
     guard store.state.activeProfile?.isPrivate == false else { throw ServiceError("PRIVATE", "AI is unavailable in private profiles.") }
     let status = await services.aiService.status()
     guard status["profileId"].string == store.activeProfileID else { throw ServiceError("CONTEXT_CHANGED", "The active profile changed.") }
@@ -1628,7 +1641,7 @@ extension ApplicationCoordinator {
     }
     return .null
   }
-  private func readContext(_ grants: [AIContextGrant]) async throws -> [AIPageExtract] {
+  func readContext(_ grants: [AIContextGrant]) async throws -> [AIPageExtract] {
     guard grants.count <= 6, Set(grants.map(\.id)).count == grants.count,
       let profile = store.state.activeProfile, !profile.isPrivate else { throw ServiceError("PRIVATE", "Review pages in a regular profile before sharing.") }
     var results: [AIPageExtract] = []
@@ -1700,7 +1713,7 @@ extension ApplicationCoordinator {
     return allowed ? .allow : .deny
   }
   private func libraryAction(_ action: String, payload: [String:String]) async throws {
-    guard !engine.isWindowClosing, !engine.isTerminating else { throw CancellationError() }
+    guard !windowContext.isClosing, !engine.isTerminating else { throw CancellationError() }
     if let profile = payload["profileId"], profile != store.activeProfileID { throw ShortcutError("The active profile changed. Try again.") }
     let id = payload["id"] ?? payload["tabID"] ?? store.state.activeTabID ?? ""
     if action == "history:clear" {
@@ -1713,15 +1726,15 @@ extension ApplicationCoordinator {
     } else if action == "data:clear" {
       try await clearProfileData(profileID: store.activeProfileID)
     } else if action.hasPrefix("download:"), action != "download:suggest" {
-      try downloads.perform(action, id: id, name: payload["name"] ?? "")
+      try downloads.perform(action, id: id, name: payload["name"] ?? "", profileID: store.activeProfileID)
     } else if action == "download:suggest" {
-      let record = try downloads.record(id)
+      let record = try downloads.record(id, profileID: store.activeProfileID)
       let suggestion = try await services.aiAction("ai:suggest-name", payload: ["name":.string(record.filename), "url":.string(record.sourceURL ?? record.url), "title":.string(record.sourceTitle ?? "")])
-      _ = try downloads.record(id)
+      _ = try downloads.record(id, profileID: store.activeProfileID)
       let alert = NSAlert(); alert.messageText = "Rename download"
       let field = NSTextField(frame: CGRect(x: 0, y: 0, width: 320, height: 24)); field.stringValue = suggestion["name"].string
       alert.accessoryView = field; alert.addButton(withTitle: "Rename"); alert.addButton(withTitle: "Cancel")
-      if alert.runModal() == .alertFirstButtonReturn { try downloads.perform("download:rename", id: id, name: field.stringValue) }
+      if alert.runModal() == .alertFirstButtonReturn { try downloads.perform("download:rename", id: id, name: field.stringValue, profileID: store.activeProfileID) }
     } else if action == "tab:mute", let tab = store.tab(id), store.profileID(for: tab) == store.activeProfileID {
       store.updateTab(id) { $0.isMuted.toggle() }; engine.pages[id]?.browser?.isAudioMuted = !tab.isMuted
     } else if action == "tab:sleep" { try await sleepTab(id) }
@@ -1761,7 +1774,7 @@ extension ApplicationCoordinator {
       throw ShortcutError("Finish the current profile operation first.")
     }
     let maintenance = engine.page(id: "maintenance:" + profileID, profileID: profileID,
-      isPrivate: profile.isPrivate, url: URL(string: "about:blank")!)
+      isPrivate: profile.isPrivate, url: URL(string: "about:blank")!, ownerWindowID: nil)
     defer { maintenance.close() }
     maintenance.hide()
     let browser = try await maintenance.ready()
@@ -1816,7 +1829,7 @@ extension ApplicationCoordinator {
 
   private func canUnload(_ page: ChromiumPage, tab: BrowserTab, automatically: Bool = false) -> Bool {
     guard !automatically || tab.autoDiscardable != false else { return false }
-    guard !Task.isCancelled, engine.isWindowOpen, !engine.isWindowClosing, !engine.isTerminating,
+    guard !Task.isCancelled, windowContext.isOpen, !windowContext.isClosing, !engine.isTerminating,
       owns(page, tabID: tab.id), !page.isLoading,
       store.state.activeTabID != tab.id, visibleSplit?.tabIDs.contains(tab.id) != true, tab.peek == nil,
       !visiblePageFrames.keys.contains(page.id), !navigation.isRestoring(page),
@@ -1827,7 +1840,7 @@ extension ApplicationCoordinator {
     return true
   }
 
-  private func unloadInactiveTab(_ id: String, automatically: Bool = false) async throws -> Bool {
+  func unloadInactiveTab(_ id: String, automatically: Bool = false) async throws -> Bool {
     guard actions.libraryCapabilities.contains("tab:sleep"), let tab = store.tab(id),
       let page = engine.pages[id], let browser = page.browser, canUnload(page, tab: tab, automatically: automatically) else { return false }
     let url = page.url
@@ -1883,7 +1896,7 @@ extension ApplicationCoordinator {
   }
 
   private func maintainInactiveTabs() async {
-    guard engine.isWindowOpen, !engine.isWindowClosing, !engine.isTerminating, deletingProfileID == nil else { return }
+    guard windowContext.isOpen, !windowContext.isClosing, !engine.isTerminating, deletingProfileID == nil else { return }
     store.recordVisibleTabActivity()
     let liveIDs = Set(engine.pages.keys).subtracting(dormantPages).subtracting(reservedPages)
     store.archiveStale(excludeIDs: liveIDs)
@@ -1901,24 +1914,9 @@ extension ApplicationCoordinator {
   }
 
   private func inspectRuntimeCapabilities(_ page: ChromiumPage? = nil) {
-    guard !runtimeCapabilitiesChecked, runtimeCapabilityTask == nil else { return }
-    runtimeCapabilityTask = Task { [weak self] in
-      guard let self else { return }
-      defer { self.runtimeCapabilityTask = nil }
-      do {
-        let capabilities = try await self.engine.nativeCapabilities()
-        self.runtimeCapabilitiesChecked = true
-        self.extensionBrowser.enabled = capabilities.extensionBrowser == true
-        self.extensionBrowser.reconcile()
-        if capabilities.browsingData { self.actions.libraryCapabilities.insert("data:clear") }
-        if capabilities.documentState && capabilities.retainedDiscard == true && capabilities.volatileDiscard == true && capabilities.encryptedNavigation == true {
-          self.actions.libraryCapabilities.insert("tab:sleep")
-        }
-      } catch {
-        if let failure = error as? CefDevToolsError, failure.isUnsupportedMethod { self.runtimeCapabilitiesChecked = true }
-      }
-    }
+    application.inspectRuntimeCapabilities()
   }
+
 }
 
 final class PassthroughHostingView<Content: View>: NSHostingView<Content> {
@@ -1931,7 +1929,7 @@ final class PassthroughHostingView<Content: View>: NSHostingView<Content> {
 
 private struct NativeContentOverlay: View {
   @ObservedObject var store: BrowserStore
-  let coordinator: ApplicationCoordinator
+  let coordinator: BrowserWindowCoordinator
   @State private var resizeRatio: Double?
   var body: some View {
     GeometryReader { geometry in

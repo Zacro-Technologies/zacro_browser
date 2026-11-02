@@ -86,11 +86,17 @@ final class NativeExtensionSync {
     refreshProfiles()
   }
   func refreshProfiles() {
-    guard started, !closed, engine.isWindowOpen, !engine.isWindowClosing, !engine.isTerminating else { return }
+    guard started, !closed, !engine.isTerminating,
+      engine.contexts.values.contains(where: { $0.isOpen && !$0.isClosing }) else { return }
     let ids = Set(store.state.profiles.filter { !$0.isPrivate }.map(\.id))
     for id in profiles.keys where !ids.contains(id) { Task { await self.removeProfile(id) } }
     var needed = services.linkedSyncProfileIDs.intersection(ids)
-    if ids.contains(store.activeProfileID) { needed.insert(store.activeProfileID) }
+    let openWindows = Set(engine.contexts.values.filter { $0.isOpen && !$0.isClosing }.map(\.id))
+    for window in store.state.windowSessions ?? [] where window.isOpen && openWindows.contains(window.id) {
+      if let id = store.state.spaces.first(where: { $0.id == window.activeSpaceID })?.profileID, ids.contains(id) {
+        needed.insert(id)
+      }
+    }
     for id in needed where profiles[id] == nil { requestRefresh(id) }
   }
   func removeProfile(_ id: String) async {

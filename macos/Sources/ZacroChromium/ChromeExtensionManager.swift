@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 
 public struct ChromeExtension: Decodable, Identifiable, Sendable {
@@ -104,6 +105,7 @@ public struct ChromeExtensionHostRequest: Sendable {
   public let method: String
   public let argumentsJSON: Data
   public let sourceTabID: Int?
+  public let sourceWindowID: Int?
   public let userGesture: Bool
   public let incognito: Bool
 }
@@ -134,23 +136,27 @@ public struct ChromeLogicalTabRegistration: Sendable {
   public let windowID: Int
   public let index: Int
   public let active: Bool
+  public let highlighted: Bool
   public let pinned: Bool
   public let discarded: Bool
   public let autoDiscardable: Bool
   public let splitViewID: Int
   public let openerLogicalID: String?
+  public let groupID: Int
   public init(logicalID: String, windowID: Int, index: Int, active: Bool, pinned: Bool,
               discarded: Bool, autoDiscardable: Bool = true, splitViewID: Int = -1,
-              openerLogicalID: String? = nil) {
+              openerLogicalID: String? = nil, highlighted: Bool? = nil, groupID: Int = -1) {
     self.logicalID = logicalID; self.windowID = windowID; self.index = index
     self.active = active; self.pinned = pinned; self.discarded = discarded
+    self.highlighted = highlighted ?? active
     self.autoDiscardable = autoDiscardable; self.splitViewID = splitViewID
     self.openerLogicalID = openerLogicalID
+    self.groupID = groupID
   }
   fileprivate var parameters: [String: Any] {
     var value: [String: Any] = ["logicalID": logicalID, "windowID": windowID, "index": index,
-      "active": active, "pinned": pinned, "discarded": discarded,
-      "autoDiscardable": autoDiscardable, "splitViewID": splitViewID]
+      "active": active, "highlighted": highlighted, "pinned": pinned, "discarded": discarded,
+      "autoDiscardable": autoDiscardable, "splitViewID": splitViewID, "groupID": groupID]
     if let openerLogicalID { value["openerLogicalID"] = openerLogicalID }
     return value
   }
@@ -160,6 +166,29 @@ public struct ChromeLogicalTabIdentity: Sendable {
   public let logicalID: String
   public let nativeID: Int
   public let materialized: Bool
+}
+
+public struct ChromeLogicalGroupRegistration: Sendable {
+  public let logicalID: String
+  public let windowID: Int
+  public let title: String
+  public let color: String
+  public let collapsed: Bool
+  public let shared: Bool
+  public init(logicalID: String, windowID: Int, title: String, color: String,
+              collapsed: Bool, shared: Bool = false) {
+    self.logicalID = logicalID; self.windowID = windowID; self.title = title
+    self.color = color; self.collapsed = collapsed; self.shared = shared
+  }
+  fileprivate var parameters: [String: Any] {
+    ["logicalID": logicalID, "windowID": windowID, "title": title, "color": color,
+     "collapsed": collapsed, "shared": shared]
+  }
+}
+
+public struct ChromeLogicalGroupIdentity: Sendable {
+  public let logicalID: String
+  public let nativeID: Int
 }
 
 public struct ChromeTabMaterialization: Sendable {
@@ -223,6 +252,7 @@ public final class ChromeExtensionManager {
           let gesture = params["userGesture"] as? Bool, let incognito = params["incognito"] as? Bool {
           callback(.hostRequest(ChromeExtensionHostRequest(requestID: requestID, extensionID: id,
             method: method, argumentsJSON: data, sourceTabID: params["sourceTabID"] as? Int,
+            sourceWindowID: params["sourceWindowID"] as? Int,
             userGesture: gesture, incognito: incognito)))
         }
       default: break
@@ -261,6 +291,17 @@ public final class ChromeExtensionManager {
     _ = try await nativeBrowser().devTools.call("Zacro.publishBrowserEvent", parameters: ["name": name, "arguments": arguments])
   }
 
+  /// Focus is independent of selection: every logical window has an active tab.
+  public func setFocusedWindow(_ nativeID: Int?, lastFocusedID: Int? = nil) async throws {
+    guard [nativeID, lastFocusedID].allSatisfy({ $0 == nil || ($0! > 0 && $0! <= Int(Int32.max)) }) else {
+      throw ChromeExtensionError.invalidResponse
+    }
+    _ = try await nativeBrowser().devTools.call("Zacro.setFocusedWindow", parameters: [
+      "windowID": nativeID.map { $0 as Any } ?? NSNull(),
+      "lastFocusedWindowID": lastFocusedID.map { $0 as Any } ?? NSNull(),
+    ])
+  }
+
   /// Publishes one authoritative tab snapshot without creating documents.
   public func synchronizeTabs(_ tabs: [ChromeLogicalTabRegistration], revision: UInt64) async throws -> [ChromeLogicalTabIdentity] {
     guard tabs.count <= 4096, revision <= 9_007_199_254_740_991,
@@ -282,10 +323,36 @@ public final class ChromeExtensionManager {
     return identities
   }
 
+  /// Allocates Chromium's actual TabGroupId projection independently of views.
+  public func synchronizeGroups(_ groups: [ChromeLogicalGroupRegistration], revision: UInt64) async throws -> [ChromeLogicalGroupIdentity] {
+    let colors = Set(["grey", "blue", "red", "yellow", "green", "pink", "purple", "cyan", "orange"])
+    guard groups.count <= 4096, revision <= 9_007_199_254_740_991,
+      Set(groups.map(\.logicalID)).count == groups.count,
+      groups.allSatisfy({ !$0.logicalID.isEmpty && $0.logicalID.utf8.count <= 256 && $0.windowID > 0 &&
+        $0.title.utf8.count <= 4096 && colors.contains($0.color) && !$0.shared }) else { throw ChromeExtensionError.invalidResponse }
+    let response = try await nativeBrowser().devTools.call("Zacro.synchronizeGroups", parameters: [
+      "groups": groups.map(\.parameters), "revision": Double(revision),
+    ])
+    guard let values = response["groups"] as? [[String: Any]], values.count == groups.count else { throw ChromeExtensionError.invalidResponse }
+    let result = try values.map { value -> ChromeLogicalGroupIdentity in
+      guard let logicalID = value["logicalID"] as? String, let nativeID = value["groupID"] as? Int,
+        nativeID >= 0 else { throw ChromeExtensionError.invalidResponse }
+      return ChromeLogicalGroupIdentity(logicalID: logicalID, nativeID: nativeID)
+    }
+    guard Set(result.map(\.logicalID)) == Set(groups.map(\.logicalID)),
+      Set(result.map(\.nativeID)).count == result.count else { throw ChromeExtensionError.invalidResponse }
+    return result
+  }
+
   /// A single-use creation token binds the first SessionTabHelper identity.
-  public func prepareTabMaterialization(_ logicalID: String) async throws -> ChromeTabMaterialization {
+  public func prepareTabMaterialization(_ logicalID: String, openerRequestID: String? = nil) async throws -> ChromeTabMaterialization {
     guard !logicalID.isEmpty, logicalID.utf8.count <= 256 else { throw ChromeExtensionError.invalidResponse }
-    let response = try await nativeBrowser().devTools.call("Zacro.prepareTabMaterialization", parameters: ["logicalID": logicalID])
+    var parameters: [String: Any] = ["logicalID": logicalID]
+    if let openerRequestID {
+      guard !openerRequestID.isEmpty, openerRequestID.utf8.count <= 128 else { throw ChromeExtensionError.invalidResponse }
+      parameters["openerRequestID"] = openerRequestID
+    }
+    let response = try await nativeBrowser().devTools.call("Zacro.prepareTabMaterialization", parameters: parameters)
     guard let nativeID = response["tabID"] as? Int, nativeID > 0,
       let token = response["token"] as? String, UUID(uuidString: token) != nil else { throw ChromeExtensionError.invalidResponse }
     return ChromeTabMaterialization(logicalID: logicalID, profileID: profileID, nativeID: nativeID, token: token)
@@ -342,9 +409,46 @@ public final class ChromeExtensionManager {
     _ = try await nativeBrowser().devTools.call("Zacro.installWebStoreExtension", parameters: ["id": identifier], timeout: 120)
   }
 
+  /// The native installer uses this manager's real profile, including policy
+  /// and manifest validation. Call only for an explicitly selected directory.
+  public func loadUnpackedExtension(at directory: URL) async throws -> String {
+    guard directory.isFileURL, directory.path.hasPrefix("/"), directory.path.utf8.count <= 4096 else {
+      throw ChromeExtensionError.invalidResponse
+    }
+    let response = try await nativeBrowser().devTools.call("Zacro.loadUnpackedExtension",
+      parameters: ["path": directory.standardizedFileURL.path], timeout: 120)
+    guard let identifier = response["id"] as? String else { throw ChromeExtensionError.invalidResponse }
+    try validate(identifier)
+    _ = try await snapshot()
+    return identifier
+  }
+
+  /// Connects only to this profile's current installed MV3 worker. The native
+  /// target check avoids guessing targets from URLs across isolated profiles.
+  public func workerSession(_ identifier: String, timeout: TimeInterval = 10) async throws -> ChromeExtensionWorkerSession {
+    try validate(identifier)
+    let browser = try await nativeBrowser()
+    let deadline = Date().addingTimeInterval(max(0.1, min(30, timeout)))
+    while true {
+      try Task.checkCancellation()
+      let target = try await browser.devTools.call("Zacro.extensionWorkerTarget", parameters: ["id": identifier])
+      if let targetID = target["targetID"] as? String, let installation = target["installationID"] as? String {
+        let parentSession = try await browser.devTools.browserSession()
+        let response = try await browser.devTools.call("Target.attachToTarget",
+          parameters: ["targetId": targetID, "flatten": true], sessionID: parentSession)
+        guard let session = response["sessionId"] as? String else { throw ChromeExtensionError.invalidResponse }
+        return ChromeExtensionWorkerSession(browser: browser, extensionID: identifier,
+          installationID: installation, targetID: targetID, parentSessionID: parentSession, sessionID: session)
+      }
+      guard Date() < deadline else { throw ChromeExtensionError.loadFailed("The extension worker has not started.") }
+      try await Task.sleep(for: .milliseconds(100))
+    }
+  }
+
   private func nativeBrowser() async throws -> CefBrowser {
-    guard !engine.isWindowClosing, !engine.isTerminating,
-      engine.isWindowOpen || engine.pages["extensions:\(profileID)"] != nil else { throw ChromeExtensionError.managementUnavailable }
+    guard !engine.isTerminating,
+      engine.pages["extensions:\(profileID)"] != nil || engine.contexts.values.contains(where: { $0.isOpen && !$0.isClosing })
+    else { throw ChromeExtensionError.managementUnavailable }
     let page = engine.pages["extensions:\(profileID)"] ?? engine.extensionsPage(profileID: profileID)
     let browser = try await page.ready()
     guard engine.pages[page.id] === page, !page.isPrivate, page.profileID == profileID else { throw ChromeExtensionError.managementUnavailable }
@@ -394,10 +498,24 @@ public final class ChromeExtensionManager {
     try await invoke("developerPrivate.updateProfileConfiguration", [["inDeveloperMode": enabled]], userGesture: true)
   }
 
-  /// Uses Chromium's native directory picker and extension validation. The
-  /// caller should show the management page before invoking this user action.
+  /// Keeps the directory picker on the real shell instead of the hidden
+  /// engine-owned management window. Chromium validates the selected package.
   public func chooseUnpackedExtension() async throws {
-    try await invokeLoad("developerPrivate.loadUnpacked", [["failQuietly": true, "populateError": true]])
+    do {
+      let capabilities = try await engine.nativeCapabilities()
+      if capabilities.extensionBrowser != true {
+        try await invokeLoad("developerPrivate.loadUnpacked", [["failQuietly": true, "populateError": true]])
+        return
+      }
+    } catch let error as CefDevToolsError where error.isUnsupportedMethod {
+      try await invokeLoad("developerPrivate.loadUnpacked", [["failQuietly": true, "populateError": true]])
+      return
+    }
+    let picker = NSOpenPanel()
+    picker.canChooseFiles = false; picker.canChooseDirectories = true
+    picker.allowsMultipleSelection = false; picker.prompt = "Load Extension"
+    guard picker.runModal() == .OK, let directory = picker.url else { return }
+    _ = try await loadUnpackedExtension(at: directory)
   }
 
   public func showOptions(_ identifier: String) async throws {
@@ -502,8 +620,8 @@ public final class ChromeExtensionManager {
   }
 
   private func evaluate(_ body: String, userGesture: Bool = false, timeout: TimeInterval = 20) async throws -> Any? {
-    guard !engine.isWindowClosing, !engine.isTerminating,
-      engine.isWindowOpen || engine.pages["extensions:\(profileID)"] != nil else {
+    guard !engine.isTerminating,
+      engine.pages["extensions:\(profileID)"] != nil || engine.contexts.values.contains(where: { $0.isOpen && !$0.isClosing }) else {
       throw ChromeExtensionError.managementUnavailable
     }
     let identifier = "extensions:\(profileID)"

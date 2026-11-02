@@ -2,6 +2,24 @@ import XCTest
 @testable import ZacroServices
 
 final class AIServiceTests: XCTestCase {
+  func testBackgroundWindowStatusIsScopedAndStaleActionCannotConfigureFocusedProfile() async throws {
+    let root = try directory(), profile = FixtureProfile(), subscription = FixtureSubscription()
+    let ai = NativeAIService(directory: root, currentProfile: { await profile.current() }, context: { _ in [] },
+      secrets: MemorySecrets(), codex: subscription, claude: subscription)
+    _ = try await ai.handle("ai:configure", payload: ["provider":"openai"], expectedProfileID: "personal")
+    await profile.change("other")
+    _ = try await ai.handle("ai:configure", payload: ["provider":"anthropic"], expectedProfileID: "other")
+    expectEqual(await ai.status(for: AIProfileScope(id: "personal"))["provider"], "openai")
+    expectEqual(await ai.status()["provider"], "anthropic")
+    expectEqual(try await ai.handle("ai:status", expectedProfileID: "other")["provider"], "anthropic")
+    do {
+      _ = try await ai.handle("ai:configure", payload: ["provider":"compatible"], expectedProfileID: "personal")
+      XCTFail("A stale window must not configure another profile")
+    } catch { expectEqual((error as? ServiceError)?.code, "PROFILE_CHANGED") }
+    expectEqual(await ai.status()["provider"], "anthropic")
+    expectTrue(await ai.status(for: AIProfileScope(id: "private", isPrivate: true))["private"].bool)
+    await ai.close()
+  }
   private func directory() throws -> URL {
     let url = FileManager.default.temporaryDirectory.appendingPathComponent("ZacroServicesTests-" + UUID().uuidString)
     try FileManager.default.createDirectory(at:url,withIntermediateDirectories:true)

@@ -2,6 +2,24 @@ import XCTest
 @testable import ZacroServices
 
 final class SyncServiceTests: XCTestCase {
+  func testWindowStatusDoesNotChangeFocusAndStaleControlsCannotMutateAccount() async throws {
+    let root = try directory(), current = FixtureProfile(), server = FixtureSyncServer()
+    let client = try NativeSyncClient(directory: root,
+      getProfile: { id in id == "missing" ? nil : AIProfileScope(id: id, isPrivate: id == "private") },
+      activeProfile: { await current.current() }, transport: server, secrets: MemorySecrets(), autoSync: false)
+    _ = try await client.handle("sync:configure", payload: ["endpoint":"https://sync.example"], expectedProfileID: "personal")
+    await current.change("other")
+    expectEqual(await client.status(profileID: "personal")["endpoint"], "https://sync.example")
+    expectEqual(await current.current().id, "other")
+    expectEqual(await client.status(profileID: "private")["state"], "private")
+    expectEqual(await client.status(profileID: "missing")["state"], "private")
+    do {
+      _ = try await client.handle("sync:configure", payload: ["endpoint":"https://wrong.example"], expectedProfileID: "personal")
+      XCTFail("A stale window must not change shared account configuration")
+    } catch { expectEqual((error as? ServiceError)?.code, "cancelled") }
+    expectEqual(await client.status()["endpoint"], "https://sync.example")
+    await client.close()
+  }
   private func directory() throws -> URL {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("ZacroSyncTests-" + UUID().uuidString)
     try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true)

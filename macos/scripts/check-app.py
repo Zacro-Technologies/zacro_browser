@@ -34,14 +34,20 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--app", type=Path, default=native_root / "dist/Zacro Native.app")
     parser.add_argument("--output", type=Path, default=native_root / "dist/acceptance")
-    parser.add_argument("--ui", action="store_true", help="Exercise native mouse and keyboard input (requires Accessibility access)")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--ui", action="store_true", help="Exercise native mouse and keyboard input (requires Accessibility access)")
+    mode.add_argument("--integration", action="store_true", help="Exercise the full Swift application owners in an isolated profile")
+    parser.add_argument("--require-extensions", action="store_true", help="Require the custom native extension protocol and real MV3 integration fixture")
     args = parser.parse_args()
+    if args.require_extensions and not args.integration:
+        parser.error("--require-extensions requires --integration")
     executable = args.app.resolve() / "Contents/MacOS/Zacro Native"
     if not executable.is_file():
         parser.error(f"Build the application first: {executable}")
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
-    report = output / ("ui.json" if args.ui else "engine.json")
+    name = "application" if args.integration else "ui" if args.ui else "engine"
+    report = output / (name + ".json")
     report.unlink(missing_ok=True)
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Fixture)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -58,11 +64,15 @@ def main():
                 ZACRO_ACCEPTANCE_OUTPUT=str(report),
                 ZACRO_NATIVE_SMOKE_URL=f"http://127.0.0.1:{server.server_port}/",
                 MallocNanoZone="0",
+                ZACRO_NATIVE_EXTENSION_FIXTURE=str(native_root / "scripts/fixtures/native-extension"),
+                ZACRO_REQUIRE_NATIVE_EXTENSIONS="1" if args.require_extensions else "0",
             )
-            with (output / ("ui.log" if args.ui else "engine.log")).open("w") as log:
+            with (output / (name + ".log")).open("w") as log:
                 arguments = [str(executable), "--engine-acceptance", "-ApplePersistenceIgnoreState", "YES"]
                 if args.ui:
                     arguments.append("--native-ui-review")
+                elif args.integration:
+                    arguments.append("--native-integration-acceptance")
                 process = subprocess.Popen(
                     arguments,
                     env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
@@ -78,7 +88,7 @@ def main():
                             os.killpg(process.pid, signal.SIGTERM)
                             process.wait(timeout=5)
                             raise SystemExit(f"FAIL: native UI input check; see {output / 'ui.log'}")
-                    code = process.wait(timeout=45)
+                    code = process.wait(timeout=280 if args.integration else 45)
                 except subprocess.TimeoutExpired:
                     os.killpg(process.pid, signal.SIGTERM)
                     try:
@@ -86,17 +96,18 @@ def main():
                     except subprocess.TimeoutExpired:
                         os.killpg(process.pid, signal.SIGKILL)
                         process.wait()
-                    raise SystemExit(f"FAIL: application timed out; see {output / 'engine.log'}")
+                    raise SystemExit(f"FAIL: application timed out; see {output / (name + '.log')}")
             # The native report is written before quitting. A pass in that file
             # must never hide a shutdown crash or other nonzero process exit.
             if code != 0:
-                raise SystemExit(f"FAIL: application exited with {code}; see {output / 'engine.log'}")
+                raise SystemExit(f"FAIL: application exited with {code}; see {output / (name + '.log')}")
             if not report.is_file():
                 raise SystemExit("FAIL: application did not produce an acceptance report")
             result = json.loads(report.read_text())
             if result.get("passed") is not True:
                 raise SystemExit(f"FAIL: {result.get('error', 'engine acceptance failed')}")
-            print("PASS: native mouse/keyboard controls and clean shutdown" if args.ui else
+            print("PASS: application ownership, retained documents, and clean shutdown" if args.integration else
+                  "PASS: native mouse/keyboard controls and clean shutdown" if args.ui else
                   "PASS: four Chrome documents, profile isolation, retained state, and clean shutdown")
             print(f"Report: {report}")
     finally:

@@ -109,6 +109,7 @@ struct BrowserShell<Content: View>: View {
   @State private var hoveredTab: String?
   @State private var hoveredFolder: String?
   @State private var hoveredPin: String?
+  @State private var editingGroupColor: String?
   @State private var operationError: String?
   @State private var nameError: String?
   @FocusState private var sidebarFocus: String?
@@ -525,17 +526,38 @@ struct BrowserShell<Content: View>: View {
       }
       Rectangle().fill(colors.ink.opacity(0.12)).frame(height: 1).padding(.horizontal, 7).padding(.vertical, 10)
       Label("New Tab", systemImage: "plus").foregroundStyle(colors.muted).padding(.horizontal, 8).frame(height: 36)
-      ForEach(groups) { group in
-        HStack(spacing: 0) {
-          if let left = store.tab(group.leftTabID) { previewRow(left, selected: false) }
-          Rectangle().fill(colors.ink.opacity(0.14)).frame(width: 1, height: 18)
-          if let right = store.tab(group.rightTabID) { previewRow(right, selected: false) }
-        }.background(group.tabIDs.contains(space.lastActiveTabID ?? "") ? selectionBackground(true) : colors.ink.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
+      ForEach(store.state.tabGroups.filter { group in all.contains { !$0.isClosed && $0.groupID == group.id } }) { group in
+        HStack(spacing: 8) {
+          NativeGlyph("chevron.down", size: 12).rotationEffect(.degrees(group.collapsed ? -90 : 0)).foregroundStyle(accent).frame(width: 16)
+          Text(group.title.isEmpty ? "Tab group" : group.title).fontWeight(.semibold).lineLimit(1)
+          Spacer()
+          Circle().fill(groupColor(group.color)).frame(width: 10, height: 10)
+        }.padding(.horizontal, 8).frame(height: 36)
+        if !group.collapsed {
+          VStack(spacing: 2) {
+            ForEach(all.filter { !$0.isClosed && $0.groupID == group.id }) { tab in
+              if let split = store.split(for: tab.id) {
+                if split.leftTabID == tab.id { previewSplitRow(split, selectedID: space.lastActiveTabID) }
+              } else { previewRow(tab, selected: tab.id == space.lastActiveTabID) }
+            }
+          }.padding(.leading, 16)
+        }
       }
-      ForEach(all.filter { !$0.isPinned && !$0.isFavorite && !$0.isClosed && $0.folderID == nil && !grouped.contains($0.id) && ($0.url != "about:blank" || $0.homePage == true) }) { tab in
+      ForEach(groups.filter { store.tab($0.leftTabID)?.groupID == nil }) { group in
+        previewSplitRow(group, selectedID: space.lastActiveTabID)
+      }
+      ForEach(all.filter { !$0.isPinned && !$0.isFavorite && !$0.isClosed && $0.folderID == nil && !grouped.contains($0.id) && $0.groupID == nil && ($0.url != "about:blank" || $0.homePage == true) }) { tab in
         previewRow(tab, selected: tab.id == space.lastActiveTabID)
       }
     }.frame(maxWidth: .infinity, alignment: .leading)
+  }
+  private func previewSplitRow(_ group: SplitGroup, selectedID: String?) -> some View {
+    HStack(spacing: 0) {
+      if let left = store.tab(group.leftTabID) { previewRow(left, selected: false) }
+      Rectangle().fill(colors.ink.opacity(0.14)).frame(width: 1, height: 18)
+      if let right = store.tab(group.rightTabID) { previewRow(right, selected: false) }
+    }.background(group.tabIDs.contains(selectedID ?? "") ? selectionBackground(true) : colors.ink.opacity(0.06),
+      in: RoundedRectangle(cornerRadius: 10))
   }
   private func previewRow(_ tab: BrowserTab, selected: Bool, favorite: Bool = false) -> some View {
     HStack(spacing: 8) {
@@ -665,6 +687,7 @@ struct BrowserShell<Content: View>: View {
       }
       .buttonStyle(.plain).foregroundStyle(colors.muted)
       VStack(spacing: 2) {
+        tabGroupRows
         splitRows
         rows(
           tabs.filter { !$0.isPinned && !$0.isFavorite && !$0.isClosed && $0.folderID == nil && ($0.url != "about:blank" || $0.homePage == true) },
@@ -696,20 +719,134 @@ struct BrowserShell<Content: View>: View {
     }.padding(.bottom, favorites.isEmpty && drag.id == nil ? 0 : 8).contentShape(Rectangle())
       .onDrop(of: [.plainText], delegate: dropDelegate(section: .favorite))
   }
-  private var splitRows: some View {
-    ForEach(store.state.splits.filter { $0.spaceID == store.state.activeSpaceID }) { group in
-      HStack(spacing: 0) {
-        if let left = store.tab(group.leftTabID) { tabRow(left, section: .regular, grouped: true) }
-        Rectangle().fill(colors.ink.opacity(0.14)).frame(width: 1, height: 18)
-        if let right = store.tab(group.rightTabID) { tabRow(right, section: .regular, grouped: true) }
-      }.background(group.tabIDs.contains(store.state.activeTabID ?? "") ? selectionBackground(true) : colors.ink.opacity(0.06),
-        in: RoundedRectangle(cornerRadius: 10))
-        .shadow(color: .black.opacity(0.07), radius: 1.5, y: 1)
-        .accessibilityElement(children: .contain).accessibilityLabel("Split view")
+  private var visibleTabGroups: [BrowserTabGroup] {
+    let ids = Set(tabs.filter { !$0.isClosed }.compactMap(\.groupID))
+    return store.state.tabGroups.filter { ids.contains($0.id) }
+  }
+  private let groupColors = ["grey", "blue", "red", "yellow", "green", "pink", "purple", "cyan", "orange"]
+  private func groupColor(_ name: String) -> Color {
+    switch name {
+    case "blue": return Color(red: 0.30, green: 0.56, blue: 0.94)
+    case "red": return Color(red: 0.91, green: 0.35, blue: 0.37)
+    case "yellow": return Color(red: 0.91, green: 0.72, blue: 0.24)
+    case "green": return Color(red: 0.29, green: 0.69, blue: 0.43)
+    case "pink": return Color(red: 0.89, green: 0.48, blue: 0.68)
+    case "purple": return Color(red: 0.65, green: 0.44, blue: 0.88)
+    case "cyan": return Color(red: 0.26, green: 0.69, blue: 0.77)
+    case "orange": return Color(red: 0.91, green: 0.53, blue: 0.25)
+    default: return colors.muted
     }
   }
+  private func updateGroup(_ group: BrowserTabGroup, color: String? = nil, collapsed: Bool? = nil) {
+    do { try store.updateTabGroup(group.id, color: color, collapsed: collapsed) }
+    catch { operationError = error.localizedDescription; store.clearError() }
+  }
+  private func groupMenuItems(_ group: BrowserTabGroup) -> [NativeMenuAction] {
+    [
+      .init(id: "rename", title: "Rename group…", glyph: "edit") { beginRename(.tabGroup(group.id), name: group.title) },
+      .init(id: "collapse", title: group.collapsed ? "Expand group" : "Collapse group", glyph: "folder") { updateGroup(group, collapsed: !group.collapsed) },
+      .init(id: "ungroup", title: "Ungroup tabs", glyph: "folder", divider: true) {
+        do { try store.ungroupTabs(store.state.tabs.filter { $0.groupID == group.id }.map(\.id)) }
+        catch { operationError = error.localizedDescription; store.clearError() }
+      },
+    ]
+  }
+  private var tabGroupRows: some View {
+    ForEach(visibleTabGroups) { group in
+      let members = tabs.filter { !$0.isClosed && $0.groupID == group.id }
+      VStack(spacing: 2) {
+        HStack(spacing: 0) {
+          Button { updateGroup(group, collapsed: !group.collapsed) } label: {
+            HStack(spacing: 8) {
+              NativeGlyph("chevron.down", size: 12).rotationEffect(.degrees(group.collapsed ? -90 : 0))
+                .foregroundStyle(accent).frame(width: 16)
+              Text(group.title.isEmpty ? "Tab group" : group.title).font(.system(size: 13, weight: .semibold)).lineLimit(1)
+              Spacer(minLength: 0)
+              Text("\(members.count)").font(.system(size: 10)).foregroundStyle(colors.muted)
+            }.padding(.leading, 8).padding(.trailing, 4).frame(height: 36).contentShape(Rectangle())
+          }.buttonStyle(.plain).focused($sidebarFocus, equals: "group:\(group.id)").id("group:\(group.id)")
+            .accessibilityLabel("\(group.collapsed ? "Expand" : "Collapse") \(group.title.isEmpty ? "tab group" : group.title), \(members.count) tabs")
+          Button { editingGroupColor = group.id } label: {
+            Circle().fill(groupColor(group.color)).frame(width: 10, height: 10).frame(width: 27, height: 28).contentShape(Rectangle())
+          }.buttonStyle(.plain).help("Group color").accessibilityLabel("Group color: \(group.color)")
+            .popover(isPresented: Binding(get: { editingGroupColor == group.id }, set: { if !$0 { editingGroupColor = nil } })) {
+              HStack(spacing: 5) {
+                ForEach(groupColors, id: \.self) { color in
+                  Button { updateGroup(group, color: color); editingGroupColor = nil } label: {
+                    Circle().fill(groupColor(color)).frame(width: 18, height: 18)
+                      .overlay { if group.color == color { NativeGlyph("checkmark", size: 10).foregroundStyle(.white) } }
+                      .frame(width: 23, height: 28)
+                  }.buttonStyle(.plain).accessibilityLabel(color.capitalized)
+                    .accessibilityAddTraits(group.color == color ? [.isSelected] : [])
+                }
+              }.padding(9).background { NativeControlSurface().overlay(colors.chrome.opacity(0.65)) }
+            }
+        }
+        if !group.collapsed {
+          VStack(spacing: 2) {
+            ForEach(members) { tab in
+              if let split = store.split(for: tab.id) {
+                if split.leftTabID == tab.id { splitRow(split) }
+              } else { tabRow(tab, section: .regular) }
+            }
+          }.padding(.leading, 8)
+            .overlay(alignment: .leading) { Rectangle().fill(groupColor(group.color).opacity(0.35)).frame(width: 1) }
+            .padding(.leading, 8)
+        }
+      }.animation(reduceMotion ? nil : .easeOut(duration: 0.14 * effectiveMotion), value: group.collapsed)
+        .contextMenu { NativeMenuCommands(items: groupMenuItems(group)) }
+        .background { menuAnchor(id: "group:\(group.id)", items: groupMenuItems(group)) }
+        .onDrop(of: [.plainText], isTargeted: nil) { _ in
+          guard let id = drag.id else { return false }
+          do { _ = try store.groupTabs([id], groupID: group.id); drag.cancel(); return true }
+          catch { operationError = error.localizedDescription; store.clearError(); drag.cancel(); return false }
+        }
+    }
+  }
+  private var splitRows: some View {
+    ForEach(store.state.splits.filter { $0.spaceID == store.state.activeSpaceID && store.tab($0.leftTabID)?.groupID == nil }) { group in
+      splitRow(group)
+    }
+  }
+  private func splitRow(_ group: SplitGroup) -> some View {
+    HStack(spacing: 0) {
+      if let left = store.tab(group.leftTabID) { tabRow(left, section: .regular, grouped: true) }
+      Rectangle().fill(colors.ink.opacity(0.14)).frame(width: 1, height: 18)
+      if let right = store.tab(group.rightTabID) { tabRow(right, section: .regular, grouped: true) }
+    }.background(!highlightedTabIDs.isDisjoint(with: group.tabIDs) ? selectionBackground(true) : colors.ink.opacity(0.06),
+      in: RoundedRectangle(cornerRadius: 10))
+      .shadow(color: .black.opacity(0.07), radius: 1.5, y: 1)
+      .accessibilityElement(children: .contain).accessibilityLabel("Split view")
+  }
   private func rows(_ candidates: [BrowserTab], section: SidebarSection) -> some View {
-    ForEach(candidates.filter { store.split(for: $0.id) == nil }) { tab in tabRow(tab, section: section) }
+    ForEach(candidates.filter { store.split(for: $0.id) == nil && $0.groupID == nil }) { tab in tabRow(tab, section: section) }
+  }
+  private var highlightedTabIDs: Set<String> {
+    let id = store.owningWindowID ?? store.state.focusedWindowID
+    return store.state.windowSessions?.first(where: { $0.id == id })?.highlightedTabIDs
+      ?? Set(store.state.activeTabID.map { [$0] } ?? [])
+  }
+  private func selectSidebarTab(_ tab: BrowserTab) {
+    let modifiers = NSApp.currentEvent?.modifierFlags ?? []
+    do {
+      if !tab.isClosed && modifiers.contains(.shift), let active = store.state.activeTabID {
+        let visible = sidebarKeyboardItems.filter { store.tab($0)?.isClosed == false }
+        if let start = visible.firstIndex(of: active), let end = visible.firstIndex(of: tab.id) {
+          try store.selectTabs(Array(visible[min(start, end)...max(start, end)]), activeID: active)
+          actions.activate(active); return
+        }
+      }
+      if !tab.isClosed && modifiers.contains(.command), let active = store.state.activeTabID {
+        var highlighted = highlightedTabIDs
+        if highlighted.contains(tab.id), tab.id != active { highlighted.remove(tab.id) }
+        else { highlighted.insert(tab.id) }
+        try store.selectTabs(store.state.tabs.filter { highlighted.contains($0.id) }.map(\.id), activeID: active)
+        actions.activate(active); return
+      }
+      store.selectTab(id: tab.id)
+      try store.selectTabs([tab.id], activeID: tab.id)
+      actions.activate(tab.id)
+    } catch { operationError = error.localizedDescription; store.clearError() }
   }
   private func selectionBackground(_ selected: Bool) -> Color {
     colors.card.opacity(selected ? 0.46 : 0)
@@ -740,7 +877,7 @@ struct BrowserShell<Content: View>: View {
   }
   private func tabRow(_ tab: BrowserTab, section: SidebarSection, grouped: Bool = false) -> some View {
     let favorite = section == .favorite
-    let selected = tab.id == store.state.activeTabID && !tab.isClosed
+    let selected = highlightedTabIDs.contains(tab.id) && !tab.isClosed
     let hovered = hoveredTab == tab.id || sidebarFocus == tab.id
     let away = tab.isPinned && !tab.isClosed && tab.savedURL != nil && tab.savedURL != tab.url
     return HStack(spacing: 0) {
@@ -753,7 +890,7 @@ struct BrowserShell<Content: View>: View {
         }.buttonStyle(.plain).padding(.leading, 3).help("Reset to saved page")
           .onHover { if $0 { hoveredPin = tab.id } else if hoveredPin == tab.id { hoveredPin = nil } }
       }
-      Button { store.selectTab(id: tab.id); actions.activate(tab.id) } label: {
+      Button { selectSidebarTab(tab) } label: {
         HStack(spacing: 8) {
           if favorite || grouped || !tab.isPinned { tabIcon(tab, size: favorite ? 20 : 16) }
           if !favorite {
@@ -813,6 +950,15 @@ struct BrowserShell<Content: View>: View {
     items.append(.init(id: "duplicate", title: "Duplicate tab", glyph: "copy", divider: true) { if let duplicate = store.duplicateTab(id: tab.id) { actions.activate(duplicate.id) } })
     if store.split(for: tab.id) != nil { items.append(.init(id: "split", title: "Unsplit tabs", glyph: "split") { store.unsplit(tabID: tab.id) }) }
     else { items.append(.init(id: "split", title: "Open in split view", glyph: "split") { store.selectTab(id: tab.id); actions.activate(tab.id); showPalette(.split) }) }
+    if !tab.isClosed {
+      items.append(.init(id: "group", title: tab.groupID == nil ? "Group selected tabs" : "Remove from group", glyph: "folder") {
+        let ids = highlightedTabIDs.contains(tab.id) ? Array(highlightedTabIDs) : [tab.id]
+        do {
+          if tab.groupID != nil { try store.ungroupTabs(ids) }
+          else { let group = try store.groupTabs(ids); beginRename(.tabGroup(group.id), name: group.title) }
+        } catch { operationError = error.localizedDescription; store.clearError() }
+      })
+    }
     items.append(.init(id: "move", title: "Move to Space or folder", glyph: "folder") { showPalette(.move(tabID: tab.id, pin: false)) })
     items.append(.init(id: "rename", title: "Rename tab…", glyph: "edit") { beginRename(.tab(tab.id), name: tab.displayTitle) })
     items.append(.init(id: "bookmark", title: isBookmarked(tab.url) ? "Remove bookmark" : "Bookmark tab", glyph: "bookmark") { store.toggleBookmark(url: tab.url, title: tab.displayTitle) })
@@ -939,7 +1085,7 @@ struct BrowserShell<Content: View>: View {
     if id.hasPrefix("focus-folder:"), let folder = store.state.folders.first(where: { $0.id == String(id.dropFirst(13)) }),
       store.state.spaces.contains(where: { $0.id == folder.spaceID && $0.profileID == store.activeProfileID }) {
       store.selectSpace(id: folder.spaceID); store.updateFolder(id: folder.id, isExpanded: true)
-      store.state.settings.sidebarVisible = true
+      store.updateSettings { $0.sidebarVisible = true }
       if sidebarWidth == 0 { actions.library = nil }
       DispatchQueue.main.async { sidebarFocus = "folder:\(folder.id)" }
       return true
@@ -967,10 +1113,10 @@ struct BrowserShell<Content: View>: View {
         actions.activate(tab.id)
       }
     case "space-theme", "customize-space":
-      actions.library = nil; store.state.settings.sidebarVisible = true; actions.themeEditor = true
+      actions.library = nil; store.updateSettings { $0.sidebarVisible = true }; actions.themeEditor = true
     case "site-searches": showPalette(.siteSearches)
     case "focus-sidebar", "reveal-tab":
-      store.state.settings.sidebarVisible = true
+      store.updateSettings { $0.sidebarVisible = true }
       if sidebarWidth == 0 { actions.library = nil }
       if let tab = store.state.activeTab, let folder = tab.folderID { store.updateFolder(id: folder, isExpanded: true) }
       sidebarFocus = store.state.activeTabID ?? sidebarKeyboardItems.first ?? "address"
@@ -1009,7 +1155,7 @@ struct BrowserShell<Content: View>: View {
   }
   private func openNewSpace() {
     guard store.state.spaces.count < 500 else { operationError = "Space limit reached."; return }
-    actions.palette = false; actions.library = nil; store.state.settings.sidebarVisible = true
+    actions.palette = false; actions.library = nil; store.updateSettings { $0.sidebarVisible = true }
     creatingSpace = true; actions.themeEditor = true
   }
   private var sidebarKeyboardItems: [String] {
@@ -1019,8 +1165,12 @@ struct BrowserShell<Content: View>: View {
       if folder.isExpanded { items += tabs.filter { $0.folderID == folder.id && !$0.isFavorite && store.split(for: $0.id) == nil }.map(\.id) }
     }
     items += tabs.filter { $0.isPinned && !$0.isFavorite && $0.folderID == nil && store.split(for: $0.id) == nil }.map(\.id)
-    items += store.state.splits.filter { $0.spaceID == store.state.activeSpaceID }.flatMap(\.tabIDs)
-    items += tabs.filter { !$0.isPinned && !$0.isFavorite && !$0.isClosed && $0.folderID == nil && ($0.url != "about:blank" || $0.homePage == true) && store.split(for: $0.id) == nil }.map(\.id)
+    for group in visibleTabGroups {
+      items.append("group:\(group.id)")
+      if !group.collapsed { items += tabs.filter { $0.groupID == group.id && !$0.isClosed }.map(\.id) }
+    }
+    items += store.state.splits.filter { $0.spaceID == store.state.activeSpaceID && store.tab($0.leftTabID)?.groupID == nil }.flatMap(\.tabIDs)
+    items += tabs.filter { !$0.isPinned && !$0.isFavorite && !$0.isClosed && $0.folderID == nil && $0.groupID == nil && ($0.url != "about:blank" || $0.homePage == true) && store.split(for: $0.id) == nil }.map(\.id)
     return items
   }
   private func handleSidebarKey(_ key: KeyPress) -> KeyPress.Result {
@@ -1036,6 +1186,14 @@ struct BrowserShell<Content: View>: View {
     case .upArrow: sidebarFocus = items[max(0, index - 1)]
     case .downArrow: sidebarFocus = items[min(items.count - 1, index + 1)]
     case .leftArrow, .rightArrow:
+      let groupID = current.hasPrefix("group:") ? String(current.dropFirst(6)) : store.tab(current)?.groupID
+      if let groupID, let group = store.state.tabGroups.first(where: { $0.id == groupID }) {
+        if key.key == .leftArrow && current != "group:\(groupID)" { sidebarFocus = "group:\(groupID)" }
+        else if key.key == .leftArrow { updateGroup(group, collapsed: true) }
+        else if group.collapsed { updateGroup(group, collapsed: false) }
+        else { sidebarFocus = items[min(items.count - 1, index + 1)] }
+        return .handled
+      }
       let folderID = current.hasPrefix("folder:") ? String(current.dropFirst(7)) : store.tab(current)?.folderID
       if let folderID, let folder = store.state.folders.first(where: { $0.id == folderID }) {
         if key.key == .leftArrow {
@@ -1090,10 +1248,16 @@ struct BrowserShell<Content: View>: View {
       return
     }
     do {
+      if case .tabGroup(let id) = target {
+        try store.updateTabGroup(id, title: value)
+        renameTarget = nil; nameError = nil; return
+      }
+      if case .tab(let id) = target, store.tab(id) == nil { throw ShortcutError("This tab is no longer in this window.") }
       try store.commit { state in
         switch target {
         case .tab(let id):
           if let index = state.tabs.firstIndex(where: { $0.id == id }) { state.tabs[index].customTitle = value }
+        case .tabGroup: break
         case .folder(let id):
           if let index = state.folders.firstIndex(where: { $0.id == id }) { state.folders[index].name = String(value.prefix(60)) }
         case .space(let id):
@@ -1141,7 +1305,7 @@ struct BrowserShell<Content: View>: View {
       if contextMenuRequest == id { contextMenuRequest = nil }
       if editor == nil, creation == nil, renameTarget == nil, !actions.palette, !actions.themeEditor,
         !showBrowserMenu, !showPageActions,
-        store.tab(id) != nil || id.hasPrefix("space:") || id.hasPrefix("folder:") { sidebarFocus = id }
+        store.tab(id) != nil || id.hasPrefix("space:") || id.hasPrefix("folder:") || id.hasPrefix("group:") { sidebarFocus = id }
     }.allowsHitTesting(false)
   }
   private func isContextMenuKey(_ key: KeyPress) -> Bool {
@@ -1189,7 +1353,7 @@ struct BrowserShell<Content: View>: View {
       guard canDeleteProfile(id) else { return }
       alert.informativeText =
         "This removes the profile and its Spaces, tabs, bookmarks, and history. Other profiles are kept."
-    case .tab: return
+    case .tab, .tabGroup: return
     }
     alert.addButton(withTitle: "Delete")
     alert.addButton(withTitle: "Cancel")
@@ -1201,7 +1365,7 @@ struct BrowserShell<Content: View>: View {
     case .folder(let id): store.deleteFolder(id: id)
     case .space(let id): actions.deleteSpace(id)
     case .profile(let id): actions.deleteProfile(id)
-    case .tab: break
+    case .tab, .tabGroup: break
     }
   }
   private func isBookmarked(_ url: String) -> Bool {
@@ -1276,12 +1440,14 @@ private struct WindowMaterialMask: Shape {
 }
 private enum SidebarNamedItem: Equatable {
   case tab(String)
+  case tabGroup(String)
   case folder(String)
   case space(String)
   case profile(String)
   var kind: String {
     switch self {
     case .tab: "Tab"
+    case .tabGroup: "Tab group"
     case .folder: "Folder"
     case .space: "Space"
     case .profile: "Profile"
@@ -1301,16 +1467,19 @@ private enum SidebarSection: Equatable {
   @Published var id: String?
   @Published var preview: [BrowserTab]?
   private var hover: DispatchWorkItem?
+  private var projectedGroupID: String?
   func start(_ id: String, tabs: [BrowserTab]) {
     cancel()
     self.id = id
     preview = tabs
+    projectedGroupID = tabs.first(where: { $0.id == id })?.groupID
   }
   func cancel() {
     hover?.cancel()
     hover = nil
     id = nil
     preview = nil
+    projectedGroupID = nil
   }
   func stopHover() {
     hover?.cancel()
@@ -1329,6 +1498,8 @@ private enum SidebarSection: Equatable {
     var projected = preview ?? store.state.tabs
     guard let index = projected.firstIndex(where: { $0.id == id }) else { return }
     var moved = projected.remove(at: index)
+    projectedGroupID = before.flatMap { store.tab($0)?.groupID }
+    if section != .regular || projectedGroupID != source.groupID { moved.groupID = nil }
     moved.spaceID = space; moved.folderID = section.folderID
     moved.isFavorite = section == .favorite; moved.isPinned = section.pinned
     moved.savedURL = section.pinned ? (moved.savedURL ?? moved.url) : nil
@@ -1355,7 +1526,8 @@ private enum SidebarSection: Equatable {
     else { cancel(); return false }
     let index = section == nil ? nil : preview?.firstIndex(where: { $0.id == id })
     store.moveTab(id: id, spaceID: space, folderID: section?.folderID, index: index,
-      pinned: section?.pinned, favorite: section.map { $0 == .favorite }, clearFolder: section != nil)
+      pinned: section?.pinned, favorite: section.map { $0 == .favorite }, clearFolder: section != nil,
+      clearGroup: section == .regular && source.groupID != nil && projectedGroupID != source.groupID)
     cancel(); return true
   }
 

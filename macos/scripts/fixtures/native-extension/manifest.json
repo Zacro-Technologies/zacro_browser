@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "Zacro Native Integration Fixture",
+  "version": "1.0.0",
+  "description": "Disposable local acceptance fixture for Zacro's native Chromium integration.",
+  "permissions": ["tabs", "tabGroups", "storage", "scripting", "activeTab", "offscreen", "sidePanel", "debugger"],
+  "host_permissions": ["http://127.0.0.1/*"],
+  "background": {"service_worker": "worker.js"},
+  "action": {"default_title": "Record native action"},
+  "side_panel": {"default_path": "panel.html"},
+  "options_page": "options.html"
+}
