@@ -2,6 +2,36 @@ import XCTest
 @testable import ZacroServices
 
 final class AIServiceTests: XCTestCase {
+  func testSavedSessionOnlySubscriptionPolicyPrecedesEveryOperationAfterRestart() async throws {
+    let root = try directory(), firstConnection = FixtureSubscription(), secrets = MemorySecrets()
+    let first = NativeAIService(directory: root, currentProfile: { AIProfileScope(id: "personal") },
+      context: { _ in [] }, secrets: secrets, codex: firstConnection)
+    _ = try await first.handle("ai:configure", payload: ["authStorage":"session"])
+    await first.close()
+    let operations: [(String, ServiceJSON, String)] = [
+      ("ai:login", [:], "login"), ("ai:test-connection", [:], "refresh"),
+      ("ai:ask", ["question":"No undisclosed page context"], "run"),
+      ("ai:suggest-name", ["name":"original.pdf"], "run"),
+      ("ai:disconnect", [:], "logout"), ("ai:status", ["refresh":true], "refresh")]
+    for (action, payload, operation) in operations {
+      let connection = FixtureSubscription()
+      let reopened = NativeAIService(directory: root, currentProfile: { AIProfileScope(id: "personal") },
+        context: { _ in [] }, secrets: secrets, codex: connection)
+      // Deliberately do not refresh status before the action: this was the
+      // ordering that could start a provider in its default Keychain mode.
+      _ = try await reopened.handle(action, payload: payload)
+      let calls = await connection.storageOperations
+      XCTAssertEqual(calls.map(\.operation), [operation], action)
+      XCTAssertTrue(calls.allSatisfy { $0.storage == "session" }, action)
+      await reopened.close()
+    }
+    let actual = NativeAIService(directory: root, currentProfile: { AIProfileScope(id: "personal") },
+      context: { _ in [] }, secrets: secrets)
+    expectEqual(await actual.status()["credentialStorage"], "session")
+    XCTAssertEqual(secrets.reads, 0, "Restoring a storage choice must not inspect credentials")
+    await actual.close()
+  }
+
   func testWindowConversationsNeverInheritUndisplayedHistoryAndResetIsScoped() async throws {
     let subscription = FixtureSubscription()
     let ai = NativeAIService(directory: try directory(), currentProfile: { AIProfileScope(id:"personal") },

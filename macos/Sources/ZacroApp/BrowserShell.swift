@@ -109,9 +109,8 @@ struct BrowserShell<Content: View>: View {
   @ObservedObject var actions: BrowserActions
   @ViewBuilder var content: () -> Content
   @StateObject private var drag = SidebarDragSession()
-  @State private var gestureProgress: Double = 0
-  @State private var gestureTracking = false
-  @State private var gestureSettleDuration = 0.18
+  @StateObject private var spaceViewport = NativeSpaceViewport()
+  @State private var spaceScroll = NativeSpaceScrollCache()
   @State private var name = ""
   @State private var creation: String?
   @State private var renameTarget: SidebarNamedItem?
@@ -150,17 +149,16 @@ struct BrowserShell<Content: View>: View {
     creatingSpace || themeDraft?.id == store.state.activeSpaceID ? (themeDraft?.theme ?? savedTheme) : savedTheme
   }
   private var theme: SpaceTheme {
-    guard gestureProgress != 0, let current = spaces.firstIndex(where: { $0.id == store.state.activeSpaceID }) else { return editingTheme }
-    let position = min(Double(spaces.count - 1), max(0, Double(current) + gestureProgress))
-    let first = Int(floor(position)), last = Int(ceil(position))
-    var value = NativeSpaceAppearance.blend(spaces[first].theme, spaces[last].theme, progress: position - Double(first))
+    guard let blend = spaceViewport.blend, blend.from != blend.to,
+      let first = spaces.first(where: { $0.id == blend.from }), let last = spaces.first(where: { $0.id == blend.to }) else { return editingTheme }
+    var value = NativeSpaceAppearance.blend(first.theme, last.theme, progress: blend.progress)
     value.appearance = editingTheme.appearance
     return value
   }
   private var effectiveMotion: Double { reduceMotion ? 0 : store.state.settings.motionScale }
   private var allowsRowMotion: Bool {
     effectiveMotion > 0 && rowMotionSpaceID == store.state.activeSpaceID
-      && !gestureTracking && gestureProgress == 0 && drag.id == nil
+      && !spaceViewport.isTracking && !spaceViewport.isAnimating && drag.id == nil
   }
   private var rowAnimation: Animation? {
     allowsRowMotion ? .timingCurve(0.16, 1, 0.3, 1, duration: 0.14 * effectiveMotion) : nil
@@ -373,6 +371,7 @@ struct BrowserShell<Content: View>: View {
       if drag.id != nil && !drag.native.isDragging && NSEvent.pressedMouseButtons == 0 { drag.cancel() }
     }
     .onAppear {
+      synchronizeSpaces()
       rowMotionSpaceID = store.state.activeSpaceID
       actions.performInterfaceCommand = performInterfaceCommand
       actions.handleInterfaceEscape = dismissInterface
@@ -395,11 +394,15 @@ struct BrowserShell<Content: View>: View {
       } else { themeDraft = nil; creatingSpace = false }
     }
     .onChange(of: store.state.activeSpaceID) { _, _ in
+      synchronizeSpaces()
       rowMotionSpaceID = store.state.activeSpaceID
       drag.resetReflow(store: store)
       discardThemePreview()
       maybeOpenBlankPalette()
     }
+    .onChange(of: spaces.map(\.id)) { _, _ in synchronizeSpaces() }
+    .onChange(of: effectiveMotion) { _, _ in synchronizeSpaces() }
+    .onDisappear { spaceViewport.stop() }
     .onChange(of: store.activeProfileID) { _, _ in drag.cancel() }
     .onChange(of: store.state.tabs) { _, _ in drag.reconcile(store: store) }
     .onChange(of: store.state.activeTabID) { _, _ in maybeOpenBlankPalette() }
@@ -500,26 +503,22 @@ struct BrowserShell<Content: View>: View {
         contextKey: store.activeProfileID,
         onProgress: { value in
           var transaction = Transaction(); transaction.animation = nil
-          withTransaction(transaction) { gestureTracking = value != 0; gestureProgress = value }
+          withTransaction(transaction) { spaceViewport.track(progress: value) }
         },
         onSelect: { index, duration in
           guard spaces.indices.contains(index) else { return }
-          gestureSettleDuration = duration
-          withAnimation(reduceMotion ? nil : .easeOut(duration: duration * effectiveMotion)) {
-            gestureTracking = false
-            gestureProgress = 0
-            store.selectSpace(id: spaces[index].id)
-          }
+          spaceViewport.settle(selectedID: spaces[index].id, duration: duration, motionScale: effectiveMotion)
+          store.selectSpace(id: spaces[index].id)
         }
       ) {
         GeometryReader { geometry in
-          let activeIndex = spaces.firstIndex(where: { $0.id == store.state.activeSpaceID }) ?? 0
           ZStack(alignment: .topLeading) {
-            ForEach(Array(spaces.enumerated()), id: \.element.id) { index, space in
-              spacePage(space, height: geometry.size.height)
-                .frame(width: geometry.size.width, height: geometry.size.height)
-                .offset(x: (Double(index - activeIndex) - gestureProgress) * geometry.size.width)
-                .animation(gestureTracking || reduceMotion ? nil : .easeOut(duration: gestureSettleDuration * effectiveMotion), value: Double(activeIndex) + gestureProgress)
+            ForEach(spaceViewport.frames) { frame in
+              if let space = spaces.first(where: { $0.id == frame.id }) {
+                spacePage(space, height: geometry.size.height)
+                  .frame(width: geometry.size.width, height: geometry.size.height)
+                  .offset(x: frame.offset * geometry.size.width)
+              }
             }
           }.clipped()
         }.font(.system(size: 13)).foregroundStyle(colors.ink).tint(accent)
@@ -540,6 +539,10 @@ struct BrowserShell<Content: View>: View {
       .overlay(alignment: .leading) { spaceEdge(-1) }
       .overlay(alignment: .trailing) { spaceEdge(1) }
   }
+  private func synchronizeSpaces() {
+    spaceScroll.prune(spaceIDs: Set(store.state.spaces.map(\.id)))
+    spaceViewport.synchronize(ids: spaces.map(\.id), selectedID: store.state.activeSpaceID, motionScale: effectiveMotion)
+  }
   private func favorites(in space: BrowserSpace) -> [BrowserTab] {
     (drag.preview ?? store.state.tabs).filter {
       $0.isFavorite && store.profileID(for: $0) == space.profileID && store.split(for: $0.id)?.spaceID != space.id
@@ -553,8 +556,13 @@ struct BrowserShell<Content: View>: View {
     return VStack(spacing: 0) {
       ScrollViewReader { reader in
         ScrollView {
-          if active { favoriteGrid }
-          else { previewFavorites(favorites, selectedID: space.lastActiveTabID) }
+          Group {
+            if active { favoriteGrid }
+            else { previewFavorites(favorites, selectedID: space.lastActiveTabID) }
+          }.background {
+            NativeSpaceScrollAnchor(cache: spaceScroll, spaceID: space.id, favorites: true, active: active)
+              .allowsHitTesting(false)
+          }
         }.scrollIndicators(.hidden).frame(height: min(naturalHeight, min(176, max(0, height * 0.35))))
           .onChange(of: sidebarFocus) { _, id in
             if active, let id, favorites.contains(where: { $0.id == id }) { reader.scrollTo(id) }
@@ -562,8 +570,13 @@ struct BrowserShell<Content: View>: View {
       }
       ScrollViewReader { reader in
         ScrollView {
-          if active { tabList }
-          else { previewTabList(space) }
+          Group {
+            if active { tabList }
+            else { previewTabList(space) }
+          }.background {
+            NativeSpaceScrollAnchor(cache: spaceScroll, spaceID: space.id, favorites: false, active: active)
+              .allowsHitTesting(false)
+          }
         }.scrollIndicators(.hidden)
           .onChange(of: sidebarFocus) { _, id in
             if active, let id, !favorites.contains(where: { $0.id == id }) { reader.scrollTo(id) }
@@ -1124,7 +1137,7 @@ struct BrowserShell<Content: View>: View {
           }
         }
       } label: {
-        NativeGlyph("archivebox")
+        NativeGlyph.menuImage("archivebox")
       }.menuStyle(.borderlessButton).menuIndicator(.hidden).frame(width: 28, height: 28)
         .focused($sidebarFocus, equals: "library").accessibilityLabel("Library")
       spaceDots
@@ -1135,7 +1148,7 @@ struct BrowserShell<Content: View>: View {
         Divider()
         Button("Private session") { actions.runtimeCommands.first(where: { $0.id == "new-private-space" })?.action() }
       } label: {
-        NativeGlyph("plus")
+        NativeGlyph.menuImage("plus")
       }.menuStyle(.borderlessButton).menuIndicator(.hidden).frame(width: 26, height: 26).accessibilityLabel("Add")
     }.foregroundStyle(accent).frame(height: 32).padding(.bottom, 4)
       .popover(isPresented: $actions.themeEditor, arrowEdge: .bottom) {

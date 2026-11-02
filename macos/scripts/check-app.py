@@ -40,8 +40,10 @@ class Fixture(http.server.BaseHTTPRequestHandler):
         if route == "/download":
             self.stream_download()
             return
-        body = b"<!doctype html><title>Zacro Native acceptance</title><p>Local engine check</p>"
+        body = b'<!doctype html><title>Zacro Native acceptance</title><link rel="icon" type="image/svg+xml" href="/favicon.svg"><p>Local engine check</p>'
         mime = "text/html; charset=utf-8"
+        if route == "/native-history-form":
+            body = b'<!doctype html><title>Native retained form</title><form><textarea id="retained" name="retained"></textarea></form>'
         if self.path == "/favicon.svg":
             body = b'<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><rect width="32" height="32" rx="6" fill="#7e5bef"/><circle cx="16" cy="16" r="8" fill="white"/></svg>'
             mime = "image/svg+xml"

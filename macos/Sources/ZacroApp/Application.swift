@@ -73,7 +73,16 @@ final class BrowserWindowCoordinator: NSObject {
   private let peekPanel = PeekPanelController()
   var hasPresentedPeek: Bool { peekPanel.presentationWindow?.isVisible == true }
   private let loadingStrips = NativeLoadingStripController()
+  private let documentErrorPanels = NativeDocumentErrorPanelController()
+  func hasPresentedDocumentError(_ id: String) -> Bool { documentErrorPanels.isPresented(documentID: id) }
+  func presentedDocumentErrorBounds(_ id: String) -> CGRect? { documentErrorPanels.presentedBounds(documentID: id) }
   private var loadingDocumentIDs = Set<String>()
+  private var observedDocumentBounds: [String: CGRect] = [:]
+  private var selectionFocusIntent = DocumentFocusIntent()
+  private var selectionFocusTask: Task<Void, Never>?
+  private weak var retiringPaletteEditor: NSTextView?
+  private weak var retiringPaletteWindow: NSWindow?
+  private var retiringPaletteDeadline: TimeInterval = 0
   private var pendingDeletion: (Set<String>, () -> Void)? { get { application.pendingDeletion } set { application.pendingDeletion = newValue } }
   private var profileDeletionPageIDs: Set<String> { get { application.profileDeletionPageIDs } set { application.profileDeletionPageIDs = newValue } }
   private var deletingProfileID: String? { get { application.deletingProfileID } set { application.deletingProfileID = newValue } }
@@ -157,6 +166,9 @@ final class BrowserWindowCoordinator: NSObject {
   }
   func prepareTermination() {
     loadingStrips.hide()
+    documentErrorPanels.hide()
+    cancelSelectionFocus()
+    if let keyMonitor { NSEvent.removeMonitor(keyMonitor); self.keyMonitor = nil }
     extensions.close()
     idleSweep?.cancel()
     for task in pageCreations.values { task.cancel() }
@@ -239,7 +251,7 @@ final class BrowserWindowCoordinator: NSObject {
     }
     modelURLs[tab.id] = popup.browser?.url?.absoluteString ?? tab.url
     wire(popup, tabID: tab.id, peek: false)
-    if foreground { store.selectTab(id: tab.id); popup.focus() }
+    if foreground { store.selectTab(id: tab.id); focusSelectedDocument(force: true) }
     scheduleLayout()
     return true
   }
@@ -320,6 +332,7 @@ final class BrowserWindowCoordinator: NSObject {
       self?.pageCreationFailures.removeValue(forKey: id)
       self?.actions.nativePageVisible = false
       self?.scheduleLayout()
+      self?.focusSelectedDocument(force: true)
     }
     actions.back = { [weak self] in self?.goBack() }
     actions.forward = { [weak self] in self?.goForward() }
@@ -366,7 +379,10 @@ final class BrowserWindowCoordinator: NSObject {
       guard let self else { return }
       self.hidePeekPresentation(immediately: true)
       self.loadingStrips.hide()
+      self.documentErrorPanels.hide()
       self.loadingDocumentIDs.removeAll()
+      self.observedDocumentBounds.removeAll()
+      self.cancelSelectionFocus()
       self.actions.documentErrors.removeAll()
       self.actions.nativePageVisible = false
       self.visiblePageFrames.removeAll()
@@ -401,19 +417,61 @@ final class BrowserWindowCoordinator: NSObject {
     }
     store.$state.dropFirst().sink { [weak self] _ in self?.scheduleLayout() }.store(
       in: &observations)
-    actions.$palette.dropFirst().sink { [weak self] _ in self?.scheduleLayout() }.store(
+    actions.$palette.dropFirst().sink { [weak self] presented in
+      guard let self else { return }
+      if presented {
+        self.abandonSelectionFocus()
+        self.retiringPaletteEditor = nil
+        self.retiringPaletteWindow = nil
+      } else if self.actions.palette, let key = NSApp.keyWindow,
+        let editor = key.firstResponder as? NSTextView,
+        self.ownsDocumentFocusWindow(key)
+          || (key.identifier == NSUserInterfaceItemIdentifier("ZacroBrowserControls") && key.parent === self.window) {
+        // @Published delivers before the closing palette removes its field
+        // editor. Only this exact editor gets a short retirement grace period.
+        self.retiringPaletteEditor = editor
+        self.retiringPaletteWindow = key
+        self.retiringPaletteDeadline = ProcessInfo.processInfo.systemUptime + 0.25
+      }
+      self.scheduleLayout()
+    }.store(
       in: &observations)
     actions.$library.dropFirst().sink { [weak self] section in
       guard let self else { return }
-      if section != nil { self.window?.makeKeyAndOrderFront(nil) }
+      if section != nil { self.abandonSelectionFocus(); self.window?.makeKeyAndOrderFront(nil) }
       self.scheduleLayout()
+    }.store(in: &observations)
+    for publisher in [actions.$themeEditor.eraseToAnyPublisher(), actions.$findVisible.eraseToAnyPublisher(),
+      actions.$recordingShortcut.eraseToAnyPublisher()] {
+      publisher.dropFirst().sink { [weak self] shown in
+        if shown { self?.abandonSelectionFocus() }
+      }.store(in: &observations)
+    }
+    for name in [NSApplication.didResignActiveNotification, NSWindow.willBeginSheetNotification,
+      NSText.didBeginEditingNotification, NSControl.textDidBeginEditingNotification] {
+      NotificationCenter.default.publisher(for: name).sink { [weak self] _ in
+        guard let self, self.selectionFocusIntent.phase == .pending else { return }
+        self.abandonSelectionFocus()
+      }.store(in: &observations)
+    }
+    NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification).sink { [weak self] event in
+      guard let self, self.selectionFocusIntent.phase == .pending,
+        !self.ownsDocumentFocusWindow(event.object as? NSWindow) else { return }
+      self.abandonSelectionFocus()
     }.store(in: &observations)
     installServices()
     services.start()
     refreshDefaultBrowser()
     refreshCommands()
-    keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { [weak self] event in
-      self?.handleKey(event) == true ? nil : event
+    keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged,
+      .leftMouseDown, .rightMouseDown, .otherMouseDown, .leftMouseDragged, .rightMouseDragged,
+      .otherMouseDragged, .scrollWheel]) { [weak self] event in
+      guard let self else { return event }
+      // This runs before the event's selection/navigation action. That action
+      // may create a new intent; an older asynchronous completion may not.
+      if event.type != .flagsChanged { self.abandonSelectionFocus() }
+      guard event.type == .keyDown || event.type == .flagsChanged else { return event }
+      return self.handleKey(event) ? nil : event
     }
     scheduleLayout()
     if show { windowContext.show() } else { window.orderFront(nil) }
@@ -471,7 +529,94 @@ final class BrowserWindowCoordinator: NSObject {
       if page.isLoading { loadingDocumentIDs.insert(page.id) } else { loadingDocumentIDs.remove(page.id) }
       changed = true
     }
+    if observedDocumentBounds[page.id] != page.documentBounds {
+      observedDocumentBounds[page.id] = page.documentBounds
+      changed = true
+    }
     if changed { scheduleLayout() }
+  }
+  private func showsNativeDocument(_ page: ChromiumPage) -> Bool {
+    if page.documentError == nil { return true }
+    return page.isSidePanelVisible && page.documentBounds.map { $0.width > 0 && $0.height > 0 } == true
+  }
+  private func cancelSelectionFocus() {
+    selectionFocusTask?.cancel(); selectionFocusTask = nil
+    selectionFocusIntent.clear()
+  }
+  private var focusSelection: DocumentFocusIntent.Selection? {
+    selectedDocumentID.map { .init(documentID: $0, profileID: store.activeProfileID) }
+  }
+  private func abandonSelectionFocus() {
+    selectionFocusTask?.cancel(); selectionFocusTask = nil
+    selectionFocusIntent.abandon(focusSelection)
+  }
+  private func ownsDocumentFocusWindow(_ candidate: NSWindow?) -> Bool {
+    guard let candidate else { return false }
+    return candidate === window || windowPages.values.contains { $0.nativeWindow === candidate }
+  }
+  private var permitsDocumentFocusEnvironment: Bool {
+    guard NSApp.isActive, windowContext.isOpen, !windowContext.isClosing, !engine.isTerminating,
+      deletingProfileID == nil, !actions.palette, !actions.themeEditor, actions.library == nil,
+      !actions.findVisible, !actions.recordingShortcut, window?.attachedSheet == nil,
+      NSApp.modalWindow == nil else { return false }
+    return true
+  }
+  private var permitsDocumentFocusContext: Bool {
+    permitsDocumentFocusEnvironment && ownsDocumentFocusWindow(NSApp.keyWindow)
+  }
+  private var permitsSelectionFocusTransition: Bool {
+    guard permitsDocumentFocusEnvironment else { return false }
+    if ownsDocumentFocusWindow(NSApp.keyWindow) || NSApp.keyWindow == nil { return true }
+    return NSApp.keyWindow === retiringPaletteWindow
+      && ProcessInfo.processInfo.systemUptime < retiringPaletteDeadline
+  }
+  private var permitsDocumentFocus: Bool {
+    permitsDocumentFocusContext && NSEvent.pressedMouseButtons == 0
+      && !(NSApp.keyWindow?.firstResponder is NSTextView)
+  }
+  /// Visibility is independent of activation. Only the still-selected document
+  /// of the focused browser may take focus after asynchronous materialization.
+  private func focusSelectedDocument(force: Bool = false) {
+    guard let selection = focusSelection else { cancelSelectionFocus(); return }
+    guard let token = selectionFocusIntent.begin(selection, explicit: force) else { return }
+    selectionFocusTask?.cancel()
+    let id = selection.documentID, profileID = selection.profileID
+    guard let tab = store.document(id: id), !tab.isClosed, tab.url != "about:blank",
+      permitsSelectionFocusTransition else { abandonSelectionFocus(); return }
+    let transitionDeadline = ProcessInfo.processInfo.systemUptime + 0.25
+    selectionFocusTask = Task { [weak self] in
+      guard let self else { return }
+      defer {
+        if self.selectionFocusIntent.isPending(token) { self.abandonSelectionFocus() }
+      }
+      do {
+        while !self.permitsDocumentFocus {
+          try Task.checkCancellation()
+          let now = ProcessInfo.processInfo.systemUptime
+          guard self.selectionFocusIntent.isPending(token), self.focusSelection == selection,
+            self.permitsSelectionFocusTransition,
+            now < transitionDeadline else { return }
+          if let editor = NSApp.keyWindow?.firstResponder as? NSTextView {
+            guard editor === self.retiringPaletteEditor, now < self.retiringPaletteDeadline else { return }
+          }
+          try await Task.sleep(for: .milliseconds(16))
+        }
+        try Task.checkCancellation()
+        guard self.selectionFocusIntent.isPending(token), self.focusSelection == selection else { return }
+        let page = try await self.ensurePageReady(tab)
+        try await self.navigation.waitForRestore(page)
+        try Task.checkCancellation()
+        guard self.selectionFocusIntent.isPending(token), self.selectedDocumentID == id,
+          self.store.activeProfileID == profileID, self.permitsDocumentFocus,
+          self.engine.pages[id] === page, page.documentError == nil else { return }
+        self.layoutPages()
+        guard self.selectionFocusIntent.isPending(token), self.selectedDocumentID == id,
+          page.nativeWindow?.isVisible == true,
+          self.permitsDocumentFocus else { return }
+        page.focus()
+        if self.selectionFocusIntent.complete(token) { self.selectionFocusTask = nil }
+      } catch { /* The page's own error/retry presentation owns failure reporting. */ }
+    }
   }
   func retryDocument(_ id: String) {
     guard let tab = store.document(id: id), !tab.isClosed, let page = engine.pages[id],
@@ -935,6 +1080,7 @@ final class BrowserWindowCoordinator: NSObject {
       self.navigation.forget(page.id)
       self.actions.documentErrors.removeValue(forKey: page.id)
       self.loadingDocumentIDs.remove(page.id)
+      self.observedDocumentBounds.removeValue(forKey: page.id)
       if !peek || self.engine.pages[tabID]?.isAudible != true { self.actions.audibleTabIDs.remove(tabID) }
       self.reservedPages.remove(page.id)
       self.dormantPages.remove(page.id); self.discardingPages.remove(page.id); self.mediaPermissionPages.remove(page.id)
@@ -964,10 +1110,7 @@ final class BrowserWindowCoordinator: NSObject {
           catch { self.showError(error.localizedDescription) }
         }
         if wasActive {
-          DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            if let active = self.activePage { active.focus() } else { self.window?.makeKey() }
-          }
+          self.focusSelectedDocument(force: true)
         }
       }
       self.scheduleLayout()
@@ -989,6 +1132,7 @@ final class BrowserWindowCoordinator: NSObject {
       self.visiblePageFrames.removeValue(forKey: id)
       self.actions.documentErrors.removeValue(forKey: id)
       self.loadingDocumentIDs.remove(id)
+      self.observedDocumentBounds.removeValue(forKey: id)
       self.sidePanelPageIDs.remove(id)
       self.modelURLs.removeValue(forKey: id)
       self.pendingHistory.removeValue(forKey: id)
@@ -1128,7 +1272,7 @@ final class BrowserWindowCoordinator: NSObject {
     // Persistent tabs keep their native document and layer attached. Only
     // actual visibility/frame changes reach Chromium, avoiding hide/show flash.
     for entry in desired.values { entry.0.setCornerRadius(isPopup ? 0 : store.state.settings.pageRadius) }
-    let visible = desired.filter { $0.value.0.documentError == nil }
+    let visible = desired.filter { showsNativeDocument($0.value.0) }
     for (id, _) in visiblePageFrames where visible[id] == nil {
       engine.pages[id]?.hide()
       if id.hasPrefix("peek:"), desired[id] == nil { engine.pages[id]?.setPresentationParent(nil) }
@@ -1143,7 +1287,7 @@ final class BrowserWindowCoordinator: NSObject {
     {
       peekPanel.show(
         parent: parent, contentFrame: contentFrame,
-        preview: preview.documentError == nil ? preview.browser?.nativeView?.window : nil,
+        preview: showsNativeDocument(preview) ? preview.browser?.nativeView?.window : nil,
         close: { [weak self] in self?.closePeek() }, expand: { [weak self] in self?.promotePeek() },
         theme: presentationTheme, radius: store.state.settings.pageRadius,
         motionScale: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : store.state.settings.motionScale,
@@ -1152,16 +1296,27 @@ final class BrowserWindowCoordinator: NSObject {
           guard let self, let preview, self.engine.pages[preview.id] === preview,
             self.store.state.activeTabID == id else { return }
           self.peekFrames[id] = frame
-          if preview.documentError == nil {
+          if self.showsNativeDocument(preview) {
             preview.show(frame: frame)
             self.visiblePageFrames[preview.id] = frame
           }
-        }, error: preview.documentError?.message, url: store.document(id: preview.id)?.url ?? "",
+        }, error: showsNativeDocument(preview) ? nil : preview.documentError?.message,
+        url: store.document(id: preview.id)?.url ?? "",
         retry: { [weak self, weak preview] in if let preview { self?.retryDocument(preview.id) } })
       preview.setPresentationParent(peekPanel.presentationWindow)
     }
+    var errorPresentations: [String: NativeDocumentErrorPresentation] = [:]
+    for (id, entry) in visible {
+      guard let error = entry.0.documentError, let bounds = entry.0.documentBounds,
+        let window = entry.0.nativeWindow else { continue }
+      errorPresentations[id] = NativeDocumentErrorPresentation(window: window, bounds: bounds,
+        message: error.message, url: store.document(id: id)?.url ?? "", isPeek: id.hasPrefix("peek:"),
+        retry: { [weak self] in self?.retryDocument(id) },
+        editAddress: { [weak self] in self?.editDocumentAddress(id) })
+    }
+    documentErrorPanels.update(errorPresentations, theme: presentationTheme)
     let loadingWindows = Dictionary(uniqueKeysWithValues: visible.compactMap { id, entry -> (String, NSWindow)? in
-      guard entry.0.isLoading, let window = entry.0.nativeWindow else { return nil }
+      guard entry.0.isLoading, entry.0.documentError == nil, let window = entry.0.nativeWindow else { return nil }
       return (id, window)
     })
     loadingStrips.update(windows: loadingWindows, theme: presentationTheme,
@@ -1177,6 +1332,7 @@ final class BrowserWindowCoordinator: NSObject {
         retirePage(id: id)
       }
     }
+    focusSelectedDocument()
   }
   func navigate(_ address: String) {
     actions.nativePageVisible = false
@@ -1187,7 +1343,7 @@ final class BrowserWindowCoordinator: NSObject {
       navigation.cancelRestore(preview)
       pendingHistory[preview.id] = (preview.url?.absoluteString, url.absoluteString)
       preview.load(url)
-      preview.focus()
+      focusSelectedDocument(force: true)
       return
     }
     if let tab = store.state.activeTab {
@@ -1206,6 +1362,7 @@ final class BrowserWindowCoordinator: NSObject {
       _ = page(for: tab)
     }
     scheduleLayout()
+    focusSelectedDocument(force: true)
   }
   func goBack() { stepHistory(forward: false) }
   func goForward() { stepHistory(forward: true) }
@@ -1333,7 +1490,12 @@ final class BrowserWindowCoordinator: NSObject {
     if let focusedWindow = NSApp.keyWindow, focusedWindow !== window {
       let browserControls = focusedWindow.identifier == NSUserInterfaceItemIdentifier("ZacroBrowserControls")
         && focusedWindow.parent === window
-      guard browserControls || windowPages.values.contains(where: { $0.nativeWindow === focusedWindow }) else { return false }
+      let extensionPopup = engine.extensionPopupOwner(focusedWindow) === windowContext
+      guard browserControls || documentErrorPanels.owns(focusedWindow)
+        || extensionPopup || windowPages.values.contains(where: { $0.nativeWindow === focusedWindow }) else { return false }
+      // Escape belongs to the actual Chrome bubble. Shell navigation shortcuts
+      // below still target its exact owning logical browser window.
+      if extensionPopup && event.keyCode == 53 && flags.isEmpty { return false }
     }
     if event.keyCode == 53 && flags.isEmpty {
       if actions.handleInterfaceEscape() { return true }

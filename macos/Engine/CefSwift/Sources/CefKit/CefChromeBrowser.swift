@@ -11,6 +11,12 @@ public struct CefChromeBrowserOptions {
     /// beneath their own AppKit window.
     public var showsWindowOnCreation: Bool = true
 
+    /// Hosted document surfaces show their compositor without stealing focus
+    /// from the selected pane or a native overlay. Explicit focus still works.
+    /// Requires Zacro's native Views adapter; ordinary CEF windows keep their
+    /// normal activation behavior by default.
+    public var activatesWhenShown: Bool = true
+
     /// Shows Chrome's own toolbar (back/forward/omnibox) inside the window.
     /// `false` (the default) hides Chrome's UI entirely — the window shows
     /// only web content while the full Chrome runtime remains available.
@@ -217,6 +223,7 @@ public final class CefChromeBrowser {
             options.nativeTabReservation = nil
             options.isFrameless = true
             options.showsWindowOnCreation = false
+            options.activatesWhenShown = false
             options.initialBounds = CGRect(x: -16000, y: -16000, width: 600, height: 400)
             let popup = CefChromeBrowser(browser: browser, options: options)
             popup.windowOwner = self.windowOwner ?? self
@@ -288,6 +295,7 @@ public final class CefChromeBrowser {
         pageOptions.nativeTabReservation = nativeTabReservation
         pageOptions.isFrameless = true
         pageOptions.showsWindowOnCreation = false
+        pageOptions.activatesWhenShown = false
         pageOptions.initialBounds = CGRect(x: -16000, y: -16000, width: 600, height: 400)
         let page = Self.create(url: url, options: pageOptions, delegate: delegate)
         guard !page.browser.isClosed else { return page }
@@ -730,6 +738,12 @@ final class ChromeWindowDelegate {
                 return
             }
             MainActor.assumeIsolated {
+                if !me.options.activatesWhenShown {
+                    // Existing CefView ABI: the browser-process adapter reads
+                    // this root-view ID before calling Widget::ShowInactive.
+                    let view = UnsafeMutableRawPointer(window).assumingMemoryBound(to: cef_view_t.self)
+                    view.pointee.set_id?(view, 0x5a414352)
+                }
                 me.chrome?.handleWindowCreated(window)
             }
             cefRelease(UnsafeMutableRawPointer(window))

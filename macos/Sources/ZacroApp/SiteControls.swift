@@ -20,7 +20,7 @@ struct NativeMenuCommands: View {
     ForEach(items) { item in
       if item.divider { Divider() }
       Button(action: item.action) {
-        Label { Text(item.title) } icon: { NativeGlyph(item.glyph) }
+        Label { Text(item.title) } icon: { NativeGlyph.menuImage(item.glyph) }
       }.disabled(!item.enabled)
     }
   }

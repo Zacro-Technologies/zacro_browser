@@ -13,6 +13,24 @@ struct NativeGlyph: View {
       else { Image(systemName: name).resizable().scaledToFit() }
     }.frame(width: size, height: size).accessibilityHidden(true)
   }
+  /// AppKit-backed SwiftUI menus extract an Image or Text from their label;
+  /// a Shape-only label becomes an empty NSPopUpButton. Keep the exact same
+  /// vector paths in a template image for that native control boundary.
+  static func menuImage(_ name: String, size: CGFloat = 16) -> Image {
+    let key = aliases[name] ?? name
+    guard let commands = paths[key] else { return Image(systemName: name) }
+    let image = NSImage(size: NSSize(width: size, height: size), flipped: true) { rect in
+      guard let context = NSGraphicsContext.current?.cgContext else { return false }
+      context.setStrokeColor(NSColor.black.cgColor)
+      context.setLineWidth(size * 1.7 / 24)
+      context.setLineCap(.round); context.setLineJoin(.round)
+      context.addPath(GlyphPath(commands: commands).path(in: rect).cgPath)
+      context.strokePath()
+      return true
+    }
+    image.isTemplate = true
+    return Image(nsImage: image)
+  }
   static let aliases: [String: String] = [
     "sidebar.left": "sidebar", "arrow.left": "back", "arrow.right": "forward", "arrow.clockwise": "reload",
     "magnifyingglass": "search", "xmark": "close", "slider.horizontal.3": "pageControls", "archivebox": "library",

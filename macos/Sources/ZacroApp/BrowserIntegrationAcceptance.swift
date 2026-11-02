@@ -37,6 +37,7 @@ final class BrowserIntegrationAcceptance {
     try await wait("initialShellLayout") { first.actions.contentFrame.width > 400 }
     guard let firstWindow = first.window else { throw Failure("No application window presentation") }
     for (name, passed) in NativeSidebarDragAcceptance.check(in: firstWindow) { try require(passed, name) }
+    for (name, passed) in NativeSpaceViewportAcceptance.check() { try require(passed, name) }
     first.actions.palette = false
     guard let tab = first.store.createTab(address: url.appendingPathComponent("first").absoluteString) else { throw Failure("First tab creation") }
     let page = try await first.ensurePageReady(tab)
@@ -244,6 +245,7 @@ final class BrowserIntegrationAcceptance {
     do { nativeExtensions = try await engine.nativeCapabilities().extensionBrowser == true }
     catch let error as CefDevToolsError where error.isUnsupportedMethod { nativeExtensions = false }
     if nativeExtensions {
+      try await checkHostedSelection(url: url, owner: second, survivor: page)
       try await checkExtensionFixture(url: url, owner: second, page: page)
       try await checkNativeMedia(url: url, owner: second)
     }
@@ -266,6 +268,29 @@ final class BrowserIntegrationAcceptance {
       "webStoreUsesOneOrdinaryOwnedTab")
     second.store.selectTab(id: page.id)
     if nativeExtensions { try await checkProfileClear(url: url, survivor: page, owner: second) }
+  }
+
+  private func checkHostedSelection(url: URL, owner: BrowserWindowCoordinator, survivor: ChromiumPage) async throws {
+    owner.actions.palette = false; owner.actions.library = nil; owner.windowContext.show()
+    guard let left = owner.store.createTab(address: url.appendingPathComponent("focus-left").absoluteString),
+      let right = owner.store.createTab(address: url.appendingPathComponent("focus-right").absoluteString) else {
+      throw Failure("Hosted focus fixture tabs")
+    }
+    owner.store.setSplit(left: left.id, right: right.id)
+    owner.store.selectTab(id: left.id)
+    let leftPage = try await owner.ensurePageReady(left), rightPage = try await owner.ensurePageReady(right)
+    try await loaded(leftPage); try await loaded(rightPage)
+    try await wait("hostedSplitShowPreservesSelectedPane") {
+      owner.store.state.activeTabID == left.id && leftPage.nativeWindow?.isVisible == true
+        && rightPage.nativeWindow?.isVisible == true && NSApp.keyWindow === leftPage.nativeWindow
+    }
+    owner.store.selectTab(id: right.id)
+    try await wait("logicalSplitSelectionFocusesItsActualDocument") {
+      owner.activePage === rightPage && NSApp.keyWindow === rightPage.nativeWindow
+    }
+    try require(await owner.requestCloseTab(left.id), "inactiveSplitFocusFixtureCloses")
+    try require(await owner.requestCloseTab(right.id), "activeSplitFocusFixtureCloses")
+    owner.store.selectTab(id: survivor.id)
   }
 
   private func checkFailedDocuments(url: URL, owner: BrowserWindowCoordinator, survivor: ChromiumPage) async throws {
@@ -704,6 +729,32 @@ final class BrowserIntegrationAcceptance {
       let instance = initial["instance"] as? String else { throw Failure("Native side panel document") }
     try require(initial["windowID"] as? Int == owner.windowContext.nativeID,
       "sidePanelUsesLogicalBrowserWindow")
+    owner.navigate("http://127.0.0.1:1/panel-error")
+    try await wait("failedDocumentKeepsNativeSidePanelVisible") {
+      guard let bounds = hostPage.documentBounds, let window = hostPage.nativeWindow else { return false }
+      return hostPage.documentError != nil && hostPage.isSidePanelVisible && window.isVisible
+        && bounds.width > 0 && bounds.width < window.frame.width - 20
+        && owner.hasPresentedDocumentError(host.id)
+    }
+    guard let documentBounds = hostPage.documentBounds,
+      let errorBounds = owner.presentedDocumentErrorBounds(host.id) else {
+      throw Failure("Side panel error presentation bounds")
+    }
+    try require(abs(errorBounds.minX - documentBounds.minX) < 1
+      && abs(errorBounds.minY - documentBounds.minY) < 1
+      && abs(errorBounds.width - documentBounds.width) < 1
+      && abs(errorBounds.height - documentBounds.height) < 1,
+      "pageErrorCoversOnlyTheFailedDocument")
+    let failedPanel = try await worker.evaluate("zacroAcceptance.panelState()") as? [String: Any]
+    try require(failedPanel?["instance"] as? String == instance
+      && failedPanel?["draft"] as? String == "unsaved panel draft", "pageErrorPreservesExtensionPanelDocument")
+    let hostBrowserID = hostPage.browser?.id
+    owner.navigate(url.appendingPathComponent("panel-recovered").absoluteString)
+    try await loaded(hostPage)
+    try await wait("sidePanelDocumentRecoversWithoutReplacingEitherView") {
+      hostPage.documentError == nil && hostPage.browser?.id == hostBrowserID
+        && hostPage.isSidePanelVisible && !owner.hasPresentedDocumentError(host.id)
+    }
     try owner.activateExtensionTab(source.id)
     owner.layoutPages()
     await application.extensionBrowser.waitForTopologyPublication()

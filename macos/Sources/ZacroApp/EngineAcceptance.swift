@@ -274,6 +274,49 @@ final class EngineAcceptance {
       try require(error.localizedDescription.contains("failed") || error.localizedDescription.contains("cancelled"),
         "navigationCommitRejectsFailedDocument")
     }
+    try await checkLargeNativeHistory(url: url)
+  }
+
+  private func checkLargeNativeHistory(url: URL) async throws {
+    var components = URLComponents(url: url, resolvingAgainstBaseURL: false)!
+    components.path = "/native-history-form"; components.query = nil
+    let formURL = components.url!
+    func fresh(_ name: String) async throws -> CefBrowser {
+      try await engine.page(id: "acceptance-large-history-" + name,
+        profileID: "a", isPrivate: false, url: nil).ready()
+    }
+    func waitForForm(_ browser: CefBrowser, expression: String) async throws -> Bool {
+      let deadline = Date().addingTimeInterval(5)
+      repeat {
+        if (try? await browser.devTools.evaluate(expression)) as? Bool == true { return true }
+        try await Task.sleep(for: .milliseconds(30))
+      } while Date() < deadline
+      return false
+    }
+    let source = try await fresh("source")
+    try await source.loadAndWaitForNavigationCommit(formURL)
+    try require(try await waitForForm(source, expression: "!!document.getElementById('retained')"),
+      "largeHistoryFormLoaded")
+    let expected = "'Zacro native history · '.repeat(30000)"
+    _ = try await source.devTools.evaluate("(() => { const field=document.getElementById('retained'); field.value=\(expected); field.dispatchEvent(new Event('input',{bubbles:true})); field.dispatchEvent(new Event('change',{bubbles:true})); })()")
+    try await source.loadAndWaitForNavigationCommit(url)
+    let saved = try await source.serializedNavigationState()
+    let restored = try await fresh("restored")
+    try await restored.restoreNavigationState(saved)
+    restored.goBack()
+    try require(try await waitForForm(restored,
+      expression: "document.getElementById('retained')?.value === \(expected)"),
+      "encryptedHistoryRetainsLargeFormWithoutTruncation")
+    _ = try await restored.devTools.evaluate("(() => { const field=document.getElementById('retained'); field.value='oversized-form-'.repeat(600000); field.dispatchEvent(new Event('input',{bubbles:true})); field.dispatchEvent(new Event('change',{bubbles:true})); })()")
+    try await restored.loadAndWaitForNavigationCommit(url)
+    do {
+      _ = try await restored.serializedNavigationState()
+      throw Failure(message: "Oversized navigation was reported as successfully captured")
+    } catch let error as CefDevToolsError {
+      try require(error.localizedDescription.contains("supported size"), "oversizedHistoryCaptureFailsExplicitly")
+    }
+    try require(try await restored.devTools.evaluate("location.href") as? String == url.absoluteString,
+      "oversizedHistoryCapturePreservesLiveDocument")
   }
 
   private func checkWindowContexts(page: ChromiumPage, browser: CefBrowser, url: URL) async throws {

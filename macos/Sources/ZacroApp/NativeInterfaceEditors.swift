@@ -161,7 +161,7 @@ struct NativeInterfaceEditors: View {
         Button("Change shortcut") { error = nil; recordingSession = UUID(); recording = shortcut.id }
         Button("Disable shortcut") { apply { try store.updateShortcut(id: shortcut.id, accelerator: "") } }
         Button("Reset shortcut") { apply { try store.resetShortcut(id: shortcut.id) } }
-      } label: { NativeGlyph("ellipsis").frame(width: 18, height: 26) }.menuStyle(.borderlessButton).menuIndicator(.hidden).frame(width: 20)
+      } label: { NativeGlyph.menuImage("ellipsis").frame(width: 18, height: 26) }.menuStyle(.borderlessButton).menuIndicator(.hidden).frame(width: 20)
     }.frame(minHeight: 32).padding(.horizontal, 7)
   }
   static func keyLabel(_ value: String) -> String {
@@ -246,7 +246,7 @@ struct NativeInterfaceEditors: View {
                 Menu {
                   Button("Rename profile") { profileName = profile.name; renameProfile = profile }
                   Button("Delete profile", role: .destructive) { deleteProfile(profile) }.disabled(!store.state.profiles.contains { !$0.isPrivate && $0.id != profile.id })
-                } label: { NativeGlyph("ellipsis").frame(width: 22, height: 30) }.menuStyle(.borderlessButton).menuIndicator(.hidden).frame(width: 24)
+                } label: { NativeGlyph.menuImage("ellipsis").frame(width: 22, height: 30) }.menuStyle(.borderlessButton).menuIndicator(.hidden).frame(width: 24)
               }
               Picker("Archive inactive tabs", selection: Binding(get: { isDefault ? store.state.settings.archiveAfterHours : profile.archiveAfterHours ?? -1 }, set: { value in
                 store.setArchiveHours(profileID: profile.id, hours: value < 0 ? nil : value)
@@ -309,7 +309,7 @@ struct NativeInterfaceEditors: View {
                 Button("Block") { changePermission(entry, allowed: false) }
                 Divider()
                 Button("Reset permission") { changePermission(entry, allowed: nil) }
-              } label: { NativeGlyph("ellipsis").frame(width: 22, height: 28) }
+              } label: { NativeGlyph.menuImage("ellipsis").frame(width: 22, height: 28) }
                 .menuStyle(.borderlessButton).menuIndicator(.hidden).frame(width: 24)
                 .accessibilityLabel("Change \(entry.permission) for \(entry.origin)")
             }.padding(10).background(colors.card.opacity(0.22), in: RoundedRectangle(cornerRadius: 9))

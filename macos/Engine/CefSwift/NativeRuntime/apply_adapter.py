@@ -29,7 +29,8 @@ def main():
              "libcef/browser/browser_platform_delegate.h", "libcef/browser/browser_platform_delegate.cc",
              "libcef/browser/chrome/chrome_browser_main_extra_parts_cef.h",
              "libcef/browser/chrome/chrome_browser_main_extra_parts_cef.cc",
-             "libcef/browser/net/throttle_handler.cc"]
+             "libcef/browser/net/throttle_handler.cc",
+             "libcef/browser/views/window_impl.cc"]
     originals = {path: subprocess.check_output(["git", "show", f"HEAD:{path}"], cwd=cef, text=True) for path in paths}
     output = dict(originals)
     header = output[paths[0]]
@@ -146,6 +147,17 @@ namespace throttle {""")
     return;
   }""")
     output[paths[7]] = throttle
+    output[paths[8]] = replace_once(output[paths[8]], """    shown_as_browser_modal_ = false;
+    widget_->Show();""", """    shown_as_browser_modal_ = false;
+    // Only Swift-hosted document surfaces carry this native root-view marker.
+    // Keep Views visibility/compositing while leaving logical pane activation
+    // to the shell's explicit focus operation. Chrome dialogs and auth windows
+    // retain normal activation; no public CEF ABI is changed.
+    if (GetID() == 0x5a414352) {
+      widget_->ShowInactive();
+    } else {
+      widget_->Show();
+    }""")
     adapter_path = "libcef/browser/devtools/zacro_native_adapter.inc"
     originals[adapter_path] = ""
     output[adapter_path] = (ROOT / "devtools_native_adapter.inc").read_text()

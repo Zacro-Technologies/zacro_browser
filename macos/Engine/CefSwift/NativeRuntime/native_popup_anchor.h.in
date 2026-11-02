@@ -15,6 +15,7 @@ class NativeExtensionPopupAnchor {
   static bool Prepare(content::WebContents* contents, int native_window_number,
                       const gfx::RectF& cocoa_screen_anchor);
   static bool HasPrepared(content::WebContents* contents);
+  static bool IsPreparedOwnerActive(content::WebContents* contents);
   static void CancelPrepared(content::WebContents* contents);
   static std::unique_ptr<NativeExtensionPopupAnchor> Take(content::WebContents* contents);
   ~NativeExtensionPopupAnchor();

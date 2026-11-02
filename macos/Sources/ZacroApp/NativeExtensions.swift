@@ -37,6 +37,9 @@ final class NativeExtensionsModel: ObservableObject {
   private var actionGeneration = 0
   private var actionStates: [String: ChromeExtensionAction] = [:]
   private var actionIcons: [String: NSImage] = [:]
+  // Genuine manifest action capability is installation-scoped. Per-document
+  // action state can expire without removing and reflowing every pinned tile.
+  private var actionCapabilities: [String: Bool] = [:]
   var invokeAction: ((String, String, NSRect?) async throws -> Void)?
   var invokeOptions: ((String, String) async throws -> Void)?
   var invokeSidePanel: ((String, String) async throws -> Void)?
@@ -54,7 +57,7 @@ final class NativeExtensionsModel: ObservableObject {
     if actions.recordingShortcut { recordShortcut(nil) }
     request?.cancel(); generation += 1; scope = store.activeProfileID
     actionRequest?.cancel(); actionGeneration += 1
-    activeDocument = nil; activeAddress = nil; actionStates = [:]; actionIcons = [:]
+    activeDocument = nil; activeAddress = nil; actionStates = [:]; actionIcons = [:]; actionCapabilities = [:]
     shortcutRequest?.cancel(); shortcutGeneration += 1; shortcuts = []
     refreshPending = false
     entries = []; icons = [:]; error = nil; loading = false
@@ -84,6 +87,7 @@ final class NativeExtensionsModel: ObservableObject {
         let previousIcons = Dictionary(uniqueKeysWithValues: self.entries.map { ($0.id, $0.version + ":" + $0.iconUrl) })
         let currentIcons = Dictionary(uniqueKeysWithValues: snapshot.extensions.map { ($0.id, $0.version + ":" + $0.iconUrl) })
         self.icons = self.icons.filter { previousIcons[$0.key] == currentIcons[$0.key] && currentIcons[$0.key] != nil }
+        self.actionCapabilities = self.actionCapabilities.filter { previousIcons[$0.key] == currentIcons[$0.key] && currentIcons[$0.key] != nil }
         self.entries = snapshot.extensions
         self.developerMode = snapshot.profile.inDeveloperMode
         self.canLoadUnpacked = snapshot.profile.canLoadUnpacked
@@ -122,7 +126,7 @@ final class NativeExtensionsModel: ObservableObject {
         badgeColor: state.flatMap { Self.color($0.badgeColor) },
         badgeForeground: state.flatMap { Self.color($0.badgeForeground) },
         enabled: entry.isEnabled, actionEnabled: usableAction,
-        pinned: entry.isPinned && state?.hasAction == true, canPin: entry.userMayModify && state?.hasAction == true,
+        pinned: entry.isPinned && actionCapabilities[entry.id] == true, canPin: entry.userMayModify && actionCapabilities[entry.id] == true,
         perform: { [weak self] in self?.perform(operation, id: entry.id, expectedProfile: profile) },
         togglePin: { [weak self] in self?.perform(entry.isPinned ? "unpin" : "pin", id: entry.id, expectedProfile: profile) })
     }
@@ -137,6 +141,8 @@ final class NativeExtensionsModel: ObservableObject {
     switch event {
     case .registryChanged, .installationChanged:
       shortcutRequest?.cancel(); shortcutGeneration += 1; shortcuts = []
+      actionRequest?.cancel(); actionGeneration += 1
+      actionStates = [:]; actionIcons = [:]; actionCapabilities = [:]
       refresh()
     case .actionChanged: refreshActions()
     case .commandsChanged: refreshShortcuts()
@@ -177,7 +183,7 @@ final class NativeExtensionsModel: ObservableObject {
     refreshActions()
   }
   func canPin(_ identifier: String) -> Bool {
-    entries.first(where: { $0.id == identifier })?.userMayModify == true && actionStates[identifier]?.hasAction == true
+    entries.first(where: { $0.id == identifier })?.userMayModify == true && actionCapabilities[identifier] == true
   }
   private func refreshActions() {
     actionRequest?.cancel(); actionGeneration += 1
@@ -203,6 +209,7 @@ final class NativeExtensionsModel: ObservableObject {
         self.actionGeneration == actionRevision else { return }
       self.objectWillChange.send()
       self.actionStates = states; self.actionIcons = images
+      for (id, state) in states { self.actionCapabilities[id] = state.hasAction }
       self.publish(profile, revision)
     }
   }
@@ -366,7 +373,7 @@ final class NativeExtensionsModel: ObservableObject {
     request?.cancel(); request = nil; generation += 1
     actionRequest?.cancel(); actionRequest = nil; actionGeneration += 1
     scope = nil; activeDocument = nil; activeAddress = nil; loading = false; refreshPending = false
-    actionStates = [:]; actionIcons = [:]
+    actionStates = [:]; actionIcons = [:]; actionCapabilities = [:]
     shortcutRequest?.cancel(); shortcutRequest = nil; shortcutGeneration += 1; shortcuts = []
     NativeShortcutSuspension.noteProfile(engine: engine, owner: suspensionToken, profile: nil)
   }
@@ -500,7 +507,7 @@ private struct NativeExtensionCard: View {
         Menu {
           Button("Reload") { model.perform("reload",id:item.id) }
           Button("Remove…",role:.destructive) { model.perform("remove",id:item.id) }.disabled(item.mustRemainInstalled || !item.userMayModify)
-        } label: { NativeGlyph("more").frame(width:16,height:16) }.menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+        } label: { NativeGlyph.menuImage("more").frame(width:16,height:16) }.menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
       }.font(.system(size:12))
       NativeExtensionPermissions(item: item, model: model, palette: palette)
       if !item.commands.isEmpty { NativeExtensionCommands(item: item, model: model, palette: palette) }
@@ -664,7 +671,7 @@ private struct NativeExtensionCommands: View {
                       }
                     }
                   }
-                } label: { NativeGlyph("more").frame(width: 16, height: 16) }
+                } label: { NativeGlyph.menuImage("more").frame(width: 16, height: 16) }
                   .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
                   .accessibilityLabel("Shortcut actions for " + command.description)
                   .disabled(!canEdit(command) || saving != nil)

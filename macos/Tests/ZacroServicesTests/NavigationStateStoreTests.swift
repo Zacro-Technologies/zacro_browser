@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import XCTest
 @testable import ZacroServices
 
@@ -18,6 +19,61 @@ final class NavigationStateStoreTests: XCTestCase {
   private func file(_ root: URL, profile: String = "personal", tab: String = "tab", peek: Bool = false) -> URL {
     root.appendingPathComponent("Navigation").appendingPathComponent(ServiceFiles.hash(profile))
       .appendingPathComponent(ServiceFiles.hash(tab) + (peek ? "-peek.bin" : "-main.bin"))
+  }
+  func testApprovedNativeAddressBindingsRoundTripWithoutPlaintextDocumentMetadata() async throws {
+    let root = try directory(), vault = store(root), payload = Data([0, 255, 9, 17])
+    let addresses = ["chrome://settings/", "file:///tmp/private-document.html", "blob:https://example.com/12345678",
+      "https://fixture-user:fixture-password@example.com/approved",
+      "data:text/html," + String(repeating: "%3Cprivate-content%3E", count: 5_000)]
+    for (index, address) in addresses.enumerated() {
+      let id = "native-\(index)"
+      try await vault.write(profileID: "personal", tabID: id, address: address, encryptedData: payload)
+      let persisted = try Data(contentsOf: file(root, tab: id))
+      XCTAssertLessThan(persisted.count, 1_024)
+      XCTAssertNil(persisted.range(of: Data(address.utf8)))
+      let restarted = store(root)
+      expectEqual(try await restarted.read(profileID: "personal", tabID: id, address: address), payload)
+      expectEqual(try await restarted.read(profileID: "personal", tabID: id, address: address + "#other"), nil)
+      XCTAssertFalse(FileManager.default.fileExists(atPath: file(root, tab: id).path))
+    }
+  }
+  func testLegacyAddressMetadataRemainsReadableAndCopyUpgradesToDigest() async throws {
+    let root = try directory(), vault = store(root), payload = Data([19, 23]), address = "https://legacy.test/"
+    let legacy: [String: Any] = ["profile": ServiceFiles.hash("personal"), "tab": ServiceFiles.hash("tab"),
+      "peek": false, "address": address, "length": payload.count,
+      "digest": SHA256.hash(data: payload).map { String(format: "%02x", $0) }.joined()]
+    let header = try JSONSerialization.data(withJSONObject: legacy), length = UInt32(header.count)
+    var bytes = Data([0x5a, 0x41, 0x43, 0x4e, 0x41, 0x56, 1, 0])
+    bytes.append(contentsOf: [UInt8((length >> 24) & 255), UInt8((length >> 16) & 255), UInt8((length >> 8) & 255), UInt8(length & 255)])
+    bytes.append(header); bytes.append(payload)
+    try FileManager.default.createDirectory(at: file(root).deletingLastPathComponent(), withIntermediateDirectories: true)
+    try bytes.write(to: file(root))
+    expectEqual(try await vault.read(profileID: "personal", tabID: "tab", address: address), payload)
+    expectTrue(try await vault.copy(profileID: "personal", fromTabID: "tab", toTabID: "copy", address: address))
+    let copied = try Data(contentsOf: file(root, tab: "copy"))
+    let copiedLength = copied[8..<12].reduce(0) { ($0 << 8) | Int($1) }
+    var metadata = try XCTUnwrap(JSONSerialization.jsonObject(with: copied[12..<(12 + copiedLength)]) as? [String: Any])
+    XCTAssertEqual(metadata["version"] as? Int, 2)
+    XCTAssertNil(metadata["address"]); XCTAssertEqual((metadata["addressDigest"] as? String)?.count, 64)
+    // Unknown metadata versions cannot accidentally be treated as legacy.
+    metadata["version"] = 999
+    let changed = try JSONSerialization.data(withJSONObject: metadata), size = UInt32(changed.count)
+    var corrupt = Data(bytes.prefix(8))
+    corrupt.append(contentsOf: [UInt8((size >> 24) & 255), UInt8((size >> 16) & 255), UInt8((size >> 8) & 255), UInt8(size & 255)])
+    corrupt.append(changed); corrupt.append(payload); try corrupt.write(to: file(root, tab: "copy"))
+    expectEqual(try await store(root).read(profileID: "personal", tabID: "copy", address: address), nil)
+  }
+  func testInvalidOrOversizedNativeAddressCannotReplaceAValidArtifact() async throws {
+    let root = try directory(), vault = store(root), address = "file:///tmp/kept.html", payload = Data([1, 2])
+    try await vault.write(profileID: "personal", tabID: "tab", address: address, encryptedData: payload)
+    for invalid in ["relative", "javascript:alert(1)", "chrome-untrusted://test/", "file:///tmp/line\nfeed",
+      "data:text/plain," + String(repeating: "x", count: NativeNavigationStateStore.maximumAddressBytes)] {
+      do {
+        try await vault.write(profileID: "personal", tabID: "tab", address: invalid, encryptedData: Data([9]))
+        XCTFail("Invalid structural binding must fail")
+      } catch let error as ServiceError { XCTAssertEqual(error.code, "INPUT") }
+      expectEqual(try await vault.read(profileID: "personal", tabID: "tab", address: address), payload)
+    }
   }
   func testRestartRestoresExactBytesWithProfileTabAndPeekIsolation() async throws {
     let root = try directory(), first = store(root), bytes = Data([0, 255, 1, 2, 0, 34])

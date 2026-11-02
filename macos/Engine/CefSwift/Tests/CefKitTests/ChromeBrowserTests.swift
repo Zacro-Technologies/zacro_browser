@@ -14,6 +14,7 @@ import Testing
     @Test func defaults() {
         let options = CefChromeBrowserOptions()
         #expect(options.showsChromeToolbar == false)  // hide Chrome's UI by default
+        #expect(options.activatesWhenShown)
         #expect(options.isFrameless == false)
         #expect(options.initialBounds == nil)
         #expect(options.backgroundColor == nil)
@@ -34,6 +35,33 @@ import Testing
 
 @MainActor
 @Suite struct ChromeDelegateBridgeTests {
+
+    private final class WindowMarker {
+        var identifier: Int32?
+    }
+
+    @Test func hostedWindowMarksInactivePresentationWithoutChangingTheCEFABI() {
+        for activates in [true, false] {
+            var options = CefChromeBrowserOptions()
+            options.activatesWhenShown = activates
+            let owner = ChromeWindowDelegate(chrome: nil, options: options)
+            let delegate = owner.makeStruct()
+            defer { cefRelease(UnsafeMutableRawPointer(delegate)) }
+            let marker = WindowMarker()
+            let window = cefAllocate(cef_window_t.self, owner: marker)
+            defer { cefRelease(UnsafeMutableRawPointer(window)) }
+            let view = UnsafeMutableRawPointer(window).assumingMemoryBound(to: cef_view_t.self)
+            view.pointee.set_id = { pointer, identifier in
+                MainActor.assumeIsolated {
+                    cefOwner(WindowMarker.self, pointer.map(UnsafeMutableRawPointer.init))?.identifier = identifier
+                }
+            }
+            // CEF transfers an extra reference to on_window_created.
+            cefAddRef(UnsafeMutableRawPointer(window))
+            delegate.pointee.on_window_created?(delegate, window)
+            #expect(marker.identifier == (activates ? nil : 0x5a414352))
+        }
+    }
 
     @Test func browserViewDelegateReflectsToolbarOption() {
         for shows in [false, true] {

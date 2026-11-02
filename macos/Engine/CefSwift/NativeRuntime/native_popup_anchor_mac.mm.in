@@ -78,6 +78,12 @@ class NativeExtensionPopupAnchor::Impl {
     NSNotificationCenter* center = NSNotificationCenter.defaultCenter;
     for (id observer : observers_) [center removeObserver:observer];
     if (monitor_) [NSEvent removeMonitor:monitor_];
+    if (NSWindow* popup = state_->popup) {
+      // The notification is synchronous; the shell retains only weak window
+      // identities and cannot mistake an OAuth dialog for an action popup.
+      [center postNotificationName:@"ZacroNativeExtensionPopupClosed"
+                            object:popup];
+    }
     NSWindow* anchor = widget_->GetNativeWindow().GetNativeNSWindow();
     [anchor.parentWindow removeChildWindow:anchor];
     // The owning bubble may be destroying its widget. Release the anchor on
@@ -112,6 +118,14 @@ class NativeExtensionPopupAnchor::Impl {
           }
           return event;
         }];
+    NSWindow* owner = state_->owner;
+    NSWindow* native_popup = state_->popup;
+    if (owner && native_popup) {
+      // Post last: a native observer may synchronously close the popup, which
+      // destroys this anchor. Neither the C++ state nor observers own NSWindows.
+      [center postNotificationName:@"ZacroNativeExtensionPopupOpened"
+                            object:native_popup userInfo:@{@"ownerWindow": owner}];
+    }
   }
  private:
   std::shared_ptr<PopupState> state_;
@@ -147,6 +161,12 @@ bool NativeExtensionPopupAnchor::HasPrepared(content::WebContents* contents) {
   DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
   auto* pending = contents ? static_cast<PendingAnchor*>(contents->GetUserData(kPendingAnchor)) : nullptr;
   return pending && pending->valid();
+}
+bool NativeExtensionPopupAnchor::IsPreparedOwnerActive(content::WebContents* contents) {
+  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
+  auto* pending = contents ? static_cast<PendingAnchor*>(contents->GetUserData(kPendingAnchor)) : nullptr;
+  return pending && pending->valid() && NSApp.active && !NSApp.hidden &&
+         Descendant(NSApp.keyWindow, pending->owner);
 }
 void NativeExtensionPopupAnchor::CancelPrepared(content::WebContents* contents) {
   DCHECK_CURRENTLY_ON(content::BrowserThread::UI);

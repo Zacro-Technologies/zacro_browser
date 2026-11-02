@@ -239,13 +239,15 @@ void ExtensionSidePanelManager::RegisterExtensionEntries() {""")
     result[BROWSER_H] = replace(result[BROWSER_H], "  views::View* contents_container();", """  views::View* contents_container();
 
   // A native shell paints its own themed empty canvas. Keep extension UI
-  // visible while suppressing only the blank renderer beneath it.
+  // visible while suppressing only a blank, failed or crashed renderer.
   void SetNativeEmptyContentHidden(bool hidden);""")
     result[BROWSER_H] = replace(result[BROWSER_H], " private:\n", " private:\n  bool native_empty_content_hidden_ = false;\n")
     result[BROWSER_CC] = replace(result[BROWSER_CC], "void BrowserView::FrameColorsChanged() {", """void BrowserView::SetNativeEmptyContentHidden(bool hidden) {
   auto* tab = browser_->GetActiveTabInterface();
-  if (hidden && (!tab || !tab->GetContents() ||
-      tab->GetContents()->GetLastCommittedURL() != GURL("about:blank"))) hidden = false;
+  auto* contents = tab ? tab->GetContents() : nullptr;
+  auto* entry = contents ? contents->GetController().GetLastCommittedEntry() : nullptr;
+  if (hidden && (!contents || (contents->GetLastCommittedURL() != GURL("about:blank") &&
+      !contents->IsCrashed() && (!entry || entry->GetPageType() != content::PAGE_TYPE_ERROR)))) hidden = false;
   if (native_empty_content_hidden_ == hidden) return;
   native_empty_content_hidden_ = hidden;
   for (const auto& container : GetContentsContainerViews()) {

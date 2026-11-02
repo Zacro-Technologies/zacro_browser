@@ -112,14 +112,14 @@ struct NativeLibrary: View {
           Button {
             actions.library = item
           } label: {
-            Label { Text(item == "AI" ? "Ask AI" : item) } icon: { NativeGlyph(symbol(item)) }
+            Label { Text(item == "AI" ? "Ask AI" : item) } icon: { NativeGlyph.menuImage(symbol(item)) }
           }
         }
       } label: {
         HStack(spacing: 7) {
-          NativeGlyph(symbol(section)).foregroundStyle(colors.accent)
+          NativeGlyph.menuImage(symbol(section)).foregroundStyle(colors.accent)
           Text(section == "AI" ? "Ask AI" : section).fontWeight(.semibold)
-          NativeGlyph("chevron.down").font(.system(size: 8))
+          NativeGlyph.menuImage("chevron.down", size: 10)
         }.frame(height: 28).contentShape(Rectangle())
       }.menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
         .focused($focus, equals: "section").accessibilityLabel("Choose Library section")
@@ -379,7 +379,7 @@ struct NativeLibrary: View {
         if running, actions.libraryCapabilities.contains("download:cancel") {
           Button("Cancel download") { perform("download:cancel", id: item.id) }
         }
-      } label: { NativeGlyph("ellipsis").frame(width: 24, height: 26) }
+      } label: { NativeGlyph.menuImage("ellipsis").frame(width: 24, height: 26) }
         .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
         .accessibilityLabel("Actions for \(item.filename)")
       }
@@ -504,14 +504,14 @@ struct NativeLibrary: View {
           Button {
             value.wrappedValue = options[index].0
           } label: {
-            if options[index].0 == value.wrappedValue { Label { Text(options[index].1) } icon: { NativeGlyph("check") } }
+            if options[index].0 == value.wrappedValue { Label { Text(options[index].1) } icon: { NativeGlyph.menuImage("check") } }
             else { Text(options[index].1) }
           }
         }
       } label: {
         HStack(spacing: 7) {
           Text(selected).lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
-          NativeGlyph("chevron.down", size: 10).foregroundStyle(colors.muted)
+          NativeGlyph.menuImage("chevron.down", size: 10).foregroundStyle(colors.muted)
         }.font(.system(size: 12)).padding(.horizontal, 9).frame(height: 29)
           .background(colors.card.opacity(0.35), in: RoundedRectangle(cornerRadius: 7))
       }.menuStyle(.borderlessButton).menuIndicator(.hidden).frame(width: 142)

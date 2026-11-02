@@ -31,9 +31,10 @@ public actor CodexSubscription: AISubscriptionConnection {
   private var turnContinuation: AsyncThrowingStream<[ServiceJSON], Error>.Continuation?
   private var delta: (@Sendable (String) async -> Void)?
   private var outputBytes = 0
-  public init(directory: URL, executable: URL? = Bundle.main.resourceURL?.appendingPathComponent("Providers/codex")) {
+  public init(directory: URL, executable: URL? = Bundle.main.resourceURL?.appendingPathComponent("Providers/codex"), storage: String = "keyring") {
     home = directory.appendingPathComponent("codex")
     self.executable = executable.flatMap { ProviderProcessPolicy.nativeExecutable($0) ? $0 : nil }
+    authStorage = storage == "session" ? "session" : "keyring"
   }
   public func status() -> ServiceJSON {
     var result: ServiceJSON = ["available":.bool(executable != nil),"configured":.bool(account != .null),
@@ -142,8 +143,8 @@ public actor CodexSubscription: AISubscriptionConnection {
   }
   public func setStorage(_ value: String) async throws {
     guard ["keyring","session"].contains(value) else { throw ServiceError("INPUT", "Choose keychain or this session only.") }
-    guard threadID == nil else { throw ServiceError("BUSY", "Stop the current answer before changing sign-in storage.") }
     if value == authStorage { return }
+    guard runToken == nil, threadID == nil else { throw ServiceError("BUSY", "Stop the current answer before changing sign-in storage.") }
     if authStorage == "keyring", rpc != nil { try await logout() }
     await stop(); authStorage = value
   }

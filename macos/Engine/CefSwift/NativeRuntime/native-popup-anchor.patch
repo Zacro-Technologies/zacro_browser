@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/chrome/browser/ui/views/extensions/native_extension_popup_anchor.h
-@@ -0,0 +1,29 @@
+@@ -0,0 +1,30 @@
 +#ifndef CHROME_BROWSER_UI_VIEWS_EXTENSIONS_NATIVE_EXTENSION_POPUP_ANCHOR_H_
 +#define CHROME_BROWSER_UI_VIEWS_EXTENSIONS_NATIVE_EXTENSION_POPUP_ANCHOR_H_
 +
@@ -18,6 +18,7 @@
 +  static bool Prepare(content::WebContents* contents, int native_window_number,
 +                      const gfx::RectF& cocoa_screen_anchor);
 +  static bool HasPrepared(content::WebContents* contents);
++  static bool IsPreparedOwnerActive(content::WebContents* contents);
 +  static void CancelPrepared(content::WebContents* contents);
 +  static std::unique_ptr<NativeExtensionPopupAnchor> Take(content::WebContents* contents);
 +  ~NativeExtensionPopupAnchor();
@@ -32,7 +33,7 @@
 +#endif
 --- /dev/null
 +++ b/chrome/browser/ui/views/extensions/native_extension_popup_anchor_mac.mm
-@@ -0,0 +1,165 @@
+@@ -0,0 +1,185 @@
 +#import <AppKit/AppKit.h>
 +
 +#include "chrome/browser/ui/views/extensions/native_extension_popup_anchor.h"
@@ -113,6 +114,12 @@
 +    NSNotificationCenter* center = NSNotificationCenter.defaultCenter;
 +    for (id observer : observers_) [center removeObserver:observer];
 +    if (monitor_) [NSEvent removeMonitor:monitor_];
++    if (NSWindow* popup = state_->popup) {
++      // The notification is synchronous; the shell retains only weak window
++      // identities and cannot mistake an OAuth dialog for an action popup.
++      [center postNotificationName:@"ZacroNativeExtensionPopupClosed"
++                            object:popup];
++    }
 +    NSWindow* anchor = widget_->GetNativeWindow().GetNativeNSWindow();
 +    [anchor.parentWindow removeChildWindow:anchor];
 +    // The owning bubble may be destroying its widget. Release the anchor on
@@ -147,6 +154,14 @@
 +          }
 +          return event;
 +        }];
++    NSWindow* owner = state_->owner;
++    NSWindow* native_popup = state_->popup;
++    if (owner && native_popup) {
++      // Post last: a native observer may synchronously close the popup, which
++      // destroys this anchor. Neither the C++ state nor observers own NSWindows.
++      [center postNotificationName:@"ZacroNativeExtensionPopupOpened"
++                            object:native_popup userInfo:@{@"ownerWindow": owner}];
++    }
 +  }
 + private:
 +  std::shared_ptr<PopupState> state_;
@@ -182,6 +197,12 @@
 +  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
 +  auto* pending = contents ? static_cast<PendingAnchor*>(contents->GetUserData(kPendingAnchor)) : nullptr;
 +  return pending && pending->valid();
++}
++bool NativeExtensionPopupAnchor::IsPreparedOwnerActive(content::WebContents* contents) {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  auto* pending = contents ? static_cast<PendingAnchor*>(contents->GetUserData(kPendingAnchor)) : nullptr;
++  return pending && pending->valid() && NSApp.active && !NSApp.hidden &&
++         Descendant(NSApp.keyWindow, pending->owner);
 +}
 +void NativeExtensionPopupAnchor::CancelPrepared(content::WebContents* contents) {
 +  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);

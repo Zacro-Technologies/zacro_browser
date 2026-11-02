@@ -25,6 +25,7 @@ public final class ChromiumEngine: NSObject {
   public private(set) var primaryWindow: ChromiumWindowContext?
   public private(set) var focusedWindowID: String?
   private var nextWindowID = 1
+  private let extensionPopupOwnership = ChromiumExtensionPopupOwnership()
   public var window: NSWindow? { primaryWindow?.window }
   public var onLayout: (() -> Void)? {
     get { primaryWindow?.onLayout }
@@ -57,6 +58,13 @@ public final class ChromiumEngine: NSObject {
   public init(dataDirectory: URL) {
     self.dataDirectory = dataDirectory
     super.init()
+  }
+
+  /// Exact native action-popup ownership; authentication, permission and
+  /// JavaScript dialog windows are never accepted through this lookup.
+  public func extensionPopupOwner(_ popup: NSWindow) -> ChromiumWindowContext? {
+    guard let owner = extensionPopupOwnership.owner(of: popup) else { return nil }
+    return contexts.values.first { $0.window === owner && $0.isOpen && !$0.isClosing }
   }
 
   /// Runtime capabilities do not vary by profile. Probe through the broker's
@@ -634,6 +642,9 @@ public final class ChromiumPage: CefBrowserDelegate {
   public private(set) var isLoading = false
   public private(set) var isAudible = false
   public private(set) var isSidePanelVisible = false
+  /// Actual document slot within the hosted page viewport, using top-left
+  /// coordinates. A native side panel occupies the remaining area.
+  public private(set) var documentBounds: CGRect?
   private var documentEventToken: UUID?
   private var documentObservation: Task<Void, Never>?
   fileprivate var onSidePanelChangedInternal: ((Bool) -> Void)?
@@ -672,7 +683,10 @@ public final class ChromiumPage: CefBrowserDelegate {
     set { browser?.onFindResult = newValue }
   }
   private var lastFindQuery = ""
-  private var approvedNavigationURLs: Set<String> = []
+  private var approvedNavigationURLs: Set<Data> = []
+  private static func navigationKey(_ url: URL) -> Data {
+    Data(SHA256.hash(data: Data(url.absoluteString.utf8)))
+  }
 
   fileprivate func adoptCurrentDocumentState() {
     guard let browser else { return }
@@ -700,6 +714,8 @@ public final class ChromiumPage: CefBrowserDelegate {
             self.isAudible = audible; self.onChange?()
           } else if method == "Zacro.documentSidePanelChanged", let visible = params["visible"] as? Bool {
             self.updateSidePanelVisible(visible)
+          } else if method == "Zacro.documentBoundsChanged" {
+            self.updateDocumentBounds(params["bounds"])
           }
         }
         documentEventToken = token
@@ -708,6 +724,7 @@ public final class ChromiumPage: CefBrowserDelegate {
           guard !Task.isCancelled, self.browser === browser else { return }
           if let audible = state["audible"] as? Bool { isAudible = audible; onChange?() }
           if let visible = state["sidePanelVisible"] as? Bool { updateSidePanelVisible(visible) }
+          updateDocumentBounds(state["bounds"])
         } catch {
           browser.devTools.removeEventObserver(token); documentEventToken = nil
         }
@@ -722,6 +739,21 @@ public final class ChromiumPage: CefBrowserDelegate {
     if changed { onSidePanelChangedInternal?(visible) }
   }
 
+  private func updateDocumentBounds(_ value: Any?) {
+    var bounds: CGRect?
+    if let value = value as? [String: Any],
+       let x = value["x"] as? NSNumber, let y = value["y"] as? NSNumber,
+       let width = value["width"] as? NSNumber, let height = value["height"] as? NSNumber {
+      let values = [x.doubleValue, y.doubleValue, width.doubleValue, height.doubleValue]
+      if values.allSatisfy({ $0.isFinite && $0 >= 0 && $0 <= 100_000 }), width.doubleValue > 0, height.doubleValue > 0 {
+        bounds = CGRect(x: x.doubleValue, y: y.doubleValue, width: width.doubleValue, height: height.doubleValue)
+      }
+    }
+    guard bounds != documentBounds else { return }
+    documentBounds = bounds
+    onChange?()
+  }
+
   fileprivate init(id: String, profileID: String, isPrivate: Bool) {
     self.id = id
     self.profileID = profileID
@@ -732,16 +764,20 @@ public final class ChromiumPage: CefBrowserDelegate {
   /// encrypted native history independently revalidates every privileged entry.
   public func authorizeNavigation(_ approval: ChromeNavigationApproval) throws {
     guard approval.profileID == profileID else { throw ChromeExtensionError.invalidResponse }
-    approvedNavigationURLs.insert(approval.url.absoluteString)
+    guard approval.url.absoluteString.utf8.count <= 1024 * 1024 else {
+      throw ChromeExtensionError.loadFailed("The native navigation address exceeds the supported size.")
+    }
+    let key = Self.navigationKey(approval.url)
+    guard approvedNavigationURLs.contains(key) || approvedNavigationURLs.count < 8192 else {
+      throw ChromeExtensionError.loadFailed("Too many retained native navigation authorizations.")
+    }
+    approvedNavigationURLs.insert(key)
   }
   public func loadApprovedNavigation(_ approval: ChromeNavigationApproval) async throws {
     try authorizeNavigation(approval)
-    do {
-      _ = try await ready().devTools.call("Zacro.navigateApproved", parameters: approval.parameters, timeout: 50)
-    } catch {
-      approvedNavigationURLs.remove(approval.url.absoluteString)
-      throw error
-    }
+    // A network error does not revoke an otherwise valid history entry. The
+    // native throttle rechecks the extension incarnation on every traversal.
+    _ = try await ready().devTools.call("Zacro.navigateApproved", parameters: approval.parameters, timeout: 50)
   }
   public func ready() async throws -> CefBrowser {
     guard let browser else { throw CefDevToolsError.browserClosed }
@@ -876,7 +912,7 @@ public final class ChromiumPage: CefBrowserDelegate {
       }
       return .allow
     }
-    if Self.webURL(url) || url.absoluteString == "about:blank" || approvedNavigationURLs.contains(url.absoluteString) { return allowMainFrameNavigation() }
+    if Self.webURL(url) || url.absoluteString == "about:blank" || approvedNavigationURLs.contains(Self.navigationKey(url)) { return allowMainFrameNavigation() }
     if url.scheme == "chrome", (id.hasPrefix("extensions:") || id.hasPrefix("extension-settings:")),
       url.host == "extensions" { return allowMainFrameNavigation() }
     // Chromium still validates extension resource ownership and web-accessible

@@ -60,6 +60,8 @@ After integrated build14, the full suite passed **126 Core and 64 Services tests
 
 Window sidebar moves now resolve their projected insertion neighbor against the authoritative shared collection, so a second window's drag cannot be interpreted as an index among every window's tabs. A regression covers middle reordering, favorite creation, dragging back out and restart while preserving the other window's order. Together with the subsequent window-authority AI regressions, the complete run passed **127 Core and 71 Services tests**, with no failures or skips (`core-services-window-authority.log`).
 
+Startup policies apply to every saved window: disabling session restoration retains pins, splits and Peeks without selecting them, while a standalone selected pin remains dormant on restart. An intentional empty selection survives subsequent normalization and persistence; an invalid nonempty reference still repairs. Shared Space deletion moves every affected window to the remaining Space in that window's original profile. Four repository regressions cover these paths, including restart and independent windows; all 17 repository tests passed after the latter correction (`core-services-post18-focused.log`).
+
 - Call `sidebarTabs()` for keyboard tab ordering instead of independently sorting categories.
 - Use atomic `moveTab(..., pinned:, favorite:, clearFolder:)` for drag classification. Omitted folder means preserve it; `clearFolder: true` means remove it.
 - User address entry uses `BrowserAddress.resolve`. Only a verified extension action should call `createExtensionTab`/`setExtensionPage`.

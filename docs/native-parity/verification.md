@@ -143,6 +143,16 @@ The application harness renders its own NSView trees into `view-renders`. The pa
 
 Evidence: `macos/.build/verification/integrated-release-18.log`, `integrated-release-18-retry.log`, `application-18-retry/application.json`, `application-18-retry/view-renders`, `engine-18/engine.json`, `core-services-post18-full.log`, and `cef-load-error-tests-18-retry.log`. The initial failing run remains in `application-18`. Stock reports continue to mark native extension compatibility and desktop input as unverified.
 
+## 2026-11-02: integrated build 19
+
+The release product compiled in **126.29 seconds**, without warnings. The internal bundle passed deep/strict signature verification, all **74 application checks**, all **26 stock-engine checks**, and clean shutdown. The complete **212 Core/Services tests** passed (135 Core and 77 Services), with no failures or skips and the bundled Codex handshake/PDF helper.
+
+The application checks now include thirteen deterministic Space presentation and scroll-lifetime cases: bounded hosting across 1,000 Spaces, continuous long travel, exact snapping, one-viewport distant-dot transitions, interruption, Reduce Motion, profile changes, scroll restoration and deleted-Space cleanup. Explicit focus uses a cancellable selection intent, with a narrow closing-palette grace period; later input or another window cannot revive an abandoned request. Four Core regressions exercise that intent. The actual custom-runtime split activation check remains pending because stock CEF does not honor the new hosted-window ShowInactive marker.
+
+The build retains pinned extension layout during asynchronous metadata refresh, provides real native Menu images from the source glyph paths, preserves saved subscription storage before every provider operation, and uses bounded digest metadata for exceptional navigation history. Failed pages can retain their native extension side panel while a separate error panel covers only the document rectangle. Custom-only checks assert exact error bounds, retained panel drafts and recovery. They have not yet run. Exact extension-popup/owner notifications and scoped shortcut routing compile, and the native popup-anchor object check passed; physical popup keyboard input is unverified.
+
+Evidence: `macos/.build/verification/integrated-release-19.log`, `application-19/application.json`, `engine-19/engine.json`, `core-services-post19-full.log`, `document-focus-intent-19.log`, and `popup-owner-objects-19/object-check.json`. Own-view render artifacts retain the same explicit limitations as build18. Custom-framework acceptance, desktop input, material composition and final distribution remain release gates.
+
 ## Required release evidence
 
 - Successful custom Chromium build and package provenance; native protocol capability checks.

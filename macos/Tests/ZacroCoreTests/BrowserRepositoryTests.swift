@@ -161,6 +161,33 @@ import XCTest
     XCTAssertNotNil(first.tab(firstSecond.id))
   }
 
+  func testDeletingWorkSpaceKeepsOtherWindowsInTheirOwnProfile() throws {
+    let repository = BrowserRepository(directory: try directory()), first = repository.focusedStore
+    let personal = try XCTUnwrap(first.createTab(address: "https://personal.example"))
+    let work = try first.createProfileDurably(name: "Work"), retainedSpace = first.state.activeSpaceID
+    let removed = first.createSpace(name: "Temporary", profileID: work.id)
+    let a = try XCTUnwrap(first.createTab(address: "https://work.example/a"))
+    let second = try repository.makeWindow(profileID: work.id, addresses: ["https://work.example/b"])
+    second.selectSpace(id: removed.id)
+    let b = try XCTUnwrap(second.createTab(address: "https://work.example/selected"))
+    let publicWindow = try repository.makeWindow(profileID: "default", addresses: ["https://unrelated.example"])
+    publicWindow.selectSpace(id: "home")
+    let publicSelection = publicWindow.state.activeTabID
+    first.deleteSpace(id: removed.id)
+    for scope in [first, second] {
+      XCTAssertEqual(scope.activeProfileID, work.id)
+      XCTAssertEqual(scope.state.activeSpaceID, retainedSpace)
+    }
+    XCTAssertEqual(second.state.activeTabID, b.id)
+    XCTAssertEqual(first.tab(a.id)?.spaceID, retainedSpace)
+    XCTAssertEqual(publicWindow.state.activeSpaceID, "home")
+    XCTAssertEqual(publicWindow.state.activeTabID, publicSelection)
+    XCTAssertNotNil(first.tab(personal.id))
+    let reopened = BrowserRepository(directory: repository.directory)
+    XCTAssertEqual(reopened.store(for: second.owningWindowID!)?.activeProfileID, work.id)
+    XCTAssertEqual(reopened.store(for: second.owningWindowID!)?.state.activeTabID, b.id)
+  }
+
   func testSplitTransferMovesBothMembersWithoutReplacingTheirState() throws {
     let repository = BrowserRepository(directory: try directory())
     let first = repository.focusedStore

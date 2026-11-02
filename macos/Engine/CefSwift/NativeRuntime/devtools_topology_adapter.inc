@@ -23,6 +23,7 @@
 #include "extensions/browser/extension_function_dispatcher.h"
 #include "extensions/common/url_pattern_set.h"
 #include "content/public/browser/weak_document_ptr.h"
+#include "crypto/hash.h"
 #include "url/origin.h"
 #include "cef/libcef/browser/devtools/zacro_tab_reservation.h"
 
@@ -31,6 +32,7 @@ using ZacroNativeResponse = ExtensionFunction::NativeResponse;
 using ZacroTabUtil = extensions::ExtensionTabUtil;
 
 constexpr char kZacroReservedTabID[] = "zacro.native.reserved-session-tab-id";
+constexpr size_t kZacroMaximumNavigationURLBytes = 1024 * 1024;
 class ZacroReservedTabID : public base::SupportsUserData::Data {
  public:
   explicit ZacroReservedTabID(SessionID value) : id(value) {}
@@ -131,10 +133,17 @@ class ZacroNavigationApprovals : public base::SupportsUserData::Data {
     auto value = std::make_unique<ZacroNavigationApprovals>(); auto* result = value.get();
     contents->SetUserData(key, std::move(value)); return result;
   }
-  std::map<std::string, std::pair<std::string, std::string>> destinations;
+  // Keep exact-spec identity without retaining thousands of large data URLs.
+  // The actual URL and current extension incarnation are still validated on
+  // every use; a digest is never itself a navigation grant.
+  static auto Key(std::string_view url) { return crypto::hash::Sha256(url); }
+  std::map<std::array<uint8_t, 32>, std::pair<std::string, std::string>> destinations;
 };
 bool ZacroValidateNavigation(content::BrowserContext* context, const std::string& extension_id,
     const std::string& incarnation, const std::string& url, std::string& error) {
+  if (url.empty() || url.size() > kZacroMaximumNavigationURLBytes) {
+    error = "The native navigation address exceeds the supported size."; return false;
+  }
   auto* registry = extensions::ExtensionRegistry::Get(context);
   const auto* extension = registry ? registry->enabled_extensions().GetByID(extension_id) : nullptr;
   if (!extension || incarnation.empty() ||
@@ -145,10 +154,11 @@ bool ZacroValidateNavigation(content::BrowserContext* context, const std::string
   if (!checked.has_value()) { error = checked.error(); return false; }
   if (checked->spec() != url) { error = "The native navigation address changed."; return false; }
   auto& destinations = ZacroNavigationApprovals::Get(context)->destinations;
-  if (!destinations.contains(url) && destinations.size() >= 8192) {
+  const auto key = ZacroNavigationApprovals::Key(url);
+  if (!destinations.contains(key) && destinations.size() >= 8192) {
     error = "Too many retained native navigation authorizations."; return false;
   }
-  destinations[url] = {extension_id, incarnation}; return true;
+  destinations[key] = {extension_id, incarnation}; return true;
 }
 
 class ZacroBrowserContext : public base::SupportsUserData::Data {
@@ -1082,7 +1092,7 @@ void ZacroSetTopologyObserved(content::BrowserContext* context, bool observed) {
 
 bool ZacroAllowApprovedNavigation(content::WebContents* contents, const GURL& url) {
   auto& approvals = ZacroNavigationApprovals::ForDocument(contents)->destinations;
-  auto found = approvals.find(url.spec());
+  auto found = approvals.find(ZacroNavigationApprovals::Key(url.spec()));
   if (found == approvals.end()) return true; // Existing normal browser policy still applies.
   std::string error;
   return ZacroValidateNavigation(contents->GetBrowserContext(), found->second.first,
@@ -1144,7 +1154,7 @@ bool CefDevToolsController::DispatchZacroTopology(int id, const std::string& met
       ReplyZacro(id, {}, error.empty() ? "The native navigation authorization is incomplete." : error); return true;
     }
     if (method == "Zacro.navigateApproved") {
-      ZacroNavigationApprovals::ForDocument(inspected_contents_)->destinations[*url] = {*extension, *incarnation};
+      ZacroNavigationApprovals::ForDocument(inspected_contents_)->destinations[ZacroNavigationApprovals::Key(*url)] = {*extension, *incarnation};
       if (StartZacroNavigationCommit(id, GURL(*url), base::DictValue().Set("extensionID", *extension)
           .Set("incarnationID", *incarnation).Set("url", *url))) {
         inspected_contents_->GetController().LoadURL(

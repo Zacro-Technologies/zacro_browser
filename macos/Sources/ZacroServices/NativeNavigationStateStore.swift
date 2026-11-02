@@ -9,6 +9,7 @@ import Darwin
 public actor NativeNavigationStateStore {
   public typealias ProfileReader = @Sendable (String) async -> AIProfileScope?
   public static let maximumEncryptedBytes = 6 * 1024 * 1024
+  public static let maximumAddressBytes = 1024 * 1024
   private static let maximumMetadataBytes = 32 * 1024
   private static let magic = Data([0x5a, 0x41, 0x43, 0x4e, 0x41, 0x56, 0x01, 0x00])
   private let root: URL
@@ -16,10 +17,12 @@ public actor NativeNavigationStateStore {
   private var profileRevisions: [String: UInt64] = [:]
   private var slotRevisions: [String: UInt64] = [:]
   private struct Metadata: Codable {
+    var version: Int?
     var profile: String
     var tab: String
     var peek: Bool
-    var address: String
+    var address: String?
+    var addressDigest: String?
     var length: Int
     var digest: String
   }
@@ -109,12 +112,22 @@ public actor NativeNavigationStateStore {
       .appendingPathComponent(ServiceFiles.hash(tabID) + (peek ? "-peek.bin" : "-main.bin"))
   }
   private func canonicalAddress(_ address: String) -> String? {
-    guard !address.isEmpty, address.utf8.count <= 16_384,
-      !address.unicodeScalars.contains(where: { CharacterSet.controlCharacters.union(.whitespacesAndNewlines).contains($0) }),
-      !address.contains("\\") else { return nil }
+    guard !address.isEmpty, address.utf8.count <= Self.maximumAddressBytes,
+      !address.unicodeScalars.contains(where: { $0.value < 32 || $0.value == 127 }),
+      let url = URL(string: address), let scheme = url.scheme?.lowercased(),
+      !["javascript", "devtools", "chrome-untrusted"].contains(scheme) else { return nil }
     if address == "about:blank" { return address }
-    guard var parts = URLComponents(string: address), let scheme = parts.scheme?.lowercased(),
-      let host = parts.host?.lowercased(), !host.isEmpty, parts.user == nil, parts.password == nil else { return nil }
+    // This binding is not a navigation grant. Chromium already encrypted the
+    // envelope and revalidates its profile, installed extension and URL policy
+    // before restore. Native-only documents must retain their exact spec.
+    if !["http", "https", "chrome-extension"].contains(scheme) {
+      return url.absoluteString == address ? address : nil
+    }
+    guard !address.contains(where: { $0.isWhitespace }), !address.contains("\\"),
+      var parts = URLComponents(string: address),
+      let host = parts.host?.lowercased(), !host.isEmpty, parts.user == nil, parts.password == nil else {
+      return url.absoluteString == address ? address : nil
+    }
     if scheme == "chrome-extension" {
       guard host.range(of: "^[a-p]{32}$", options: .regularExpression) != nil, parts.port == nil else { return nil }
     } else if scheme == "http" || scheme == "https" {
@@ -131,8 +144,10 @@ public actor NativeNavigationStateStore {
       throw ServiceError("STORAGE_SIZE", "The encrypted navigation state exceeds its supported size.")
     }
     let file = try path(profileID: profileID, tabID: tabID, peek: peek)
-    let metadata = Metadata(profile: ServiceFiles.hash(profileID), tab: ServiceFiles.hash(tabID), peek: peek,
-      address: address, length: encryptedData.count, digest: Self.digest(encryptedData))
+    // In particular, a data: document can contain sensitive page contents.
+    // Only its digest belongs outside Chromium's encrypted envelope.
+    let metadata = Metadata(version: 2, profile: ServiceFiles.hash(profileID), tab: ServiceFiles.hash(tabID), peek: peek,
+      address: nil, addressDigest: Self.digest(Data(address.utf8)), length: encryptedData.count, digest: Self.digest(encryptedData))
     let header = try JSONEncoder().encode(metadata)
     guard header.count <= Self.maximumMetadataBytes else { throw ServiceError("STORAGE_SIZE", "The navigation metadata exceeds its supported size.") }
     var bytes = Self.magic
@@ -153,7 +168,7 @@ public actor NativeNavigationStateStore {
       guard length > 0, length <= Self.maximumMetadataBytes, bytes.count > 12 + length else { throw InvalidArtifact.invalid }
       guard let metadata = try? JSONDecoder().decode(Metadata.self, from: bytes.subdata(in: 12..<(12 + length))),
         metadata.profile == ServiceFiles.hash(profileID), metadata.tab == ServiceFiles.hash(tabID), metadata.peek == peek,
-        metadata.address == address, metadata.length > 0, metadata.length <= Self.maximumEncryptedBytes,
+        matchesAddress(metadata, address), metadata.length > 0, metadata.length <= Self.maximumEncryptedBytes,
         bytes.count - 12 - length == metadata.length else { throw InvalidArtifact.invalid }
       let payload = bytes.subdata(in: (12 + length)..<bytes.count)
       guard Self.digest(payload) == metadata.digest else { throw InvalidArtifact.invalid }
@@ -162,6 +177,15 @@ public actor NativeNavigationStateStore {
       try removeFile(file)
       return nil
     }
+  }
+  private func matchesAddress(_ metadata: Metadata, _ address: String) -> Bool {
+    if metadata.version == nil {
+      // Read the original web-only format. Any subsequent capture or copy
+      // rewrites it with a digest; a legacy header never authorizes a URL.
+      return metadata.addressDigest == nil && metadata.address == address
+    }
+    return metadata.version == 2 && metadata.address == nil
+      && metadata.addressDigest == Self.digest(Data(address.utf8))
   }
   private func ensureDirectory(_ directory: URL) throws {
     let manager = FileManager.default

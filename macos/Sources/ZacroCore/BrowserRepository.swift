@@ -113,6 +113,14 @@ import Foundation
     state.settings.sidebarVisible = previous.settings.sidebarVisible
     state.settings.sidebarWidth = previous.settings.sidebarWidth
     state.settings.panelWidth = previous.settings.panelWidth
+    // Shared Space deletion must move every affected window to a remaining
+    // Space in its own profile, not the first profile in the collection.
+    for index in sessions.indices where !state.spaces.contains(where: { $0.id == sessions[index].activeSpaceID }) {
+      let oldProfile = previous.spaces.first { $0.id == sessions[index].activeSpaceID }?.profileID
+      if let destination = state.spaces.first(where: { $0.profileID == oldProfile }) {
+        sessions[index].activeSpaceID = destination.id
+      }
+    }
     state.windowSessions = sessions; state.focusedWindowID = previous.focusedWindowID
     BrowserWindowState.normalize(&state, migrate: true)
     return state

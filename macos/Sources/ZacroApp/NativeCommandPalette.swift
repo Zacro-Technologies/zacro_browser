@@ -529,6 +529,7 @@ private struct CommandSearchField: NSViewRepresentable {
   func updateNSView(_ field: NSTextField, context: Context) {
     context.coordinator.parent = self; field.placeholderString = placeholder
     field.textColor = textColor
+    (field.currentEditor() as? NSTextView)?.insertionPointColor = textColor
     field.placeholderAttributedString = NSAttributedString(string: placeholder, attributes: [.foregroundColor: placeholderColor, .font: NSFont.systemFont(ofSize: 15)])
     if field.stringValue != text { field.stringValue = text }
     if context.coordinator.lastFocusRequest != focusRequest {
@@ -545,6 +546,10 @@ private struct CommandSearchField: NSViewRepresentable {
     var lastFocusRequest = 0
     var lastSelectionRequest: UInt64 = 0
     init(_ parent: CommandSearchField) { self.parent = parent }
+    func controlTextDidBeginEditing(_ notification: Notification) {
+      guard let field = notification.object as? NSTextField else { return }
+      (field.currentEditor() as? NSTextView)?.insertionPointColor = parent.textColor
+    }
     func controlTextDidChange(_ notification: Notification) { if let field = notification.object as? NSTextField { parent.text = field.stringValue } }
     func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
       guard !textView.hasMarkedText() else { return false }

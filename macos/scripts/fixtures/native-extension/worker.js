@@ -294,6 +294,25 @@ globalThis.zacroAcceptance = {
       try { await chrome.tabs.create({ url: "javascript:document.title='invalid'" }); } catch { rejected = true; }
       assert(rejected && (await chrome.tabs.query({})).length === before, "Forbidden JavaScript URL mutated the model");
     });
+    await check("largeApprovedNativeNavigation", async () => {
+      assert(first, "Tab prerequisite failed");
+      const url = "data:text/html,%3Ctitle%3ELarge%20native%20document%3C/title%3E" + "x".repeat(600 * 1024);
+      const tab = await chrome.tabs.create({ windowId: sourceWindowID, url, active: true });
+      created.push(tab.id); await loaded(tab.id);
+      assert((await chrome.tabs.get(tab.id)).url === url, "Large approved URL was truncated in the host model");
+      await chrome.tabs.update(first.id, { active: true });
+      await chrome.tabs.discard(tab.id);
+      assert((await chrome.tabs.get(tab.id)).discarded, "Large approved document was not discarded");
+      const target = { tabId: tab.id };
+      await chrome.debugger.attach(target, "1.3");
+      try {
+        const actual = await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
+          expression: "location.href", returnByValue: true
+        });
+        assert(actual.result.value === url, "Large approved history did not restore the complete URL");
+        assert(!(await chrome.tabs.get(tab.id)).discarded, "Debugger did not wake the dormant native document");
+      } finally { await chrome.debugger.detach(target); }
+    });
     await check("nativeDebuggerTargets", async () => {
       assert(first, "Tab prerequisite failed");
       const targets = await chrome.debugger.getTargets();

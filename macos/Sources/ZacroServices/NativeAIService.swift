@@ -67,14 +67,18 @@ public actor NativeAIService {
               codex: (any AISubscriptionConnection)? = nil, claude: (any AISubscriptionConnection)? = nil) {
     self.currentProfile = currentProfile; self.conversationProfile = conversationProfile; contextReader = context
     api = NativeAPIClient(transport: transport); vault = AICredentialVault(directory: directory, store: secrets)
-    self.codex = codex ?? CodexSubscription(directory: directory); self.claude = claude ?? ClaudeSubscription(directory: directory)
-    preferenceFile = directory.appendingPathComponent("ai-preferences.json")
+    let preferenceFile = directory.appendingPathComponent("ai-preferences.json")
+    self.preferenceFile = preferenceFile
+    var initialStorage = "keyring"
     do {
       if let saved = try ServiceFiles.read(preferenceFile, maximum: 1024 * 1024) {
         guard saved["version"] == 1 else { throw ServiceError("STORAGE", "The AI preferences are unreadable and have been preserved.") }
         preferences = saved
+        if saved["codexAuthStorage"] == "session" { initialStorage = "session" }
       }
     } catch { preferenceError = error }
+    self.codex = codex ?? CodexSubscription(directory: directory, storage: initialStorage)
+    self.claude = claude ?? ClaudeSubscription(directory: directory)
   }
   public func events() -> AsyncStream<ServiceJSON> {
     let id = UUID()
@@ -140,9 +144,9 @@ public actor NativeAIService {
     let provider = provider(profile.id), config = config(profile.id, provider)
     var state: ServiceJSON
     if let connection = connection(provider) {
-      if refresh {
+      if refresh && !configuring {
         do {
-          if provider == .codex { try await connection.setStorage(preferences["codexAuthStorage"].string.isEmpty ? "keyring" : preferences["codexAuthStorage"].string) }
+          _ = try await preparedConnection(provider)
           state = try await connection.refresh()
         } catch { state = await connection.status(); state["error"] = .string((error as? ServiceError)?.message ?? "Unable to read this connection.") }
       } else { state = await connection.status() }
@@ -178,7 +182,11 @@ public actor NativeAIService {
       conversations.removeValue(forKey: conversation); sourcesByConversation.removeValue(forKey: conversation)
       return publishReset(profileID: profile.id, conversation: conversation, cancelledRequestID: cancelled)
     case "ai:login":
-      guard request == nil, !configuring, let connection = connection(provider(profile.id)) else { throw ServiceError("INPUT", "Choose a subscription connection before signing in.") }
+      guard request == nil, !configuring, connection(provider(profile.id)) != nil else { throw ServiceError("INPUT", "Choose a subscription connection before signing in.") }
+      let selected = provider(profile.id)
+      guard let connection = try await preparedConnection(selected) else { throw ServiceError("INPUT", "Choose a subscription connection before signing in.") }
+      _ = try await scope(conversation)
+      guard !configuring, selected == provider(profile.id) else { throw ServiceError("CANCELLED", "The provider changed before sign-in started.") }
       let url = try await connection.login()
       do { _ = try await scope(conversation) }
       catch { try? await connection.cancelLogin(); throw error }
@@ -196,7 +204,7 @@ public actor NativeAIService {
       let affected = provider.isSubscription ? Set(knownProfiles.filter { self.provider($0) == provider }) : Set([profile.id])
       if let requestProfile, affected.contains(requestProfile) { request?.cancel() }
       configuring = true; defer { configuring = false }
-      if let connection = connection(provider) { try await connection.logout() }
+      if let connection = try await preparedConnection(provider) { try await connection.logout() }
       else { try await vault.remove(AICredentialVault.id(profile: profile.id, provider: provider, endpoint: config(profile.id, provider)["baseUrl"].string)) }
       for id in affected { resetProfileConversations(id) }
       _ = try await scope(conversation)
@@ -213,7 +221,8 @@ public actor NativeAIService {
     let task = Task { [self] in
       _ = try await scope(conversation)
       let provider = provider(profile.id)
-      if let connection = connection(provider) {
+      if let connection = try await preparedConnection(provider) {
+        _ = try await scope(conversation)
         let value = try await connection.refresh()
         _ = try await scope(conversation)
         return ServiceJSON.object(["ok":value["configured"],"models":value["models"],"message":value["configured"].bool ? "Subscription connected. No inference request was made." : "Sign in to connect this subscription."])
@@ -463,7 +472,8 @@ public actor NativeAIService {
   }
   private func requestProvider(provider: NativeAIProvider, config: ServiceJSON, messages: [ServiceJSON], research: Bool, instructions: String, profile: AIProfileScope, conversation: ConversationKey, requestID: String, revision: Int) async throws -> ServiceJSON {
     _ = try await scope(conversation)
-    if let connection = connection(provider) {
+    if let connection = try await preparedConnection(provider) {
+      _ = try await scope(conversation)
       return try await connection.run(model: config["model"].string, instructions: instructions, messages: messages, research: research) { [weak self] delta in
         await self?.publishDelta(delta, profile: profile.id, id: requestID, revision: revision)
       }
@@ -471,6 +481,23 @@ public actor NativeAIService {
     let key = try await vault.get(AICredentialVault.id(profile: profile.id, provider: provider, endpoint: config["baseUrl"].string))
     _ = try await scope(conversation)
     return try await api.run(provider: provider, baseURL: config["baseUrl"].string, model: config["model"].string, key: key, instructions: instructions, messages: messages, research: research)
+  }
+  /// Read-only status must not be required before an operation. A restored
+  /// session-only preference applies before any subscription authentication,
+  /// account refresh or inference can start its provider process.
+  private func preparedConnection(_ provider: NativeAIProvider) async throws -> (any AISubscriptionConnection)? {
+    guard let connection = connection(provider) else { return nil }
+    if let preferenceError { throw preferenceError }
+    if provider == .codex {
+      let storage = preferences["codexAuthStorage"].string.isEmpty ? "keyring" : preferences["codexAuthStorage"].string
+      guard ["keyring", "session"].contains(storage) else { throw ServiceError("STORAGE", "The saved subscription storage preference is invalid. Choose its storage again in Settings.") }
+      try await connection.setStorage(storage)
+      guard (preferences["codexAuthStorage"].string.isEmpty ? "keyring" : preferences["codexAuthStorage"].string) == storage else {
+        throw ServiceError("CANCELLED", "The subscription storage changed. Retry the operation.")
+      }
+    }
+    try Task.checkCancellation()
+    return connection
   }
   private func publishDelta(_ text: String, profile: String, id: String, revision: Int) async {
     guard self.revision == revision, requestID == id, request?.isCancelled == false,

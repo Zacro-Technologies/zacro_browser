@@ -36,14 +36,16 @@ actor FixtureSubscription: AISubscriptionConnection {
   var delay = Duration.zero
   var configured = true
   var loginPending = false, cancelLoginCount = 0
-  func status() -> ServiceJSON { ["available":true,"configured":.bool(configured),"loginPending":.bool(loginPending),"models":[["id":"model","isDefault":true]]] }
-  func refresh() -> ServiceJSON { status() }
-  func login() -> URL? { loginPending = true; return nil }
+  var storage = "keyring", storageOperations: [(operation: String, storage: String)] = []
+  func status() -> ServiceJSON { ["available":true,"configured":.bool(configured),"loginPending":.bool(loginPending),"credentialStorage":.string(storage),"models":[["id":"model","isDefault":true]]] }
+  func refresh() -> ServiceJSON { storageOperations.append(("refresh", storage)); return status() }
+  func login() -> URL? { storageOperations.append(("login", storage)); loginPending = true; return nil }
   func cancelLogin() { loginPending = false; cancelLoginCount += 1 }
-  func logout() { configured = false }
-  func setStorage(_ value: String) {}
+  func logout() { storageOperations.append(("logout", storage)); configured = false }
+  func setStorage(_ value: String) { storage = value }
   func setDelay(_ delay: Duration) { self.delay = delay }
   func run(model: String,instructions: String,messages: [ServiceJSON],research: Bool,onDelta: @escaping @Sendable (String) async -> Void) async throws -> ServiceJSON {
+    storageOperations.append(("run", storage))
     calls.append((messages,research)); await onDelta("Partial "); try await Task.sleep(for:delay)
     return ["answer":"Evidence [1:1]","sources":[],"citations":[],"historyContent":"Evidence [1:1]","usage":[:]]
   }

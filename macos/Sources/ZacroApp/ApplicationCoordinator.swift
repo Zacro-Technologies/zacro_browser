@@ -56,6 +56,8 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
   }
 
   var focusedCoordinator: BrowserWindowCoordinator? {
+    if let keyWindow = NSApp.keyWindow, let context = engine.extensionPopupOwner(keyWindow),
+      let owner = windows[context.id], owner.windowContext.isOpen { return owner }
     if let focused = repository.canonicalStore.state.focusedWindowID,
       let owner = windows[focused], owner.windowContext.isOpen { return owner }
     return windows.values.first { $0.windowContext.isOpen }
