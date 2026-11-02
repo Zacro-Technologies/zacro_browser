@@ -20,7 +20,9 @@ PATHS = ("extensions/browser/extension_function.h", "extensions/browser/extensio
          "extensions/browser/event_router.h", "extensions/browser/event_router.cc",
          "chrome/browser/extensions/extension_tab_util.h", "chrome/browser/extensions/extension_tab_util.cc",
          "chrome/browser/extensions/api/messaging/chrome_messaging_delegate.cc",
-         "chrome/browser/extensions/api/debugger/debugger_api.cc")
+         "chrome/browser/extensions/api/debugger/debugger_api.cc",
+         "components/download/internal/common/download_utils.cc",
+         "extensions/browser/api/runtime/runtime_api.h", "extensions/browser/api/runtime/runtime_api.cc")
 
 def replace(text, old, new):
     if text.count(old) != 1:
@@ -72,11 +74,15 @@ ExtensionFunction::ResponseAction ExtensionFunction::RunWithValidation() {""")
     eh = replace(eh, "  // Gets the EventRouter for `browser_context`.", """  // Browser-process topology ownership. Returning false suppresses physical
   // implementation-window events; native host events retain normal routing.
   using NativeEventFilter = base::RepeatingCallback<bool(
-      content::BrowserContext*, const Event&)>;
+      content::BrowserContext*, Event&, const std::string&)>;
   static void SetNativeEventFilter(NativeEventFilter filter);
 
   // Gets the EventRouter for `browser_context`.""")
     eh = replace(eh, "  // The event to dispatch.\n  const std::string event_name;", "  // The event to dispatch.\n  const std::string event_name;\n\n  bool native_host_topology = false;")
+    eh = replace(eh, "  const base::ListValue& args() const { return event_args_->data; }", """  const base::ListValue& args() const { return event_args_->data; }
+  void ReplaceNativeArguments(base::ListValue args) {
+    event_args_ = base::MakeRefCounted<EventArgs>(std::move(args));
+  }""")
     ec = replace(ec, '#include "base/notreached.h"', '#include "base/notreached.h"\n#include "base/no_destructor.h"')
     ec = replace(ec, "void EventRouter::DispatchEventImpl(const std::string& restrict_to_extension_id,", """namespace {
 EventRouter::NativeEventFilter& NativeTopologyEventFilter() {
@@ -93,7 +99,7 @@ void EventRouter::SetNativeEventFilter(NativeEventFilter filter) {
 void EventRouter::DispatchEventImpl(const std::string& restrict_to_extension_id,""")
     ec = replace(ec, "  event->dispatch_start_time = base::TimeTicks::Now();\n  DCHECK(event);", """  DCHECK(event);
   auto& native = NativeTopologyEventFilter();
-  if (native && !native.Run(browser_context_, *event)) return;
+  if (native && !native.Run(browser_context_, *event, restrict_to_extension_id)) return;
   event->dispatch_start_time = base::TimeTicks::Now();""")
     ec = replace(ec, "  copy->exclude_process_id = exclude_process_id;", "  copy->native_host_topology = native_host_topology;\n  copy->exclude_process_id = exclude_process_id;")
     th, tc, messaging = (originals[p] for p in PATHS[4:7])
@@ -157,7 +163,46 @@ int ExtensionTabUtil::GetWindowId(BrowserWindowInterface* browser) {''')
       continue;
     }
     result.Append(SerializeTarget(host));""")
-    return dict(zip(PATHS, (h, c, eh, ec, th, tc, messaging, debugger)))
+    downloads = originals[PATHS[8]]
+    downloads = replace(downloads, '#include "build/build_config.h"', '#include "build/build_config.h"\n#if BUILDFLAG(IS_MAC)\n#include <errno.h>\n#include <stdio.h>\n#endif')
+    downloads = replace(downloads, "static_cast<int>(to_path.value().length()) >=", "static_cast<int>(display_name.value().length()) >")
+    downloads = replace(downloads, """  return base::Move(from_path, to_path)
+             ? DownloadItem::DownloadRenameResult::SUCCESS
+             : DownloadItem::DownloadRenameResult::FAILURE_NAME_INVALID;""", """#if BUILDFLAG(IS_MAC)
+  // PathExists is advisory. A different process can create the destination
+  // between that check and rename; never overwrite it during native rename.
+  if (renamex_np(from_path.value().c_str(), to_path.value().c_str(), RENAME_EXCL) == 0)
+    return DownloadItem::DownloadRenameResult::SUCCESS;
+  return errno == EEXIST ? DownloadItem::DownloadRenameResult::FAILURE_NAME_CONFLICT
+                        : DownloadItem::DownloadRenameResult::FAILURE_NAME_INVALID;
+#else
+  return base::Move(from_path, to_path)
+             ? DownloadItem::DownloadRenameResult::SUCCESS
+             : DownloadItem::DownloadRenameResult::FAILURE_NAME_INVALID;
+#endif""")
+    runtime_h, runtime_c = (originals[p] for p in PATHS[9:11])
+    runtime_h = replace(runtime_h, "  RuntimeGetContextsFunction();", """  using NativeContextDecorator = base::RepeatingCallback<bool(
+      content::WebContents*, api::runtime::ExtensionContext*)>;
+  static void SetNativeContextDecorator(NativeContextDecorator decorator);
+  RuntimeGetContextsFunction();""")
+    runtime_c = replace(runtime_c, '#include "base/notreached.h"', '#include "base/notreached.h"\n#include "base/no_destructor.h"')
+    runtime_c = replace(runtime_c, "RuntimeGetContextsFunction::RuntimeGetContextsFunction() = default;", """namespace {
+RuntimeGetContextsFunction::NativeContextDecorator& NativeRuntimeContextDecorator() {
+  static base::NoDestructor<RuntimeGetContextsFunction::NativeContextDecorator> callback;
+  return *callback;
+}
+}  // namespace
+
+void RuntimeGetContextsFunction::SetNativeContextDecorator(NativeContextDecorator decorator) {
+  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
+  NativeRuntimeContextDecorator() = std::move(decorator);
+}
+
+RuntimeGetContextsFunction::RuntimeGetContextsFunction() = default;""")
+    runtime_c = replace(runtime_c, "    results.push_back(std::move(context));", """    auto& native = NativeRuntimeContextDecorator();
+    if (native && !native.Run(web_contents, &context)) continue;
+    results.push_back(std::move(context));""")
+    return dict(zip(PATHS, (h, c, eh, ec, th, tc, messaging, debugger, downloads, runtime_h, runtime_c)))
 
 def digest(s):
     return hashlib.sha256(s.encode()).hexdigest()

@@ -12,6 +12,8 @@ final class AIServiceTests: XCTestCase {
     expectEqual(await ai.status(for: AIProfileScope(id: "personal"))["provider"], "openai")
     expectEqual(await ai.status()["provider"], "anthropic")
     expectEqual(try await ai.handle("ai:status", expectedProfileID: "other")["provider"], "anthropic")
+    do { _ = try await ai.verifiedSources(expectedProfileID: "personal"); XCTFail("Stale source controls must not read another profile") }
+    catch { expectEqual((error as? ServiceError)?.code, "PROFILE_CHANGED") }
     do {
       _ = try await ai.handle("ai:configure", payload: ["provider":"compatible"], expectedProfileID: "personal")
       XCTFail("A stale window must not configure another profile")

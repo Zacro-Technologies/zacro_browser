@@ -53,6 +53,7 @@ final class BrowserActions: ObservableObject {
   @Published var paletteRequest: NativePaletteRequest?
   @Published var runtimeCommands: [BrowserRuntimeCommand] = []
   @Published var libraryCapabilities: Set<String> = []
+  @Published var libraryMessages: [String: String] = [:]
   @Published var defaultBrowser: Bool?
   var performInterfaceCommand: (String) -> Bool = { _ in false }
   var handlePaletteEscape: () -> Bool = { false }
@@ -158,7 +159,10 @@ struct BrowserShell<Content: View>: View {
   private var hasPage: Bool {
     store.state.activeTab.map { !$0.isClosed && currentAddress != "about:blank" } ?? false
   }
-  private var currentAddress: String { store.state.activeTab?.peek?.url ?? store.state.activeTab?.url ?? "" }
+  private var currentAddress: String {
+    if let peek = store.state.activeTab?.peek, peek.isPresented != false { return peek.url }
+    return store.state.activeTab?.url ?? ""
+  }
   private var sidebarWidth: Double {
     let expanded = min(max(200, min(380, sidebarWidthDraft ?? store.state.settings.sidebarWidth)), max(0, availableWindowWidth - 240 - store.state.settings.pageGutter * 2))
     let fits = actions.library == nil || availableWindowWidth >= expanded + 260 + 240 + store.state.settings.pageGutter * 2
@@ -601,7 +605,7 @@ struct BrowserShell<Content: View>: View {
         HStack(spacing: 7) {
           NativeGlyph(hasPage ? (currentAddress.hasPrefix("https://") ? "lock" : "globe") : "magnifyingglass")
             .font(.system(size: 12)).foregroundStyle(accent)
-          Text(hasPage ? (URL(string: currentAddress)?.host ?? currentAddress) : "Search or enter URL")
+          Text(hasPage ? NativePageIdentity.label(currentAddress) : "Search or enter URL")
             .lineLimit(1).font(.system(size: 13, weight: .medium))
         }.frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 8)
           .frame(height: 32).contentShape(Rectangle())
@@ -871,7 +875,10 @@ struct BrowserShell<Content: View>: View {
           }.frame(width: 12, height: 12).padding(2)
             .background(colors.card.opacity(0.95), in: RoundedRectangle(cornerRadius: 4))
             .shadow(color: .black.opacity(0.15), radius: 1, y: 1).offset(x: 6, y: -6)
-            .accessibilityLabel("Preview: \(peek.title.isEmpty ? (URL(string: peek.url)?.host ?? peek.url) : peek.title)")
+            .opacity(peek.isPresented == false ? 0.7 : 1)
+            .contentShape(Rectangle()).onTapGesture { actions.activate(tab.id) }
+            .accessibilityLabel("Show preview: \(peek.title.isEmpty ? NativePageIdentity.label(peek.url) : peek.title)")
+            .accessibilityAddTraits(.isButton).accessibilityAction { actions.activate(tab.id) }
         }
       }
   }
@@ -961,7 +968,10 @@ struct BrowserShell<Content: View>: View {
     }
     items.append(.init(id: "move", title: "Move to Space or folder", glyph: "folder") { showPalette(.move(tabID: tab.id, pin: false)) })
     items.append(.init(id: "rename", title: "Rename tab…", glyph: "edit") { beginRename(.tab(tab.id), name: tab.displayTitle) })
-    items.append(.init(id: "bookmark", title: isBookmarked(tab.url) ? "Remove bookmark" : "Bookmark tab", glyph: "bookmark") { store.toggleBookmark(url: tab.url, title: tab.displayTitle) })
+    if BrowserAddress.webURL(tab.url) != nil {
+      items.append(.init(id: "bookmark", title: isBookmarked(tab.url) ? "Remove bookmark" : "Bookmark tab", glyph: "bookmark",
+        enabled: actions.libraryCapabilities.contains("bookmark:toggle")) { performTabAction("bookmark:toggle", tab: tab) })
+    }
     if tab.isPinned && tab.id != store.state.activeTabID && actions.loadedTabIDs.contains(tab.id) {
       items.append(.init(id: "sleep", title: "Put to sleep", glyph: "moon") { performTabAction("tab:sleep", tab: tab) })
     }
@@ -971,7 +981,7 @@ struct BrowserShell<Content: View>: View {
   private var spaceFooter: some View {
     HStack {
       Menu {
-        ForEach(["Bookmarks", "History", "Downloads", "Archive", "Settings", "Extensions", "AI"], id: \.self) {
+        ForEach(["Bookmarks", "History", "Downloads", "Archive", "Windows", "Settings", "Extensions", "AI"], id: \.self) {
           section in Button(section) { actions.library = section }
         }
         Divider()
@@ -1651,6 +1661,7 @@ private struct NativePalettePresenter: NSViewRepresentable {
       let panel = PalettePanel(
         contentRect: contentRect(parent), styleMask: [.borderless, .nonactivatingPanel],
         backing: .buffered, defer: false)
+      panel.identifier = NSUserInterfaceItemIdentifier("ZacroBrowserControls")
       panel.isOpaque = false
       panel.backgroundColor = .clear
       panel.hasShadow = false

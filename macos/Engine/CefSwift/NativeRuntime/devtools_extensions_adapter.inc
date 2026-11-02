@@ -9,6 +9,8 @@
 #include "extensions/browser/install_prefs_helper.h"
 #include "extensions/common/permissions/permissions_data.h"
 
+void ZacroObserveProfileDownloads(content::BrowserContext* context);
+
 void ZacroSetTopologyObserved(content::BrowserContext* context, bool observed);
 
 class ZacroExtensionContext : public base::SupportsUserData::Data,
@@ -60,6 +62,7 @@ class ZacroExtensionContext : public base::SupportsUserData::Data,
     return extension.id() + ":" + base::NumberToString(first.ToDeltaSinceWindowsEpoch().InMicroseconds());
   }
   base::CallbackListSubscription Observe(Events::CallbackType callback) { return events_.Add(std::move(callback)); }
+  void NotifyNative(const std::string& method, const base::DictValue& params) { events_.Notify(method, params); }
   void NotifyHost(const base::DictValue& request) { events_.Notify("Zacro.extensionHostRequest", request); }
   void OnExtensionLoaded(content::BrowserContext*, const extensions::Extension* extension) override {
     InstallationID(*extension); RegistryChanged();
@@ -129,6 +132,7 @@ bool CefDevToolsController::DispatchZacroExtensions(int id, const std::string& m
       zacro_extension_subscription_ = state->Observe(base::BindRepeating(
           &CefDevToolsController::EmitZacro, weak_ptr_factory_.GetWeakPtr()));
     }
+    if (enabled) ZacroObserveProfileDownloads(context);
     ZacroSetTopologyObserved(context, enabled);
     ReplyZacro(id, {}); return true;
   }

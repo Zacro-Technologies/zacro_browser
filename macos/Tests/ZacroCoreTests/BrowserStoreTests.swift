@@ -34,7 +34,16 @@ final class BrowserStoreTests: XCTestCase {
     for status in ["complete", "completed", "cancelled", "interrupted", "downloading", "paused"] {
       store.recordDownload(DownloadRecord(profileID: "default", url: "https://example.com/file", filename: status, status: status))
     }
+    let guid = UUID().uuidString
+    var native = DownloadRecord(profileID: "default", url: "https://example.com/native", filename: "native", status: "complete")
+    native.nativeGUID = guid; native.canResume = true; native.isDangerous = true; store.recordDownload(native)
     let reopened = BrowserStore(directory: dir)
+    XCTAssertEqual(reopened.state.downloads.first { $0.id == native.id }?.nativeGUID, guid)
+    XCTAssertNil(reopened.state.downloads.first { $0.id == native.id }?.canResume)
+    XCTAssertEqual(reopened.state.downloads.first { $0.id == native.id }?.isDangerous, true)
+    var invalid = native; invalid.nativeGUID = "invalid\nGUID"
+    reopened.recordDownload(invalid); reopened.repair()
+    XCTAssertNil(reopened.state.downloads.first { $0.id == native.id }?.nativeGUID)
     let statuses = Dictionary(uniqueKeysWithValues: reopened.state.downloads.map { ($0.filename, $0.status) })
     XCTAssertEqual(statuses["complete"], "complete")
     XCTAssertEqual(statuses["completed"], "complete")

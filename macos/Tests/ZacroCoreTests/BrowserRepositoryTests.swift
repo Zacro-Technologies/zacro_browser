@@ -173,4 +173,41 @@ import XCTest
     XCTAssertNotEqual(repository.canonicalStore.state.profiles[0].name, "Stale")
     XCTAssertNotNil(first.lastError)
   }
+  func testRecentlyClosedWindowsReopenWithoutReplacingSplitHighlightsOrCreatingBlankTabs() throws {
+    let repo = BrowserRepository(directory: try directory()), first = repo.focusedStore
+    let a = try XCTUnwrap(first.createTab(address: "https://a.example")), b = try XCTUnwrap(first.createTab(address: "https://b.example"))
+    first.setSplit(left: a.id, right: b.id)
+    try first.selectTabs([a.id, b.id], activeID: a.id)
+    let splitID = first.state.splits[0].id, firstID = first.owningWindowID!
+    let second = try repo.makeWindow(addresses: ["https://second.example"]), secondID = second.owningWindowID!
+    _ = repo.closeWindow(firstID); _ = repo.closeWindow(secondID)
+    try repo.updateWindow(firstID) { $0.closedAt = Date(timeIntervalSince1970: 10) }
+    try repo.updateWindow(secondID) { $0.closedAt = Date(timeIntervalSince1970: 20) }
+    XCTAssertEqual(first.savedWindows.map(\.id), [secondID, firstID])
+    XCTAssertEqual(first.savedWindows.first { $0.id == firstID }?.tabCount, 2)
+    let reopened = try repo.reopenWindow(id: firstID)
+    XCTAssertEqual(reopened.state.tabs.map(\.id), [a.id, b.id])
+    XCTAssertEqual(reopened.state.splits.first?.id, splitID)
+    let window = try XCTUnwrap(repo.windows.first { $0.id == firstID })
+    XCTAssertEqual(window.highlightedTabIDs, [a.id, b.id]); XCTAssertEqual(window.activeTabID, a.id)
+    XCTAssertNil(window.closedAt); XCTAssertEqual(repo.focusedWindowID, firstID)
+    let restored = BrowserRepository(directory: repo.directory)
+    XCTAssertEqual(restored.savedWindows.map(\.id), [secondID])
+    XCTAssertEqual(restored.windows.first { $0.id == firstID }?.isOpen, true)
+  }
+  func testReopeningSavedWindowIsDurableAndPrivateWindowsAreNeverListed() throws {
+    let repo = BrowserRepository(directory: try directory()), first = repo.focusedStore
+    _ = first.createTab(address: "https://public.example")
+    let id = first.owningWindowID!
+    _ = repo.closeWindow(id)
+    let secret = repo.canonicalStore.createProfile(name: "Secret", isPrivate: true)
+    let privateWindow = try repo.makeWindow(profileID: secret.id)
+    _ = repo.closeWindow(privateWindow.owningWindowID!)
+    XCTAssertTrue(repo.savedWindows.allSatisfy { $0.profileID != secret.id })
+    let before = repo.canonicalStore.state
+    try blockWrites(repo.directory)
+    XCTAssertThrowsError(try repo.reopenWindow(id: id))
+    XCTAssertEqual(repo.canonicalStore.state, before)
+  }
+
 }

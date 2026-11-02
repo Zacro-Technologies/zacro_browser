@@ -10,10 +10,16 @@ import signal
 import subprocess
 import tempfile
 import threading
+import time
+import re
+from urllib.parse import urlsplit
 
 
 class Fixture(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
+        if urlsplit(self.path).path == "/download":
+            self.stream_download()
+            return
         body = b"<!doctype html><title>Zacro Native acceptance</title><p>Local engine check</p>"
         mime = "text/html; charset=utf-8"
         if self.path == "/favicon.svg":
@@ -24,6 +30,40 @@ class Fixture(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def stream_download(self):
+        total = 16 * 1024 * 1024
+        start, end = 0, total - 1
+        requested = self.headers.get("Range")
+        if requested:
+            match = re.fullmatch(r"bytes=(\d+)-(\d*)", requested)
+            if not match:
+                self.send_error(416)
+                return
+            start = int(match[1])
+            end = min(end, int(match[2])) if match[2] else end
+            if start > end:
+                self.send_error(416)
+                return
+        self.send_response(206 if requested else 200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Disposition", 'attachment; filename="zacro-native-acceptance.bin"')
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("ETag", '"zacro-native-download-v1"')
+        self.send_header("Content-Length", str(end - start + 1))
+        if requested:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{total}")
+        self.end_headers()
+        remaining = end - start + 1
+        try:
+            while remaining:
+                chunk = min(64 * 1024, remaining)
+                self.wfile.write(b"Z" * chunk)
+                self.wfile.flush()
+                remaining -= chunk
+                time.sleep(0.05)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # Pausing/cancelling a real download closes its HTTP stream.
 
     def log_message(self, format, *args):
         pass

@@ -28,7 +28,8 @@ def main():
     paths = ["libcef/browser/devtools/devtools_controller.h", "libcef/browser/devtools/devtools_controller.cc", "BUILD.gn",
              "libcef/browser/browser_platform_delegate.h", "libcef/browser/browser_platform_delegate.cc",
              "libcef/browser/chrome/chrome_browser_main_extra_parts_cef.h",
-             "libcef/browser/chrome/chrome_browser_main_extra_parts_cef.cc"]
+             "libcef/browser/chrome/chrome_browser_main_extra_parts_cef.cc",
+             "libcef/browser/net/throttle_handler.cc"]
     originals = {path: subprocess.check_output(["git", "show", f"HEAD:{path}"], cwd=cef, text=True) for path in paths}
     output = dict(originals)
     header = output[paths[0]]
@@ -41,6 +42,8 @@ def main():
   void EmitZacro(const std::string& method, const base::DictValue& params);
   bool DispatchZacroExtensions(int id, const std::string& method, const base::DictValue* params);
   bool DispatchZacroTopology(int id, const std::string& method, const base::DictValue* params);
+  bool DispatchZacroBookmarks(int id, const std::string& method, const base::DictValue* params);
+  bool DispatchZacroDownloads(int id, const std::string& method, const base::DictValue* params);
   base::CallbackListSubscription zacro_extension_subscription_;
   void FinishZacroDataRemoval(int id, uint64_t failed_types);
   void FinishZacroDiscard(int id, int entry_id, const std::string& error);
@@ -93,7 +96,7 @@ def main():
 
   devtools_util::ProtocolParser parser;""")
     output[paths[1]] = code
-    output[paths[2]] = replace_once(output[paths[2]], '    "//components/services/print_compositor/public/mojom",', '    "//components/services/print_compositor/public/mojom",\n    "//components/sessions",\n    "//components/os_crypt/async/browser",\n    "//components/os_crypt/async/common",')
+    output[paths[2]] = replace_once(output[paths[2]], '    "//components/services/print_compositor/public/mojom",', '    "//components/services/print_compositor/public/mojom",\n    "//components/sessions",\n    "//components/os_crypt/async/browser",\n    "//components/os_crypt/async/common",\n    "//chrome/browser/ui/views/extensions:extension_popup",\n    "//extensions/browser/api/runtime",')
     platform_header = replace_once(output[paths[3]], "class WebContents;", "class WebContents;\nclass ScopedAccessibilityMode;")
     output[paths[3]] = replace_once(platform_header,
         "  raw_ptr<content::WebContents> web_contents_ = nullptr;",
@@ -127,6 +130,18 @@ void ChromeBrowserMainExtraPartsCef::PreProfileInit() {
 }
 
 void ChromeBrowserMainExtraPartsCef::PostProfileInit(Profile* profile,""")
+    throttle = output[paths[7]]
+    throttle = replace_once(throttle, "namespace throttle {", """// Native-only approved extension destinations must be revalidated on reload,
+// history traversal and subsequent navigation, not only when first opened.
+bool ZacroAllowApprovedNavigation(content::WebContents* contents, const GURL& url);
+
+namespace throttle {""")
+    throttle = replace_once(throttle, "  const bool is_main_frame = navigation_handle->IsInMainFrame();", """  const bool is_main_frame = navigation_handle->IsInMainFrame();
+  if (is_main_frame && !ZacroAllowApprovedNavigation(navigation_handle->GetWebContents(), navigation_handle->GetURL())) {
+    std::move(result_callback).Run(true);
+    return;
+  }""")
+    output[paths[7]] = throttle
     adapter_path = "libcef/browser/devtools/zacro_native_adapter.inc"
     originals[adapter_path] = ""
     output[adapter_path] = (ROOT / "devtools_native_adapter.inc").read_text()
@@ -136,6 +151,12 @@ void ChromeBrowserMainExtraPartsCef::PostProfileInit(Profile* profile,""")
     topology_path = "libcef/browser/devtools/zacro_topology_adapter.inc"
     originals[topology_path] = ""
     output[topology_path] = (ROOT / "devtools_topology_adapter.inc").read_text()
+    bookmarks_path = "libcef/browser/devtools/zacro_bookmarks_adapter.inc"
+    originals[bookmarks_path] = ""
+    output[bookmarks_path] = (ROOT / "devtools_bookmarks_adapter.inc").read_text()
+    downloads_path = "libcef/browser/devtools/zacro_downloads_adapter.inc"
+    originals[downloads_path] = ""
+    output[downloads_path] = (ROOT / "devtools_downloads_adapter.inc").read_text()
     diff = "".join("".join(difflib.unified_diff(originals[path].splitlines(True), contents.splitlines(True),
         fromfile="a/" + path if originals[path] else "/dev/null", tofile="b/" + path)) for path, contents in output.items())
     previous = {}

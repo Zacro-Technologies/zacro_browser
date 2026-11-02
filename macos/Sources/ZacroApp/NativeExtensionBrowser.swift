@@ -11,6 +11,7 @@ struct NativeExtensionWindowRequest {
   let profileID: String
   let kind: Kind
   let urls: [String]
+  let nativeAuthorizations: [String: NativeNavigationProvenance]
   let movingTabID: String?
   let focused: Bool
   let state: String?
@@ -30,10 +31,12 @@ final class NativeExtensionBrowser {
   var enabled = false
   var materializePage: ((BrowserTab) async throws -> ChromiumPage)?
   var closeTab: (String) async -> Bool = { _ in false }
+  var promotePeek: ((String, Bool, @MainActor () async throws -> Void) async throws -> BrowserTab)?
   var navigateTab: (BrowserTab, String) -> Void = { _, _ in }
-  var activateTab: (String) -> Void = { _ in }
+  var activateTab: (String) throws -> Void = { _ in }
   var discardTab: ((String) async throws -> Bool)?
   var closeWindow: ((String) async -> Bool)?
+  var restoreWindow: ((String, @MainActor () async throws -> Void) async throws -> String)?
   var createWindow: ((NativeExtensionWindowRequest) async throws -> String)?
   var moveTabs: (([String], String, Int, @MainActor () async throws -> Void) async throws -> Void)?
   var isDiscarded: (String) -> Bool = { _ in false }
@@ -61,6 +64,7 @@ final class NativeExtensionBrowser {
   private var splitIdentities: [String: Int] = [:]
   private var nextSplitIdentity = 1
   private var snapshots: [String: Snapshot] = [:]
+  private var sessionSnapshots: [String: [String]] = [:]
   private var focusSnapshots: [String: Int] = [:]
   private var lastFocusSnapshots: [String: Int] = [:]
   private var highlightSnapshots: [String: [Int]] = [:]
@@ -94,6 +98,71 @@ final class NativeExtensionBrowser {
     self.repository = repository; self.engine = engine
   }
 
+  /// Peek has its own real WebContents identity, projected from the source's
+  /// saved preview rather than duplicated in the persistent tab collection.
+  func documentTab(_ logicalID: String) -> BrowserTab? { store.document(id: logicalID) }
+  func peekSourceID(_ logicalID: String) -> String? {
+    guard logicalID.hasPrefix("peek:") else { return nil }
+    let source = String(logicalID.dropFirst(5))
+    return store.tab(source)?.peek != nil ? source : nil
+  }
+  func didPromotePeek(sourceID: String, targetID: String) {
+    let previous = "peek:" + sourceID
+    if let identity = identities.removeValue(forKey: previous) {
+      identity.signature = ""; identities[targetID] = identity
+    }
+    if let snapshot = snapshots.removeValue(forKey: previous) { snapshots[targetID] = snapshot }
+    if let profile = store.tab(targetID).flatMap({ store.profileID(for: $0) }) {
+      catalogKeys.removeValue(forKey: profile)
+      if catalogMembers[profile]?.remove(previous) != nil { catalogMembers[profile]?.insert(targetID) }
+    }
+    creationOpeners.removeValue(forKey: previous)
+  }
+  private func activeDocumentID(_ window: BrowserWindowSession) -> String? {
+    guard let id = window.activeTabID else { return nil }
+    if let peek = store.tab(id)?.peek, peek.isPresented != false { return "peek:" + id }
+    return id
+  }
+  private func highlightedDocuments(_ window: BrowserWindowSession) -> Set<String> {
+    var result = window.highlightedTabIDs
+    if let source = window.activeTabID, let active = activeDocumentID(window), active != source {
+      result.remove(source); result.insert(active)
+    }
+    return result
+  }
+  private func documentIsDiscarded(_ id: String) -> Bool {
+    peekSourceID(id) == nil ? isDiscarded(id) : engine.pages[id] == nil
+  }
+  private func persistentTab(_ tab: BrowserTab, request: ChromeExtensionHostRequest, profile: String,
+                             manager: ChromeExtensionManager) async throws -> BrowserTab {
+    guard let source = peekSourceID(tab.id) else { return tab }
+    guard let promotePeek else { throw Failure("Peek promotion is unavailable.") }
+    let wasActive = repository.windows.first(where: { $0.id == tab.windowID }).map { activeDocumentID($0) == tab.id } ?? false
+    guard let previousID = identities[tab.id]?.id else { throw Failure("The preview has no registered native identity.") }
+    let result = try await promotePeek(source, wasActive, { [weak self] in
+      guard let self else { throw CancellationError() }
+      try await self.authorize(request, profile: profile, manager: manager)
+      guard let current = self.documentTab(tab.id), current.windowID == tab.windowID,
+        self.store.profileID(for: current) == profile, self.identities[tab.id]?.id == previousID else {
+        throw Failure("The preview changed before it could be promoted.")
+      }
+    })
+    try await authorize(request, profile: profile, manager: manager)
+    guard let current = documentTab(result.id), !current.isClosed, store.profileID(for: current) == profile,
+      identities[result.id]?.id == previousID else { throw Failure("The preview identity changed during promotion.") }
+    return current
+  }
+
+  private func persistentTabs(_ values: [BrowserTab], request: ChromeExtensionHostRequest, profile: String,
+                              manager: ChromeExtensionManager) async throws -> [BrowserTab] {
+    var result: [BrowserTab] = []
+    for value in values {
+      guard let current = documentTab(value.id), !current.isClosed else { throw Failure("A tab closed before the operation completed.") }
+      result.append(try await persistentTab(current, request: request, profile: profile, manager: manager))
+    }
+    return result
+  }
+
   /// Registered synchronously before a new window can schedule its first page.
   /// The opaque native request remains authoritative for the real opener frame.
   func setCreationOpener(tabIDs: [String], requestID: String) {
@@ -103,13 +172,13 @@ final class NativeExtensionBrowser {
   /// Reserves an immutable native identity without creating a document/view.
   /// The caller must pass the returned token to the CEF factory, not a page.
   func preparePageCreation(tabID: String) async throws -> ChromeTabMaterialization? {
-    guard enabled, let tab = store.tab(tabID), !tab.isClosed,
+    guard enabled, let tab = documentTab(tabID), !tab.isClosed,
       let profile = store.profileID(for: tab),
       store.state.profiles.contains(where: { $0.id == profile && !$0.isPrivate }) else { return nil }
     try await synchronizeCatalog(profile)
     let ticket = try await ChromeExtensionManager(engine: engine, profileID: profile).prepareTabMaterialization(tabID, openerRequestID: creationOpeners[tabID])
     try checkProfile(profile)
-    guard store.tab(tabID)?.isClosed == false, identities[tabID]?.id == ticket.nativeID,
+    guard documentTab(tabID)?.isClosed == false, identities[tabID]?.id == ticket.nativeID,
       ticket.logicalID == tabID, ticket.profileID == profile else { throw Failure("The tab changed before its document could load.") }
     creationOpeners.removeValue(forKey: tabID)
     return ticket
@@ -118,7 +187,7 @@ final class NativeExtensionBrowser {
   /// Adopts an existing real popup/startup page, or verifies that a newly
   /// materialized page received its reserved ID before any document script runs.
   func prepareInitialNavigation(_ page: ChromiumPage) async throws {
-    guard enabled, !page.isPrivate, let tab = store.tab(page.id), !tab.isClosed,
+    guard enabled, !page.isPrivate, let tab = documentTab(page.id), !tab.isClosed,
       store.profileID(for: tab) == page.profileID else { return }
     try await registerMaterialized(page, profile: page.profileID)
     catalogKeys.removeValue(forKey: page.profileID)
@@ -167,6 +236,14 @@ final class NativeExtensionBrowser {
         self.reconcileAgain = false
         await self.publishChanges()
       }
+    }
+  }
+
+  func waitForTopologyPublication() async {
+    reconcile()
+    while let task = reconciliation {
+      await task.value
+      if Task.isCancelled || stopped { return }
     }
   }
 
@@ -226,12 +303,13 @@ final class NativeExtensionBrowser {
 
   private func tabs(_ profile: String, in window: String? = nil) -> [BrowserTab] {
     let open = Set(windows(profile).map(\.id))
-    return store.state.tabs.filter { !$0.isClosed && store.profileID(for: $0) == profile
+    let persistent = store.state.tabs.filter { !$0.isClosed && store.profileID(for: $0) == profile
       && $0.windowID.map(open.contains) == true && (window == nil || $0.windowID == window) }
+    return persistent + persistent.compactMap(\.peekDocument)
   }
 
   private func owner(_ tab: BrowserTab) throws -> BrowserStore {
-    guard let id = store.tab(tab.id)?.windowID, engine.context(id: id)?.isOpen == true,
+    guard let id = documentTab(tab.id)?.windowID, engine.context(id: id)?.isOpen == true,
       engine.context(id: id)?.isClosing == false, let scope = repository.store(for: id) else {
       throw Failure("The tab's window is closed.")
     }
@@ -260,7 +338,7 @@ final class NativeExtensionBrowser {
   private func defaultRecord(_ profile: String, id: Any?, request: ChromeExtensionHostRequest? = nil) throws -> BrowserTab {
     if let id, !(id is NSNull) { return try record(profile, nativeID: integer(id)) }
     let window = try currentWindow(profile, request: request)
-    guard let tab = tabs(profile, in: window.id).first(where: { $0.id == window.activeTabID }) else {
+    guard let tab = tabs(profile, in: window.id).first(where: { $0.id == activeDocumentID(window) }) else {
       throw Failure("This profile has no active tab in that window.")
     }
     return tab
@@ -277,10 +355,10 @@ final class NativeExtensionBrowser {
       let index = indices[id, default: 0]; indices[id] = index + 1
       let opener = tab.openerTabID ?? engine.pages[tab.id]?.openerID
       return ChromeLogicalTabRegistration(logicalID: tab.id, windowID: context.nativeID, index: index,
-        active: window.activeTabID == tab.id, pinned: tab.isPinned, discarded: isDiscarded(tab.id),
+        active: activeDocumentID(window) == tab.id, pinned: tab.isPinned, discarded: documentIsDiscarded(tab.id),
         autoDiscardable: tab.autoDiscardable != false, splitViewID: try splitIdentity(tab.id, profile: profile),
         openerLogicalID: opener.flatMap { $0 != tab.id && valid.contains($0) ? $0 : nil },
-        highlighted: window.highlightedTabIDs.contains(tab.id), groupID: nativeGroupID(tab))
+        highlighted: highlightedDocuments(window).contains(tab.id), groupID: nativeGroupID(tab))
     }
   }
   private func catalogKey(_ entries: [ChromeLogicalTabRegistration]) throws -> Data {
@@ -323,6 +401,10 @@ final class NativeExtensionBrowser {
           .synchronizeTabs(entries, revision: revision)
         try self.checkProfile(profile)
         guard generation == self.epoch else { throw CancellationError() }
+        // A native response may arrive after a Peek was promoted or tabs were
+        // transferred. Never apply the stale membership over the synchronous
+        // identity handoff; the next loop adopts the current live documents.
+        guard try self.catalogKey(self.registrations(profile)) == key else { return }
         let expected = Set(entries.map(\.logicalID))
         guard values.count == expected.count, Set(values.map(\.logicalID)) == expected,
           Set(values.map(\.nativeID)).count == values.count, values.allSatisfy({ $0.nativeID > 0 }) else {
@@ -345,23 +427,30 @@ final class NativeExtensionBrowser {
 
   private func registerMaterialized(_ page: ChromiumPage, profile: String) async throws {
     try checkProfile(profile)
-    guard page.profileID == profile, !page.isPrivate, engine.pages[page.id] === page,
-      let entry = try registrations(profile).first(where: { $0.logicalID == page.id }) else {
+    let logicalID = page.id
+    guard page.profileID == profile, !page.isPrivate, engine.pages[logicalID] === page else {
+      throw Failure("The tab closed before its document could load.")
+    }
+    let browser = try await page.ready()
+    try checkProfile(profile)
+    // Promotion keeps this page and its immutable native ID, but renames the
+    // logical record. Its new registration belongs to the next catalog pass.
+    guard page.id == logicalID else { return }
+    guard engine.pages[logicalID] === page, documentTab(logicalID)?.isClosed == false,
+      let entry = try registrations(profile).first(where: { $0.logicalID == logicalID }) else {
       throw Failure("The tab closed before its document could load.")
     }
     let opener = entry.openerLogicalID.flatMap { identities[$0]?.id }
     let signature = "\(entry.windowID):\(entry.index):\(entry.active):\(entry.highlighted):\(entry.pinned):\(entry.discarded):\(entry.autoDiscardable):\(entry.splitViewID):\(entry.groupID):\(opener ?? -1)"
-    if let existing = identities[page.id], existing.page === page, existing.signature == signature { return }
-    let browser = try await page.ready()
-    try checkProfile(profile)
-    guard engine.pages[page.id] === page, store.tab(page.id)?.isClosed == false else { throw Failure("Unknown profile tab.") }
-    let nativeID = try await browser.registerExtensionTab(logicalID: page.id, windowID: entry.windowID,
+    if let existing = identities[logicalID], existing.page === page, existing.signature == signature { return }
+    let nativeID = try await browser.registerExtensionTab(logicalID: logicalID, windowID: entry.windowID,
       index: entry.index, active: entry.active, pinned: entry.pinned, discarded: entry.discarded,
       autoDiscardable: entry.autoDiscardable, splitViewID: entry.splitViewID, openerTabID: opener, highlighted: entry.highlighted, groupID: entry.groupID)
     try checkProfile(profile)
-    guard engine.pages[page.id] === page, store.tab(page.id)?.isClosed == false,
+    guard page.id == logicalID else { return }
+    guard engine.pages[logicalID] === page, documentTab(logicalID)?.isClosed == false,
       page.reservedNativeTabID.map({ $0 == nativeID }) ?? true else { throw Failure("The native tab identity changed.") }
-    identities[page.id] = Identity(page, id: nativeID, signature: signature)
+    identities[logicalID] = Identity(page, id: nativeID, signature: signature)
   }
 
   private func tabData(_ logicalID: String, profile: String, synchronize: Bool = true) async throws -> [String: Any] {
@@ -377,8 +466,8 @@ final class NativeExtensionBrowser {
     guard let identity = identities[tab.id] else { throw Failure("Unknown profile tab.") }
     guard let window = repository.windows.first(where: { $0.id == tab.windowID }),
       let context = engine.context(id: window.id), context.isOpen else { throw Failure("Unknown profile window.") }
-    let page = engine.pages[tab.id], active = window.activeTabID == tab.id
-    let highlighted = window.highlightedTabIDs.contains(tab.id)
+    let page = engine.pages[tab.id], active = activeDocumentID(window) == tab.id
+    let highlighted = highlightedDocuments(window).contains(tab.id)
     let muted = page?.browser?.isAudioMuted ?? tab.isMuted
     var value: [String: Any] = [
       "id": identity.id, "windowId": context.nativeID, "index": index,
@@ -387,7 +476,7 @@ final class NativeExtensionBrowser {
       "lastAccessed": tab.lastAccessedAt.timeIntervalSince1970 * 1_000,
       "url": tab.url, "title": tab.title, "status": page?.isLoading == true ? "loading" : "complete",
       "audible": isAudible(tab.id), "mutedInfo": ["muted": muted], "muted": muted,
-      "discarded": isDiscarded(tab.id), "autoDiscardable": tab.autoDiscardable != false,
+      "discarded": documentIsDiscarded(tab.id), "autoDiscardable": tab.autoDiscardable != false,
     ]
     if let favicon = page?.faviconURL { value["favIconUrl"] = favicon.absoluteString }
     let opener = tab.openerTabID ?? page?.openerID
@@ -486,12 +575,14 @@ final class NativeExtensionBrowser {
       let ids = try identifiers(arg(0)).map { value -> String in
         let tab = try record(profile, nativeID: value); _ = try owner(tab); return tab.id
       }
-      try repository.ungroupTabs(Array(Set(ids))); didChange(); return []
+      let grouped = Array(Set(ids)).filter { documentTab($0)?.groupID != nil }
+      if !grouped.isEmpty { try repository.ungroupTabs(grouped); didChange() }
+      return []
     case "tabs.group":
       let props = try properties(arg(0), allowed: ["tabIds", "groupId", "createProperties"])
       if props["groupId"] != nil && props["createProperties"] != nil { throw Failure("Choose an existing group or new-group properties.") }
       let requested = try identifiers(props["tabIds"]).map { try record(profile, nativeID: $0).id }
-      var seen = Set<String>(); let ids = requested.filter { seen.insert($0).inserted }
+      var seen = Set<String>(); var ids = requested.filter { seen.insert($0).inserted }
       let existing = try props["groupId"].map { try groupRecord(profile, nativeID: integer($0)) }
       let creation = try properties(props["createProperties"], allowed: ["windowId"])
       let target = try existing.map { group -> BrowserWindowSession in
@@ -499,7 +590,12 @@ final class NativeExtensionBrowser {
         return window
       } ?? targetWindow(creation["windowId"], profile: profile, request: request)
       guard target.kind == .normal else { throw Failure("Tab groups require a normal browser window.") }
-      let foreign = ids.filter { store.tab($0)?.windowID != target.id }
+      let current = try ids.map { id -> BrowserTab in
+        guard let tab = documentTab(id) else { throw Failure("Unknown profile tab.") }; return tab
+      }
+      ids = try await persistentTabs(current, request: request, profile: profile, manager: manager).map(\.id)
+      try await authorize(request, profile: profile, manager: manager)
+      let foreign = ids.filter { documentTab($0)?.windowID != target.id }
       if !foreign.isEmpty {
         guard let moveTabs else { throw Failure("Native tab transfer is unavailable.") }
         try await moveTabs(foreign, target.id, -1) { [weak self] in
@@ -604,11 +700,32 @@ final class NativeExtensionBrowser {
     return identity
   }
 
+  private func validateSplitPair(_ pair: [BrowserTab], profile: String) throws {
+    guard pair.count == 2, pair[0].windowID == pair[1].windowID,
+      pair[0].spaceID == pair[1].spaceID, pair[0].isPinned == pair[1].isPinned,
+      pair[0].groupID == pair[1].groupID else { throw Failure("Split tabs must be in the same Space, tab group, and pinned state.") }
+    let ordered = tabs(profile, in: pair[0].windowID)
+    guard let first = ordered.firstIndex(where: { $0.id == pair[0].id }),
+      let second = ordered.firstIndex(where: { $0.id == pair[1].id }), abs(first - second) == 1 else {
+      throw Failure("Split tabs must be adjacent.")
+    }
+    guard pair.allSatisfy({ store.split(for: $0.id) == nil }) else { throw Failure("A tab is already in split view.") }
+  }
+
   private func perform(_ request: ChromeExtensionHostRequest, profile: String,
                        arguments: [Any], manager: ChromeExtensionManager) async throws -> [Any] {
     func arg(_ index: Int) -> Any? { arguments.indices.contains(index) ? arguments[index] : nil }
     try await authorize(request, profile: profile, manager: manager)
     switch request.method {
+    case "native.prepareDocument":
+      try await synchronizeCatalog(profile)
+      let tab = try record(profile, nativeID: integer(arg(0)))
+      _ = try await requireDocument(tab)
+      try await authorize(request, profile: profile, manager: manager)
+      guard documentTab(tab.id)?.isClosed == false else { throw Failure("The tab closed before its document could load.") }
+      return []
+    case "sessions.getRecentlyClosed", "sessions.getDevices", "sessions.restore":
+      return try await performSession(request, profile: profile, arguments: arguments, manager: manager)
     case "tabs.group", "tabs.ungroup", "tabGroups.get", "tabGroups.query", "tabGroups.update", "tabGroups.move":
       return try await performGroup(request, profile: profile, arguments: arguments, manager: manager)
     case "tabs.query", "tabs.getAllInWindow":
@@ -641,7 +758,7 @@ final class NativeExtensionBrowser {
       return [try await tabData(tab.id, profile: profile)]
     case "tabs.getSelected":
       let window = try targetWindow(arg(0), profile: profile, request: request)
-      guard let id = window.activeTabID, tabs(profile, in: window.id).contains(where: { $0.id == id }) else { throw Failure("This profile has no active tab in that window.") }
+      guard let id = activeDocumentID(window), tabs(profile, in: window.id).contains(where: { $0.id == id }) else { throw Failure("This profile has no active tab in that window.") }
       return [try await tabData(id, profile: profile)]
     case "tabs.create":
       let props = try properties(arg(0))
@@ -651,40 +768,65 @@ final class NativeExtensionBrowser {
       var props = try properties(propertiesFirst ? arg(0) : arg(1), allowed: ["url", "active", "selected", "pinned", "muted", "highlighted", "autoDiscardable", "openerTabId"])
       if props["active"] == nil, let selected = props["selected"] { props["active"] = selected }
       try await synchronizeCatalog(profile)
-      let tab = try defaultRecord(profile, id: propertiesFirst ? nil : arg(0), request: request)
+      var tab = try defaultRecord(profile, id: propertiesFirst ? nil : arg(0), request: request)
       try validateTabProperties(props)
       var scope = try owner(tab)
       let activate = props["active"] as? Bool == true
-      if props["highlighted"] as? Bool == false, activate || scope.state.activeTabID == tab.id { throw Failure("The active tab cannot be unhighlighted independently.") }
+      if props["highlighted"] as? Bool == false, activate || repository.windows.first(where: { $0.id == tab.windowID }).map({ activeDocumentID($0) == tab.id }) == true { throw Failure("The active tab cannot be unhighlighted independently.") }
       if activate || props["highlighted"] as? Bool == true { try canActivate(profile, in: tab.windowID) }
-      let address = try navigationURL(props["url"], extensionID: request.extensionID)
+      let destination = try await navigationDestination(props["url"], request: request, profile: profile, manager: manager)
+      if peekSourceID(tab.id) != nil, props["pinned"] as? Bool == true || props["openerTabId"] != nil || (props["highlighted"] as? Bool == true && !activate) {
+        tab = try await persistentTab(tab, request: request, profile: profile, manager: manager)
+      }
       try await authorize(request, profile: profile, manager: manager)
-      guard let currentTab = store.tab(tab.id), !currentTab.isClosed else { throw Failure("Unknown profile tab.") }
+      guard let currentTab = documentTab(tab.id), !currentTab.isClosed else { throw Failure("Unknown profile tab.") }
       scope = try owner(currentTab)
       if activate || props["highlighted"] as? Bool == true { try canActivate(profile, in: currentTab.windowID) }
-      guard store.tab(tab.id)?.isClosed == false else { throw Failure("Unknown profile tab.") }
+      guard documentTab(tab.id)?.isClosed == false else { throw Failure("Unknown profile tab.") }
       let openerID = try props["openerTabId"].map { try record(profile, nativeID: integer($0)).id }
       if openerID == tab.id { throw Failure("A tab cannot be its own opener.") }
-      try scope.commit { state in
-        guard let i = state.tabs.firstIndex(where: { $0.id == tab.id }) else { return }
-        if let pinned = props["pinned"] as? Bool, pinned != state.tabs[i].isPinned {
-          state.tabs[i].isPinned = pinned; state.tabs[i].isFavorite = false; state.tabs[i].folderID = nil
-          state.tabs[i].savedURL = pinned ? state.tabs[i].url : nil
-          state.tabs[i].savedTitle = pinned ? state.tabs[i].title : nil
+      if let source = peekSourceID(tab.id) {
+        try scope.updatePeekDurably(tabID: source) { peek in
+          if let muted = props["muted"] as? Bool { peek.isMuted = muted }
+          if let automatic = props["autoDiscardable"] as? Bool { peek.autoDiscardable = automatic }
+          if let destination {
+            let history = peek.navigation ?? [NavigationEntry(url: peek.url, title: peek.title, nativeNavigation: peek.nativeNavigation)]
+            let index = peek.navigationIndex ?? max(0, history.count - 1)
+            let entry = NavigationEntry(url: destination.url, nativeNavigation: destination.provenance)
+            peek.url = destination.url; peek.nativeNavigation = destination.provenance
+            peek.navigation = Array((Array(history.prefix(max(0, index + 1))) + [entry]).suffix(100))
+            peek.navigationIndex = (peek.navigation?.count ?? 1) - 1
+          }
         }
-        if let muted = props["muted"] as? Bool { state.tabs[i].isMuted = muted }
-        if let automatic = props["autoDiscardable"] as? Bool { state.tabs[i].autoDiscardable = automatic }
-        if let openerID { state.tabs[i].openerTabID = openerID }
-        if let address { state.tabs[i].url = address; state.tabs[i].homePage = nil }
+      } else {
+        try scope.commit { state in
+          guard let i = state.tabs.firstIndex(where: { $0.id == tab.id }) else { return }
+          if let pinned = props["pinned"] as? Bool, pinned != state.tabs[i].isPinned {
+            state.tabs[i].isPinned = pinned; state.tabs[i].isFavorite = false; state.tabs[i].folderID = nil
+            state.tabs[i].savedURL = pinned ? state.tabs[i].url : nil
+            state.tabs[i].savedTitle = pinned ? state.tabs[i].title : nil
+            state.tabs[i].savedNativeNavigation = pinned ? state.tabs[i].nativeNavigation : nil
+          }
+          if let muted = props["muted"] as? Bool { state.tabs[i].isMuted = muted }
+          if let automatic = props["autoDiscardable"] as? Bool { state.tabs[i].autoDiscardable = automatic }
+          if let openerID { state.tabs[i].openerTabID = openerID }
+          if let destination {
+            state.tabs[i].url = destination.url; state.tabs[i].nativeNavigation = destination.provenance
+            state.tabs[i].homePage = nil
+            let entry = NavigationEntry(url: destination.url, nativeNavigation: destination.provenance)
+            state.tabs[i].navigation = Array((Array(state.tabs[i].navigation.prefix(max(0, state.tabs[i].navigationIndex + 1))) + [entry]).suffix(100))
+            state.tabs[i].navigationIndex = state.tabs[i].navigation.count - 1
+          }
+        }
       }
       if let muted = props["muted"] as? Bool { engine.pages[tab.id]?.browser?.isAudioMuted = muted }
-      if let address, let current = store.tab(tab.id) {
-        navigateTab(current, address)
+      if let destination, let current = documentTab(tab.id) {
+        navigateTab(current, destination.url)
         _ = try await requireDocument(current)
         try await authorize(request, profile: profile, manager: manager)
       }
-      if activate { try canActivate(profile, in: store.tab(tab.id)?.windowID); activateTab(tab.id) }
-      if let highlighted = props["highlighted"] as? Bool, let id = store.tab(tab.id)?.windowID {
+      if activate { try canActivate(profile, in: documentTab(tab.id)?.windowID); try activateTab(tab.id) }
+      if let highlighted = props["highlighted"] as? Bool, peekSourceID(tab.id) == nil, let id = documentTab(tab.id)?.windowID {
         if highlighted { try canActivate(profile, in: id) }
         try repository.updateWindow(id) { window in
           if highlighted { window.highlightedTabIDs.insert(tab.id) }
@@ -708,11 +850,11 @@ final class NativeExtensionBrowser {
       try validateTabProperties(props)
       let tab = try defaultRecord(profile, id: propertiesFirst ? nil : arg(0), request: request)
       try await authorize(request, profile: profile, manager: manager)
-      let wasDiscarded = isDiscarded(tab.id)
+      let wasDiscarded = documentIsDiscarded(tab.id)
       let page = try await requireDocument(tab)
       let browser = try await page.ready()
       try await authorize(request, profile: profile, manager: manager)
-      guard engine.pages[tab.id] === page, store.tab(tab.id)?.isClosed == false else { throw Failure("Unknown profile tab.") }
+      guard engine.pages[tab.id] === page, documentTab(tab.id)?.isClosed == false else { throw Failure("Unknown profile tab.") }
       if request.method == "tabs.reload" {
         if !wasDiscarded { browser.reload(ignoreCache: props["bypassCache"] as? Bool ?? false) }
       }
@@ -726,13 +868,16 @@ final class NativeExtensionBrowser {
       try await synchronizeCatalog(profile)
       let tab = try record(profile, nativeID: integer(arg(0)))
       let props: [String: Any] = ["url": tab.url, "active": (try owner(tab)).activeProfileID == profile, "pinned": tab.isPinned, "windowId": engine.context(id: tab.windowID!)!.nativeID]
-      return [try await create(props, request: request, profile: profile, manager: manager, duplicate: true)]
+      return [try await create(props, request: request, profile: profile, manager: manager, duplicateOf: tab)]
     case "tabs.createSplit":
       let ids = try identifiers(arg(0))
       guard ids.count == 2, Set(ids).count == 2 else { throw Failure("Choose exactly two different tabs for split view.") }
       try await synchronizeCatalog(profile)
       try await authorize(request, profile: profile, manager: manager)
-      let pair = try ids.map { try record(profile, nativeID: $0) }
+      let initial = try ids.map { try record(profile, nativeID: $0) }
+      try validateSplitPair(initial, profile: profile)
+      let pair = try await persistentTabs(initial, request: request, profile: profile, manager: manager)
+      try await authorize(request, profile: profile, manager: manager)
       let ordered = tabs(profile, in: pair[0].windowID)
       guard let first = ordered.firstIndex(where: { $0.id == pair[0].id }),
         let second = ordered.firstIndex(where: { $0.id == pair[1].id }), abs(first - second) == 1 else {
@@ -764,7 +909,7 @@ final class NativeExtensionBrowser {
       let ids = try identifiers(arg(0)), props = try properties(arg(1), allowed: ["index", "windowId"])
       let position = try integer(props["index"], minimum: -1)
       guard Set(ids).count == ids.count else { throw Failure("Duplicate tab IDs are not allowed.") }
-      let records = try ids.map { try record(profile, nativeID: $0) }
+      var records = try ids.map { try record(profile, nativeID: $0) }
       let destination: BrowserWindowSession
       if props["windowId"] != nil { destination = try targetWindow(props["windowId"], profile: profile, request: request) }
       else {
@@ -773,6 +918,7 @@ final class NativeExtensionBrowser {
         destination = window
       }
       guard let moveTabs else { throw Failure("Native tab transfer is unavailable.") }
+      records = try await persistentTabs(records, request: request, profile: profile, manager: manager)
       try await authorize(request, profile: profile, manager: manager)
       for tab in records { _ = try owner(tab) }
       try await moveTabs(records.map(\.id), destination.id, position) { [weak self] in
@@ -789,11 +935,15 @@ final class NativeExtensionBrowser {
       let window = try targetWindow(props["windowId"], profile: profile, request: request)
       let indices = try identifiers(props["tabs"]), available = tabs(profile, in: window.id)
       guard Set(indices).count == indices.count, indices.allSatisfy({ available.indices.contains($0) }),
-        let first = indices.first else { throw Failure("Invalid tab selection indices.") }
+        indices.first != nil else { throw Failure("Invalid tab selection indices.") }
       try canActivate(profile, in: window.id)
       try await authorize(request, profile: profile, manager: manager)
       try canActivate(profile, in: window.id)
-      try repository.selectTabs(indices.map { available[$0].id }, activeID: available[first].id, inWindowID: window.id)
+      let selected = try await persistentTabs(indices.map { available[$0] }, request: request, profile: profile, manager: manager)
+      try await authorize(request, profile: profile, manager: manager)
+      try canActivate(profile, in: window.id)
+      guard let active = selected.first else { throw Failure("Choose tabs to highlight.") }
+      try repository.selectTabs(selected.map(\.id), activeID: active.id, inWindowID: window.id, presentPeek: false)
       didChange()
       return [try await windowData(window.id, profile: profile, info: ["populate": true])]
     case "tabs.discard":
@@ -801,8 +951,9 @@ final class NativeExtensionBrowser {
       guard let discardTab else { throw Failure("Native tab suspension is unavailable.") }
       let explicit = arg(0) != nil && !(arg(0) is NSNull)
       let candidates = explicit ? [try defaultRecord(profile, id: arg(0), request: request)]
-        : tabs(profile).filter { tab in !repository.windows.contains(where: { $0.activeTabID == tab.id }) && !isDiscarded(tab.id) }.sorted { $0.lastAccessedAt < $1.lastAccessedAt }
-      for tab in candidates {
+        : tabs(profile).filter { tab in peekSourceID(tab.id) == nil && !repository.windows.contains(where: { activeDocumentID($0) == tab.id }) && !documentIsDiscarded(tab.id) }.sorted { $0.lastAccessedAt < $1.lastAccessedAt }
+      for candidate in candidates {
+        let tab = try await persistentTab(candidate, request: request, profile: profile, manager: manager)
         try await authorize(request, profile: profile, manager: manager)
         let discarded: Bool
         if isDiscarded(tab.id) { discarded = true } else { discarded = try await discardTab(tab.id) }
@@ -816,7 +967,7 @@ final class NativeExtensionBrowser {
       try await synchronizeCatalog(profile)
       let factorOnly = request.method == "tabs.setZoom" && arguments.count == 1
       let tab = try defaultRecord(profile, id: factorOnly ? nil : arg(0), request: request)
-      guard !isDiscarded(tab.id), let page = engine.pages[tab.id], let browser = page.browser else { throw Failure("The target tab is not currently loaded.") }
+      guard !documentIsDiscarded(tab.id), let page = engine.pages[tab.id], let browser = page.browser else { throw Failure("The target tab is not currently loaded.") }
       if request.method == "tabs.getZoom" { return [pow(1.2, browser.zoomLevel)] }
       try await authorize(request, profile: profile, manager: manager)
       let factor = try number(arg(factorOnly ? 0 : 1))
@@ -889,17 +1040,25 @@ final class NativeExtensionBrowser {
       let kind = NativeExtensionWindowRequest.Kind(rawValue: props["type"] as? String ?? "normal")
       guard let kind else { throw Failure("Unsupported browser window type.") }
       var urls: [String] = []
+      var nativeAuthorizations: [String: NativeNavigationProvenance] = [:]
       if let addresses = props["url"] {
         let values = (addresses as? [Any]) ?? [addresses]
         guard !values.isEmpty, values.count <= 1_000 else { throw Failure("Invalid window URLs.") }
-        urls = try values.map { guard let value = try navigationURL($0, extensionID: request.extensionID) else { throw Failure("Invalid window URL.") }; return value }
+        for value in values {
+          guard let destination = try await navigationDestination(value, request: request, profile: profile, manager: manager) else { throw Failure("Invalid window URL.") }
+          urls.append(destination.url)
+          if let proof = destination.provenance { nativeAuthorizations[destination.url] = proof }
+        }
       }
       try await synchronizeCatalog(profile)
-      let moving = try props["tabId"].map { try record(profile, nativeID: integer($0)) }
-      if let moving { _ = try owner(moving) }
+      var moving = try props["tabId"].map { try record(profile, nativeID: integer($0)) }
+      if let value = moving {
+        _ = try owner(value)
+        moving = try await persistentTab(value, request: request, profile: profile, manager: manager)
+      }
       guard let createWindow else { throw Failure("Native window creation is unavailable.") }
       try await authorize(request, profile: profile, manager: manager)
-      let creation = NativeExtensionWindowRequest(profileID: profile, kind: kind, urls: urls,
+      let creation = NativeExtensionWindowRequest(profileID: profile, kind: kind, urls: urls, nativeAuthorizations: nativeAuthorizations,
         movingTabID: moving?.id, focused: props["focused"] as? Bool ?? true, state: props["state"] as? String,
         left: props["left"] as? Int, top: props["top"] as? Int, width: props["width"] as? Int, height: props["height"] as? Int,
         openerRequestID: props["setSelfAsOpener"] as? Bool == true ? request.requestID : nil,
@@ -915,7 +1074,7 @@ final class NativeExtensionBrowser {
   }
 
   private func create(_ props: [String: Any], request: ChromeExtensionHostRequest, profile: String,
-                      manager: ChromeExtensionManager, duplicate: Bool = false) async throws -> [String: Any] {
+                      manager: ChromeExtensionManager, duplicateOf: BrowserTab? = nil) async throws -> [String: Any] {
     var props = try properties(props, allowed: ["url", "active", "selected", "index", "pinned", "windowId", "openerTabId"])
     if props["active"] == nil, let selected = props["selected"] { props["active"] = selected }
     try validateTabProperties(props)
@@ -924,8 +1083,14 @@ final class NativeExtensionBrowser {
     let active = props["active"] as? Bool ?? true
     if active { try canActivate(profile, in: target.id) }
     if let opener = props["openerTabId"] { try await synchronizeCatalog(profile); _ = try record(profile, nativeID: integer(opener)) }
-    let address = duplicate && props["url"] as? String == "about:blank" ? "about:blank"
-      : try navigationURL(props["url"], extensionID: request.extensionID) ?? "about:blank"
+    let destination: NavigationDestination
+    if let original = duplicateOf {
+      destination = try await duplicateDestination(original, profile: profile, manager: manager)
+    } else {
+      destination = try await navigationDestination(props["url"], request: request, profile: profile, manager: manager)
+        ?? NavigationDestination(url: "about:blank", provenance: nil)
+    }
+    let address = destination.url
     try await authorize(request, profile: profile, manager: manager)
     if active { try canActivate(profile, in: target.id) }
     _ = try targetWindow(engine.context(id: target.id)?.nativeID, profile: profile, request: request)
@@ -933,11 +1098,11 @@ final class NativeExtensionBrowser {
     guard store.state.tabs.count < 1_000 else { throw Failure("Close some tabs before opening more.") }
     guard let space = store.state.spaces.first(where: { $0.id == scope.state.activeSpaceID && $0.profileID == profile })
       ?? store.state.spaces.first(where: { $0.profileID == profile }) else { throw Failure("Profile has no Space.") }
-    var tab = BrowserTab(spaceID: space.id, url: address, title: URL(string: address)?.host ?? "New tab",
+    var tab = BrowserTab(spaceID: space.id, url: address, title: address == "about:blank" ? "New tab" : NativePageIdentity.label(address),
       isPinned: props["pinned"] as? Bool ?? false)
-    tab.windowID = target.id; tab.openerTabID = openerID
-    tab.navigation = [NavigationEntry(url: address)]; tab.navigationIndex = 0
-    if tab.isPinned { tab.savedURL = address; tab.savedTitle = tab.title }
+    tab.windowID = target.id; tab.openerTabID = openerID; tab.nativeNavigation = destination.provenance
+    tab.navigation = [NavigationEntry(url: address, nativeNavigation: destination.provenance)]; tab.navigationIndex = 0
+    if tab.isPinned { tab.savedURL = address; tab.savedTitle = tab.title; tab.savedNativeNavigation = destination.provenance }
     try scope.commit { state in
       if let index = props["index"] as? Int, index >= 0 {
         let own = state.tabs.indices.filter { i in !state.tabs[i].isClosed && state.tabs[i].windowID == target.id && store.profileID(for: state.tabs[i]) == profile }
@@ -947,13 +1112,136 @@ final class NativeExtensionBrowser {
     try await synchronizeCatalog(profile)
     try await authorize(request, profile: profile, manager: manager)
     if active { try canActivate(profile, in: target.id) }
-    guard store.tab(tab.id)?.isClosed == false else { throw Failure("The tab closed before the operation completed.") }
+    guard documentTab(tab.id)?.isClosed == false else { throw Failure("The tab closed before the operation completed.") }
     if address != "about:blank" { navigateTab(tab, address) }
     _ = try await requireDocument(tab)
     try await authorize(request, profile: profile, manager: manager)
-    if active { try canActivate(profile, in: store.tab(tab.id)?.windowID); activateTab(tab.id) }
+    if active { try canActivate(profile, in: documentTab(tab.id)?.windowID); try activateTab(tab.id) }
     didChange()
     return try await tabData(tab.id, profile: profile)
+  }
+
+  private struct ClosedSession {
+    enum Kind: Equatable { case tab, window }
+    let kind: Kind
+    let id: String
+    let token: String
+    let date: Date
+    let tabs: [BrowserTab]
+    let window: BrowserWindowSession?
+    var signature: String { token + ":" + tabs.map(\.id).joined(separator: ",") }
+  }
+  private func sessionToken(_ kind: String, id: String, date: Date) -> String {
+    "zacro:" + kind + ":" + id + ":" + String(date.timeIntervalSince1970.bitPattern)
+  }
+  private func closedSessions(_ profile: String) -> [ClosedSession] {
+    var entries = store.state.archive.filter { store.profileID(for: $0.tab) == profile }.map { item in
+      ClosedSession(kind: .tab, id: item.id, token: sessionToken("tab", id: item.id, date: item.archivedAt),
+        date: item.archivedAt, tabs: [item.tab], window: nil)
+    }
+    entries += store.state.tabs.compactMap { tab -> ClosedSession? in
+      guard tab.isClosed, store.profileID(for: tab) == profile, let date = tab.closedAt else { return nil }
+      return ClosedSession(kind: .tab, id: tab.id, token: sessionToken("pin", id: tab.id, date: date),
+        date: date, tabs: [tab], window: nil)
+    }
+    for window in repository.windows where !window.isOpen {
+      let owned = store.state.tabs.filter { $0.windowID == window.id }
+      // Restoring a physical shell must not awaken another browsing profile.
+      guard !owned.isEmpty, owned.allSatisfy({ store.profileID(for: $0) == profile }),
+        store.state.spaces.first(where: { $0.id == window.activeSpaceID })?.profileID == profile else { continue }
+      let persistent = owned.filter { !$0.isClosed }
+      let tabs = persistent + persistent.compactMap(\.peekDocument)
+      guard !tabs.isEmpty else { continue }
+      let date = window.closedAt ?? .distantPast
+      entries.append(ClosedSession(kind: .window, id: window.id,
+        token: sessionToken("window", id: window.id, date: date), date: date, tabs: tabs, window: window))
+    }
+    return entries.sorted { $0.date == $1.date ? $0.token < $1.token : $0.date > $1.date }
+  }
+  private func closedSession(_ token: String?, profile: String) throws -> ClosedSession {
+    let entries = closedSessions(profile)
+    guard let token else {
+      guard let first = entries.first else { throw Failure("There are no recently closed tabs or windows.") }
+      return first
+    }
+    for entry in entries {
+      if entry.token == token { return entry }
+      if entry.kind == .window, let tab = entry.tabs.first(where: { sessionToken("window-tab", id: $0.id, date: entry.date) == token }) {
+        return ClosedSession(kind: .tab, id: tab.id, token: token, date: entry.date, tabs: [tab], window: entry.window)
+      }
+    }
+    throw Failure("This recently closed session is no longer available in this profile.")
+  }
+  private func closedTabData(_ tab: BrowserTab, token: String, index: Int, active: Bool) -> [String: Any] {
+    ["sessionId": token, "index": index, "windowId": -1, "groupId": -1, "splitViewId": -1,
+      "selected": active, "active": active, "highlighted": active, "pinned": tab.isPinned,
+      "frozen": false, "discarded": false, "autoDiscardable": tab.autoDiscardable != false,
+      "incognito": false, "lastAccessed": tab.lastAccessedAt.timeIntervalSince1970 * 1_000,
+      "url": tab.url, "title": tab.title, "favIconUrl": ""]
+  }
+  private func closedSessionData(_ entry: ClosedSession) -> [String: Any] {
+    let modified = Int(max(0, min(Double(Int32.max), entry.date.timeIntervalSince1970)))
+    if entry.kind == .tab {
+      return ["lastModified": modified, "tab": closedTabData(entry.tabs[0], token: entry.token, index: 0, active: false)]
+    }
+    let tabs = entry.tabs.enumerated().map { index, tab in
+      closedTabData(tab, token: sessionToken("window-tab", id: tab.id, date: entry.date),
+        index: index, active: entry.window.map { activeDocumentID($0) == tab.id } ?? false)
+    }
+    return ["lastModified": modified, "window": ["sessionId": entry.token, "tabs": tabs,
+      "type": entry.window?.kind.rawValue ?? "normal", "state": "normal", "incognito": false,
+      "alwaysOnTop": false, "focused": false]]
+  }
+  private func performSession(_ request: ChromeExtensionHostRequest, profile: String,
+                              arguments: [Any], manager: ChromeExtensionManager) async throws -> [Any] {
+    if request.method != "sessions.restore" {
+      let filter = try properties(arguments.first, allowed: ["maxResults"])
+      let count = try filter["maxResults"].map { try integer($0, minimum: 0) } ?? 25
+      guard count <= 25 else { throw Failure("At most 25 sessions may be requested.") }
+      // No browser session sync account is configured. Do not expose physical
+      // Chrome manager/child windows as local or foreign browsing sessions.
+      if request.method == "sessions.getDevices" { return [[Any]()] }
+      return [closedSessions(profile).prefix(count).map { closedSessionData($0) }]
+    }
+    let token: String?
+    if let value = arguments.first, !(value is NSNull) {
+      guard let value = value as? String, !value.isEmpty, value.utf8.count <= 512 else { throw Failure("Invalid session ID.") }
+      token = value
+    } else { token = nil }
+    let entry = try closedSession(token, profile: profile)
+    for tab in entry.tabs {
+      if let proof = tab.nativeNavigation {
+        _ = try await duplicateDestination(tab, profile: profile, manager: manager, requireOpen: false)
+        guard proof.matches(tab.url) else { throw Failure("The saved page is no longer authorized.") }
+      }
+    }
+    try await authorize(request, profile: profile, manager: manager)
+    guard try closedSession(entry.token, profile: profile).tabs == entry.tabs else { throw Failure("The saved session changed.") }
+    let now = Int(Date().timeIntervalSince1970)
+    if entry.kind == .window {
+      guard let restoreWindow else { throw Failure("Window restoration is unavailable.") }
+      let id = try await restoreWindow(entry.id, { [weak self] in
+        guard let self else { throw CancellationError() }
+        try await self.authorize(request, profile: profile, manager: manager)
+        guard try self.closedSession(entry.token, profile: profile).tabs == entry.tabs else { throw Failure("The saved window changed.") }
+      })
+      try await authorize(request, profile: profile, manager: manager)
+      didChange()
+      return [["lastModified": now, "window": try await windowData(id, profile: profile, info: ["populate": true])]]
+    }
+    let target: BrowserWindowSession
+    if let retained = documentTab(entry.id), retained.isClosed,
+      let existing = windows(profile).first(where: { $0.id == retained.windowID }) {
+      target = existing
+    } else { target = try currentWindow(profile, request: request) }
+    try canActivate(profile, in: target.id)
+    guard let scope = repository.store(for: target.id) else { throw Failure("Unknown profile window.") }
+    let tab = try scope.restoreSessionTabDurably(id: entry.id)
+    _ = try await requireDocument(tab)
+    try await authorize(request, profile: profile, manager: manager)
+    try canActivate(profile, in: documentTab(tab.id)?.windowID)
+    try activateTab(tab.id); didChange()
+    return [["lastModified": now, "tab": try await tabData(tab.id, profile: profile)]]
   }
 
   private func requireDocument(_ tab: BrowserTab) async throws -> ChromiumPage {
@@ -961,7 +1249,7 @@ final class NativeExtensionBrowser {
     if let materializePage { page = try await materializePage(tab) }
     else if let existing = engine.pages[tab.id] { page = existing }
     else { throw Failure("The tab could not be loaded.") }
-    guard engine.pages[tab.id] === page, let current = store.tab(tab.id), !current.isClosed,
+    guard engine.pages[tab.id] === page, let current = documentTab(tab.id), !current.isClosed,
       store.profileID(for: current) == page.profileID else { throw Failure("The tab closed before the operation completed.") }
     return page
   }
@@ -993,6 +1281,13 @@ final class NativeExtensionBrowser {
         for (id, previous) in snapshots where previous.profile == profile { next[id] = previous }
         continue
       }
+      let closed = closedSessions(profile).map(\.signature)
+      if let previous = sessionSnapshots[profile], previous != closed {
+        do {
+          try await manager.publishBrowserEvent("sessions.onChanged", arguments: [])
+          sessionSnapshots[profile] = closed
+        } catch { }
+      } else if sessionSnapshots[profile] == nil { sessionSnapshots[profile] = closed }
       await publishGroupChanges(profile, manager: manager)
       let sessions = windows(profile)
       var currentWindows: [String: [String: Any]] = [:]
@@ -1039,6 +1334,9 @@ final class NativeExtensionBrowser {
           }
           if value["active"] as? Bool == true,
             old == nil || old?.value["active"] as? Bool != true || !equal(old?.value["windowId"], value["windowId"]) || !equal(old?.value["id"], value["id"]) {
+            let legacy: [Any] = [value["id"]!, ["windowId": value["windowId"]!]]
+            try await manager.publishBrowserEvent("tabs.onSelectionChanged", arguments: legacy)
+            try await manager.publishBrowserEvent("tabs.onActiveChanged", arguments: legacy)
             try await manager.publishBrowserEvent("tabs.onActivated", arguments: [["tabId": value["id"]!, "windowId": value["windowId"]!]])
           }
         } catch {
@@ -1054,11 +1352,13 @@ final class NativeExtensionBrowser {
       for session in sessions {
         guard let context = engine.context(id: session.id) else { continue }
         let key = profile + ":" + String(context.nativeID)
-        let highlighted = tabs(profile, in: session.id).filter { session.highlightedTabIDs.contains($0.id) }
+        let highlighted = tabs(profile, in: session.id).filter { highlightedDocuments(session).contains($0.id) }
           .compactMap { next[$0.id]?.value["id"] as? Int }
         if highlightSnapshots[key] != highlighted {
           do {
-            try await manager.publishBrowserEvent("tabs.onHighlighted", arguments: [["windowId": context.nativeID, "tabIds": highlighted]])
+            let selection: [Any] = [["windowId": context.nativeID, "tabIds": highlighted]]
+            try await manager.publishBrowserEvent("tabs.onHighlightChanged", arguments: selection)
+            try await manager.publishBrowserEvent("tabs.onHighlighted", arguments: selection)
             highlightSnapshots[key] = highlighted
           } catch { }
         }
@@ -1181,15 +1481,51 @@ final class NativeExtensionBrowser {
       if ["fullscreen", "maximized"].contains(value), props["focused"] as? Bool == false { throw Failure("This window state requires focus.") }
     }
   }
-  private func navigationURL(_ value: Any?, extensionID: String) throws -> String? {
+  private struct NavigationDestination {
+    let url: String
+    let provenance: NativeNavigationProvenance?
+  }
+  private func navigationDestination(_ value: Any?, request: ChromeExtensionHostRequest, profile: String,
+                                     manager: ChromeExtensionManager) async throws -> NavigationDestination? {
     guard let value, !(value is NSNull) else { return nil }
-    guard let text = value as? String, !text.isEmpty, !text.contains("\\") else { throw Failure("Unsupported navigation URL.") }
-    if text == "about:blank" { return text }
-    if let url = BrowserAddress.webURL(text) { return url.absoluteString }
-    guard let base = URL(string: "chrome-extension://\(extensionID)/"),
-      let absolute = URL(string: text, relativeTo: base)?.absoluteURL,
-      let url = BrowserAddress.extensionURL(absolute.absoluteString), url.host == extensionID else { throw Failure("Unsupported navigation URL.") }
-    return url.absoluteString
+    guard let text = value as? String, !text.isEmpty, let url = URL(string: text), url.absoluteString == text else {
+      throw Failure("Unsupported navigation URL.")
+    }
+    // Chromium has already normalized and authorized the request's URL. Keep
+    // ordinary documents independent of the lifetime of the creating extension.
+    if BrowserAddress.documentURL(text)?.absoluteString == text {
+      return NavigationDestination(url: text, provenance: nil)
+    }
+    let approval = try await manager.authorizeHostNavigation(requestID: request.requestID, url: url)
+    try checkProfile(profile, request: request)
+    guard approval.profileID == profile, approval.extensionID == request.extensionID,
+      approval.url.absoluteString == text,
+      let proof = NativeNavigationProvenance(extensionID: approval.extensionID,
+        incarnationID: approval.incarnationID, approvedURL: text) else {
+      throw Failure("The browser did not approve this navigation.")
+    }
+    return NavigationDestination(url: text, provenance: proof)
+  }
+  private func duplicateDestination(_ tab: BrowserTab, profile: String,
+                                    manager: ChromeExtensionManager, requireOpen: Bool = true) async throws -> NavigationDestination {
+    if BrowserAddress.documentURL(tab.url)?.absoluteString == tab.url {
+      return NavigationDestination(url: tab.url, provenance: nil)
+    }
+    guard let proof = tab.nativeNavigation, proof.matches(tab.url), let url = URL(string: tab.url) else {
+      throw Failure("This page cannot be duplicated.")
+    }
+    let approval = try await manager.validateNavigation(extensionID: proof.extensionID,
+      incarnationID: proof.incarnationID, url: url)
+    try checkProfile(profile)
+    guard approval.profileID == profile, approval.extensionID == proof.extensionID,
+      approval.incarnationID == proof.incarnationID, approval.url.absoluteString == tab.url else {
+      throw Failure("The page is no longer authorized.")
+    }
+    if requireOpen {
+      guard let current = documentTab(tab.id), !current.isClosed, current.url == tab.url,
+        current.nativeNavigation == proof else { throw Failure("The page changed before it could be duplicated.") }
+    }
+    return NavigationDestination(url: tab.url, provenance: proof)
   }
   private func equal(_ lhs: Any?, _ rhs: Any?) -> Bool {
     guard let lhs else { return rhs == nil }; guard let rhs else { return false }

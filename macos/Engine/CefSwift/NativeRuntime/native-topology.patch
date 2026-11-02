@@ -68,12 +68,12 @@
 +  // Browser-process topology ownership. Returning false suppresses physical
 +  // implementation-window events; native host events retain normal routing.
 +  using NativeEventFilter = base::RepeatingCallback<bool(
-+      content::BrowserContext*, const Event&)>;
++      content::BrowserContext*, Event&, const std::string&)>;
 +  static void SetNativeEventFilter(NativeEventFilter filter);
  
    // Gets the EventRouter for `browser_context`.
    static EventRouter* Get(content::BrowserContext* browser_context);
-@@ -725,6 +731,8 @@
+@@ -725,10 +731,15 @@
    // The event to dispatch.
    const std::string event_name;
  
@@ -82,6 +82,13 @@
    // Returns a reference to the event arguments for read-only access.
    // The reference is valid only for the lifetime of the current arguments
    // on this Event. Use `args_ptr()` if retaining ownership is needed.
+   const base::ListValue& args() const { return event_args_->data; }
++  void ReplaceNativeArguments(base::ListValue args) {
++    event_args_ = base::MakeRefCounted<EventArgs>(std::move(args));
++  }
+   const scoped_refptr<const EventArgs>& args_ptr() const { return event_args_; }
+ 
+   // If non-null, then the event will not be sent to other BrowserContexts
 --- a/extensions/browser/event_router.cc
 +++ b/extensions/browser/event_router.cc
 @@ -23,6 +23,7 @@
@@ -113,7 +120,7 @@
                                      std::unique_ptr<Event> event) {
 +  DCHECK(event);
 +  auto& native = NativeTopologyEventFilter();
-+  if (native && !native.Run(browser_context_, *event)) return;
++  if (native && !native.Run(browser_context_, *event, restrict_to_extension_id)) return;
    event->dispatch_start_time = base::TimeTicks::Now();
 -  DCHECK(event);
    // We don't expect to get events from a completely different browser context.
@@ -228,5 +235,93 @@
 +      continue;
 +    }
      result.Append(SerializeTarget(host));
+   }
+ 
+--- a/components/download/internal/common/download_utils.cc
++++ b/components/download/internal/common/download_utils.cc
+@@ -21,6 +21,10 @@
+ #include "base/strings/stringprintf.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "build/build_config.h"
++#if BUILDFLAG(IS_MAC)
++#include <errno.h>
++#include <stdio.h>
++#endif
+ #include "components/download/public/common/download_create_info.h"
+ #include "components/download/public/common/download_features.h"
+ #include "components/download/public/common/download_interrupt_reasons_utils.h"
+@@ -821,14 +825,23 @@
+   int max_path_component_length =
+       base::GetMaximumPathComponentLength(to_path.DirName());
+   if (max_path_component_length != -1) {
+-    if (static_cast<int>(to_path.value().length()) >=
++    if (static_cast<int>(display_name.value().length()) >
+         max_path_component_length) {
+       return DownloadItem::DownloadRenameResult::FAILURE_NAME_TOO_LONG;
+     }
+   }
++#if BUILDFLAG(IS_MAC)
++  // PathExists is advisory. A different process can create the destination
++  // between that check and rename; never overwrite it during native rename.
++  if (renamex_np(from_path.value().c_str(), to_path.value().c_str(), RENAME_EXCL) == 0)
++    return DownloadItem::DownloadRenameResult::SUCCESS;
++  return errno == EEXIST ? DownloadItem::DownloadRenameResult::FAILURE_NAME_CONFLICT
++                        : DownloadItem::DownloadRenameResult::FAILURE_NAME_INVALID;
++#else
+   return base::Move(from_path, to_path)
+              ? DownloadItem::DownloadRenameResult::SUCCESS
+              : DownloadItem::DownloadRenameResult::FAILURE_NAME_INVALID;
++#endif
+ }
+ 
+ int64_t GetDownloadValidationLengthConfig() {
+--- a/extensions/browser/api/runtime/runtime_api.h
++++ b/extensions/browser/api/runtime/runtime_api.h
+@@ -345,6 +345,9 @@
+  public:
+   DECLARE_EXTENSION_FUNCTION("runtime.getContexts", RUNTIME_GETCONTEXTS)
+ 
++  using NativeContextDecorator = base::RepeatingCallback<bool(
++      content::WebContents*, api::runtime::ExtensionContext*)>;
++  static void SetNativeContextDecorator(NativeContextDecorator decorator);
+   RuntimeGetContextsFunction();
+   RuntimeGetContextsFunction(const RuntimeGetContextsFunction&) = delete;
+   RuntimeGetContextsFunction& operator=(const RuntimeGetContextsFunction&) =
+--- a/extensions/browser/api/runtime/runtime_api.cc
++++ b/extensions/browser/api/runtime/runtime_api.cc
+@@ -15,6 +15,7 @@
+ #include "base/location.h"
+ #include "base/metrics/histogram_functions.h"
+ #include "base/notreached.h"
++#include "base/no_destructor.h"
+ #include "base/one_shot_event.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/task/single_thread_task_runner.h"
+@@ -897,6 +898,18 @@
+   return RespondNow(WithArguments(std::move(dict)));
+ }
+ 
++namespace {
++RuntimeGetContextsFunction::NativeContextDecorator& NativeRuntimeContextDecorator() {
++  static base::NoDestructor<RuntimeGetContextsFunction::NativeContextDecorator> callback;
++  return *callback;
++}
++}  // namespace
++
++void RuntimeGetContextsFunction::SetNativeContextDecorator(NativeContextDecorator decorator) {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  NativeRuntimeContextDecorator() = std::move(decorator);
++}
++
+ RuntimeGetContextsFunction::RuntimeGetContextsFunction() = default;
+ RuntimeGetContextsFunction::~RuntimeGetContextsFunction() = default;
+ 
+@@ -1040,6 +1053,8 @@
+     context.document_origin = host->GetLastCommittedOrigin().Serialize();
+     context.incognito = host->GetBrowserContext()->IsOffTheRecord();
+ 
++    auto& native = NativeRuntimeContextDecorator();
++    if (native && !native.Run(web_contents, &context)) continue;
+     results.push_back(std::move(context));
    }
  

@@ -57,6 +57,7 @@ public final class BrowserStore: ObservableObject {
     }
     if initialState == nil {
       for i in state.downloads.indices {
+        state.downloads[i].canResume = nil // A live native snapshot must confirm resumability after a restart.
         if state.downloads[i].status == "completed" { state.downloads[i].status = "complete" }
         else if !["complete", "cancelled", "interrupted"].contains(state.downloads[i].status) {
           state.downloads[i].status = "interrupted"
@@ -72,6 +73,7 @@ public final class BrowserStore: ObservableObject {
   private func owns(_ tab: BrowserTab) -> Bool { owningWindowID == nil || tab.windowID == owningWindowID }
   private var ownedTabs: [BrowserTab] { state.tabs.filter(owns) }
   public var activeProfileID: String { state.activeSpace?.profileID ?? "default" }
+  public var savedWindows: [BrowserSavedWindow] { repository?.savedWindows ?? [] }
   public var visibleTabs: [BrowserTab] {
     state.tabs.filter { tab in
       owns(tab) && (tab.spaceID == state.activeSpaceID
@@ -244,6 +246,8 @@ public final class BrowserStore: ObservableObject {
     }
     state.activeTabID = id
     state.tabs[index].isClosed = false
+    state.tabs[index].closedAt = nil
+    state.tabs[index].peek?.isPresented = true
     state.tabs[index].lastAccessedAt = Date()
     if let space = state.spaces.firstIndex(where: { $0.id == state.activeSpaceID }) {
       state.spaces[space].lastActiveTabID = id
@@ -284,10 +288,12 @@ public final class BrowserStore: ObservableObject {
     for i in state.tabs.indices where state.tabs[i].openerTabID == id { state.tabs[i].openerTabID = nil }
     if tab.isFavorite || tab.isPinned {
       state.tabs[index].isClosed = true
+      state.tabs[index].closedAt = Date()
       state.tabs[index].peek = nil
       state.tabs[index].openerTabID = nil
       state.tabs[index].url = tab.savedURL ?? tab.url
-      state.tabs[index].navigation = [NavigationEntry(url: state.tabs[index].url)]
+      state.tabs[index].nativeNavigation = tab.savedURL == nil ? tab.nativeNavigation : tab.savedNativeNavigation
+      state.tabs[index].navigation = [NavigationEntry(url: state.tabs[index].url, nativeNavigation: state.tabs[index].nativeNavigation)]
       state.tabs[index].navigationIndex = 0
     } else {
       if tab.url != "about:blank", !state.profiles.contains(where: { $0.id == profileID(for: tab) && $0.isPrivate }) {
@@ -338,6 +344,7 @@ public final class BrowserStore: ObservableObject {
     tab.windowID = creationWindowID
     if state.tabs.contains(where: { $0.id == tab.id }) { tab.id = UUID().uuidString }
     tab.isClosed = false
+    tab.closedAt = nil
     tab.openerTabID = nil
     state.tabs.append(tab)
     selectTab(id: tab.id)
@@ -353,6 +360,7 @@ public final class BrowserStore: ObservableObject {
     state.tabs[index].isPinned = true
     if !wasPinned || state.tabs[index].savedURL == nil {
       state.tabs[index].savedURL = state.tabs[index].url
+      state.tabs[index].savedNativeNavigation = state.tabs[index].nativeNavigation
       state.tabs[index].savedTitle = state.tabs[index].title
     }
     state.tabs[index].folderID = nil
@@ -366,6 +374,7 @@ public final class BrowserStore: ObservableObject {
     state.tabs[index].isPinned.toggle()
     state.tabs[index].isFavorite = false
     state.tabs[index].savedURL = state.tabs[index].isPinned ? state.tabs[index].url : nil
+    state.tabs[index].savedNativeNavigation = state.tabs[index].isPinned ? state.tabs[index].nativeNavigation : nil
     state.tabs[index].savedTitle = state.tabs[index].isPinned ? state.tabs[index].title : nil
     state.tabs[index].folderID = nil
     if state.tabs[index].isClosed && !state.tabs[index].isPinned { state.tabs.remove(at: index) }
@@ -401,13 +410,13 @@ public final class BrowserStore: ObservableObject {
     let makeFavorite = favorite ?? ((folderID != nil || pinned == false || source.spaceID != target) ? false : source.isFavorite)
     let makePinned = makeFavorite || (pinned ?? (folderID != nil ? true : source.isPinned))
     if makePinned {
-      if !source.isPinned || state.tabs[i].savedURL == nil { state.tabs[i].savedURL = source.url }
+      if !source.isPinned || state.tabs[i].savedURL == nil { state.tabs[i].savedURL = source.url; state.tabs[i].savedNativeNavigation = source.nativeNavigation }
       if state.tabs[i].savedTitle == nil { state.tabs[i].savedTitle = source.title }
       state.tabs[i].isPinned = true; state.tabs[i].isFavorite = makeFavorite
       if makeFavorite { state.tabs[i].folderID = nil }
     } else {
       state.tabs[i].isPinned = false; state.tabs[i].isFavorite = false; state.tabs[i].folderID = nil
-      state.tabs[i].savedURL = nil; state.tabs[i].savedTitle = nil; state.tabs[i].isClosed = false
+      state.tabs[i].savedURL = nil; state.tabs[i].savedNativeNavigation = nil; state.tabs[i].savedTitle = nil; state.tabs[i].isClosed = false
     }
     if let index {
       let moved = state.tabs.remove(at: i)
@@ -430,6 +439,7 @@ public final class BrowserStore: ObservableObject {
     let title = boundedText(title, limit: 500)
     let value = url.absoluteString
     state.tabs[i].url = value
+    state.tabs[i].nativeNavigation = nil
     if value != "about:blank" { state.tabs[i].homePage = nil }
     if !title.isEmpty { state.tabs[i].title = title }
     let old = state.tabs[i]
@@ -474,6 +484,7 @@ public final class BrowserStore: ObservableObject {
     guard state.tabs[i].navigation.indices.contains(destination) else { return nil }
     state.tabs[i].navigationIndex = destination
     state.tabs[i].url = state.tabs[i].navigation[destination].url
+    state.tabs[i].nativeNavigation = state.tabs[i].navigation[destination].nativeNavigation
     state.tabs[i].title = state.tabs[i].navigation[destination].title
     save()
     return state.tabs[i].url
@@ -523,13 +534,8 @@ public final class BrowserStore: ObservableObject {
     if let repository { return repository.mutate(windowID: owningWindowID) { $0.closePeek(tabID: tabID) } }
  updateTab(tabID) { $0.peek = nil } }
   @discardableResult public func promotePeek(tabID: String) -> BrowserTab? {
-    if let repository { return repository.mutate(windowID: owningWindowID) { $0.promotePeek(tabID: tabID) } }
-
-    guard let tab = tab(tabID), let peek = tab.peek,
-      let created = createTab(address: peek.url, spaceID: tab.spaceID, activate: false) else { return nil }
-    updateTab(created.id) { $0.title = peek.title.isEmpty ? $0.title : peek.title }
-    closePeek(tabID: tabID); selectTab(id: created.id)
-    return self.tab(created.id)
+    do { return try promotePeekDurably(tabID: tabID) }
+    catch { lastError = error.localizedDescription; return nil }
   }
   @discardableResult public func createSpace(name: String, profileID: String? = nil) -> BrowserSpace
   {
@@ -717,11 +723,15 @@ public final class BrowserStore: ObservableObject {
     try commit(purgeRecovery: true) { state in
       state.history.removeAll { $0.profileID == profile }
       for i in state.tabs.indices where spaces.contains(state.tabs[i].spaceID) {
-        state.tabs[i].navigation = [NavigationEntry(url: state.tabs[i].url, title: state.tabs[i].title)]
+        state.tabs[i].navigation = [NavigationEntry(url: state.tabs[i].url, title: state.tabs[i].title, nativeNavigation: state.tabs[i].nativeNavigation)]
         state.tabs[i].navigationIndex = 0
+        if let peek = state.tabs[i].peek {
+          state.tabs[i].peek?.navigation = [NavigationEntry(url: peek.url, title: peek.title, nativeNavigation: peek.nativeNavigation)]
+          state.tabs[i].peek?.navigationIndex = 0
+        }
       }
       for i in state.archive.indices where spaces.contains(state.archive[i].tab.spaceID) {
-        state.archive[i].tab.navigation = [NavigationEntry(url: state.archive[i].tab.url, title: state.archive[i].tab.title)]
+        state.archive[i].tab.navigation = [NavigationEntry(url: state.archive[i].tab.url, title: state.archive[i].tab.title, nativeNavigation: state.archive[i].tab.nativeNavigation)]
         state.archive[i].tab.navigationIndex = 0
       }
     }
@@ -763,6 +773,7 @@ public final class BrowserStore: ObservableObject {
     } else {
       state.downloads.insert(record, at: 0)
     }
+    state.downloads = DownloadCollection.ordered(state.downloads)
     save()
   }
   public func clearError() { if let repository { repository.clearError(); return }; lastError = nil }
@@ -825,18 +836,28 @@ public final class BrowserStore: ObservableObject {
     if let repository { return repository.mutate(windowID: owningWindowID) { $0.replacePinnedDestination(id: id) } }
 
     guard let tab = tab(id), tab.isPinned || tab.isFavorite else { return }
-    updateTab(id) { $0.savedURL = $0.url; $0.savedTitle = $0.title }
+    updateTab(id) { $0.savedURL = $0.url; $0.savedTitle = $0.title; $0.savedNativeNavigation = $0.nativeNavigation }
   }
   public func resetPinnedDestination(id: String) {
     if let repository { return repository.mutate(windowID: owningWindowID) { $0.resetPinnedDestination(id: id) } }
 
     guard let tab = tab(id), tab.isPinned || tab.isFavorite else { return }
-    updateTab(id) { $0.url = $0.savedURL ?? $0.url }
+    updateTab(id) {
+      if let saved = $0.savedURL { $0.url = saved; $0.nativeNavigation = $0.savedNativeNavigation }
+    }
   }
   @discardableResult public func duplicateTab(id: String) -> BrowserTab? {
     if let repository { return repository.mutate(windowID: owningWindowID) { $0.duplicateTab(id: id) } }
 
     guard let tab = tab(id) else { return nil }
+    if let proof = tab.nativeNavigation, proof.matches(tab.url) {
+      guard let created = createTab(spaceID: tab.spaceID) else { return nil }
+      updateTab(created.id) {
+        $0.url = tab.url; $0.title = tab.title; $0.nativeNavigation = proof
+        $0.navigation = [NavigationEntry(url: tab.url, title: tab.title, nativeNavigation: proof)]; $0.navigationIndex = 0
+      }
+      return self.tab(created.id)
+    }
     let duplicate = BrowserAddress.extensionURL(tab.url) == nil
       ? createTab(address: tab.url, spaceID: tab.spaceID)
       : createExtensionTab(url: tab.url, title: tab.title, spaceID: tab.spaceID)
@@ -887,6 +908,7 @@ public final class BrowserStore: ObservableObject {
     clean.archive.removeAll { !spaces.contains($0.tab.spaceID) }
     clean.history.removeAll { !profiles.contains($0.profileID) }
     clean.bookmarks.removeAll { !profiles.contains($0.profileID) }
+    clean.bookmarkImportAcknowledgements.removeAll { !profiles.contains($0.profileID) }
     clean.downloads.removeAll { !profiles.contains($0.profileID) }
     clean.permissions.removeAll { !profiles.contains($0.profileID) }
     if !spaces.contains(clean.activeSpaceID) {
@@ -916,7 +938,7 @@ public final class BrowserStore: ObservableObject {
     state.folders = Array(unique(state.folders).prefix(1_000))
     state.bookmarks = Array(unique(state.bookmarks).prefix(20_000))
     state.history = Array(unique(state.history).prefix(20_000))
-    state.downloads = Array(unique(state.downloads).prefix(1_000))
+    state.downloads = unique(state.downloads)
     state.archive = Array(unique(state.archive).prefix(1_000))
     state.splits = unique(state.splits)
     if state.profiles.isEmpty { state.profiles = BrowserState().profiles }
@@ -928,10 +950,15 @@ public final class BrowserStore: ObservableObject {
     let spaces = Set(state.spaces.map(\.id))
     state.tabs.removeAll {
       !spaces.contains($0.spaceID)
-        || BrowserAddress.documentURL($0.url) == nil
+        || BrowserAddress.documentURL($0.url, provenance: $0.nativeNavigation) == nil
     }
     let spaceProfiles = Dictionary(uniqueKeysWithValues: state.spaces.map { ($0.id,$0.profileID) })
-    let openTabs = Dictionary(uniqueKeysWithValues: state.tabs.filter { !$0.isClosed }.map { ($0.id,$0) })
+    var openTabs = Dictionary(uniqueKeysWithValues: state.tabs.filter { !$0.isClosed }.map { ($0.id,$0) })
+    for tab in state.tabs {
+      if let preview = tab.peekDocument, BrowserAddress.documentURL(preview.url, provenance: preview.nativeNavigation) != nil {
+        openTabs[preview.id] = preview
+      }
+    }
     for i in state.tabs.indices {
       guard let openerID = state.tabs[i].openerTabID else { continue }
       if state.tabs[i].isClosed || openerID == state.tabs[i].id || openTabs[openerID] == nil ||
@@ -942,7 +969,7 @@ public final class BrowserStore: ObservableObject {
     state.folders.removeAll { !spaces.contains($0.spaceID) }
     state.archive.removeAll {
       !spaces.contains($0.tab.spaceID)
-        || BrowserAddress.documentURL($0.tab.url) == nil
+        || BrowserAddress.documentURL($0.tab.url, provenance: $0.tab.nativeNavigation) == nil
     }
     state.splits.removeAll { group in
       !spaces.contains(group.spaceID) || group.leftTabID == group.rightTabID
@@ -967,6 +994,10 @@ public final class BrowserStore: ObservableObject {
     state.bookmarks.removeAll {
       !profiles.contains($0.profileID) || BrowserAddress.webURL($0.url) == nil
     }
+    let publicProfiles = Set(state.profiles.filter { !$0.isPrivate }.map(\.id))
+    state.bookmarkImportAcknowledgements = Array(state.bookmarkImportAcknowledgements.filter {
+      publicProfiles.contains($0.profileID) && !$0.logicalID.isEmpty && $0.logicalID.count <= 128 && UUID(uuidString: $0.uuid) != nil
+    }.prefix(20_000))
     for i in state.history.indices {
       state.history[i].url = BrowserAddress.webURL(state.history[i].url)!.absoluteString
       state.history[i].title = boundedText(state.history[i].title, limit: 500, fallback: state.history[i].url)
@@ -976,6 +1007,10 @@ public final class BrowserStore: ObservableObject {
       state.bookmarks[i].title = boundedText(state.bookmarks[i].title, limit: 500, fallback: state.bookmarks[i].url)
     }
     state.downloads.removeAll { !profiles.contains($0.profileID) }
+    for i in state.downloads.indices {
+      if let guid = state.downloads[i].nativeGUID, UUID(uuidString: guid) == nil { state.downloads[i].nativeGUID = nil }
+    }
+    state.downloads = DownloadCollection.ordered(state.downloads)
     var permissionIDs = Set<String>()
     state.permissions = Array(state.permissions.compactMap { permission in
       guard profiles.contains(permission.profileID), let origin = BrowserAddress.webOrigin(permission.origin),
@@ -1075,20 +1110,30 @@ public final class BrowserStore: ObservableObject {
     state.tabs[index].savedTitle = state.tabs[index].savedTitle.map { boundedText($0, limit: 500) }
     if let peek = state.tabs[index].peek { state.tabs[index].peek?.title = boundedText(peek.title, limit: 500) }
   }
-  private func repairTab(_ tab: inout BrowserTab) {
-    if let url = BrowserAddress.documentURL(tab.url) { tab.url = url.absoluteString }
-    tab.savedURL = tab.savedURL.flatMap { BrowserAddress.documentURL($0)?.absoluteString }
+  func repairTab(_ tab: inout BrowserTab) {
+    if !tab.isClosed || tab.closedAt?.timeIntervalSince1970.isFinite == false { tab.closedAt = nil }
+    if let url = BrowserAddress.documentURL(tab.url, provenance: tab.nativeNavigation) { tab.url = url.absoluteString }
+    if tab.nativeNavigation?.matches(tab.url) != true { tab.nativeNavigation = nil }
+    tab.savedURL = tab.savedURL.flatMap { BrowserAddress.documentURL($0, provenance: tab.savedNativeNavigation)?.absoluteString }
+    if tab.savedURL.map({ tab.savedNativeNavigation?.matches($0) == true }) != true { tab.savedNativeNavigation = nil }
     if let folder = tab.folderID, !state.folders.contains(where: { $0.id == folder && $0.spaceID == tab.spaceID }) { tab.folderID = nil }
     if tab.isFavorite { tab.folderID = nil; tab.isPinned = true }
     if tab.folderID != nil { tab.isPinned = true }
     tab.title = boundedText(tab.title, limit: 500, fallback: "New tab")
     tab.customTitle = tab.customTitle.flatMap { let value = boundedText($0, limit: 500); return value.isEmpty ? nil : value }
     if tab.isPinned {
-      if tab.savedURL.flatMap(BrowserAddress.documentURL) == nil { tab.savedURL = tab.url }
+      if tab.savedURL.flatMap({ BrowserAddress.documentURL($0, provenance: tab.savedNativeNavigation) }) == nil { tab.savedURL = tab.url; tab.savedNativeNavigation = tab.nativeNavigation }
       tab.savedTitle = boundedText(tab.savedTitle ?? tab.title, limit: 500, fallback: tab.title)
-    } else { tab.savedURL = nil; tab.savedTitle = nil; tab.isClosed = false }
-    if tab.isClosed || tab.peek.map({ BrowserAddress.webURL($0.url) == nil }) == true { tab.peek = nil }
-    else if let peek = tab.peek, let url = BrowserAddress.webURL(peek.url) { tab.peek = .init(url: url.absoluteString, title: boundedText(peek.title, limit: 500)) }
+    } else { tab.savedURL = nil; tab.savedNativeNavigation = nil; tab.savedTitle = nil; tab.isClosed = false }
+    if tab.isClosed || tab.peek.map({ BrowserAddress.documentURL($0.url, provenance: $0.nativeNavigation) == nil }) == true { tab.peek = nil }
+    else if var peek = tab.peek, var preview = tab.peekDocument {
+      repairTab(&preview)
+      peek.url = preview.url; peek.title = preview.title; peek.nativeNavigation = preview.nativeNavigation
+      peek.navigation = preview.navigation; peek.navigationIndex = preview.navigationIndex
+      if peek.createdAt?.timeIntervalSince1970.isFinite == false { peek.createdAt = nil }
+      if peek.lastAccessedAt?.timeIntervalSince1970.isFinite == false { peek.lastAccessedAt = nil }
+      tab.peek = peek
+    }
     let originalIndex = tab.navigationIndex
     var entries: [NavigationEntry] = []
     var currentIndex: Int?
@@ -1096,13 +1141,13 @@ public final class BrowserStore: ObservableObject {
       let start = max(0, originalIndex - 49), end = min(tab.navigation.count, max(0, originalIndex - 49) + 100)
       for index in start..<end {
         let entry = tab.navigation[index]
-        guard let url = BrowserAddress.webURL(entry.url)?.absoluteString ?? (entry.url == "about:blank" ? entry.url : nil) else { continue }
+        guard let url = BrowserAddress.documentURL(entry.url, provenance: entry.nativeNavigation)?.absoluteString else { continue }
         if index == originalIndex, url == tab.url { currentIndex = entries.count }
-        entries.append(.init(url: url, title: boundedText(entry.title, limit: 500)))
+        entries.append(.init(url: url, title: boundedText(entry.title, limit: 500), nativeNavigation: entry.nativeNavigation?.matches(url) == true ? entry.nativeNavigation : nil))
       }
     }
     if let currentIndex { tab.navigation = entries; tab.navigationIndex = currentIndex }
-    else { tab.navigation = [.init(url: tab.url, title: tab.title)]; tab.navigationIndex = 0 }
+    else { tab.navigation = [.init(url: tab.url, title: tab.title, nativeNavigation: tab.nativeNavigation)]; tab.navigationIndex = 0 }
   }
   private func unique<T: Identifiable>(_ values: [T]) -> [T] where T.ID == String {
     var seen = Set<String>()

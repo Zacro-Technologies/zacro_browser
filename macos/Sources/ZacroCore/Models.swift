@@ -69,8 +69,10 @@ public enum BrowserAddress {
       !parts.path.hasPrefix("/zacro-compat-") else { return nil }
     return parts.url
   }
-  static func documentURL(_ value: String) -> URL? {
-    webURL(value) ?? extensionURL(value) ?? (value == "about:blank" ? URL(string: value) : nil)
+  /// Structural retention only. A native provenance always requires engine revalidation before load.
+  public static func documentURL(_ value: String, provenance: NativeNavigationProvenance? = nil) -> URL? {
+    if provenance?.matches(value) == true { return NativeNavigationProvenance.structuralURL(value) }
+    return webURL(value) ?? extensionURL(value) ?? (value == "about:blank" ? URL(string: value) : nil)
   }
 }
 
@@ -127,17 +129,30 @@ public struct BrowserSpace: Codable, Identifiable, Equatable, Sendable {
 public struct NavigationEntry: Codable, Equatable, Sendable {
   public var url: String
   public var title: String
-  public init(url: String, title: String = "") {
+  public var nativeNavigation: NativeNavigationProvenance?
+  public init(url: String, title: String = "", nativeNavigation: NativeNavigationProvenance? = nil) {
     self.url = url
     self.title = title
+    self.nativeNavigation = nativeNavigation
   }
 }
 public struct SavedPeek: Codable, Equatable, Sendable {
   public var url: String
   public var title: String
+  public var nativeNavigation: NativeNavigationProvenance?
+  public var muted: Bool?
+  public var autoDiscardable: Bool?
+  public var isPresented: Bool?
+  public var navigation: [NavigationEntry]?
+  public var navigationIndex: Int?
+  public var createdAt: Date?
+  public var lastAccessedAt: Date?
+  public var isMuted: Bool { get { muted ?? false } set { muted = newValue } }
   public init(url: String, title: String = "") {
     self.url = url
     self.title = title
+    createdAt = Date()
+    lastAccessedAt = createdAt
   }
 }
 public struct BrowserTab: Codable, Identifiable, Equatable, Sendable {
@@ -153,6 +168,9 @@ public struct BrowserTab: Codable, Identifiable, Equatable, Sendable {
   public var isFavorite: Bool
   public var isPinned: Bool
   public var isClosed: Bool
+  public var closedAt: Date?
+  public var nativeNavigation: NativeNavigationProvenance?
+  public var savedNativeNavigation: NativeNavigationProvenance?
   public var savedURL: String?
   public var savedTitle: String?
   public var muted: Bool?
@@ -244,6 +262,7 @@ public struct Bookmark: Codable, Identifiable, Equatable, Sendable {
   public var profileID: String
   public var url: String
   public var title: String
+  public var nativeIdentity: NativeBookmarkIdentity?
   public var createdAt: Date
   public init(id: String = UUID().uuidString, profileID: String, url: String, title: String, createdAt: Date = Date()) {
     self.id = id
@@ -252,13 +271,14 @@ public struct Bookmark: Codable, Identifiable, Equatable, Sendable {
     self.title = title
     self.createdAt = createdAt
   }
-  private enum CodingKeys: String, CodingKey { case id, profileID, url, title, createdAt }
+  private enum CodingKeys: String, CodingKey { case id, profileID, url, title, createdAt, nativeIdentity }
   public init(from decoder: Decoder) throws {
     let values = try decoder.container(keyedBy: CodingKeys.self)
     id = try values.decode(String.self, forKey: .id)
     profileID = try values.decode(String.self, forKey: .profileID)
     url = try values.decode(String.self, forKey: .url)
     title = try values.decode(String.self, forKey: .title)
+    nativeIdentity = try values.decodeIfPresent(NativeBookmarkIdentity.self, forKey: .nativeIdentity)
     createdAt = try values.decodeIfPresent(Date.self, forKey: .createdAt) ?? .distantPast
   }
 }
@@ -272,6 +292,9 @@ public struct ArchivedTab: Codable, Identifiable, Equatable, Sendable {
   }
 }
 public struct DownloadRecord: Codable, Identifiable, Equatable, Sendable {
+  public var nativeGUID: String?
+  public var canResume: Bool?
+  public var isDangerous: Bool?
   public var id: String
   public var profileID: String
   public var url: String
@@ -362,6 +385,7 @@ public struct BrowserState: Codable, Equatable, Sendable {
   public var tabGroups: [BrowserTabGroup] = []
   public var history: [HistoryEntry] = []
   public var bookmarks: [Bookmark] = []
+  public var bookmarkImportAcknowledgements: [NativeBookmarkImportAcknowledgement] = []
   public var archive: [ArchivedTab] = []
   public var downloads: [DownloadRecord] = []
   public var permissions: [WebsitePermission] = []
@@ -380,7 +404,7 @@ public struct BrowserState: Codable, Equatable, Sendable {
     activeSpaceID = "home"
   }
   private enum CodingKeys: String, CodingKey {
-    case version, profiles, spaces, tabs, folders, splits, tabGroups, history, bookmarks, archive, downloads,
+    case version, profiles, spaces, tabs, folders, splits, tabGroups, history, bookmarks, bookmarkImportAcknowledgements, archive, downloads,
       permissions, settings, windowBounds, windowSessions, focusedWindowID, activeSpaceID, activeTabID
   }
   public init(from decoder: Decoder) throws {
@@ -396,6 +420,7 @@ public struct BrowserState: Codable, Equatable, Sendable {
     tabGroups = try c.decodeIfPresent([BrowserTabGroup].self, forKey: .tabGroups) ?? []
     history = try c.decodeIfPresent([HistoryEntry].self, forKey: .history) ?? []
     bookmarks = try c.decodeIfPresent([Bookmark].self, forKey: .bookmarks) ?? []
+    bookmarkImportAcknowledgements = try c.decodeIfPresent([NativeBookmarkImportAcknowledgement].self, forKey: .bookmarkImportAcknowledgements) ?? []
     archive = try c.decodeIfPresent([ArchivedTab].self, forKey: .archive) ?? []
     downloads = try c.decodeIfPresent([DownloadRecord].self, forKey: .downloads) ?? []
     permissions = try c.decodeIfPresent([WebsitePermission].self, forKey: .permissions) ?? []

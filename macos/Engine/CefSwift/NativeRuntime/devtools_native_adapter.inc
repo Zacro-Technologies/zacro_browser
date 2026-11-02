@@ -2,6 +2,7 @@
 // This channel is reachable only through CEF's native API. It is never exposed
 // as a page binding, socket, scheme handler, or extension API.
 #include <algorithm>
+#include <cmath>
 #include "base/base64.h"
 #include "base/functional/bind.h"
 #include "base/pickle.h"
@@ -17,6 +18,8 @@
 #include "chrome/browser/ui/extensions/extension_action_view_model.h"
 #include "chrome/browser/ui/extensions/extensions_container.h"
 #include "chrome/browser/ui/toolbar/toolbar_action_view_model.h"
+#include "chrome/browser/ui/side_panel/side_panel_ui.h"
+#include "chrome/browser/ui/views/extensions/native_extension_popup_anchor.h"
 #include "components/os_crypt/async/browser/os_crypt_async.h"
 #include "components/os_crypt/async/common/encryptor.h"
 #include "components/sessions/content/content_serialized_navigation_builder.h"
@@ -41,8 +44,11 @@
 #include "extensions/common/extension.h"
 #include "extensions/common/manifest_handlers/background_info.h"
 #include "ui/gfx/image/image.h"
+#include "ui/gfx/geometry/rect_f.h"
 #include "cef/libcef/browser/devtools/zacro_extensions_adapter.inc"
 #include "cef/libcef/browser/devtools/zacro_topology_adapter.inc"
+#include "cef/libcef/browser/devtools/zacro_bookmarks_adapter.inc"
+#include "cef/libcef/browser/devtools/zacro_downloads_adapter.inc"
 
 namespace {
 constexpr char kZacroBrowserSession[] = "zacro.native.browser.v1";
@@ -61,6 +67,30 @@ bool ZacroRestorableURL(const GURL& url, content::BrowserContext* context) {
     return registry && registry->enabled_extensions().Contains(std::string(url.host()));
   }
   return false;
+}
+
+bool ZacroHasExtensionUI(content::WebContents* contents) {
+  auto* browser = extensions::browser_window_util::GetBrowserForTabContents(*contents);
+  if (!browser) return false;
+  if (auto* panel = SidePanelUI::From(browser); panel && panel->IsSidePanelShowing()) return true;
+  auto* container = ExtensionsContainer::From(*browser);
+  auto* registry = extensions::ExtensionRegistry::Get(contents->GetBrowserContext());
+  if (container && registry) for (const auto& extension : registry->enabled_extensions()) {
+    auto* action = container->GetActionForId(extension->id());
+    if (action && action->IsShowingPopup()) return true;
+  }
+  return false;
+}
+
+bool ZacroHistoryApproval(const GURL& url, content::BrowserContext* context,
+    std::string& extension, std::string& incarnation, content::WebContents* contents = nullptr) {
+  if (ZacroRestorableURL(url, context)) return true;
+  auto& approvals = (contents ? ZacroNavigationApprovals::ForDocument(contents) : ZacroNavigationApprovals::Get(context))->destinations;
+  const auto found = approvals.find(url.spec());
+  if (found == approvals.end()) return false;
+  extension = found->second.first; incarnation = found->second.second;
+  std::string error;
+  return ZacroValidateNavigation(context, extension, incarnation, url.spec(), error);
 }
 }
 
@@ -176,6 +206,8 @@ bool CefDevToolsController::DispatchZacro(const std::string_view& message) {
   }
   if (DispatchZacroTopology(*id, *method, request->FindDict("params"))) return true;
   if (DispatchZacroExtensions(*id, *method, request->FindDict("params"))) return true;
+  if (DispatchZacroBookmarks(*id, *method, request->FindDict("params"))) return true;
+  if (DispatchZacroDownloads(*id, *method, request->FindDict("params"))) return true;
   const auto* session = request->FindString("sessionId");
   if (session && (*session == kZacroBrowserSession || zacro_browser_sessions_.contains(*session))) {
     if (!zacro_browser_agent_) {
@@ -205,7 +237,7 @@ bool CefDevToolsController::DispatchZacro(const std::string_view& message) {
         .Set("documentState", true).Set("browsingData", true).Set("navigationState", true)
         .Set("encryptedNavigation", true).Set("retainedDiscard", true)
         .Set("extensionActions", true).Set("legacyNavigation", true).Set("extensionStorage", true).Set("extensionBrowser", true)
-        .Set("volatileDiscard", true));
+        .Set("volatileDiscard", true).Set("bookmarks", true).Set("historyRemoval", true).Set("downloads", true));
     return true;
   }
   if (*method == "Zacro.extensionWorkerTarget") {
@@ -302,7 +334,21 @@ bool CefDevToolsController::DispatchZacro(const std::string_view& message) {
     auto* container = browser ? ExtensionsContainer::From(*browser) : nullptr;
     auto* model = container ? container->GetActionForId(*extension_id) : nullptr;
     if (!model) { ReplyZacro(*id, {}, "The native extension action container is unavailable."); return true; }
+    if (const auto* anchor = params->FindDict("anchor")) {
+      const auto number = anchor->FindInt("windowNumber");
+      const auto x = anchor->FindDouble("x"), y = anchor->FindDouble("y");
+      const auto width = anchor->FindDouble("width"), height = anchor->FindDouble("height");
+      if (!extensions::ExtensionTabUtil::IsVisibleToNativeBrowserModel(inspected_contents_) ||
+          !number || *number <= 0 || !x || !y || !width || !height ||
+          !std::isfinite(*x) || !std::isfinite(*y) || !std::isfinite(*width) || !std::isfinite(*height) ||
+          std::abs(*x) > 1000000 || std::abs(*y) > 1000000 || *width <= 0 || *height <= 0 ||
+          *width > 4096 || *height > 4096 ||
+          !NativeExtensionPopupAnchor::Prepare(inspected_contents_, *number, gfx::RectF(*x, *y, *width, *height))) {
+        ReplyZacro(*id, {}, "The native extension popup anchor is unavailable."); return true;
+      }
+    }
     model->ExecuteUserAction(ExtensionActionViewModel::InvocationSource::kCdp);
+    NativeExtensionPopupAnchor::CancelPrepared(inspected_contents_);
     ReplyZacro(*id, base::DictValue().Set("performed", true)); return true;
   }
   if (*method == "Zacro.restoreNavigationEntries") {
@@ -319,10 +365,12 @@ bool CefDevToolsController::DispatchZacro(const std::string_view& message) {
       const auto* item = value.GetIfDict();
       const auto* url = item ? item->FindString("url") : nullptr;
       const auto* title = item ? item->FindString("title") : nullptr;
+      std::string extension, incarnation;
       if (!url || url->size() > 32768 || !title || title->size() > 8192 ||
-          !ZacroRestorableURL(GURL(*url), inspected_contents_->GetBrowserContext())) {
+          !ZacroHistoryApproval(GURL(*url), inspected_contents_->GetBrowserContext(), extension, incarnation)) {
         ReplyZacro(*id, {}, "Legacy navigation contains an invalid entry."); return true;
       }
+      if (!extension.empty()) ZacroNavigationApprovals::ForDocument(inspected_contents_)->destinations[*url] = {extension, incarnation};
       sessions::SerializedNavigationEntry entry;
       entry.set_index(serialized.size()); entry.set_virtual_url(GURL(*url)); entry.set_title(base::UTF8ToUTF16(*title));
       serialized.push_back(std::move(entry));
@@ -340,6 +388,7 @@ bool CefDevToolsController::DispatchZacro(const std::string_view& message) {
         .Set("beforeUnload", inspected_contents_->NeedToFireBeforeUnloadOrUnloadEvents())
         .Set("devToolsOpen", DevToolsWindow::GetInstanceForInspectedWebContents(inspected_contents_) != nullptr)
         .Set("profileDownloads", context->GetDownloadManager()->InProgressCount())
+        .Set("extensionUI", ZacroHasExtensionUI(inspected_contents_))
         .Set("crashed", inspected_contents_->IsCrashed())
         .Set("loading", inspected_contents_->IsLoading()));
     return true;
@@ -348,11 +397,13 @@ bool CefDevToolsController::DispatchZacro(const std::string_view& message) {
     const auto* params = request->FindDict("params");
     const bool site = params && params->FindBool("siteData").value_or(false);
     const bool cache = params && params->FindBool("cache").value_or(false);
+    const bool history = params && params->FindBool("history").value_or(false);
     uint64_t mask = 0;
     if (site) mask |= chrome_browsing_data_remover::DATA_TYPE_SITE_DATA;
     if (cache) mask |= content::BrowsingDataRemover::DATA_TYPE_CACHE;
+    if (history) mask |= chrome_browsing_data_remover::DATA_TYPE_HISTORY;
     if (!mask || zacro_data_removals_.contains(*id)) {
-      ReplyZacro(*id, {}, "Choose site data or cache to clear."); return true;
+      ReplyZacro(*id, {}, "Choose history, site data or cache to clear."); return true;
     }
     auto removal = std::make_unique<ZacroDataRemoval>(
         inspected_contents_->GetBrowserContext()->GetBrowsingDataRemover(),
@@ -367,7 +418,7 @@ bool CefDevToolsController::DispatchZacro(const std::string_view& message) {
     if (zacro_discard_ || inspected_contents_->GetVisibility() != content::Visibility::HIDDEN || inspected_contents_->IsLoading() ||
         inspected_contents_->IsCurrentlyAudible() || inspected_contents_->IsBeingCaptured() ||
         inspected_contents_->NeedToFireBeforeUnloadOrUnloadEvents() ||
-        DevToolsWindow::GetInstanceForInspectedWebContents(inspected_contents_) ||
+        DevToolsWindow::GetInstanceForInspectedWebContents(inspected_contents_) || ZacroHasExtensionUI(inspected_contents_) ||
         inspected_contents_->GetBrowserContext()->GetDownloadManager()->InProgressCount() > 0) {
       ReplyZacro(*id, {}, "The document is in use and cannot be put to sleep."); return true;
     }
@@ -381,7 +432,8 @@ bool CefDevToolsController::DispatchZacro(const std::string_view& message) {
     size_t retained_bytes = 0;
     for (int index = 0; index < controller.GetEntryCount(); ++index) {
       auto* entry = controller.GetEntryAtIndex(index);
-      if (!ZacroRestorableURL(entry->GetVirtualURL(), inspected_contents_->GetBrowserContext())) {
+      std::string extension, incarnation;
+      if (!ZacroHistoryApproval(entry->GetVirtualURL(), inspected_contents_->GetBrowserContext(), extension, incarnation, inspected_contents_)) {
         zacro_dormant_history_.clear(); ReplyZacro(*id, {}, "The document history contains an unsupported address."); return true;
       }
       auto saved = sessions::ContentSerializedNavigationBuilder::FromNavigationEntry(index, entry);
@@ -424,17 +476,19 @@ bool CefDevToolsController::DispatchZacro(const std::string_view& message) {
       ReplyZacro(*id, {}, "Navigation history exceeds the supported entry count."); return true;
     }
     base::Pickle pickle;
-    pickle.WriteInt(1);
+    pickle.WriteInt(2);
     pickle.WriteInt(controller.GetLastCommittedEntryIndex());
     pickle.WriteInt(count);
     for (int index = 0; index < count; ++index) {
-      if (!ZacroRestorableURL(controller.GetEntryAtIndex(index)->GetURL(),
-                             inspected_contents_->GetBrowserContext())) {
+      std::string extension, incarnation;
+      if (!ZacroHistoryApproval(controller.GetEntryAtIndex(index)->GetVirtualURL(),
+                             inspected_contents_->GetBrowserContext(), extension, incarnation, inspected_contents_)) {
         ReplyZacro(*id, {}, "This navigation contains a non-restorable browser URL."); return true;
       }
       auto entry = sessions::ContentSerializedNavigationBuilder::FromNavigationEntry(
           index, controller.GetEntryAtIndex(index));
       entry.WriteToPickle(512 * 1024, &pickle);
+      pickle.WriteString(extension); pickle.WriteString(incarnation);
       if (pickle.size() > kZacroMaximumHistoryBytes - 4096) {
         ReplyZacro(*id, {}, "Navigation state exceeds the supported size."); return true;
       }
@@ -507,7 +561,7 @@ bool CefDevToolsController::DispatchZacro(const std::string_view& message) {
           auto pickle = base::Pickle::WithData(*plain);
           base::PickleIterator iterator(pickle);
           int version = 0, selected = -1, count = 0;
-          if (!iterator.ReadInt(&version) || version != 1 || !iterator.ReadInt(&selected) ||
+          if (!iterator.ReadInt(&version) || (version != 1 && version != 2) || !iterator.ReadInt(&selected) ||
               !iterator.ReadInt(&count) || count < 1 || count > 500 || selected < 0 || selected >= count) {
             self->ReplyZacro(id, {}, "Unsupported navigation state."); return;
           }
@@ -515,9 +569,14 @@ bool CefDevToolsController::DispatchZacro(const std::string_view& message) {
           std::vector<sessions::SerializedNavigationEntry> saved;
           for (int index = 0; index < count; ++index) {
             sessions::SerializedNavigationEntry entry;
-            if (!entry.ReadFromPickle(&iterator) || !ZacroRestorableURL(entry.virtual_url(), context)) {
-              self->ReplyZacro(id, {}, "Invalid navigation entry."); return;
+            std::string extension, incarnation, error;
+            if (!entry.ReadFromPickle(&iterator) ||
+                (version == 2 && (!iterator.ReadString(&extension) || !iterator.ReadString(&incarnation))) ||
+                (extension.empty() ? !ZacroRestorableURL(entry.virtual_url(), context) :
+                 !ZacroValidateNavigation(context, extension, incarnation, entry.virtual_url().spec(), error))) {
+              self->ReplyZacro(id, {}, error.empty() ? "Invalid navigation entry." : error); return;
             }
+            if (!extension.empty()) ZacroNavigationApprovals::ForDocument(self->inspected_contents_)->destinations[entry.virtual_url().spec()] = {extension, incarnation};
             saved.push_back(std::move(entry));
           }
           auto& controller = self->inspected_contents_->GetController();

@@ -1,0 +1,29 @@
+#ifndef CHROME_BROWSER_UI_VIEWS_EXTENSIONS_NATIVE_EXTENSION_POPUP_ANCHOR_H_
+#define CHROME_BROWSER_UI_VIEWS_EXTENSIONS_NATIVE_EXTENSION_POPUP_ANCHOR_H_
+
+#include <memory>
+#include "base/functional/callback_forward.h"
+
+namespace content { class WebContents; }
+namespace gfx { class RectF; }
+namespace views { class View; class Widget; }
+
+// Browser-process-only bridge from a native shell action to Chromium's actual
+// ExtensionPopup. It never loads an extension URL or grants tab permissions.
+class NativeExtensionPopupAnchor {
+ public:
+  static bool Prepare(content::WebContents* contents, int native_window_number,
+                      const gfx::RectF& cocoa_screen_anchor);
+  static bool HasPrepared(content::WebContents* contents);
+  static void CancelPrepared(content::WebContents* contents);
+  static std::unique_ptr<NativeExtensionPopupAnchor> Take(content::WebContents* contents);
+  ~NativeExtensionPopupAnchor();
+  views::View* view() const;
+  void Attach(views::Widget* popup, base::RepeatingClosure close);
+ private:
+  class Impl;
+  explicit NativeExtensionPopupAnchor(std::unique_ptr<Impl> impl);
+  std::unique_ptr<Impl> impl_;
+};
+
+#endif

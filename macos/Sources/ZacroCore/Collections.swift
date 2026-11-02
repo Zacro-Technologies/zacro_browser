@@ -9,7 +9,7 @@ extension BrowserStore {
     let ids = Set(profiles.map(\.id))
     let spaces = state.spaces.filter { ids.contains($0.profileID) }
     let spaceIDs = Set(spaces.map(\.id))
-    let tabs = state.tabs.filter { spaceIDs.contains($0.spaceID) }
+    let tabs = state.tabs.filter { spaceIDs.contains($0.spaceID) && BrowserAddress.documentURL($0.url) != nil }
     let tabIDs = Set(tabs.map(\.id))
     let null = NSNull()
     let profilesJSON: [[String: Any]] = profiles.map {
@@ -32,10 +32,15 @@ extension BrowserStore {
       if tab.homePage == true { value["homePage"] = true }
       if let autoDiscardable = tab.autoDiscardable { value["autoDiscardable"] = autoDiscardable }
       if let group = tab.groupID { value["groupId"] = group }
-      if let opener = tab.openerTabID, tabIDs.contains(opener) { value["openerTabId"] = opener }
-      if let saved = tab.savedURL { value["pinnedUrl"] = saved }
+      if let opener = tab.openerTabID {
+        let source = opener.hasPrefix("peek:") ? String(opener.dropFirst(5)) : opener
+        if tabIDs.contains(source), !opener.hasPrefix("peek:") || tabs.contains(where: { $0.id == source && $0.peek.flatMap { BrowserAddress.webURL($0.url) } != nil }) {
+          value["openerTabId"] = opener
+        }
+      }
+      if let saved = tab.savedURL, BrowserAddress.webURL(saved) != nil { value["pinnedUrl"] = saved }
       if let title = tab.savedTitle { value["pinnedTitle"] = title }
-      if let peek = tab.peek { value["savedPeek"] = ["url": peek.url, "title": peek.title] }
+      if let peek = tab.peek, BrowserAddress.webURL(peek.url) != nil { value["savedPeek"] = ["url": peek.url, "title": peek.title] }
       return value
     }
     var settings = try JSONSerialization.jsonObject(with: JSONEncoder().encode(state.settings)) as! [String: Any]
@@ -81,7 +86,21 @@ extension BrowserStore {
   }
 
   func mergeCollection(_ source: BrowserState, includeHistory: Bool = false) throws {
-    let validation = BrowserStore(directory: directory.appendingPathComponent("import-validation"), initialState: source)
+    var sanitized = source
+    for i in sanitized.tabs.indices {
+      sanitized.tabs[i].nativeNavigation = nil; sanitized.tabs[i].savedNativeNavigation = nil
+      sanitized.tabs[i].peek?.nativeNavigation = nil
+      if let navigation = sanitized.tabs[i].peek?.navigation {
+        sanitized.tabs[i].peek?.navigation = navigation.map { NavigationEntry(url: $0.url, title: $0.title) }
+      }
+      for j in sanitized.tabs[i].navigation.indices { sanitized.tabs[i].navigation[j].nativeNavigation = nil }
+    }
+    for i in sanitized.archive.indices {
+      sanitized.archive[i].tab.nativeNavigation = nil; sanitized.archive[i].tab.savedNativeNavigation = nil
+      sanitized.archive[i].tab.peek = nil
+      for j in sanitized.archive[i].tab.navigation.indices { sanitized.archive[i].tab.navigation[j].nativeNavigation = nil }
+    }
+    let validation = BrowserStore(directory: directory.appendingPathComponent("import-validation"), initialState: sanitized)
     validation.repair()
     var source = validation.state
     source.profiles.removeAll(where: \.isPrivate)
@@ -122,7 +141,10 @@ extension BrowserStore {
       tab.id = tabsMap[tab.id]!; tab.spaceID = spacesMap[tab.spaceID]!
       tab.folderID = tab.folderID.flatMap { foldersMap[$0] }
       tab.windowID = destinationWindow; tab.groupID = tab.groupID.flatMap { groupsMap[$0] }
-      tab.openerTabID = tab.openerTabID.flatMap { tabsMap[$0] }
+      tab.openerTabID = tab.openerTabID.flatMap { id in
+        if id.hasPrefix("peek:") { return tabsMap[String(id.dropFirst(5))].map { "peek:" + $0 } }
+        return tabsMap[id]
+      }
       if !includeHistory { tab.navigation = [NavigationEntry(url: tab.url, title: tab.title)]; tab.navigationIndex = 0 }
       merged.tabs.append(tab)
     }

@@ -27,6 +27,7 @@ final class NativeExtensionSync {
     init(_ manager: ChromeExtensionManager) { self.manager = manager }
   }
   var nativeEvent: ((String, ChromeExtensionEvent) -> Void)?
+  var nativeObservationReady: ((String) -> Void)?
   private let engine: ChromiumEngine
   private let store: BrowserStore
   private let services: NativeServicesModel
@@ -99,6 +100,16 @@ final class NativeExtensionSync {
     }
     for id in needed where profiles[id] == nil { requestRefresh(id) }
   }
+  func ensureNativeObservation(profileID: String) async throws {
+    try await ordered(profileID) { profile in
+      if !profile.observing {
+        do { try await self.prepare(profileID, profile) }
+        catch { if !profile.observing { throw error } }
+      }
+      try self.check(profileID, profile)
+      guard profile.observing else { throw CancellationError() }
+    }
+  }
   func removeProfile(_ id: String) async {
     epochs[id, default: 0] += 1
     let removalEpoch = epochs[id, default: 0]
@@ -122,7 +133,7 @@ final class NativeExtensionSync {
   func close() async {
     guard !closed else { return }; closed = true
     services.portableLibrary = nil; services.prepareNativeSync = nil; services.nativeSyncStatusChanged = nil
-    services.syncLibraryEvent = nil; services.syncStorageEvent = nil; services.nativeSyncAction = nil; nativeEvent = nil
+    services.syncLibraryEvent = nil; services.syncStorageEvent = nil; services.nativeSyncAction = nil; nativeEvent = nil; nativeObservationReady = nil
     for id in Array(profiles.keys) { await removeProfile(id) }
     for task in tails.values { task.cancel() }; tails.removeAll()
   }
@@ -208,6 +219,7 @@ final class NativeExtensionSync {
         }
       }
       try check(id, profile); profile.observing = true
+      nativeObservationReady?(id)
     }
     guard profile.pendingLifecycle == 0 else { throw CancellationError() }
     // An uninstall/reinstall must retire its previous recovery checkpoint

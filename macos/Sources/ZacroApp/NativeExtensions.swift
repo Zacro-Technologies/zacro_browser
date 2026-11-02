@@ -27,7 +27,7 @@ final class NativeExtensionsModel: ObservableObject {
   private var actionGeneration = 0
   private var actionStates: [String: ChromeExtensionAction] = [:]
   private var actionIcons: [String: NSImage] = [:]
-  var invokeAction: ((String,String) async throws -> Void)?
+  var invokeAction: ((String, String, NSRect?) async throws -> Void)?
   init(store: BrowserStore, engine: ChromiumEngine, actions: BrowserActions) {
     self.store = store; self.engine = engine; self.actions = actions
   }
@@ -109,7 +109,7 @@ final class NativeExtensionsModel: ObservableObject {
     switch event {
     case .registryChanged, .installationChanged: refresh()
     case .actionChanged: refreshActions()
-    case .storageChanged, .hostRequest: break
+    case .storageChanged, .hostRequest, .bookmarksChanged, .downloadChanged, .downloadRemoved: break
     }
   }
   func activePageChanged(_ page: ChromiumPage?) {
@@ -123,7 +123,8 @@ final class NativeExtensionsModel: ObservableObject {
   private func refreshActions() {
     actionRequest?.cancel(); actionGeneration += 1
     guard let page = activeDocument, page.profileID == store.activeProfileID,
-      !isPrivate, engine.isWindowOpen, !engine.isWindowClosing else { return }
+      !isPrivate, let windowID = page.ownerWindowID, windowID == store.owningWindowID,
+      let context = engine.context(id: windowID), context.isOpen, !context.isClosing else { return }
     let profile = store.activeProfileID, revision = generation, actionRevision = actionGeneration
     actionRequest = Task { [weak self, weak page] in
       do { try await Task.sleep(for: .milliseconds(40)) } catch { return }
@@ -139,6 +140,7 @@ final class NativeExtensionsModel: ObservableObject {
         }
       }
       guard self.valid(profile, revision), self.activeDocument === page,
+        page.ownerWindowID == windowID, context.isOpen, !context.isClosing,
         self.actionGeneration == actionRevision else { return }
       self.actionStates = states; self.actionIcons = images
       self.publish(profile, revision)
@@ -152,6 +154,13 @@ final class NativeExtensionsModel: ObservableObject {
   func perform(_ operation: String, id: String = "", value: String? = nil, expectedProfile: String? = nil) {
     guard !isPrivate, expectedProfile.map({ $0 == store.activeProfileID }) ?? true else { return }
     let profile = store.activeProfileID, revision = generation
+    let actionAnchor: NSRect?
+    if operation == "action", let event = NSApp.currentEvent,
+      [.leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp, .otherMouseDown, .otherMouseUp].contains(event.type),
+      let eventWindow = event.window {
+      actionAnchor = eventWindow.convertToScreen(NSRect(x: event.locationInWindow.x - 10,
+        y: event.locationInWindow.y - 10, width: 20, height: 20))
+    } else { actionAnchor = nil }
     Task { [weak self] in
       guard let self, self.valid(profile,revision) else { return }
       let manager = ChromeExtensionManager(engine: self.engine, profileID: profile)
@@ -177,7 +186,7 @@ final class NativeExtensionsModel: ObservableObject {
           try await manager.chooseUnpackedExtension()
         case "action":
           guard let invoke = self.invokeAction else { throw ChromeExtensionError.managementUnavailable }
-          try await invoke(profile,id)
+          try await invoke(profile, id, actionAnchor)
         default: throw ChromeExtensionError.invalidResponse
         }
         guard self.valid(profile,revision) else { return }

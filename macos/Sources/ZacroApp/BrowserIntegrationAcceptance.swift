@@ -55,11 +55,24 @@ final class BrowserIntegrationAcceptance {
     _ = try await previewBrowser.devTools.evaluate("document.body.innerHTML='<input id=previewDraft>'; document.querySelector('#previewDraft').value='peek draft'; null")
     let sourceDraft = try await browser.devTools.evaluate("document.querySelector('#draft').value") as? String
     try require(sourceDraft == "keep this draft" && page.nativeWindow?.isVisible == true, "peekKeepsSourceRendered")
+    try first.activateExtensionTab(tab.id)
+    first.layoutPages()
+    try await wait("sourceActivationHidesRetainedPeek") {
+      first.activePage === page && first.store.tab(tab.id)?.peek?.isPresented == false && preview.nativeWindow?.isVisible == false
+    }
+    try first.activateExtensionTab(preview.id)
+    first.layoutPages()
+    let resumedPreviewDraft = try await previewBrowser.devTools.evaluate("document.querySelector('#previewDraft').value") as? String
+    try require(first.activePage === preview && resumedPreviewDraft == "peek draft", "peekActivationRetainsDocumentAndDraft")
+    first.runCommand("mute-tab")
+    try require(previewBrowser.isAudioMuted && !browser.isAudioMuted && first.store.tab(tab.id)?.isMuted == false,
+      "peekMuteDoesNotMuteSource")
     first.promotePeek()
     try await wait("peekPromotion") { first.store.state.activeTabID != tab.id && first.store.tab(tab.id)?.peek == nil }
     guard let promotedID = first.store.state.activeTabID else { throw Failure("Promoted Peek missing") }
     let promotedDraft = try await previewBrowser.devTools.evaluate("document.querySelector('#previewDraft').value") as? String
-    try require(engine.pages[promotedID] === preview && promotedDraft == "peek draft", "peekPromotionKeepsRendererAndForm")
+    try require(engine.pages[promotedID] === preview && promotedDraft == "peek draft"
+      && first.store.tab(promotedID)?.isMuted == true, "peekPromotionKeepsRendererAndForm")
 
     first.store.setSplit(left: tab.id, right: promotedID)
     guard let split = first.store.split(for: tab.id) else { throw Failure("Split creation") }
@@ -72,8 +85,8 @@ final class BrowserIntegrationAcceptance {
     first.store.selectTab(id: tab.id)
     try require(first.store.split(for: tab.id)?.id == split.id, "splitSurvivesTabSwitch")
 
-    // This is the historical watchdog sequence: an actual native target-blank
-    // popup remains open across a second profile and a live split.
+    // Keep a real target-blank popup and a live split open while importing the
+    // Electron collection format through the production import pipeline.
     let beforePopup = Set(application.store.state.tabs.map(\.id))
     _ = try await browser.devTools.evaluate("window.retainedPopup=window.open('/popup','zacro-app-acceptance'); !!window.retainedPopup", userGesture: true)
     try await wait("popupAdoptedByApplication") {
@@ -82,9 +95,29 @@ final class BrowserIntegrationAcceptance {
     guard let popup = application.store.state.tabs.first(where: { !beforePopup.contains($0.id) && engine.pages[$0.id]?.openerID == tab.id }),
       let popupPage = engine.pages[popup.id] else { throw Failure("Popup adoption") }
     try await loaded(popupPage)
+    try require(popup.openerTabID == tab.id, "popupOpenerIsPersistedInSession")
     let originalSpace = tab.spaceID
-    _ = first.store.createProfile(name: "Acceptance second profile")
-    guard let other = first.store.createTab(address: url.appendingPathComponent("other-profile").absoluteString) else { throw Failure("Other profile tab") }
+    let previousProfiles = Set(first.store.state.profiles.map(\.id))
+    let collection: [String: Any] = [
+      "format": "zacro-export", "version": 1,
+      "profiles": [["id": "imported-profile", "name": "Acceptance second profile", "private": false]],
+      "spaces": [["id": "imported-space", "profileId": "imported-profile", "name": "Imported space", "color": "#7556D9"]],
+      "tabs": [["id": "imported-tab", "spaceId": "imported-space", "profileId": "imported-profile",
+        "url": url.appendingPathComponent("other-profile").absoluteString, "title": "Imported page", "pinned": true]],
+      "bookmarks": [["id": "imported-bookmark", "profileId": "imported-profile",
+        "url": url.appendingPathComponent("saved").absoluteString, "title": "Imported bookmark"]]
+    ]
+    let export = engine.dataDirectory.appendingPathComponent("acceptance-electron-export.json")
+    try JSONSerialization.data(withJSONObject: collection).write(to: export, options: .atomic)
+    try first.store.importData(from: export)
+    guard let imported = first.store.state.profiles.first(where: { !previousProfiles.contains($0.id) }),
+      let importedSpace = first.store.state.spaces.first(where: { $0.profileID == imported.id }),
+      let other = first.store.state.tabs.first(where: { $0.spaceID == importedSpace.id }) else { throw Failure("Imported profile tab") }
+    first.store.selectSpace(id: importedSpace.id)
+    first.store.selectTab(id: other.id)
+    try require(other.isPinned && other.windowID == first.windowContext.id
+      && first.store.state.bookmarks.contains(where: { $0.profileID == imported.id && $0.title == "Imported bookmark" }),
+      "electronImportRetainsCollectionsAndWindowOwnership")
     let otherPage = try await first.ensurePageReady(other)
     try await loaded(otherPage)
     try require(otherPage.browser?.profileCachePath != browser.profileCachePath, "applicationProfilesAreIsolated")
@@ -110,6 +143,35 @@ final class BrowserIntegrationAcceptance {
     second.store.updateSettings { $0.sidebarWidth = 288 }
     try require(first.store.state.settings.sidebarWidth == 256 && second.store.state.settings.sidebarWidth == 288,
       "windowSidebarWidthsAreIndependent")
+    _ = try await browser.devTools.evaluate("document.body.insertAdjacentHTML('beforeend','<p>Approved context from its owning window.</p>'); null")
+    first.windowContext.show()
+    try await wait("focusReturnsToFirstWindow", record: false) { application.focusedCoordinator === first }
+    let context = try await application.readContext([
+      AIContextGrant(id: tab.id, url: URL(string: tab.url)!, profileID: page.profileID)
+    ])
+    try require(context.count == 1 && context[0].text.contains("Approved context from its owning window."),
+      "approvedContextUsesTabOwnerAcrossSameProfileWindows")
+    application.newWindow()
+    guard let third = application.windows.values.first(where: { $0 !== first && $0 !== second }),
+      let savedLeft = third.store.createTab(address: url.appendingPathComponent("saved-left").absoluteString),
+      let savedRight = third.store.createTab(address: url.appendingPathComponent("saved-right").absoluteString) else {
+      throw Failure("Saved window setup")
+    }
+    third.actions.palette = false
+    third.store.setSplit(left: savedLeft.id, right: savedRight.id)
+    let savedIDs = Set(third.store.state.tabs.map(\.id)), closedNativeID = third.windowContext.nativeID
+    guard let savedSplit = third.store.split(for: savedLeft.id) else { throw Failure("Saved window split") }
+    _ = try await third.ensurePageReady(savedLeft)
+    let didClose = await third.requestCloseWindow()
+    try require(didClose && application.repository.savedWindows.contains(where: { $0.id == third.windowContext.id }),
+      "closedWindowAppearsInSavedWindows")
+    let reopened = try application.reopenWindow(id: third.windowContext.id)
+    try require(reopened === third && reopened.windowContext.nativeID != closedNativeID
+      && Set(reopened.store.state.tabs.map(\.id)) == savedIDs
+      && reopened.store.split(for: savedLeft.id)?.id == savedSplit.id, "reopenedWindowRetainsExactTabsAndSplit")
+    let reopenedPage = try await reopened.ensurePageReady(savedLeft)
+    try await loaded(reopenedPage)
+    try require(await reopened.requestCloseWindow(), "restoredWindowClosesCleanly")
     application.store.save(); try application.store.flush()
     let decoded = try JSONDecoder().decode(BrowserState.self,
       from: Data(contentsOf: engine.dataDirectory.appendingPathComponent("native-state.json")))
@@ -167,6 +229,34 @@ final class BrowserIntegrationAcceptance {
           && action["windowId"] as? Int == owner.windowContext.nativeID
           && action["active"] as? Bool == true
       }
+      try await checkNativeHistory(manager: manager, worker: worker, owner: owner, url: url)
+      try await checkNativeBookmarkMigration(manager: manager, profileID: page.profileID, url: url)
+      try await checkNativeDownload(worker: worker, profileID: page.profileID, url: url)
+      try await checkNativePeek(manager: manager, identifier: identifier, worker: worker, owner: owner, source: page, url: url)
+      guard let blank = owner.store.createTab(address: "about:blank") else { throw Failure("Blank action tab") }
+      let blankPage = try await owner.extensionActionPage(profileID: page.profileID)
+      try await manager.performAction(identifier, on: blankPage)
+      try await wait("nativeExtensionActionOnBlankTab") {
+        guard let action = try await worker.evaluate("zacroAcceptance.actionResult()") as? [String: Any] else { return false }
+        return action["id"] as? Int == blankPage.reservedNativeTabID
+          && action["url"] as? String == "about:blank" && owner.store.state.activeTabID == blank.id
+      }
+      try require(blankPage.id == blank.id && blankPage.ownerWindowID == owner.windowContext.id,
+        "blankExtensionActionUsesRealOwnedDocument")
+      _ = try await worker.evaluate("zacroAcceptance.configureAction('popup')")
+      guard let ownerWindow = owner.window else { throw Failure("Blank action window") }
+      let anchor = ownerWindow.convertToScreen(NSRect(x: 180, y: max(0, ownerWindow.frame.height - 80), width: 20, height: 20))
+      try await manager.performAction(identifier, on: blankPage, anchorWindow: ownerWindow, anchorRect: anchor)
+      guard let popup = try await worker.evaluate("zacroAcceptance.popupResult()") as? [String: Any] else {
+        throw Failure("Native action popup result")
+      }
+      try require(popup["windowID"] as? Int == owner.windowContext.nativeID
+        && (popup["tabIDs"] as? [Int]) == [blankPage.reservedNativeTabID].compactMap { $0 },
+        "extensionPopupOnBlankUsesLogicalOwnerAndActiveTab")
+      _ = try await worker.evaluate("zacroAcceptance.configureAction('record')")
+      owner.store.selectTab(id: page.id)
+      try await checkNativeSidePanel(manager: manager, identifier: identifier, worker: worker,
+                                     owner: owner, source: page, url: url)
       extensionFixturePassed = true
       await worker.close()
     } catch {
@@ -175,13 +265,174 @@ final class BrowserIntegrationAcceptance {
     }
   }
 
+  private func checkNativeSidePanel(manager: ChromeExtensionManager, identifier: String,
+                                    worker: ChromeExtensionWorkerSession, owner: BrowserWindowCoordinator,
+                                    source: ChromiumPage, url: URL) async throws {
+    _ = try await worker.evaluate("zacroAcceptance.configureAction('panel')")
+    guard let host = owner.store.createTab(address: url.appendingPathComponent("panel-host").absoluteString) else {
+      throw Failure("Native side panel host")
+    }
+    let hostPage = try await owner.ensurePageReady(host)
+    try await application.navigation.waitForRestore(hostPage)
+    try await loaded(hostPage)
+    owner.layoutPages()
+    try await application.extensionBrowser.prepareInitialNavigation(hostPage)
+    await application.extensionBrowser.waitForTopologyPublication()
+    try await manager.performAction(identifier, on: hostPage)
+    guard let initial = try await worker.evaluate("zacroAcceptance.panelState('unsaved panel draft')") as? [String: Any],
+      let instance = initial["instance"] as? String else { throw Failure("Native side panel document") }
+    try require(initial["windowID"] as? Int == owner.windowContext.nativeID,
+      "sidePanelUsesLogicalBrowserWindow")
+    try owner.activateExtensionTab(source.id)
+    owner.layoutPages()
+    await application.extensionBrowser.waitForTopologyPublication()
+    guard let switched = try await worker.evaluate("zacroAcceptance.panelState()") as? [String: Any] else {
+      throw Failure("Switched side panel document")
+    }
+    try require(switched["instance"] as? String == instance && switched["draft"] as? String == "unsaved panel draft",
+      "sidePanelRetainsLiveDocumentAcrossTabSwitch")
+    guard let hostID = hostPage.reservedNativeTabID else { throw Failure("Side panel host identity") }
+    _ = try await worker.evaluate("chrome.tabs.remove(\(hostID)).then(()=>true)")
+    guard let retained = try await worker.evaluate("zacroAcceptance.panelState()") as? [String: Any] else {
+      throw Failure("Retained side panel after host close")
+    }
+    try require(retained["instance"] as? String == instance && retained["draft"] as? String == "unsaved panel draft"
+      && application.engine.pages[source.id] === source, "sidePanelSurvivesOriginalHostClosure")
+    _ = try await worker.evaluate("zacroAcceptance.closePanel(\(owner.windowContext.nativeID))")
+    _ = try await worker.evaluate("zacroAcceptance.configureAction('record')")
+  }
+
+  private func checkNativePeek(manager: ChromeExtensionManager, identifier: String,
+                               worker: ChromeExtensionWorkerSession, owner: BrowserWindowCoordinator,
+                               source: ChromiumPage, url: URL) async throws {
+    let destination = url.appendingPathComponent("extension-peek").absoluteString
+    owner.store.selectTab(id: source.id)
+    owner.store.setPeek(tabID: source.id, address: destination)
+    guard let document = owner.store.tab(source.id)?.peekDocument else { throw Failure("Extension Peek model") }
+    let preview = try await owner.ensurePageReady(document)
+    try await application.navigation.waitForRestore(preview)
+    try await loaded(preview)
+    owner.layoutPages()
+    try await application.extensionBrowser.prepareInitialNavigation(preview)
+    await application.extensionBrowser.waitForTopologyPublication()
+    guard let sourceID = source.reservedNativeTabID, let peekID = preview.reservedNativeTabID else {
+      throw Failure("Extension Peek native identities")
+    }
+    _ = try await worker.evaluate("zacroPeekFixture.activateSourceThenPeek(\(sourceID),\(peekID))")
+    try require(owner.activePage === preview && owner.store.tab(source.id)?.peek?.isPresented != false,
+      "extensionSelectsRetainedPeekAndSource")
+    let browser = try await preview.ready()
+    _ = try await browser.devTools.evaluate("document.body.innerHTML='<input id=extensionPeekDraft>'; document.querySelector('#extensionPeekDraft').value='retained extension preview'; null")
+    try await manager.performAction(identifier, on: preview)
+    try await wait("extensionActionTargetsPeek") {
+      let action = try await worker.evaluate("zacroAcceptance.actionResult()") as? [String: Any]
+      return action?["id"] as? Int == peekID && action?["active"] as? Bool == true
+    }
+    // The worker validates real scripting, per-tab zoom, and PNG capture. Keep
+    // image bytes inside the worker instead of serializing them into the log.
+    let accessed = try await worker.evaluate("(async()=>{const r=await zacroPeekFixture.documentAccess(\(sourceID),\(peekID),\(try literal(destination)));return r.peekID===\(peekID)&&r.capture.length>100})()") as? Bool
+    try require(accessed == true, "extensionsAccessActualPeekDocument")
+    await application.extensionBrowser.waitForTopologyPublication()
+    _ = try await worker.evaluate("zacroPeekFixture.promoteByPinning(\(sourceID),\(peekID))")
+    guard let promoted = owner.store.state.tabs.first(where: { application.engine.pages[$0.id] === preview }) else {
+      throw Failure("Extension-promoted Peek model")
+    }
+    let draft = try await browser.devTools.evaluate("document.querySelector('#extensionPeekDraft').value") as? String
+    try require(promoted.isPinned && preview.reservedNativeTabID == peekID && preview.browser === browser
+      && owner.store.tab(source.id)?.peek == nil && draft == "retained extension preview",
+      "extensionPeekPromotionRetainsNativeIdentityAndDraft")
+
+    owner.store.selectTab(id: source.id)
+    owner.store.setPeek(tabID: source.id, address: url.appendingPathComponent("extension-peek-close").absoluteString)
+    guard let closingDocument = owner.store.tab(source.id)?.peekDocument else { throw Failure("Closable Peek model") }
+    let closing = try await owner.ensurePageReady(closingDocument)
+    try await application.navigation.waitForRestore(closing)
+    try await loaded(closing)
+    owner.layoutPages()
+    try await application.extensionBrowser.prepareInitialNavigation(closing)
+    await application.extensionBrowser.waitForTopologyPublication()
+    guard let closingID = closing.reservedNativeTabID else { throw Failure("Closable Peek native identity") }
+    _ = try await worker.evaluate("zacroPeekFixture.closePreview(\(sourceID),\(closingID))")
+    try require(owner.store.tab(source.id)?.peek == nil && application.engine.pages[source.id] === source
+      && owner.activePage === source, "extensionClosesPeekWithoutClosingSource")
+  }
+
+  private func checkNativeHistory(manager: ChromeExtensionManager, worker: ChromeExtensionWorkerSession,
+                                  owner: BrowserWindowCoordinator, url: URL) async throws {
+    guard let marker = try await worker.evaluate("zacroAcceptance.seedHistory(\(try literal(url.absoluteString)))") as? String,
+      let action = owner.actions.performLibraryAction else { throw Failure("Native history setup") }
+    try await action("history:clear", ["profileId": owner.store.activeProfileID])
+    let cleared = try await worker.evaluate("zacroAcceptance.verifyHistoryCleared(\(try literal(marker)))") as? Bool
+    try require(cleared == true, "browserHistoryClearRemovesExtensionVisibleVisits")
+  }
+
+  private func checkNativeBookmarkMigration(manager: ChromeExtensionManager, profileID: String, url: URL) async throws {
+    let entry = ChromeBookmarkImport(logicalID: UUID().uuidString,
+      url: url.appendingPathComponent("bookmark-import").absoluteString,
+      title: "Native migration fixture", dateAdded: Date().timeIntervalSince1970 * 1000)
+    let first = try await manager.importBookmarks([entry])
+    guard let node = first.first?.node, first.count == 1 else { throw Failure("Native bookmark import") }
+    try await manager.removeBookmark(nodeID: node.nodeID, uuid: node.uuid, storage: node.storage)
+    let replay = try await manager.importBookmarks([entry])
+    try require(replay.count == 1 && replay[0].removed && replay[0].node == nil && replay[0].uuid == node.uuid,
+      "nativeBookmarkImportDoesNotResurrectDeletedEntry")
+    try await application.bookmarks.refresh(profileID: profileID)
+    try application.store.flush()
+    try await manager.acknowledgeBookmarkImports(replay)
+  }
+
+  private func checkNativeDownload(worker: ChromeExtensionWorkerSession, profileID: String, url: URL) async throws {
+    guard let seed = try await worker.evaluate("zacroAcceptance.seedDownload(\(try literal(url.absoluteString)))") as? [String: Any],
+      let nativeID = seed["id"] as? Int, let filename = seed["filename"] as? String else { throw Failure("Worker download setup") }
+    do {
+      try await wait("workerDownloadAppearsInSwiftLibrary") {
+        application.store.state.downloads.contains { $0.profileID == profileID && $0.filename == filename && $0.nativeGUID != nil }
+      }
+      guard let record = application.store.state.downloads.first(where: { $0.profileID == profileID && $0.filename == filename }),
+        let guid = record.nativeGUID else { throw Failure("Worker download identity") }
+      try await application.downloads.perform("download:pause", id: record.id, profileID: profileID)
+      try await wait("swiftLibraryPausesWorkerDownload") {
+        let state = try await worker.evaluate("zacroAcceptance.downloadState(\(nativeID))") as? [String: Any]
+        return state?["paused"] as? Bool == true
+      }
+      try await application.downloads.perform("download:resume", id: record.id, profileID: profileID)
+      try await wait("swiftLibraryResumesWorkerDownload", timeout: 30) {
+        application.store.state.downloads.contains { $0.id == record.id && $0.nativeGUID == guid && $0.status == "complete" }
+      }
+      let renamed = "zacro-native-acceptance-" + UUID().uuidString.lowercased() + ".bin"
+      try await application.downloads.perform("download:rename", id: record.id, name: renamed, profileID: profileID)
+      guard let native = try await worker.evaluate("zacroAcceptance.downloadState(\(nativeID))") as? [String: Any],
+        let path = native["filename"] as? String else { throw Failure("Renamed native download") }
+      try require(URL(fileURLWithPath: path).lastPathComponent == renamed
+        && application.store.state.downloads.first(where: { $0.id == record.id })?.path == path,
+        "downloadRenameUpdatesChromiumAndSwift")
+      let handle = try FileHandle(forReadingFrom: URL(fileURLWithPath: path))
+      defer { try? handle.close() }
+      try require(try handle.read(upToCount: 64) == Data(repeating: 90, count: 64), "resumedDownloadHasExpectedPayload")
+      try await application.downloads.perform("download:undo", id: record.id, profileID: profileID)
+      try require(application.store.state.downloads.first(where: { $0.id == record.id })?.filename == filename,
+        "nativeDownloadRenameUndo")
+      _ = try await worker.evaluate("zacroAcceptance.cleanupDownload(\(nativeID))")
+      try await wait("nativeDownloadRemovalUpdatesSwiftLibrary") {
+        !application.store.state.downloads.contains { $0.id == record.id }
+      }
+    } catch {
+      _ = try? await worker.evaluate("zacroAcceptance.cleanupDownload(\(nativeID))")
+      throw error
+    }
+  }
+
+  private func literal(_ value: String) throws -> String {
+    String(decoding: try JSONSerialization.data(withJSONObject: value, options: [.fragmentsAllowed]), as: UTF8.self)
+  }
+
   private func loaded(_ page: ChromiumPage) async throws {
     try await wait("loaded:" + page.id, record: false) {
       page.browser != nil && !page.isLoading && page.url?.host == "127.0.0.1" && !page.title.isEmpty
     }
   }
-  private func wait(_ name: String, record: Bool = true, condition: () async throws -> Bool) async throws {
-    let limit = Date().addingTimeInterval(12)
+  private func wait(_ name: String, record: Bool = true, timeout: TimeInterval = 12, condition: () async throws -> Bool) async throws {
+    let limit = Date().addingTimeInterval(timeout)
     while Date() < limit {
       try Task.checkCancellation()
       if try await condition() { if record { checks[name] = true }; return }

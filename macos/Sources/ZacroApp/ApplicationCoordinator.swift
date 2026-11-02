@@ -16,19 +16,23 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
   var pendingDeletion: (Set<String>, () -> Void)?
   var profileDeletionPageIDs = Set<String>()
   var deletingProfileID: String?
+  var clearingHistoryProfiles: Set<String> = []
   var scopeCloseCancelled: (() -> Void)?
   lazy var favicons = FaviconCache(directory: engine.dataDirectory.appendingPathComponent("Icons"))
   lazy var downloads = NativeDownloads(store: store, engine: engine)
+  lazy var bookmarks = NativeBookmarkSync(engine: engine, store: store)
   lazy var navigation = NativeNavigationCoordinator(engine: engine, store: store)
   lazy var services = NativeServicesModel(store: store, directory: engine.dataDirectory) { [weak self] grants in
-    guard let owner = await self?.focusedCoordinator else { throw CancellationError() }
-    return try await owner.readContext(grants)
+    guard let self else { throw CancellationError() }
+    return try await self.readContext(grants)
   }
   lazy var extensionSync = NativeExtensionSync(engine: engine, store: store, services: services)
   lazy var extensionBrowser = NativeExtensionBrowser(repository: repository, engine: engine)
   private(set) var runtimeCapabilityTask: Task<Void, Never>?
   private(set) var runtimeCapabilitiesChecked = false
   private var runtimeCapabilities: CefNativeCapabilities?
+  private var observedNativeProfiles: Set<String> = []
+  private var libraryStatus: [String: [String: String]] = [:]
 
   init(engine: ChromiumEngine, repository: BrowserRepository) {
     self.engine = engine; self.repository = repository
@@ -47,6 +51,32 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
   }
   private func owner(page: ChromiumPage) -> BrowserWindowCoordinator? {
     page.ownerWindowID.flatMap { windows[$0] } ?? owner(tabID: page.id)
+  }
+
+  /// The approved tab identity, rather than whichever same-profile shell most
+  /// recently gained focus, determines where page context is read.
+  func readContext(_ grants: [AIContextGrant]) async throws -> [AIPageExtract] {
+    guard grants.count <= 6, Set(grants.map(\.id)).count == grants.count,
+      let profile = store.state.activeProfile, !profile.isPrivate,
+      grants.allSatisfy({ $0.profileID == profile.id }) else {
+      throw ServiceError("CONTEXT_CHANGED", "Review the selected pages in their regular profile before sharing.")
+    }
+    var result: [AIPageExtract] = []
+    for grant in grants {
+      try Task.checkCancellation()
+      guard store.activeProfileID == profile.id, let owner = owner(tabID: grant.id),
+        owner.windowContext.isOpen, !owner.windowContext.isClosing else {
+        throw ServiceError("CONTEXT_CHANGED", "A selected page or its window changed. Review it again before sharing.")
+      }
+      let page = try await owner.readContext([grant])
+      guard store.activeProfileID == profile.id, self.owner(tabID: grant.id) === owner,
+        owner.windowContext.isOpen, !owner.windowContext.isClosing,
+        store.tab(grant.id)?.url == grant.url.absoluteString else {
+        throw ServiceError("CONTEXT_CHANGED", "A selected page or its window changed while it was being read.")
+      }
+      result.append(contentsOf: page)
+    }
+    return result
   }
 
   func install() {
@@ -70,6 +100,7 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
     focusedCoordinator?.installMenus()
     downloads.onStarted = { [weak self] id in self?.owner(tabID: id)?.actions.library = "Downloads" }
     downloads.install()
+    bookmarks.start()
     extensionSync.start()
     services.start()
     inspectRuntimeCapabilities()
@@ -107,13 +138,13 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
       self.scheduleAllWindows()
     }
     navigation.beforeRestore = { [weak self] page in
-      guard let self, !page.isPrivate, self.store.tab(page.id) != nil else { return }
+      guard let self, !page.isPrivate, self.store.document(id: page.id) != nil else { return }
       self.inspectRuntimeCapabilities()
       await self.runtimeCapabilityTask?.value
       if self.extensionBrowser.enabled { try await self.extensionBrowser.prepareInitialNavigation(page) }
     }
     navigation.didFailPreparation = { [weak self] id, message in
-      guard let self, let owner = self.owner(tabID: id), owner.store.state.activeTabID == id,
+      guard let self, let owner = self.owner(tabID: id), owner.selectedDocumentID == id,
         self.deletingProfileID == nil, owner.windowContext.isOpen,
         !owner.windowContext.isClosing, !self.engine.isTerminating else { return }
       owner.showError("This tab could not be opened: " + message)
@@ -132,6 +163,8 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
       guard let self else { return }
       for owner in self.windows.values { owner.prepareTermination() }
       for owner in self.windows.values { await owner.closeServicesPresentation() }
+      await self.downloads.close()
+      await self.bookmarks.close()
       await self.extensionBrowser.close()
       await self.extensionSync.close()
       await self.services.close()
@@ -148,7 +181,10 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
     }
     extensionBrowser.closeTab = { [weak self] id in await self?.owner(tabID: id)?.requestCloseTab(id) ?? false }
     extensionBrowser.navigateTab = { [weak self] tab, address in self?.owner(tabID: tab.id)?.navigateExtensionTab(tab, address: address) }
-    extensionBrowser.activateTab = { [weak self] id in self?.owner(tabID: id)?.activateExtensionTab(id) }
+    extensionBrowser.activateTab = { [weak self] id in
+      guard let owner = self?.owner(tabID: id) else { throw CancellationError() }
+      try owner.activateExtensionTab(id)
+    }
     extensionBrowser.discardTab = { [weak self] id in try await self?.owner(tabID: id)?.unloadInactiveTab(id) ?? false }
     extensionBrowser.closeWindow = { [weak self] id in await self?.windows[id]?.requestCloseWindow() ?? false }
     extensionBrowser.createWindow = { [weak self] request in
@@ -159,16 +195,39 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
       guard let self else { throw CancellationError() }
       try await self.moveTabs(ids, toWindowID: destination, index: index, authorize: authorize)
     }
+    extensionBrowser.promotePeek = { [weak self] sourceID, activate, authorize in
+      guard let self, let owner = self.owner(tabID: sourceID) else { throw CancellationError() }
+      return try await owner.promotePeekDocument(sourceID: sourceID, activate: activate, authorize: authorize)
+    }
+    extensionBrowser.restoreWindow = { [weak self] id, authorize in
+      guard let self, !self.engine.isTerminating else { throw CancellationError() }
+      try await authorize()
+      return try self.reopenWindow(id: id).windowContext.id
+    }
     extensionBrowser.isDiscarded = { [weak self] id in self?.owner(tabID: id)?.isDiscarded(id) ?? true }
     extensionBrowser.isAudible = { [weak self] id in self?.engine.pages[id]?.isAudible ?? false }
     extensionBrowser.didChange = { [weak self] in self?.scheduleAllWindows() }
     extensionSync.nativeEvent = { [weak self] profile, event in
       guard let self else { return }
+      self.bookmarks.nativeEvent(profileID: profile, event: event)
+      self.downloads.nativeEvent(profileID: profile, event: event)
       for owner in self.windows.values { owner.extensionEvent(profileID: profile, event: event) }
       if case let .hostRequest(request) = event {
         Task { [weak self] in await self?.extensionBrowser.handle(profileID: profile, request: request) }
       }
     }
+    bookmarks.ensureObservation = { [weak self] id in
+      guard let self else { throw CancellationError() }
+      try await self.extensionSync.ensureNativeObservation(profileID: id)
+    }
+    extensionSync.nativeObservationReady = { [weak self] id in
+      guard let self else { return }
+      self.observedNativeProfiles.insert(id)
+      self.bookmarks.observationReady(profileID: id)
+      Task { [weak self] in try? await self?.downloads.refresh(profileID: id) }
+    }
+    bookmarks.onStatus = { [weak self] id, message in self?.publishLibraryStatus(profileID: id, section: "Bookmarks", message: message) }
+    downloads.onStatus = { [weak self] id, message in self?.publishLibraryStatus(profileID: id, section: "Downloads", message: message) }
     services.sourceAction = { [weak self] action, payload in
       guard let owner = self?.focusedCoordinator else { throw CancellationError() }
       return try await owner.openAISources(action: action, payload: payload)
@@ -197,6 +256,13 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
   }
 
   func scheduleAllWindows() { for owner in windows.values { owner.scheduleLayout() } }
+  func libraryMessages(profileID: String) -> [String: String] { libraryStatus[profileID, default: [:]] }
+  private func publishLibraryStatus(profileID: String, section: String, message: String?) {
+    libraryStatus[profileID, default: [:]][section] = message
+    for owner in windows.values where owner.store.activeProfileID == profileID {
+      owner.actions.libraryMessages = libraryMessages(profileID: profileID)
+    }
+  }
   private func windowForManagedPage(_ page: ChromiumPage, foreground: Bool) throws -> BrowserWindowCoordinator {
     guard !page.isPrivate, deletingProfileID != page.profileID, !engine.isTerminating,
       store.state.profiles.contains(where: { $0.id == page.profileID && !$0.isPrivate }) else { throw CancellationError() }
@@ -226,6 +292,10 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
       let scope = try repository.makeWindow(profileID: focusedCoordinator?.store.activeProfileID)
       try present(scope, focused: true)
     } catch { focusedCoordinator?.showError(error.localizedDescription) }
+  }
+  @discardableResult func reopenWindow(id: String) throws -> BrowserWindowCoordinator {
+    guard !engine.isTerminating else { throw CancellationError() }
+    return try present(repository.reopenWindow(id: id), focused: true)
   }
   @discardableResult private func present(_ scope: BrowserStore, focused: Bool) throws -> BrowserWindowCoordinator {
     guard let id = scope.owningWindowID else { throw CancellationError() }
@@ -260,7 +330,7 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
     if let value = request.height { bounds.height = Double(value) }
     if request.state == "maximized" { bounds.maximized = true }
     let scope = try repository.makeWindow(profileID: request.profileID, movingTabIDs: moving,
-      addresses: request.urls, bounds: bounds,
+      addresses: request.urls, bounds: bounds, nativeAuthorizations: request.nativeAuthorizations,
       kind: request.kind == .popup ? .popup : .normal, focus: request.focused)
     guard let id = scope.owningWindowID else { throw CancellationError() }
     let created = scope.state.tabs.filter { !moving.contains($0.id) }
@@ -329,6 +399,9 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
         self.runtimeCapabilities = capabilities
         self.runtimeCapabilitiesChecked = true
         self.extensionBrowser.enabled = capabilities.extensionBrowser == true
+        self.bookmarks.enabled = capabilities.bookmarks == true
+        self.downloads.enabled = capabilities.downloads == true
+        for id in self.observedNativeProfiles { Task { [weak self] in try? await self?.downloads.refresh(profileID: id) } }
         for owner in self.windows.values { self.applyRuntimeCapabilities(to: owner) }
         self.extensionBrowser.reconcile()
       } catch {
@@ -338,7 +411,7 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
   }
   private func applyRuntimeCapabilities(to owner: BrowserWindowCoordinator) {
     guard let capabilities = runtimeCapabilities else { return }
-    if capabilities.browsingData { owner.actions.libraryCapabilities.insert("data:clear") }
+    if capabilities.browsingData { owner.actions.libraryCapabilities.formUnion(["data:clear", "history:clear"]) }
     if capabilities.documentState && capabilities.retainedDiscard == true && capabilities.volatileDiscard == true && capabilities.encryptedNavigation == true {
       owner.actions.libraryCapabilities.insert("tab:sleep")
     }
@@ -348,8 +421,8 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
   func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
   func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
     if let owner = focusedCoordinator { owner.windowContext.show() }
-    else if let session = repository.windows.last, let scope = repository.store(for: session.id) {
-      do { try repository.updateWindow(session.id) { $0.isOpen = true }; try present(scope, focused: true) }
+    else if let session = repository.savedWindows.first {
+      do { try reopenWindow(id: session.id) }
       catch { newWindow() }
     } else { newWindow() }
     return true

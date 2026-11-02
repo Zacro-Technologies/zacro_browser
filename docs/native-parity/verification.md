@@ -89,6 +89,24 @@ This test creates the second profile through the application model. It does not 
 
 Evidence: `macos/.build/verification/integrated-release-12.log`, `core-services-post11.log`, and `application-12/application.json` with `application-12/application.log` beneath the same verification directory.
 
+## 2026-11-02: integrated build 13
+
+The release build passed in 78.21 seconds after correcting a shadowed error variable in the Archive panel. Strict signature verification passed for the internal test bundle. Its actual application integration run passed all 26 checks and exited 0. New checks imported an Electron-format profile, pinned page and bookmark through the production importer while a real popup and split remained open; read approved page context from its actual owning window after focus moved to another same-profile window; and closed/reopened a saved window with the exact same tab IDs and split, a fresh native window ID, and a clean subsequent close.
+
+The full Core/Services suite passed 179 tests (115 Core and 64 Services), with zero failures or skips. These include trusted native URL provenance, saved windows, durable closed-tab/session restoration, bookmark migration acknowledgement/recovery, download identity after restart, and explicit AI profile scoping. The build integrates Chromium history clearing, native bookmark observation/migration, profile-wide download snapshots/controls, sessions routing, and native URL revalidation. Those new Chromium protocols still require the custom framework; the stock runtime report continues to mark native extension and desktop input verification false.
+
+Evidence: `macos/.build/verification/integrated-release-13-retry.log`, `core-services-post12-full.log`, `bookmark-coordinator-typecheck.log`, and `application-13/application.json` with `application-13/application.log`. The HTTP download fixture independently passed Range/invalid-range checks. The custom framework completed another 5,763 actions without a compiler failure in its most recent segment, with 51,712 remaining when paused for this integrated build.
+
+## 2026-11-02: integrated build 14
+
+The release build passed in 103.98 seconds. Its isolated test bundle passed deep, strict signature verification, and all 30 application-owner checks passed with exit 0. New checks exercise hiding and reselecting the same Peek document, retaining its form draft, muting Peek independently of its source, preserving mute and the renderer through promotion, and persisting a popup's opener relationship. These checks use the real application owners and Chromium documents; they do not synthesize desktop input.
+
+The prior full Core/Services run passed 188 cases. Two additional parked-Peek session cases then passed with the five-case session suite: restoring a preview transfers its source and persistent split atomically, preserves preview selection and restart metadata, rejects live/cross-profile destinations, and rolls back failed writes. The integrated build contains the resulting 190-test source catalog; the full 190-case run is still pending.
+
+The custom-only extension fixture now covers Peek tab identity, selection, scripting, zoom, capture, promotion and closure; blank-page action popups; retained global side panels; worker downloads controlled and renamed through the Swift Library; bookmark import deletion/replay; and Chromium-visible history clearing. These fixtures compiled but have **not** executed against the custom framework yet. The stock report explicitly retains `nativeExtensionProtocol: false`, `extensionCompatibilityVerified: false`, and `desktopInputVerified: false`.
+
+Evidence: `macos/.build/verification/integrated-release-14.log`, `application-14/application.json`, `application-14/application.log`, `core-services-post13-full.log`, and `sessions-peek-post13.log`. The custom framework's latest segment completed 5,254 compilation actions without errors, with 46,862 remaining when paused for this build.
+
 ## Required release evidence
 
 - Successful custom Chromium build and package provenance; native protocol capability checks.

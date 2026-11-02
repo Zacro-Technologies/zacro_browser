@@ -96,9 +96,9 @@ final class NativeServicesModel: ObservableObject {
     if let syncService {
       tasks.append(Task { [weak self] in
         let stream = await syncService.events()
-        if self?.sharedBackend == nil {
+        if let self, self.sharedBackend == nil {
           await syncService.start()
-          do { try await self?.recoverProfileDeletions() } catch { self?.cleanupError = error.localizedDescription }
+          do { try await self.recoverProfileDeletions() } catch { self.cleanupError = error.localizedDescription }
         }
         if let profile = self?.scope { self?.applySync(await syncService.status(profileID: profile.id)) }
         for await event in stream {

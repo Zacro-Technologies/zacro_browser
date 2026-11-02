@@ -9,11 +9,11 @@ struct NativeHomePage: View {
   let colors: NativeSpacePalette
   let sidebarVisible: Bool
   private var query: String { actions.homeQuery }
-  private struct Link: Identifiable { let url: String; let title: String; var id: String { url } }
+  private struct Link: Identifiable { let url: String; let title: String; var tabID: String? = nil; var id: String { url } }
   private var saved: [Link] {
     let pins = store.visibleTabs.filter { $0.isPinned }
     var seen = Set(sidebarVisible ? pins.map(\.url) : [])
-    let candidates = (sidebarVisible ? [] : pins.map { Link(url: $0.url, title: $0.displayTitle) })
+    let candidates = (sidebarVisible ? [] : pins.map { Link(url: $0.url, title: $0.displayTitle, tabID: $0.id) })
       + store.state.bookmarks.filter { $0.profileID == store.activeProfileID }.map { Link(url: $0.url, title: $0.title) }
     return Array(candidates.filter { seen.insert($0.url).inserted }.prefix(6))
   }
@@ -45,7 +45,7 @@ struct NativeHomePage: View {
       if !saved.isEmpty {
         HStack(alignment: .top, spacing: 4) {
           ForEach(saved) { link in
-            Button { navigate(link.url) } label: {
+            Button { open(link) } label: {
               VStack(spacing: 8) {
                 favicon(link.url).frame(width: 18, height: 18).frame(width: 32, height: 32)
                   .background(colors.card.opacity(0.45), in: RoundedRectangle(cornerRadius: 9))
@@ -64,7 +64,7 @@ struct NativeHomePage: View {
               .buttonStyle(.plain).help("History").accessibilityLabel("History")
           }
           ForEach(recent) { link in
-            Button { navigate(link.url) } label: {
+            Button { open(link) } label: {
               HStack(spacing: 10) {
                 favicon(link.url).frame(width: 16, height: 16)
                 Text(link.title.isEmpty ? domain(link.url) : link.title).font(.system(size: 12)).lineLimit(1)
@@ -84,7 +84,13 @@ struct NativeHomePage: View {
       Image(nsImage: image).resizable().scaledToFit()
     } else { NativeGlyph("globe") .foregroundStyle(colors.muted) }
   }
-  private func domain(_ url: String) -> String { URL(string: url)?.host?.replacingOccurrences(of: "www.", with: "") ?? url }
+  private func domain(_ url: String) -> String { NativePageIdentity.label(url).replacingOccurrences(of: "www.", with: "") }
+  private func open(_ link: Link) {
+    if let id = link.tabID, let tab = store.tab(id), store.profileID(for: tab) == store.activeProfileID,
+      BrowserAddress.webURL(tab.url) == nil {
+      actions.homeQuery = ""; actions.activate(id)
+    } else { navigate(link.url) }
+  }
   private func navigate(_ value: String) {
     let value = value.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !value.isEmpty else { return }

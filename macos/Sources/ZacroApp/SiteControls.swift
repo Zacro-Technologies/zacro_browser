@@ -188,10 +188,11 @@ struct SiteControlActions {
   var manageExtensions: () -> Void = {}
   var extensionStore: () -> Void = {}
 
+  var hasDocument: Bool { NativePageIdentity.hasDocument(url) }
   var hasWebPage: Bool { ["http", "https"].contains(url?.scheme?.lowercased() ?? "") }
   var origin: String {
-    guard let url, let host = url.host else { return "No website open" }
-    return host + (url.port.map { ":\($0)" } ?? "")
+    guard let url, hasDocument else { return "No page open" }
+    return NativePageIdentity.label(url.absoluteString)
   }
 }
 
@@ -215,7 +216,7 @@ struct SiteControls: View {
           NSPasteboard.general.clearContents(); NSPasteboard.general.setString(url.absoluteString, forType: .string)
           copied = true
         }
-        quick("star", label: actions.isBookmarked ? "Remove bookmark" : "Bookmark page", selected: actions.isBookmarked) { perform(actions.bookmark) }
+        quick("star", label: actions.isBookmarked ? "Remove bookmark" : "Bookmark page", selected: actions.isBookmarked, enabled: actions.hasWebPage) { perform(actions.bookmark) }
         quick("split", label: actions.isSplit ? "Unsplit tabs" : "Split view", selected: actions.isSplit) { perform(actions.split) }
         quick("search", label: "Find on page") { perform(actions.find) }
       }
@@ -246,13 +247,13 @@ struct SiteControls: View {
       sectionHeading("Settings")
       setting("Space theme", caption: actions.spaceName, glyph: "palette", action: actions.customizeSpace)
       setting("Site permissions", caption: "Manage access", glyph: "shield", disabled: !actions.hasWebPage, action: actions.permissions)
-      setting("Developer tools", caption: "Inspect page", glyph: "terminal", disabled: !actions.hasWebPage, action: actions.developerTools)
+      setting("Developer tools", caption: "Inspect page", glyph: "terminal", disabled: !actions.hasDocument, action: actions.developerTools)
       Divider().overlay(colors.ink.opacity(0.08)).padding(.top, 8)
       HStack {
         Button { perform(actions.permissions) } label: {
           HStack(spacing: 6) {
             NativeGlyph(actions.url?.scheme == "https" && !actions.pageError ? "lock" : "globe").frame(width: 15, height: 15).foregroundStyle(accent)
-            Text(!actions.hasWebPage ? "No page open" : actions.url?.scheme == "https" && !actions.pageError ? "Secure" : "Not secure")
+            Text(NativePageIdentity.securityLabel(actions.url, failed: actions.pageError))
           }.padding(.horizontal, 9).padding(.vertical, 7).background(colors.ink.opacity(0.045), in: RoundedRectangle(cornerRadius: 8))
         }.buttonStyle(.plain).disabled(!actions.hasWebPage).help(actions.origin).focused($focus, equals: "security")
         Spacer()
@@ -277,7 +278,9 @@ struct SiteControls: View {
       .onKeyPress(.escape) { dismiss(); return .handled }
   }
   private var focusIDs: [String] {
-    var result = actions.hasWebPage ? ["copy", "star", "split", "search"] : []
+    var result = actions.hasDocument ? ["copy"] : []
+    if actions.hasWebPage { result.append("star") }
+    if actions.hasDocument { result += ["split", "search"] }
     if !actions.isPrivate { result.append("extensions") }
     if !actions.isPrivate, actions.extensionsReady, actions.extensionError == nil {
       for item in actions.extensions {
@@ -286,16 +289,18 @@ struct SiteControls: View {
       }
     }
     result.append("Space theme")
-    if actions.hasWebPage { result += ["Site permissions", "Developer tools", "security"] }
+    if actions.hasWebPage { result.append("Site permissions") }
+    if actions.hasDocument { result.append("Developer tools") }
+    if actions.hasWebPage { result.append("security") }
     result.append("more")
     return result
   }
-  private func quick(_ glyph: String, label: String, focusID: String? = nil, selected: Bool = false, action: @escaping () -> Void) -> some View {
+  private func quick(_ glyph: String, label: String, focusID: String? = nil, selected: Bool = false, enabled: Bool? = nil, action: @escaping () -> Void) -> some View {
     Button(action: action) {
       NativeGlyph(glyph).frame(width: 18, height: 18).frame(maxWidth: .infinity).frame(height: 42)
         .background(colors.card.opacity(selected ? 0.46 : 0.24), in: RoundedRectangle(cornerRadius: 10))
         .shadow(color: .black.opacity(0.08), radius: 1.5, y: 1)
-    }.buttonStyle(.plain).foregroundStyle(accent).disabled(!actions.hasWebPage)
+    }.buttonStyle(.plain).foregroundStyle(accent).disabled(!(enabled ?? actions.hasDocument))
       .focused($focus, equals: focusID ?? glyph)
       .help(label).accessibilityLabel(label).accessibilityAddTraits(selected ? [.isSelected] : [])
   }

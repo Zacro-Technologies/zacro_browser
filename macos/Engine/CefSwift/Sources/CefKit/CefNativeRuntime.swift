@@ -19,6 +19,9 @@ public struct CefNativeCapabilities: Decodable, Sendable {
     public let extensionStorage: Bool?
     public let extensionBrowser: Bool?
     public let volatileDiscard: Bool?
+    public let bookmarks: Bool?
+    public let historyRemoval: Bool?
+    public let downloads: Bool?
 }
 
 public struct CefDocumentSafetyState: Decodable, Sendable {
@@ -27,12 +30,13 @@ public struct CefDocumentSafetyState: Decodable, Sendable {
     public let beforeUnload: Bool
     public let devToolsOpen: Bool
     public let profileDownloads: Int
+    public let extensionUI: Bool
     public let crashed: Bool
     public let loading: Bool
 
     /// Unknown state must never be interpreted as safe by the caller.
     public var permitsAutomaticUnload: Bool {
-        !audible && !capturing && !beforeUnload && !devToolsOpen && profileDownloads == 0 && !loading && !crashed
+        !audible && !capturing && !beforeUnload && !devToolsOpen && !extensionUI && profileDownloads == 0 && !loading && !crashed
     }
 }
 
@@ -119,9 +123,9 @@ extension CefBrowser {
 
     /// Removes real profile storage including IndexedDB, localStorage, service
     /// workers, CacheStorage and cookies. Extension origins are preserved.
-    public func clearProfileBrowsingData(siteData: Bool, cache: Bool) async throws {
-        guard siteData || cache else { return }
-        let response = try await devTools.call("Zacro.clearBrowsingData", parameters: ["siteData": siteData, "cache": cache], timeout: 120)
+    public func clearProfileBrowsingData(siteData: Bool, cache: Bool, history: Bool = false) async throws {
+        guard siteData || cache || history else { return }
+        let response = try await devTools.call("Zacro.clearBrowsingData", parameters: ["siteData": siteData, "cache": cache, "history": history], timeout: 120)
         guard response["cleared"] as? Bool == true else { throw CefDevToolsError.invalidMessage }
     }
 }

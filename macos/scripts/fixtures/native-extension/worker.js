@@ -1,4 +1,5 @@
 /* Real MV3 APIs only. Loaded solely into a fresh disposable acceptance profile. */
+importScripts('peek.js');
 const events = [];
 const record = (name, ...args) => {
   events.push({ name, args });
@@ -14,7 +15,17 @@ for (const name of ["onCreated", "onUpdated", "onMoved", "onRemoved"]) {
   chrome.tabGroups[name].addListener((...args) => record(`tabGroups.${name}`, ...args));
 }
 chrome.storage.onChanged.addListener((changes, area) => record("storage.onChanged", changes, area));
+let nativeActionMode = "record";
+for (const name of ["onOpened", "onClosed"]) {
+  chrome.sidePanel[name].addListener(info => record(`sidePanel.${name}`, info));
+}
 chrome.action.onClicked.addListener(async tab => {
+  // Invoke in the real action event's user-gesture scope before awaiting work.
+  if (nativeActionMode === "panel") {
+    chrome.sidePanel.open({ windowId: tab.windowId }).catch(error => {
+      chrome.storage.local.set({ nativePanelError: String(error) });
+    });
+  }
   await chrome.storage.local.set({ lastNativeAction: tab });
   await chrome.action.setBadgeText({ text: "OK", tabId: tab.id });
   await chrome.action.setBadgeBackgroundColor({ color: "#635BFF", tabId: tab.id });
@@ -37,6 +48,78 @@ async function loaded(tabId) {
 
 globalThis.zacroAcceptance = {
   events,
+  async configureAction(mode = "record") {
+    assert(["record", "popup", "panel"].includes(mode), "Unknown action fixture mode");
+    nativeActionMode = mode;
+    await chrome.storage.local.remove(["nativePopupResult", "nativePanelError"]);
+    await chrome.action.setPopup({ popup: mode === "popup" ? "popup.html" : "" });
+    await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: false });
+    return true;
+  },
+  async popupResult() {
+    const end = Date.now() + 10000;
+    while (Date.now() < end) {
+      const { nativePopupResult } = await chrome.storage.local.get("nativePopupResult");
+      if (nativePopupResult) {
+        assert(nativePopupResult.contexts.length === 1 && nativePopupResult.contexts[0].contextType === "POPUP",
+          "Action did not create an actual Chrome popup context");
+        return nativePopupResult;
+      }
+      await wait(40);
+    }
+    throw new Error("Native action popup did not load");
+  },
+  async panelState(draft) {
+    const end = Date.now() + 10000;
+    while (Date.now() < end) {
+      const { nativePanelError } = await chrome.storage.local.get("nativePanelError");
+      assert(!nativePanelError, nativePanelError);
+      const contexts = await chrome.runtime.getContexts({ contextTypes: ["SIDE_PANEL"] });
+      if (contexts.length) {
+        assert(contexts.length === 1, "Global panel was recreated in another physical window");
+        try {
+          return { ...await chrome.runtime.sendMessage({ type: "zacro-native-panel", draft }), contexts };
+        } catch { /* The first load may not have installed the listener yet. */ }
+      }
+      await wait(40);
+    }
+    throw new Error("Native side panel did not load");
+  },
+  async closePanel(windowID) { await chrome.sidePanel.close({ windowId: windowID }); return true; },
+  async seedDownload(baseURL) {
+    const url = new URL("download", baseURL);
+    assert(url.protocol === "http:" && url.hostname === "127.0.0.1", "Download fixture requires loopback");
+    const filename = `zacro-native-acceptance-${crypto.randomUUID()}.bin`;
+    const id = await chrome.downloads.download({ url: url.href, filename, conflictAction: "uniquify", saveAs: false });
+    return { id, filename, url: url.href };
+  },
+  async downloadState(id) {
+    const values = await chrome.downloads.search({ id });
+    assert(values.length === 1, "Native worker download disappeared");
+    return values[0];
+  },
+  async cleanupDownload(id) {
+    const values = await chrome.downloads.search({ id });
+    if (!values.length) return true;
+    assert(/(?:^|[\\/])zacro-native-acceptance-[a-f0-9-]+(?: \(\d+\))?\.bin$/.test(values[0].filename),
+      "Refusing to remove a nonfixture download");
+    if (values[0].state === "in_progress") await chrome.downloads.cancel(id);
+    if (values[0].state === "complete" && values[0].exists) await chrome.downloads.removeFile(id);
+    await chrome.downloads.erase({ id });
+    return true;
+  },
+  async seedHistory(baseURL) {
+    const url = new URL("native-history-marker", baseURL).href;
+    await chrome.history.addUrl({ url });
+    assert((await chrome.history.getVisits({ url })).length > 0, "Native history visit was not created");
+    return url;
+  },
+  async verifyHistoryCleared(url) {
+    assert((await chrome.history.getVisits({ url })).length === 0, "Native history survived the browser history clear");
+    assert((await chrome.history.search({ text: "native-history-marker", startTime: 0 })).length === 0,
+      "Native history search retained the cleared visit");
+    return true;
+  },
   async run({ baseURL, sourceWindowID, groups = true }) {
     const origin = new URL(baseURL);
     assert(origin.protocol === "http:" && origin.hostname === "127.0.0.1", "Fixture requires a loopback server");
@@ -110,6 +193,17 @@ globalThis.zacroAcceptance = {
       assert(settings.mode === "automatic", "Missing native zoom settings");
       await chrome.tabs.setZoom(first.id, 0);
     });
+    await check("dormantNativeDocumentAPI", async () => {
+      assert(first, "Tab prerequisite failed");
+      const sleeper = await chrome.tabs.create({ windowId: sourceWindowID, url: new URL("native-sleeper", origin).href, active: true });
+      created.push(sleeper.id); await loaded(sleeper.id);
+      await chrome.tabs.update(first.id, { active: true });
+      const sleeping = await chrome.tabs.discard(sleeper.id);
+      assert(sleeping.id === sleeper.id && sleeping.discarded, "Sleeping changed the native tab identity");
+      const zoom = await chrome.tabs.getZoom(sleeper.id);
+      assert(Number.isFinite(zoom) && zoom > 0, "Dormant API did not resume the actual native function");
+      assert((await chrome.tabs.get(sleeper.id)).id === sleeper.id, "Waking replaced the native tab identity");
+    });
     await check("workerStorageAndNotifications", async () => {
       const start = events.length;
       await chrome.storage.sync.set({ nativeFixtureValue: { number: 42, text: "worker" } });
@@ -118,6 +212,49 @@ globalThis.zacroAcceptance = {
       assert(!("nativeFixtureValue" in await chrome.storage.sync.get(null)), "Native sync removal missing");
       await wait(50);
       assert(events.slice(start).some(event => event.name === "storage.onChanged"), "Storage events did not reach worker");
+    });
+    await check("logicalClosedSessions", async () => {
+      const url = new URL("native-closed-session", origin).href;
+      const tab = await chrome.tabs.create({ windowId: sourceWindowID, url, active: false });
+      await chrome.tabs.remove(tab.id);
+      const closed = await chrome.sessions.getRecentlyClosed({ maxResults: 25 });
+      const session = closed.find(value => value.tab?.url === url);
+      assert(session?.tab?.sessionId && session.tab.id === undefined, "Closed session leaked a live/physical tab identity");
+      const restored = await chrome.sessions.restore(session.tab.sessionId);
+      assert(restored.tab?.id && restored.tab.url === url && restored.tab.windowId === sourceWindowID,
+        "Session restored outside the authoritative model");
+      created.push(restored.tab.id);
+    });
+    await check("approvedNativeNavigation", async () => {
+      const url = "data:text/html,%3Ctitle%3EZacro%20approved%3C/title%3E%3Cp%3Enative%3C/p%3E";
+      const tab = await chrome.tabs.create({ windowId: sourceWindowID, url, active: true });
+      created.push(tab.id); await loaded(tab.id);
+      assert((await chrome.tabs.get(tab.id)).url === url, "Chrome-approved data navigation was discarded by the host");
+      const before = (await chrome.tabs.query({})).length;
+      let rejected = false;
+      try { await chrome.tabs.create({ url: "javascript:document.title='invalid'" }); } catch { rejected = true; }
+      assert(rejected && (await chrome.tabs.query({})).length === before, "Forbidden JavaScript URL mutated the model");
+    });
+    await check("nativeDebuggerTargets", async () => {
+      assert(first, "Tab prerequisite failed");
+      const targets = await chrome.debugger.getTargets();
+      assert(targets.some(target => target.tabId === first.id), "Logical native tab target missing");
+      assert(!targets.some(target => target.type === "page" && /^chrome:\/\/extensions/.test(target.url || "")), "Hidden manager leaked through debugger");
+      const target = { tabId: first.id };
+      await chrome.debugger.attach(target, "1.3");
+      try {
+        const result = await chrome.debugger.sendCommand(target, "Runtime.evaluate", { expression: "location.href", returnByValue: true });
+        assert(result.result.value === (await chrome.tabs.get(first.id)).url, "Debugger attached to the wrong document");
+      } finally { await chrome.debugger.detach(target); }
+    });
+    await check("nativeBookmarkHierarchy", async () => {
+      const folder = await chrome.bookmarks.create({ title: "Zacro native acceptance" });
+      try {
+        const item = await chrome.bookmarks.create({ parentId: folder.id, title: "Native child", url: new URL("native-bookmark", origin).href });
+        assert((await chrome.bookmarks.getChildren(folder.id)).some(node => node.id === item.id), "Native bookmark tree lost child");
+        await chrome.bookmarks.update(item.id, { title: "Updated native child" });
+        assert((await chrome.bookmarks.get(item.id))[0].title === "Updated native child", "Native bookmark update missing");
+      } finally { await chrome.bookmarks.removeTree(folder.id); }
     });
     await check("realOffscreenDocument", async () => {
       await chrome.offscreen.createDocument({ url: "offscreen.html", reasons: ["DOM_PARSER"], justification: "Disposable native browser acceptance" });

@@ -112,6 +112,9 @@ public struct ChromeExtensionHostRequest: Sendable {
 
 public enum ChromeExtensionEvent {
   case registryChanged
+  case bookmarksChanged(revision: String)
+  case downloadChanged(ChromeNativeDownload)
+  case downloadRemoved(guid: String)
   case installationChanged(extensionID: String, kind: String)
   case actionChanged(extensionID: String, nativeTabID: Int?)
   case storageChanged(extensionID: String, installationID: String, changes: [String: Any], origin: String)
@@ -235,6 +238,13 @@ public final class ChromeExtensionManager {
     let token = try browser.devTools.observeEvents { method, params in
       switch method {
       case "Zacro.extensionRegistryChanged": callback(.registryChanged)
+      case "Zacro.downloadChanged":
+        if let data = try? JSONSerialization.data(withJSONObject: params),
+          let value = try? JSONDecoder().decode(ChromeNativeDownload.self, from: data) { callback(.downloadChanged(value)) }
+      case "Zacro.downloadRemoved":
+        if let guid = params["guid"] as? String { callback(.downloadRemoved(guid: guid)) }
+      case "Zacro.bookmarksChanged":
+        if let revision = params["revision"] as? String { callback(.bookmarksChanged(revision: revision)) }
       case "Zacro.extensionInstallationChanged":
         if let id = params["id"] as? String, let kind = params["kind"] as? String,
           ["installed", "updated", "uninstalled"].contains(kind) { callback(.installationChanged(extensionID: id, kind: kind)) }
@@ -445,7 +455,7 @@ public final class ChromeExtensionManager {
     }
   }
 
-  private func nativeBrowser() async throws -> CefBrowser {
+  func nativeBrowser() async throws -> CefBrowser {
     guard !engine.isTerminating,
       engine.pages["extensions:\(profileID)"] != nil || engine.contexts.values.contains(where: { $0.isOpen && !$0.isClosing })
     else { throw ChromeExtensionError.managementUnavailable }
@@ -453,6 +463,12 @@ public final class ChromeExtensionManager {
     let browser = try await page.ready()
     guard engine.pages[page.id] === page, !page.isPrivate, page.profileID == profileID else { throw ChromeExtensionError.managementUnavailable }
     return browser
+  }
+
+  /// Clears Chromium's real HistoryService and history-backed suggestions for
+  /// this profile, including visits visible through chrome.history.
+  public func clearBrowsingHistory() async throws {
+    try await nativeBrowser().clearProfileBrowsingData(siteData: false, cache: false, history: true)
   }
 
   public func setPinned(_ identifier: String, pinned: Bool) async throws {
@@ -464,13 +480,28 @@ public final class ChromeExtensionManager {
   /// Invokes Chrome's own toolbar action model. Chromium applies activeTab
   /// grants, dispatches onClicked, or opens the extension's popup/side panel.
   /// This must only be called in direct response to a native user action.
-  public func performAction(_ identifier: String, on page: ChromiumPage) async throws {
+  public func performAction(_ identifier: String, on page: ChromiumPage,
+                            anchorWindow: NSWindow? = nil, anchorRect: NSRect? = nil) async throws {
     try validate(identifier)
     guard page.profileID == profileID, engine.pages[page.id] === page, let browser = page.browser,
       let extensionInfo = try await snapshot().extensions.first(where: { $0.id == identifier }), extensionInfo.isEnabled,
       !page.isPrivate || extensionInfo.incognitoAccess.isActive else { throw ChromeExtensionError.managementUnavailable }
     guard engine.pages[page.id] === page, page.browser === browser else { throw ChromeExtensionError.managementUnavailable }
-    _ = try await browser.devTools.call("Zacro.performExtensionAction", parameters: ["id": identifier])
+    var parameters: [String: Any] = ["id": identifier]
+    if let anchorWindow {
+      guard let ownerID = page.ownerWindowID, let owner = engine.context(id: ownerID),
+        owner.isOpen, owner.window === anchorWindow else { throw ChromeExtensionError.managementUnavailable }
+      let rect = anchorRect ?? anchorWindow.convertToScreen(NSRect(
+        x: max(0, anchorWindow.contentLayoutRect.width - 40),
+        y: max(0, anchorWindow.contentLayoutRect.height - 48), width: 20, height: 20))
+      guard [rect.minX, rect.minY, rect.width, rect.height].allSatisfy({ $0.isFinite }),
+        rect.width > 0, rect.height > 0, rect.width <= 4096, rect.height <= 4096 else {
+        throw ChromeExtensionError.invalidResponse
+      }
+      parameters["anchor"] = ["windowNumber": anchorWindow.windowNumber,
+        "x": rect.minX, "y": rect.minY, "width": rect.width, "height": rect.height]
+    }
+    _ = try await browser.devTools.call("Zacro.performExtensionAction", parameters: parameters)
   }
 
   public func setEnabled(_ identifier: String, enabled: Bool) async throws {

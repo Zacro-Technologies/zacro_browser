@@ -69,6 +69,9 @@ def main():
     ])
     run([sys.executable, str(HERE / "apply_adapter.py"), "--cef-root", str(cef)], source, environment)
     run([sys.executable, str(HERE / "apply_storage_adapter.py"), "--chromium-root", str(source)], source, environment)
+    run([sys.executable, str(HERE / "apply_bookmark_adapter.py"), "--chromium-root", str(source)], source, environment)
+    run([sys.executable, str(HERE / "apply_sidepanel_adapter.py"), "--chromium-root", str(source)], source, environment)
+    run([sys.executable, str(HERE / "apply_popup_anchor.py"), "--chromium-root", str(source)], source, environment)
     run([sys.executable, str(HERE / "apply_topology_adapter.py"), "--chromium-root", str(source)], source, environment)
     run([sys.executable, str(HERE / "apply_tab_reservation.py"), "--chromium-root", str(source)], source, environment)
     if not args.skip_generation:

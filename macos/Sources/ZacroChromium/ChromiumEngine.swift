@@ -587,6 +587,7 @@ public final class ChromiumPage: CefBrowserDelegate {
     set { browser?.onFindResult = newValue }
   }
   private var lastFindQuery = ""
+  private var approvedNavigationURLs: Set<String> = []
 
   fileprivate func adoptCurrentDocumentState() {
     guard let browser else { return }
@@ -626,6 +627,21 @@ public final class ChromiumPage: CefBrowserDelegate {
     self.isPrivate = isPrivate
   }
   public func load(_ url: URL) { browser?.load(url) }
+  /// Authorize each validated entry before restoring native history. The
+  /// encrypted native history independently revalidates every privileged entry.
+  public func authorizeNavigation(_ approval: ChromeNavigationApproval) throws {
+    guard approval.profileID == profileID else { throw ChromeExtensionError.invalidResponse }
+    approvedNavigationURLs.insert(approval.url.absoluteString)
+  }
+  public func loadApprovedNavigation(_ approval: ChromeNavigationApproval) async throws {
+    try authorizeNavigation(approval)
+    do {
+      _ = try await ready().devTools.call("Zacro.navigateApproved", parameters: approval.parameters)
+    } catch {
+      approvedNavigationURLs.remove(approval.url.absoluteString)
+      throw error
+    }
+  }
   public func ready() async throws -> CefBrowser {
     guard let browser else { throw CefDevToolsError.browserClosed }
     try await browser.waitUntilReady()
@@ -750,7 +766,7 @@ public final class ChromiumPage: CefBrowserDelegate {
   public func browser(_ b: CefBrowser, decidePolicyForNavigation url: URL?, isMainFrame: Bool, isRedirect: Bool, userGesture: Bool) -> CefNavigationDecision {
     guard isMainFrame else { return .allow }
     guard let url else { return .cancel }
-    if Self.webURL(url) || url.absoluteString == "about:blank" { return .allow }
+    if Self.webURL(url) || url.absoluteString == "about:blank" || approvedNavigationURLs.contains(url.absoluteString) { return .allow }
     if url.scheme == "chrome", (id.hasPrefix("extensions:") || id.hasPrefix("extension-settings:")),
       url.host == "extensions" { return .allow }
     // Chromium still validates extension resource ownership and web-accessible

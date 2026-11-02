@@ -33,7 +33,7 @@ struct NativeGlyph: View {
       "next-tab": "forward", "previous-tab": "back", "next-space": "layers", "previous-space": "layers", "bookmark": "bookmark",
       "pin-tab": "pin", "duplicate-tab": "copy", "rename-tab": "edit", "move-tab": "folder", "mute-tab": "volume",
       "new-folder": "folderPlus", "new-space": "layers", "new-private-space": "shield", "preferences": "settings",
-      "shortcuts": "keyboard", "history": "history", "downloads": "download", "bookmarks": "bookmark", "archive": "archive",
+      "shortcuts": "keyboard", "history": "history", "downloads": "download", "bookmarks": "bookmark", "archive": "archive", "windows": "layers", "reopen-window": "undo",
       "extensions": "extension", "ai": "sparkle", "find": "search", "find-next": "down", "find-previous": "up",
       "reload": "reload", "force-reload": "reload", "stop": "stop", "history-back": "back", "history-forward": "forward",
       "zoom-in": "plus", "zoom-out": "minimize", "zoom-reset": "monitor", "split": "split", "unsplit": "split",

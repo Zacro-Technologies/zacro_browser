@@ -18,12 +18,12 @@ struct NativeLibrary: View {
   @FocusState private var focus: String?
   @Environment(\.colorScheme) private var colorScheme
   @Environment(\.presentedSpaceTheme) private var presentedTheme
-  private let sections = ["Bookmarks", "History", "Downloads", "Archive", "Settings", "Extensions", "AI"]
+  private let sections = ["Bookmarks", "History", "Downloads", "Archive", "Windows", "Settings", "Extensions", "AI"]
   private var colors: NativeSpacePalette {
     let theme = presentedTheme ?? store.state.activeSpace?.theme ?? SpaceTheme()
     return NativeSpacePalette(theme: theme, dark: colorScheme == .dark)
   }
-  private var isRecords: Bool { ["Bookmarks", "History", "Downloads", "Archive"].contains(section) }
+  private var isRecords: Bool { ["Bookmarks", "History", "Downloads", "Archive", "Windows"].contains(section) }
   private var rows: [LibraryRow] {
     switch section {
     case "Bookmarks": return store.state.bookmarks.filter { $0.profileID == store.activeProfileID }.map {
@@ -47,9 +47,25 @@ struct NativeLibrary: View {
     }.sorted { $0.createdAt > $1.createdAt }.prefix(500))
   }
 
+  private var savedWindows: [BrowserSavedWindow] {
+    store.savedWindows.filter { matches($0.title, $0.profileName) }
+  }
+  private var focusableIDs: [String] {
+    section == "Windows" ? savedWindows.map(\.id) : section == "Downloads" ? downloads.map(\.id) : filteredRows.map(\.id)
+  }
+
   var body: some View {
     VStack(spacing: 0) {
       header
+      if let message = actions.libraryMessages[section] {
+        HStack(alignment: .top, spacing: 7) {
+          NativeGlyph("exclamationmark.triangle", size: 13).foregroundStyle(colors.accent)
+          Text(message).font(.system(size: 11)).fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }.padding(9).background(colors.ink.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
+          .padding(.horizontal, 12).padding(.bottom, 10)
+          .accessibilityElement(children: .combine).accessibilityLabel(message)
+      }
       if isRecords {
         HStack(spacing: 7) {
           NativeGlyph("magnifyingglass").foregroundStyle(colors.muted)
@@ -57,8 +73,8 @@ struct NativeLibrary: View {
             .textFieldStyle(.plain).focused($focus, equals: "search")
             .accessibilityLabel("Search \(section.lowercased())")
             .onKeyPress(.downArrow) {
-              guard let first = filteredRows.first else { return .ignored }
-              focus = first.id
+              guard let first = focusableIDs.first else { return .ignored }
+              focus = first
               return .handled
             }
         }.padding(.horizontal, 10).frame(height: 32)
@@ -133,6 +149,24 @@ struct NativeLibrary: View {
           }.padding(.horizontal, 12).padding(.bottom, 12)
         }
       }.scrollIndicators(.hidden)
+    } else if section == "Windows" {
+      ScrollViewReader { reader in
+        ScrollView {
+          if savedWindows.isEmpty { emptyState }
+          else {
+            LazyVStack(alignment: .leading, spacing: 4) {
+              ForEach(windowGroups, id: \.label) { group in
+                groupHeading(group.label, count: group.items.count)
+                ForEach(group.items) { item in savedWindowRow(item).id(item.id) }
+              }
+            }.padding(.horizontal, 12).padding(.bottom, 12)
+          }
+        }.scrollIndicators(.hidden)
+          .onChange(of: focus) { _, id in
+            guard let id, id != "search", id != "section" else { return }
+            reader.scrollTo(id, anchor: .center)
+          }
+      }
     } else if isRecords {
       ScrollViewReader { reader in
         ScrollView {
@@ -174,6 +208,38 @@ struct NativeLibrary: View {
     }
     return result
   }
+  private var windowGroups: [LibraryWindowGroup] {
+    var result: [LibraryWindowGroup] = []
+    for item in savedWindows {
+      let label = dateLabel(item.closedAt ?? .distantPast)
+      if let index = result.firstIndex(where: { $0.label == label }) { result[index].items.append(item) }
+      else { result.append(LibraryWindowGroup(label: label, items: [item])) }
+    }
+    return result
+  }
+  private func savedWindowRow(_ item: BrowserSavedWindow) -> some View {
+    Button {
+      perform("window:restore", id: item.id, values: ["windowID": item.id])
+    } label: {
+      HStack(spacing: 9) {
+        NativeGlyph("square.stack").foregroundStyle(colors.accent).frame(width: 20)
+        VStack(alignment: .leading, spacing: 3) {
+          Text(item.title).lineLimit(1)
+          Text("\(item.tabCount) \(item.tabCount == 1 ? "tab" : "tabs") · \(item.profileName)")
+            .font(.system(size: 11)).foregroundStyle(colors.muted).lineLimit(1)
+        }.frame(maxWidth: .infinity, alignment: .leading)
+        if busy.contains(item.id) { ProgressView().controlSize(.small) }
+        else { NativeGlyph("arrow.uturn.backward").foregroundStyle(colors.muted) }
+      }.padding(.vertical, 9).padding(.horizontal, 7).contentShape(Rectangle())
+        .background(colors.card.opacity(focus == item.id ? 0.46 : 0), in: RoundedRectangle(cornerRadius: 8))
+    }.buttonStyle(.plain).focused($focus, equals: item.id)
+      .disabled(busy.contains(item.id) || !actions.libraryCapabilities.contains("window:restore"))
+      .accessibilityLabel("Reopen \(item.title), \(item.tabCount) tabs, \(item.profileName)")
+      .onKeyPress(.downArrow) { moveFocus(item.id, offset: 1); return .handled }
+      .onKeyPress(.upArrow) { moveFocus(item.id, offset: -1); return .handled }
+      .onKeyPress(.home) { focus = focusableIDs.first; return .handled }
+      .onKeyPress(.end) { focus = focusableIDs.last; return .handled }
+  }
   private func groupHeading(_ title: String, count: Int) -> some View {
     HStack {
       Text(title).fontWeight(.semibold)
@@ -196,6 +262,7 @@ struct NativeLibrary: View {
     case "History": "No history yet"
     case "Archive": "No archived tabs"
     case "Downloads": "No downloads yet"
+    case "Windows": "No saved windows"
     default: "No bookmarks yet"
     }
   }
@@ -204,6 +271,7 @@ struct NativeLibrary: View {
     case "History": "Pages you visit appear here."
     case "Archive": "Closed tabs will appear here."
     case "Downloads": "Files you download appear here."
+    case "Windows": "Closed windows stay here with their tabs and split views."
     default: "Bookmark a page to keep it here."
     }
   }
@@ -215,7 +283,7 @@ struct NativeLibrary: View {
       }.frame(width: 16, height: 16)
       Button {
         if section == "Archive" {
-          if let tab = store.restoreTab(id: row.id) { actions.activate(tab.id) }
+          restoreArchive(row.id)
         } else { actions.newTab(row.url) }
       } label: {
         VStack(alignment: .leading, spacing: 3) {
@@ -232,14 +300,15 @@ struct NativeLibrary: View {
         Text(row.date, style: .time).font(.system(size: 10)).foregroundStyle(colors.muted)
       }
       if section == "Bookmarks" {
-        Button { store.removeBookmark(id: row.id) } label: { NativeGlyph("xmark").frame(width: 24, height: 26) }
+        Button { perform("bookmark:remove", id: row.id) } label: { NativeGlyph("xmark").frame(width: 24, height: 26) }
           .buttonStyle(.plain).accessibilityLabel("Remove bookmark \(row.title)")
+            .disabled(busy.contains(row.id) || !actions.libraryCapabilities.contains("bookmark:remove"))
       } else if section == "Archive" {
         Button {
-          if let tab = store.restoreTab(id: row.id) { actions.activate(tab.id) }
+          restoreArchive(row.id)
         } label: { NativeGlyph("arrow.uturn.backward").frame(width: 24, height: 26) }
           .buttonStyle(.plain).accessibilityLabel("Restore \(row.title)")
-      } else if actions.libraryCapabilities.contains("peek:open") {
+      } else if BrowserAddress.webURL(row.url) != nil, actions.libraryCapabilities.contains("peek:open") {
         Button { perform("peek:open", values: ["url": row.url]) } label: {
           NativeGlyph("eye").frame(width: 24, height: 26)
         }.buttonStyle(.plain).accessibilityLabel("Preview \(row.title)")
@@ -247,23 +316,30 @@ struct NativeLibrary: View {
     }.padding(.vertical, 8).padding(.horizontal, 5)
       .background(colors.card.opacity(focus == row.id ? 0.46 : 0), in: RoundedRectangle(cornerRadius: 8))
       .contextMenu {
-        Button("Open in new tab") { actions.newTab(row.url) }
-        if actions.libraryCapabilities.contains("peek:open") {
+        if section == "Archive" { Button("Restore tab") { restoreArchive(row.id) } }
+        else { Button("Open in new tab") { actions.newTab(row.url) } }
+        if BrowserAddress.webURL(row.url) != nil, actions.libraryCapabilities.contains("peek:open") {
           Button("Peek at page") { perform("peek:open", values: ["url": row.url]) }
         }
         Button("Copy address") { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(row.url, forType: .string) }
       }
   }
 
+  private func restoreArchive(_ id: String) {
+    do { actions.activate(try store.restoreSessionTabDurably(id: id).id) }
+    catch { self.error = error.localizedDescription; store.clearError() }
+  }
+
   private func downloadRow(_ item: DownloadRecord) -> some View {
-    let complete = item.status == "completed"
+    let complete = ["complete", "completed"].contains(item.status) && item.isDangerous != true
     let paused = item.status == "paused"
+    let resumable = item.status == "interrupted" && item.canResume == true && item.isDangerous != true
     let running = ["downloading", "progressing", "paused"].contains(item.status)
     return HStack(alignment: .top, spacing: 8) {
       NativeGlyph("doc").font(.system(size: 19)).foregroundStyle(colors.accent).frame(width: 22, height: 32)
       VStack(alignment: .leading, spacing: 5) {
         Text(item.filename).lineLimit(2)
-        Text(complete ? bytes(max(item.totalBytes, item.receivedBytes)) : paused ? "Paused" : running ? "\(bytes(item.receivedBytes)) / \(bytes(item.totalBytes))" : item.status.capitalized)
+        Text(item.isDangerous == true ? "Blocked download" : complete ? bytes(max(item.totalBytes, item.receivedBytes)) : paused ? "Paused" : running ? "\(bytes(item.receivedBytes)) / \(bytes(item.totalBytes))" : item.status.capitalized)
           .font(.system(size: 11)).foregroundStyle(colors.muted)
         if running {
           ProgressView(value: item.totalBytes > 0 ? Double(item.receivedBytes) / Double(item.totalBytes) : nil)
@@ -274,10 +350,10 @@ struct NativeLibrary: View {
         Button { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)]) } label: {
           NativeGlyph("folder").frame(width: 24, height: 26)
         }.buttonStyle(.plain).help("Show in Finder")
-      } else if running, actions.libraryCapabilities.contains(paused ? "download:resume" : "download:pause") {
-        Button { perform(paused ? "download:resume" : "download:pause", id: item.id) } label: {
-          NativeGlyph(paused ? "play" : "pause").frame(width: 24, height: 26)
-        }.buttonStyle(.plain).help(paused ? "Resume download" : "Pause download")
+      } else if running || resumable, actions.libraryCapabilities.contains(paused || resumable ? "download:resume" : "download:pause") {
+        Button { perform(paused || resumable ? "download:resume" : "download:pause", id: item.id) } label: {
+          NativeGlyph(paused || resumable ? "play" : "pause").frame(width: 24, height: 26)
+        }.buttonStyle(.plain).help(paused || resumable ? "Resume download" : "Pause download")
       }
       Menu {
         if complete, let path = item.path {
@@ -498,9 +574,10 @@ struct NativeLibrary: View {
     }
   }
   private func moveFocus(_ id: String, offset: Int) {
-    guard let index = filteredRows.firstIndex(where: { $0.id == id }) else { return }
+    let ids = focusableIDs
+    guard let index = ids.firstIndex(of: id) else { return }
     let next = index + offset
-    focus = next < 0 ? "search" : filteredRows[min(filteredRows.count - 1, next)].id
+    focus = next < 0 ? "search" : ids[min(ids.count - 1, next)]
   }
   private func matches(_ title: String, _ url: String) -> Bool {
     let text = query.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -521,6 +598,7 @@ struct NativeLibrary: View {
     case "History": "clock.arrow.circlepath"
     case "Downloads": "arrow.down.circle"
     case "Archive": "archivebox"
+    case "Windows": "square.stack"
     case "Settings": "gearshape"
     case "Extensions": "puzzlepiece.extension"
     default: "sparkles"
@@ -550,6 +628,10 @@ private struct LibraryRow: Identifiable {
 private struct LibraryGroup {
   let label: String
   var items: [LibraryRow]
+}
+private struct LibraryWindowGroup {
+  let label: String
+  var items: [BrowserSavedWindow]
 }
 private struct LibraryDownloadGroup {
   let label: String

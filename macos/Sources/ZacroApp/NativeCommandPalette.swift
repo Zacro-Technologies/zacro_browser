@@ -42,6 +42,10 @@ struct NativeCommandPalette: View {
     store.state.tabs.filter { store.profileID(for: $0) == store.activeProfileID && $0.url != "about:blank" }
       .sorted { $0.lastAccessedAt > $1.lastAccessedAt }
   }
+  private var currentDocumentURL: String? {
+    if let peek = store.state.activeTab?.peek, peek.isPresented != false { return peek.url }
+    return store.state.activeTab?.url
+  }
   private var selectedEntry: Entry? { results.indices.contains(selection) ? results[selection] : nil }
   private var placeholder: String {
     if let site { return "Search \(site.name)" }
@@ -191,7 +195,7 @@ struct NativeCommandPalette: View {
     if filter != "action" {
       for (index, tab) in profileTabs.enumerated() {
         if query.isEmpty && filter == "all" && (tab.id == store.state.activeTabID || index > 5) { continue }
-        let detail = tab.spaceID == store.state.activeSpaceID ? (URL(string: tab.url)?.host ?? "") : (store.state.spaces.first { $0.id == tab.spaceID }?.name ?? "")
+        let detail = tab.spaceID == store.state.activeSpaceID ? NativePageIdentity.label(tab.url) : (store.state.spaces.first { $0.id == tab.spaceID }?.name ?? "")
         add(Entry(id: "tab:\(tab.id)", kind: "tab", title: tab.displayTitle, icon: "globe", detail: detail,
           type: tab.isClosed ? tab.isFavorite ? "Open favorite" : "Open pinned tab" : "Switch to tab",
           keywords: "\(tab.url) \(tab.title) \(tab.savedURL ?? "")", url: tab.url) {
@@ -240,7 +244,7 @@ struct NativeCommandPalette: View {
       add(entry, priority: 5)
     }
     if filter == "all" {
-      if let url = store.state.activeTab?.peek?.url ?? store.state.activeTab?.url,
+      if let url = currentDocumentURL,
         let website = SiteSearchEngine.currentWebsite(url, engines: store.state.settings.siteSearches, searchEngine: store.state.settings.searchEngine) {
         var entry = Entry(id: "current-website", kind: "action", title: "Search in \(website.name)", icon: "magnifyingglass", detail: query, type: "This website") {
           if let url = website.searchURL(query) { navigate(url.absoluteString) } else { enterSite(website) }
@@ -315,10 +319,15 @@ struct NativeCommandPalette: View {
         if actions.libraryCapabilities.contains("peek:open") {
           items.append(task("result:peek", "Peek at page", "eye") { close { Task { try? await actions.performLibraryAction?("peek:open", ["url": pageURL, "profileId": store.activeProfileID]) } } })
         }
+      } else if let tab, NativePageIdentity.hasDocument(URL(string: pageURL)) {
+        items.append(task("result:newtab", "Open in new tab", "plus") { duplicate(tab) })
+      }
+      if NativePageIdentity.hasDocument(URL(string: pageURL)) {
         items.append(task("result:copy", "Copy address", "link") { close { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(pageURL, forType: .string) } })
       }
       if let tab {
-        if tab.id != store.state.activeTabID, tab.spaceID == store.state.activeSpaceID, let current = store.state.activeTabID {
+        if tab.id != store.state.activeTabID, tab.spaceID == store.state.activeSpaceID,
+          store.split(for: tab.id) == nil, let current = store.state.activeTabID, store.split(for: current) == nil {
           items.append(task("result:split", "Open in split view", "rectangle.split.2x1") { close { store.setSplit(left: current, right: tab.id) } })
         }
         items += [task("result:pin", tab.isPinned ? "Unpin tab" : "Pin tab", "pin") { close { store.togglePin(id: tab.id) } },
@@ -358,7 +367,15 @@ struct NativeCommandPalette: View {
   private func run(_ item: Entry) { item.run() }
   private func activate(separate: Bool) {
     guard let entry = selectedEntry else { return }
-    if separate, let url = entry.url { navigate(url, separate: true) } else { run(entry) }
+    if separate, entry.kind == "tab", let tab = store.tab(String(entry.id.dropFirst(4))),
+      BrowserAddress.webURL(tab.url) == nil {
+      duplicate(tab)
+    } else if separate, let url = entry.url { navigate(url, separate: true) } else { run(entry) }
+  }
+  private func duplicate(_ tab: BrowserTab) {
+    close {
+      if let duplicate = store.duplicateTab(id: tab.id) { actions.activate(duplicate.id) }
+    }
   }
   private func moveSelection(_ offset: Int) {
     guard !results.isEmpty else { return }

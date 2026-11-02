@@ -38,6 +38,52 @@ final class NativeNavigationCoordinator {
     }
   }
 
+  func validateDestination(of tab: BrowserTab) async throws -> ChromeNavigationApproval? {
+    guard let profileID = store.profileID(for: tab),
+      let profile = store.state.profiles.first(where: { $0.id == profileID }) else { throw CancellationError() }
+    return try await approval(address: tab.url, provenance: tab.nativeNavigation,
+      profileID: profileID, isPrivate: profile.isPrivate)
+  }
+
+  func loadDestination(_ page: ChromiumPage, tab: BrowserTab) async throws {
+    let peek = tab.id.hasPrefix("peek:"), sourceID = tab.id.hasPrefix("peek:") ? String(tab.id.dropFirst(5)) : tab.id
+    guard owns(page, tabID: sourceID, peek: peek, address: tab.url) else { throw CancellationError() }
+    let approval = try await validateDestination(of: tab)
+    try Task.checkCancellation()
+    guard owns(page, tabID: sourceID, peek: peek, address: tab.url) else { throw CancellationError() }
+    if let approval { try await page.loadApprovedNavigation(approval) }
+    else if let url = BrowserAddress.documentURL(tab.url) { page.load(url) }
+  }
+
+  private func approval(address: String, provenance: NativeNavigationProvenance?,
+                        profileID: String, isPrivate: Bool) async throws -> ChromeNavigationApproval? {
+    guard let url = BrowserAddress.documentURL(address, provenance: provenance) else {
+      throw ShortcutError("This saved page does not have a valid navigation authorization.")
+    }
+    guard let provenance else { return nil }
+    guard !isPrivate, provenance.matches(address) else {
+      throw ShortcutError("The extension authorization no longer matches this page.")
+    }
+    let approval = try await ChromeExtensionManager(engine: engine, profileID: profileID).validateNavigation(
+      extensionID: provenance.extensionID, incarnationID: provenance.incarnationID, url: url)
+    guard approval.url == url, approval.profileID == profileID else { throw ChromeExtensionError.invalidResponse }
+    return approval
+  }
+
+  private func authorizeHistory(_ page: ChromiumPage, tab: BrowserTab) async throws {
+    let peek = tab.id.hasPrefix("peek:"), sourceID = tab.id.hasPrefix("peek:") ? String(tab.id.dropFirst(5)) : tab.id
+    var validated: [String: NativeNavigationProvenance] = [:]
+    for entry in tab.navigation {
+      guard let provenance = entry.nativeNavigation, validated[entry.url] != provenance else { continue }
+      let approval = try await approval(address: entry.url, provenance: provenance,
+        profileID: page.profileID, isPrivate: page.isPrivate)
+      try Task.checkCancellation()
+      guard owns(page, tabID: sourceID, peek: peek, address: tab.url) else { throw CancellationError() }
+      if let approval { try page.authorizeNavigation(approval) }
+      validated[entry.url] = provenance
+    }
+  }
+
   func restore(_ page: ChromiumPage, tabID: String, peek: Bool, address: String, dormant: Bool = false) {
     let id = page.id
     restores[id]?.cancel()
@@ -51,6 +97,7 @@ final class NativeNavigationCoordinator {
         }
       }
       var restored = false
+      var destinationApproval: ChromeNavigationApproval?
       do {
         let browser = try await page.ready()
         try Task.checkCancellation()
@@ -61,6 +108,18 @@ final class NativeNavigationCoordinator {
           return
         }
         guard self.owns(page, tabID: tabID, peek: peek, address: address) else { return }
+        do {
+          destinationApproval = try await self.approval(address: address,
+            provenance: self.store.document(id: page.id)?.nativeNavigation,
+            profileID: page.profileID, isPrivate: page.isPrivate)
+          try Task.checkCancellation()
+          guard self.owns(page, tabID: tabID, peek: peek, address: address) else { return }
+          if let destinationApproval { try page.authorizeNavigation(destinationApproval) }
+        } catch {
+          if !(error is CancellationError) { self.didFailPreparation?(id, error.localizedDescription) }
+          return
+        }
+        if let tab = self.store.document(id: page.id) { try await self.authorizeHistory(page, tab: tab) }
         if dormant {
           try await browser.restoreDiscardedDocument()
           restored = true
@@ -71,10 +130,10 @@ final class NativeNavigationCoordinator {
           if let state {
             try await browser.restoreNavigationState(state)
             restored = true
-          } else if !peek, let tab = self.store.tab(tabID), tab.navigation.count > 1,
+          } else if let tab = self.store.document(id: page.id), tab.navigation.count > 1,
             tab.navigation.indices.contains(tab.navigationIndex) {
             let entries = tab.navigation.compactMap { entry -> CefNavigationEntry? in
-              guard let url = URL(string: entry.url) else { return nil }
+              guard let url = BrowserAddress.documentURL(entry.url, provenance: entry.nativeNavigation) else { return nil }
               return CefNavigationEntry(url: url, title: entry.title)
             }
             if entries.count == tab.navigation.count {
@@ -88,11 +147,20 @@ final class NativeNavigationCoordinator {
         fputs("Zacro could not restore native navigation: \(error.localizedDescription)\n", stderr)
       }
       guard !Task.isCancelled, self.owns(page, tabID: tabID, peek: peek, address: address) else { return }
-      self.restores.removeValue(forKey: id)
-      if !restored && !peek && (self.store.tab(tabID)?.navigation.count ?? 0) > 1 {
+      if !restored && (self.store.document(id: page.id)?.navigation.count ?? 0) > 1 {
         self.urlOnlyRestorations.insert(id)
       } else { self.urlOnlyRestorations.remove(id) }
-      if !restored, let url = URL(string: address) { page.load(url) }
+      if !restored {
+        do {
+          if let destinationApproval { try await page.loadApprovedNavigation(destinationApproval) }
+          else if let url = BrowserAddress.documentURL(address) { page.load(url) }
+        } catch {
+          if !(error is CancellationError) { self.didFailPreparation?(id, error.localizedDescription) }
+          return
+        }
+      }
+      guard !Task.isCancelled, self.owns(page, tabID: tabID, peek: peek, address: address) else { return }
+      self.restores.removeValue(forKey: id)
       self.didRestore?(id, restored)
       self.observe(page, tabID: tabID, peek: peek)
     }
@@ -134,7 +202,7 @@ final class NativeNavigationCoordinator {
       let address = page.url?.absoluteString,
       owns(page, tabID: tabID, peek: peek, address: address), let browser = page.browser else { return false }
     do {
-      if !peek {
+      if store.document(id: page.id) != nil {
         let native = try await browser.devTools.call("Page.getNavigationHistory")
         guard !Task.isCancelled, owns(page, tabID: tabID, peek: peek, address: address), page.url?.absoluteString == address else { return false }
         if let raw = native["entries"] as? [[String: Any]], let selected = native["currentIndex"] as? Int,
@@ -144,14 +212,20 @@ final class NativeNavigationCoordinator {
           var entries: [NavigationEntry] = []
           var index: Int?
           for position in start..<end {
-            guard let url = raw[position]["url"] as? String,
-              BrowserAddress.webURL(url) != nil || BrowserAddress.extensionURL(url) != nil || url == "about:blank" else { continue }
+            guard let url = raw[position]["url"] as? String else { continue }
+            let current = store.document(id: page.id)
+            let provenance = current?.nativeNavigation.flatMap { $0.matches(url) ? $0 : nil }
+              ?? current?.navigation.first(where: { $0.url == url && $0.nativeNavigation?.matches(url) == true })?.nativeNavigation
+            guard BrowserAddress.documentURL(url, provenance: provenance) != nil else { continue }
             if position == selected { index = entries.count }
-            entries.append(NavigationEntry(url: url, title: String((raw[position]["title"] as? String ?? "").prefix(500))))
+            entries.append(NavigationEntry(url: url, title: String((raw[position]["title"] as? String ?? "").prefix(500)), nativeNavigation: provenance))
           }
           if let index, entries.indices.contains(index), entries[index].url == address,
-            let current = store.tab(tabID), current.navigation != entries || current.navigationIndex != index {
-            store.updateTab(tabID) { $0.navigation = entries; $0.navigationIndex = index }
+            let current = store.document(id: page.id), current.navigation != entries || current.navigationIndex != index {
+            store.updateTab(tabID) {
+              if peek { $0.peek?.navigation = entries; $0.peek?.navigationIndex = index }
+              else { $0.navigation = entries; $0.navigationIndex = index }
+            }
           }
         }
       }

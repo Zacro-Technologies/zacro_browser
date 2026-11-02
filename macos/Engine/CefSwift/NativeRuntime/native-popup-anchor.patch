@@ -1,0 +1,315 @@
+--- /dev/null
++++ b/chrome/browser/ui/views/extensions/native_extension_popup_anchor.h
+@@ -0,0 +1,29 @@
++#ifndef CHROME_BROWSER_UI_VIEWS_EXTENSIONS_NATIVE_EXTENSION_POPUP_ANCHOR_H_
++#define CHROME_BROWSER_UI_VIEWS_EXTENSIONS_NATIVE_EXTENSION_POPUP_ANCHOR_H_
++
++#include <memory>
++#include "base/functional/callback_forward.h"
++
++namespace content { class WebContents; }
++namespace gfx { class RectF; }
++namespace views { class View; class Widget; }
++
++// Browser-process-only bridge from a native shell action to Chromium's actual
++// ExtensionPopup. It never loads an extension URL or grants tab permissions.
++class NativeExtensionPopupAnchor {
++ public:
++  static bool Prepare(content::WebContents* contents, int native_window_number,
++                      const gfx::RectF& cocoa_screen_anchor);
++  static bool HasPrepared(content::WebContents* contents);
++  static void CancelPrepared(content::WebContents* contents);
++  static std::unique_ptr<NativeExtensionPopupAnchor> Take(content::WebContents* contents);
++  ~NativeExtensionPopupAnchor();
++  views::View* view() const;
++  void Attach(views::Widget* popup, base::RepeatingClosure close);
++ private:
++  class Impl;
++  explicit NativeExtensionPopupAnchor(std::unique_ptr<Impl> impl);
++  std::unique_ptr<Impl> impl_;
++};
++
++#endif
+--- /dev/null
++++ b/chrome/browser/ui/views/extensions/native_extension_popup_anchor_mac.mm
+@@ -0,0 +1,165 @@
++#import <AppKit/AppKit.h>
++
++#include "chrome/browser/ui/views/extensions/native_extension_popup_anchor.h"
++
++#include <utility>
++#include <vector>
++#include <cmath>
++#include "base/functional/callback.h"
++#include "base/supports_user_data.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/time/time.h"
++#include "content/public/browser/browser_thread.h"
++#include "content/public/browser/web_contents.h"
++#include "ui/gfx/geometry/rect.h"
++#include "ui/gfx/geometry/rect_f.h"
++#include "ui/gfx/mac/coordinate_conversion.h"
++#include "ui/views/view.h"
++#include "ui/views/widget/widget.h"
++
++namespace {
++constexpr char kPendingAnchor[] = "zacro.native.extension-popup-anchor";
++struct PendingAnchor : base::SupportsUserData::Data {
++  PendingAnchor(NSWindow* window, const gfx::Rect& bounds)
++      : owner(window), bounds(bounds), expires(base::TimeTicks::Now() + base::Seconds(5)) {}
++  __weak NSWindow* owner;
++  gfx::Rect bounds;
++  base::TimeTicks expires;
++  bool valid() const {
++    return owner && owner.visible && !owner.miniaturized && base::TimeTicks::Now() <= expires;
++  }
++};
++bool Descendant(NSWindow* window, NSWindow* ancestor) {
++  if (!ancestor) return false;
++  for (NSWindow* current = window; current; current = current.parentWindow) {
++    if (current == ancestor) return true;
++  }
++  return false;
++}
++struct PopupState {
++  __weak NSWindow* owner;
++  __weak NSWindow* popup;
++  base::RepeatingClosure close;
++  void Close() {
++    // Closing the bubble can synchronously destroy its anchor and reset the
++    // stored callback. Keep this invocation's bind state alive until it returns.
++    auto callback = close;
++    if (callback) callback.Run();
++  }
++};
++}  // namespace
++
++class NativeExtensionPopupAnchor::Impl {
++ public:
++  Impl(NSWindow* owner, const gfx::Rect& bounds) : state_(std::make_shared<PopupState>()) {
++    state_->owner = owner;
++    widget_ = std::make_unique<views::Widget>();
++    views::Widget::InitParams params(views::Widget::InitParams::CLIENT_OWNS_WIDGET,
++                                    views::Widget::InitParams::TYPE_POPUP);
++    params.name = "ZacroExtensionPopupAnchor";
++    params.bounds = bounds;
++    params.opacity = views::Widget::InitParams::WindowOpacity::kTranslucent;
++    params.activatable = views::Widget::InitParams::Activatable::kNo;
++    params.accept_events = false;
++    params.shadow_type = views::Widget::InitParams::ShadowType::kNone;
++    widget_->Init(std::move(params));
++    widget_->SetContentsView(std::make_unique<views::View>());
++    NSWindow* anchor = widget_->GetNativeWindow().GetNativeNSWindow();
++    anchor.opaque = NO; anchor.backgroundColor = NSColor.clearColor;
++    anchor.hasShadow = NO; anchor.ignoresMouseEvents = YES;
++    // NativeWidgetMac only recognizes Views parents. The native shell is an
++    // ordinary NSWindow, so attach its child explicitly without showing the
++    // hidden Chrome document or changing its active WebContents.
++    [owner addChildWindow:anchor ordered:NSWindowAbove];
++    widget_->ShowInactive();
++  }
++  ~Impl() {
++    state_->close.Reset();
++    NSNotificationCenter* center = NSNotificationCenter.defaultCenter;
++    for (id observer : observers_) [center removeObserver:observer];
++    if (monitor_) [NSEvent removeMonitor:monitor_];
++    NSWindow* anchor = widget_->GetNativeWindow().GetNativeNSWindow();
++    [anchor.parentWindow removeChildWindow:anchor];
++    // The owning bubble may be destroying its widget. Release the anchor on
++    // the next UI turn, after BubbleDialogDelegate removes its observations.
++    base::SequencedTaskRunner::GetCurrentDefault()->DeleteSoon(FROM_HERE, std::move(widget_));
++  }
++  views::View* view() const { return widget_->GetContentsView(); }
++  void Attach(views::Widget* popup, base::RepeatingClosure close) {
++    state_->popup = popup->GetNativeWindow().GetNativeNSWindow();
++    state_->close = std::move(close);
++    std::weak_ptr<PopupState> weak = state_;
++    NSNotificationCenter* center = NSNotificationCenter.defaultCenter;
++    for (NSNotificationName name in @[NSWindowWillCloseNotification,
++                                    NSWindowWillMiniaturizeNotification,
++                                    NSWindowDidResizeNotification]) {
++      observers_.push_back([center addObserverForName:name object:state_->owner queue:nil
++          usingBlock:^(NSNotification*) { if (auto state = weak.lock()) state->Close(); }]);
++    }
++    observers_.push_back([center addObserverForName:NSApplicationDidResignActiveNotification object:NSApp queue:nil
++        usingBlock:^(NSNotification*) { if (auto state = weak.lock()) state->Close(); }]);
++    observers_.push_back([center addObserverForName:NSWindowDidBecomeKeyNotification object:nil queue:nil
++        usingBlock:^(NSNotification* event) {
++          if (auto state = weak.lock(); state && !Descendant(event.object, state->popup)) state->Close();
++        }]);
++    monitor_ = [NSEvent addLocalMonitorForEventsMatchingMask:
++        NSEventMaskLeftMouseDown | NSEventMaskRightMouseDown | NSEventMaskOtherMouseDown
++        handler:^NSEvent*(NSEvent* event) {
++          if (auto state = weak.lock(); state && !Descendant(event.window, state->popup)) {
++            // Keep native menus usable. The popup's existing close routine also
++            // preserves its DevTools and JavaScript-dialog exceptions.
++            if (!event.window || event.window.level < NSPopUpMenuWindowLevel) state->Close();
++          }
++          return event;
++        }];
++  }
++ private:
++  std::shared_ptr<PopupState> state_;
++  std::unique_ptr<views::Widget> widget_;
++  std::vector<__strong id> observers_;
++  __strong id monitor_ = nil;
++};
++
++NativeExtensionPopupAnchor::NativeExtensionPopupAnchor(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
++NativeExtensionPopupAnchor::~NativeExtensionPopupAnchor() = default;
++views::View* NativeExtensionPopupAnchor::view() const { return impl_->view(); }
++void NativeExtensionPopupAnchor::Attach(views::Widget* popup, base::RepeatingClosure close) {
++  impl_->Attach(popup, std::move(close));
++}
++bool NativeExtensionPopupAnchor::Prepare(content::WebContents* contents,
++                                       int native_window_number,
++                                       const gfx::RectF& cocoa_screen_anchor) {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  CancelPrepared(contents);
++  if (!contents || native_window_number <= 0 || cocoa_screen_anchor.IsEmpty() ||
++      !std::isfinite(cocoa_screen_anchor.x()) || !std::isfinite(cocoa_screen_anchor.y()) ||
++      !std::isfinite(cocoa_screen_anchor.width()) || !std::isfinite(cocoa_screen_anchor.height()) ||
++      cocoa_screen_anchor.width() > 512 || cocoa_screen_anchor.height() > 512) return false;
++  NSWindow* owner = [NSApp windowWithWindowNumber:native_window_number];
++  const NSRect native_rect = NSMakeRect(cocoa_screen_anchor.x(), cocoa_screen_anchor.y(),
++      cocoa_screen_anchor.width(), cocoa_screen_anchor.height());
++  if (!owner || !owner.visible || owner.miniaturized ||
++      !NSContainsRect(owner.frame, native_rect)) return false;
++  contents->SetUserData(kPendingAnchor, std::make_unique<PendingAnchor>(owner, gfx::ScreenRectFromNSRect(native_rect)));
++  return true;
++}
++bool NativeExtensionPopupAnchor::HasPrepared(content::WebContents* contents) {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  auto* pending = contents ? static_cast<PendingAnchor*>(contents->GetUserData(kPendingAnchor)) : nullptr;
++  return pending && pending->valid();
++}
++void NativeExtensionPopupAnchor::CancelPrepared(content::WebContents* contents) {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  if (contents) contents->RemoveUserData(kPendingAnchor);
++}
++std::unique_ptr<NativeExtensionPopupAnchor> NativeExtensionPopupAnchor::Take(content::WebContents* contents) {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  auto* pending = contents ? static_cast<PendingAnchor*>(contents->GetUserData(kPendingAnchor)) : nullptr;
++  if (!pending) return nullptr;
++  NSWindow* owner = pending->valid() ? pending->owner : nil;
++  const gfx::Rect bounds = pending->bounds;
++  contents->RemoveUserData(kPendingAnchor);
++  if (!owner) return nullptr;
++  return std::unique_ptr<NativeExtensionPopupAnchor>(
++      new NativeExtensionPopupAnchor(std::make_unique<Impl>(owner, bounds)));
++}
+--- a/chrome/browser/ui/views/extensions/extension_popup.h
++++ b/chrome/browser/ui/views/extensions/extension_popup.h
+@@ -23,6 +23,7 @@
+ #include "ui/views/widget/widget_observer.h"
+ 
+ class BrowserWindowInterface;
++class NativeExtensionPopupAnchor;
+ class ExtensionViewViews;
+ 
+ namespace content {
+@@ -137,6 +138,9 @@
+   // Handles a signal from the extension host to close.
+   void HandleCloseExtensionHost(extensions::ExtensionHost* host);
+ 
++#if BUILDFLAG(IS_MAC)
++  std::unique_ptr<NativeExtensionPopupAnchor> native_anchor_;
++#endif
+   raw_ptr<BrowserWindowInterface> browser_;
+ 
+   // The contained host for the view.
+--- a/chrome/browser/ui/views/extensions/extension_popup.cc
++++ b/chrome/browser/ui/views/extensions/extension_popup.cc
+@@ -41,6 +41,7 @@
+ 
+ #if BUILDFLAG(IS_MAC)
+ #include "base/message_loop/message_pump_apple.h"
++#include "chrome/browser/ui/views/extensions/native_extension_popup_anchor.h"
+ #endif
+ 
+ constexpr gfx::Size ExtensionPopup::kMinSize;
+@@ -63,9 +64,27 @@
+     views::BubbleBorder::Arrow arrow,
+     PopupShowAction show_action,
+     ShowPopupCallback callback) {
++#if BUILDFLAG(IS_MAC)
++  auto native_anchor = NativeExtensionPopupAnchor::Take(
++      browser->GetTabStripModel()->GetActiveWebContents());
++  if (native_anchor) {
++    anchor = views::BubbleAnchor(native_anchor->view());
++    arrow = views::BubbleBorder::TOP_LEFT;
++  }
++#endif
+   auto* popup = new ExtensionPopup(browser, std::move(host), anchor, arrow,
+                                    show_action, std::move(callback));
++#if BUILDFLAG(IS_MAC)
++  popup->native_anchor_ = std::move(native_anchor);
++#endif
+   views::BubbleDialogDelegateView::CreateBubble(popup);
++#if BUILDFLAG(IS_MAC)
++  if (popup->native_anchor_) {
++    popup->native_anchor_->Attach(popup->GetWidget(), base::BindRepeating(
++        &ExtensionPopup::CloseUnlessBlockedByInspectionOrJSDialog,
++        popup->deferred_close_weak_ptr_factory_.GetWeakPtr()));
++  }
++#endif
+ 
+   // Check that the preferred adjustment is set to mirror to match
+   // the assumption in the logic to calculate max bounds.
+--- a/chrome/browser/ui/views/extensions/extension_action_delegate_desktop.cc
++++ b/chrome/browser/ui/views/extensions/extension_action_delegate_desktop.cc
+@@ -13,6 +13,9 @@
+ #include "chrome/browser/ui/extensions/accelerator_priority.h"
+ #include "chrome/browser/ui/extensions/extension_action_view_model.h"
+ #include "chrome/browser/ui/views/extensions/extension_popup.h"
++#if BUILDFLAG(IS_MAC)
++#include "chrome/browser/ui/views/extensions/native_extension_popup_anchor.h"
++#endif
+ #include "chrome/browser/ui/views/extensions/extensions_container_views.h"
+ #include "extensions/common/api/extension_action/action_info.h"
+ #include "extensions/common/command.h"
+@@ -58,6 +61,15 @@
+   popup_host_observation_.Observe(popup_host_.get());
+   extensions_container_views_->SetPopupOwner(model_);
+ 
++#if BUILDFLAG(IS_MAC)
++  if (NativeExtensionPopupAnchor::HasPrepared(GetActiveWebContents())) {
++    // A hidden Chrome toolbar cannot complete its pop-out layout animation.
++    // Keep the same popup owner, ExtensionViewHost and granted user action;
++    // only skip the toolbar animation when a native shell supplied an anchor.
++    ShowPopup(std::move(host), show_action, by_user, std::move(callback));
++    return;
++  }
++#endif
+   extensions_container_views_->PopOutAction(
+       model_->GetId(),
+       base::BindOnce(&ExtensionActionDelegateDesktop::ShowPopup,
+--- a/chrome/browser/ui/views/extensions/BUILD.gn
++++ b/chrome/browser/ui/views/extensions/BUILD.gn
+@@ -885,7 +885,7 @@
+ }
+ 
+ source_set("extension_popup") {
+-  public = [ "extension_popup.h" ]
++  public = [ "extension_popup.h", "native_extension_popup_anchor.h" ]
+   public_deps = [
+     ":extension_view_views",
+     ":security_dialog_tracker",
+@@ -903,6 +903,9 @@
+ 
+ source_set("extension_popup_impl") {
+   sources = [ "extension_popup.cc" ]
++  if (is_mac) {
++    sources += [ "native_extension_popup_anchor_mac.mm" ]
++  }
+   public_deps = [
+     ":extension_popup",
+     "//chrome/browser:browser_public_dependencies",
+@@ -917,6 +920,7 @@
+     "//components/web_modal",
+     "//content/public/browser",
+     "//ui/base",
++    "//ui/gfx",
+     "//ui/gfx/geometry",
+     "//ui/views",
+   ]

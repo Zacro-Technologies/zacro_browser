@@ -222,8 +222,8 @@ public actor NativeAIService {
   public func profileChanged() {
     revision += 1; request?.cancel(); conversations.removeAll(); sourcesByProfile.removeAll()
   }
-  public func verifiedSources() async throws -> [ServiceJSON] {
-    let profile = try await scope()
+  public func verifiedSources(expectedProfileID: String? = nil) async throws -> [ServiceJSON] {
+    let profile = try await scope(expectedProfileID)
     return sourcesByProfile[profile.id,default:[]].flatMap { $0 }
   }
 

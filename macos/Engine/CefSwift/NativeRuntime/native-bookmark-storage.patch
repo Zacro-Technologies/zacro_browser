@@ -1,0 +1,237 @@
+--- a/components/bookmarks/browser/bookmark_storage.h
++++ b/components/bookmarks/browser/bookmark_storage.h
+@@ -93,6 +93,11 @@
+   // Schedules saving the bookmark bar model to disk.
+   void ScheduleSave();
+ 
++  // Captures the current model and immediately queues its primary-file write.
++  // Completes on the calling sequence after the atomic write, including false
++  // for serialization/encryption failures. Repeated calls keep distinct results.
++  void SaveForNative(base::OnceCallback<void(bool)> callback);
++
+   // ImportantFileWriter::BackgroundDataSerializer implementation.
+   base::ImportantFileWriter::BackgroundDataProducerCallback
+   GetSerializedDataProducerForBackgroundSequence() override;
+--- a/components/bookmarks/browser/bookmark_storage.cc
++++ b/components/bookmarks/browser/bookmark_storage.cc
+@@ -7,6 +7,7 @@
+ #include <stddef.h>
+ 
+ #include <algorithm>
++#include <tuple>
+ #include <unordered_map>
+ #include <utility>
+ 
+@@ -19,6 +20,7 @@
+ #include "base/memory/scoped_refptr.h"
+ #include "base/notreached.h"
+ #include "base/numerics/safe_conversions.h"
++#include "base/task/bind_post_task.h"
+ #include "base/task/sequenced_task_runner.h"
+ #include "base/task/task_traits.h"
+ #include "base/task/thread_pool.h"
+@@ -204,6 +206,32 @@
+ 
+ BookmarkStorage::~BookmarkStorage() {
+   SaveNowIfScheduled();
++}
++
++void BookmarkStorage::SaveForNative(base::OnceCallback<void(bool)> callback) {
++  // The normal serializer preserves the selected primary encryption format,
++  // secondary writes, backup sequencing and sync metadata. Always capture a
++  // fresh snapshot: an already queued write may predate this caller's mutation.
++  auto completion = base::SplitOnceCallback(
++      base::BindPostTaskToCurrentDefault(std::move(callback)));
++  writer_.RegisterOnNextWriteCallbacks(
++      base::OnceClosure(),
++      base::BindOnce(
++          [](base::OnceCallback<void(bool)> complete,
++             base::ScopedClosureRunner failure, bool success) {
++            // ImportantFileWriter drops its callback if background production
++            // fails. The runner reports that failure instead of hanging a host
++            // request. On a real write result, consume only the success branch.
++            std::ignore = failure.Release();
++            std::move(complete).Run(success);
++          },
++          std::move(completion.first),
++          base::ScopedClosureRunner(
++              base::BindOnce(std::move(completion.second), false))));
++  ScheduleSave();
++  // Consume these callbacks in this UI turn, so another caller cannot replace
++  // them before this specific snapshot is posted to the sequenced writer.
++  writer_.DoScheduledWrite();
+ }
+ 
+ void BookmarkStorage::ScheduleSave() {
+--- a/components/bookmarks/browser/bookmark_model.h
++++ b/components/bookmarks/browser/bookmark_model.h
+@@ -17,6 +17,7 @@
+ #include "base/check_op.h"
+ #include "base/compiler_specific.h"
+ #include "base/containers/flat_map.h"
++#include "base/functional/callback_forward.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/scoped_refptr.h"
+ #include "base/memory/weak_ptr.h"
+@@ -446,6 +447,12 @@
+     return weak_factory_.GetWeakPtr();
+   }
+ 
++  // Captures both bookmark stores and completes on this sequence only after
++  // their primary files have been written atomically. False means the caller
++  // must retain its migration/retry state; mutations remain in the live model.
++  // The model must be loaded with real storage, not an in-memory test model.
++  void SaveForNative(base::OnceCallback<void(bool)> callback);
++
+   // Similar to Load() but allows unit-tests to mimic an empty JSON file being
+   // loaded from disk, without dealing with actual files, and complete loading
+   // synchronously.
+--- a/components/bookmarks/browser/bookmark_model.cc
++++ b/components/bookmarks/browser/bookmark_model.cc
+@@ -11,6 +11,7 @@
+ #include <string>
+ #include <utility>
+ 
++#include "base/barrier_callback.h"
+ #include "base/check.h"
+ #include "base/check_op.h"
+ #include "base/debug/crash_logging.h"
+@@ -23,6 +24,7 @@
+ #include "base/notreached.h"
+ #include "base/observer_list.h"
+ #include "base/strings/string_util.h"
++#include "base/task/sequenced_task_runner.h"
+ #include "base/task/thread_pool.h"
+ #include "base/uuid.h"
+ #include "components/bookmarks/browser/bookmark_load_details.h"
+@@ -1221,6 +1223,24 @@
+   CHECK(loaded_);
+ }
+ 
++void BookmarkModel::SaveForNative(base::OnceCallback<void(bool)> callback) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (!loaded_ || !local_or_syncable_store_) {
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(std::move(callback), false));
++    return;
++  }
++  auto barrier = base::BarrierCallback<bool>(
++      account_store_ ? 2 : 1,
++      base::BindOnce(
++          [](base::OnceCallback<void(bool)> complete, std::vector<bool> results) {
++            std::move(complete).Run(
++                std::all_of(results.begin(), results.end(), [](bool ok) { return ok; }));
++          }, std::move(callback)));
++  local_or_syncable_store_->SaveForNative(base::BindOnce(barrier));
++  if (account_store_) account_store_->SaveForNative(base::BindOnce(barrier));
++}
++
+ void BookmarkModel::CommitPendingWriteForTest() {
+   if (local_or_syncable_store_) {
+     local_or_syncable_store_->SaveNowIfScheduledForTesting();  // IN-TEST
+--- a/components/bookmarks/browser/bookmark_storage_unittest.cc
++++ b/components/bookmarks/browser/bookmark_storage_unittest.cc
+@@ -16,6 +16,8 @@
+ #include "base/test/metrics/histogram_tester.h"
+ #include "base/test/scoped_feature_list.h"
+ #include "base/test/task_environment.h"
++#include "base/test/test_future.h"
++#include "base/functional/bind.h"
+ #include "base/test/test_file_util.h"
+ #include "base/time/time.h"
+ #include "components/bookmarks/browser/bookmark_codec.h"
+@@ -666,4 +668,94 @@
+     ::testing::Values(BookmarkEncryptionStage::kWriteBothReadOnlyClear,
+                       BookmarkEncryptionStage::kWriteBothReadPreferEncrypted));
+ 
++// Native migration must not acknowledge an in-memory-only BookmarkModel write.
++TEST_P(BookmarkStorageWithSingleFileTest, NativeSaveAcknowledgesPrimaryFile) {
++  base::test::TaskEnvironment environment{
++      base::test::TaskEnvironment::TimeSource::MOCK_TIME,
++      base::test::TaskEnvironment::ThreadPoolExecutionMode::QUEUED};
++  auto model = CreateModelWithOneBookmark();
++  BookmarkStorage storage(model.get(), BookmarkStorage::kSelectLocalOrSyncableNodes,
++                          encryptor_, clear_text_file_path_, encrypted_file_path_);
++  base::test::TestFuture<bool> result;
++  storage.SaveForNative(result.GetCallback());
++  EXPECT_FALSE(result.IsReady());
++  EXPECT_FALSE(storage.HasScheduledSaveForTesting());
++  environment.RunUntilIdle();
++  ASSERT_TRUE(result.Get());
++  ASSERT_TRUE(GetPrimaryFileContent());
++}
++
++TEST_P(BookmarkStorageWithSingleFileTest, NativeBackToBackSavesKeepBothCallbacks) {
++  base::test::TaskEnvironment environment{
++      base::test::TaskEnvironment::TimeSource::MOCK_TIME,
++      base::test::TaskEnvironment::ThreadPoolExecutionMode::QUEUED};
++  auto model = CreateModelWithOneBookmark();
++  BookmarkStorage storage(model.get(), BookmarkStorage::kSelectLocalOrSyncableNodes,
++                          encryptor_, clear_text_file_path_, encrypted_file_path_);
++  base::test::TestFuture<bool> first, second;
++  storage.SaveForNative(first.GetCallback());
++  model->AddURL(model->other_node(), 0, u"Second", GURL("https://second.example/"));
++  storage.SaveForNative(second.GetCallback());
++  EXPECT_FALSE(first.IsReady()); EXPECT_FALSE(second.IsReady());
++  environment.RunUntilIdle();
++  EXPECT_TRUE(first.Get()); EXPECT_TRUE(second.Get());
++  auto content = GetPrimaryFileContent();
++  ASSERT_TRUE(content);
++  EXPECT_NE(DictValueToJsonString(*content).find("https://second.example/"), std::string::npos);
++}
++
++TEST_P(BookmarkStorageWithSingleFileTest, NativeSaveReportsFailedAtomicWrite) {
++  base::test::TaskEnvironment environment{
++      base::test::TaskEnvironment::TimeSource::MOCK_TIME,
++      base::test::TaskEnvironment::ThreadPoolExecutionMode::QUEUED};
++  auto model = CreateModelWithOneBookmark();
++  ASSERT_TRUE(base::CreateDirectory(GetPrimaryFilepath()));
++  BookmarkStorage storage(model.get(), BookmarkStorage::kSelectLocalOrSyncableNodes,
++                          encryptor_, clear_text_file_path_, encrypted_file_path_);
++  base::test::TestFuture<bool> result;
++  storage.SaveForNative(result.GetCallback());
++  environment.RunUntilIdle();
++  EXPECT_FALSE(result.Get());
++  EXPECT_TRUE(base::DirectoryExists(GetPrimaryFilepath()));
++}
++
++TEST_P(BookmarkStorageWithSingleFileTest, NativeSaveReportsSerializationFailure) {
++  class FailingStorage : public BookmarkStorage {
++   public:
++    using BookmarkStorage::BookmarkStorage;
++    base::ImportantFileWriter::BackgroundDataProducerCallback
++    GetSerializedDataProducerForBackgroundSequence() override {
++      return base::BindOnce([]() -> std::optional<std::string> { return std::nullopt; });
++    }
++  };
++  base::test::TaskEnvironment environment{
++      base::test::TaskEnvironment::TimeSource::MOCK_TIME,
++      base::test::TaskEnvironment::ThreadPoolExecutionMode::QUEUED};
++  auto model = CreateModelWithOneBookmark();
++  FailingStorage storage(model.get(), BookmarkStorage::kSelectLocalOrSyncableNodes,
++                         encryptor_, clear_text_file_path_, encrypted_file_path_);
++  base::test::TestFuture<bool> result;
++  storage.SaveForNative(result.GetCallback());
++  environment.RunUntilIdle();
++  EXPECT_FALSE(result.Get());
++  EXPECT_FALSE(base::PathExists(GetPrimaryFilepath()));
++}
++
++TEST_P(BookmarkStorageWithSingleFileTest, NativeCallbackSurvivesStorageDestruction) {
++  base::test::TaskEnvironment environment{
++      base::test::TaskEnvironment::TimeSource::MOCK_TIME,
++      base::test::TaskEnvironment::ThreadPoolExecutionMode::QUEUED};
++  auto model = CreateModelWithOneBookmark();
++  base::test::TestFuture<bool> result;
++  {
++    BookmarkStorage storage(model.get(), BookmarkStorage::kSelectLocalOrSyncableNodes,
++                            encryptor_, clear_text_file_path_, encrypted_file_path_);
++    storage.SaveForNative(result.GetCallback());
++  }
++  model.reset();
++  environment.RunUntilIdle();
++  EXPECT_TRUE(result.Get());
++  ASSERT_TRUE(GetPrimaryFileContent());
++}
++
+ }  // namespace bookmarks

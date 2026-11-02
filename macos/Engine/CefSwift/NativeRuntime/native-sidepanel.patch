@@ -1,0 +1,276 @@
+--- a/chrome/browser/ui/side_panel/side_panel_registry.h
++++ b/chrome/browser/ui/side_panel/side_panel_registry.h
+@@ -64,6 +64,10 @@
+   // successful and false if there is no entry registered for the `key`.
+   bool Deregister(const SidePanelEntry::Key& key);
+ 
++  // Takes an inactive entry after its live view has been detached. The caller
++  // must immediately register it in another registry in the same profile.
++  std::unique_ptr<SidePanelEntry> TakeNativeEntry(const SidePanelEntry::Key& key);
++
+   // Set the active entry in the side panel to be |entry|.
+   void SetActiveEntry(SidePanelEntry* entry);
+ 
+--- a/chrome/browser/ui/side_panel/side_panel_registry.cc
++++ b/chrome/browser/ui/side_panel/side_panel_registry.cc
+@@ -146,6 +146,20 @@
+   return true;
+ }
+ 
++std::unique_ptr<SidePanelEntry> SidePanelRegistry::TakeNativeEntry(
++    const SidePanelEntry::Key& key) {
++  auto* entry = GetEntryForKey(key);
++  if (!entry || (active_entry_ && *active_entry_ == entry) ||
++      deregistering_entry_key_) return nullptr;
++  auto it = std::find_if(entries_.begin(), entries_.end(), base::MatchesUniquePtr(entry));
++  CHECK(it != entries_.end());
++  entry->RemoveObserver(this);
++  entry->set_scope(nullptr);
++  auto taken = std::move(*it);
++  entries_.erase(it);
++  return taken;
++}
++
+ void SidePanelRegistry::SetActiveEntry(SidePanelEntry* entry) {
+   active_entry_ = entry;
+ }
+--- a/chrome/browser/ui/side_panel/side_panel_ui.h
++++ b/chrome/browser/ui/side_panel/side_panel_ui.h
+@@ -9,6 +9,7 @@
+ #include "chrome/browser/ui/side_panel/side_panel_entry_id.h"
+ #include "chrome/browser/ui/side_panel/side_panel_entry_key.h"
+ #include "chrome/browser/ui/side_panel/side_panel_enums.h"
++#include "chrome/browser/ui/side_panel/side_panel_native_view.h"
+ #include "ui/base/unowned_user_data/scoped_unowned_user_data.h"
+ #include "ui/gfx/geometry/rect.h"
+ 
+@@ -58,6 +59,13 @@
+   // starting_bounds_in_browser_coordinates to its final open position.
+   virtual void ShowFrom(SidePanelEntryKey entry_key,
+                         gfx::Rect starting_bounds_in_browser_coordinates) = 0;
++
++  // Native embedders may host one logical window in several BrowserViews.
++  // Detach the current global view without destroying its extension document.
++  // Unsupported platforms leave the panel untouched and return null.
++  virtual SidePanelNativeView TakeNativeGlobalView(const SidePanelEntryKey& key) {
++    return nullptr;
++  }
+ 
+   // Close the side panel.
+   virtual void Close(SidePanelEntryHideReason hide_reason,
+--- a/chrome/browser/ui/views/side_panel/side_panel_coordinator.h
++++ b/chrome/browser/ui/views/side_panel/side_panel_coordinator.h
+@@ -52,6 +52,7 @@
+   void TearDownPreBrowserWindowDestruction();
+ 
+   // SidePanelUI:
++  SidePanelNativeView TakeNativeGlobalView(const SidePanelEntryKey& key) override;
+   using SidePanelUI::Close;
+   void Close(SidePanelEntryHideReason reason,
+              bool suppress_animations) override;
+--- a/chrome/browser/ui/views/side_panel/side_panel_coordinator.cc
++++ b/chrome/browser/ui/views/side_panel/side_panel_coordinator.cc
+@@ -212,6 +212,20 @@
+ //   (4) At the moment that this comment was written, if this class is showing
+ //   a window-scoped side-panel entry, and the window is closed via any
+ //   mechanism, this method is not called.
++SidePanelNativeView SidePanelCoordinator::TakeNativeGlobalView(
++    const SidePanelEntryKey& key) {
++  if (!IsSidePanelEntryShowing(key, /*for_tab=*/false)) return nullptr;
++  auto* panel = GetSidePanel();
++  panel->ResetSidePanelAnimationContent();
++  auto* wrapper = panel->GetContentParentView();
++  if (wrapper->children().size() != 1) return nullptr;
++  auto view = wrapper->RemoveChildViewT(wrapper->children().front());
++  // The detached view continues to own its ExtensionViewHost. Close cannot
++  // destroy it or emit an extension onClosed event while it is retained here.
++  Close(SidePanelEntryHideReason::kSidePanelClosed, /*suppress_animations=*/true);
++  return view;
++}
++
+ void SidePanelCoordinator::Close(SidePanelEntryHideReason reason,
+                                  bool suppress_animations) {
+   SidePanel* const side_panel = GetSidePanel();
+--- a/chrome/browser/ui/extensions/extension_side_panel_coordinator.h
++++ b/chrome/browser/ui/extensions/extension_side_panel_coordinator.h
+@@ -112,6 +112,13 @@
+   SidePanelEntry* GetEntry() const;
+   BrowserWindowInterface* GetBrowser();
+ 
++  // Keeps the existing extension document, view observer and close callback.
++  // Called only while its entry/view are detached between same-profile windows.
++  bool RebindNativeBrowser(BrowserWindowInterface* browser, SidePanelRegistry* registry);
++  base::WeakPtr<ExtensionSidePanelCoordinator> GetNativeWeakPtr() {
++    return weak_factory_.GetWeakPtr();
++  }
++
+  private:
+   // SidePanelEntryObserver:
+   void OnEntryShown(SidePanelEntry* entry) override;
+--- a/chrome/browser/ui/extensions/extension_side_panel_coordinator.cc
++++ b/chrome/browser/ui/extensions/extension_side_panel_coordinator.cc
+@@ -134,6 +134,18 @@
+   return browser_ != nullptr;
+ }
+ 
++bool ExtensionSidePanelCoordinator::RebindNativeBrowser(
++    BrowserWindowInterface* browser, SidePanelRegistry* registry) {
++  if (for_tab_ || !host_ || !browser || !registry ||
++      browser->GetProfile() != profile_ || !host_->RebindNativeBrowser(browser)) return false;
++  if (delegate_) delegate_->OnEntryDeregistered();
++  browser_ = browser;
++  registry_ = registry;
++  window_id_ = ExtensionTabUtil::GetWindowId(browser);
++  if (delegate_) delegate_->OnEntryRegistered();
++  return true;
++}
++
+ void ExtensionSidePanelCoordinator::DeregisterEntry() {
+   scoped_entry_observation_.Reset();
+   // Deregister synchronously closes the side panel if this entry is showing.
+--- a/chrome/browser/ui/extensions/extension_side_panel_manager.h
++++ b/chrome/browser/ui/extensions/extension_side_panel_manager.h
+@@ -65,6 +65,11 @@
+   // side panel content.
+   void RegisterExtensionEntries();
+ 
++  // Moves an already-open global panel, preserving its WebContents. Contextual
++  // panels and cross-profile transfers are deliberately not transferred.
++  bool TransferNativeGlobalPanel(const ExtensionId& extension_id,
++                                ExtensionSidePanelManager* destination);
++
+   // ExtensionRegistryObserver implementation.
+   void OnExtensionLoaded(content::BrowserContext* browser_context,
+                          const Extension* extension) override;
+--- a/chrome/browser/ui/extensions/extension_side_panel_manager.cc
++++ b/chrome/browser/ui/extensions/extension_side_panel_manager.cc
+@@ -9,6 +9,8 @@
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/extensions/extension_side_panel_coordinator.h"
++#include "chrome/browser/ui/side_panel/side_panel_registry.h"
++#include "chrome/browser/ui/side_panel/side_panel_ui.h"
+ #include "content/public/browser/browser_context.h"
+ #include "extensions/browser/extension_registry.h"
+ #include "extensions/browser/extension_util.h"
+@@ -61,6 +63,72 @@
+   return (it == coordinators_.end()) ? nullptr : it->second.get();
+ }
+ 
++bool ExtensionSidePanelManager::TransferNativeGlobalPanel(
++    const ExtensionId& extension_id, ExtensionSidePanelManager* destination) {
++  if (!destination || destination == this || for_tab_ || destination->for_tab_ ||
++      profile_ != destination->profile_) return false;
++  auto source = coordinators_.find(extension_id);
++  auto target = destination->coordinators_.find(extension_id);
++  if (source == coordinators_.end() || !source->second->host() ||
++      target == destination->coordinators_.end() || target->second->host()) return false;
++  auto* coordinator = source->second.get();
++  const auto source_weak = coordinator->GetNativeWeakPtr();
++  const auto target_weak = target->second->GetNativeWeakPtr();
++  scoped_refptr<const Extension> extension = coordinator->extension();
++  const auto key = coordinator->GetEntryKey();
++  const auto* original_entry = coordinator->GetEntry();
++  auto* source_ui = SidePanelUI::From(browser_);
++  auto* target_ui = SidePanelUI::From(destination->browser_);
++  if (!source_ui || !target_ui || !coordinator->GetEntry() ||
++      !source_ui->IsSidePanelEntryShowing(key, /*for_tab=*/false)) return false;
++  // A contextual panel takes precedence in Chrome. Keep the global document
++  // retained in the old view until a tab without an override becomes active.
++  if (auto* tab = destination->browser_->GetActiveTabInterface()) {
++    auto* contextual = SidePanelRegistry::From(tab);
++    if (contextual && contextual->GetEntryForKey(key)) return false;
++  }
++  auto view = source_ui->TakeNativeGlobalView(key);
++  if (!view) return false;
++  // Closing the shell invokes arbitrary native entry observers. They may
++  // deregister a panel, replace a coordinator or unload the extension. Never
++  // reuse a pre-callback iterator or require those objects to survive.
++  auto still_current = [&]() {
++    const auto current_source = coordinators_.find(extension_id);
++    const auto current_target = destination->coordinators_.find(extension_id);
++    return source_weak && target_weak &&
++        current_source != coordinators_.end() && current_source->second.get() == source_weak.get() &&
++        current_target != destination->coordinators_.end() && current_target->second.get() == target_weak.get() &&
++        registry_->GetEntryForKey(key) == original_entry && source_weak->host() && !target_weak->host() &&
++        ExtensionRegistry::Get(profile_)->enabled_extensions().GetByID(extension_id) == extension.get();
++  };
++  if (!still_current()) return false;
++  // Remove only the destination's unused coordinator; its original extension
++  // content has never been created. No stateful document is overwritten.
++  target_weak->DeregisterEntry();
++  if (!still_current()) return false;
++  destination->coordinators_.erase(extension_id);
++  auto entry = registry_->TakeNativeEntry(key);
++  if (!entry) return false;
++  auto moved = std::move(coordinators_.at(extension_id));
++  coordinators_.erase(extension_id);
++  // Hold the coordinator ourselves while action-item callbacks run. Registry
++  // unload observers cannot delete it while RebindNativeBrowser is executing.
++  if (!moved->RebindNativeBrowser(destination->browser_, destination->registry_)) return false;
++  entry->CacheView(std::move(view));
++  if (!destination->registry_->Register(std::move(entry))) return false;
++  if (!moved->host() || ExtensionRegistry::Get(profile_)->enabled_extensions().GetByID(extension_id) != extension.get()) {
++    moved->DeregisterEntry();
++    return false;
++  }
++  destination->coordinators_[extension_id] = std::move(moved);
++  target_ui->Show(key, std::nullopt, /*suppress_animations=*/true);
++  // This physical view can still receive future per-profile option changes.
++  if (ExtensionRegistry::Get(profile_)->enabled_extensions().GetByID(extension_id) == extension.get())
++    MaybeCreateExtensionSidePanelCoordinator(extension.get());
++  return source_weak && source_weak->host() &&
++      target_ui->IsSidePanelEntryShowing(key, /*for_tab=*/false);
++}
++
+ void ExtensionSidePanelManager::RegisterExtensionEntries() {
+   ExtensionRegistry* extension_registry = ExtensionRegistry::Get(profile_);
+   extension_registry_observation_.Observe(extension_registry);
+--- a/chrome/browser/extensions/extension_view_host.h
++++ b/chrome/browser/extensions/extension_view_host.h
+@@ -24,6 +24,8 @@
+ class WebContents;
+ }
+ 
++class BrowserWindowInterface;
++
+ namespace extensions {
+ 
+ class ExtensionView;
+@@ -40,6 +42,10 @@
+     Delegate(const Delegate&) = delete;
+     Delegate& operator=(const Delegate&) = delete;
+     virtual ~Delegate();
++
++    // Only a window-scoped host may move between physical views of the same
++    // logical native window. Tab-scoped and unsupported delegates reject it.
++    virtual bool RebindNativeBrowser(BrowserWindowInterface* browser) { return false; }
+ 
+     // Opens a URL with the given disposition.
+     virtual content::WebContents* OpenURL(
+@@ -75,6 +81,10 @@
+   ExtensionViewHost& operator=(const ExtensionViewHost&) = delete;
+ 
+   ~ExtensionViewHost() override;
++
++  bool RebindNativeBrowser(BrowserWindowInterface* browser) {
++    return delegate_->RebindNativeBrowser(browser);
++  }
+ 
+   void set_view(ExtensionView* view) { view_ = view; }
+   ExtensionView* view() { return view_; }
+--- a/chrome/browser/extensions/extension_view_host_factory.cc
++++ b/chrome/browser/extensions/extension_view_host_factory.cc
+@@ -49,6 +49,12 @@
+       const ExtensionViewHostBrowserDelegate&) = delete;
+   ~ExtensionViewHostBrowserDelegate() override = default;
+ 
++  bool RebindNativeBrowser(BrowserWindowInterface* browser) override {
++    if (!browser || browser->GetProfile() != browser_->GetProfile()) return false;
++    browser_ = browser;
++    return true;
++  }
++
+   content::WebContents* OpenURL(
+       const content::OpenURLParams& params,
+       base::OnceCallback<void(content::NavigationHandle&)>

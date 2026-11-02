@@ -19,6 +19,29 @@ import Foundation
   public var focusedWindowID: String { writer.state.focusedWindowID ?? windows[0].id }
   public var defaultWindowID: String { windows.first?.id ?? "main" }
   public var focusedStore: BrowserStore { store(for: focusedWindowID)! }
+  public var savedWindows: [BrowserSavedWindow] {
+    windows.compactMap { window -> BrowserSavedWindow? in
+      guard !window.isOpen else { return nil }
+      let tabs = writer.state.tabs.filter { $0.windowID == window.id }
+      guard !tabs.isEmpty, let space = writer.state.spaces.first(where: { $0.id == window.activeSpaceID }),
+        let profile = writer.state.profiles.first(where: { $0.id == space.profileID && !$0.isPrivate }) else { return nil }
+      let active = tabs.first { $0.id == window.activeTabID } ?? tabs.first { !$0.isClosed }
+      return BrowserSavedWindow(id: window.id, title: active?.displayTitle ?? space.name,
+        tabCount: tabs.filter { !$0.isClosed }.count, profileID: profile.id, profileName: profile.name, closedAt: window.closedAt)
+    }.sorted { ($0.closedAt ?? .distantPast) > ($1.closedAt ?? .distantPast) }
+  }
+
+  @discardableResult public func reopenWindow(id: String, focus: Bool = true) throws -> BrowserStore {
+    guard savedWindows.contains(where: { $0.id == id }), windows.filter(\.isOpen).count < 100 else {
+      throw ShortcutError("Choose a saved public window and close an open window if the limit is reached.")
+    }
+    try commitState { state in
+      guard let index = state.windowSessions?.firstIndex(where: { $0.id == id }) else { return }
+      state.windowSessions![index].isOpen = true; state.windowSessions![index].closedAt = nil
+      if focus { state.focusedWindowID = id }
+    }
+    return store(for: id)!
+  }
 
   public init(directory: URL, initialState: BrowserState? = nil) {
     self.directory = directory
@@ -156,6 +179,7 @@ import Foundation
 
   @discardableResult public func makeWindow(profileID: String? = nil, movingTabIDs: [String] = [],
       addresses: [String] = [], bounds: BrowserWindowBounds? = nil,
+      nativeAuthorizations: [String: NativeNavigationProvenance] = [:],
       kind: BrowserWindowKind = .normal, focus: Bool = true) throws -> BrowserStore {
     guard windows.filter(\.isOpen).count < 100 else { throw ShortcutError("Close an open window before opening more.") }
     let profile = profileID ?? writer.state.activeProfile?.id ?? writer.state.profiles[0].id
@@ -163,7 +187,7 @@ import Foundation
     if movingTabIDs.isEmpty, addresses.isEmpty, !windows.contains(where: \.isOpen), kind == .normal,
        let existing = windows.first(where: { window in window.kind == .normal &&
          writer.state.spaces.contains(where: { $0.id == window.activeSpaceID && $0.profileID == profile }) }) {
-      try updateWindow(existing.id) { $0.isOpen = true }
+      try updateWindow(existing.id) { $0.isOpen = true; $0.closedAt = nil }
       if focus { focusWindow(existing.id) }
       return store(for: existing.id)!
     }
@@ -177,13 +201,13 @@ import Foundation
     let requested = addresses.isEmpty && movingTabIDs.isEmpty ? ["about:blank"] : addresses
     guard candidate.tabs.count + requested.count <= 1_000 else { throw ShortcutError("Close some tabs before opening more.") }
     let urls = try requested.map { address -> URL in
-      guard let url = BrowserAddress.documentURL(address) else { throw ShortcutError("Choose a valid web or extension address.") }
+      guard let url = BrowserAddress.documentURL(address, provenance: nativeAuthorizations[address]) else { throw ShortcutError("Choose a valid web or extension address.") }
       return url
     }
     if let first = urls.first {
-      for url in urls {
+      for (address, url) in zip(requested, urls) {
         var tab = BrowserTab(spaceID: space.id, url: url.absoluteString, title: url.host ?? "New tab")
-        tab.windowID = session.id; tab.navigation = [NavigationEntry(url: url.absoluteString)]; tab.navigationIndex = 0
+        tab.windowID = session.id; tab.nativeNavigation = nativeAuthorizations[address]; tab.navigation = [NavigationEntry(url: url.absoluteString, nativeNavigation: nativeAuthorizations[address])]; tab.navigationIndex = 0
         candidate.tabs.append(tab)
         if session.activeTabID == nil && url == first { session.activeTabID = tab.id }
       }
@@ -212,16 +236,20 @@ import Foundation
     try writer.commit { $0 = candidate }; publish()
   }
 
-  public func selectTabs(_ ids: [String], activeID: String, inWindowID id: String) throws {
+  public func selectTabs(_ ids: [String], activeID: String, inWindowID id: String, presentPeek: Bool? = nil) throws {
     guard !ids.isEmpty, Set(ids).count == ids.count, ids.contains(activeID),
       ids.allSatisfy({ value in writer.state.tabs.contains { $0.id == value && $0.windowID == id && !$0.isClosed } }),
       let active = writer.state.tabs.first(where: { $0.id == activeID }),
       let profile = writer.state.spaces.first(where: { $0.id == active.spaceID })?.profileID,
       ids.allSatisfy({ value in writer.state.tabs.first(where: { $0.id == value }).flatMap { tab in writer.state.spaces.first { $0.id == tab.spaceID } }?.profileID == profile })
     else { throw ShortcutError("Select open tabs from one profile in this window.") }
-    try updateWindow(id) {
-      $0.activeSpaceID = active.spaceID; $0.activeTabID = activeID
-      $0.highlightedTabIDs = Set(ids); $0.lastActiveTabBySpace[active.spaceID] = activeID
+    try commitState { state in
+      guard let index = state.windowSessions?.firstIndex(where: { $0.id == id }) else { throw ShortcutError("Unknown browser window.") }
+      state.windowSessions![index].activeSpaceID = active.spaceID; state.windowSessions![index].activeTabID = activeID
+      state.windowSessions![index].highlightedTabIDs = Set(ids); state.windowSessions![index].lastActiveTabBySpace[active.spaceID] = activeID
+      if let presentPeek, let tabIndex = state.tabs.firstIndex(where: { $0.id == activeID }) {
+        state.tabs[tabIndex].peek?.isPresented = presentPeek
+      }
     }
   }
 
@@ -232,7 +260,7 @@ import Foundation
     try writer.commit { $0 = candidate }; publish()
   }
 
-  private static func move(_ state: inout BrowserState, ids: [String], destination: String, index: Int) throws {
+  static func move(_ state: inout BrowserState, ids: [String], destination: String, index: Int) throws {
     guard !ids.isEmpty, Set(ids).count == ids.count, index >= -1,
       state.windowSessions?.contains(where: { $0.id == destination && $0.isOpen }) == true else { throw ShortcutError("Choose an open destination window and distinct tabs.") }
     var moving = Set(ids)
@@ -288,6 +316,7 @@ import Foundation
   @discardableResult public func closeWindow(_ id: String) -> [String] {
     guard let index = writer.state.windowSessions?.firstIndex(where: { $0.id == id }) else { return [] }
     writer.state.windowSessions![index].isOpen = false
+    writer.state.windowSessions![index].closedAt = Date()
     if writer.state.focusedWindowID == id, let other = windows.first(where: \.isOpen) { writer.state.focusedWindowID = other.id }
     let open = Set(windows.filter(\.isOpen).map(\.id))
     let retired = writer.state.profiles.filter { profile in

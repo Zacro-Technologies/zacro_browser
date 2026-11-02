@@ -4,11 +4,17 @@
 #include "base/no_destructor.h"
 #include "chrome/browser/extensions/extension_tab_util.h"
 #include "chrome/browser/extensions/window_controller.h"
+#include "chrome/browser/extensions/extension_view_host.h"
+#include "chrome/browser/ui/extensions/extension_side_panel_manager.h"
 #include "chrome/common/extensions/api/tabs.h"
 #include "chrome/common/extensions/api/tab_groups.h"
 #include "chrome/common/extensions/api/windows.h"
+#include "chrome/common/extensions/api/sessions.h"
+#include "chrome/common/extensions/api/side_panel.h"
 #include "components/tab_groups/tab_group_id.h"
 #include "extensions/browser/event_router.h"
+#include "extensions/browser/api/runtime/runtime_api.h"
+#include "extensions/browser/extension_host_registry.h"
 #include "extensions/browser/extension_function.h"
 #include "extensions/browser/extension_function_dispatcher.h"
 #include "extensions/common/url_pattern_set.h"
@@ -32,9 +38,12 @@ std::optional<extensions::events::HistogramValue> ZacroBrowserEvent(const std::s
   static const base::NoDestructor<std::map<std::string, HistogramValue>> events({
     {"tabs.onCreated", TABS_ON_CREATED}, {"tabs.onUpdated", TABS_ON_UPDATED},
     {"tabs.onRemoved", TABS_ON_REMOVED}, {"tabs.onActivated", TABS_ON_ACTIVATED},
-    {"tabs.onHighlighted", TABS_ON_HIGHLIGHTED}, {"tabs.onMoved", TABS_ON_MOVED},
+    {"tabs.onHighlighted", TABS_ON_HIGHLIGHTED},
+    {"tabs.onSelectionChanged", TABS_ON_SELECTION_CHANGED}, {"tabs.onActiveChanged", TABS_ON_ACTIVE_CHANGED},
+    {"tabs.onHighlightChanged", TABS_ON_HIGHLIGHT_CHANGED}, {"tabs.onMoved", TABS_ON_MOVED},
     {"tabs.onAttached", TABS_ON_ATTACHED}, {"tabs.onDetached", TABS_ON_DETACHED},
     {"tabs.onReplaced", TABS_ON_REPLACED}, {"tabs.onZoomChange", TABS_ON_ZOOM_CHANGE},
+    {"sessions.onChanged", SESSIONS_ON_CHANGED},
     {"windows.onCreated", WINDOWS_ON_CREATED}, {"windows.onRemoved", WINDOWS_ON_REMOVED},
     {"windows.onFocusChanged", WINDOWS_ON_FOCUS_CHANGED}, {"windows.onBoundsChanged", WINDOWS_ON_BOUNDS_CHANGED},
     {"tabGroups.onCreated", TAB_GROUPS_ON_CREATED}, {"tabGroups.onUpdated", TAB_GROUPS_ON_UPDATED},
@@ -66,6 +75,11 @@ std::optional<bool> ZacroValidateFunction(const std::string& method, const base:
 #define ZACRO_GROUP(name, type) if (method == "tabGroups." name) return extensions::api::tab_groups::type::Params::Create(args).has_value()
   ZACRO_GROUP("get", Get); ZACRO_GROUP("query", Query); ZACRO_GROUP("update", Update); ZACRO_GROUP("move", Move);
 #undef ZACRO_GROUP
+  if (method == "sidePanel.open") return extensions::api::side_panel::Open::Params::Create(args).has_value();
+  if (method == "sidePanel.close") return extensions::api::side_panel::Close::Params::Create(args).has_value();
+  if (method == "sessions.getRecentlyClosed") return extensions::api::sessions::GetRecentlyClosed::Params::Create(args).has_value();
+  if (method == "sessions.getDevices") return extensions::api::sessions::GetDevices::Params::Create(args).has_value();
+  if (method == "sessions.restore") return extensions::api::sessions::Restore::Params::Create(args).has_value();
   if (method == "tabs.getCurrent") return args.empty();
   return std::nullopt;
 }
@@ -90,6 +104,43 @@ bool ZacroPrepareNavigation(ExtensionFunction* function, base::ListValue& args, 
   return true;
 }
 
+// Per-profile approvals are produced only through the native channel. Durable
+// Core provenance is a hint: every use rechecks the installed extension and
+// Chromium's current navigation/file-access policy.
+class ZacroNavigationApprovals : public base::SupportsUserData::Data {
+ public:
+  static ZacroNavigationApprovals* Get(content::BrowserContext* context) {
+    constexpr char key[] = "zacro.native.navigation-approvals";
+    if (auto* found = context->GetUserData(key)) return static_cast<ZacroNavigationApprovals*>(found);
+    auto value = std::make_unique<ZacroNavigationApprovals>(); auto* result = value.get();
+    context->SetUserData(key, std::move(value)); return result;
+  }
+  static ZacroNavigationApprovals* ForDocument(content::WebContents* contents) {
+    constexpr char key[] = "zacro.native.document-navigation-approvals";
+    if (auto* found = contents->GetUserData(key)) return static_cast<ZacroNavigationApprovals*>(found);
+    auto value = std::make_unique<ZacroNavigationApprovals>(); auto* result = value.get();
+    contents->SetUserData(key, std::move(value)); return result;
+  }
+  std::map<std::string, std::pair<std::string, std::string>> destinations;
+};
+bool ZacroValidateNavigation(content::BrowserContext* context, const std::string& extension_id,
+    const std::string& incarnation, const std::string& url, std::string& error) {
+  auto* registry = extensions::ExtensionRegistry::Get(context);
+  const auto* extension = registry ? registry->enabled_extensions().GetByID(extension_id) : nullptr;
+  if (!extension || incarnation.empty() ||
+      ZacroExtensionContext::Get(context)->IncarnationID(*extension) != incarnation) {
+    error = "The extension navigation authorization is no longer current."; return false;
+  }
+  auto checked = ZacroTabUtil::PrepareURLForNavigation(url, extension, context);
+  if (!checked.has_value()) { error = checked.error(); return false; }
+  if (checked->spec() != url) { error = "The native navigation address changed."; return false; }
+  auto& destinations = ZacroNavigationApprovals::Get(context)->destinations;
+  if (!destinations.contains(url) && destinations.size() >= 8192) {
+    error = "Too many retained native navigation authorizations."; return false;
+  }
+  destinations[url] = {extension_id, incarnation}; return true;
+}
+
 class ZacroBrowserContext : public base::SupportsUserData::Data {
  public:
   static constexpr char kKey[] = "zacro.native.browser-model";
@@ -103,6 +154,37 @@ class ZacroBrowserContext : public base::SupportsUserData::Data {
   }
   explicit ZacroBrowserContext(content::BrowserContext* context) : context_(context) {}
   static void InstallHooks() {
+    extensions::RuntimeGetContextsFunction::SetNativeContextDecorator(base::BindRepeating(
+        [](content::WebContents* contents, extensions::api::runtime::ExtensionContext* value) {
+          auto* state = Get(contents->GetBrowserContext());
+          const int native_id = sessions::SessionTabHelper::IdForTab(contents).id();
+          auto tab = state->tabs_.find(native_id);
+          if (tab != state->tabs_.end() && tab->second->web_contents() == contents) {
+            value->tab_id = native_id; value->window_id = tab->second->window; return true;
+          }
+          // Popup/panel documents are extension UI, not logical browser tabs.
+          // Ask their real ExtensionViewHost for the browser that owns them.
+          const int physical_window = value->window_id;
+          value->tab_id = -1; value->window_id = -1;
+          if (physical_window >= 0) for (const auto& [id, candidate] : state->tabs_) {
+            if (candidate->web_contents() && ZacroTabUtil::GetWindowIdOfTab(candidate->web_contents()) == physical_window) {
+              value->window_id = candidate->window; break;
+            }
+          }
+          auto* registry = extensions::ExtensionHostRegistry::Get(contents->GetBrowserContext());
+          auto* host = registry ? registry->GetExtensionHostForPrimaryMainFrame(contents->GetPrimaryMainFrame()) : nullptr;
+          if (host && (host->extension_host_type() == extensions::mojom::ViewType::kExtensionPopup ||
+                       host->extension_host_type() == extensions::mojom::ViewType::kExtensionSidePanel)) {
+            auto* controller = static_cast<extensions::ExtensionViewHost*>(host)->GetExtensionWindowController();
+            auto* browser = controller ? controller->GetBrowserWindowInterface() : nullptr;
+            for (const auto& [id, candidate] : state->tabs_) {
+              if (candidate->web_contents() && extensions::browser_window_util::GetBrowserForTabContents(*candidate->web_contents()) == browser) {
+                value->window_id = candidate->window; break;
+              }
+            }
+          }
+          return value->context_type != extensions::api::runtime::ContextType::kTab;
+        }));
     sessions::SessionTabHelper::SetNativeInitialIDProvider(base::BindRepeating(
         [](content::WebContents* contents) -> std::optional<SessionID> {
           auto* reserved = static_cast<ZacroReservedTabID*>(contents->GetUserData(kZacroReservedTabID));
@@ -135,7 +217,33 @@ class ZacroBrowserContext : public base::SupportsUserData::Data {
           return Get(function->browser_context())->Dispatch(function, args, std::move(response));
         }));
     extensions::EventRouter::SetNativeEventFilter(base::BindRepeating(
-        [](content::BrowserContext* context, const extensions::Event& event) {
+        [](content::BrowserContext* context, extensions::Event& event, const std::string& extension_id) {
+          if (event.event_name == "sidePanel.onOpened" || event.event_name == "sidePanel.onClosed") {
+            auto* state = Get(context);
+            if (event.args().size() != 1 || !event.args()[0].is_dict()) return false;
+            auto arguments = event.args().Clone(); auto& info = arguments[0].GetDict();
+            const auto physical = info.FindInt("windowId");
+            if (!physical) return false;
+            std::optional<int> logical;
+            content::WebContents* owner = nullptr;
+            for (const auto& [id, tab] : state->tabs_) {
+              if (tab->web_contents() && ZacroTabUtil::GetWindowIdOfTab(tab->web_contents()) == *physical) {
+                logical = tab->window; owner = tab->web_contents(); break;
+              }
+            }
+            if (!logical) return false;
+            if (!info.FindInt("tabId") && !extension_id.empty()) {
+              if (event.event_name == "sidePanel.onOpened") {
+                state->global_panels_[*logical] = {extension_id, owner->GetWeakPtr()};
+              } else {
+                auto current = state->global_panels_.find(*logical);
+                if (current != state->global_panels_.end() && current->second.extension == extension_id &&
+                    current->second.contents.get() == owner) state->global_panels_.erase(current);
+              }
+            }
+            info.Set("windowId", *logical); event.ReplaceNativeArguments(std::move(arguments));
+            return true;
+          }
           if (event.native_host_topology || !ZacroBrowserEvent(event.event_name)) return true;
           auto* state = Get(context);
           // Zoom events already use true SessionTabIDs and no physical window
@@ -172,8 +280,20 @@ class ZacroBrowserContext : public base::SupportsUserData::Data {
     last_focused_window_ = last_focused ? last_focused : window;
   }
   struct Tab : content::WebContentsObserver {
-    explicit Tab(content::WebContents* contents) : content::WebContentsObserver(contents) {}
-    void Bind(content::WebContents* contents) { Observe(contents); }
+    explicit Tab(content::WebContents* contents) { Bind(contents); }
+    void Bind(content::WebContents* contents) {
+      detach_subscription = {}; closing = false; Observe(contents);
+      if (contents) if (auto* tab = tabs::TabInterface::MaybeGetFromContents(contents)) {
+        detach_subscription = tab->RegisterWillDetach(base::BindRepeating(
+            [](Tab* self, tabs::TabInterface* tab, tabs::TabInterface::DetachReason reason) {
+              if (reason != tabs::TabInterface::DetachReason::kDelete || !self->web_contents()) return;
+              self->closing = true;
+              // Chrome invokes WillDetach only once beforeunload has accepted
+              // closure. Move a global panel before its containing view dies.
+              Get(self->web_contents()->GetBrowserContext())->ReconcileGlobalPanels(self->web_contents());
+            }, base::Unretained(this)));
+      }
+    }
     std::string logical_id;
     int window = 1;
     int index = 0;
@@ -185,6 +305,8 @@ class ZacroBrowserContext : public base::SupportsUserData::Data {
     int split_view_id = -1;
     int group_id = -1;
     std::optional<int> opener_tab_id;
+    bool closing = false;
+    base::CallbackListSubscription detach_subscription;
   };
   // Snapshot publication reserves identities without allocating WebContents,
   // renderer processes or native windows for dormant restored tabs.
@@ -234,6 +356,7 @@ class ZacroBrowserContext : public base::SupportsUserData::Data {
       tabs_.at(id)->opener_tab_id = opener_id && opener_id != id ? std::make_optional(opener_id) : std::nullopt;
     }
     revision_ = *revision;
+    ReconcileGlobalPanels();
     return base::DictValue().Set("tabs", std::move(identities));
   }
   base::DictValue SynchronizeGroups(const base::DictValue& params, std::string& error) {
@@ -347,7 +470,7 @@ class ZacroBrowserContext : public base::SupportsUserData::Data {
     if (!logical || logical->empty() || logical->size() > 256 || !window || *window < 1 || !index || *index < 0 ||
         !active || !pinned || !discarded || native_id < 1 || split < -1 ||
         (opener && (*opener <= 0 || *opener == native_id || !tabs_.contains(*opener))) ||
-        contents->GetBrowserContext() != context_) {
+        contents->GetBrowserContext() != context_ || !ValidGroupReference(params.FindInt("groupID").value_or(-1), *window)) {
       error = "The native tab registration is invalid."; return 0;
     }
     const int reserved = FindLogical(*logical);
@@ -362,6 +485,7 @@ class ZacroBrowserContext : public base::SupportsUserData::Data {
     tab->auto_discardable = params.FindBool("autoDiscardable").value_or(true);
     tab->split_view_id = split; tab->opener_tab_id = opener;
     tab->group_id = params.FindInt("groupID").value_or(-1);
+    ReconcileGlobalPanels();
     return native_id;
   }
   bool Validate(const std::string& id, std::string& error) {
@@ -371,10 +495,30 @@ class ZacroBrowserContext : public base::SupportsUserData::Data {
     auto* registry = extensions::ExtensionRegistry::Get(context_);
     if (request.function->browser_context() != context_ || !registry ||
         registry->enabled_extensions().GetByID(request.extension->id()) != request.extension.get() ||
-        !ZacroExtensionContext::Get(context_)->IsCurrent(*request.extension, request.installation)) {
+        !ZacroExtensionContext::Get(context_)->IsCurrent(*request.extension, request.installation) || !request.function->HasPermission()) {
       error = "The extension caller or installation changed."; return false;
     }
     return true;
+  }
+  base::DictValue AuthorizeNavigation(const std::string& id, const std::string& url, std::string& error) {
+    if (!Validate(id, error)) return {};
+    auto& request = *pending_.at(id);
+    const std::string method(request.function->name());
+    bool found = false;
+    if (method == "tabs.create" || method == "tabs.update" || method == "windows.create") {
+      for (const auto& argument : request.arguments) {
+        if (!argument.is_dict()) continue;
+        const auto* address = argument.GetDict().Find("url");
+        if (!address) continue;
+        if (address->is_string()) found |= address->GetString() == url;
+        else if (address->is_list()) for (const auto& value : address->GetList())
+          found |= value.is_string() && value.GetString() == url;
+      }
+    }
+    if (!found) { error = "The destination does not belong to this native navigation request."; return {}; }
+    const auto incarnation = ZacroExtensionContext::Get(context_)->IncarnationID(*request.extension);
+    if (!ZacroValidateNavigation(context_, request.extension->id(), incarnation, url, error)) return {};
+    return base::DictValue().Set("extensionID", request.extension->id()).Set("incarnationID", incarnation).Set("url", url);
   }
   void Complete(const std::string& id, base::ListValue results, std::string error) {
     auto it = pending_.find(id); if (it == pending_.end()) return;
@@ -382,6 +526,30 @@ class ZacroBrowserContext : public base::SupportsUserData::Data {
     if (!Validate(id, validation)) error = validation;
     auto request = std::move(it->second); pending_.erase(it);
     request->timer.Stop();
+    if (error.empty() && request->prepare_document) {
+      auto tab = tabs_.find(*request->prepare_document);
+      if (tab == tabs_.end() || !tab->second->web_contents() || tab->second->discarded || !results.empty()) {
+        error = "The requested document was not restored.";
+      } else {
+        auto function = request->function;
+        auto arguments = request->arguments.Clone();
+        const int target = request->capture_document ? ZacroTabUtil::GetWindowIdOfTab(tab->second->web_contents()) : *request->prepare_document;
+        if (request->side_panel_document) {
+          if (arguments[0].GetDict().contains("windowId")) arguments[0].GetDict().Set("windowId", ZacroTabUtil::GetWindowIdOfTab(tab->second->web_contents()));
+        } else if (arguments.empty()) arguments.Append(target); else arguments[0] = base::Value(target);
+        function->ReplaceNativeArguments(std::move(arguments));
+        // RunWithValidation was already entered when this request was
+        // deferred. Recheck its public validation hook, then enter Run exactly
+        // once with the resolved native target and the original caller.
+        if (!function->HasPermission() || !function->PreRunValidation(&error)) {
+          if (error.empty()) error = "The extension permission changed while restoring the document.";
+        } else {
+          request->response.Reset();
+          function->Run().Execute();
+          return;
+        }
+      }
+    }
     if (error.empty()) {
       if (!SanitizeResults(*request, results)) { results.clear(); error = "The native tab response is invalid."; }
     }
@@ -463,6 +631,9 @@ class ZacroBrowserContext : public base::SupportsUserData::Data {
     tab.opener_tab_id = data.FindInt("openerTabID");
   }
   struct Request {
+    std::optional<int> prepare_document;
+    bool capture_document = false;
+    bool side_panel_document = false;
     scoped_refptr<ExtensionFunction> function;
     scoped_refptr<const extensions::Extension> extension;
     std::string installation;
@@ -488,6 +659,35 @@ class ZacroBrowserContext : public base::SupportsUserData::Data {
     // Document-local APIs retain Chromium's exact implementation. Resolve only
     // their optional logical target, leaving their permissions and mutations to
     // the original ExtensionFunction after this native hook returns false.
+    std::optional<int> prepare_document;
+    bool capture_document = false;
+    bool side_panel_document = false;
+    if (method == "sidePanel.open" || method == "sidePanel.close") {
+      if (method == "sidePanel.open" && !function->user_gesture()) {
+        std::move(response).Run({}, "sidePanel.open() may only be called in response to a user gesture."); return true;
+      }
+      const auto& options = args[0].GetDict();
+      const auto requested_tab = options.FindInt("tabId");
+      auto window = options.FindInt("windowId");
+      if (!requested_tab && !window) {
+        std::move(response).Run({}, "At least one of tabId and windowId must be provided."); return true;
+      }
+      if (window == -2) window = source_window ? source_window : (focused_window_ ? focused_window_ : last_focused_window_);
+      int target = requested_tab.value_or(-1);
+      if (!requested_tab && window) for (const auto& [id, tab] : tabs_) {
+        if (tab->window == *window && tab->active) { target = id; break; }
+      }
+      auto tab = tabs_.find(target);
+      if (tab == tabs_.end() || (window && tab->second->window != *window)) {
+        std::move(response).Run({}, "The side panel target is not in the requested logical window."); return true;
+      }
+      if (tab->second->web_contents() && !tab->second->discarded) {
+        auto arguments = args.Clone();
+        if (options.contains("windowId")) arguments[0].GetDict().Set("windowId", ZacroTabUtil::GetWindowIdOfTab(tab->second->web_contents()));
+        function->ReplaceNativeArguments(std::move(arguments)); return false;
+      }
+      prepare_document = target; side_panel_document = true;
+    }
     if (method == "tabs.getZoom" || method == "tabs.setZoom" || method == "tabs.getZoomSettings" ||
         method == "tabs.setZoomSettings" || method == "tabs.captureVisibleTab" || method == "tabs.detectLanguage") {
       int target = -1;
@@ -496,17 +696,20 @@ class ZacroBrowserContext : public base::SupportsUserData::Data {
       auto target_window = source_window ? source_window : (focused_window_ ? focused_window_ : last_focused_window_);
       if (capture && !args.empty() && args[0].is_int() && args[0].GetInt() != -2) target_window = args[0].GetInt();
       if (target < 0 && target_window) for (const auto& [id, tab] : tabs_) {
-        if (tab->window == *target_window && tab->active && tab->web_contents()) { target = id; break; }
+        if (tab->window == *target_window && tab->active) { target = id; break; }
       }
       auto tab = tabs_.find(target);
-      if (tab == tabs_.end() || !tab->second->web_contents() || tab->second->discarded) {
-        std::move(response).Run({}, "The target tab is not currently loaded."); return true;
+      if (tab == tabs_.end()) {
+        std::move(response).Run({}, "The target tab does not exist in this profile."); return true;
       }
-      auto native_args = args.Clone();
-      const int native_target = capture ? ZacroTabUtil::GetWindowIdOfTab(tab->second->web_contents()) : target;
-      if (native_args.empty()) native_args.Append(native_target); else native_args[0] = base::Value(native_target);
-      function->ReplaceNativeArguments(std::move(native_args));
-      return false;
+      if (tab->second->web_contents() && !tab->second->discarded) {
+        auto native_args = args.Clone();
+        const int native_target = capture ? ZacroTabUtil::GetWindowIdOfTab(tab->second->web_contents()) : target;
+        if (native_args.empty()) native_args.Append(native_target); else native_args[0] = base::Value(native_target);
+        function->ReplaceNativeArguments(std::move(native_args));
+        return false;
+      }
+      prepare_document = target; capture_document = capture;
     }
     if (!function->extension() || pending_.size() >= 256) {
       std::move(response).Run({}, "The native browser host is unavailable."); return true;
@@ -523,6 +726,8 @@ class ZacroBrowserContext : public base::SupportsUserData::Data {
     request->installation = ZacroExtensionContext::Get(context_)->InstallationID(*function->extension());
     if (auto* frame = function->render_frame_host()) request->source_document = frame->GetWeakDocumentPtr();
     request->arguments = arguments.Clone(); request->response = std::move(response);
+    request->prepare_document = prepare_document; request->capture_document = capture_document;
+    request->side_panel_document = side_panel_document;
     // A beforeunload decision has no arbitrary deadline. Do not report failure
     // and then perform a delayed close after the user finally makes a choice.
     if (method != "tabs.remove" && method != "windows.remove") {
@@ -532,6 +737,9 @@ class ZacroBrowserContext : public base::SupportsUserData::Data {
     auto event = base::DictValue().Set("requestID", id).Set("extensionID", function->extension_id())
         .Set("method", method).Set("arguments", std::move(arguments)).Set("userGesture", function->user_gesture())
         .Set("incognito", context_->IsOffTheRecord());
+    if (prepare_document) {
+      event.Set("method", "native.prepareDocument"); event.Set("arguments", base::ListValue().Append(*prepare_document));
+    }
     if (auto* sender = function->GetSenderWebContents()) {
       int source = sessions::SessionTabHelper::IdForTab(sender).id();
       if (tabs_.contains(source)) event.Set("sourceTabID", source);
@@ -568,11 +776,15 @@ class ZacroBrowserContext : public base::SupportsUserData::Data {
     if (value.is_list()) return ScrubValues(extension, type, value.GetList());
     if (!value.is_dict()) return true;
     auto& dict = value.GetDict();
+    for (const char* nested : {"tab", "window", "sessions"}) {
+      if (auto* entry = dict.Find(nested); entry && !ScrubValue(extension, type, *entry)) return false;
+    }
     if (auto* tabs = dict.FindList("tabs")) if (!ScrubValues(extension, type, *tabs)) return false;
     if (!dict.contains("windowId") || !dict.contains("index")) return true;
-    const auto id = dict.FindInt("id"); if (!id) return false;
-    auto found = tabs_.find(*id);
-    if (found == tabs_.end()) return false;
+    const auto id = dict.FindInt("id");
+    const bool closed = !id && dict.FindString("sessionId");
+    auto found = id ? tabs_.find(*id) : tabs_.end();
+    if (!closed && found == tabs_.end()) return false;
     auto* contents = found == tabs_.end() ? nullptr : found->second->web_contents();
     // Real registered documents use their grant-bearing WebContents. Dormant
     // model URLs may differ from its blank document, so grants are also checked
@@ -646,6 +858,21 @@ class ZacroBrowserContext : public base::SupportsUserData::Data {
     return value.is_dict() && extensions::api::tab_groups::TabGroup::FromValue(value.GetDict()).has_value();
   }
   static bool ValidResults(const std::string& method, const base::ListValue& results) {
+    if (method.starts_with("sessions.")) {
+      if (results.size() != 1) return false;
+      auto session = [](const base::Value& value) {
+        return value.is_dict() && extensions::api::sessions::Session::FromValue(value.GetDict()).has_value() &&
+            (value.GetDict().contains("tab") != value.GetDict().contains("window"));
+      };
+      if (method == "sessions.restore") return session(results[0]);
+      if (!results[0].is_list()) return false;
+      for (const auto& value : results[0].GetList()) {
+        if (method == "sessions.getDevices") {
+          if (!value.is_dict() || !extensions::api::sessions::Device::FromValue(value.GetDict()).has_value()) return false;
+        } else if (!session(value)) return false;
+      }
+      return true;
+    }
     if (method == "tabs.group") return results.size() == 1 && results[0].is_int() && results[0].GetInt() >= 0;
     if (method == "tabs.ungroup") return results.empty();
     if (method.starts_with("tabGroups.")) {
@@ -669,6 +896,41 @@ class ZacroBrowserContext : public base::SupportsUserData::Data {
     }
     return window ? ValidWindow(results[0]) : ValidTab(results[0]);
   }
+  struct GlobalPanel {
+    std::string extension;
+    base::WeakPtr<content::WebContents> contents;
+  };
+  void ReconcileGlobalPanels(content::WebContents* closing_contents = nullptr) {
+    // Transfers may dispatch close events for a different destination panel.
+    // Iterate a snapshot, then revalidate the original owner before changing it.
+    const auto panels = global_panels_;
+    for (const auto& [window, panel] : panels) {
+      auto current = global_panels_.find(window);
+      if (current == global_panels_.end() || current->second.extension != panel.extension ||
+          current->second.contents.get() != panel.contents.get()) continue;
+      if (!panel.contents) { global_panels_.erase(current); continue; }
+      content::WebContents* destination = nullptr;
+      for (const auto& [id, tab] : tabs_) {
+        if (tab->window == window && !tab->closing && tab->web_contents() && !tab->discarded) {
+          if (tab->active) { destination = tab->web_contents(); break; }
+          if (!destination && closing_contents == panel.contents.get()) destination = tab->web_contents();
+        }
+      }
+      if (!destination || destination == panel.contents.get()) continue;
+      auto* source_browser = extensions::browser_window_util::GetBrowserForTabContents(*panel.contents);
+      auto* target_browser = extensions::browser_window_util::GetBrowserForTabContents(*destination);
+      if (!source_browser || !target_browser) continue;
+      auto* source = extensions::ExtensionSidePanelManager::From(source_browser);
+      auto* target = extensions::ExtensionSidePanelManager::From(target_browser);
+      if (source && source->TransferNativeGlobalPanel(panel.extension, target)) {
+        auto unchanged = global_panels_.find(window);
+        if (unchanged != global_panels_.end() && unchanged->second.extension == panel.extension &&
+            unchanged->second.contents.get() == panel.contents.get()) {
+          global_panels_[window] = {panel.extension, destination->GetWeakPtr()};
+        }
+      }
+    }
+  }
   raw_ptr<content::BrowserContext> context_;
   bool observed_ = false;
   double revision_ = 0;
@@ -676,6 +938,7 @@ class ZacroBrowserContext : public base::SupportsUserData::Data {
   std::optional<int> focused_window_;
   std::optional<int> last_focused_window_;
   std::map<int, std::unique_ptr<Tab>> tabs_;
+  std::map<int, GlobalPanel> global_panels_;
   std::map<std::string, Group> groups_;
   std::map<std::string, Reservation> reservations_;
   std::map<std::string, std::unique_ptr<Request>> pending_;
@@ -685,6 +948,15 @@ class ZacroBrowserContext : public base::SupportsUserData::Data {
 
 void ZacroSetTopologyObserved(content::BrowserContext* context, bool observed) {
   ZacroBrowserContext::Get(context)->SetObserved(observed);
+}
+
+bool ZacroAllowApprovedNavigation(content::WebContents* contents, const GURL& url) {
+  auto& approvals = ZacroNavigationApprovals::ForDocument(contents)->destinations;
+  auto found = approvals.find(url.spec());
+  if (found == approvals.end()) return true; // Existing normal browser policy still applies.
+  std::string error;
+  return ZacroValidateNavigation(contents->GetBrowserContext(), found->second.first,
+      found->second.second, url.spec(), error);
 }
 
 void ZacroInstallTopologyHooks() { ZacroBrowserContext::InstallHooks(); }
@@ -710,10 +982,32 @@ bool CefDevToolsController::DispatchZacroTopology(int id, const std::string& met
   if (method != "Zacro.registerExtensionTab" && method != "Zacro.validateExtensionHostRequest" &&
       method != "Zacro.completeExtensionHostRequest" && method != "Zacro.publishBrowserEvent" &&
       method != "Zacro.synchronizeTabs" && method != "Zacro.prepareTabMaterialization" &&
-      method != "Zacro.setFocusedWindow" && method != "Zacro.synchronizeGroups") return false;
+      method != "Zacro.setFocusedWindow" && method != "Zacro.synchronizeGroups" &&
+      method != "Zacro.authorizeHostNavigation" && method != "Zacro.validateNavigation" &&
+      method != "Zacro.navigateApproved") return false;
   if (!params) { ReplyZacro(id, {}, "The native browser parameters are missing."); return true; }
   auto* state = ZacroBrowserContext::Get(inspected_contents_->GetBrowserContext());
   std::string error;
+  if (method == "Zacro.authorizeHostNavigation") {
+    const auto* request = params->FindString("requestID"); const auto* url = params->FindString("url");
+    auto result = request && url ? state->AuthorizeNavigation(*request, *url, error) : base::DictValue();
+    if (!request || !url) error = "The navigation request or destination is missing.";
+    ReplyZacro(id, std::move(result), error); return true;
+  }
+  if (method == "Zacro.validateNavigation" || method == "Zacro.navigateApproved") {
+    const auto* extension = params->FindString("extensionID"); const auto* incarnation = params->FindString("incarnationID");
+    const auto* url = params->FindString("url");
+    if (!extension || !incarnation || !url || !ZacroValidateNavigation(
+        inspected_contents_->GetBrowserContext(), *extension, *incarnation, *url, error)) {
+      ReplyZacro(id, {}, error.empty() ? "The native navigation authorization is incomplete." : error); return true;
+    }
+    if (method == "Zacro.navigateApproved") {
+      ZacroNavigationApprovals::ForDocument(inspected_contents_)->destinations[*url] = {*extension, *incarnation};
+      inspected_contents_->GetController().LoadURL(
+          GURL(*url), content::Referrer(), ui::PAGE_TRANSITION_AUTO_TOPLEVEL, std::string());
+    }
+    ReplyZacro(id, base::DictValue().Set("extensionID", *extension).Set("incarnationID", *incarnation).Set("url", *url)); return true;
+  }
   if (method == "Zacro.synchronizeGroups") {
     auto result = state->SynchronizeGroups(*params, error);
     ReplyZacro(id, std::move(result), error); return true;

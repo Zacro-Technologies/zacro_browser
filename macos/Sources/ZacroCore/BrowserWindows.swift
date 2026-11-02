@@ -7,6 +7,7 @@ public struct BrowserWindowSession: Codable, Equatable, Identifiable, Sendable {
   public var id: String
   public var kind: BrowserWindowKind = .normal
   public var isOpen = true
+  public var closedAt: Date?
   public var activeSpaceID: String
   public var activeTabID: String?
   public var highlightedTabIDs: Set<String> = []
@@ -19,6 +20,15 @@ public struct BrowserWindowSession: Codable, Equatable, Identifiable, Sendable {
   public init(id: String = UUID().uuidString, activeSpaceID: String, kind: BrowserWindowKind = .normal) {
     self.id = id; self.activeSpaceID = activeSpaceID; self.kind = kind
   }
+}
+
+public struct BrowserSavedWindow: Identifiable, Equatable, Sendable {
+  public var id: String
+  public var title: String
+  public var tabCount: Int
+  public var profileID: String
+  public var profileName: String
+  public var closedAt: Date?
 }
 
 enum BrowserWindowState {
