@@ -50,6 +50,8 @@ final class NativeExtensionBrowser {
   private var lastFocusedWindows: [String: String] = [:]
   private var identities: [String: Identity] = [:]
   private var creationOpeners: [String: String] = [:]
+  private var optionsWindows: [String: OptionsWindow] = [:]
+  private var optionsTasks: [String: (id: UUID, task: Task<Void, Error>)] = [:]
   private var groupIdentities: [String: Int] = [:]
   private var groupKeys: [String: Data] = [:]
   private var groupRevisions: [String: UInt64] = [:]
@@ -87,6 +89,12 @@ final class NativeExtensionBrowser {
     }
   }
   private struct Snapshot { let profile: String; let value: [String: Any] }
+  private struct OptionsWindow {
+    let windowID: String
+    let tabID: String
+    let incarnationID: String
+    let url: String
+  }
   private struct GroupSnapshot { let profile: String; let value: [String: Any]; let index: Int }
   private struct Failure: Error, LocalizedError {
     let message: String
@@ -167,6 +175,95 @@ final class NativeExtensionBrowser {
   /// The opaque native request remains authoritative for the real opener frame.
   func setCreationOpener(tabIDs: [String], requestID: String) {
     for id in tabIDs where engine.pages[id] == nil { creationOpeners[id] = requestID }
+  }
+
+  /// Both the Library and runtime.openOptionsPage use a registered, profile-owned
+  /// browser window. The hidden management document never opens visible pages.
+  func openOptions(profileID: String, extensionID: String, sourceWindowID: Int? = nil) async throws {
+    try await openOptions(profileID: profileID, extensionID: extensionID,
+      sourceWindowID: sourceWindowID, request: nil)
+  }
+
+  private func openOptions(profileID: String, extensionID: String, sourceWindowID: Int?,
+                           request: ChromeExtensionHostRequest?) async throws {
+    try checkProfile(profileID, request: request)
+    let key = profileID + ":" + extensionID
+    let previous = optionsTasks[key]?.task
+    let identifier = UUID()
+    let task = Task { @MainActor [weak self] in
+      // Coalesce presentation through one ordered queue while retaining each
+      // caller's own native authorization, including a later revoked request.
+      _ = try? await previous?.value
+      guard let self else { throw CancellationError() }
+      try await self.presentOptions(profileID: profileID, extensionID: extensionID,
+        sourceWindowID: sourceWindowID, request: request)
+    }
+    optionsTasks[key] = (identifier, task)
+    defer { if optionsTasks[key]?.id == identifier { optionsTasks.removeValue(forKey: key) } }
+    try await task.value
+  }
+
+  private func presentOptions(profileID: String, extensionID: String, sourceWindowID: Int?,
+                              request: ChromeExtensionHostRequest?) async throws {
+    try checkProfile(profileID, request: request)
+    let manager = ChromeExtensionManager(engine: engine, profileID: profileID)
+    if let request { try await authorize(request, profile: profileID, manager: manager) }
+    let options = try await manager.optionsPage(extensionID)
+    let approval = options.approval
+    let address = approval.url.absoluteString
+    guard approval.profileID == profileID, approval.extensionID == extensionID,
+      let proof = NativeNavigationProvenance(extensionID: extensionID,
+        incarnationID: approval.incarnationID, approvedURL: address) else {
+      throw Failure("The extension options page is unavailable.")
+    }
+    let validate: @MainActor () async throws -> Void = { [weak self] in
+      guard let self else { throw CancellationError() }
+      try self.checkProfile(profileID, request: request)
+      let current = try await manager.validateNavigation(extensionID: extensionID,
+        incarnationID: approval.incarnationID, url: approval.url)
+      guard current.profileID == profileID, current.extensionID == extensionID,
+        current.incarnationID == approval.incarnationID, current.url == approval.url else {
+        throw Failure("The extension options page changed before it could open.")
+      }
+      if let request { try await self.authorize(request, profile: profileID, manager: manager) }
+      try self.checkProfile(profileID, request: request)
+      if let sourceWindowID {
+        let source = try self.targetWindow(sourceWindowID, profile: profileID, request: request)
+        try self.canActivate(profileID, in: source.id)
+      }
+    }
+    try await validate()
+    let key = profileID + ":" + extensionID
+    if let existing = optionsWindows[key], existing.incarnationID == approval.incarnationID,
+      existing.url == address, let tab = store.tab(existing.tabID), !tab.isClosed,
+      tab.url == address, tab.windowID == existing.windowID, store.profileID(for: tab) == profileID,
+      let context = engine.context(id: existing.windowID), context.isOpen, !context.isClosing {
+      try canActivate(profileID, in: existing.windowID)
+      try activateTab(tab.id)
+      repository.focusWindow(existing.windowID)
+      NSApp.activate(ignoringOtherApps: true); context.window.makeKeyAndOrderFront(nil)
+      _ = try await requireDocument(tab)
+      try await validate()
+      return
+    }
+    guard let createWindow else { throw Failure("Native window creation is unavailable.") }
+    // Electron presents extension settings in an 850×650 managed window even
+    // for options_ui. Preserve that experience with a real catalogued popup.
+    let creation = NativeExtensionWindowRequest(profileID: profileID, kind: .popup,
+      urls: [address], nativeAuthorizations: [address: proof], movingTabID: nil,
+      focused: true, state: nil, left: nil, top: nil, width: 850, height: 650,
+      openerRequestID: nil, authorize: validate)
+    let windowID = try await createWindow(creation)
+    try await validate()
+    guard let tab = tabs(profileID, in: windowID).first(where: { $0.url == address }),
+      engine.context(id: windowID)?.isOpen == true else {
+      throw Failure("The extension options window closed before it could open.")
+    }
+    optionsWindows[key] = OptionsWindow(windowID: windowID, tabID: tab.id,
+      incarnationID: approval.incarnationID, url: address)
+    _ = try await requireDocument(tab)
+    try await validate()
+    didChange()
   }
 
   /// Reserves an immutable native identity without creating a document/view.
@@ -260,6 +357,7 @@ final class NativeExtensionBrowser {
   /// acceptance. The next atomic catalog publishes removals for only that owner.
   func didCloseWindow(_ id: String) async {
     guard enabled, !stopped else { return }
+    optionsWindows = optionsWindows.filter { $0.value.windowID != id }
     if let attention = attentionRequests.removeValue(forKey: id) { NSApp.cancelUserAttentionRequest(attention) }
     for profile in Array(catalogKeys.keys) { catalogKeys.removeValue(forKey: profile) }
     windowFocusChanged()
@@ -270,6 +368,8 @@ final class NativeExtensionBrowser {
     stopped = true; epoch &+= 1; reconciliation?.cancel(); reconciliation = nil; closingEvents?.cancel()
     for task in tails.values { task.cancel() }
     for pending in catalogTasks.values { pending.task.cancel() }
+    for pending in optionsTasks.values { pending.task.cancel() }
+    optionsTasks.removeAll(); optionsWindows.removeAll()
     catalogTasks.removeAll(); catalogKeys.removeAll(); catalogMembers.removeAll()
     groupKeys.removeAll(); groupMembers.removeAll(); groupIdentities.removeAll(); groupSnapshots.removeAll()
     // A pending windows.remove can itself be awaiting this shutdown. Chromium
@@ -717,6 +817,11 @@ final class NativeExtensionBrowser {
     func arg(_ index: Int) -> Any? { arguments.indices.contains(index) ? arguments[index] : nil }
     try await authorize(request, profile: profile, manager: manager)
     switch request.method {
+    case "runtime.openOptionsPage":
+      guard arguments.isEmpty else { throw Failure("Invalid options-page arguments.") }
+      try await openOptions(profileID: profile, extensionID: request.extensionID,
+        sourceWindowID: request.sourceWindowID, request: request)
+      return []
     case "native.prepareDocument":
       try await synchronizeCatalog(profile)
       let tab = try record(profile, nativeID: integer(arg(0)))
@@ -1274,7 +1379,14 @@ final class NativeExtensionBrowser {
   private func publishChanges() async {
     let revision = epoch
     var next: [String: Snapshot] = [:]
-    for profile in store.state.profiles.filter({ !$0.isPrivate }).map(\.id) {
+    let profiles = store.state.profiles.filter({ !$0.isPrivate }).map(\.id)
+    // A failed topology refresh must not leave another profile's global
+    // shortcut registry active. Clear inactive focus before any catalog await.
+    for profile in profiles where !windows(profile).contains(where: { isWindowFocused($0.id, profile: profile) }) {
+      guard revision == epoch, !Task.isCancelled else { return }
+      await publishFocus(profile, manager: ChromeExtensionManager(engine: engine, profileID: profile))
+    }
+    for profile in profiles {
       let manager = ChromeExtensionManager(engine: engine, profileID: profile)
       do { try await synchronizeCatalog(profile) }
       catch {
@@ -1378,20 +1490,23 @@ final class NativeExtensionBrowser {
         }
         publishedWindows.remove(key); windowSnapshots.removeValue(forKey: key); highlightSnapshots.removeValue(forKey: key)
       }
-      let focused = sessions.first(where: { isWindowFocused($0.id, profile: profile) })
-        .flatMap { engine.context(id: $0.id)?.nativeID }
-      let lastFocused = lastFocusedWindow(profile).flatMap { engine.context(id: $0.id)?.nativeID }
-      if focusSnapshots[profile] != (focused ?? -1) || lastFocusSnapshots[profile] != (lastFocused ?? -1) {
-        do {
-          try await manager.setFocusedWindow(focused, lastFocusedID: lastFocused)
-          if focusSnapshots[profile] != (focused ?? -1) {
-            try await manager.publishBrowserEvent("windows.onFocusChanged", arguments: [focused ?? -1])
-          }
-          focusSnapshots[profile] = focused ?? -1; lastFocusSnapshots[profile] = lastFocused ?? -1
-        } catch { }
-      }
+      await publishFocus(profile, manager: manager)
     }
     if revision == epoch, !Task.isCancelled { snapshots = next }
+  }
+
+  private func publishFocus(_ profile: String, manager: ChromeExtensionManager) async {
+    let focused = windows(profile).first(where: { isWindowFocused($0.id, profile: profile) })
+      .flatMap { engine.context(id: $0.id)?.nativeID }
+    let lastFocused = lastFocusedWindow(profile).flatMap { engine.context(id: $0.id)?.nativeID }
+    guard focusSnapshots[profile] != (focused ?? -1) || lastFocusSnapshots[profile] != (lastFocused ?? -1) else { return }
+    do {
+      try await manager.setFocusedWindow(focused, lastFocusedID: lastFocused)
+      if focusSnapshots[profile] != (focused ?? -1) {
+        try await manager.publishBrowserEvent("windows.onFocusChanged", arguments: [focused ?? -1])
+      }
+      focusSnapshots[profile] = focused ?? -1; lastFocusSnapshots[profile] = lastFocused ?? -1
+    } catch { }
   }
 
   private func isRetiredWindow(_ value: Any?) -> Bool {

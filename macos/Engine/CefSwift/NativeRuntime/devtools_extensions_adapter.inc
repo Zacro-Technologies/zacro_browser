@@ -2,9 +2,11 @@
 #include "base/supports_user_data.h"
 #include "base/uuid.h"
 #include "chrome/browser/extensions/extension_action_dispatcher.h"
+#include "chrome/browser/extensions/commands/command_service.h"
 #include "extensions/browser/api/storage/storage_frontend.h"
 #include "extensions/browser/api/storage/storage_area_namespace.h"
 #include "extensions/browser/extension_registry_observer.h"
+#include "extensions/browser/event_router.h"
 #include "extensions/browser/extension_prefs.h"
 #include "extensions/browser/install_prefs_helper.h"
 #include "extensions/common/permissions/permissions_data.h"
@@ -15,6 +17,7 @@ void ZacroSetTopologyObserved(content::BrowserContext* context, bool observed);
 
 class ZacroExtensionContext : public base::SupportsUserData::Data,
                               public extensions::ExtensionRegistryObserver,
+                              public extensions::CommandService::Observer,
                               public extensions::ExtensionActionDispatcher::Observer {
  public:
   using Events = base::RepeatingCallbackList<void(const std::string&, const base::DictValue&)>;
@@ -29,6 +32,14 @@ class ZacroExtensionContext : public base::SupportsUserData::Data,
     if (registry_) registry_->AddObserver(this);
     dispatcher_ = extensions::ExtensionActionDispatcher::Get(context);
     if (dispatcher_) dispatcher_->AddObserver(this);
+    commands_ = extensions::CommandService::Get(context);
+    if (commands_) commands_->AddObserver(this);
+    if (auto* events = extensions::EventRouter::Get(context)) {
+      command_listener_observer_ = events->ObserveNativeListeners(base::BindRepeating(
+          [](ZacroExtensionContext* self, const std::string& name) {
+            if (name == "commands.onCommand") self->CommandsChanged();
+          }, base::Unretained(this)));
+    }
     // Incognito state never participates in a portable storage stream.
     if (!context->IsOffTheRecord()) {
       auto* storage = extensions::StorageFrontend::Get(context);
@@ -39,6 +50,7 @@ class ZacroExtensionContext : public base::SupportsUserData::Data,
   ~ZacroExtensionContext() override {
     if (registry_) registry_->RemoveObserver(this);
     if (dispatcher_) dispatcher_->RemoveObserver(this);
+    if (commands_) commands_->RemoveObserver(this);
   }
   std::string InstallationID(const extensions::Extension& extension) {
     auto& entry = installations_[extension.id()];
@@ -85,6 +97,9 @@ class ZacroExtensionContext : public base::SupportsUserData::Data,
     registry->RemoveObserver(this); registry_ = nullptr; installations_.clear();
   }
   void OnShuttingDown() override { dispatcher_->RemoveObserver(this); dispatcher_ = nullptr; }
+  void OnExtensionCommandAdded(const extensions::ExtensionId&, const std::string&) override { CommandsChanged(); }
+  void OnExtensionCommandRemoved(const extensions::ExtensionId&, const std::string&) override { CommandsChanged(); }
+  void OnCommandServiceDestroying() override { commands_->RemoveObserver(this); commands_ = nullptr; }
   void OnExtensionActionUpdated(extensions::ExtensionAction* action, content::WebContents* contents,
       content::BrowserContext* context) override {
     if (!action || context != context_) return;
@@ -93,6 +108,7 @@ class ZacroExtensionContext : public base::SupportsUserData::Data,
     events_.Notify("Zacro.extensionActionChanged", params);
   }
  private:
+  void CommandsChanged() { events_.Notify("Zacro.extensionCommandsChanged", base::DictValue()); }
   void RegistryChanged() { events_.Notify("Zacro.extensionRegistryChanged", base::DictValue()); }
   void StorageChanged(const extensions::ExtensionId& id, extensions::StorageAreaNamespace area,
       const base::Value& changes, const std::string& origin, const extensions::Extension* mutation_owner) {
@@ -107,9 +123,11 @@ class ZacroExtensionContext : public base::SupportsUserData::Data,
   raw_ptr<content::BrowserContext> context_;
   raw_ptr<extensions::ExtensionRegistry> registry_ = nullptr;
   raw_ptr<extensions::ExtensionActionDispatcher> dispatcher_ = nullptr;
+  raw_ptr<extensions::CommandService> commands_ = nullptr;
   std::map<std::string, std::pair<scoped_refptr<const extensions::Extension>, std::string>> installations_;
   Events events_;
   base::CallbackListSubscription storage_observer_;
+  base::CallbackListSubscription command_listener_observer_;
 };
 
 void CefDevToolsController::EmitZacro(const std::string& method, const base::DictValue& params) {

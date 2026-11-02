@@ -22,7 +22,15 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
   lazy var downloads = NativeDownloads(store: store, engine: engine)
   lazy var bookmarks = NativeBookmarkSync(engine: engine, store: store)
   lazy var navigation = NativeNavigationCoordinator(engine: engine, store: store)
-  lazy var services = NativeServicesModel(store: store, directory: engine.dataDirectory) { [weak self] grants in
+  lazy var services = NativeServicesModel(store: store, directory: engine.dataDirectory,
+    conversationProfile: { [weak self] identifier in
+      await MainActor.run {
+        guard let self, let owner = self.windows[identifier], owner.windowContext.isOpen,
+          !owner.windowContext.isClosing, !self.engine.isTerminating,
+          let profile = owner.store.state.activeProfile else { return nil }
+        return AIProfileScope(id: profile.id, isPrivate: profile.isPrivate)
+      }
+    }) { [weak self] grants in
     guard let self else { throw CancellationError() }
     return try await self.readContext(grants)
   }
@@ -56,20 +64,29 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
   /// The approved tab identity, rather than whichever same-profile shell most
   /// recently gained focus, determines where page context is read.
   func readContext(_ grants: [AIContextGrant]) async throws -> [AIPageExtract] {
+    let conversationID = grants.first?.conversationID
+    let requester = conversationID.flatMap { windows[$0] }
+    let scope = requester?.store ?? store
     guard grants.count <= 6, Set(grants.map(\.id)).count == grants.count,
-      let profile = store.state.activeProfile, !profile.isPrivate,
+      grants.allSatisfy({ $0.conversationID == conversationID }),
+      conversationID == nil || (requester?.windowContext.isOpen == true && requester?.windowContext.isClosing == false),
+      let profile = scope.state.activeProfile, !profile.isPrivate,
       grants.allSatisfy({ $0.profileID == profile.id }) else {
       throw ServiceError("CONTEXT_CHANGED", "Review the selected pages in their regular profile before sharing.")
     }
     var result: [AIPageExtract] = []
     for grant in grants {
       try Task.checkCancellation()
-      guard store.activeProfileID == profile.id, let owner = owner(tabID: grant.id),
+      guard scope.activeProfileID == profile.id, !engine.isTerminating,
+        conversationID == nil || (requester?.windowContext.isOpen == true && requester?.windowContext.isClosing == false),
+        let owner = owner(tabID: grant.id),
         owner.windowContext.isOpen, !owner.windowContext.isClosing else {
         throw ServiceError("CONTEXT_CHANGED", "A selected page or its window changed. Review it again before sharing.")
       }
       let page = try await owner.readContext([grant])
-      guard store.activeProfileID == profile.id, self.owner(tabID: grant.id) === owner,
+      guard scope.activeProfileID == profile.id, !engine.isTerminating,
+        conversationID == nil || (requester?.windowContext.isOpen == true && requester?.windowContext.isClosing == false),
+        self.owner(tabID: grant.id) === owner,
         owner.windowContext.isOpen, !owner.windowContext.isClosing,
         store.tab(grant.id)?.url == grant.url.absoluteString else {
         throw ServiceError("CONTEXT_CHANGED", "A selected page or its window changed while it was being read.")
@@ -293,6 +310,16 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
       try present(scope, focused: true)
     } catch { focusedCoordinator?.showError(error.localizedDescription) }
   }
+  func browsingWindow(profileID: String) throws -> BrowserWindowCoordinator {
+    guard !engine.isTerminating else { throw CancellationError() }
+    if let owner = windows.values.first(where: {
+      !$0.isPopup && $0.windowContext.isOpen && !$0.windowContext.isClosing && $0.store.activeProfileID == profileID
+    }) {
+      owner.windowContext.show()
+      return owner
+    }
+    return try present(repository.makeWindow(profileID: profileID), focused: true)
+  }
   @discardableResult func reopenWindow(id: String) throws -> BrowserWindowCoordinator {
     guard !engine.isTerminating else { throw CancellationError() }
     return try present(repository.reopenWindow(id: id), focused: true)
@@ -324,6 +351,7 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
     guard !engine.isTerminating, deletingProfileID != request.profileID,
       oldOwners.values.allSatisfy({ $0.windowContext.isOpen && !$0.windowContext.isClosing }) else { throw CancellationError() }
     var bounds = BrowserWindowBounds()
+    bounds.sizeKind = "window"
     if let value = request.left { bounds.x = Double(value) }
     if let value = request.top { bounds.y = Double(value) }
     if let value = request.width { bounds.width = Double(value) }

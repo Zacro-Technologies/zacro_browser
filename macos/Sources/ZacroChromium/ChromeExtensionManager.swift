@@ -23,6 +23,25 @@ public struct ChromeExtension: Decodable, Identifiable, Sendable {
     public let isEnabled: Bool
     public let isActive: Bool
   }
+  public struct SafetyCheck: Decodable, Sendable {
+    public let panelString: String?
+    public let detailString: String?
+  }
+  public struct ControlledInfo: Decodable, Sendable { public let text: String }
+  public struct DisableReasons: Decodable, Sendable {
+    public let suspiciousInstall: Bool
+    public let corruptInstall: Bool
+    public let updateRequired: Bool
+    public let publishedInStoreRequired: Bool
+    public let blockedByPolicy: Bool
+    public let reloading: Bool
+    public let custodianApprovalRequired: Bool
+    public let parentDisabledPermissions: Bool
+    public let unsupportedManifestVersion: Bool
+    public let unsupportedDeveloperExtension: Bool
+    public let disabledByAnotherExtension: Bool
+    public let disabledByExtensionName: String?
+  }
   public struct OptionsPage: Decodable, Sendable {
     public let openInTab: Bool
     public let url: String
@@ -55,6 +74,12 @@ public struct ChromeExtension: Decodable, Identifiable, Sendable {
   public let permissions: Permissions
   public let incognitoAccess: Access
   public let fileAccess: Access
+  public let userScriptsAccess: Access
+  public let isCommandRegistrationHandledExternally: Bool
+  public let blocklistText: String?
+  public let safetyCheckText: SafetyCheck?
+  public let controlledInfo: ControlledInfo?
+  public let disableReasons: DisableReasons
   public let webStoreUrl: String
   public let installWarnings: [String]
   public let runtimeWarnings: [String]
@@ -112,6 +137,7 @@ public struct ChromeExtensionHostRequest: Sendable {
 
 public enum ChromeExtensionEvent {
   case registryChanged
+  case commandsChanged
   case bookmarksChanged(revision: String)
   case downloadChanged(ChromeNativeDownload)
   case downloadRemoved(guid: String)
@@ -238,6 +264,7 @@ public final class ChromeExtensionManager {
     let token = try browser.devTools.observeEvents { method, params in
       switch method {
       case "Zacro.extensionRegistryChanged": callback(.registryChanged)
+      case "Zacro.extensionCommandsChanged": callback(.commandsChanged)
       case "Zacro.downloadChanged":
         if let data = try? JSONSerialization.data(withJSONObject: params),
           let value = try? JSONDecoder().decode(ChromeNativeDownload.self, from: data) { callback(.downloadChanged(value)) }
@@ -487,6 +514,34 @@ public final class ChromeExtensionManager {
       let extensionInfo = try await snapshot().extensions.first(where: { $0.id == identifier }), extensionInfo.isEnabled,
       !page.isPrivate || extensionInfo.incognitoAccess.isActive else { throw ChromeExtensionError.managementUnavailable }
     guard engine.pages[page.id] === page, page.browser === browser else { throw ChromeExtensionError.managementUnavailable }
+    let parameters = try actionParameters(identifier, on: page, anchorWindow: anchorWindow, anchorRect: anchorRect)
+    _ = try await browser.devTools.call("Zacro.performExtensionAction", parameters: parameters)
+  }
+
+  public func shortcuts() async throws -> [ChromeExtensionShortcut] {
+    let response = try await nativeBrowser().devTools.call("Zacro.getExtensionShortcuts")
+    guard let values = response["shortcuts"] as? [[String: Any]] else { throw ChromeExtensionError.invalidResponse }
+    return try JSONDecoder().decode([ChromeExtensionShortcut].self, from: JSONSerialization.data(withJSONObject: values))
+  }
+
+  /// Execute only a binding matched against the native snapshot in direct
+  /// response to a shell key event. Chromium revalidates its current binding,
+  /// installation, focused logical document, and shortcut suspension state.
+  public func performShortcut(_ shortcut: ChromeExtensionShortcut, on page: ChromiumPage,
+                              anchorWindow: NSWindow? = nil, anchorRect: NSRect? = nil) async throws -> Bool {
+    try validate(shortcut.extensionID)
+    guard !page.isPrivate, page.profileID == profileID, engine.pages[page.id] === page,
+      let browser = page.browser else { throw ChromeExtensionError.managementUnavailable }
+    var parameters = try actionParameters(shortcut.extensionID, on: page, anchorWindow: anchorWindow, anchorRect: anchorRect)
+    parameters["name"] = shortcut.name; parameters["incarnationID"] = shortcut.incarnationID
+    parameters["keybinding"] = shortcut.keybinding
+    let result = try await browser.devTools.call("Zacro.performExtensionShortcut", parameters: parameters)
+    guard let performed = result["performed"] as? Bool else { throw ChromeExtensionError.invalidResponse }
+    return performed
+  }
+
+  private func actionParameters(_ identifier: String, on page: ChromiumPage,
+                                anchorWindow: NSWindow?, anchorRect: NSRect?) throws -> [String: Any] {
     var parameters: [String: Any] = ["id": identifier]
     if let anchorWindow {
       guard let ownerID = page.ownerWindowID, let owner = engine.context(id: ownerID),
@@ -501,7 +556,7 @@ public final class ChromeExtensionManager {
       parameters["anchor"] = ["windowNumber": anchorWindow.windowNumber,
         "x": rect.minX, "y": rect.minY, "width": rect.width, "height": rect.height]
     }
-    _ = try await browser.devTools.call("Zacro.performExtensionAction", parameters: parameters)
+    return parameters
   }
 
   public func setEnabled(_ identifier: String, enabled: Bool) async throws {
@@ -549,11 +604,6 @@ public final class ChromeExtensionManager {
     _ = try await loadUnpackedExtension(at: directory)
   }
 
-  public func showOptions(_ identifier: String) async throws {
-    try validate(identifier)
-    try await invoke("developerPrivate.showOptions", [identifier], userGesture: true)
-  }
-
   public func setFileAccess(_ identifier: String, allowed: Bool) async throws {
     try validate(identifier)
     try await invoke("developerPrivate.updateExtensionConfiguration",
@@ -564,6 +614,23 @@ public final class ChromeExtensionManager {
     try validate(identifier)
     try await invoke("developerPrivate.updateExtensionConfiguration",
       [["extensionId": identifier, "incognitoAccess": allowed]], userGesture: true)
+  }
+
+  public func setUserScriptsAccess(_ identifier: String, allowed: Bool) async throws {
+    try validate(identifier)
+    try await invoke("developerPrivate.updateExtensionConfiguration",
+      [["extensionId": identifier, "userScriptsAccess": allowed]], userGesture: true)
+  }
+
+  public func setCommandScope(_ identifier: String, name: String, global: Bool) async throws {
+    try validate(identifier)
+    guard !name.isEmpty, name.utf8.count <= 256 else { throw ChromeExtensionError.invalidResponse }
+    try await invoke("developerPrivate.updateExtensionCommand", [["extensionId": identifier,
+      "commandName": name, "scope": global ? "GLOBAL" : "CHROME"]], userGesture: true)
+  }
+
+  public func setShortcutHandlingSuspended(_ suspended: Bool) async throws {
+    try await invoke("developerPrivate.setShortcutHandlingSuspended", [suspended])
   }
 
   public func updateCommand(_ identifier: String, name: String, keybinding: String, global: Bool = false) async throws {

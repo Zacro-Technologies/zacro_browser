@@ -14,6 +14,29 @@ import XCTest
     try FileManager.default.createDirectory(at: file, withIntermediateDirectories: true)
   }
 
+  func testSecondWindowSidebarReordersUseItsProjectionAcrossCategoryChanges() throws {
+    let repository = BrowserRepository(directory: try directory()), first = repository.focusedStore
+    _ = first.createTab(address:"https://first.example/a")
+    _ = first.createTab(address:"https://first.example/b")
+    _ = first.createTab(address:"https://first.example/c")
+    let firstOrder = first.state.tabs.map(\.id)
+    let second = try repository.makeWindow(addresses:["https://second.example/a", "https://second.example/b", "https://second.example/c"])
+    let original = second.state.tabs.map(\.id)
+    XCTAssertEqual(original.count, 3)
+    second.moveTab(id: original[2], index: 1)
+    XCTAssertEqual(second.state.tabs.map(\.id), [original[0], original[2], original[1]])
+    second.moveTab(id: original[1], index: 0, pinned: true, favorite: true)
+    XCTAssertEqual(second.state.tabs.map(\.id), [original[1], original[0], original[2]])
+    XCTAssertTrue(second.tab(original[1])!.isFavorite)
+    second.moveTab(id: original[1], index: 2, pinned: false, favorite: false, clearFolder: true)
+    XCTAssertEqual(second.state.tabs.map(\.id), [original[0], original[2], original[1]])
+    XCTAssertFalse(second.tab(original[1])!.isPinned)
+    XCTAssertEqual(first.state.tabs.map(\.id), firstOrder)
+    let reopened = BrowserRepository(directory: repository.directory)
+    XCTAssertEqual(reopened.store(for: second.owningWindowID!)?.state.tabs.map(\.id), second.state.tabs.map(\.id))
+    XCTAssertEqual(reopened.store(for: first.owningWindowID!)?.state.tabs.map(\.id), firstOrder)
+  }
+
   func testLegacyMigrationAssignsRetainedTabsAndPreservesSelection() throws {
     var legacy = BrowserState()
     let normal = BrowserTab(spaceID: "home", url: "https://example.com")

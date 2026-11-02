@@ -44,7 +44,7 @@
  #include "ui/base/unowned_user_data/scoped_unowned_user_data.h"
  #include "ui/gfx/geometry/rect.h"
  
-@@ -58,6 +59,13 @@
+@@ -58,6 +59,14 @@
    // starting_bounds_in_browser_coordinates to its final open position.
    virtual void ShowFrom(SidePanelEntryKey entry_key,
                          gfx::Rect starting_bounds_in_browser_coordinates) = 0;
@@ -55,25 +55,41 @@
 +  virtual SidePanelNativeView TakeNativeGlobalView(const SidePanelEntryKey& key) {
 +    return nullptr;
 +  }
++  virtual void SetNativeEmptyContentHidden(bool hidden) {}
  
    // Close the side panel.
    virtual void Close(SidePanelEntryHideReason hide_reason,
 --- a/chrome/browser/ui/views/side_panel/side_panel_coordinator.h
 +++ b/chrome/browser/ui/views/side_panel/side_panel_coordinator.h
-@@ -52,6 +52,7 @@
+@@ -52,6 +52,8 @@
    void TearDownPreBrowserWindowDestruction();
  
    // SidePanelUI:
 +  SidePanelNativeView TakeNativeGlobalView(const SidePanelEntryKey& key) override;
++  void SetNativeEmptyContentHidden(bool hidden) override;
    using SidePanelUI::Close;
    void Close(SidePanelEntryHideReason reason,
               bool suppress_animations) override;
 --- a/chrome/browser/ui/views/side_panel/side_panel_coordinator.cc
 +++ b/chrome/browser/ui/views/side_panel/side_panel_coordinator.cc
-@@ -212,6 +212,20 @@
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "chrome/browser/ui/views/side_panel/side_panel_coordinator.h"
++#include "chrome/browser/ui/views/frame/browser_view.h"
+ 
+ #include <memory>
+ #include <utility>
+@@ -212,6 +213,26 @@
  //   (4) At the moment that this comment was written, if this class is showing
  //   a window-scoped side-panel entry, and the window is closed via any
  //   mechanism, this method is not called.
++void SidePanelCoordinator::SetNativeEmptyContentHidden(bool hidden) {
++  if (auto* view = BrowserView::GetBrowserViewForBrowser(browser())) {
++    view->SetNativeEmptyContentHidden(hidden);
++  }
++}
++
 +SidePanelNativeView SidePanelCoordinator::TakeNativeGlobalView(
 +    const SidePanelEntryKey& key) {
 +  if (!IsSidePanelEntryShowing(key, /*for_tab=*/false)) return nullptr;
@@ -142,6 +158,14 @@
    // ExtensionRegistryObserver implementation.
    void OnExtensionLoaded(content::BrowserContext* browser_context,
                           const Extension* extension) override;
+@@ -102,6 +107,7 @@
+   // through TabFeatures instead.
+   std::optional<ui::ScopedUnownedUserData<ExtensionSidePanelManager>>
+       scoped_unowned_user_data_;
++  base::WeakPtrFactory<ExtensionSidePanelManager> native_weak_factory_{this};
+ };
+ 
+ }  // namespace extensions
 --- a/chrome/browser/ui/extensions/extension_side_panel_manager.cc
 +++ b/chrome/browser/ui/extensions/extension_side_panel_manager.cc
 @@ -9,6 +9,8 @@
@@ -153,7 +177,7 @@
  #include "content/public/browser/browser_context.h"
  #include "extensions/browser/extension_registry.h"
  #include "extensions/browser/extension_util.h"
-@@ -61,6 +63,72 @@
+@@ -61,6 +63,79 @@
    return (it == coordinators_.end()) ? nullptr : it->second.get();
  }
  
@@ -161,6 +185,8 @@
 +    const ExtensionId& extension_id, ExtensionSidePanelManager* destination) {
 +  if (!destination || destination == this || for_tab_ || destination->for_tab_ ||
 +      profile_ != destination->profile_) return false;
++  const auto source_manager = native_weak_factory_.GetWeakPtr();
++  const auto target_manager = destination->native_weak_factory_.GetWeakPtr();
 +  auto source = coordinators_.find(extension_id);
 +  auto target = destination->coordinators_.find(extension_id);
 +  if (source == coordinators_.end() || !source->second->host() ||
@@ -173,20 +199,23 @@
 +  const auto* original_entry = coordinator->GetEntry();
 +  auto* source_ui = SidePanelUI::From(browser_);
 +  auto* target_ui = SidePanelUI::From(destination->browser_);
-+  if (!source_ui || !target_ui || !coordinator->GetEntry() ||
-+      !source_ui->IsSidePanelEntryShowing(key, /*for_tab=*/false)) return false;
-+  // A contextual panel takes precedence in Chrome. Keep the global document
-+  // retained in the old view until a tab without an override becomes active.
++  if (!source_ui || !target_ui || !coordinator->GetEntry()) return false;
++  // Contextual panels retain precedence. The global document can still move
++  // into that window's inactive registry cache, so closing its previous host
++  // cannot destroy it merely because the selected tab has an override.
++  bool show_global = true;
 +  if (auto* tab = destination->browser_->GetActiveTabInterface()) {
 +    auto* contextual = SidePanelRegistry::From(tab);
-+    if (contextual && contextual->GetEntryForKey(key)) return false;
++    if (contextual && contextual->GetEntryForKey(key)) show_global = false;
 +  }
-+  auto view = source_ui->TakeNativeGlobalView(key);
++  auto view = source_ui->IsSidePanelEntryShowing(key, /*for_tab=*/false)
++      ? source_ui->TakeNativeGlobalView(key) : std::move(coordinator->GetEntry()->CachedView());
 +  if (!view) return false;
 +  // Closing the shell invokes arbitrary native entry observers. They may
 +  // deregister a panel, replace a coordinator or unload the extension. Never
 +  // reuse a pre-callback iterator or require those objects to survive.
 +  auto still_current = [&]() {
++    if (!source_manager || !target_manager) return false;
 +    const auto current_source = coordinators_.find(extension_id);
 +    const auto current_target = destination->coordinators_.find(extension_id);
 +    return source_weak && target_weak &&
@@ -208,6 +237,7 @@
 +  // Hold the coordinator ourselves while action-item callbacks run. Registry
 +  // unload observers cannot delete it while RebindNativeBrowser is executing.
 +  if (!moved->RebindNativeBrowser(destination->browser_, destination->registry_)) return false;
++  if (!source_manager || !target_manager) return false;
 +  entry->CacheView(std::move(view));
 +  if (!destination->registry_->Register(std::move(entry))) return false;
 +  if (!moved->host() || ExtensionRegistry::Get(profile_)->enabled_extensions().GetByID(extension_id) != extension.get()) {
@@ -215,12 +245,13 @@
 +    return false;
 +  }
 +  destination->coordinators_[extension_id] = std::move(moved);
-+  target_ui->Show(key, std::nullopt, /*suppress_animations=*/true);
++  if (show_global) target_ui->Show(key, std::nullopt, /*suppress_animations=*/true);
++  if (!source_manager || !target_manager) return false;
 +  // This physical view can still receive future per-profile option changes.
 +  if (ExtensionRegistry::Get(profile_)->enabled_extensions().GetByID(extension_id) == extension.get())
 +    MaybeCreateExtensionSidePanelCoordinator(extension.get());
 +  return source_weak && source_weak->host() &&
-+      target_ui->IsSidePanelEntryShowing(key, /*for_tab=*/false);
++      (!show_global || target_ui->IsSidePanelEntryShowing(key, /*for_tab=*/false));
 +}
 +
  void ExtensionSidePanelManager::RegisterExtensionEntries() {
@@ -274,3 +305,54 @@
    content::WebContents* OpenURL(
        const content::OpenURLParams& params,
        base::OnceCallback<void(content::NavigationHandle&)>
+--- a/chrome/browser/ui/views/frame/browser_view.h
++++ b/chrome/browser/ui/views/frame/browser_view.h
+@@ -265,6 +265,10 @@
+ 
+   // Container for multiple contents container views.
+   views::View* contents_container();
++
++  // A native shell paints its own themed empty canvas. Keep extension UI
++  // visible while suppressing only the blank renderer beneath it.
++  void SetNativeEmptyContentHidden(bool hidden);
+ 
+   views::View* main_shadow_overlay() { return main_shadow_overlay_; }
+ 
+@@ -836,6 +840,7 @@
+   virtual ToolbarView* OverrideCreateToolbar() { return nullptr; }
+ 
+  private:
++  bool native_empty_content_hidden_ = false;
+   // Do not friend BrowserViewLayout. Use the BrowserViewLayoutDelegate
+   // interface to keep these two classes decoupled and testable.
+   friend class BrowserViewLayoutDelegateImpl;
+--- a/chrome/browser/ui/views/frame/browser_view.cc
++++ b/chrome/browser/ui/views/frame/browser_view.cc
+@@ -6217,7 +6217,27 @@
+   FrameColorsChanged();
+ }
+ 
++void BrowserView::SetNativeEmptyContentHidden(bool hidden) {
++  auto* tab = browser_->GetActiveTabInterface();
++  if (hidden && (!tab || !tab->GetContents() ||
++      tab->GetContents()->GetLastCommittedURL() != GURL("about:blank"))) hidden = false;
++  if (native_empty_content_hidden_ == hidden) return;
++  native_empty_content_hidden_ = hidden;
++  for (const auto& container : GetContentsContainerViews()) {
++    // Opacity retains the content slot's geometry, unlike SetVisible(false),
++    // and does not remove the real tab or its extension action permissions.
++    if (!container->layer()) container->SetPaintToLayer();
++    container->layer()->SetOpacity(hidden ? 0.0f : 1.0f);
++    container->SetCanProcessEventsWithinSubtree(!hidden);
++  }
++  FrameColorsChanged();
++}
++
+ void BrowserView::FrameColorsChanged() {
++  if (native_empty_content_hidden_) {
++    GetWidget()->SetBackgroundColor(SK_ColorTRANSPARENT);
++    return;
++  }
+   if (web_app_window_title_) {
+     SkColor frame_color =
+         GetFrameView()->GetFrameColor(BrowserFrameActiveState::kUseCurrent);

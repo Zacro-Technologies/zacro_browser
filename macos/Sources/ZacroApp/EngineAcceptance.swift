@@ -149,6 +149,9 @@ final class EngineAcceptance {
     guard let popup, let popupBrowser = popup.browser else { throw Failure(message: "Native popup was not adopted") }
     let opener = try await popupBrowser.devTools.evaluate("!!window.opener && window.opener.zacroMainWorldMarker==='private-to-page'") as? Bool
     try require(opener == true && popup.profileID == page.profileID, "popupRetainsOpener")
+    let promotedWithPopup = engine.adoptPage(fromID: page.id, toID: "acceptance-promoted-with-popup")
+    try require(promotedWithPopup === page && popup.openerID == page.id && page.browser?.id == nativeID,
+      "documentAdoptionRemapsRetainedPopupOpener")
     _ = try await popupBrowser.devTools.evaluate("window.opener.zacroPopupReply='retained-callback'; null")
     let reply = try await browser.devTools.evaluate("window.zacroPopupReply") as? String
     try require(reply == "retained-callback", "popupCallback")

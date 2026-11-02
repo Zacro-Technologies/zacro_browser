@@ -56,6 +56,10 @@ Peek is also projected as a virtual live document with logical ID `peek:<sourceI
 
 The session restore transaction also accepts a virtual Peek from a parked public window. It transfers the source and any persistent split partners, selects the retained preview, and preserves its identity without promoting or duplicating it. Two additional cases verify restart, live/missing/cross-profile rejection and failed-write rollback; all five `BrowserSessionTests` passed (`sessions-peek-post13.log`).
 
+After integrated build14, the full suite passed **126 Core and 64 Services tests** with zero failures or skips, including the bundled Codex handshake and PDF helper (`core-services-post14-full.log`).
+
+Window sidebar moves now resolve their projected insertion neighbor against the authoritative shared collection, so a second window's drag cannot be interpreted as an index among every window's tabs. A regression covers middle reordering, favorite creation, dragging back out and restart while preserving the other window's order. Together with the subsequent window-authority AI regressions, the complete run passed **127 Core and 71 Services tests**, with no failures or skips (`core-services-window-authority.log`).
+
 - Call `sidebarTabs()` for keyboard tab ordering instead of independently sorting categories.
 - Use atomic `moveTab(..., pinned:, favorite:, clearFolder:)` for drag classification. Omitted folder means preserve it; `clearFolder: true` means remove it.
 - User address entry uses `BrowserAddress.resolve`. Only a verified extension action should call `createExtensionTab`/`setExtensionPage`.

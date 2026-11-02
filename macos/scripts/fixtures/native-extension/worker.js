@@ -1,5 +1,6 @@
 /* Real MV3 APIs only. Loaded solely into a fresh disposable acceptance profile. */
 importScripts('peek.js');
+importScripts('network.js');
 const events = [];
 const record = (name, ...args) => {
   events.push({ name, args });
@@ -15,6 +16,16 @@ for (const name of ["onCreated", "onUpdated", "onMoved", "onRemoved"]) {
   chrome.tabGroups[name].addListener((...args) => record(`tabGroups.${name}`, ...args));
 }
 chrome.storage.onChanged.addListener((changes, area) => record("storage.onChanged", changes, area));
+let commandWrite = Promise.resolve();
+chrome.commands.onCommand.addListener((name, tab) => {
+  record("commands.onCommand", name, tab);
+  // Serialize storage updates so repeated actual shortcuts cannot lose counts.
+  commandWrite = commandWrite.then(async () => {
+    const { nativeCommandCount = 0 } = await chrome.storage.local.get("nativeCommandCount");
+    await chrome.storage.local.set({ nativeCommandCount: nativeCommandCount + 1,
+      lastNativeCommand: { name, tab } });
+  });
+});
 let nativeActionMode = "record";
 for (const name of ["onOpened", "onClosed"]) {
   chrome.sidePanel[name].addListener(info => record(`sidePanel.${name}`, info));
@@ -48,6 +59,22 @@ async function loaded(tabId) {
 
 globalThis.zacroAcceptance = {
   events,
+  async commandResult() {
+    await commandWrite;
+    return await chrome.storage.local.get(["nativeCommandCount", "lastNativeCommand"]);
+  },
+  async optionsResult() {
+    const end = Date.now() + 10000;
+    while (Date.now() < end) {
+      try {
+        const result = await chrome.runtime.sendMessage({ type: "zacro-native-options" });
+        if (result?.instance && result?.tab && result?.window) return result;
+        await wait(40);
+      }
+      catch { await wait(40); }
+    }
+    throw new Error("The managed native options document did not become ready");
+  },
   async configureAction(mode = "record") {
     assert(["record", "popup", "panel"].includes(mode), "Unknown action fixture mode");
     nativeActionMode = mode;

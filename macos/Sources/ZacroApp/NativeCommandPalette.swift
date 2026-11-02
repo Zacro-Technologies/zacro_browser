@@ -25,12 +25,14 @@ struct NativeCommandPalette: View {
   @State private var searchKeyword = ""
   @State private var searchURL = ""
   @State private var error: String?
+  @State private var entered = false
   @Environment(\.colorScheme) private var colorScheme
+  @Environment(\.colorSchemeContrast) private var contrast
   @Environment(\.presentedSpaceTheme) private var presentedTheme
   @Environment(\.accessibilityReduceMotion) private var reduceMotion
   private var colors: NativeSpacePalette {
     let theme = presentedTheme ?? store.state.activeSpace?.theme ?? SpaceTheme()
-    return NativeSpacePalette(theme: theme, dark: colorScheme == .dark)
+    return NativeSpacePalette(theme: theme, dark: colorScheme == .dark, increasedContrast: contrast == .increased)
   }
   private let scopes = [("all", "All"), ("tab", "Tabs"), ("space", "Spaces"), ("folder", "Folders"), ("bookmark", "Bookmarks"), ("history", "History"), ("action", "Actions")]
   private var raw: String { actions.query.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -71,12 +73,17 @@ struct NativeCommandPalette: View {
           .background { NativeControlSurface().overlay(colors.chrome.opacity(0.86)).clipShape(RoundedRectangle(cornerRadius: 12)) }
           .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(colors.ink.opacity(0.08), lineWidth: 0.5))
           .shadow(color: .black.opacity(0.14), radius: 16, y: 8)
+          .scaleEffect(entered || reduceMotion ? 1 : 0.99)
+          .offset(y: entered || reduceMotion ? 0 : -4)
           .padding(.top, max(36, min(110, geometry.size.height * 0.12)))
           .frame(width: available)
       }
     }.font(.system(size: 13)).foregroundStyle(colors.ink).tint(colors.accent)
       .onAppear {
         resetSession()
+        withAnimation(reduceMotion ? nil : .timingCurve(0.16, 1, 0.3, 1, duration: 0.16 * store.state.settings.motionScale)) {
+          entered = true
+        }
         actions.handlePaletteEscape = {
           if editingSearch != nil { editingSearch = nil; error = nil }
           else if !back() { actions.palette = false }
@@ -149,14 +156,15 @@ struct NativeCommandPalette: View {
                   if item.kind == "tab", let image = actions.icons[String(item.id.dropFirst(4))] {
                     Image(nsImage: image).resizable().scaledToFit().frame(width: 16, height: 16)
                   } else { NativeGlyph(item.icon).font(.system(size: 14)) }
-                }.frame(width: 22, height: 24).foregroundStyle(colors.accent)
+                }.frame(width: 22, height: 24).foregroundStyle(selection == index ? colors.ink : colors.muted)
                 VStack(alignment: .leading, spacing: 2) {
                   Text(item.title).lineLimit(1)
-                  if !item.detail.isEmpty { Text(item.detail).font(.system(size: 11)).foregroundStyle(colors.muted).lineLimit(1) }
+                  if !item.detail.isEmpty { Text(item.detail).font(.system(size: 11)).foregroundStyle(selection == index ? colors.ink : colors.muted).lineLimit(1) }
                 }.frame(maxWidth: .infinity, alignment: .leading)
                 Text(item.type).font(.system(size: 10)).foregroundStyle(colors.muted).lineLimit(1)
               }.frame(minHeight: 26).padding(.horizontal, 10).padding(.vertical, 7)
                 .background(colors.card.opacity(selection == index ? 0.46 : 0), in: RoundedRectangle(cornerRadius: 10))
+                .modifier(NativeSelectionContrast(selected: selection == index, color: colors.ink, radius: 10))
                 .shadow(color: .black.opacity(selection == index ? 0.07 : 0), radius: 1.5, y: 1).contentShape(Rectangle())
             }.buttonStyle(.plain).onHover { if $0 { selection = index } }
               .accessibilityLabel(item.title + (item.detail.isEmpty ? "" : ", \(item.detail)"))
@@ -172,7 +180,7 @@ struct NativeCommandPalette: View {
         .frame(height: min(360, min(max(46, Double(results.count) * 44), max(120, Double(actions.contentFrame.height) - 200))))
         .onChange(of: selection) { _, index in
           guard results.indices.contains(index) else { return }
-          withAnimation(reduceMotion ? nil : .easeOut(duration: 0.1)) { reader.scrollTo(results[index].id, anchor: .center) }
+          withAnimation(reduceMotion ? nil : .easeOut(duration: 0.1 * store.state.settings.motionScale)) { reader.scrollTo(results[index].id, anchor: .center) }
         }
     }
   }

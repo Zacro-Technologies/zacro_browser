@@ -57,8 +57,9 @@ def main():
     if revision != "d0c02bfad08ec92a6ffcf989e53cd995e6381a4c":
         raise SystemExit(f"Expected pinned Chromium 156.0.8078.48, found {revision}.")
     version = "156.0.8078.48"
-    if shutil.disk_usage(source).free < 65 * GIB:
-        raise SystemExit("This build needs at least 65 GiB free before compilation; nothing was removed.")
+    minimum_free = 25 if args.skip_generation else 65
+    if shutil.disk_usage(source).free < minimum_free * GIB:
+        raise SystemExit(f"This {'resumed' if args.skip_generation else 'new'} build needs at least {minimum_free} GiB free; nothing was removed.")
     environment = os.environ.copy()
     environment["PATH"] = str(args.download_dir.resolve() / "depot_tools") + os.pathsep + environment["PATH"]
     environment["GN_OUT_CONFIGS"] = "Release_GN_arm64"
@@ -66,6 +67,7 @@ def main():
         'target_cpu="arm64"', "is_debug=false", "is_component_build=false",
         "is_official_build=false", "symbol_level=0", "blink_symbol_level=0",
         "v8_symbol_level=0", "chrome_pgo_phase=0",
+        "proprietary_codecs=true", 'ffmpeg_branding="Chrome"',
     ])
     run([sys.executable, str(HERE / "apply_adapter.py"), "--cef-root", str(cef)], source, environment)
     run([sys.executable, str(HERE / "apply_storage_adapter.py"), "--chromium-root", str(source)], source, environment)
@@ -78,6 +80,17 @@ def main():
         run([sys.executable, str(cef / "tools" / "gclient_hook.py")], cef, environment)
     elif not (source / "out/Release_GN_arm64/build.ninja").is_file():
         raise SystemExit("Generate the pinned Release build before using --skip-generation.")
+    else:
+        # A resumed build may predate the explicit H.264/AAC parity settings.
+        # Preserve every other generated CEF option and let Ninja regenerate
+        # only the graph/objects affected by these required media features.
+        argument_file = source / "out/Release_GN_arm64/args.gn"
+        previous = argument_file.read_text()
+        lines = [line for line in previous.splitlines()
+                 if line.split("=", 1)[0].strip() not in {"proprietary_codecs", "ffmpeg_branding"}]
+        current = "\n".join(lines + ["proprietary_codecs=true", 'ffmpeg_branding="Chrome"']) + "\n"
+        if previous != current:
+            argument_file.write_text(current)
     if args.generate_only:
         return
     targets = [

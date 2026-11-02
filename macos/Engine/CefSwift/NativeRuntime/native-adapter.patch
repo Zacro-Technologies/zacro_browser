@@ -251,7 +251,7 @@
    // Identify the RenderFrameHost that originated the navigation.
 --- /dev/null
 +++ b/libcef/browser/devtools/zacro_native_adapter.inc
-@@ -0,0 +1,618 @@
+@@ -0,0 +1,757 @@
 +// Zacro's browser-process adapter, included by CefDevToolsController.
 +// This channel is reachable only through CEF's native API. It is never exposed
 +// as a page binding, socket, scheme handler, or extension API.
@@ -297,8 +297,10 @@
 +#include "extensions/browser/unpacked_installer.h"
 +#include "extensions/common/extension.h"
 +#include "extensions/common/manifest_handlers/background_info.h"
++#include "extensions/common/manifest_handlers/options_page_info.h"
 +#include "ui/gfx/image/image.h"
 +#include "ui/gfx/geometry/rect_f.h"
++void ZacroRefreshSidePanelPresentation(content::WebContents* contents);
 +#include "cef/libcef/browser/devtools/zacro_extensions_adapter.inc"
 +#include "cef/libcef/browser/devtools/zacro_topology_adapter.inc"
 +#include "cef/libcef/browser/devtools/zacro_bookmarks_adapter.inc"
@@ -336,6 +338,12 @@
 +  return false;
 +}
 +
++bool ZacroHasSidePanel(content::WebContents* contents) {
++  auto* browser = extensions::browser_window_util::GetBrowserForTabContents(*contents);
++  auto* panel = browser ? SidePanelUI::From(browser) : nullptr;
++  return panel && panel->IsSidePanelShowing();
++}
++
 +bool ZacroHistoryApproval(const GURL& url, content::BrowserContext* context,
 +    std::string& extension, std::string& incarnation, content::WebContents* contents = nullptr) {
 +  if (ZacroRestorableURL(url, context)) return true;
@@ -346,6 +354,18 @@
 +  std::string error;
 +  return ZacroValidateNavigation(context, extension, incarnation, url.spec(), error);
 +}
++}
++
++void ZacroRefreshSidePanelPresentation(content::WebContents* contents) {
++  auto* browser = extensions::browser_window_util::GetBrowserForTabContents(*contents);
++  auto* panel = browser ? SidePanelUI::From(browser) : nullptr;
++  const bool showing = panel && panel->IsSidePanelShowing();
++  // Keep the blank renderer suppressed through the close event. Swift will
++  // hide the child window on its next layout turn; restoring it here would
++  // expose a white frame between native close and that layout.
++  if (panel) panel->SetNativeEmptyContentHidden(contents->GetLastCommittedURL() == GURL("about:blank"));
++  ZacroExtensionContext::Get(contents->GetBrowserContext())->NotifyNative("Zacro.extensionPanelPresentation",
++      base::DictValue().Set("tabID", sessions::SessionTabHelper::IdForTab(contents).id()).Set("visible", showing));
 +}
 +
 +class ZacroDataRemoval : public content::BrowsingDataRemover::Observer {
@@ -372,11 +392,24 @@
 +class ZacroDocumentObserver : public content::WebContentsObserver {
 + public:
 +  ZacroDocumentObserver(content::WebContents* contents,
-+      base::RepeatingCallback<void(bool)> audio)
-+      : content::WebContentsObserver(contents), audio_(std::move(audio)) {}
++      base::RepeatingCallback<void(bool)> audio, base::RepeatingCallback<void(bool)> panel)
++      : content::WebContentsObserver(contents), audio_(std::move(audio)), panel_(std::move(panel)) {
++    subscription_ = ZacroExtensionContext::Get(contents->GetBrowserContext())->Observe(base::BindRepeating(
++        [](ZacroDocumentObserver* observer, const std::string& method, const base::DictValue& params) {
++          if (method == "Zacro.extensionPanelPresentation" && observer->web_contents() &&
++              params.FindInt("tabID") == sessions::SessionTabHelper::IdForTab(observer->web_contents()).id()) {
++            observer->panel_.Run(params.FindBool("visible").value_or(false));
++          }
++        }, base::Unretained(this)));
++  }
 +  void OnAudioStateChanged(bool audible) override { audio_.Run(audible); }
++  void DidFinishNavigation(content::NavigationHandle* handle) override {
++    if (handle->IsInPrimaryMainFrame() && handle->HasCommitted()) ZacroRefreshSidePanelPresentation(web_contents());
++  }
 + private:
 +  base::RepeatingCallback<void(bool)> audio_;
++  base::RepeatingCallback<void(bool)> panel_;
++  base::CallbackListSubscription subscription_;
 +};
 +
 +class ZacroDiscardOperation : public content::WebContentsObserver {
@@ -454,14 +487,38 @@
 +      zacro_document_observer_ = std::make_unique<ZacroDocumentObserver>(inspected_contents_, base::BindRepeating(
 +          [](base::WeakPtr<CefDevToolsController> self, bool audible) {
 +            if (self) self->EmitZacro("Zacro.documentAudioChanged", base::DictValue().Set("audible", audible));
++          }, weak_ptr_factory_.GetWeakPtr()), base::BindRepeating(
++          [](base::WeakPtr<CefDevToolsController> self, bool visible) {
++            if (self) self->EmitZacro("Zacro.documentSidePanelChanged", base::DictValue().Set("visible", visible));
 +          }, weak_ptr_factory_.GetWeakPtr()));
 +    }
-+    ReplyZacro(*id, base::DictValue().Set("audible", inspected_contents_->IsCurrentlyAudible())); return true;
++    ReplyZacro(*id, base::DictValue().Set("audible", inspected_contents_->IsCurrentlyAudible())
++        .Set("sidePanelVisible", ZacroHasSidePanel(inspected_contents_))); return true;
 +  }
 +  if (DispatchZacroTopology(*id, *method, request->FindDict("params"))) return true;
 +  if (DispatchZacroExtensions(*id, *method, request->FindDict("params"))) return true;
 +  if (DispatchZacroBookmarks(*id, *method, request->FindDict("params"))) return true;
 +  if (DispatchZacroDownloads(*id, *method, request->FindDict("params"))) return true;
++  if (*method == "Zacro.getExtensionOptions") {
++    const auto* params = request->FindDict("params");
++    const auto* extension_id = params ? params->FindString("id") : nullptr;
++    auto* context = inspected_contents_->GetBrowserContext();
++    auto* registry = extensions::ExtensionRegistry::Get(context);
++    const auto* extension = extension_id && registry ? registry->enabled_extensions().GetByID(*extension_id) : nullptr;
++    if (!extension || !extensions::OptionsPageInfo::HasOptionsPage(extension)) {
++      ReplyZacro(*id, {}, "This enabled extension has no options page."); return true;
++    }
++    const auto url = extensions::OptionsPageInfo::GetOptionsPage(extension);
++    const auto incarnation = ZacroExtensionContext::Get(context)->IncarnationID(*extension);
++    std::string error;
++    if (!ZacroValidateNavigation(context, extension->id(), incarnation, url.spec(), error)) {
++      ReplyZacro(*id, {}, error); return true;
++    }
++    ReplyZacro(*id, base::DictValue().Set("extensionID", extension->id()).Set("incarnationID", incarnation)
++        .Set("url", url.spec()).Set("name", extension->name())
++        .Set("openInTab", extensions::OptionsPageInfo::ShouldOpenInTab(extension)));
++    return true;
++  }
 +  const auto* session = request->FindString("sessionId");
 +  if (session && (*session == kZacroBrowserSession || zacro_browser_sessions_.contains(*session))) {
 +    if (!zacro_browser_agent_) {
@@ -559,15 +616,91 @@
 +    installer->BeginInstall();
 +    return true;
 +  }
-+  if (*method == "Zacro.performExtensionAction" || *method == "Zacro.getExtensionAction") {
++  if (*method == "Zacro.getExtensionShortcuts") {
++    auto* context = inspected_contents_->GetBrowserContext();
++    auto* registry = extensions::ExtensionRegistry::Get(context);
++    auto* commands = extensions::CommandService::Get(context);
++    base::ListValue shortcuts;
++    if (registry && commands) for (const auto& extension : registry->enabled_extensions()) {
++      const auto incarnation = ZacroExtensionContext::Get(context)->IncarnationID(*extension);
++      if (incarnation.empty()) continue;
++      auto append = [&](const ui::Command& command, bool action) {
++        const auto& accelerator = command.accelerator();
++        if (accelerator.key_code() == ui::VKEY_UNKNOWN || command.global()) return;
++        shortcuts.Append(base::DictValue().Set("extensionID", extension->id()).Set("incarnationID", incarnation)
++            .Set("name", command.command_name()).Set("keybinding", ui::Command::AcceleratorToString(accelerator))
++            .Set("keyCode", static_cast<int>(accelerator.key_code())).Set("shift", accelerator.IsShiftDown())
++            .Set("control", accelerator.IsCtrlDown()).Set("alt", accelerator.IsAltDown())
++            .Set("command", accelerator.IsCmdDown()).Set("isAction", action));
++      };
++      ui::CommandMap named;
++      commands->GetNamedCommands(extension->id(), extensions::CommandService::ACTIVE,
++          extensions::CommandService::REGULAR, &named);
++      if (extensions::EventRouter::Get(context)->ExtensionHasEventListener(extension->id(), "commands.onCommand"))
++        for (const auto& [name, command] : named) append(command, false);
++      const auto* info = extensions::ActionInfo::GetExtensionActionInfo(extension.get());
++      extensions::Command action;
++      if (info && commands->GetExtensionActionCommand(extension->id(), info->type,
++          extensions::CommandService::ACTIVE, &action, nullptr)) append(action, true);
++    }
++    ReplyZacro(*id, base::DictValue().Set("shortcuts", std::move(shortcuts))); return true;
++  }
++  if (*method == "Zacro.performExtensionAction" || *method == "Zacro.getExtensionAction" ||
++      *method == "Zacro.performExtensionShortcut") {
 +    const auto* params = request->FindDict("params");
 +    const auto* extension_id = params ? params->FindString("id") : nullptr;
 +    auto* context = inspected_contents_->GetBrowserContext();
 +    auto* registry = extensions::ExtensionRegistry::Get(context);
 +    const auto* extension = extension_id && registry ? registry->enabled_extensions().GetByID(*extension_id) : nullptr;
++    if (*method == "Zacro.performExtensionShortcut") {
++      const auto* name = params ? params->FindString("name") : nullptr;
++      const auto* binding = params ? params->FindString("keybinding") : nullptr;
++      const auto* incarnation = params ? params->FindString("incarnationID") : nullptr;
++      auto* commands = extensions::CommandService::Get(context);
++      auto* global = extensions::ExtensionCommandsGlobalRegistry::Get(context);
++      auto* listener = ui::GlobalAcceleratorListener::GetInstance();
++      ZacroBrowserContext::Get(context)->ReconcileKeyboardFocus();
++      if (!extension || !commands || !name || !binding || !incarnation ||
++          *incarnation != ZacroExtensionContext::Get(context)->IncarnationID(*extension) ||
++          !extensions::ExtensionTabUtil::IsVisibleToNativeBrowserModel(inspected_contents_) ||
++          !ZacroBrowserContext::Get(context)->IsCommandTarget(inspected_contents_) ||
++          !global || global->shortcut_handling_suspended() ||
++          (listener && listener->IsShortcutHandlingSuspended())) {
++        ReplyZacro(*id, base::DictValue().Set("performed", false)); return true;
++      }
++      ui::CommandMap named;
++      commands->GetNamedCommands(*extension_id, extensions::CommandService::ACTIVE,
++          extensions::CommandService::REGULAR, &named);
++      auto found = named.find(*name);
++      if (found != named.end()) {
++        const auto& accelerator = found->second.accelerator();
++        auto* browser = extensions::browser_window_util::GetBrowserForTabContents(*inspected_contents_);
++        auto* keys = browser ? ExtensionKeybindingRegistryViews::From(browser) : nullptr;
++        if (*binding != ui::Command::AcceleratorToString(accelerator) || !keys ||
++            keys->shortcut_handling_suspended() || !keys->IsAcceleratorRegistered(accelerator) ||
++            !keys->AcceleratorPressed(accelerator)) {
++          ReplyZacro(*id, base::DictValue().Set("performed", false)); return true;
++        }
++        ReplyZacro(*id, base::DictValue().Set("performed", true)); return true;
++      }
++      extensions::Command action_command;
++      const auto* info = extensions::ActionInfo::GetExtensionActionInfo(extension);
++      if (!info || !commands->GetExtensionActionCommand(*extension_id, info->type,
++          extensions::CommandService::ACTIVE, &action_command, nullptr) || action_command.global() ||
++          action_command.command_name() != *name ||
++          ui::Command::AcceleratorToString(action_command.accelerator()) != *binding) {
++        ReplyZacro(*id, base::DictValue().Set("performed", false)); return true;
++      }
++      // Action commands use the actual action host below, retaining activeTab
++      // grants and a native popup anchored to the owning Swift window.
++    }
 +    auto* manager = extensions::ExtensionActionManager::Get(context);
 +    auto* action = extension && manager ? manager->GetExtensionAction(*extension) : nullptr;
-+    if (!action) { ReplyZacro(*id, {}, "This extension has no available toolbar action."); return true; }
++    if (!action) {
++      if (*method == "Zacro.performExtensionShortcut") ReplyZacro(*id, base::DictValue().Set("performed", false));
++      else ReplyZacro(*id, {}, "This extension has no available toolbar action.");
++      return true;
++    }
 +    const int tab_id = sessions::SessionTabHelper::IdForTab(inspected_contents_).id();
 +    if (*method == "Zacro.getExtensionAction") {
 +      auto color = [](SkColor value) { return base::ListValue().Append(static_cast<int>(SkColorGetR(value))).Append(static_cast<int>(SkColorGetG(value))).Append(static_cast<int>(SkColorGetB(value))).Append(static_cast<int>(SkColorGetA(value))); };
@@ -587,7 +720,11 @@
 +    auto* browser = extensions::browser_window_util::GetBrowserForTabContents(*inspected_contents_);
 +    auto* container = browser ? ExtensionsContainer::From(*browser) : nullptr;
 +    auto* model = container ? container->GetActionForId(*extension_id) : nullptr;
-+    if (!model) { ReplyZacro(*id, {}, "The native extension action container is unavailable."); return true; }
++    if (!model) {
++      if (*method == "Zacro.performExtensionShortcut") ReplyZacro(*id, base::DictValue().Set("performed", false));
++      else ReplyZacro(*id, {}, "The native extension action container is unavailable.");
++      return true;
++    }
 +    if (const auto* anchor = params->FindDict("anchor")) {
 +      const auto number = anchor->FindInt("windowNumber");
 +      const auto x = anchor->FindDouble("x"), y = anchor->FindDouble("y");
@@ -601,7 +738,9 @@
 +        ReplyZacro(*id, {}, "The native extension popup anchor is unavailable."); return true;
 +      }
 +    }
-+    model->ExecuteUserAction(ExtensionActionViewModel::InvocationSource::kCdp);
++    model->ExecuteUserAction(*method == "Zacro.performExtensionShortcut"
++        ? ExtensionActionViewModel::InvocationSource::kCommand
++        : ExtensionActionViewModel::InvocationSource::kCdp);
 +    NativeExtensionPopupAnchor::CancelPrepared(inspected_contents_);
 +    ReplyZacro(*id, base::DictValue().Set("performed", true)); return true;
 +  }
@@ -872,14 +1011,16 @@
 +}
 --- /dev/null
 +++ b/libcef/browser/devtools/zacro_extensions_adapter.inc
-@@ -0,0 +1,184 @@
+@@ -0,0 +1,202 @@
 +// Browser-context-owned registry/storage observation. No renderer bridge.
 +#include "base/supports_user_data.h"
 +#include "base/uuid.h"
 +#include "chrome/browser/extensions/extension_action_dispatcher.h"
++#include "chrome/browser/extensions/commands/command_service.h"
 +#include "extensions/browser/api/storage/storage_frontend.h"
 +#include "extensions/browser/api/storage/storage_area_namespace.h"
 +#include "extensions/browser/extension_registry_observer.h"
++#include "extensions/browser/event_router.h"
 +#include "extensions/browser/extension_prefs.h"
 +#include "extensions/browser/install_prefs_helper.h"
 +#include "extensions/common/permissions/permissions_data.h"
@@ -890,6 +1031,7 @@
 +
 +class ZacroExtensionContext : public base::SupportsUserData::Data,
 +                              public extensions::ExtensionRegistryObserver,
++                              public extensions::CommandService::Observer,
 +                              public extensions::ExtensionActionDispatcher::Observer {
 + public:
 +  using Events = base::RepeatingCallbackList<void(const std::string&, const base::DictValue&)>;
@@ -904,6 +1046,14 @@
 +    if (registry_) registry_->AddObserver(this);
 +    dispatcher_ = extensions::ExtensionActionDispatcher::Get(context);
 +    if (dispatcher_) dispatcher_->AddObserver(this);
++    commands_ = extensions::CommandService::Get(context);
++    if (commands_) commands_->AddObserver(this);
++    if (auto* events = extensions::EventRouter::Get(context)) {
++      command_listener_observer_ = events->ObserveNativeListeners(base::BindRepeating(
++          [](ZacroExtensionContext* self, const std::string& name) {
++            if (name == "commands.onCommand") self->CommandsChanged();
++          }, base::Unretained(this)));
++    }
 +    // Incognito state never participates in a portable storage stream.
 +    if (!context->IsOffTheRecord()) {
 +      auto* storage = extensions::StorageFrontend::Get(context);
@@ -914,6 +1064,7 @@
 +  ~ZacroExtensionContext() override {
 +    if (registry_) registry_->RemoveObserver(this);
 +    if (dispatcher_) dispatcher_->RemoveObserver(this);
++    if (commands_) commands_->RemoveObserver(this);
 +  }
 +  std::string InstallationID(const extensions::Extension& extension) {
 +    auto& entry = installations_[extension.id()];
@@ -960,6 +1111,9 @@
 +    registry->RemoveObserver(this); registry_ = nullptr; installations_.clear();
 +  }
 +  void OnShuttingDown() override { dispatcher_->RemoveObserver(this); dispatcher_ = nullptr; }
++  void OnExtensionCommandAdded(const extensions::ExtensionId&, const std::string&) override { CommandsChanged(); }
++  void OnExtensionCommandRemoved(const extensions::ExtensionId&, const std::string&) override { CommandsChanged(); }
++  void OnCommandServiceDestroying() override { commands_->RemoveObserver(this); commands_ = nullptr; }
 +  void OnExtensionActionUpdated(extensions::ExtensionAction* action, content::WebContents* contents,
 +      content::BrowserContext* context) override {
 +    if (!action || context != context_) return;
@@ -968,6 +1122,7 @@
 +    events_.Notify("Zacro.extensionActionChanged", params);
 +  }
 + private:
++  void CommandsChanged() { events_.Notify("Zacro.extensionCommandsChanged", base::DictValue()); }
 +  void RegistryChanged() { events_.Notify("Zacro.extensionRegistryChanged", base::DictValue()); }
 +  void StorageChanged(const extensions::ExtensionId& id, extensions::StorageAreaNamespace area,
 +      const base::Value& changes, const std::string& origin, const extensions::Extension* mutation_owner) {
@@ -982,9 +1137,11 @@
 +  raw_ptr<content::BrowserContext> context_;
 +  raw_ptr<extensions::ExtensionRegistry> registry_ = nullptr;
 +  raw_ptr<extensions::ExtensionActionDispatcher> dispatcher_ = nullptr;
++  raw_ptr<extensions::CommandService> commands_ = nullptr;
 +  std::map<std::string, std::pair<scoped_refptr<const extensions::Extension>, std::string>> installations_;
 +  Events events_;
 +  base::CallbackListSubscription storage_observer_;
++  base::CallbackListSubscription command_listener_observer_;
 +};
 +
 +void CefDevToolsController::EmitZacro(const std::string& method, const base::DictValue& params) {
@@ -1059,7 +1216,7 @@
 +}
 --- /dev/null
 +++ b/libcef/browser/devtools/zacro_topology_adapter.inc
-@@ -0,0 +1,1055 @@
+@@ -0,0 +1,1100 @@
 +// The Swift shell owns logical tabs and windows. Chromium still owns the
 +// extension caller, schema, permission grants and real WebContents identities.
 +#include "base/strings/pattern.h"
@@ -1067,6 +1224,8 @@
 +#include "chrome/browser/extensions/extension_tab_util.h"
 +#include "chrome/browser/extensions/window_controller.h"
 +#include "chrome/browser/extensions/extension_view_host.h"
++#include "chrome/browser/extensions/extension_commands_global_registry.h"
++#include "chrome/browser/ui/views/extensions/extension_keybinding_registry_views.h"
 +#include "chrome/browser/ui/extensions/extension_side_panel_manager.h"
 +#include "chrome/common/extensions/api/tabs.h"
 +#include "chrome/common/extensions/api/tab_groups.h"
@@ -1143,6 +1302,7 @@
 +  if (method == "sessions.getDevices") return extensions::api::sessions::GetDevices::Params::Create(args).has_value();
 +  if (method == "sessions.restore") return extensions::api::sessions::Restore::Params::Create(args).has_value();
 +  if (method == "tabs.getCurrent") return args.empty();
++  if (method == "runtime.openOptionsPage") return args.empty();
 +  return std::nullopt;
 +}
 +
@@ -1294,6 +1454,7 @@
 +              }
 +            }
 +            if (!logical) return false;
++            ZacroRefreshSidePanelPresentation(owner);
 +            if (!info.FindInt("tabId") && !extension_id.empty()) {
 +              if (event.event_name == "sidePanel.onOpened") {
 +                state->global_panels_[*logical] = {extension_id, owner->GetWeakPtr()};
@@ -1340,6 +1501,35 @@
 +  void SetFocusedWindow(std::optional<int> window, std::optional<int> last_focused) {
 +    focused_window_ = window;
 +    last_focused_window_ = last_focused ? last_focused : window;
++    ReconcileKeyboardFocus();
++  }
++  void ReconcileKeyboardFocus() {
++    // The Swift shell is not a Views widget, so its activation does not update
++    // Chromium's per-profile command target automatically. Keep the genuine
++    // registry attached to the active logical document, including global keys.
++    ExtensionKeybindingRegistryViews* active = nullptr;
++    for (const auto& [id, tab] : tabs_) {
++      auto* contents = tab->web_contents();
++      auto* browser = contents ? extensions::browser_window_util::GetBrowserForTabContents(*contents) : nullptr;
++      auto* registry = browser ? ExtensionKeybindingRegistryViews::From(browser) : nullptr;
++      if (!registry) continue;
++      registry->OnHostActivationChanged(false);
++      if (focused_window_ == tab->window && tab->active && !tab->closing) active = registry;
++    }
++    if (active) {
++      active->OnHostActivationChanged(true);
++      if (auto* global = extensions::ExtensionCommandsGlobalRegistry::Get(context_)) {
++        auto* listener = ui::GlobalAcceleratorListener::GetInstance();
++        active->SetShortcutHandlingSuspended(global->shortcut_handling_suspended() ||
++            (listener && listener->IsShortcutHandlingSuspended()));
++      }
++    }
++  }
++  bool IsCommandTarget(content::WebContents* contents) const {
++    const auto found = tabs_.find(sessions::SessionTabHelper::IdForTab(contents).id());
++    return found != tabs_.end() && found->second->web_contents() == contents &&
++        found->second->active && !found->second->closing &&
++        focused_window_ == found->second->window;
 +  }
 +  struct Tab : content::WebContentsObserver {
 +    explicit Tab(content::WebContents* contents) { Bind(contents); }
@@ -1419,6 +1609,7 @@
 +    }
 +    revision_ = *revision;
 +    ReconcileGlobalPanels();
++    ReconcileKeyboardFocus();
 +    return base::DictValue().Set("tabs", std::move(identities));
 +  }
 +  base::DictValue SynchronizeGroups(const base::DictValue& params, std::string& error) {
@@ -1548,6 +1739,7 @@
 +    tab->split_view_id = split; tab->opener_tab_id = opener;
 +    tab->group_id = params.FindInt("groupID").value_or(-1);
 +    ReconcileGlobalPanels();
++    ReconcileKeyboardFocus();
 +    return native_id;
 +  }
 +  bool Validate(const std::string& id, std::string& error) {
@@ -1576,6 +1768,10 @@
 +        else if (address->is_list()) for (const auto& value : address->GetList())
 +          found |= value.is_string() && value.GetString() == url;
 +      }
++    }
++    if (method == "runtime.openOptionsPage") {
++      found = extensions::OptionsPageInfo::HasOptionsPage(request.extension.get()) &&
++          extensions::OptionsPageInfo::GetOptionsPage(request.extension.get()).spec() == url;
 +    }
 +    if (!found) { error = "The destination does not belong to this native navigation request."; return {}; }
 +    const auto incarnation = ZacroExtensionContext::Get(context_)->IncarnationID(*request.extension);
@@ -1718,6 +1914,10 @@
 +      std::move(response).Run({}, "Cannot specify setSelfAsOpener Service Worker extension."); return true;
 +    }
 +    const auto source_window = SourceWindow(function);
++    if (method == "runtime.openOptionsPage" &&
++        (!function->extension() || !extensions::OptionsPageInfo::HasOptionsPage(function->extension()))) {
++      std::move(response).Run({}, "No options page declared."); return true;
++    }
 +    // Document-local APIs retain Chromium's exact implementation. Resolve only
 +    // their optional logical target, leaving their permissions and mutations to
 +    // the original ExtensionFunction after this native hook returns false.
@@ -1945,7 +2145,7 @@
 +      return true;
 +    }
 +    const bool window = method.starts_with("windows.") || method == "tabs.highlight";
-+    if (method == "tabs.remove" || method == "tabs.reload" || method == "tabs.goBack" || method == "tabs.goForward" ||
++    if (method == "runtime.openOptionsPage" || method == "tabs.remove" || method == "tabs.reload" || method == "tabs.goBack" || method == "tabs.goForward" ||
 +        method == "windows.remove" || method == "tabs.unsplit") return results.empty();
 +    if (method == "tabs.createSplit") return results.size() == 1 && results[0].is_int() && results[0].GetInt() >= 0;
 +    if (method == "tabs.getCurrent" && results.empty()) return true;
@@ -1985,6 +2185,8 @@
 +      auto* source = extensions::ExtensionSidePanelManager::From(source_browser);
 +      auto* target = extensions::ExtensionSidePanelManager::From(target_browser);
 +      if (source && source->TransferNativeGlobalPanel(panel.extension, target)) {
++        if (panel.contents) ZacroRefreshSidePanelPresentation(panel.contents.get());
++        ZacroRefreshSidePanelPresentation(destination);
 +        auto unchanged = global_panels_.find(window);
 +        if (unchanged != global_panels_.end() && unchanged->second.extension == panel.extension &&
 +            unchanged->second.contents.get() == panel.contents.get()) {

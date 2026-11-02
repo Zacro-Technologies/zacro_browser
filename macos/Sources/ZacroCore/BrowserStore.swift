@@ -384,7 +384,27 @@ public final class BrowserStore: ObservableObject {
     id: String, spaceID: String? = nil, folderID: String? = nil, index: Int? = nil,
     pinned: Bool? = nil, favorite: Bool? = nil, clearFolder: Bool = false, clearGroup: Bool = false
   ) {
-    if let repository { return repository.mutate(windowID: owningWindowID) { $0.moveTab(id: id, spaceID: spaceID, folderID: folderID, index: index, pinned: pinned, favorite: favorite, clearFolder: clearFolder, clearGroup: clearGroup) } }
+    if let repository {
+      return repository.mutate(windowID: owningWindowID) { reducer in
+        var insertion = index
+        if let owner = owningWindowID, let index {
+          // Drag previews index this window's projection. Resolve its remaining
+          // neighbor against the fresh shared collection before reducing.
+          let remaining = reducer.state.tabs.filter { $0.id != id }
+          let local = remaining.filter { $0.windowID == owner }
+          let position = max(0, min(index, local.count))
+          if position < local.count {
+            insertion = remaining.firstIndex { $0.id == local[position].id }
+          } else if let last = local.last, let anchor = remaining.firstIndex(where: { $0.id == last.id }) {
+            insertion = anchor + 1
+          } else {
+            insertion = min(reducer.state.tabs.firstIndex(where: { $0.id == id }) ?? remaining.count, remaining.count)
+          }
+        }
+        reducer.moveTab(id: id, spaceID: spaceID, folderID: folderID, index: insertion, pinned: pinned,
+          favorite: favorite, clearFolder: clearFolder, clearGroup: clearGroup)
+      }
+    }
 
     guard let source = tab(id) else { return }
     let target = spaceID ?? source.spaceID

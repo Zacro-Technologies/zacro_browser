@@ -19,8 +19,8 @@ struct NativeSpacePalette {
     init(_ value: NativeSpacePalette) { self.value = value }
   }
 
-  init(theme: SpaceTheme, dark: Bool) {
-    let key = "\(theme.primaryColor):\(theme.secondaryColor):\(theme.intensity):\(theme.grain):\(dark)" as NSString
+  init(theme: SpaceTheme, dark: Bool, increasedContrast: Bool = false) {
+    let key = "\(theme.primaryColor):\(theme.secondaryColor):\(theme.intensity):\(theme.grain):\(dark):\(increasedContrast)" as NSString
     if let cached = Self.cache.object(forKey: key) { self = cached.value; return }
     self.dark = dark
     let primary = Self.rgb(theme.primaryColor)
@@ -76,7 +76,7 @@ struct NativeSpacePalette {
       fittedAccent = Self.mix(originalAccent, accentEndpoint, high).map { $0.rounded() }
     }
     self.ink = Self.color(ink.map { $0.rounded() })
-    self.muted = Self.color(muted.map { $0.rounded() })
+    self.muted = Self.color((increasedContrast ? ink : muted).map { $0.rounded() })
     self.accent = Self.color(fittedAccent)
     self.chrome = Self.color(chrome)
     self.primary = Self.color(tintPrimary)
@@ -104,6 +104,23 @@ struct NativeSpacePalette {
   }
   private static func color(_ channels: [Double]) -> Color {
     Color(.sRGB, red: channels[0] / 255, green: channels[1] / 255, blue: channels[2] / 255, opacity: 1)
+  }
+}
+
+/// The original interface only outlines selections when macOS requests more
+/// contrast. Ordinary and drag presentations keep their translucent fill.
+struct NativeSelectionContrast: ViewModifier {
+  let selected: Bool
+  let color: Color
+  let radius: CGFloat
+  @Environment(\.colorSchemeContrast) private var contrast
+  func body(content: Content) -> some View {
+    content.overlay {
+      if selected && contrast == .increased {
+        RoundedRectangle(cornerRadius: radius).strokeBorder(color, lineWidth: 1)
+          .allowsHitTesting(false).accessibilityHidden(true)
+      }
+    }
   }
 }
 
@@ -195,9 +212,10 @@ struct ThemeEditor: View {
   @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
   @Environment(\.accessibilityReduceMotion) private var reduceMotion
   @Environment(\.colorScheme) private var colorScheme
+  @Environment(\.colorSchemeContrast) private var contrast
   private var colors: NativeSpacePalette {
     NativeSpacePalette(theme: theme, dark: theme.appearance == "dark"
-      || (theme.appearance == "system" && colorScheme == .dark))
+      || (theme.appearance == "system" && colorScheme == .dark), increasedContrast: contrast == .increased)
   }
   private let presets = [
     "#9D4460", "#416958", "#486786", "#A56545", "#786298", "#59646E", "#CF667D", "#B68535", "#4F9485", "#6192BD", "#A466B5", "#353D60",

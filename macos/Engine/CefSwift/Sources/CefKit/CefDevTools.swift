@@ -36,11 +36,15 @@ public final class CefDevTools {
     private var registration: UnsafeMutablePointer<cef_registration_t>?
     private var sequence: Int32 = 0
     private var closed = false
-    private var pending: [Int32: CheckedContinuation<Data, Error>] = [:]
+    private struct Pending {
+        let sessionID: String?
+        let continuation: CheckedContinuation<Data, Error>
+    }
+    private var pending: [Int32: Pending] = [:]
     private var deadlines: [Int32: Task<Void, Never>] = [:]
     private var browserSessionID: String?
     private var eventObservers: [UUID: (String, [String: Any]) -> Void] = [:]
-    private static let responseLimit = 10 * 1024 * 1024
+    private var protocolEventObservers: [UUID: (String, [String: Any], String?) -> Void] = [:]
 
     init(browser: CefBrowser) { self.browser = browser }
 
@@ -49,7 +53,16 @@ public final class CefDevTools {
         try attach(to: browser)
         let token = UUID(); eventObservers[token] = callback; return token
     }
-    public func removeEventObserver(_ token: UUID) { eventObservers.removeValue(forKey: token) }
+    /// Observes root and flattened child-session events without folding the
+    /// envelope's sessionId into params (which may have a different sessionId).
+    @discardableResult public func observeProtocolEvents(_ callback: @escaping (String, [String: Any], String?) -> Void) throws -> UUID {
+        guard !closed, let browser, browser.hasRawBrowser else { throw CefDevToolsError.browserClosed }
+        try attach(to: browser)
+        let token = UUID(); protocolEventObservers[token] = callback; return token
+    }
+    public func removeEventObserver(_ token: UUID) {
+        eventObservers.removeValue(forKey: token); protocolEventObservers.removeValue(forKey: token)
+    }
 
     public func call(
         _ method: String, parameters: [String: Any] = [:], timeout: TimeInterval = 15,
@@ -60,6 +73,7 @@ public final class CefDevTools {
         guard !method.isEmpty, method.count < 256, pending.count < 32,
               timeout.isFinite, timeout > 0, timeout <= 120,
               JSONSerialization.isValidJSONObject(parameters) else { throw CefDevToolsError.invalidMessage }
+        if let sessionID, sessionID.isEmpty || sessionID.utf8.count > 1024 { throw CefDevToolsError.invalidMessage }
         try attach(to: browser)
         sequence = sequence == Int32.max ? 1 : sequence + 1
         let identifier = sequence
@@ -73,7 +87,7 @@ public final class CefDevTools {
         guard message.count <= messageLimit else { throw CefDevToolsError.invalidMessage }
         let response: Data = try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
-                pending[identifier] = continuation
+                pending[identifier] = Pending(sessionID: CefDevToolsEnvelope.responseSession(for: sessionID), continuation: continuation)
                 deadlines[identifier] = Task { [weak self] in
                     do { try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000)) }
                     catch { return }
@@ -188,46 +202,30 @@ public final class CefDevTools {
         }
         browser = nil
         eventObservers.removeAll()
+        protocolEventObservers.removeAll()
     }
 
     private func attach(to browser: CefBrowser) throws {
         guard registration == nil else { return }
         let observer = cefAllocate(cef_dev_tools_message_observer_t.self, owner: self)
-        observer.pointee.on_dev_tools_method_result = { rawSelf, rawBrowser, identifier, success, bytes, count in
+        observer.pointee.on_dev_tools_message = { rawSelf, rawBrowser, bytes, count in
             cefRelease(rawBrowser.map(UnsafeMutableRawPointer.init))
-            guard let owner = cefOwner(CefDevTools.self, rawSelf.map(UnsafeMutableRawPointer.init)) else { return }
+            guard let owner = cefOwner(CefDevTools.self, rawSelf.map(UnsafeMutableRawPointer.init)) else { return 1 }
             MainActor.assumeIsolated {
-                guard count <= CefDevTools.responseLimit else {
-                    owner.finish(identifier, with: .failure(CefDevToolsError.responseTooLarge))
+                guard count <= CefDevToolsEnvelope.maximumBytes else {
+                    owner.failPending(CefDevToolsError.responseTooLarge)
                     return
                 }
-                let data = bytes.map { Data(bytes: $0, count: count) } ?? Data("{}".utf8)
-                guard let result = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                    owner.finish(identifier, with: .failure(CefDevToolsError.invalidMessage))
-                    return
-                }
-                if success != 0 { owner.finish(identifier, with: .success(data)) }
-                else {
-                    owner.finish(identifier, with: .failure(CefDevToolsError.protocolError(
-                        code: result["code"] as? Int ?? -32000,
-                        message: result["message"] as? String ?? "Chromium rejected the protocol request.")))
-                }
+                owner.receive(bytes.map { Data(bytes: $0, count: count) } ?? Data())
             }
+            return 1 // Never invoke CEF's session-unaware fallback parser too.
         }
         observer.pointee.on_dev_tools_agent_detached = { rawSelf, rawBrowser in
             cefRelease(rawBrowser.map(UnsafeMutableRawPointer.init))
             guard let owner = cefOwner(CefDevTools.self, rawSelf.map(UnsafeMutableRawPointer.init)) else { return }
-            MainActor.assumeIsolated { owner.failPending(CefDevToolsError.browserClosed) }
-        }
-        observer.pointee.on_dev_tools_event = { rawSelf, rawBrowser, rawMethod, bytes, count in
-            cefRelease(rawBrowser.map(UnsafeMutableRawPointer.init))
-            guard count <= CefDevTools.responseLimit,
-              let owner = cefOwner(CefDevTools.self, rawSelf.map(UnsafeMutableRawPointer.init)) else { return }
-            let method = CefStringUtil.string(from: rawMethod)
-            let data = bytes.map { Data(bytes: $0, count: count) } ?? Data("{}".utf8)
-            guard let params = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
             MainActor.assumeIsolated {
-                for callback in Array(owner.eventObservers.values) { callback(method, params) }
+                owner.browserSessionID = nil
+                owner.failPending(CefDevToolsError.browserClosed)
             }
         }
         var transferred = false
@@ -241,9 +239,30 @@ public final class CefDevTools {
         guard registration != nil else { throw CefDevToolsError.unavailable }
     }
 
+    func receive(_ data: Data) {
+        guard !closed else { return }
+        do {
+            switch try CefDevToolsEnvelope.parse(data) {
+            case .response(let identifier, let sessionID, let result):
+                guard let call = pending[identifier], call.sessionID == sessionID else { return }
+                finish(identifier, with: result)
+            case .event(let method, let parameters, let sessionID):
+                if method == "Target.detachedFromTarget", let detached = parameters["sessionId"] as? String {
+                    for identifier in pending.keys.filter({ pending[$0]?.sessionID == detached }) {
+                        finish(identifier, with: .failure(CefDevToolsError.browserClosed))
+                    }
+                }
+                if sessionID == nil {
+                    for callback in Array(eventObservers.values) { callback(method, parameters) }
+                }
+                for callback in Array(protocolEventObservers.values) { callback(method, parameters, sessionID) }
+            }
+        } catch { failPending(error) }
+    }
+
     private func finish(_ identifier: Int32, with result: Result<Data, Error>) {
         deadlines.removeValue(forKey: identifier)?.cancel()
-        pending.removeValue(forKey: identifier)?.resume(with: result)
+        pending.removeValue(forKey: identifier)?.continuation.resume(with: result)
     }
 
     private func failPending(_ error: Error) {

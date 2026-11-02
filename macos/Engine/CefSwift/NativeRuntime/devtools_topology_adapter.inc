@@ -5,6 +5,8 @@
 #include "chrome/browser/extensions/extension_tab_util.h"
 #include "chrome/browser/extensions/window_controller.h"
 #include "chrome/browser/extensions/extension_view_host.h"
+#include "chrome/browser/extensions/extension_commands_global_registry.h"
+#include "chrome/browser/ui/views/extensions/extension_keybinding_registry_views.h"
 #include "chrome/browser/ui/extensions/extension_side_panel_manager.h"
 #include "chrome/common/extensions/api/tabs.h"
 #include "chrome/common/extensions/api/tab_groups.h"
@@ -81,6 +83,7 @@ std::optional<bool> ZacroValidateFunction(const std::string& method, const base:
   if (method == "sessions.getDevices") return extensions::api::sessions::GetDevices::Params::Create(args).has_value();
   if (method == "sessions.restore") return extensions::api::sessions::Restore::Params::Create(args).has_value();
   if (method == "tabs.getCurrent") return args.empty();
+  if (method == "runtime.openOptionsPage") return args.empty();
   return std::nullopt;
 }
 
@@ -232,6 +235,7 @@ class ZacroBrowserContext : public base::SupportsUserData::Data {
               }
             }
             if (!logical) return false;
+            ZacroRefreshSidePanelPresentation(owner);
             if (!info.FindInt("tabId") && !extension_id.empty()) {
               if (event.event_name == "sidePanel.onOpened") {
                 state->global_panels_[*logical] = {extension_id, owner->GetWeakPtr()};
@@ -278,6 +282,35 @@ class ZacroBrowserContext : public base::SupportsUserData::Data {
   void SetFocusedWindow(std::optional<int> window, std::optional<int> last_focused) {
     focused_window_ = window;
     last_focused_window_ = last_focused ? last_focused : window;
+    ReconcileKeyboardFocus();
+  }
+  void ReconcileKeyboardFocus() {
+    // The Swift shell is not a Views widget, so its activation does not update
+    // Chromium's per-profile command target automatically. Keep the genuine
+    // registry attached to the active logical document, including global keys.
+    ExtensionKeybindingRegistryViews* active = nullptr;
+    for (const auto& [id, tab] : tabs_) {
+      auto* contents = tab->web_contents();
+      auto* browser = contents ? extensions::browser_window_util::GetBrowserForTabContents(*contents) : nullptr;
+      auto* registry = browser ? ExtensionKeybindingRegistryViews::From(browser) : nullptr;
+      if (!registry) continue;
+      registry->OnHostActivationChanged(false);
+      if (focused_window_ == tab->window && tab->active && !tab->closing) active = registry;
+    }
+    if (active) {
+      active->OnHostActivationChanged(true);
+      if (auto* global = extensions::ExtensionCommandsGlobalRegistry::Get(context_)) {
+        auto* listener = ui::GlobalAcceleratorListener::GetInstance();
+        active->SetShortcutHandlingSuspended(global->shortcut_handling_suspended() ||
+            (listener && listener->IsShortcutHandlingSuspended()));
+      }
+    }
+  }
+  bool IsCommandTarget(content::WebContents* contents) const {
+    const auto found = tabs_.find(sessions::SessionTabHelper::IdForTab(contents).id());
+    return found != tabs_.end() && found->second->web_contents() == contents &&
+        found->second->active && !found->second->closing &&
+        focused_window_ == found->second->window;
   }
   struct Tab : content::WebContentsObserver {
     explicit Tab(content::WebContents* contents) { Bind(contents); }
@@ -357,6 +390,7 @@ class ZacroBrowserContext : public base::SupportsUserData::Data {
     }
     revision_ = *revision;
     ReconcileGlobalPanels();
+    ReconcileKeyboardFocus();
     return base::DictValue().Set("tabs", std::move(identities));
   }
   base::DictValue SynchronizeGroups(const base::DictValue& params, std::string& error) {
@@ -486,6 +520,7 @@ class ZacroBrowserContext : public base::SupportsUserData::Data {
     tab->split_view_id = split; tab->opener_tab_id = opener;
     tab->group_id = params.FindInt("groupID").value_or(-1);
     ReconcileGlobalPanels();
+    ReconcileKeyboardFocus();
     return native_id;
   }
   bool Validate(const std::string& id, std::string& error) {
@@ -514,6 +549,10 @@ class ZacroBrowserContext : public base::SupportsUserData::Data {
         else if (address->is_list()) for (const auto& value : address->GetList())
           found |= value.is_string() && value.GetString() == url;
       }
+    }
+    if (method == "runtime.openOptionsPage") {
+      found = extensions::OptionsPageInfo::HasOptionsPage(request.extension.get()) &&
+          extensions::OptionsPageInfo::GetOptionsPage(request.extension.get()).spec() == url;
     }
     if (!found) { error = "The destination does not belong to this native navigation request."; return {}; }
     const auto incarnation = ZacroExtensionContext::Get(context_)->IncarnationID(*request.extension);
@@ -656,6 +695,10 @@ class ZacroBrowserContext : public base::SupportsUserData::Data {
       std::move(response).Run({}, "Cannot specify setSelfAsOpener Service Worker extension."); return true;
     }
     const auto source_window = SourceWindow(function);
+    if (method == "runtime.openOptionsPage" &&
+        (!function->extension() || !extensions::OptionsPageInfo::HasOptionsPage(function->extension()))) {
+      std::move(response).Run({}, "No options page declared."); return true;
+    }
     // Document-local APIs retain Chromium's exact implementation. Resolve only
     // their optional logical target, leaving their permissions and mutations to
     // the original ExtensionFunction after this native hook returns false.
@@ -883,7 +926,7 @@ class ZacroBrowserContext : public base::SupportsUserData::Data {
       return true;
     }
     const bool window = method.starts_with("windows.") || method == "tabs.highlight";
-    if (method == "tabs.remove" || method == "tabs.reload" || method == "tabs.goBack" || method == "tabs.goForward" ||
+    if (method == "runtime.openOptionsPage" || method == "tabs.remove" || method == "tabs.reload" || method == "tabs.goBack" || method == "tabs.goForward" ||
         method == "windows.remove" || method == "tabs.unsplit") return results.empty();
     if (method == "tabs.createSplit") return results.size() == 1 && results[0].is_int() && results[0].GetInt() >= 0;
     if (method == "tabs.getCurrent" && results.empty()) return true;
@@ -923,6 +966,8 @@ class ZacroBrowserContext : public base::SupportsUserData::Data {
       auto* source = extensions::ExtensionSidePanelManager::From(source_browser);
       auto* target = extensions::ExtensionSidePanelManager::From(target_browser);
       if (source && source->TransferNativeGlobalPanel(panel.extension, target)) {
+        if (panel.contents) ZacroRefreshSidePanelPresentation(panel.contents.get());
+        ZacroRefreshSidePanelPresentation(destination);
         auto unchanged = global_panels_.find(window);
         if (unchanged != global_panels_.end() && unchanged->second.extension == panel.extension &&
             unchanged->second.contents.get() == panel.contents.get()) {

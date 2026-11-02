@@ -42,6 +42,7 @@ struct NativeHomePage: View {
           .disabled(query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
       }.padding(.horizontal, 12).frame(height: 40)
         .background(colors.card.opacity(0.46), in: RoundedRectangle(cornerRadius: 11))
+        .modifier(NativeSelectionContrast(selected: true, color: colors.ink, radius: 11))
       if !saved.isEmpty {
         HStack(alignment: .top, spacing: 4) {
           ForEach(saved) { link in
@@ -51,6 +52,7 @@ struct NativeHomePage: View {
                   .background(colors.card.opacity(0.45), in: RoundedRectangle(cornerRadius: 9))
                 Text(link.title.isEmpty ? domain(link.url) : link.title).font(.system(size: 11)).lineLimit(1)
               }.frame(maxWidth: .infinity).frame(height: 64).contentShape(Rectangle())
+                .modifier(NativeSelectionContrast(selected: true, color: colors.ink, radius: 9))
             }.buttonStyle(.plain).help("\(link.title) — \(link.url)")
           }
         }.accessibilityElement(children: .contain).accessibilityLabel("Saved pages")

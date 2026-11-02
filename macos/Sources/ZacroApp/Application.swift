@@ -59,6 +59,7 @@ final class BrowserWindowCoordinator: NSObject {
   unowned let application: ApplicationCoordinator
   let windowContext: ChromiumWindowContext
   var window: NSWindow? { windowContext.window }
+  var isPopup: Bool { application.repository.windows.first(where: { $0.id == windowContext.id })?.kind == .popup }
   var engine: ChromiumEngine { application.engine }
   let store: BrowserStore
   let actions = BrowserActions()
@@ -68,18 +69,19 @@ final class BrowserWindowCoordinator: NSObject {
   private var layoutQueued = false
   private var splitResizeDraft: (id: String, ratio: Double)?
   private var keyMonitor: Any?
+  private var replayingExtensionKey = false
   private let peekPanel = PeekPanelController()
   private var pendingDeletion: (Set<String>, () -> Void)? { get { application.pendingDeletion } set { application.pendingDeletion = newValue } }
   private var profileDeletionPageIDs: Set<String> { get { application.profileDeletionPageIDs } set { application.profileDeletionPageIDs = newValue } }
   private var deletingProfileID: String? { get { application.deletingProfileID } set { application.deletingProfileID = newValue } }
   private var scopeCloseCancelled: (() -> Void)? { get { application.scopeCloseCancelled } set { application.scopeCloseCancelled = newValue } }
-  private var internalPage: ChromiumPage?
   private var favicons: FaviconCache { application.favicons }
   private var peekFrames: [String: CGRect] = [:]
   private var peekOrigins: [String: CGRect] = [:]
   private var peekClosingSnapshots: [String: NSImage] = [:]
   private var retiringPageIDs = Set<String>()
   private var visiblePageFrames: [String: CGRect] = [:]
+  private var sidePanelPageIDs = Set<String>()
   private var modelURLs: [String: String] = [:]
   private var iconDestinations: [String: String] = [:]
   private var pendingHistory: [String: (source: String?, destination: String)] = [:]
@@ -138,7 +140,7 @@ final class BrowserWindowCoordinator: NSObject {
     guard store.document(id: id) != nil else { throw CancellationError() }
     pageCreationFailures.removeValue(forKey: id)
     try store.selectDocumentDurably(id: id)
-    internalPage = nil; actions.nativePageVisible = false
+    actions.nativePageVisible = false
     scheduleLayout()
   }
   func extensionEvent(profileID: String, event: ChromeExtensionEvent) {
@@ -237,7 +239,6 @@ final class BrowserWindowCoordinator: NSObject {
     return true
   }
   var activePage: ChromiumPage? {
-    if let internalPage, internalPage.profileID == store.activeProfileID { return internalPage }
     guard let tab = store.state.activeTab else { return nil }
     if tab.peek?.isPresented != false, tab.peek != nil, let preview = engine.pages["peek:" + tab.id] { return preview }
     return engine.pages[tab.id]
@@ -276,14 +277,16 @@ final class BrowserWindowCoordinator: NSObject {
     peekPanel.hide(immediately: immediately)
   }
   func install(show: Bool = true) {
-    guard let window = window, let parent = window.contentView else { return }
+    guard let window = window else { return }
     store.enableDebouncedPersistence()
-    window.titleVisibility = .hidden
-    window.titlebarAppearsTransparent = true
-    window.styleMask.insert(.fullSizeContentView)
+    window.titleVisibility = isPopup ? .visible : .hidden
+    window.titlebarAppearsTransparent = !isPopup
+    if isPopup { window.styleMask.remove(.fullSizeContentView) }
+    else { window.styleMask.insert(.fullSizeContentView) }
     window.isOpaque = false
     window.backgroundColor = .clear
     restoreWindowBounds(window)
+    guard let parent = window.contentView else { return }
     let root = BrowserShell(store: store, actions: actions) { [weak self] in
       NativeContentOverlay(store: self!.store, coordinator: self!)
     }
@@ -304,14 +307,12 @@ final class BrowserWindowCoordinator: NSObject {
     actions.navigate = { [weak self] address in self?.navigate(address) }
     actions.newTab = { [weak self] address in
       guard let self, let tab = self.store.createTab(address: address) else { return }
-      self.internalPage = nil
       self.actions.nativePageVisible = false
       _ = self.page(for: tab)
       self.scheduleLayout()
     }
     actions.activate = { [weak self] id in
       self?.pageCreationFailures.removeValue(forKey: id)
-      self?.internalPage = nil
       self?.actions.nativePageVisible = false
       self?.scheduleLayout()
     }
@@ -353,9 +354,9 @@ final class BrowserWindowCoordinator: NSObject {
     windowContext.onClosed = { [weak self] in
       guard let self else { return }
       self.hidePeekPresentation(immediately: true)
-      self.internalPage = nil
       self.actions.nativePageVisible = false
       self.visiblePageFrames.removeAll()
+      self.sidePanelPageIDs.removeAll()
       self.peekFrames.removeAll()
       self.peekClosingSnapshots.removeAll()
       self.extensions.close()
@@ -412,11 +413,11 @@ final class BrowserWindowCoordinator: NSObject {
     }.store(in: &observations)
   }
   private func passesThrough(_ point: NSPoint) -> Bool {
-    guard let host, store.state.activeTab != nil || internalPage != nil, !actions.palette,
+    guard let host, store.state.activeTab != nil, !actions.palette,
       actions.library == nil, !actions.themeEditor
     else { return false }
     let top = CGPoint(x: point.x, y: host.isFlipped ? point.y : host.bounds.height - point.y)
-    if !store.state.settings.sidebarVisible
+    if !isPopup && !store.state.settings.sidebarVisible
       && CGRect(x: contentFrame.minX, y: contentFrame.minY, width: 56, height: 56).contains(top)
     {
       return false
@@ -698,6 +699,11 @@ final class BrowserWindowCoordinator: NSObject {
       guard let self, let page, self.owns(page, tabID: tabID), !self.navigation.isRestoring(page),
         !self.reservedPages.contains(page.id), !self.discardingPages.contains(page.id), !self.dormantPages.contains(page.id) else { return }
       defer { self.extensionBrowser.reconcile() }
+      if page.isSidePanelVisible != self.sidePanelPageIDs.contains(page.id) {
+        if page.isSidePanelVisible { self.sidePanelPageIDs.insert(page.id) }
+        else { self.sidePanelPageIDs.remove(page.id) }
+        self.scheduleLayout()
+      }
       let audible = page.isAudible || self.engine.pages[peek ? tabID : "peek:" + tabID]?.isAudible == true
       if audible != self.actions.audibleTabIDs.contains(tabID) {
         if audible { self.actions.audibleTabIDs.insert(tabID) } else { self.actions.audibleTabIDs.remove(tabID) }
@@ -878,6 +884,7 @@ final class BrowserWindowCoordinator: NSObject {
       self.reservedPages.remove(page.id)
       self.dormantPages.remove(page.id); self.discardingPages.remove(page.id); self.mediaPermissionPages.remove(page.id)
       self.visiblePageFrames.removeValue(forKey: page.id)
+      self.sidePanelPageIDs.remove(page.id)
       self.modelURLs.removeValue(forKey: page.id)
       self.pendingHistory.removeValue(forKey: page.id)
       self.restoredHistoryPages.remove(page.id)
@@ -895,10 +902,11 @@ final class BrowserWindowCoordinator: NSObject {
         if self.store.tab(tabID)?.peek != nil { self.store.closePeek(tabID: tabID) }
       } else if let tab = self.store.tab(tabID), !tab.isClosed {
         let wasActive = self.store.state.activeTabID == tabID
-        let opener = page.openerID.flatMap { self.store.tab($0) }
+        let opener = page.openerID.flatMap { self.store.document(id: $0) }
         self.store.closeTab(id: tabID)
         if wasActive, let opener, !opener.isClosed, self.store.profileID(for: opener) == page.profileID {
-          self.store.selectTab(id: opener.id)
+          do { try self.store.selectDocumentDurably(id: opener.id) }
+          catch { self.showError(error.localizedDescription) }
         }
         if wasActive {
           DispatchQueue.main.async { [weak self] in
@@ -924,6 +932,7 @@ final class BrowserWindowCoordinator: NSObject {
       self.reservedPages.remove(id)
       self.retiringPageIDs.remove(id)
       self.visiblePageFrames.removeValue(forKey: id)
+      self.sidePanelPageIDs.remove(id)
       self.modelURLs.removeValue(forKey: id)
       self.pendingHistory.removeValue(forKey: id)
       self.restoredHistoryPages.remove(id)
@@ -945,7 +954,11 @@ final class BrowserWindowCoordinator: NSObject {
   func updateNavigationState(_ page: ChromiumPage?) {
     refreshSiteControls()
     let tab = selectedDocumentID.flatMap { store.document(id: $0) }
-    let nativeHistory = internalPage != nil || (page != nil && !restoredHistoryPages.contains(page!.id))
+    if isPopup, let window {
+      let title = String((page?.title.isEmpty == false ? page!.title : tab?.title ?? "Zacro").prefix(200))
+      if window.title != title { window.title = title }
+    }
+    let nativeHistory = page != nil && !restoredHistoryPages.contains(page!.id)
     let back = nativeHistory ? page?.canGoBack ?? false : tab.map { $0.navigationIndex > 0 } ?? false
     let forward = nativeHistory ? page?.canGoForward ?? false : tab.map { $0.navigationIndex >= 0 && $0.navigationIndex < $0.navigation.count - 1 } ?? false
     let loading = page?.isLoading ?? false
@@ -993,22 +1006,19 @@ final class BrowserWindowCoordinator: NSObject {
       profileDeletionPageIDs.subtract(pending.0)
       pending.1()
     }
-    if store.state.activeTab?.peek == nil || store.state.activeTab?.peek?.isPresented == false || internalPage != nil { hidePeekPresentation() }
+    if store.state.activeTab?.peek == nil || store.state.activeTab?.peek?.isPresented == false { hidePeekPresentation() }
     if contentFrame.width <= 0, let bounds = window?.contentView?.bounds {
-      let gutter = store.state.settings.pageGutter
-      let sidebar = store.state.settings.sidebarVisible ? store.state.settings.sidebarWidth : 0
+      let gutter = isPopup ? 0 : store.state.settings.pageGutter
+      let sidebar = !isPopup && store.state.settings.sidebarVisible ? store.state.settings.sidebarWidth : 0
       contentFrame = CGRect(
         x: sidebar + gutter, y: gutter, width: max(1, bounds.width - sidebar - 2 * gutter),
         height: max(1, bounds.height - 2 * gutter))
     }
     guard contentFrame.width > 0 else { return }
     var desired: [String: (ChromiumPage, CGRect)] = [:]
-    if let internalPage, internalPage.profileID == store.activeProfileID,
-      store.state.activeProfile?.isPrivate != true
-    {
-      desired[internalPage.id] = (internalPage, contentFrame)
-    } else if let current = store.state.activeTab, !current.isClosed,
-      current.url != "about:blank" || visibleSplit != nil || (current.peek != nil && current.peek?.isPresented != false) {
+    if let current = store.state.activeTab, !current.isClosed,
+      current.url != "about:blank" || engine.pages[current.id]?.isSidePanelVisible == true
+        || visibleSplit != nil || (current.peek != nil && current.peek?.isPresented != false) {
       if let group = visibleSplit, let left = store.tab(group.leftTabID),
         let right = store.tab(group.rightTabID)
       {
@@ -1029,7 +1039,8 @@ final class BrowserWindowCoordinator: NSObject {
               width: contentFrame.width - firstWidth - 6, height: contentFrame.height)
           )
         }
-      } else if current.url != "about:blank", let page = page(for: current) {
+      } else if current.url != "about:blank" || engine.pages[current.id]?.isSidePanelVisible == true,
+        let page = page(for: current) {
         desired[page.id] = (page, contentFrame)
       }
       if current.peek?.isPresented != false, let document = current.peekDocument, let preview = page(for: document) {
@@ -1043,7 +1054,7 @@ final class BrowserWindowCoordinator: NSObject {
     }
     // Persistent tabs keep their native document and layer attached. Only
     // actual visibility/frame changes reach Chromium, avoiding hide/show flash.
-    for entry in desired.values { entry.0.setCornerRadius(store.state.settings.pageRadius) }
+    for entry in desired.values { entry.0.setCornerRadius(isPopup ? 0 : store.state.settings.pageRadius) }
     for (id, _) in visiblePageFrames where desired[id] == nil {
       engine.pages[id]?.hide()
       if id.hasPrefix("peek:") { engine.pages[id]?.setPresentationParent(nil) }
@@ -1083,7 +1094,6 @@ final class BrowserWindowCoordinator: NSObject {
     }
   }
   func navigate(_ address: String) {
-    internalPage = nil
     actions.nativePageVisible = false
     guard let url = BrowserAddress.resolve(address, engine: store.state.settings.searchEngine)
     else { return }
@@ -1115,10 +1125,6 @@ final class BrowserWindowCoordinator: NSObject {
   func goBack() { stepHistory(forward: false) }
   func goForward() { stepHistory(forward: true) }
   private func stepHistory(forward: Bool) {
-    if internalPage != nil {
-      if forward { activePage?.goForward() } else { activePage?.goBack() }
-      return
-    }
     guard let id = selectedDocumentID, let tab = store.document(id: id), let page = page(for: tab) else { return }
     if !restoredHistoryPages.contains(page.id) {
       if forward { page.goForward() } else { page.goBack() }
@@ -1224,6 +1230,7 @@ final class BrowserWindowCoordinator: NSObject {
     return menu
   }
   private func handleKey(_ event: NSEvent) -> Bool {
+    if replayingExtensionKey { return false }
     guard application.focusedCoordinator === self else { return false }
     let flags = event.modifierFlags.intersection([.command, .control, .option, .shift])
     if event.type == .flagsChanged {
@@ -1254,12 +1261,50 @@ final class BrowserWindowCoordinator: NSObject {
     let keys = NativeKeyBinding.candidates(event)
     guard let command = BrowserShortcut.catalog(overrides: store.state.settings.shortcutOverrides).first(where: {
       !keys.isDisjoint(with: [$0.accelerator] + $0.aliases)
-    }) else { return false }
+    }) else { return dispatchExtensionShortcut(event) }
     let repeatable = ["zoom-in", "zoom-out", "next-tab", "previous-tab", "recent-tab", "previous-recent-tab", "find-next", "find-previous"]
     if event.isARepeat && !repeatable.contains(command.id) { return true }
     if command.id.contains("recent-tab") { recentModifiers = flags.subtracting(.shift) }
     else { recentTabCycle = nil; recentModifiers = [] }
     runCommand(command.id)
+    return true
+  }
+  private func dispatchExtensionShortcut(_ event: NSEvent) -> Bool {
+    // Chromium handles keys focused in its own document windows. This path
+    // covers the Swift shell, where its native keybinding registry has no view.
+    guard event.type == .keyDown, let shell = window, NSApp.keyWindow === shell,
+      !actions.palette, !actions.themeEditor, !actions.recordingShortcut,
+      let shortcut = extensions.matchingShortcut(for: event) else { return false }
+    if event.isARepeat { return true }
+    let profile = store.activeProfileID, selected = selectedDocumentID
+    let responder = shell.firstResponder
+    Task { [weak self, weak shell, weak responder] in
+      guard let self, let shell, self.window === shell, NSApp.keyWindow === shell,
+        shell.firstResponder === responder, self.store.activeProfileID == profile,
+        self.selectedDocumentID == selected, !self.actions.recordingShortcut else { return }
+      do {
+        let page = try await self.extensionActionPage(profileID: profile)
+        guard NSApp.keyWindow === shell, shell.firstResponder === responder, !self.actions.recordingShortcut else { return }
+        let address = page.url
+        let anchor = shell.convertToScreen(NSRect(x: max(8, self.store.state.settings.sidebarWidth - 34),
+          y: max(0, (shell.contentView?.bounds.height ?? shell.frame.height) - 68), width: 26, height: 26))
+        let performed = try await ChromeExtensionManager(engine: self.engine, profileID: profile)
+          .performShortcut(shortcut, on: page, anchorWindow: shell, anchorRect: anchor)
+        guard !performed, self.windowContext.isOpen, !self.windowContext.isClosing,
+          !self.engine.isTerminating, NSApp.keyWindow === shell, shell.firstResponder === responder,
+          self.store.activeProfileID == profile, self.activePage === page, page.url == address,
+          !self.actions.recordingShortcut, NSApp.modalWindow == nil, shell.attachedSheet == nil else { return }
+        // Replay only Chromium's explicit, nonexecuted rejection. A timeout or
+        // lost acknowledgement must never execute an original key twice.
+        self.replayingExtensionKey = true
+        defer { self.replayingExtensionKey = false }
+        NSApp.sendEvent(event)
+      } catch is CancellationError {
+        return
+      } catch {
+        self.extensions.error = error.localizedDescription
+      }
+    }
     return true
   }
   func installMenus() {
@@ -1348,7 +1393,6 @@ final class BrowserWindowCoordinator: NSObject {
               owner.actions.icons.removeValue(forKey: id); owner.actions.iconColors.removeValue(forKey: id)
               owner.actions.peekIcons.removeValue(forKey: id)
             }
-            if owner.internalPage?.profileID == profile { owner.internalPage = nil; owner.actions.nativePageVisible = false }
           }
           try await self.services.didDeleteProfile(profile)
         } catch {
@@ -1428,11 +1472,21 @@ final class BrowserWindowCoordinator: NSObject {
   }
   func openExtensions(store showStore: Bool) {
     guard store.state.activeProfile?.isPrivate != true else { return }
-    internalPage =
-      showStore
-      ? engine.extensionStorePage(profileID: store.activeProfileID, ownerWindowID: windowContext.id)
-      : engine.extensionSettingsPage(profileID: store.activeProfileID, ownerWindowID: windowContext.id)
-    actions.nativePageVisible = true
+    actions.palette = false
+    if !showStore {
+      actions.library = "Extensions"
+      return
+    }
+    actions.library = nil
+    let existing = store.state.tabs.first {
+      !$0.isClosed && store.profileID(for: $0) == store.activeProfileID
+        && URL(string: $0.url)?.scheme == "https"
+        && URL(string: $0.url)?.host == "chromewebstore.google.com"
+    }
+    guard let tab = existing ?? store.createTab(address: "https://chromewebstore.google.com/") else { return }
+    do { try store.selectDocumentDurably(id: tab.id) }
+    catch { showError(error.localizedDescription); return }
+    _ = page(for: tab)
     scheduleLayout()
   }
   func updateIcon(_ page: ChromiumPage, tab: BrowserTab) {
@@ -1567,6 +1621,22 @@ extension BrowserWindowCoordinator {
     store.sidebarTabs()
   }
   func runCommand(_ id: String) {
+    if isPopup {
+      if id == "close-tab" || id == "close-window" {
+        if id == "close-tab", store.state.activeTab?.peek != nil, store.state.activeTab?.peek?.isPresented != false { closePeek() }
+        else { Task { [weak self] in _ = await self?.requestCloseWindow() } }
+        return
+      }
+      if id == "focus-chrome" { activePage?.focus(); return }
+      let documentCommands: Set<String> = ["history-back", "history-forward", "copy-url", "mute-tab", "reload", "force-reload",
+        "stop", "find", "find-next", "find-previous", "bookmark", "save-page", "print", "zoom-in", "zoom-out", "zoom-reset",
+        "developer-tools", "fullscreen", "about", "new-window", "open-browser", "peek-close", "peek-promote"]
+      if !documentCommands.contains(id) {
+        do { try application.browsingWindow(profileID: store.activeProfileID).runCommand(id) }
+        catch { showError(error.localizedDescription) }
+        return
+      }
+    }
     guard commandAvailable(id) else { return }
     if actions.performInterfaceCommand(id) {
       if !actions.palette && !actions.themeEditor { window?.makeKeyAndOrderFront(nil) }
@@ -1743,6 +1813,12 @@ extension BrowserWindowCoordinator {
     return page
   }
   private func installServices() {
+    extensions.invokeOptions = { [weak self] profile, identifier in
+      guard let self, self.store.activeProfileID == profile, self.store.state.activeProfile?.isPrivate == false,
+        self.windowContext.isOpen, !self.windowContext.isClosing, !self.engine.isTerminating else { throw CancellationError() }
+      try await self.application.extensionBrowser.openOptions(profileID: profile, extensionID: identifier,
+        sourceWindowID: self.windowContext.nativeID)
+    }
     extensions.invokeAction = { [weak self] profile, identifier, anchor in
       guard let self else { throw CancellationError() }
       let anchorRect = anchor ?? self.window.map { window in
@@ -1778,10 +1854,10 @@ extension BrowserWindowCoordinator {
   func openAISources(action: String, payload: ServiceJSON) async throws -> ServiceJSON {
     guard store.state.activeProfile?.isPrivate == false else { throw ServiceError("PRIVATE", "AI is unavailable in private profiles.") }
     let profileID = store.activeProfileID
-    let status = await services.aiService.status(for: AIProfileScope(id: profileID))
+    let status = await services.aiService.status(for: AIProfileScope(id: profileID), conversationID: services.conversationID)
     guard status["profileId"].string == profileID, store.activeProfileID == profileID else { throw ServiceError("CONTEXT_CHANGED", "The active profile changed.") }
     let latest = status["latest"]
-    let sources = try await services.aiService.verifiedSources(expectedProfileID: profileID)
+    let sources = try await services.aiService.verifiedSources(expectedProfileID: profileID, conversationID: services.conversationID)
     guard store.activeProfileID == profileID, !windowContext.isClosing, !engine.isTerminating else {
       throw ServiceError("CONTEXT_CHANGED", "The window or active profile changed.")
     }
@@ -2034,7 +2110,6 @@ extension BrowserWindowCoordinator {
       actions.peekIcons.removeValue(forKey: tab.id)
     }
     favicons.clear(profile: profileID)
-    if internalPage?.profileID == profileID { internalPage = nil; actions.nativePageVisible = false }
   }
   private func sleepTab(_ id: String) async throws {
     guard let tab = store.tab(id), store.profileID(for: tab) == store.activeProfileID, tab.isPinned else { return }

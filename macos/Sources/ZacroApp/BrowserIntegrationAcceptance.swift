@@ -19,7 +19,7 @@ final class BrowserIntegrationAcceptance {
 
   func run(url: URL) {
     deadline = Task { [weak self] in
-      do { try await Task.sleep(for: .seconds(240)) } catch { return }
+      do { try await Task.sleep(for: .seconds(420)) } catch { return }
       self?.finish("The application integration check timed out.")
     }
     task = Task { [weak self] in
@@ -189,6 +189,21 @@ final class BrowserIntegrationAcceptance {
       first.services.ai["profileId"].string == otherProfile
         && second.services.ai["profileId"].string == second.store.activeProfileID
     }
+    first.windowContext.show()
+    try await wait("differentProfileWindowGainsFocus", record: false) { application.focusedCoordinator === first }
+    let backgroundContext = try await application.readContext([
+      AIContextGrant(id: tab.id, url: URL(string: tab.url)!, profileID: page.profileID,
+        conversationID: second.windowContext.id)
+    ])
+    try require(backgroundContext.count == 1 && backgroundContext[0].text.contains("Approved context from its owning window."),
+      "approvedContextSurvivesAnotherProfileWindowFocus")
+    var rejectedUnknownOwner = false
+    do {
+      _ = try await application.readContext([
+        AIContextGrant(id: tab.id, url: URL(string: tab.url)!, profileID: page.profileID, conversationID: "missing-window")
+      ])
+    } catch let error as ServiceError { rejectedUnknownOwner = error.code == "CONTEXT_CHANGED" }
+    try require(rejectedUnknownOwner, "contextCannotInventWindowAuthority")
     await first.closeServicesPresentation()
     first.services.start()
     let siblingStatus = await second.services.aiService.status(for: AIProfileScope(id: second.store.activeProfileID))
@@ -196,10 +211,65 @@ final class BrowserIntegrationAcceptance {
       && first.services.aiService === application.services.aiService, "closingWindowPresentationKeepsSharedServices")
     do { nativeExtensions = try await engine.nativeCapabilities().extensionBrowser == true }
     catch let error as CefDevToolsError where error.isUnsupportedMethod { nativeExtensions = false }
-    if nativeExtensions { try await checkExtensionFixture(url: url, owner: second, page: page) }
+    if nativeExtensions {
+      try await checkExtensionFixture(url: url, owner: second, page: page)
+      try await checkNativeMedia(url: url, owner: second)
+    }
     else if ProcessInfo.processInfo.environment["ZACRO_REQUIRE_NATIVE_EXTENSIONS"] == "1" {
       throw Failure("The packaged runtime does not implement the native extension protocol")
     }
+    try await checkNativePDF(url: url, owner: second)
+    second.store.selectTab(id: page.id)
+    second.openExtensions(store: false)
+    try require(second.actions.library == "Extensions" && second.activePage === page,
+      "extensionManagementUsesNativeLibraryWithoutReplacingPage")
+    second.openExtensions(store: true)
+    guard let webStoreTab = second.store.state.activeTab,
+      URL(string: webStoreTab.url)?.host == "chromewebstore.google.com" else { throw Failure("Owned Web Store tab") }
+    let webStorePage = try await second.ensurePageReady(webStoreTab)
+    let count = second.store.state.tabs.count
+    second.openExtensions(store: true)
+    try require(second.store.state.activeTabID == webStoreTab.id && second.store.state.tabs.count == count
+      && webStoreTab.windowID == second.windowContext.id && webStorePage.ownerWindowID == second.windowContext.id,
+      "webStoreUsesOneOrdinaryOwnedTab")
+    second.store.selectTab(id: page.id)
+  }
+
+  private func checkNativeMedia(url: URL, owner: BrowserWindowCoordinator) async throws {
+    guard let tab = owner.store.createTab(address: url.appendingPathComponent("media-host").absoluteString) else {
+      throw Failure("Media acceptance tab")
+    }
+    let page = try await owner.ensurePageReady(tab)
+    try await application.navigation.waitForRestore(page)
+    try await loaded(page)
+    owner.layoutPages()
+    let browser = try await page.ready()
+    let script = url.appendingPathComponent("media/acceptance.js").absoluteString
+    _ = try await browser.devTools.evaluate("new Promise((resolve,reject)=>{const s=document.createElement('script');s.src=\(try literal(script));s.onload=()=>resolve(true);s.onerror=()=>reject(new Error('Media fixture failed to load'));document.head.append(s)})")
+    do {
+      guard let result = try await browser.devTools.evaluate("zacroMediaAcceptance.run(\(try literal(url.absoluteString)))", timeout: 90) as? [String: Any],
+        let mediaChecks = result["checks"] as? [String: Bool] else { throw Failure("Invalid media acceptance result") }
+      for (name, passed) in mediaChecks { checks["media:" + name] = passed }
+      guard result["passed"] as? Bool == true else { throw Failure("Native media: \(result["errors"] ?? "failed")") }
+      let pictureInPicture = try await browser.devTools.evaluate("zacroMediaAcceptance.pictureInPicture()", userGesture: true) as? Bool
+      try require(pictureInPicture == true, "nativePictureInPicturePresentsDecodedVideo")
+      _ = try await browser.devTools.evaluate("zacroMediaAcceptance.cleanup(); true")
+    } catch {
+      _ = try? await browser.devTools.evaluate("zacroMediaAcceptance.cleanup(); true")
+      throw error
+    }
+    try require(await owner.requestCloseTab(tab.id), "mediaFixtureClosesCleanly")
+  }
+
+  private func checkNativePDF(url: URL, owner: BrowserWindowCoordinator) async throws {
+    guard let pdfTab = owner.store.createTab(address: url.appendingPathComponent("media/synthetic.pdf").absoluteString) else {
+      throw Failure("PDF acceptance tab")
+    }
+    let pdfPage = try await owner.ensurePageReady(pdfTab)
+    try await application.navigation.waitForRestore(pdfPage)
+    try await loaded(pdfPage)
+    try require(try await NativePDFAcceptance.check(pdfPage), "nativePDFViewerLoadsActualDocument")
+    try require(await owner.requestCloseTab(pdfTab.id), "pdfFixtureClosesCleanly")
   }
 
   private func checkExtensionFixture(url: URL, owner: BrowserWindowCoordinator, page: ChromiumPage) async throws {
@@ -219,6 +289,10 @@ final class BrowserIntegrationAcceptance {
         let fixtureChecks = result["checks"] as? [String: Bool] else { throw Failure("Invalid extension fixture result") }
       for (name, passed) in fixtureChecks { checks["extension:" + name] = passed }
       guard result["passed"] as? Bool == true else { throw Failure("Native extension fixture: \(result["errors"] ?? "failed")") }
+      guard let network = try await worker.evaluate("zacroNetworkAcceptance.run(\(encoded))", timeout: 90) as? [String: Any],
+        let networkChecks = network["checks"] as? [String: Bool] else { throw Failure("Invalid extension network fixture result") }
+      for (name, passed) in networkChecks { checks["extension-network:" + name] = passed }
+      guard network["passed"] as? Bool == true else { throw Failure("Native extension network fixture: \(network["errors"] ?? "failed")") }
       owner.store.selectTab(id: page.id)
       owner.windowContext.show()
       try await application.extensionBrowser.prepareInitialNavigation(page)
@@ -229,6 +303,8 @@ final class BrowserIntegrationAcceptance {
           && action["windowId"] as? Int == owner.windowContext.nativeID
           && action["active"] as? Bool == true
       }
+      try await checkNativeShortcut(manager: manager, identifier: identifier, worker: worker, page: page)
+      try await checkNativeOptions(worker: worker, identifier: identifier, owner: owner)
       try await checkNativeHistory(manager: manager, worker: worker, owner: owner, url: url)
       try await checkNativeBookmarkMigration(manager: manager, profileID: page.profileID, url: url)
       try await checkNativeDownload(worker: worker, profileID: page.profileID, url: url)
@@ -265,6 +341,66 @@ final class BrowserIntegrationAcceptance {
     }
   }
 
+  private func checkNativeShortcut(manager: ChromeExtensionManager, identifier: String,
+                                   worker: ChromeExtensionWorkerSession, page: ChromiumPage) async throws {
+    await application.extensionBrowser.waitForTopologyPublication()
+    guard let shortcut = try await manager.shortcuts().first(where: {
+      $0.extensionID == identifier && $0.name == "record-native-shortcut"
+    }) else { throw Failure("Native extension command registration") }
+    let previous = try await worker.evaluate("zacroAcceptance.commandResult()") as? [String: Any]
+    let count = previous?["nativeCommandCount"] as? Int ?? 0
+    try require(try await manager.performShortcut(shortcut, on: page), "nativeShortcutUsesChromiumRegistry")
+    try await wait("nativeShortcutDispatchesActualCommandEvent") {
+      let value = try await worker.evaluate("zacroAcceptance.commandResult()") as? [String: Any]
+      let command = value?["lastNativeCommand"] as? [String: Any]
+      let tab = command?["tab"] as? [String: Any]
+      return value?["nativeCommandCount"] as? Int == count + 1
+        && command?["name"] as? String == shortcut.name && tab?["id"] as? Int == page.reservedNativeTabID
+    }
+    try await manager.setShortcutHandlingSuspended(true)
+    do {
+      try require(try await manager.performShortcut(shortcut, on: page) == false, "shortcutRecordingSuspendsNativeExecution")
+      try await manager.setShortcutHandlingSuspended(false)
+    } catch {
+      try? await manager.setShortcutHandlingSuspended(false)
+      throw error
+    }
+    let after = try await worker.evaluate("zacroAcceptance.commandResult()") as? [String: Any]
+    try require(after?["nativeCommandCount"] as? Int == count + 1, "suspendedShortcutDoesNotDeliverDuplicateCommand")
+  }
+
+  private func checkNativeOptions(worker: ChromeExtensionWorkerSession, identifier: String,
+                                  owner: BrowserWindowCoordinator) async throws {
+    owner.windowContext.show()
+    _ = try await worker.evaluate("chrome.runtime.openOptionsPage().then(()=>true)")
+    guard let first = try await worker.evaluate("zacroAcceptance.optionsResult()") as? [String: Any],
+      let nativeWindow = first["window"] as? [String: Any], let nativeWindowID = nativeWindow["id"] as? Int,
+      let nativeTab = first["tab"] as? [String: Any], let nativeTabID = nativeTab["id"] as? Int,
+      let instance = first["instance"] as? String,
+      let popup = application.windows.values.first(where: { $0.windowContext.nativeID == nativeWindowID }),
+      let page = popup.windowPages.values.first(where: { $0.reservedNativeTabID == nativeTabID }),
+      let popupWindow = popup.window else { throw Failure("Managed extension options popup") }
+    try require(popup.isPopup && nativeWindow["type"] as? String == "popup"
+      && page.url?.scheme == "chrome-extension" && page.url?.host == identifier
+      && page.ownerWindowID == popup.windowContext.id, "extensionOptionsUsesOwnedPopupAndActualDocument")
+    try await wait("optionsPopupHasContentOnlyLayout") {
+      !popupWindow.styleMask.contains(.fullSizeContentView)
+        && abs(popup.actions.contentFrame.minX) < 1 && abs(popup.actions.contentFrame.minY) < 1
+        && popup.actions.contentFrame.width > 600 && abs(popupWindow.frame.width - 850) < 2
+        && abs(popupWindow.frame.height - 650) < 2
+    }
+    let browser = try await page.ready()
+    _ = try await browser.devTools.evaluate("document.querySelector('#options-draft').value='retained options draft'; true")
+    _ = try await worker.evaluate("chrome.runtime.openOptionsPage().then(()=>true)")
+    let again = try await worker.evaluate("zacroAcceptance.optionsResult()") as? [String: Any]
+    let repeatedWindow = again?["window"] as? [String: Any], repeatedTab = again?["tab"] as? [String: Any]
+    try require(again?["instance"] as? String == instance && again?["draft"] as? String == "retained options draft"
+      && repeatedWindow?["id"] as? Int == nativeWindowID && repeatedTab?["id"] as? Int == nativeTabID,
+      "extensionOptionsReusePreservesWindowTabAndForm")
+    try require(await popup.requestCloseWindow(), "extensionOptionsPopupClosesCleanly")
+    owner.windowContext.show()
+  }
+
   private func checkNativeSidePanel(manager: ChromeExtensionManager, identifier: String,
                                     worker: ChromeExtensionWorkerSession, owner: BrowserWindowCoordinator,
                                     source: ChromiumPage, url: URL) async throws {
@@ -299,6 +435,19 @@ final class BrowserIntegrationAcceptance {
     try require(retained["instance"] as? String == instance && retained["draft"] as? String == "unsaved panel draft"
       && application.engine.pages[source.id] === source, "sidePanelSurvivesOriginalHostClosure")
     _ = try await worker.evaluate("zacroAcceptance.closePanel(\(owner.windowContext.nativeID))")
+    guard let blank = owner.store.createTab(address: "about:blank") else { throw Failure("Blank side panel host") }
+    let blankPage = try await owner.extensionActionPage(profileID: source.profileID)
+    try await manager.performAction(identifier, on: blankPage)
+    _ = try await worker.evaluate("zacroAcceptance.panelState('blank canvas panel')")
+    try await wait("nativeSidePanelVisibleOverBlankCanvas") {
+      blankPage.isSidePanelVisible && blankPage.nativeWindow?.isVisible == true
+    }
+    try require(owner.store.state.activeTabID == blank.id && !owner.actions.nativePageVisible
+      && blankPage.url?.absoluteString == "about:blank", "blankSidePanelPreservesThemedEmptyCanvas")
+    _ = try await worker.evaluate("zacroAcceptance.closePanel(\(owner.windowContext.nativeID))")
+    try await wait("blankSidePanelCloseHidesOnlyNativeDocument") {
+      !blankPage.isSidePanelVisible && blankPage.nativeWindow?.isVisible == false
+    }
     _ = try await worker.evaluate("zacroAcceptance.configureAction('record')")
   }
 

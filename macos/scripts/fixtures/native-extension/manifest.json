@@ -15,7 +15,9 @@
     "history",
     "bookmarks",
     "sessions",
-    "downloads"
+    "downloads",
+    "declarativeNetRequestWithHostAccess",
+    "webRequest"
   ],
   "host_permissions": [
     "http://127.0.0.1/*"
@@ -26,8 +28,14 @@
   "action": {
     "default_title": "Record native action"
   },
+  "commands": {
+    "record-native-shortcut": {
+      "suggested_key": { "mac": "Command+Shift+Y" },
+      "description": "Record a native shell shortcut"
+    }
+  },
   "side_panel": {
     "default_path": "panel.html"
   },
-  "options_page": "options.html"
+  "options_ui": { "page": "options.html", "open_in_tab": true }
 }

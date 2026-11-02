@@ -313,6 +313,7 @@ public final class ChromiumEngine: NSObject {
       let page = pages.removeValue(forKey: fromID) else { return nil }
     page.id = toID
     pages[toID] = page
+    for child in pages.values where child.openerID == fromID { child.openerID = toID }
     return page
   }
   public func close(id: String) { pages[id]?.close() }
@@ -551,6 +552,7 @@ public final class ChromiumPage: CefBrowserDelegate {
   public private(set) var url: URL?
   public private(set) var isLoading = false
   public private(set) var isAudible = false
+  public private(set) var isSidePanelVisible = false
   private var documentEventToken: UUID?
   private var documentObservation: Task<Void, Never>?
   public private(set) var canGoBack = false
@@ -606,14 +608,19 @@ public final class ChromiumPage: CefBrowserDelegate {
         let browser = try await ready()
         try Task.checkCancellation()
         let token = try browser.devTools.observeEvents { [weak self] method, params in
-          guard let self, method == "Zacro.documentAudioChanged", let audible = params["audible"] as? Bool else { return }
-          self.isAudible = audible; self.onChange?()
+          guard let self else { return }
+          if method == "Zacro.documentAudioChanged", let audible = params["audible"] as? Bool {
+            self.isAudible = audible; self.onChange?()
+          } else if method == "Zacro.documentSidePanelChanged", let visible = params["visible"] as? Bool {
+            self.isSidePanelVisible = visible; self.onChange?()
+          }
         }
         documentEventToken = token
         do {
           let state = try await browser.devTools.call("Zacro.observeDocument", parameters: ["enabled": true])
           guard !Task.isCancelled, self.browser === browser else { return }
           if let audible = state["audible"] as? Bool { isAudible = audible; onChange?() }
+          if let visible = state["sidePanelVisible"] as? Bool { isSidePanelVisible = visible; onChange?() }
         } catch {
           browser.devTools.removeEventObserver(token); documentEventToken = nil
         }
@@ -927,18 +934,4 @@ extension ChromiumEngine {
     return page
   }
 
-  public func extensionStorePage(profileID: String) -> ChromiumPage {
-    extensionStorePage(profileID: profileID, ownerWindowID: primaryWindow?.id)
-  }
-
-  public func extensionSettingsPage(profileID: String, ownerWindowID: String) -> ChromiumPage {
-    page(id: "extension-settings:\(profileID):\(ownerWindowID)", profileID: profileID,
-      isPrivate: false, url: URL(string: "chrome://extensions/")!, ownerWindowID: ownerWindowID)
-  }
-
-  public func extensionStorePage(profileID: String, ownerWindowID: String?) -> ChromiumPage {
-    page(
-      id: "extension-store:\(profileID):\(ownerWindowID ?? "unowned")", profileID: profileID, isPrivate: false,
-      url: URL(string: "https://chromewebstore.google.com/")!, ownerWindowID: ownerWindowID)
-  }
 }

@@ -11,6 +11,7 @@ final class NativeServicesModel: ObservableObject {
   @Published var aiEvent: ServiceJSON = [:]
   @Published var contextTabs: [NativeAIContextTab] = []
   let aiConversation = NativeAIConversationState()
+  var conversationID: String { store.owningWindowID ?? "application" }
   let aiService: NativeAIService
   let syncService: NativeSyncClient?
   var sourceAction: ((String, ServiceJSON) async throws -> ServiceJSON)?
@@ -33,13 +34,14 @@ final class NativeServicesModel: ObservableObject {
   private let store: BrowserStore
   private var tasks: [Task<Void, Never>] = []
   private var profileTask: Task<Void, Never>?
+  private var aiContextReset: Task<Void, Never>?
   private var profileID: String?
   private var syncStartupError: String?
   private var cleanupError: String?
   private var started = false
   private var shutdownTask: Task<Void, Never>?
 
-  init(store: BrowserStore, directory: URL, context: @escaping NativeAIService.ContextReader) {
+  init(store: BrowserStore, directory: URL, conversationProfile: NativeAIService.ConversationProfileReader? = nil, context: @escaping NativeAIService.ContextReader) {
     self.store = store
     let libraryFeed = NativePortableLibraryReader(); self.libraryFeed = libraryFeed
     let active: NativeAIService.ProfileReader = { [store] in
@@ -48,7 +50,7 @@ final class NativeServicesModel: ObservableObject {
         return AIProfileScope(id: profile.id, isPrivate: profile.isPrivate)
       }
     }
-    aiService = NativeAIService(directory: directory, currentProfile: active, context: context)
+    aiService = NativeAIService(directory: directory, currentProfile: active, conversationProfile: conversationProfile, context: context)
     do {
       syncService = try NativeSyncClient(directory: directory, getProfile: { [store] id in
         await MainActor.run {
@@ -80,6 +82,11 @@ final class NativeServicesModel: ObservableObject {
       throw ServiceError("PROFILE_CHANGED", "Activate this window's profile before using these controls.")
     }
   }
+  private func requireAIProfile(_ id: String) throws {
+    guard shutdownTask == nil, store.activeProfileID == id, store.state.activeProfile?.isPrivate == false else {
+      throw ServiceError("PROFILE_CHANGED", "This window's profile changed. Review the request again.")
+    }
+  }
   func start() {
     guard !started else { return }; started = true
     observeBackend()
@@ -88,6 +95,7 @@ final class NativeServicesModel: ObservableObject {
       for await event in stream {
         guard let self, !Task.isCancelled else { break }
         guard event["profileId"].string == self.store.activeProfileID else { continue }
+        guard !event.contains("conversationId") || event["conversationId"].string == self.conversationID else { continue }
         self.aiEvent = event
         self.aiConversation.receive(event)
         if event["type"].string == "ai:status" { self.applyAI(event["status"]) }
@@ -131,19 +139,26 @@ final class NativeServicesModel: ObservableObject {
     }
     if contextTabs != nextTabs { contextTabs = nextTabs }
     guard profileID != current else { return }
+    let previousProfile = profileID ?? current, conversation = conversationID
+    let precedingReset = aiContextReset
+    aiContextReset = Task { [aiService] in
+      await precedingReset?.value
+      await aiService.clearConversation(profileID: previousProfile, conversationID: conversation)
+    }
     profileID = current
     ai = ["profileId":.string(current),"private":.bool(isPrivate),"configured":false]
     applySync(sync)
     aiConversation.activate(profileID: current, isPrivate: store.state.activeProfile?.isPrivate ?? true)
     profileTask?.cancel()
     profileTask = Task { [weak self, aiService, syncService] in
+      await self?.aiContextReset?.value
       guard !Task.isCancelled else { return }
       if self?.sharedBackend == nil {
         await aiService.profileChanged()
         guard !Task.isCancelled else { return }
         await syncService?.profileChanged()
       }
-      let status = await aiService.status(for: AIProfileScope(id: current, isPrivate: isPrivate))
+      let status = await aiService.status(for: AIProfileScope(id: current, isPrivate: isPrivate), conversationID: self?.conversationID)
       guard !Task.isCancelled, self?.profileID == current else { return }
       self?.applyAI(status)
       if let syncService {
@@ -183,7 +198,8 @@ final class NativeServicesModel: ObservableObject {
   }
   func aiAction(_ action: String, payload: ServiceJSON = [:]) async throws -> ServiceJSON {
     let profile = store.activeProfileID
-    try requireFocusedProfile(profile)
+    await aiContextReset?.value
+    try requireAIProfile(profile)
     if action == "ai:prepare" {
       guard store.state.activeProfile?.isPrivate == false else { throw ServiceError("PRIVATE","AI is unavailable in private profiles.") }
       guard !aiConversation.busy else { throw ServiceError("BUSY","Stop the current response before changing context.") }
@@ -196,7 +212,7 @@ final class NativeServicesModel: ObservableObject {
       ]
       aiConversation.prepare(payload["question"].string.isEmpty ? prompts[intent] ?? "" : payload["question"].string)
       if ["summarize","explain","compare","research"].contains(intent) {
-        _ = try await aiService.handle("ai:reset", expectedProfileID: profile)
+        _ = try await aiService.handle("ai:reset", expectedProfileID: profile, conversationID: conversationID)
         guard store.activeProfileID == profile, store.state.activeProfile?.isPrivate == false else {
           throw ServiceError("PROFILE_CHANGED","The active profile changed.")
         }
@@ -212,12 +228,17 @@ final class NativeServicesModel: ObservableObject {
       return try await sourceAction(action, payload)
     }
     do {
-      let result = try await aiService.handle(action, payload: payload, expectedProfileID: profile)
-      try requireFocusedProfile(profile)
-      if ["ai:login", "ai:install"].contains(action), let url = BrowserAddress.webURL(result["url"].string) { NSWorkspace.shared.open(url) }
-      applyAI(await aiService.status(for: scope)); return result
+      let result = try await aiService.handle(action, payload: payload, expectedProfileID: profile, conversationID: conversationID)
+      try requireAIProfile(profile)
+      if ["ai:login", "ai:install"].contains(action), let url = BrowserAddress.webURL(result["url"].string), !NSWorkspace.shared.open(url) {
+        if action == "ai:login" {
+          _ = try? await aiService.handle("ai:login-cancel", expectedProfileID: profile, conversationID: conversationID)
+        }
+        throw ServiceError("OPEN_BROWSER", "Unable to open the provider page in your default browser. Try again after choosing a default browser.")
+      }
+      applyAI(await aiService.status(for: scope, conversationID: conversationID)); return result
     } catch {
-      applyAI(await aiService.status(for: scope)); throw error
+      applyAI(await aiService.status(for: scope, conversationID: conversationID)); throw error
     }
   }
   func syncAction(_ action: String, payload: ServiceJSON = [:]) async throws -> ServiceJSON {
@@ -306,6 +327,9 @@ final class NativeServicesModel: ObservableObject {
     tasks.forEach { $0.cancel() }; tasks.removeAll()
     backendSubscription?.cancel(); backendSubscription = nil
     if sharedBackend != nil {
+      await aiContextReset?.value
+      await aiService.clearConversation(profileID: profileID ?? store.activeProfileID, conversationID: conversationID)
+      aiContextReset = nil
       started = false; profileID = nil
       aiConversation.activate(profileID: "", isPrivate: true)
       contextTabs = []; ai = [:]; sync = [:]

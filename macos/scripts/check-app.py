@@ -16,8 +16,22 @@ from urllib.parse import urlsplit
 
 
 class Fixture(http.server.BaseHTTPRequestHandler):
+    def do_HEAD(self):
+        route = urlsplit(self.path).path
+        if route.startswith("/media/"):
+            self.media_fixture(route, head_only=True)
+        else:
+            self.send_error(405)
+
     def do_GET(self):
-        if urlsplit(self.path).path == "/download":
+        route = urlsplit(self.path).path
+        if route.startswith("/media/"):
+            self.media_fixture(route)
+            return
+        if route.startswith("/native-network/"):
+            self.network_fixture(route)
+            return
+        if route == "/download":
             self.stream_download()
             return
         body = b"<!doctype html><title>Zacro Native acceptance</title><p>Local engine check</p>"
@@ -30,6 +44,72 @@ class Fixture(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def media_fixture(self, route, head_only=False):
+        types = {"synthetic-h264.mp4": "video/mp4", "synthetic-aac.m4a": "audio/mp4", "synthetic.pdf": "application/pdf",
+                 "acceptance.js": "text/javascript; charset=utf-8"}
+        name = route.removeprefix("/media/")
+        if name not in types:
+            self.send_error(404)
+            return
+        body = (Path(__file__).resolve().parent / "fixtures" / "media" / name).read_bytes()
+        total = len(body)
+        start, end = 0, total - 1
+        requested = None if head_only else self.headers.get("Range")
+        if requested:
+            match = re.fullmatch(r"bytes=(\d*)-(\d*)", requested)
+            if match and any(match.groups()):
+                first, last = match.groups()
+                if first:
+                    start = int(first)
+                    end = min(total - 1, int(last)) if last else total - 1
+                else:
+                    start = max(0, total - int(last))
+            if not match or not any(match.groups()) or start >= total or start > end:
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{total}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+        self.send_response(206 if requested else 200)
+        self.send_header("Content-Type", types[name])
+        self.send_header("Content-Length", str(end - start + 1))
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Cache-Control", "no-store")
+        if requested:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{total}")
+        self.end_headers()
+        if not head_only:
+            try:
+                self.wfile.write(body[start:end + 1])
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+    def network_fixture(self, route):
+        mime = "text/html; charset=utf-8"
+        if route.startswith("/native-network/echo"):
+            mime = "application/json; charset=utf-8"
+            body = json.dumps({"path": self.path, "headers": {
+                name.lower(): value for name, value in self.headers.items()
+            }}).encode("utf-8")
+        elif route == "/native-network/document":
+            body = b'<!doctype html><title>Native network fixture</title><p id="main">Main document</p><iframe src="/native-network/frame"></iframe>'
+        elif route == "/native-network/frame":
+            body = b'<!doctype html><title>Native frame fixture</title><p id="frame">Child document</p>'
+        elif route == "/native-network/denied":
+            body = b'<!doctype html><title>Unpermitted fixture origin</title><p>No extension host permission for localhost.</p>'
+        else:
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", mime)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def stream_download(self):
         total = 16 * 1024 * 1024
@@ -128,7 +208,7 @@ def main():
                             os.killpg(process.pid, signal.SIGTERM)
                             process.wait(timeout=5)
                             raise SystemExit(f"FAIL: native UI input check; see {output / 'ui.log'}")
-                    code = process.wait(timeout=280 if args.integration else 45)
+                    code = process.wait(timeout=460 if args.integration else 45)
                 except subprocess.TimeoutExpired:
                     os.killpg(process.pid, signal.SIGTERM)
                     try:

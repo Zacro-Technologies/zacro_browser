@@ -71,13 +71,22 @@ ExtensionFunction::ResponseAction ExtensionFunction::RunWithValidation() {""")
   }
   return Run();
 }""")
+    eh = replace(eh, '#include "base/compiler_specific.h"', '#include "base/compiler_specific.h"\n#include "base/callback_list.h"')
     eh = replace(eh, "  // Gets the EventRouter for `browser_context`.", """  // Browser-process topology ownership. Returning false suppresses physical
   // implementation-window events; native host events retain normal routing.
   using NativeEventFilter = base::RepeatingCallback<bool(
       content::BrowserContext*, Event&, const std::string&)>;
   static void SetNativeEventFilter(NativeEventFilter filter);
+  base::CallbackListSubscription ObserveNativeListeners(
+      base::RepeatingCallback<void(const std::string&)> observer) {
+    return native_listener_changes_.Add(std::move(observer));
+  }
 
   // Gets the EventRouter for `browser_context`.""")
+    eh = replace(eh, "  base::WeakPtrFactory<EventRouter> weak_factory_{this};", "  base::RepeatingCallbackList<void(const std::string&)> native_listener_changes_;\n  base::WeakPtrFactory<EventRouter> weak_factory_{this};")
+    for name in ("Added", "Removed", "Updated"):
+        old = "void EventRouter::OnListener" + name + "(const EventListener* listener) {"
+        ec = replace(ec, old, old + '\n  native_listener_changes_.Notify(listener->event_name());')
     eh = replace(eh, "  // The event to dispatch.\n  const std::string event_name;", "  // The event to dispatch.\n  const std::string event_name;\n\n  bool native_host_topology = false;")
     eh = replace(eh, "  const base::ListValue& args() const { return event_args_->data; }", """  const base::ListValue& args() const { return event_args_->data; }
   void ReplaceNativeArguments(base::ListValue args) {

@@ -49,6 +49,7 @@ struct NativeInterfaceEditors: View {
   let destination: NativeInterfaceEditor
   @Environment(\.dismiss) private var dismiss
   @Environment(\.colorScheme) private var colorScheme
+  @Environment(\.colorSchemeContrast) private var contrast
   @Environment(\.presentedSpaceTheme) private var presentedTheme
   @State private var query = ""
   @State private var recording: String?
@@ -58,7 +59,7 @@ struct NativeInterfaceEditors: View {
   @State private var renameProfile: BrowserProfile?
   private var colors: NativeSpacePalette {
     let theme = presentedTheme ?? store.state.activeSpace?.theme ?? SpaceTheme()
-    return NativeSpacePalette(theme: theme, dark: colorScheme == .dark)
+    return NativeSpacePalette(theme: theme, dark: colorScheme == .dark, increasedContrast: contrast == .increased)
   }
   private var shortcuts: [BrowserShortcut] { BrowserShortcut.catalog(overrides: store.state.settings.shortcutOverrides) }
   private var title: String {
@@ -81,6 +82,9 @@ struct NativeInterfaceEditors: View {
       case .spaces: spaces
       }
       if let error { Text(error).font(.system(size: 12)).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true).accessibilityAddTraits(.updatesFrequently) }
+      if recording != nil, let message = actions.shortcutCaptureError {
+        Text(message).font(.system(size: 12)).foregroundStyle(colors.ink).fixedSize(horizontal: false, vertical: true)
+      }
     }.padding(20).frame(width: 500)
       .font(.system(size: 13)).foregroundStyle(colors.ink).tint(colors.accent)
       .background { NativeControlSurface().overlay(colors.chrome.opacity(0.65)) }
@@ -125,14 +129,20 @@ struct NativeInterfaceEditors: View {
       Text(shortcut.title).lineLimit(1)
       Spacer(minLength: 8)
       if recording == shortcut.id {
-        ShortcutCapture { result in
+        if actions.shortcutCaptureReady {
+          ShortcutCapture { result in
+            guard recording == shortcut.id else { return }
           switch result {
           case .cancel: recording = nil
           case .value(let value):
             do { try store.updateShortcut(id: shortcut.id, accelerator: value); error = nil; recording = nil }
             catch { self.error = error.localizedDescription }
           }
-        }.frame(width: 150, height: 28)
+          }.frame(width: 150, height: 28)
+        } else {
+          if actions.shortcutCaptureError == nil { ProgressView().controlSize(.mini); Text("Preparing shortcut…").font(.system(size: 11)) }
+          Button("Cancel") { recording = nil }.buttonStyle(.plain)
+        }
       } else {
         Button { error = nil; recording = shortcut.id } label: {
           Text(shortcut.accelerator.isEmpty ? "Not set" : Self.keyLabel(shortcut.accelerator))
@@ -377,6 +387,11 @@ private struct ShortcutCapture: NSViewRepresentable {
   final class CaptureView: NSView {
     var receive: (Result) -> Void = { _ in }
     override var acceptsFirstResponder: Bool { true }
+    override func resignFirstResponder() -> Bool {
+      let callback = receive
+      DispatchQueue.main.async { callback(.cancel) }
+      return true
+    }
     override func draw(_ dirtyRect: NSRect) {
       NSColor.controlAccentColor.withAlphaComponent(0.12).setFill(); NSBezierPath(roundedRect: bounds, xRadius: 7, yRadius: 7).fill()
       let text = "Press shortcut…" as NSString

@@ -17,11 +17,12 @@ struct NativeLibrary: View {
   @State private var layoutExpanded = false
   @FocusState private var focus: String?
   @Environment(\.colorScheme) private var colorScheme
+  @Environment(\.colorSchemeContrast) private var contrast
   @Environment(\.presentedSpaceTheme) private var presentedTheme
   private let sections = ["Bookmarks", "History", "Downloads", "Archive", "Windows", "Settings", "Extensions", "AI"]
   private var colors: NativeSpacePalette {
     let theme = presentedTheme ?? store.state.activeSpace?.theme ?? SpaceTheme()
-    return NativeSpacePalette(theme: theme, dark: colorScheme == .dark)
+    return NativeSpacePalette(theme: theme, dark: colorScheme == .dark, increasedContrast: contrast == .increased)
   }
   private var isRecords: Bool { ["Bookmarks", "History", "Downloads", "Archive", "Windows"].contains(section) }
   private var rows: [LibraryRow] {

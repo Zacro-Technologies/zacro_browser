@@ -2,6 +2,65 @@ import XCTest
 @testable import ZacroServices
 
 final class AIServiceTests: XCTestCase {
+  func testWindowConversationsNeverInheritUndisplayedHistoryAndResetIsScoped() async throws {
+    let subscription = FixtureSubscription()
+    let ai = NativeAIService(directory: try directory(), currentProfile: { AIProfileScope(id:"personal") },
+      context: { _ in [] }, codex: subscription, claude: subscription)
+    let first = try await ai.handle("ai:ask", payload:["question":"Window A first"], conversationID:"window-a")
+    let second = try await ai.handle("ai:ask", payload:["question":"Window B first"], conversationID:"window-b")
+    expectEqual(first["conversationId"], "window-a"); expectEqual(second["conversationId"], "window-b")
+    _ = try await ai.handle("ai:reset", conversationID:"window-b")
+    _ = try await ai.handle("ai:ask", payload:["question":"Window A followup"], conversationID:"window-a")
+    var calls = await subscription.calls
+    expectEqual(calls[1].messages.count, 1)
+    expectEqual(calls[1].messages[0]["content"], "Window B first")
+    expectEqual(calls[2].messages.count, 3)
+    expectEqual(calls[2].messages[0]["content"], "Window A first")
+    expectFalse(calls[2].messages.contains { $0["content"].string.contains("Window B") })
+    expectEqual(await ai.status(for:AIProfileScope(id:"personal"), conversationID:"window-b")["latest"], .null)
+    expectEqual(await ai.status(for:AIProfileScope(id:"personal"), conversationID:"window-a")["latest"]["question"], "Window A followup")
+    await ai.clearConversation(profileID:"personal", conversationID:"window-a")
+    _ = try await ai.handle("ai:ask", payload:["question":"Reopened A"], conversationID:"window-a")
+    calls = await subscription.calls
+    expectEqual(calls.last?.messages.count, 1)
+    await ai.close()
+  }
+  func testResetOrCancelInAnotherWindowDoesNotInterruptRunningAnswer() async throws {
+    let subscription = FixtureSubscription(); await subscription.setDelay(.milliseconds(150))
+    let ai = NativeAIService(directory: try directory(), currentProfile: { AIProfileScope(id:"personal") },
+      context: { _ in [] }, codex: subscription, claude: subscription)
+    let running = Task { try await ai.handle("ai:ask", payload:["question":"A request"], conversationID:"window-a") }
+    for _ in 0..<100 { if await subscription.calls.count > 0 { break }; try await Task.sleep(for:.milliseconds(5)) }
+    _ = try await ai.handle("ai:cancel", conversationID:"window-b")
+    _ = try await ai.handle("ai:reset", conversationID:"window-b")
+    expectEqual(try await running.value["conversationId"], "window-a")
+    await subscription.setDelay(.seconds(5))
+    let cancelled = Task { try await ai.handle("ai:ask", payload:["question":"A cancelled"], conversationID:"window-a") }
+    for _ in 0..<100 { if await subscription.calls.count > 1 { break }; try await Task.sleep(for:.milliseconds(5)) }
+    _ = try await ai.handle("ai:cancel", conversationID:"window-a")
+    do { _ = try await cancelled.value; XCTFail("Own-window cancellation must stop its answer") }
+    catch { expectEqual((error as? ServiceError)?.code, "CANCELLED") }
+    await ai.close()
+  }
+  func testVerifiedSourcesAndLifecycleClearStayInTheirWindow() async throws {
+    let subscription = FixtureSubscription(), profile = FixtureProfile()
+    let ai = NativeAIService(directory:try directory(), currentProfile:{ await profile.current() }, context:{ grants in
+      grants.map { AIPageExtract(id:$0.id,url:$0.url,title:"Source",text:"Actual evidence") }
+    }, codex:subscription, claude:subscription)
+    for window in ["a","b"] {
+      _ = try await ai.handle("ai:ask", payload:["question":"Read", "tabIds":[.string(window)],
+        "contextTabs":[["id":.string(window),"url":.string("https://example.com/" + window)]]], conversationID:window)
+    }
+    let sources = try await ai.verifiedSources(conversationID:"a")
+    expectFalse(sources.isEmpty)
+    expectTrue(sources.allSatisfy { $0["url"].string.hasPrefix("https://example.com/a") })
+    await profile.change("other")
+    await ai.clearConversation(profileID:"personal", conversationID:"a")
+    await profile.change("personal")
+    expectTrue(try await ai.verifiedSources(conversationID:"a").isEmpty)
+    expectFalse(try await ai.verifiedSources(conversationID:"b").isEmpty)
+    await ai.close()
+  }
   func testBackgroundWindowStatusIsScopedAndStaleActionCannotConfigureFocusedProfile() async throws {
     let root = try directory(), profile = FixtureProfile(), subscription = FixtureSubscription()
     let ai = NativeAIService(directory: root, currentProfile: { await profile.current() }, context: { _ in [] },
@@ -21,6 +80,109 @@ final class AIServiceTests: XCTestCase {
     expectEqual(await ai.status()["provider"], "anthropic")
     expectTrue(await ai.status(for: AIProfileScope(id: "private", isPrivate: true))["private"].bool)
     await ai.close()
+  }
+  func testWindowAuthorityPreservesBackgroundAnswerAndUnrelatedProviderHistory() async throws {
+    let focused = FixtureProfile(), owners = AIWindowOwners(), subscription = FixtureSubscription()
+    await owners.set("a", profile: "personal"); await owners.set("b", profile: "other")
+    let ai = NativeAIService(directory: try directory(), currentProfile: { await focused.current() },
+      conversationProfile: { await owners.profile($0) }, context: { grants in
+        expectEqual(grants.first?.conversationID, "a")
+        return grants.map { AIPageExtract(id:$0.id,url:$0.url,title:"Evidence",text:"Approved source") }
+      }, secrets: MemorySecrets(), codex: subscription, claude: subscription)
+    let payload: ServiceJSON = ["question":"Read A", "tabIds":["a-tab"],
+      "contextTabs":[["id":"a-tab","url":"https://example.com/a"]]]
+    await subscription.setDelay(.milliseconds(120))
+    let running = Task { try await ai.handle("ai:ask", payload:payload, expectedProfileID:"personal", conversationID:"a") }
+    for _ in 0..<100 { if await subscription.calls.count > 0 { break }; try await Task.sleep(for:.milliseconds(5)) }
+    await focused.change("other"); await ai.profileChanged()
+    expectEqual(try await running.value["conversationId"], "a")
+    expectFalse(try await ai.verifiedSources(expectedProfileID:"personal", conversationID:"a").isEmpty)
+    _ = try await ai.handle("ai:configure", payload:["provider":"compatible","baseUrl":"http://127.0.0.1:8080/v1","model":"local"], expectedProfileID:"other", conversationID:"b")
+    _ = try await ai.handle("ai:disconnect", expectedProfileID:"other", conversationID:"b")
+    _ = try await ai.handle("ai:ask", payload:payload.merging(["question":"A followup"]), expectedProfileID:"personal", conversationID:"a")
+    expectEqual(await subscription.calls.last?.messages.count, 3)
+    expectEqual(try await ai.handle("ai:status", expectedProfileID:"personal", conversationID:"a")["provider"], "codex")
+    expectFalse(try await ai.verifiedSources(expectedProfileID:"personal", conversationID:"a").isEmpty)
+    await ai.close()
+  }
+  func testWindowAuthorityRejectsMissingChangedPrivateAndClosedOwners() async throws {
+    let owners = AIWindowOwners(), subscription = FixtureSubscription()
+    await owners.set("a", profile:"personal")
+    let ai = NativeAIService(directory:try directory(), currentProfile:{ AIProfileScope(id:"personal") },
+      conversationProfile:{ await owners.profile($0) }, context:{ grants in
+        await owners.set("a", profile:"other")
+        return grants.map { AIPageExtract(id:$0.id,url:$0.url,title:"Page",text:"Must not transmit") }
+      }, codex:subscription, claude:subscription)
+    do {
+      _ = try await ai.handle("ai:ask", payload:["question":"Guess"], expectedProfileID:"personal", conversationID:"missing")
+      XCTFail("A profile string cannot authorize an unknown window")
+    } catch { expectEqual((error as? ServiceError)?.code, "PRIVATE") }
+    do {
+      _ = try await ai.handle("ai:ask", payload:["question":"Read","tabIds":["one"],"contextTabs":[["id":"one","url":"https://example.com/"]]], expectedProfileID:"personal", conversationID:"a")
+      XCTFail("The approved owner changed before transmission")
+    } catch { expectEqual((error as? ServiceError)?.code, "PROFILE_CHANGED") }
+    expectTrue(await subscription.calls.isEmpty)
+    await owners.set("a", profile:"private", isPrivate:true)
+    do { _ = try await ai.handle("ai:ask", payload:["question":"Private"], conversationID:"a"); XCTFail("Private owner must fail") }
+    catch { expectEqual((error as? ServiceError)?.code, "PRIVATE") }
+    await owners.set("a", profile:"personal"); await subscription.setDelay(.seconds(5))
+    let running = Task { try await ai.handle("ai:ask", payload:["question":"Closing window"], conversationID:"a") }
+    for _ in 0..<100 { if await subscription.calls.count > 0 { break }; try await Task.sleep(for:.milliseconds(5)) }
+    await owners.remove("a"); await ai.profileChanged()
+    do { _ = try await running.value; XCTFail("Closing the actual owner must stop its answer") }
+    catch { expectEqual((error as? ServiceError)?.code, "CANCELLED") }
+    expectEqual(await ai.status(for:AIProfileScope(id:"personal"), conversationID:"a")["latest"], .null)
+    await ai.close()
+  }
+  func testSubscriptionLogoutResetsEveryAffectedProfileButPreservesAnotherProvider() async throws {
+    let owners = AIWindowOwners(), codex = FixtureSubscription(), claude = FixtureSubscription()
+    for name in ["a","b","c"] { await owners.set(name, profile:name) }
+    let ai = NativeAIService(directory:try directory(), currentProfile:{ AIProfileScope(id:"a") },
+      conversationProfile:{ await owners.profile($0) }, context:{ _ in [] }, codex:codex, claude:claude)
+    _ = try await ai.handle("ai:configure", payload:["provider":"claude-code"], conversationID:"b")
+    for name in ["a","b","c"] { _ = try await ai.handle("ai:ask", payload:["question":.string(name)], conversationID:name) }
+    let events = await ai.events(); var reader = events.makeAsyncIterator()
+    _ = try await ai.handle("ai:disconnect", conversationID:"a")
+    var resetProfiles = Set<String>()
+    for _ in 0..<2 { if let event = await reader.next() { expectEqual(event["type"], "ai:reset"); resetProfiles.insert(event["profileId"].string) } }
+    expectEqual(resetProfiles, ["a","c"])
+    for name in ["a","c"] { expectEqual(await ai.status(for:AIProfileScope(id:name), conversationID:name)["latest"], .null) }
+    _ = try await ai.handle("ai:ask", payload:["question":"B followup"], conversationID:"b")
+    expectEqual(await claude.calls.last?.messages.count, 3)
+    await ai.close()
+  }
+  func testConnectionChecksOwnCancellationAcrossEveryLifecycleBoundary() async throws {
+    for boundary in ["cancel","reset","close","profile","caller"] {
+      let transport = CancellableConnectionTransport(), profile = FixtureProfile()
+      let ai = NativeAIService(directory:try directory(), currentProfile:{ await profile.current() }, context:{ _ in [] },
+        transport:transport, secrets:MemorySecrets(), codex:FixtureSubscription(), claude:FixtureSubscription())
+      _ = try await ai.handle("ai:configure", payload:["provider":"compatible","baseUrl":"http://127.0.0.1:8080/v1","model":"local"])
+      let running = Task { try await ai.handle("ai:test-connection", conversationID:"a") }
+      for _ in 0..<100 { if await transport.calls > 0 { break }; try await Task.sleep(for:.milliseconds(5)) }
+      expectEqual(await transport.calls, 1)
+      _ = try await ai.handle("ai:cancel", conversationID:"b")
+      _ = try await ai.handle("ai:reset", conversationID:"b")
+      expectEqual(await transport.cancelled, 0)
+      expectTrue(await ai.status()["busy"].bool)
+      let started = Date()
+      switch boundary {
+      case "cancel": _ = try await ai.handle("ai:cancel", conversationID:"a")
+      case "reset": await ai.clearConversation(profileID:"personal", conversationID:"a")
+      case "close": await ai.close()
+      case "profile": await profile.change("private",privateMode:true); await ai.profileChanged()
+      default: running.cancel()
+      }
+      do { _ = try await running.value; XCTFail("Connection check survived \(boundary)") }
+      catch { expectEqual((error as? ServiceError)?.code, "CANCELLED") }
+      XCTAssertLessThan(Date().timeIntervalSince(started), 1, boundary)
+      expectEqual(await transport.cancelled, 1)
+      expectFalse(await ai.status()["busy"].bool)
+      if ["cancel","reset","caller"].contains(boundary) {
+        await transport.setDelay(.zero)
+        expectTrue(try await ai.handle("ai:test-connection", conversationID:"a")["ok"].bool)
+      }
+      await ai.close()
+    }
   }
   private func directory() throws -> URL {
     let url = FileManager.default.temporaryDirectory.appendingPathComponent("ZacroServicesTests-" + UUID().uuidString)
@@ -206,4 +368,22 @@ final class AIServiceTests: XCTestCase {
     await connection.stop()
   }
 
+}
+
+private actor AIWindowOwners {
+  private var profiles: [String:AIProfileScope] = [:]
+  func set(_ window: String, profile: String, isPrivate: Bool = false) { profiles[window] = AIProfileScope(id:profile,isPrivate:isPrivate) }
+  func remove(_ window: String) { profiles.removeValue(forKey:window) }
+  func profile(_ window: String) -> AIProfileScope? { profiles[window] }
+}
+private actor CancellableConnectionTransport: ServiceHTTPTransport {
+  private(set) var calls = 0, cancelled = 0
+  private var delay: Duration = .seconds(5)
+  func setDelay(_ value: Duration) { delay = value }
+  func send(_ request: ServiceHTTPRequest) async throws -> ServiceHTTPResponse {
+    calls += 1
+    do { try await Task.sleep(for:delay) }
+    catch { if Task.isCancelled { cancelled += 1 }; throw error }
+    return ServiceHTTPResponse(status:200,body:["data":[["id":"local"]]])
+  }
 }

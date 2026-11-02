@@ -40,6 +40,8 @@ final class BrowserActions: ObservableObject {
   @Published var audibleTabIDs: Set<String> = []
   @Published var loadedTabIDs: Set<String> = []
   @Published var recordingShortcut = false
+  @Published var shortcutCaptureReady = false
+  @Published var shortcutCaptureError: String?
   @Published var findVisible = false
   @Published var findQuery = ""
   @Published var findMatchCount = 0
@@ -116,6 +118,7 @@ struct BrowserShell<Content: View>: View {
   @FocusState private var sidebarFocus: String?
   @Environment(\.accessibilityReduceMotion) private var reduceMotion
   @Environment(\.colorScheme) private var colorScheme
+  @Environment(\.colorSchemeContrast) private var contrast
   @State private var themeDraft: BrowserSpace?
   @State private var themeError: String?
   @State private var creatingSpace = false
@@ -141,9 +144,12 @@ struct BrowserShell<Content: View>: View {
     return value
   }
   private var effectiveMotion: Double { reduceMotion ? 0 : store.state.settings.motionScale }
+  private var isPopup: Bool {
+    store.state.windowSessions?.first(where: { $0.id == store.owningWindowID })?.kind == .popup
+  }
   private var colors: NativeSpacePalette {
     NativeSpacePalette(theme: theme, dark: theme.appearance == "dark"
-      || (theme.appearance == "system" && colorScheme == .dark))
+      || (theme.appearance == "system" && colorScheme == .dark), increasedContrast: contrast == .increased)
   }
   private var accent: Color { colors.accent }
   private var tabHeight: CGFloat { store.state.settings.tabDensity == "compact" ? 28 : 36 }
@@ -164,6 +170,7 @@ struct BrowserShell<Content: View>: View {
     return store.state.activeTab?.url ?? ""
   }
   private var sidebarWidth: Double {
+    guard !isPopup else { return 0 }
     let expanded = min(max(200, min(380, sidebarWidthDraft ?? store.state.settings.sidebarWidth)), max(0, availableWindowWidth - 240 - store.state.settings.pageGutter * 2))
     let fits = actions.library == nil || availableWindowWidth >= expanded + 260 + 240 + store.state.settings.pageGutter * 2
     return store.state.settings.sidebarVisible && fits ? expanded : 0
@@ -202,6 +209,37 @@ struct BrowserShell<Content: View>: View {
 
 
   var body: some View {
+    Group {
+      if isPopup { popupShell }
+      else { standardShell }
+    }
+  }
+
+  /// Registered extension options and Chrome popup windows retain their own
+  /// document, but do not inherit the browser's sidebar or Library presentation.
+  private var popupShell: some View {
+    content()
+      .frame(maxWidth: .infinity, maxHeight: .infinity)
+      .background {
+        NativeContentFrameReporter { frame in publishContentFrame(frame) }
+          .frame(maxWidth: .infinity, maxHeight: .infinity).allowsHitTesting(false)
+      }
+      .background {
+        NativePalettePresenter(
+          isPresented: $actions.findVisible,
+          content: AnyView(NativeFindBar(actions: actions, colors: colors)), motionScale: effectiveMotion,
+          frame: CGRect(x: max(actions.contentFrame.minX + 8, actions.contentFrame.maxX - 326),
+            y: max(4, actions.contentFrame.minY), width: min(310, max(200, actions.contentFrame.width - 24)), height: 32),
+          takesKey: true, dismissOnOutsideClick: false, dismissOnResign: false)
+          .frame(width: 0, height: 0).allowsHitTesting(false)
+      }
+      .onAppear {
+        actions.performInterfaceCommand = { _ in false }
+        actions.handleInterfaceEscape = { false }
+      }
+  }
+
+  private var standardShell: some View {
     ZStack {
       NativeThemeBackground(theme: theme)
         .mask(
@@ -331,9 +369,12 @@ struct BrowserShell<Content: View>: View {
       } else { themeDraft = nil; creatingSpace = false }
     }
     .onChange(of: store.state.activeSpaceID) { _, _ in
+      drag.resetReflow(store: store)
       discardThemePreview()
       maybeOpenBlankPalette()
     }
+    .onChange(of: store.activeProfileID) { _, _ in drag.cancel() }
+    .onChange(of: store.state.tabs) { _, _ in drag.reconcile(store: store) }
     .onChange(of: store.state.activeTabID) { _, _ in maybeOpenBlankPalette() }
     .onChange(of: actions.palette) { _, presented in if presented { discardThemePreview() } }
     .onChange(of: editor) { _, value in if value == nil { maybeOpenBlankPalette() } else { discardThemePreview() } }
@@ -364,7 +405,7 @@ struct BrowserShell<Content: View>: View {
   private var canDropSplit: Bool {
     guard let id = drag.id, let source = store.tab(id), let active = store.state.activeTab,
       id != active.id, source.url != "about:blank", active.url != "about:blank", !active.isClosed,
-      active.peek == nil, store.profileID(for: source) == store.activeProfileID,
+      (active.peek == nil || active.peek?.isPresented == false), store.profileID(for: source) == store.activeProfileID,
       store.split(for: source.id) == nil, store.split(for: active.id) == nil else { return false }
     return true
   }
@@ -628,6 +669,7 @@ struct BrowserShell<Content: View>: View {
           NativeActionPopover(title: "Browser menu", items: browserMenuItems, colors: colors)
         }
     }.background(colors.ink.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
+      .modifier(NativeSelectionContrast(selected: true, color: colors.ink, radius: 10))
   }
   private var tabList: some View {
     VStack(alignment: .leading, spacing: 2) {
@@ -819,6 +861,7 @@ struct BrowserShell<Content: View>: View {
       if let right = store.tab(group.rightTabID) { tabRow(right, section: .regular, grouped: true) }
     }.background(!highlightedTabIDs.isDisjoint(with: group.tabIDs) ? selectionBackground(true) : colors.ink.opacity(0.06),
       in: RoundedRectangle(cornerRadius: 10))
+      .modifier(NativeSelectionContrast(selected: !highlightedTabIDs.isDisjoint(with: group.tabIDs), color: colors.ink, radius: 10))
       .shadow(color: .black.opacity(0.07), radius: 1.5, y: 1)
       .accessibilityElement(children: .contain).accessibilityLabel("Split view")
   }
@@ -925,6 +968,7 @@ struct BrowserShell<Content: View>: View {
       .frame(maxWidth: .infinity)
       .background(grouped ? .clear : selected ? (favorite ? favoriteSelection(tab) : selectionBackground(true)) : favorite || hovered ? colors.ink.opacity(0.05) : .clear,
         in: RoundedRectangle(cornerRadius: 10))
+      .modifier(NativeSelectionContrast(selected: selected && !grouped && drag.id == nil, color: colors.ink, radius: 10))
       .opacity(drag.id == tab.id ? 0.45 : 1)
       .shadow(color: .black.opacity(selected && !grouped && drag.id == nil ? 0.07 : 0), radius: 1.5, y: 1)
       .onHover { if $0 { hoveredTab = tab.id } else if hoveredTab == tab.id { hoveredTab = nil } }
@@ -1021,6 +1065,7 @@ struct BrowserShell<Content: View>: View {
             space.id == store.state.activeSpaceID ? 1 : 0.45)
             .frame(width: 26, height: 26)
             .background(selectionBackground(space.id == store.state.activeSpaceID), in: RoundedRectangle(cornerRadius: 7))
+            .modifier(NativeSelectionContrast(selected: space.id == store.state.activeSpaceID, color: colors.ink, radius: 7))
         }.buttonStyle(.plain).help(space.name).accessibilityLabel("Switch to \(space.name)")
           .accessibilityAddTraits(space.id == store.state.activeSpaceID ? [.isSelected] : [])
           .contextMenu { spaceMenu(space) }
@@ -1085,7 +1130,7 @@ struct BrowserShell<Content: View>: View {
   private var palette: some View { NativeCommandPalette(store: store, actions: actions) }
   private func toggleSidebar() {
     if store.state.settings.sidebarVisible && sidebarWidth == 0 { actions.library = nil }
-    else { store.state.settings.sidebarVisible.toggle(); store.save() }
+    else { store.updateSettings { $0.sidebarVisible.toggle() } }
   }
   private func showPalette(_ request: NativePaletteRequest) {
     actions.openPalette()
@@ -1478,6 +1523,13 @@ private enum SidebarSection: Equatable {
   @Published var preview: [BrowserTab]?
   private var hover: DispatchWorkItem?
   private var projectedGroupID: String?
+  private var projection: Projection?
+  private struct Projection {
+    let space: String
+    let section: SidebarSection
+    let before: String?
+    let after: Bool
+  }
   func start(_ id: String, tabs: [BrowserTab]) {
     cancel()
     self.id = id
@@ -1490,6 +1542,25 @@ private enum SidebarSection: Equatable {
     id = nil
     preview = nil
     projectedGroupID = nil
+    projection = nil
+  }
+  func resetReflow(store: BrowserStore) {
+    guard id != nil else { return }
+    projection = nil
+    reconcile(store: store)
+  }
+  func reconcile(store: BrowserStore) {
+    guard let id else { return }
+    guard let source = store.tab(id), store.profileID(for: source) == store.activeProfileID else {
+      cancel(); return
+    }
+    if let projection {
+      project(store: store, space: projection.space, section: projection.section,
+        before: projection.before, after: projection.after)
+    } else {
+      projectedGroupID = source.groupID
+      preview = store.state.tabs
+    }
   }
   func stopHover() {
     hover?.cancel()
@@ -1505,7 +1576,11 @@ private enum SidebarSection: Equatable {
     guard let id, let source = store.tab(id), before != id,
       store.state.spaces.first(where: { $0.id == space })?.profileID == store.profileID(for: source)
     else { return }
-    var projected = preview ?? store.state.tabs
+    // Reflow is only a presentation of the latest model. A page can finish
+    // loading, open another tab, or close while a native drag is in progress.
+    // Reusing the previous projection would hide those changes until drop.
+    projection = Projection(space: space, section: section, before: before, after: after)
+    var projected = store.state.tabs
     guard let index = projected.firstIndex(where: { $0.id == id }) else { return }
     var moved = projected.remove(at: index)
     projectedGroupID = before.flatMap { store.tab($0)?.groupID }
@@ -1528,7 +1603,10 @@ private enum SidebarSection: Equatable {
     }
     projected.insert(moved, at: min(projected.count, destination))
     guard projected != preview else { return }
-    withAnimation(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? nil : .easeInOut(duration: 0.14)) { preview = projected }
+    let duration = 0.14 * store.state.settings.motionScale
+    withAnimation(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? nil : .easeInOut(duration: duration)) {
+      preview = projected
+    }
   }
   func commit(store: BrowserStore, space: String, section: SidebarSection? = nil) -> Bool {
     guard let id, let source = store.tab(id),

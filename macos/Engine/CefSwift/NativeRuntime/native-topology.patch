@@ -60,7 +60,15 @@
  }
 --- a/extensions/browser/event_router.h
 +++ b/extensions/browser/event_router.h
-@@ -141,6 +141,12 @@
+@@ -13,6 +13,7 @@
+ #include <vector>
+ 
+ #include "base/compiler_specific.h"
++#include "base/callback_list.h"
+ #include "base/containers/flat_map.h"
+ #include "base/functional/callback.h"
+ #include "base/gtest_prod_util.h"
+@@ -141,6 +142,16 @@
      virtual void OnNonExtensionEventDispatched(const std::string& event_name) {}
      virtual void OnWillBroadcastEvent(const Event& event) {}
    };
@@ -70,10 +78,22 @@
 +  using NativeEventFilter = base::RepeatingCallback<bool(
 +      content::BrowserContext*, Event&, const std::string&)>;
 +  static void SetNativeEventFilter(NativeEventFilter filter);
++  base::CallbackListSubscription ObserveNativeListeners(
++      base::RepeatingCallback<void(const std::string&)> observer) {
++    return native_listener_changes_.Add(std::move(observer));
++  }
  
    // Gets the EventRouter for `browser_context`.
    static EventRouter* Get(content::BrowserContext* browser_context);
-@@ -725,10 +731,15 @@
+@@ -688,6 +699,7 @@
+   mojo::AssociatedReceiverSet<mojom::EventRouter, content::ChildProcessId>
+       receivers_;
+ 
++  base::RepeatingCallbackList<void(const std::string&)> native_listener_changes_;
+   base::WeakPtrFactory<EventRouter> weak_factory_{this};
+ };
+ 
+@@ -725,10 +737,15 @@
    // The event to dispatch.
    const std::string event_name;
  
@@ -99,7 +119,31 @@
  #include "base/strings/string_util.h"
  #include "base/task/sequenced_task_runner.h"
  #include "components/crx_file/id_util.h"
-@@ -1380,11 +1381,25 @@
+@@ -977,6 +978,7 @@
+ }
+ 
+ void EventRouter::OnListenerAdded(const EventListener* listener) {
++  native_listener_changes_.Notify(listener->event_name());
+   RenderProcessHost* process = listener->process();
+   content::ChildProcessId render_process_id;
+   if (process) {
+@@ -999,6 +1001,7 @@
+ }
+ 
+ void EventRouter::OnListenerRemoved(const EventListener* listener) {
++  native_listener_changes_.Notify(listener->event_name());
+   auto render_process_id = listener->process() ? listener->process()->GetID()
+                                                : content::ChildProcessId();
+   const EventListenerInfo details(
+@@ -1016,6 +1019,7 @@
+ }
+ 
+ void EventRouter::OnListenerUpdated(const EventListener* listener) {
++  native_listener_changes_.Notify(listener->event_name());
+   // `UpdateFilter()` only updates lazy listeners, which have no process.
+   CHECK(listener->IsLazy());
+ 
+@@ -1380,11 +1384,25 @@
    }
  }
  
@@ -126,7 +170,7 @@
    // We don't expect to get events from a completely different browser context.
    DCHECK(!event->restrict_to_browser_context ||
           ExtensionsBrowserClient::Get()->IsSameContext(
-@@ -2128,6 +2143,7 @@
+@@ -2128,6 +2146,7 @@
        user_gesture, std::move(copied_filter_info),
        lazy_background_active_on_dispatch, dispatch_start_time);
  

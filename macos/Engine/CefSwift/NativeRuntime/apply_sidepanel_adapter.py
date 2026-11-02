@@ -6,6 +6,7 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
+import tempfile
 
 ROOT = Path(__file__).resolve().parent
 PIN = "d0c02bfad08ec92a6ffcf989e53cd995e6381a4c"
@@ -20,8 +21,10 @@ MANAGER_H = "chrome/browser/ui/extensions/extension_side_panel_manager.h"
 MANAGER_CC = "chrome/browser/ui/extensions/extension_side_panel_manager.cc"
 HOST_H = "chrome/browser/extensions/extension_view_host.h"
 FACTORY_CC = "chrome/browser/extensions/extension_view_host_factory.cc"
+BROWSER_H = "chrome/browser/ui/views/frame/browser_view.h"
+BROWSER_CC = "chrome/browser/ui/views/frame/browser_view.cc"
 PATHS = (REGISTRY_H, REGISTRY_CC, UI_H, VIEWS_H, VIEWS_CC, COORDINATOR_H,
-         COORDINATOR_CC, MANAGER_H, MANAGER_CC, HOST_H, FACTORY_CC)
+         COORDINATOR_CC, MANAGER_H, MANAGER_CC, HOST_H, FACTORY_CC, BROWSER_H, BROWSER_CC)
 
 
 def replace(text, old, new):
@@ -40,12 +43,22 @@ def generated(originals):
   virtual SidePanelNativeView TakeNativeGlobalView(const SidePanelEntryKey& key) {
     return nullptr;
   }
+  virtual void SetNativeEmptyContentHidden(bool hidden) {}
 
   // Close the side panel.""")
     result[VIEWS_H] = replace(result[VIEWS_H], "  // SidePanelUI:\n", """  // SidePanelUI:
   SidePanelNativeView TakeNativeGlobalView(const SidePanelEntryKey& key) override;
+  void SetNativeEmptyContentHidden(bool hidden) override;
 """)
-    result[VIEWS_CC] = replace(result[VIEWS_CC], "void SidePanelCoordinator::Close(SidePanelEntryHideReason reason,", """SidePanelNativeView SidePanelCoordinator::TakeNativeGlobalView(
+    result[VIEWS_CC] = replace(result[VIEWS_CC], '#include "chrome/browser/ui/views/side_panel/side_panel_coordinator.h"',
+        '#include "chrome/browser/ui/views/side_panel/side_panel_coordinator.h"\n#include "chrome/browser/ui/views/frame/browser_view.h"')
+    result[VIEWS_CC] = replace(result[VIEWS_CC], "void SidePanelCoordinator::Close(SidePanelEntryHideReason reason,", """void SidePanelCoordinator::SetNativeEmptyContentHidden(bool hidden) {
+  if (auto* view = BrowserView::GetBrowserViewForBrowser(browser())) {
+    view->SetNativeEmptyContentHidden(hidden);
+  }
+}
+
+SidePanelNativeView SidePanelCoordinator::TakeNativeGlobalView(
     const SidePanelEntryKey& key) {
   if (!IsSidePanelEntryShowing(key, /*for_tab=*/false)) return nullptr;
   auto* panel = GetSidePanel();
@@ -125,12 +138,16 @@ void ExtensionSidePanelCoordinator::DeregisterEntry() {""")
   // panels and cross-profile transfers are deliberately not transferred.
   bool TransferNativeGlobalPanel(const ExtensionId& extension_id,
                                 ExtensionSidePanelManager* destination);""")
+    result[MANAGER_H] = replace(result[MANAGER_H], "      scoped_unowned_user_data_;", """      scoped_unowned_user_data_;
+  base::WeakPtrFactory<ExtensionSidePanelManager> native_weak_factory_{this};""")
     result[MANAGER_CC] = replace(result[MANAGER_CC], '#include "chrome/browser/ui/extensions/extension_side_panel_coordinator.h"',
         '#include "chrome/browser/ui/extensions/extension_side_panel_coordinator.h"\n#include "chrome/browser/ui/side_panel/side_panel_registry.h"\n#include "chrome/browser/ui/side_panel/side_panel_ui.h"')
     result[MANAGER_CC] = replace(result[MANAGER_CC], "void ExtensionSidePanelManager::RegisterExtensionEntries() {", """bool ExtensionSidePanelManager::TransferNativeGlobalPanel(
     const ExtensionId& extension_id, ExtensionSidePanelManager* destination) {
   if (!destination || destination == this || for_tab_ || destination->for_tab_ ||
       profile_ != destination->profile_) return false;
+  const auto source_manager = native_weak_factory_.GetWeakPtr();
+  const auto target_manager = destination->native_weak_factory_.GetWeakPtr();
   auto source = coordinators_.find(extension_id);
   auto target = destination->coordinators_.find(extension_id);
   if (source == coordinators_.end() || !source->second->host() ||
@@ -143,20 +160,23 @@ void ExtensionSidePanelCoordinator::DeregisterEntry() {""")
   const auto* original_entry = coordinator->GetEntry();
   auto* source_ui = SidePanelUI::From(browser_);
   auto* target_ui = SidePanelUI::From(destination->browser_);
-  if (!source_ui || !target_ui || !coordinator->GetEntry() ||
-      !source_ui->IsSidePanelEntryShowing(key, /*for_tab=*/false)) return false;
-  // A contextual panel takes precedence in Chrome. Keep the global document
-  // retained in the old view until a tab without an override becomes active.
+  if (!source_ui || !target_ui || !coordinator->GetEntry()) return false;
+  // Contextual panels retain precedence. The global document can still move
+  // into that window's inactive registry cache, so closing its previous host
+  // cannot destroy it merely because the selected tab has an override.
+  bool show_global = true;
   if (auto* tab = destination->browser_->GetActiveTabInterface()) {
     auto* contextual = SidePanelRegistry::From(tab);
-    if (contextual && contextual->GetEntryForKey(key)) return false;
+    if (contextual && contextual->GetEntryForKey(key)) show_global = false;
   }
-  auto view = source_ui->TakeNativeGlobalView(key);
+  auto view = source_ui->IsSidePanelEntryShowing(key, /*for_tab=*/false)
+      ? source_ui->TakeNativeGlobalView(key) : std::move(coordinator->GetEntry()->CachedView());
   if (!view) return false;
   // Closing the shell invokes arbitrary native entry observers. They may
   // deregister a panel, replace a coordinator or unload the extension. Never
   // reuse a pre-callback iterator or require those objects to survive.
   auto still_current = [&]() {
+    if (!source_manager || !target_manager) return false;
     const auto current_source = coordinators_.find(extension_id);
     const auto current_target = destination->coordinators_.find(extension_id);
     return source_weak && target_weak &&
@@ -178,6 +198,7 @@ void ExtensionSidePanelCoordinator::DeregisterEntry() {""")
   // Hold the coordinator ourselves while action-item callbacks run. Registry
   // unload observers cannot delete it while RebindNativeBrowser is executing.
   if (!moved->RebindNativeBrowser(destination->browser_, destination->registry_)) return false;
+  if (!source_manager || !target_manager) return false;
   entry->CacheView(std::move(view));
   if (!destination->registry_->Register(std::move(entry))) return false;
   if (!moved->host() || ExtensionRegistry::Get(profile_)->enabled_extensions().GetByID(extension_id) != extension.get()) {
@@ -185,20 +206,69 @@ void ExtensionSidePanelCoordinator::DeregisterEntry() {""")
     return false;
   }
   destination->coordinators_[extension_id] = std::move(moved);
-  target_ui->Show(key, std::nullopt, /*suppress_animations=*/true);
+  if (show_global) target_ui->Show(key, std::nullopt, /*suppress_animations=*/true);
+  if (!source_manager || !target_manager) return false;
   // This physical view can still receive future per-profile option changes.
   if (ExtensionRegistry::Get(profile_)->enabled_extensions().GetByID(extension_id) == extension.get())
     MaybeCreateExtensionSidePanelCoordinator(extension.get());
   return source_weak && source_weak->host() &&
-      target_ui->IsSidePanelEntryShowing(key, /*for_tab=*/false);
+      (!show_global || target_ui->IsSidePanelEntryShowing(key, /*for_tab=*/false));
 }
 
 void ExtensionSidePanelManager::RegisterExtensionEntries() {""")
+    result[BROWSER_H] = replace(result[BROWSER_H], "  views::View* contents_container();", """  views::View* contents_container();
+
+  // A native shell paints its own themed empty canvas. Keep extension UI
+  // visible while suppressing only the blank renderer beneath it.
+  void SetNativeEmptyContentHidden(bool hidden);""")
+    result[BROWSER_H] = replace(result[BROWSER_H], " private:\n", " private:\n  bool native_empty_content_hidden_ = false;\n")
+    result[BROWSER_CC] = replace(result[BROWSER_CC], "void BrowserView::FrameColorsChanged() {", """void BrowserView::SetNativeEmptyContentHidden(bool hidden) {
+  auto* tab = browser_->GetActiveTabInterface();
+  if (hidden && (!tab || !tab->GetContents() ||
+      tab->GetContents()->GetLastCommittedURL() != GURL("about:blank"))) hidden = false;
+  if (native_empty_content_hidden_ == hidden) return;
+  native_empty_content_hidden_ = hidden;
+  for (const auto& container : GetContentsContainerViews()) {
+    // Opacity retains the content slot's geometry, unlike SetVisible(false),
+    // and does not remove the real tab or its extension action permissions.
+    if (!container->layer()) container->SetPaintToLayer();
+    container->layer()->SetOpacity(hidden ? 0.0f : 1.0f);
+    container->SetCanProcessEventsWithinSubtree(!hidden);
+  }
+  FrameColorsChanged();
+}
+
+void BrowserView::FrameColorsChanged() {
+  if (native_empty_content_hidden_) {
+    GetWidget()->SetBackgroundColor(SK_ColorTRANSPARENT);
+    return;
+  }""")
     return result
 
 
 def digest(text):
     return hashlib.sha256(text.encode()).hexdigest()
+
+
+def source_baselines(source):
+    originals = {path: subprocess.check_output(["git", "show", "HEAD:" + path], cwd=source, text=True) for path in PATHS}
+    cef = source / "cef"
+    if not subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=cef, text=True).startswith("4fa4ab516dac"):
+        raise SystemExit("The pinned CEF source revision changed")
+    with tempfile.TemporaryDirectory(prefix="zacro-sidepanel-baseline-") as temporary:
+        tree = Path(temporary)
+        for path, text in originals.items():
+            destination = tree / path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(text)
+        for name in ("chrome_runtime_views", "win_taskbar_decorator_3645"):
+            upstream = subprocess.check_output(["git", "show", "HEAD:patch/patches/" + name + ".patch"], cwd=cef, text=True)
+            selected = ["diff --git " + section for section in upstream.split("diff --git ")[1:]
+                        if section.splitlines()[0].split()[0] in PATHS]
+            if selected:
+                subprocess.run(["git", "apply", "-p0", "--unsafe-paths", "-"], cwd=tree,
+                               input="".join(selected), text=True, check=True)
+        return {path: (tree / path).read_text() for path in PATHS}
 
 
 def main():
@@ -210,7 +280,7 @@ def main():
     revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True).strip()
     if revision != PIN:
         raise SystemExit(f"Expected pinned Chromium {PIN}, found {revision}")
-    originals = {path: subprocess.check_output(["git", "show", "HEAD:" + path], cwd=source, text=True) for path in PATHS}
+    originals = source_baselines(source)
     output = generated(originals)
     receipt = source / "out/zacro-sidepanel.json"
     prior = json.loads(receipt.read_text()) if receipt.exists() else {}

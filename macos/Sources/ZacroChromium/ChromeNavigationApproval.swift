@@ -20,8 +20,22 @@ public struct ChromeNavigationApproval: Sendable {
   }
 }
 
+public struct ChromeExtensionOptions: Sendable {
+  public let approval: ChromeNavigationApproval
+  public let openInTab: Bool
+  public let name: String
+}
+
 @MainActor
 extension ChromeExtensionManager {
+  public func optionsPage(_ identifier: String) async throws -> ChromeExtensionOptions {
+    let result = try await nativeBrowser().devTools.call("Zacro.getExtensionOptions", parameters: ["id": identifier])
+    guard let openInTab = result["openInTab"] as? Bool, let name = result["name"] as? String else {
+      throw ChromeExtensionError.invalidResponse
+    }
+    return try ChromeExtensionOptions(approval: ChromeNavigationApproval(profileID: profileID, response: result),
+      openInTab: openInTab, name: name)
+  }
   public func authorizeHostNavigation(requestID: String, url: URL) async throws -> ChromeNavigationApproval {
     let result = try await nativeBrowser().devTools.call("Zacro.authorizeHostNavigation", parameters: [
       "requestID": requestID, "url": url.absoluteString,
