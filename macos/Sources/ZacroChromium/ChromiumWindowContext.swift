@@ -5,6 +5,7 @@ import Foundation
 /// contexts preserves its renderer, navigation history and extension tab ID.
 @MainActor
 public final class ChromiumWindowContext: NSObject, NSWindowDelegate {
+  public static let fullScreenTransitionFailedNotification = Notification.Name("ZacroBrowserWindowFullScreenTransitionFailed")
   public internal(set) var id: String
   public internal(set) var nativeID: Int {
     didSet { window.identifier = NSUserInterfaceItemIdentifier("ZacroBrowserWindow:\(nativeID)") }
@@ -47,4 +48,11 @@ public final class ChromiumWindowContext: NSObject, NSWindowDelegate {
   public func windowDidResize(_ notification: Notification) { onLayout?() }
   public func windowDidMove(_ notification: Notification) { onLayout?() }
   public func windowDidBecomeKey(_ notification: Notification) { engine?.windowDidFocus(id: id) }
+  public func windowDidFailToEnterFullScreen(_ window: NSWindow) { fullScreenTransitionFailed(window) }
+  public func windowDidFailToExitFullScreen(_ window: NSWindow) { fullScreenTransitionFailed(window) }
+  private func fullScreenTransitionFailed(_ sender: NSWindow) {
+    guard sender === window else { return }
+    NotificationCenter.default.post(name: Self.fullScreenTransitionFailedNotification, object: sender)
+    onLayout?()
+  }
 }

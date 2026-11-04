@@ -27,7 +27,12 @@ struct NativeChromeButtonStyle: ButtonStyle {
       .padding(.horizontal, prominent ? 12 : 10).padding(.vertical, prominent ? 8 : 7)
       .foregroundStyle(prominent ? (colors.dark ? Color(red: 43 / 255, green: 23 / 255, blue: 32 / 255) : .white) : colors.ink)
       .background(prominent ? colors.accent : hovered ? colors.hover : colors.card.opacity(0.84), in: RoundedRectangle(cornerRadius: 7))
-      .overlay { if !prominent { RoundedRectangle(cornerRadius: 7).strokeBorder(colors.line, lineWidth: 1) } }
+      .overlay {
+        if !prominent {
+          RoundedRectangle(cornerRadius: 7).strokeBorder(colors.line, lineWidth: 1)
+            .allowsHitTesting(false).accessibilityHidden(true)
+        }
+      }
       .contentShape(RoundedRectangle(cornerRadius: 7))
       .scaleEffect(configuration.isPressed && enabled && !reduceMotion ? 0.97 : 1)
       .opacity(enabled ? 1 : 0.38)
@@ -128,9 +133,14 @@ struct NativeChromeSelect<Value: Hashable>: View {
 struct NativeChromeTextFieldStyle: TextFieldStyle {
   let colors: NativeSpacePalette
   func _body(configuration: TextField<Self._Label>) -> some View {
-    configuration.textFieldStyle(.plain).padding(.horizontal, 9).padding(.vertical, 7)
+    configuration.textFieldStyle(.plain)
+      .frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
+      .padding(.horizontal, 9).padding(.vertical, 7)
       .background(colors.card.opacity(0.84), in: RoundedRectangle(cornerRadius: 7))
-      .overlay { RoundedRectangle(cornerRadius: 7).strokeBorder(colors.line, lineWidth: 1) }
+      .overlay {
+        RoundedRectangle(cornerRadius: 7).strokeBorder(colors.line, lineWidth: 1)
+          .allowsHitTesting(false).accessibilityHidden(true)
+      }
   }
 }
 

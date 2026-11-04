@@ -22,12 +22,13 @@ CONSTRAINED = "components/constrained_window/constrained_window_views.cc"
 CONSTRAINED_BUILD = "components/constrained_window/BUILD.gn"
 BRIDGE = "components/remote_cocoa/app_shim/native_widget_ns_window_bridge.mm"
 BRIDGE_BUILD = "components/remote_cocoa/app_shim/BUILD.gn"
+CAPTURE = "components/remote_cocoa/app_shim/mouse_capture.mm"
 EXTERNAL_PARENT = "components/remote_cocoa/app_shim/external_window_modal_parent.h"
 EXTERNAL_PARENT_IMPL = "components/remote_cocoa/app_shim/zacro_external_window_modal_parent.inc"
 NEW = {EXTERNAL_PARENT: "native_external_window_modal_parent.h.in",
        EXTERNAL_PARENT_IMPL: "native_external_window_modal_parent.inc"}
 PATHS = (INSTALL_H, INSTALL_CC, PARAMS, VIEW, UNINSTALL_H, UNINSTALL_CC, CONSTRAINED,
-         CONSTRAINED_BUILD, BRIDGE, BRIDGE_BUILD, *NEW)
+         CONSTRAINED_BUILD, BRIDGE, BRIDGE_BUILD, CAPTURE, *NEW)
 
 
 def replace(text, old, new):
@@ -38,6 +39,83 @@ def replace(text, old, new):
 
 def generated(originals):
     output = dict(originals)
+    # Keep the dispatch/capture contract byte-for-byte: these optional scalar
+    # diagnostics only observe the pinned local monitor's actual return path.
+    capture = replace(output[CAPTURE], '#include "base/check_op.h"',
+                      '#include "base/check_op.h"\n#include "base/logging.h"')
+    capture = replace(capture, '#include <memory>', '#include <cstdint>\n#include <memory>')
+    capture = replace(capture, 'namespace remote_cocoa {\n', '''namespace remote_cocoa {
+namespace {
+bool NativeCaptureTraceEnabled() {
+  static const bool enabled =
+      [NSProcessInfo.processInfo.arguments containsObject:@"--engine-acceptance"] &&
+      [NSProcessInfo.processInfo.arguments
+          containsObject:@"--native-integration-acceptance"] &&
+      [NSProcessInfo.processInfo.environment[@"ZACRO_NATIVE_CAPTURE_TRACE"]
+          isEqualToString:@"1"];
+  return enabled;
+}
+}  // namespace
+''')
+    capture = replace(capture, '''  [NSEvent removeMonitor:global_monitor_];
+  [NSEvent removeMonitor:local_monitor_];
+  g_active_event_tap = nullptr;''', '''  // Snapshot before removing monitors or notifying a possibly reentrant owner.
+  const bool trace_capture = NativeCaptureTraceEnabled();
+  const NSInteger capture_window_number = trace_capture
+      ? [GetCaptureWindow() windowNumber] : 0;
+  [NSEvent removeMonitor:global_monitor_];
+  [NSEvent removeMonitor:local_monitor_];
+  g_active_event_tap = nullptr;
+  if (trace_capture) {
+    LOG(ERROR) << "Native mouse capture stage=released capture_window="
+               << capture_window_number << " active_count=0";
+  }''')
+    capture = replace(capture, '''    bool handled = weak_ptr->delegate_->PostCapturedEvent(event);''', '''    // The delegate may destroy the capture, its window, or another monitor.
+    // Read only scalar values before dispatch; never touch its owner afterward.
+    const bool trace_capture = NativeCaptureTraceEnabled() &&
+        event.type == NSEventTypeScrollWheel;
+    NSInteger capture_window_number = 0;
+    NSInteger target_window_number = 0;
+    NSUInteger phase = 0;
+    NSUInteger momentum_phase = 0;
+    int64_t timestamp_micros = 0;
+    CGFloat delta_x = 0;
+    CGFloat delta_y = 0;
+    if (trace_capture) {
+      capture_window_number = [weak_ptr->delegate_->GetWindow() windowNumber];
+      target_window_number = event.windowNumber;
+      phase = event.phase;
+      momentum_phase = event.momentumPhase;
+      timestamp_micros = static_cast<int64_t>(event.timestamp * 1'000'000);
+      delta_x = event.scrollingDeltaX;
+      delta_y = event.scrollingDeltaY;
+      LOG(ERROR) << "Native mouse capture stage=local-scroll-enter capture_window="
+                 << capture_window_number << " target_window=" << target_window_number
+                 << " phase=" << phase << " momentum=" << momentum_phase
+                 << " timestamp_us=" << timestamp_micros
+                 << " delta_x=" << delta_x << " delta_y=" << delta_y
+                 << " active_count=1";
+    }
+    bool handled = weak_ptr->delegate_->PostCapturedEvent(event);
+    if (trace_capture) {
+      LOG(ERROR) << "Native mouse capture stage=local-scroll-return capture_window="
+                 << capture_window_number << " target_window=" << target_window_number
+                 << " phase=" << phase << " momentum=" << momentum_phase
+                 << " timestamp_us=" << timestamp_micros
+                 << " delta_x=" << delta_x << " delta_y=" << delta_y
+                 << " handled=" << handled << " returns_nil=" << handled;
+    }''')
+    capture = replace(capture, '''      [NSEvent addGlobalMonitorForEventsMatchingMask:event_mask
+                                             handler:global_block];''', '''      [NSEvent addGlobalMonitorForEventsMatchingMask:event_mask
+                                             handler:global_block];
+  if (NativeCaptureTraceEnabled()) {
+    LOG(ERROR) << "Native mouse capture stage=installed capture_window="
+               << [GetCaptureWindow() windowNumber]
+               << " local_monitor=" << (local_monitor_ != nil)
+               << " global_monitor=" << (global_monitor_ != nil)
+               << " active_count=" << (g_active_event_tap == this ? 1 : 0);
+  }''')
+    output[CAPTURE] = capture
     callback_decl = '''  // Native browser operations retain Chrome's consent UI and result callback.
   // Validation and cancellation registration run only on the UI thread. The
   // registration replaces the prior pending-icon/widget cancellation closure.

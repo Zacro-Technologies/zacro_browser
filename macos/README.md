@@ -19,11 +19,11 @@ Native state is stored separately in `~/Library/Application Support/Zacro Native
 
 ## Validation
 
-The latest completed Core/Services run passed 321 tests. Build 61's native extension suite passed all 306 checks with normal application exit. Focused interface, navigation, restoration, window-transfer and accessibility checks also passed; the verification record gives exact builds and coverage. The updated custom framework 66 has passed provenance validation.
+The latest completed Core/Services run passed 321 tests. Recent work aligns window controls and sidebar rows, preserves native text editing, and keeps Space transitions continuous with retained pages and scroll positions. Window transparency is applied once; an empty canvas keeps an opaque theme-colored surface.
 
-Build 70 passed 10 media checks, 28 extension-host checks and 71 independent engine/window/accessibility checks, all with normal exits. The pane-edge and motion changes passed 155 focused checks in 68 and actual visual review. Full 70 attempts stopped at foreground readiness; full-application acceptance remains open. The delivered `dist` apps remain build 40.
+Release 105 passed all 1,032 full application checks and 71 independent engine, window and scoped accessibility checks, with normal browser and TURN exits. Both `dist/Zacro Native.app` and `macos/dist/Zacro Native.app` now contain version **0.11.0** from that accepted release, with matching executable/provenance hashes and verified development signatures. See the [verification record](../docs/native-parity/verification.md#current-completion-record) for exact scope and historical failures.
 
-Desktop review confirmed the corrected pane contour, live tinted content beneath Peek, expansion retaining its draft, content-only mode, Unsplit, Favorite/pin/folder creation and saved themes. Physical drag/trackpad, VoiceOver, production Keychain and distribution checks remain separate gates. Universal Chrome extension compatibility is not established; some APIs have [external requirements](../docs/native-parity/compatibility-boundaries.md).
+Earlier desktop review confirmed the corrected pane contour, live tinted content beneath Peek, expansion retaining its draft, content-only mode, Unsplit, Favorite/pin/folder creation and saved themes. Physical drag/trackpad, VoiceOver, production Keychain and distribution checks remain separate gates. Universal Chrome extension compatibility is not established; some APIs have [external requirements](../docs/native-parity/compatibility-boundaries.md).
 
 Run the isolated checks after packaging:
 

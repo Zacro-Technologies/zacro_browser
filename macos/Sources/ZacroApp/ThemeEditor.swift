@@ -196,7 +196,7 @@ private struct NativeThemeTint: View {
             .opacity(theme.grain * 0.18 * 0.7)
         }
       }.frame(width: width, height: height).clipped()
-    }
+    }.allowsHitTesting(false).accessibilityHidden(true)
   }
 }
 
@@ -216,12 +216,58 @@ struct NativeThemeBackground: View {
   }
 }
 
+/// Window transitions crossfade opaque tint recipes first, then apply one
+/// window tint opacity and one material. Empty canvases use their separate
+/// opaque backdrop; the editor's single-theme recipe above remains unchanged.
+@MainActor
+struct NativeSpaceWindowBackdrop: View {
+  @ObservedObject var viewport: NativeSpaceViewport
+  var spaces: [BrowserSpace]
+  var fallback: SpaceTheme
+  var prefersFallback = false
+  @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+  @Environment(\.colorSchemeContrast) private var contrast
+
+  init(viewport: NativeSpaceViewport, spaces: [BrowserSpace], fallback: SpaceTheme,
+    prefersFallback: Bool = false) {
+    _viewport = ObservedObject(wrappedValue: viewport)
+    self.spaces = spaces; self.fallback = fallback; self.prefersFallback = prefersFallback
+  }
+
+  var body: some View {
+    let presentation = NativeSpaceBackdropPresentation.resolve(blend: viewport.blend,
+      isTracking: viewport.isTracking, isAnimating: viewport.isAnimating,
+      spaces: spaces, fallback: fallback, prefersFallback: prefersFallback,
+      selectedID: viewport.selectedID)
+    let style = NativeSpaceWindowBackdropStyle.resolve(presentation,
+      reduceTransparency: reduceTransparency, increasedContrast: contrast == .increased)
+    ZStack {
+      if style.materialAmount > 0 { ThemeMaterial(amount: style.materialAmount) }
+      NativeSpaceBackdrop(viewport: viewport, spaces: spaces, fallback: fallback,
+        prefersFallback: prefersFallback) { endpoint in
+          NativeThemeTint(theme: endpoint)
+        }
+        .compositingGroup()
+        .opacity(style.tintOpacity)
+    }.allowsHitTesting(false).accessibilityHidden(true)
+  }
+}
+
 /// An opaque empty canvas uses the Space colors without stacking another blur.
 struct NativeEmptyPageBackground: View {
   var theme: SpaceTheme
   @Environment(\.presentedSpaceTheme) private var presented
+  @Environment(\.nativeSpaceBackdropContext) private var backdropContext
   var body: some View {
-    NativeThemeTint(theme: presented ?? theme).allowsHitTesting(false).accessibilityHidden(true)
+    Group {
+      if let backdropContext {
+        NativeSpaceBackdrop(context: backdropContext) { endpoint in
+          NativeThemeTint(theme: endpoint)
+        }
+      } else {
+        NativeThemeTint(theme: presented ?? theme)
+      }
+    }.allowsHitTesting(false).accessibilityHidden(true)
   }
 }
 
@@ -376,26 +422,29 @@ struct ThemeEditor: View {
   }
 
   private var colorField: some View {
-    GeometryReader { geometry in
-      ZStack {
-        colors.chrome
-        NativeThemeTint(theme: theme).opacity(reduceTransparency || contrast == .increased ? 1 : theme.opacity)
-        Canvas { context, size in
-          for x in stride(from: 7.0, through: size.width, by: 8) {
-            for y in stride(from: 7.0, through: size.height, by: 8) {
-              context.fill(
-                Path(ellipseIn: CGRect(x: x, y: y, width: 1, height: 1)),
-                with: .color(colors.ink.opacity(0.22)))
-            }
+    ZStack {
+      colors.chrome
+      NativeThemeTint(theme: theme).opacity(reduceTransparency || contrast == .increased ? 1 : theme.opacity)
+      Canvas { context, size in
+        for x in stride(from: 7.0, through: size.width, by: 8) {
+          for y in stride(from: 7.0, through: size.height, by: 8) {
+            context.fill(
+              Path(ellipseIn: CGRect(x: x, y: y, width: 1, height: 1)),
+              with: .color(colors.ink.opacity(0.22)))
           }
-        }.allowsHitTesting(false)
-        puck(primary: true, size: geometry.size)
-        puck(primary: false, size: geometry.size)
+        }
+      }.allowsHitTesting(false)
+      VStack(spacing: 0) {
+        appearanceControls.padding(.top, 12).padding(.bottom, 8)
+        GeometryReader { geometry in
+          ZStack {
+            puck(primary: true, size: geometry.size)
+            puck(primary: false, size: geometry.size)
+          }.coordinateSpace(name: "themeColors")
+        }.background { NativeInterfaceAlignmentMark(id: "theme-puck-region") }
       }
-      .coordinateSpace(name: "themeColors")
-      .clipShape(RoundedRectangle(cornerRadius: 10))
-      .overlay(alignment: .top) { appearanceControls.padding(.top, 12) }
     }.frame(height: 218)
+      .clipShape(RoundedRectangle(cornerRadius: 10))
   }
 
   private var appearanceControls: some View {
@@ -406,6 +455,7 @@ struct ThemeEditor: View {
         } label: {
           NativeGlyph(appearance == "system" ? "sparkles" : appearance == "light" ? "sun.max" : "moon.stars.fill", size: 17)
             .frame(width: 34, height: 32)
+            .background { NativeInterfaceAlignmentMark(id: "theme-appearance-" + appearance) }
             .background(colors.ink.opacity(theme.appearance == appearance ? 0.09 : 0), in: RoundedRectangle(cornerRadius: 9))
         }.buttonStyle(.plain).help("\(appearance.capitalized) appearance")
           .accessibilityLabel("\(appearance.capitalized) appearance")
@@ -424,6 +474,17 @@ struct ThemeEditor: View {
     let other = ThemeColor.hsv(ThemeColor.nsColor(primary ? theme.secondaryColor : theme.primaryColor))
     let overlaps = hypot(ThemeColor.puckProgress(hue: hsv.hue - other.hue) * span.width,
       (hsv.saturation - other.saturation) * span.height) < 64
+    // The overlap offset is presentation only. Keep both complete pucks in
+    // their own region, below the appearance controls, without changing HSV.
+    let radius: CGFloat = 32 // Include the selected puck's outer ring.
+    func contained(_ value: CGFloat, in length: CGFloat) -> CGFloat {
+      min(max(radius, value), max(radius, length - radius))
+    }
+    let center = CGPoint(
+      x: contained(inset + ThemeColor.puckProgress(hue: hsv.hue) * span.width
+        + (overlaps ? (primary ? -22 : 22) : 0), in: size.width),
+      y: contained(inset + (1 - hsv.saturation) * span.height
+        + (overlaps ? (primary ? -16 : 16) : 0), in: size.height))
     return Circle().fill(Color(nsColor: color))
       .overlay(Circle().strokeBorder(.white.opacity(0.79), lineWidth: 3))
       .overlay(
@@ -432,8 +493,8 @@ struct ThemeEditor: View {
       )
       .shadow(color: .black.opacity(0.13), radius: 5, y: 3)
       .frame(width: 58, height: 58)
-      .position(x: inset + ThemeColor.puckProgress(hue: hsv.hue) * span.width, y: inset + (1 - hsv.saturation) * span.height)
-      .offset(x: overlaps ? (primary ? -22 : 22) : 0, y: overlaps ? (primary ? -16 : 16) : 0)
+      .background { NativeInterfaceAlignmentMark(id: primary ? "theme-puck-primary" : "theme-puck-secondary") }
+      .position(center)
       .zIndex(selectedPrimary == primary ? 2 : 1)
       .gesture(
         DragGesture(minimumDistance: 0, coordinateSpace: .named("themeColors"))
@@ -522,6 +583,7 @@ private struct ThemeColorWell: View {
             if !invalid && value.uppercased() != hex.uppercased() { hex = value.uppercased(); select() }
           }
           .accessibilityLabel("\(title) hexadecimal color")
+          .accessibilityIdentifier("native-theme-hex:" + title)
           .help(invalid ? "Enter six hexadecimal digits" : title)
       }
     }
@@ -531,6 +593,7 @@ private struct ThemeColorWell: View {
     .overlay(
       RoundedRectangle(cornerRadius: 10).strokeBorder(
         invalid ? Color.red : .primary.opacity(selected ? 0.18 : 0.06))
+        .allowsHitTesting(false).accessibilityHidden(true)
     )
     .onTapGesture(perform: select)
     .onAppear { draft = hex; valid = ThemeColor.valid(hex) }
@@ -721,8 +784,11 @@ struct NativeSpaceIdentity: View {
   var body: some View {
     DisclosureGroup("Name & icon", isExpanded: $expanded) {
       VStack(alignment: .leading, spacing: 10) {
-        TextField("Space name", text: Binding(get: { name }, set: { name = String($0.prefix(60)) })).textFieldStyle(NativeChromeTextFieldStyle(colors: colors))
-        TextField("Find an icon", text: $query).textFieldStyle(NativeChromeTextFieldStyle(colors: colors))
+        NativeChromeTextInput(placeholder: "Space name",
+          text: Binding(get: { name }, set: { name = String($0.prefix(60)) }), colors: colors,
+          identifier: "native-space-name", maximumLength: 60)
+        NativeChromeTextInput(placeholder: "Find an icon", text: $query, colors: colors,
+          identifier: "native-space-icon-search")
         LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 2), count: 12), spacing: 2) {
           ForEach(NativeGlyph.spaceNames.filter { query.isEmpty || $0.localizedCaseInsensitiveContains(query) }, id: \.self) { icon in
             Button { self.icon = icon; ThemeHaptics.tick() } label: {

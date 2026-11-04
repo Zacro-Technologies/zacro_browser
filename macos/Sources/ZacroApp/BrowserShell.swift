@@ -136,7 +136,7 @@ struct BrowserShell<Content: View>: View {
   @ObservedObject var actions: BrowserActions
   @ViewBuilder var content: () -> Content
   @StateObject private var drag = SidebarDragSession()
-  @StateObject private var spaceViewport = NativeSpaceViewport()
+  @State private var spaceViewport = NativeSpaceViewport()
   @StateObject private var dialogs = NativeWindowDialogOwner()
   @StateObject private var sidebarToggleHandoff = NativeSidebarToggleHandoff()
   @State private var spaceScroll = NativeSpaceScrollCache()
@@ -165,6 +165,7 @@ struct BrowserShell<Content: View>: View {
   @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
   @Environment(\.colorScheme) private var colorScheme
   @Environment(\.colorSchemeContrast) private var contrast
+  @Environment(\.nativeInterfaceAlignmentRecording) private var alignmentRecording
   @State private var themeDraft: BrowserSpace?
   @State private var themeError: String?
   @State private var creatingSpace = false
@@ -182,13 +183,9 @@ struct BrowserShell<Content: View>: View {
   private var editingTheme: SpaceTheme {
     creatingSpace || themeDraft?.id == store.state.activeSpaceID ? (themeDraft?.theme ?? savedTheme) : savedTheme
   }
-  private var theme: SpaceTheme {
-    guard let blend = spaceViewport.blend, blend.from != blend.to,
-      let first = spaces.first(where: { $0.id == blend.from }), let last = spaces.first(where: { $0.id == blend.to }) else { return editingTheme }
-    var value = NativeSpaceAppearance.blend(first.theme, last.theme, progress: blend.progress)
-    value.appearance = editingTheme.appearance
-    return value
-  }
+  // Fractional motion belongs to the native strip and its small backdrop.
+  // Controls use the selected Space's palette until selection commits.
+  private var theme: SpaceTheme { editingTheme }
   private var effectiveMotion: Double { reduceMotion ? 0 : store.state.settings.motionScale }
   private var needsTransparentResizeHitArea: Bool {
     !reduceTransparency && contrast != .increased && theme.opacity <= 0 && theme.blur <= 0
@@ -312,7 +309,8 @@ struct BrowserShell<Content: View>: View {
       // One continuous backdrop also sits below the native page's antialiased
       // edge. A second inverse mask here exposes the desktop between two
       // partially covered edges, producing a bright seam.
-      NativeThemeBackground(theme: theme)
+      NativeSpaceWindowBackdrop(viewport: spaceViewport, spaces: spaces, fallback: theme,
+        prefersFallback: creatingSpace || themeDraft != nil)
       VStack(spacing: 0) {
        HStack(spacing: 0) {
         if sidebarWidth > 0 {
@@ -540,6 +538,9 @@ struct BrowserShell<Content: View>: View {
       }
     }
       .environment(\.presentedSpaceTheme, theme)
+      .environment(\.nativeSpaceBackdropContext, NativeSpaceBackdropContext(
+        viewport: spaceViewport, spaces: spaces, fallback: theme,
+        prefersFallback: creatingSpace || themeDraft != nil))
       .frame(maxWidth: .infinity, maxHeight: .infinity)
       .background {
         NativeContentFrameReporter { frame in publishContentFrame(frame) }
@@ -572,17 +573,13 @@ struct BrowserShell<Content: View>: View {
     .padding(12).help("Show sidebar").accessibilityLabel("Show sidebar")
   }
   private var sidebar: some View {
-    VStack(spacing: 0) {
-      navigation
-      addressButton.padding(.bottom, 8)
-      if let extensions = actions.pinnedExtensionsContent() { extensions.padding(.bottom, 8) }
-      else if !actions.siteControls.isPrivate && actions.siteControls.extensions.contains(where: { $0.pinned }) {
-        NativePinnedExtensions(extensions: actions.siteControls.extensions, colors: colors, width: sidebarWidth - 16).padding(.bottom, 8)
-      }
-      SpaceGestureSurface(
+    SpaceGestureSurface(
         index: spaces.firstIndex(where: { $0.id == store.state.activeSpaceID }) ?? 0,
         count: spaces.count,
         contextKey: store.activeProfileID,
+        isEnabled: isOwnedWindowOpen && !actions.palette && !actions.themeEditor
+          && editor == nil && creation == nil && renameTarget == nil && !showSiteControls
+          && !showBrowserMenu && !showPageActions && !actions.recordingShortcut,
         onProgress: { value in
           var transaction = Transaction(); transaction.animation = nil
           withTransaction(transaction) { spaceViewport.track(progress: value) }
@@ -591,22 +588,30 @@ struct BrowserShell<Content: View>: View {
           guard spaces.indices.contains(index) else { return }
           spaceViewport.settle(selectedID: spaces[index].id, duration: duration, motionScale: effectiveMotion)
           store.selectSpace(id: spaces[index].id)
-        }
+        },
+        onCancel: { spaceViewport.cancelTracking() }
       ) {
+      VStack(spacing: 0) {
+        navigation
+        addressButton.padding(.bottom, 8)
+        if let extensions = actions.pinnedExtensionsContent() { extensions.padding(.bottom, 8) }
+        else if !actions.siteControls.isPrivate && actions.siteControls.extensions.contains(where: { $0.pinned }) {
+          NativePinnedExtensions(extensions: actions.siteControls.extensions, colors: colors, width: sidebarWidth - 16).padding(.bottom, 8)
+        }
         GeometryReader { geometry in
-          ZStack(alignment: .topLeading) {
-            ForEach(spaceViewport.frames) { frame in
-              if let space = spaces.first(where: { $0.id == frame.id }) {
-                spacePage(space, height: geometry.size.height)
-                  .frame(width: geometry.size.width, height: geometry.size.height)
-                  .offset(x: frame.offset * geometry.size.width)
-              }
-            }
-          }.clipped()
+          NativeSpacePageStrip(viewport: spaceViewport, selectedID: store.state.activeSpaceID) { id, _ in
+            guard let space = spaces.first(where: { $0.id == id }) else { return AnyView(Color.clear) }
+            return AnyView(spacePage(space, height: geometry.size.height)
+              .font(.system(size: 13)).foregroundStyle(colors.ink).tint(accent)
+              .environment(\.presentedSpaceTheme, theme)
+              .environment(\.nativeInterfaceAlignmentRecording, alignmentRecording)
+              .environment(\.nativeChromeControlContext,
+                "\(store.owningWindowID ?? ""):\(store.activeProfileID):\(store.state.activeSpaceID)")
+              .preferredColorScheme(theme.appearance == "dark" ? .dark : theme.appearance == "light" ? .light : nil))
+          }.frame(width: geometry.size.width, height: geometry.size.height).clipped()
         }.font(.system(size: 13)).foregroundStyle(colors.ink).tint(accent)
           .environment(\.presentedSpaceTheme, theme)
           .preferredColorScheme(theme.appearance == "dark" ? .dark : theme.appearance == "light" ? .light : nil)
-      }
       spaceFooter
     }.padding(.horizontal, 8)
       .background {
@@ -615,17 +620,28 @@ struct BrowserShell<Content: View>: View {
         if reduceTransparency { colors.chrome }
       }
       .background {
-        NativeSidebarDragHost(controller: drag.native, isEnabled: isOwnedWindowOpen, motionScale: effectiveMotion, canStart: { [weak store] id in
+        NativeSidebarDragHost(controller: drag.native, isEnabled: isOwnedWindowOpen, motionScale: effectiveMotion, canStart: { [weak store = store] id in
           guard let store else { return false }
           return NativeSidebarDragAuthority.capture(id: id, store: store) != nil
-        }, began: { [weak drag, weak store] id in
+        }, began: { [weak drag = drag, weak store = store] id in
           guard let store else { return }
           drag?.start(id, store: store)
-        }, ended: { [weak drag] in drag?.cancel() }, projectedRegion: { [weak drag] in drag?.projectionRegionID },
-          exitedRegion: { [weak drag, weak store] in if let store { drag?.resetReflow(store: store) } })
+        }, ended: { [weak drag = drag] in drag?.cancel() }, projectedRegion: { [weak drag = drag] in drag?.projectionRegionID },
+          exitedRegion: { [weak drag = drag, weak store = store] in if let store { drag?.resetReflow(store: store) } })
       }
       .overlay(alignment: .leading) { spaceEdge(-1) }
       .overlay(alignment: .trailing) { spaceEdge(1) }
+      .font(.system(size: 13)).foregroundStyle(colors.ink).tint(accent)
+      .environment(\.presentedSpaceTheme, theme)
+      .environment(\.nativeInterfaceAlignmentRecording, alignmentRecording)
+      .environment(\.nativeChromeControlContext,
+        "\(store.owningWindowID ?? ""):\(store.activeProfileID):\(store.state.activeSpaceID)")
+      .preferredColorScheme(theme.appearance == "dark" ? .dark : theme.appearance == "light" ? .light : nil)
+      // This native host covers the entire full-size sidebar. Its parent
+      // already handles the window geometry; applying the titlebar safe area
+      // again moves the whole navigation row down by the titlebar height.
+      .ignoresSafeArea()
+    }
   }
   private func synchronizeSpaces() {
     spaceScroll.prune(spaceIDs: Set(store.state.spaces.map(\.id)))
@@ -670,7 +686,8 @@ struct BrowserShell<Content: View>: View {
             if active, let id, !favorites.contains(where: { $0.id == id }) { reader.scrollTo(id) }
           }
       }
-    }.allowsHitTesting(active).accessibilityHidden(!active)
+    }.background { NativeInterfaceAlignmentMark(id: "space-page:" + space.id) }
+      .allowsHitTesting(active).accessibilityHidden(!active)
       .onKeyPress(keys: [.upArrow, .downArrow, .leftArrow, .rightArrow, .home, .end, KeyEquivalent("\u{F70D}"), KeyEquivalent("\u{F735}")]) { handleSidebarKey($0) }
   }
   private func previewFavorites(_ favorites: [BrowserTab], selectedID: String?) -> some View {
@@ -697,16 +714,20 @@ struct BrowserShell<Content: View>: View {
     return VStack(alignment: .leading, spacing: 2) {
       HStack(spacing: 7) {
         NativeGlyph(store.state.profiles.first(where: { $0.id == space.profileID })?.isPrivate == true ? "shield" : space.icon).frame(width: 14)
-        Text(space.name).fontWeight(.semibold)
-        Spacer()
+        Text(space.name).fontWeight(.semibold).lineLimit(1)
+          .background { NativeInterfaceAlignmentMark(id: "preview-space-title:" + space.id) }
+        Spacer(minLength: 0)
         if store.state.profiles.first(where: { $0.id == space.profileID })?.isPrivate == true { Text("Private").font(.system(size: 10)) }
       }.font(.system(size: 12)).foregroundStyle(accent).padding(.horizontal, 8).frame(height: 32)
+        .background { NativeInterfaceAlignmentMark(id: "preview-space-row:" + space.id) }
       ForEach(store.state.folders.filter { $0.spaceID == space.id }) { folder in
         HStack(spacing: 8) {
           NativeGlyph("folder", size: 16).foregroundStyle(accent).frame(width: 16)
-          Text(folder.name).fontWeight(.semibold)
-          Spacer()
+          Text(folder.name).fontWeight(.semibold).lineLimit(1)
+            .background { NativeInterfaceAlignmentMark(id: "preview-folder-title:" + folder.id) }
+          Spacer(minLength: 0)
         }.padding(.horizontal, 8).frame(height: tabHeight)
+          .background { NativeInterfaceAlignmentMark(id: "preview-folder-row:" + folder.id) }
         if folder.isExpanded {
           VStack(spacing: 2) {
             ForEach(all.filter { $0.folderID == folder.id && !$0.isFavorite && !grouped.contains($0.id) }) { tab in
@@ -750,30 +771,35 @@ struct BrowserShell<Content: View>: View {
   }
   private func previewSplitRow(_ group: SplitGroup, selectedID: String?) -> some View {
     HStack(spacing: 0) {
-      if let left = store.tab(group.leftTabID) { previewRow(left, selected: false) }
+      if let left = store.tab(group.leftTabID) { previewRow(left, selected: false, grouped: true) }
       Rectangle().fill(colors.ink.opacity(0.14)).frame(width: 1, height: 18)
-      if let right = store.tab(group.rightTabID) { previewRow(right, selected: false) }
+      if let right = store.tab(group.rightTabID) { previewRow(right, selected: false, grouped: true) }
     }.background(group.tabIDs.contains(selectedID ?? "") ? selectionBackground(true) : colors.ink.opacity(0.06),
       in: RoundedRectangle(cornerRadius: 10))
   }
-  private func previewRow(_ tab: BrowserTab, selected: Bool, favorite: Bool = false) -> some View {
+  private func previewRow(_ tab: BrowserTab, selected: Bool, favorite: Bool = false, grouped: Bool = false) -> some View {
     HStack(spacing: 8) {
       tabIcon(tab, size: favorite ? 20 : 16, favorite: favorite)
+        .background { NativeInterfaceAlignmentMark(id: "preview-tab-icon:" + tab.id) }
       if !favorite {
-        if tab.isPinned && !tab.isClosed && tab.savedURL != nil && tab.savedURL != tab.url {
+        if !grouped && tab.isPinned && !tab.isClosed && tab.savedURL != nil && tab.savedURL != tab.url {
           Text("/").foregroundStyle(colors.muted).padding(.trailing, -5)
         }
-        Text(tab.displayTitle).lineLimit(1); Spacer(minLength: 0)
+        Text(tab.displayTitle).lineLimit(1)
+          .background { NativeInterfaceAlignmentMark(id: "preview-tab-title:" + tab.id) }
+        Spacer(minLength: 0)
       }
     }.font(.system(size: 13, weight: selected ? .medium : .regular))
-      .frame(maxWidth: .infinity, minHeight: favorite ? 46 : tabHeight).padding(.horizontal, 8)
+      .frame(maxWidth: .infinity, minHeight: favorite ? 46 : tabHeight)
+      .padding(.leading, grouped ? 6 : 8).padding(.trailing, 8)
+      .background { NativeInterfaceAlignmentMark(id: "preview-tab-row:" + tab.id) }
       .background(selected && !tab.isClosed ? (favorite ? favoriteSelection(tab) : selectionBackground(true)) : favorite ? colors.ink.opacity(0.05) : .clear,
         in: RoundedRectangle(cornerRadius: 10))
       .overlay(alignment: .topTrailing) { if favorite { peekBadge(tab, favorite: true).padding(2) } }
   }
   private var navigation: some View {
     HStack(spacing: 0) {
-      Spacer().frame(width: 70)
+      NativeWindowControlsAnchor().frame(width: 70, height: 36)
       Button {
         toggleSidebar()
       } label: {
@@ -833,11 +859,13 @@ struct BrowserShell<Content: View>: View {
       Button { editor = .spaces } label: {
         HStack(spacing: 7) {
           NativeGlyph(store.state.activeProfile?.isPrivate == true ? "shield" : store.state.activeSpace?.icon ?? "circle.fill").frame(width: 14)
-          Text(store.state.activeSpace?.name ?? "Personal").fontWeight(.semibold)
-          Spacer()
+          Text(store.state.activeSpace?.name ?? "Personal").fontWeight(.semibold).lineLimit(1)
+            .background { NativeInterfaceAlignmentMark(id: "active-space-title:" + store.state.activeSpaceID) }
+          Spacer(minLength: 0)
           if store.state.activeProfile?.isPrivate == true { Text("Private").font(.system(size: 10)) }
           NativeGlyph("chevron.down", size: 12)
         }.font(.system(size: 12)).padding(.horizontal, 8).frame(height: 32).contentShape(Rectangle())
+          .background { NativeInterfaceAlignmentMark(id: "active-space-row:" + store.state.activeSpaceID) }
       }.buttonStyle(.plain).foregroundStyle(accent).accessibilityLabel("Spaces & profiles")
         .accessibilityIdentifier("space-picker")
         .focusable().focusEffectDisabled().focused($sidebarFocus, equals: "space-picker")
@@ -859,8 +887,10 @@ struct BrowserShell<Content: View>: View {
               }.foregroundStyle(accent).frame(width: 16, height: 16)
                 .animation(NativeMotion.animation(NativeMotion.fast, scale: effectiveMotion), value: hoveredFolder == folder.id || sidebarFocus == "folder:\(folder.id)")
               Text(folder.name).font(.system(size: 13, weight: .semibold)).lineLimit(1)
+                .background { NativeInterfaceAlignmentMark(id: "active-folder-title:" + folder.id) }
               Spacer(minLength: 0)
             }.padding(.horizontal, 8).frame(height: tabHeight).contentShape(Rectangle())
+              .background { NativeInterfaceAlignmentMark(id: "active-folder-row:" + folder.id) }
           }.buttonStyle(NativeHoverPressButtonStyle(hover: colors.hover, radius: 6, scale: 1, motionScale: effectiveMotion))
             .accessibilityLabel("\(folder.isExpanded ? "Collapse" : "Expand") \(folder.name)")
             .focusable().focusEffectDisabled().focused($sidebarFocus, equals: "folder:\(folder.id)").id("folder:\(folder.id)")
@@ -1119,18 +1149,24 @@ struct BrowserShell<Content: View>: View {
         Button { store.resetPinnedDestination(id: tab.id); actions.activate(tab.id) } label: {
           Group {
             if hoveredPin == tab.id { NativeGlyph("arrow.left", size: 15).frame(width: 16, height: 16) }
-            else { tabIcon(tab, size: 16) }
+            else { tabIcon(tab, size: 16)
+              .background { NativeInterfaceAlignmentMark(id: "active-tab-icon:" + tab.id) }
+            }
           }.frame(width: 28, height: 28)
         }.buttonStyle(NativeHoverPressButtonStyle(hover: colors.hover, radius: 5, scale: 1, motionScale: effectiveMotion))
-          .padding(.leading, 3).help("Reset to saved page")
+          .padding(.leading, 2).help("Reset to saved page")
           .onHover { if $0 { hoveredPin = tab.id } else if hoveredPin == tab.id { hoveredPin = nil } }
       }
       Button { selectSidebarTab(tab) } label: {
         HStack(spacing: 8) {
-          if favorite || grouped || !tab.isPinned { tabIcon(tab, size: favorite ? 20 : 16, favorite: favorite) }
+          if favorite || grouped || !tab.isPinned {
+            tabIcon(tab, size: favorite ? 20 : 16, favorite: favorite)
+              .background { NativeInterfaceAlignmentMark(id: "active-tab-icon:" + tab.id) }
+          }
           if !favorite {
             if away && !grouped { Text("/").foregroundStyle(colors.muted).padding(.trailing, -5) }
             Text(tab.displayTitle).lineLimit(1)
+              .background { NativeInterfaceAlignmentMark(id: "active-tab-title:" + tab.id) }
             Spacer(minLength: 0)
           }
         }.frame(maxWidth: .infinity, minHeight: favorite ? 46 : tabHeight)
@@ -1166,6 +1202,7 @@ struct BrowserShell<Content: View>: View {
       }
     }.font(.system(size: 13, weight: selected ? .medium : .regular))
       .frame(maxWidth: .infinity)
+      .background { NativeInterfaceAlignmentMark(id: "active-tab-row:" + tab.id) }
       .background(grouped || favorite ? .clear : selected ? selectionBackground(true) : hovered ? colors.ink.opacity(0.05) : .clear,
         in: RoundedRectangle(cornerRadius: 10))
       .modifier(NativeSelectionContrast(selected: selected && !grouped && !favorite && drag.id == nil, color: colors.ink, radius: 10))
@@ -2263,7 +2300,7 @@ private struct NativeSplitDropOverlay: View {
   }
 }
 
-private struct NativeFindBar: View {
+struct NativeFindBar: View {
   @ObservedObject var actions: BrowserActions
   let colors: NativeSpacePalette
   var body: some View {
@@ -2283,7 +2320,8 @@ private struct NativeFindBar: View {
     }.buttonStyle(.plain).font(.system(size: 12)).padding(.leading, 8).padding(.trailing, 5)
       .frame(maxWidth: .infinity, maxHeight: .infinity)
       .foregroundStyle(colors.ink).background { NativeControlSurface().overlay(colors.card.opacity(0.84)).clipShape(RoundedRectangle(cornerRadius: 7)) }
-      .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(colors.ink.opacity(0.1), lineWidth: 1))
+      .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(colors.ink.opacity(0.1), lineWidth: 1)
+        .allowsHitTesting(false).accessibilityHidden(true))
       .shadow(color: .black.opacity(0.09), radius: 7, y: 4)
   }
   private func close() { actions.findVisible = false; actions.closeFind() }

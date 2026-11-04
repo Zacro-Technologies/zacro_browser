@@ -57,6 +57,42 @@ class ManagementPromptTests(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "source drift"):
             adapter.generated(changed)
 
+    def test_capture_trace_preserves_actual_dispatch_and_pinned_lifecycle(self):
+        original = self.originals[adapter.CAPTURE]
+        generated = adapter.generated(self.originals)[adapter.CAPTURE]
+        self.assertIn('static const bool enabled =', generated)
+        self.assertIn('containsObject:@"--engine-acceptance"', generated)
+        self.assertIn('containsObject:@"--native-integration-acceptance"', generated)
+        self.assertIn('environment[@"ZACRO_NATIVE_CAPTURE_TRACE"]', generated)
+        self.assertNotIn('event.eventNumber', generated)
+        local = method(generated, '  auto local_block =', '  auto global_block =')
+        dispatch = local.index('bool handled = weak_ptr->delegate_->PostCapturedEvent(event);')
+        self.assertLess(local.index('event.type == NSEventTypeScrollWheel'), dispatch)
+        self.assertLess(local.index('target_window_number = event.windowNumber;'), dispatch)
+        self.assertLess(local.index('capture_window_number = [weak_ptr->delegate_->GetWindow() windowNumber];'), dispatch)
+        self.assertNotIn('weak_ptr', local[dispatch + len('bool handled = weak_ptr->delegate_->PostCapturedEvent(event);'):])
+        # Remove only the inserted observation before comparing the complete
+        # original post-dispatch activation/return and global-monitor paths.
+        original_tail = method(original, '    // Mac: When the app is inactive', '  auto global_block =')
+        self.assertEqual(original_tail, method(generated, '    // Mac: When the app is inactive', '  auto global_block ='))
+        original_global = method(original, '  auto global_block =', '\n}\n\nNSWindow* CocoaMouseCapture::ActiveEventTap::GetCaptureWindow()')
+        generated_global = method(generated, '  auto global_block =', '  if (NativeCaptureTraceEnabled()) {')
+        self.assertEqual(original_global.rstrip(), generated_global.rstrip())
+        self.assertIn('return handled ? nil : event;', local)
+        self.assertIn('owner_->delegate_->OnMouseCaptureLost();', generated)
+
+    def test_capture_trace_rejects_unrelated_edits_and_source_drift(self):
+        output = adapter.generated(self.originals)
+        changed = dict(self.originals)
+        changed[adapter.CAPTURE] = changed[adapter.CAPTURE].replace(
+            '    bool handled = weak_ptr->delegate_->PostCapturedEvent(event);', '// drift')
+        with self.assertRaisesRegex(SystemExit, 'source drift'):
+            adapter.generated(changed)
+        changed = dict(output)
+        changed[adapter.CAPTURE] += '// unrelated capture edit\n'
+        with self.assertRaisesRegex(SystemExit, 'unrelated prompt edits'):
+            adapter.validate_current(self.originals, output, changed)
+
     def test_only_exact_baseline_current_or_receipted_previous_output_is_allowed(self):
         output = adapter.generated(self.originals)
         adapter.validate_current(self.originals, output, self.originals)

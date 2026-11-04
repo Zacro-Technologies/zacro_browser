@@ -44,6 +44,58 @@ enum NativeSpaceViewportAcceptance {
     result["space_profile_change_removes_old_previews"] = Set(viewport.frames.map(\.id)) == Set(["private-a", "private-b"])
       && !viewport.isAnimating
 
+    let interrupted = NativeSpaceViewport(automaticallyAdvance: false)
+    interrupted.synchronize(ids: ids, selectedID: ids[400], motionScale: 0, at: 0)
+    var boundedInterruptions = true
+    for turn in 0..<50 {
+      let incoming = ids[turn.isMultiple(of: 2) ? 900 - turn : 20 + turn]
+      interrupted.synchronize(ids: ids, selectedID: incoming, motionScale: 1, at: Double(turn) * 0.000_1)
+      boundedInterruptions = boundedInterruptions && interrupted.frames.count <= 4
+        && interrupted.frames.contains { $0.id == incoming }
+    }
+    result["space_rapid_dot_interruptions_keep_the_incoming_page_within_bounded_hosts"] = boundedInterruptions
+
+    let continuity = NativeSpaceViewport(automaticallyAdvance: false)
+    continuity.synchronize(ids: ids, selectedID: ids[200], motionScale: 0, at: 10)
+    continuity.synchronize(ids: ids, selectedID: ids[201], motionScale: 1, at: 11)
+    continuity.advance(at: 11.06)
+    let beforeDotInterruption = continuity.frames.first(where: { $0.id == ids[201] })?.offset ?? 99
+    continuity.track(progress: 0.12)
+    let dotWasContinuous = near(continuity.frames.first(where: { $0.id == ids[201] })?.offset,
+      beforeDotInterruption - 0.12) && continuity.isTracking && !continuity.isAnimating
+    continuity.track(progress: 0)
+    let reversalKeptOrigin = near(continuity.frames.first(where: { $0.id == ids[201] })?.offset,
+      beforeDotInterruption) && continuity.isTracking
+    continuity.track(progress: -0.2)
+    result["space_finger_interrupts_dot_at_its_visual_position_and_preserves_zero_reversal"] = dotWasContinuous
+      && reversalKeptOrigin && near(continuity.frames.first(where: { $0.id == ids[201] })?.offset,
+        beforeDotInterruption + 0.2)
+
+    continuity.synchronize(ids: ids, selectedID: ids[700], motionScale: 1, at: 12)
+    let newerDot = continuity.frames
+    continuity.cancelTracking()
+    let newerDotSurvived = continuity.isAnimating && continuity.frames == newerDot
+    continuity.advance(at: 12.3)
+    result["space_old_contact_cancellation_cannot_finish_a_newer_dot_transition"] = newerDotSurvived
+      && near(continuity.frames.first(where: { $0.id == ids[700] })?.offset, 0)
+
+    continuity.track(progress: 0.6)
+    continuity.settle(selectedID: ids[701], duration: 0.2, motionScale: 1, at: 13)
+    continuity.advance(at: 13.05)
+    let beforeSnapInterruption = continuity.frames.first(where: { $0.id == ids[701] })?.offset ?? 99
+    continuity.track(progress: -0.1)
+    let snapWasContinuous = near(continuity.frames.first(where: { $0.id == ids[701] })?.offset,
+      beforeSnapInterruption + 0.1)
+    continuity.cancelTracking()
+    let activeCancelClearedOrigin = !continuity.isTracking && !continuity.isAnimating
+      && !continuity.hasPendingTrackingPresentation
+      && near(continuity.frames.first(where: { $0.id == ids[701] })?.offset, 0)
+    continuity.track(progress: 0.15)
+    result["space_finger_interrupts_snap_continuously_and_active_cancel_discards_its_origin"] = snapWasContinuous
+      && activeCancelClearedOrigin
+      && near(continuity.frames.first(where: { $0.id == ids[701] })?.offset, -0.15)
+    continuity.stop()
+
     let cache = NativeSpaceScrollCache()
     let key = NativeSpaceScrollCache.Key(spaceID: "one", favorites: false)
     let favoriteKey = NativeSpaceScrollCache.Key(spaceID: "one", favorites: true)

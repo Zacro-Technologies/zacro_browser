@@ -23,10 +23,10 @@ final class BrowserIntegrationAcceptance {
   init(application: ApplicationCoordinator) { self.application = application }
 
   func run(url: URL) {
-    // The measured prelude and extension catalog alone take about six minutes.
-    // Give the complete catalog room for capture, media and window retirement;
-    // each individual fixture retains its own existing deadline.
-    let aggregateSeconds = suite == "all" ? 600 : 420
+    // The full UI and extension sequence reached 966 passing checks at the
+    // former ten-minute aggregate limit, before capture/media/retirement.
+    // Budget the complete catalog; individual fixture deadlines stay unchanged.
+    let aggregateSeconds = suite == "all" ? 900 : 420
     deadline = Task { [weak self] in
       do { try await Task.sleep(for: .seconds(aggregateSeconds)) } catch { return }
       self?.finish("The application integration check timed out.")
@@ -56,7 +56,7 @@ final class BrowserIntegrationAcceptance {
   /// Focused runs use the same production fixtures and disposable application
   /// owners. Their report names the suite and never claims full-app acceptance.
   private func checkFocusedSuite(url: URL) async throws {
-    guard ["extensions", "extension-actions", "extension-services", "extension-admission", "extension-search", "extension-management", "extension-uninstall", "extension-ui-owner", "extension-host", "history-mirror", "history-spa", "history-veto", "history-publication", "popup-close", "popup-adoption", "download-retirement", "windows", "hosted-selection", "resize", "peek", "navigation", "capture", "media", "sidebar", "recovery", "interface"].contains(suite),
+    guard ["extensions", "extension-actions", "extension-services", "extension-admission", "extension-search", "extension-management", "extension-uninstall", "extension-ui-owner", "extension-host", "history-mirror", "history-spa", "history-veto", "history-publication", "popup-close", "popup-adoption", "download-retirement", "windows", "hosted-selection", "resize", "peek", "navigation", "capture", "media", "sidebar", "space-input-construction", "space-swipe", "space-swipe-prelude", "recovery", "interface", "interface-prelude", "application-reopening"].contains(suite),
       let owner = application.focusedCoordinator else { throw Failure("Unknown acceptance suite or missing owner") }
     let engine = application.engine
     nativeExtensions = try await engine.nativeCapabilities().extensionBrowser == true
@@ -65,6 +65,23 @@ final class BrowserIntegrationAcceptance {
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,
       attributes: [.posixPermissions: 0o700])
     application.downloads.destinationDirectory = directory
+    if suite == "space-input-construction" {
+      try await wait("initialShellLayout") { owner.actions.contentFrame.width > 400 }
+      guard let window = owner.window else { throw Failure("Space input construction owner disappeared") }
+      for (name, passed) in NativeSpaceGestureAcceptance.checkConstruction(in: window) { try require(passed, name) }
+      return
+    }
+    if suite == "space-swipe-prelude" {
+      // Start at the same initially blank shell as the full prefix, before the
+      // ordinary focused runner creates its source document or hides a palette.
+      try await wait("initialShellLayout") { owner.actions.contentFrame.width > 400 }
+      guard let window = owner.window else { throw Failure("Space prelude owner disappeared") }
+      try await checkSpaceSwipePrelude(owner: owner, window: window, url: url)
+      for name in try await NativeSpaceGestureAcceptance.run(application: application, url: url, originalOwner: owner) {
+        try require(true, name)
+      }
+      return
+    }
     owner.windowContext.show(); owner.actions.palette = false
     try await wait("focusedSuiteShellReady") { owner.actions.contentFrame.width > 400 }
     guard let tab = owner.store.createTab(address: url.appendingPathComponent("focused-suite-source").absoluteString) else {
@@ -74,7 +91,9 @@ final class BrowserIntegrationAcceptance {
     try await application.navigation.waitForRestore(page)
     try await loaded(page)
     try await page.ready().setDownloadDirectory(directory)
-    if suite == "recovery" {
+    if suite == "application-reopening" {
+      try await checkApplicationReopening(url: url, owner: owner, page: page)
+    } else if suite == "recovery" {
       for name in try await NativeAuxiliaryTerminationRecoveryAcceptance.run() { try require(true, name) }
     } else if suite == "history-mirror" {
       for name in try await NativeHistoryMirrorRuntimeAcceptance.run(application: application, url: url) { try require(true, name) }
@@ -84,7 +103,11 @@ final class BrowserIntegrationAcceptance {
     } else if suite == "history-publication" {
       for name in try await NativeHistoryPublicationRaceAcceptance.run(application: application,
         url: url, originalOwner: owner) { try require(true, name) }
-    } else if suite == "interface" {
+    } else if suite == "interface" || suite == "interface-prelude" {
+      if suite == "interface-prelude" {
+        guard let window = owner.window else { throw Failure("Interface prelude owner disappeared") }
+        try await checkInterfacePrelude(in: window)
+      }
       for (name, passed) in await NativeCommandInterfaceAcceptance.check() { try require(passed, name) }
       for name in try await NativeEditingRuntimeAcceptance.run(application: application, url: url, owner: owner) { try require(true, name) }
       guard let window = owner.window else { throw Failure("AI interface fixture owner disappeared") }
@@ -101,7 +124,15 @@ final class BrowserIntegrationAcceptance {
       for name in try await NativeSidebarToggleAcceptance.run(application: application, url: url, originalOwner: owner) {
         try require(true, name)
       }
+    } else if suite == "space-swipe" {
+      for name in try await NativeSpaceGestureAcceptance.run(application: application, url: url, originalOwner: owner) {
+        try require(true, name)
+      }
     } else if suite == "resize" {
+      guard let window = owner.window else { throw Failure("No owned window for native controls acceptance") }
+      for name in try await NativeWindowControlsAcceptance.run(in: window) { try require(true, name) }
+      for name in try await NativeInterfaceAlignmentAcceptance.run() { try require(true, name) }
+      for name in try await NativeThemeAlignmentAcceptance.run() { try require(true, name) }
       for (name, passed) in NativePaneShadowAcceptance.check() { try require(passed, name) }
       try await NativeChromeControlRenderEvidence.capture(directory: engine.dataDirectory)
       for name in try await NativeWindowResizeAcceptance.run(application: application, url: url, originalOwner: owner) {
@@ -194,6 +225,69 @@ final class BrowserIntegrationAcceptance {
     }
   }
 
+  /// Keep the hosted-surface order identical in the full run and its focused
+  /// reproduction. These fixtures temporarily replace their own content only.
+  private func checkInterfacePrelude(in window: NSWindow) async throws {
+    for name in try await NativeWindowControlsAcceptance.run(in: window) { try require(true, name) }
+    for name in try await NativeInterfaceAlignmentAcceptance.run() { try require(true, name) }
+    for name in try await NativeThemeAlignmentAcceptance.run() { try require(true, name) }
+    for name in try await NativeMotionAcceptance.run(in: window) { try require(true, name) }
+    for (name, passed) in NativeSidebarDragAcceptance.check(in: window) { try require(passed, name) }
+    for (name, passed) in NativeSpaceViewportAcceptance.check() { try require(passed, name) }
+    for name in try await NativeSpacePageStripAcceptance.run(in: window) { try require(true, name) }
+    for (name, passed) in NativeSpaceBackdropAcceptance.check() { try require(passed, name) }
+    for (name, passed) in try await NativeSpaceBackdropAcceptance.renderedAlphaChecks() { try require(passed, name) }
+    for (name, passed) in NativeThemeColorWellAcceptance.check() { try require(passed, name) }
+    for (name, passed) in NativeThemeColorAcceptance.check() { try require(passed, name) }
+    for (name, passed) in NativePaneShadowAcceptance.check() { try require(passed, name) }
+  }
+
+  private func retireInitialPaletteBeforeInterfaceFixtures(owner: BrowserWindowCoordinator, window: NSWindow) async throws {
+    let initialPalette = owner.actions.paletteWindow
+    let current = NSApp.currentEvent
+    fputs("Native interface prelude state: owner=\(window.windowNumber) visible=\(window.isVisible) palette=\(owner.actions.palette) paletteWindow=\(initialPalette?.windowNumber ?? -1) paletteVisible=\(initialPalette?.isVisible == true) themeEditor=\(owner.actions.themeEditor) modal=\(NSApp.modalWindow?.windowNumber ?? -1) key=\(NSApp.keyWindow?.windowNumber ?? -1) currentEventType=\(current?.type.rawValue ?? UInt.max) currentEventWindow=\(current?.window?.windowNumber ?? -1)\n", stderr)
+    guard owner.actions.palette else { return }
+    guard owner.window === window, initialPalette == nil || initialPalette?.parent === window else {
+      throw Failure("Initial command palette is not attached to its exact browser owner")
+    }
+    owner.actions.palette = false
+    try await wait("initialOwnedPaletteRetiresBeforeIndependentInterfaceFixtures", timeout: 3) {
+      owner.window === window && !owner.actions.palette && owner.actions.paletteWindow == nil
+        && initialPalette?.isVisible != true
+    }
+  }
+
+  /// The same initial hosted surfaces and owned window transitions precede
+  /// space gestures in both the complete run and its focused reproduction.
+  private func checkSpaceSwipePrelude(owner: BrowserWindowCoordinator, window: NSWindow, url: URL) async throws {
+    guard owner.window === window, owner.windowContext.isOpen, !owner.windowContext.isClosing else {
+      throw Failure("Space prelude requires its exact open browser owner")
+    }
+    try await retireInitialPaletteBeforeInterfaceFixtures(owner: owner, window: window)
+    try await checkInterfacePrelude(in: window)
+    for (name, passed) in await NativeCommandInterfaceAcceptance.check() { try require(passed, name) }
+    for name in try await NativeEditingRuntimeAcceptance.run(application: application, url: url, owner: owner) { try require(true, name) }
+    for (name, passed) in NativePageContextMenuAcceptance.check() { try require(passed, name) }
+    for (name, passed) in NativePeekLinkAcceptance.check() { try require(passed, name) }
+    for (name, passed) in await NativeWindowDialogOwnerAcceptance.check() { try require(passed, name) }
+    try await checkNativeWindowSheets(owner: window)
+    for name in try await NativeAuxiliaryTerminationRecoveryAcceptance.run() { try require(true, name) }
+    owner.windowContext.show()
+    for name in try await NativeAIModelAcceptance.run(window: window) { try require(true, name) }
+    for name in try await NativeSidebarAccessibilityAcceptance.run(application: application, url: url, originalOwner: owner) {
+      try require(true, name)
+    }
+    for name in try await NativeSidebarFocusAcceptance.run(application: application, url: url, originalOwner: owner) {
+      try require(true, name)
+    }
+    for name in try await NativeSidebarToggleAcceptance.run(application: application, url: url, originalOwner: owner) {
+      try require(true, name)
+    }
+    guard owner.window === window, owner.windowContext.isOpen, !owner.windowContext.isClosing else {
+      throw Failure("Space prelude lost its exact browser owner")
+    }
+  }
+
   private func checkApplication(url: URL) async throws {
     try checkAIResetOrdering()
     let engine = application.engine
@@ -204,28 +298,8 @@ final class BrowserIntegrationAcceptance {
     guard let first = application.focusedCoordinator else { throw Failure("No application window") }
     try await wait("initialShellLayout") { first.actions.contentFrame.width > 400 }
     guard let firstWindow = first.window else { throw Failure("No application window presentation") }
-    for name in try await NativeMotionAcceptance.run(in: firstWindow) { try require(true, name) }
-    for (name, passed) in NativeSidebarDragAcceptance.check(in: firstWindow) { try require(passed, name) }
-    for (name, passed) in NativeSpaceViewportAcceptance.check() { try require(passed, name) }
-    for (name, passed) in NativeThemeColorWellAcceptance.check() { try require(passed, name) }
-    for (name, passed) in NativeThemeColorAcceptance.check() { try require(passed, name) }
-    for (name, passed) in NativePaneShadowAcceptance.check() { try require(passed, name) }
-    for (name, passed) in await NativeCommandInterfaceAcceptance.check() { try require(passed, name) }
-    for name in try await NativeEditingRuntimeAcceptance.run(application: application, url: url, owner: first) { try require(true, name) }
-    for (name, passed) in NativePageContextMenuAcceptance.check() { try require(passed, name) }
-    for (name, passed) in NativePeekLinkAcceptance.check() { try require(passed, name) }
-    for (name, passed) in await NativeWindowDialogOwnerAcceptance.check() { try require(passed, name) }
-    try await checkNativeWindowSheets(owner: firstWindow)
-    for name in try await NativeAuxiliaryTerminationRecoveryAcceptance.run() { try require(true, name) }
-    first.windowContext.show()
-    for name in try await NativeAIModelAcceptance.run(window: firstWindow) { try require(true, name) }
-    for name in try await NativeSidebarAccessibilityAcceptance.run(application: application, url: url, originalOwner: first) {
-      try require(true, name)
-    }
-    for name in try await NativeSidebarFocusAcceptance.run(application: application, url: url, originalOwner: first) {
-      try require(true, name)
-    }
-    for name in try await NativeSidebarToggleAcceptance.run(application: application, url: url, originalOwner: first) {
+    try await checkSpaceSwipePrelude(owner: first, window: firstWindow, url: url)
+    for name in try await NativeSpaceGestureAcceptance.run(application: application, url: url, originalOwner: first) {
       try require(true, name)
     }
     first.actions.palette = false
@@ -647,8 +721,34 @@ final class BrowserIntegrationAcceptance {
     page: ChromiumPage) async throws {
     owner.store.selectTab(id: page.id)
     owner.actions.palette = false; owner.actions.library = nil
-    owner.windowContext.show(); owner.layoutPages(); page.focus()
-    try await wait("menuFixtureFocusesActualPage", record: false) { NSApp.keyWindow === page.nativeWindow }
+    let expectedShell = owner.windowContext.window
+    func focusReceipt(_ stage: String) {
+      fputs("Native application reopening focus: stage=\(stage) appActive=\(NSApp.isActive) keyWindow=\(NSApp.keyWindow?.windowNumber ?? -1) mainWindow=\(NSApp.mainWindow?.windowNumber ?? -1) "
+        + "owner=\(owner.windowContext.id) ownerOpen=\(owner.windowContext.isOpen) ownerClosing=\(owner.windowContext.isClosing) exactShell=\(owner.window === expectedShell) shellWindow=\(expectedShell.windowNumber) shellVisible=\(expectedShell.isVisible) shellMiniaturized=\(expectedShell.isMiniaturized) "
+        + "focusedOwner=\(application.focusedCoordinator === owner) pendingIntents=\(application.pendingApplicationIntentCount) deletingProfile=\(application.deletingProfileID ?? "nil") "
+        + "pageID=\(page.id) pageProfile=\(page.profileID) pageOwned=\(page.ownerWindowID == owner.windowContext.id) exactPage=\(application.engine.pages[page.id] === page) activePageMatches=\(owner.activePage === page) "
+        + "activeTab=\(owner.store.state.activeTabID ?? "nil") selectedDocument=\(owner.selectedDocumentID ?? "nil") activeProfile=\(owner.store.activeProfileID) hasPeek=\(owner.store.state.activeTab?.peek != nil) peekPresented=\(owner.store.state.activeTab?.peek?.isPresented == true) "
+        + "pageWindow=\(page.nativeWindow?.windowNumber ?? -1) pageVisible=\(page.nativeWindow?.isVisible == true) pageParent=\(page.nativeWindow?.parent?.windowNumber ?? -1) sheet=\(expectedShell.attachedSheet?.windowNumber ?? -1) modal=\(NSApp.modalWindow?.windowNumber ?? -1) presentation=\(owner.actions.interfacePresentationState().sorted())\n", stderr)
+    }
+    focusReceipt("before-explicit-reopen")
+    // This menu fixture establishes foreground through the same explicit
+    // application-reopen intent as the Dock. A page-focus request alone must
+    // not activate an application that has lost foreground during a long run.
+    application.repository.focusWindow(owner.windowContext.id)
+    _ = application.applicationShouldHandleReopen(NSApp, hasVisibleWindows: true)
+    do {
+      try await wait("applicationReopeningIntentRestoresActualForeground", record: false) {
+        NSApp.isActive && owner.windowContext.isOpen && !owner.windowContext.isClosing
+          && owner.window === expectedShell && expectedShell.isVisible && !expectedShell.isMiniaturized
+          && self.application.focusedCoordinator === owner && self.application.pendingApplicationIntentCount == 0
+      }
+      focusReceipt("before-page-focus")
+      owner.layoutPages(); page.focus()
+      try await wait("menuFixtureFocusesActualPage", record: false) { NSApp.keyWindow === page.nativeWindow }
+    } catch {
+      focusReceipt("failure")
+      throw error
+    }
     application.performApplicationCommand("zoom-in", preferredWindowID: owner.windowContext.id)
     try require(NSApp.keyWindow === page.nativeWindow && application.pendingApplicationIntentCount == 0,
       "applicationMenuPreservesActualDocumentFocus")

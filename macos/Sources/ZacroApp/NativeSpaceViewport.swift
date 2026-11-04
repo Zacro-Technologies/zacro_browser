@@ -24,6 +24,9 @@ final class NativeSpaceViewport: ObservableObject {
   private var position = 0.0
   private var animation: Motion?
   private let clock = NativeMotionClock()
+  private let trackingClock = NativeMotionClock()
+  private var pendingTrackingProgress: Double?
+  private var trackingOriginPosition: Double?
   private weak var motionView: NSView?
   private let automaticallyAdvance: Bool
   private struct Motion {
@@ -38,12 +41,16 @@ final class NativeSpaceViewport: ObservableObject {
   }
 
   init(automaticallyAdvance: Bool = true) { self.automaticallyAdvance = automaticallyAdvance }
+  var hasPendingTrackingPresentation: Bool { pendingTrackingProgress != nil }
 
   /// The anchor supplies this viewport's exact window content view. A zero-size
   /// SwiftUI attachment is only a locator, never the display-link source.
   func attachMotionView(_ view: NSView?) {
     guard motionView !== view else { return }
+    let wasTracking = isTracking || pendingTrackingProgress != nil || trackingOriginPosition != nil
+    cancelTrackingPresentation()
     clock.stop(); motionView = view
+    if wasTracking { finish(); return }
     guard automaticallyAdvance, let motion = animation else { return }
     guard let view, view.window != nil else { finish(); return }
     startClock(for: motion, in: view)
@@ -63,7 +70,16 @@ final class NativeSpaceViewport: ObservableObject {
     let direction = nextIndex > previousIndex ? 1.0 : -1.0
     // Preserve currently visible presentation offsets when a second selection
     // interrupts a transition. Offscreen pages never accumulate across clicks.
-    var starts = frames.filter { abs($0.offset) < 1.000_001 }
+    let visible = frames.filter { abs($0.offset) < 1.000_001 }
+    // Repeated dot commands can arrive before the next display frame. Keep
+    // the incoming destination plus the three nearest existing pages, rather
+    // than accumulating another offscreen host for every interrupted intent.
+    let retained = Set(visible.enumerated().filter { $0.element.id != selected }
+      .sorted { first, second in
+        let a = abs(first.element.offset), b = abs(second.element.offset)
+        return a == b ? first.offset < second.offset : a < b
+      }.prefix(3).map { $0.element.id })
+    var starts = visible.filter { $0.id == selected || retained.contains($0.id) }
     if !starts.contains(where: { $0.id == selected }) { starts.append(.init(id: selected, offset: direction)) }
     let ends = starts.map { frame in
       Frame(id: frame.id, offset: frame.id == selected ? 0
@@ -79,11 +95,45 @@ final class NativeSpaceViewport: ObservableObject {
     guard let selectedID, let current = ids.firstIndex(of: selectedID), progress.isFinite else { return }
     // Idle/contact-began events do not own an in-flight dot animation. An
     // actual horizontal gesture takes over when it supplies feedback.
-    if progress == 0 && !isTracking { return }
-    cancelAnimation()
-    isTracking = progress != 0
-    position = Double(current) + progress
-    presentPosition(position)
+    if trackingOriginPosition == nil {
+      guard progress != 0 else { return }
+      // A new contact takes over the position actually on screen, even when
+      // the logical destination of a preceding dot/snap is already selected.
+      trackingOriginPosition = animation != nil || isAnimating ? position : Double(current)
+      if animation != nil || isAnimating { cancelAnimation() }
+    }
+    guard let origin = trackingOriginPosition else { return }
+    if !isTracking { isTracking = true }
+    if pendingTrackingProgress == progress
+      || (pendingTrackingProgress == nil && position == origin + progress) { return }
+    guard automaticallyAdvance, let motionView, let window = motionView.window,
+      window.isVisible, !window.isMiniaturized else {
+      position = origin + progress
+      presentPosition(position)
+      return
+    }
+    // The recognizer still receives every raw event. Only presentation is
+    // coalesced: a burst replaces this pending value instead of rebuilding the
+    // sidebar for each wheel sample between display frames.
+    pendingTrackingProgress = progress
+    guard !trackingClock.isRunning else { return }
+    trackingClock.start(in: motionView, until: ProcessInfo.processInfo.systemUptime + 0.05) { [weak self] _ in
+      self?.flushPendingTrackingPresentation()
+    }
+  }
+
+  /// A release must start its snap from the latest admitted finger position,
+  /// even if the release arrived before the next physical display frame.
+  @discardableResult
+  func flushPendingTrackingPresentation() -> Bool {
+    trackingClock.stop()
+    guard let progress = pendingTrackingProgress else { return false }
+    pendingTrackingProgress = nil
+    guard let origin = trackingOriginPosition, let selectedID, ids.contains(selectedID) else { return false }
+    position = origin + progress
+    var transaction = Transaction(); transaction.animation = nil; transaction.disablesAnimations = true
+    withTransaction(transaction) { presentPosition(position) }
+    return true
   }
 
   /// Called before the authoritative model changes selection, so its subsequent
@@ -91,6 +141,7 @@ final class NativeSpaceViewport: ObservableObject {
   func settle(selectedID selected: String, duration: Double, motionScale: Double,
     at time: TimeInterval = ProcessInfo.processInfo.systemUptime) {
     guard let target = ids.firstIndex(of: selected), let previous = selectedID else { return }
+    flushPendingTrackingPresentation()
     self.selectedID = selected
     begin(Motion(started: time, duration: max(0, duration * motionScale), fromPosition: position,
       targetPosition: Double(target), starts: [], ends: [],
@@ -98,6 +149,13 @@ final class NativeSpaceViewport: ObservableObject {
   }
 
   func stop() { finish() }
+
+  /// Cancellation of an old contact cannot finish a newer dot or release
+  /// transition. Only presentation still owned by an admitted finger is reset.
+  func cancelTracking() {
+    guard isTracking || trackingOriginPosition != nil || pendingTrackingProgress != nil else { return }
+    finish()
+  }
 
   /// Explicit time makes interruption, snapping and bounded-host behavior
   /// reproducible without claiming physical trackpad input acceptance.
@@ -111,19 +169,22 @@ final class NativeSpaceViewport: ObservableObject {
       position = start + (motion.targetPosition - start) * progress
       presentPosition(position)
     } else {
-      frames = zip(motion.starts, motion.ends).map { start, end in
+      let next: [Frame] = zip(motion.starts, motion.ends).map { start, end in
         .init(id: start.id, offset: start.offset + (end.offset - start.offset) * progress)
       }
+      if frames != next { frames = next }
       position = motion.targetPosition - (frames.first(where: { $0.id == selectedID })?.offset ?? 0)
-      blend = .init(from: motion.appearance.from, to: motion.appearance.to, progress: progress)
+      let nextBlend = Blend(from: motion.appearance.from, to: motion.appearance.to, progress: progress)
+      if blend != nextBlend { blend = nextBlend }
     }
   }
 
   private func begin(_ motion: Motion) {
-    cancelAnimation(); isTracking = false
+    cancelTrackingPresentation(); cancelAnimation()
+    if isTracking { isTracking = false }
     animation = motion
     guard motion.duration > 0 else { finish(); return }
-    isAnimating = true
+    if !isAnimating { isAnimating = true }
     advance(at: motion.started)
     guard automaticallyAdvance else { return }
     guard let motionView, motionView.window != nil else { finish(); return }
@@ -138,25 +199,38 @@ final class NativeSpaceViewport: ObservableObject {
     }
   }
   private func cancelAnimation() {
-    clock.stop(); animation = nil; isAnimating = false
+    clock.stop(); animation = nil
+    if isAnimating { isAnimating = false }
+  }
+  private func cancelTrackingPresentation() {
+    trackingClock.stop(); pendingTrackingProgress = nil; trackingOriginPosition = nil
   }
   private func finish() {
-    cancelAnimation(); isTracking = false
-    guard let selectedID, let index = ids.firstIndex(of: selectedID) else { frames = []; blend = nil; return }
+    cancelTrackingPresentation(); cancelAnimation()
+    if isTracking { isTracking = false }
+    guard let selectedID, let index = ids.firstIndex(of: selectedID) else {
+      if !frames.isEmpty { frames = [] }; if blend != nil { blend = nil }; return
+    }
     position = Double(index); presentPosition(position)
   }
   private func reset(ids: [String], selectedID: String?) {
-    cancelAnimation(); isTracking = false; self.ids = ids; self.selectedID = selectedID
+    cancelTrackingPresentation(); cancelAnimation()
+    if isTracking { isTracking = false }
+    self.ids = ids; self.selectedID = selectedID
     finish()
   }
   private func presentPosition(_ value: Double) {
-    guard !ids.isEmpty else { frames = []; blend = nil; return }
+    guard !ids.isEmpty else {
+      if !frames.isEmpty { frames = [] }; if blend != nil { blend = nil }; return
+    }
     let clamped = min(Double(ids.count - 1), max(0, value))
     let lower = Int(floor(clamped)), upper = Int(ceil(clamped))
-    frames = (max(0, lower - 1)...min(ids.count - 1, upper + 1)).map {
+    let next = (max(0, lower - 1)...min(ids.count - 1, upper + 1)).map {
       Frame(id: ids[$0], offset: Double($0) - value)
     }
-    blend = .init(from: ids[lower], to: ids[upper], progress: clamped - Double(lower))
+    if frames != next { frames = next }
+    let nextBlend = Blend(from: ids[lower], to: ids[upper], progress: clamped - Double(lower))
+    if blend != nextBlend { blend = nextBlend }
   }
 }
 

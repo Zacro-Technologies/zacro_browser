@@ -302,7 +302,7 @@ def main():
                         help="Launch through macOS LaunchServices and verify the actual app exit status with kqueue")
     parser.add_argument("--await-foreground", action="store_true",
                         help="Wait for actual foreground ownership before integration fixtures (activate the owned window with Computer input)")
-    parser.add_argument("--suite", choices=("all", "extensions", "extension-actions", "extension-services", "extension-admission", "extension-search", "extension-management", "extension-uninstall", "extension-ui-owner", "extension-host", "history-mirror", "history-spa", "history-veto", "history-publication", "popup-close", "popup-adoption", "download-retirement", "windows", "hosted-selection", "resize", "peek", "navigation", "capture", "media", "sidebar", "recovery", "interface"), default="all",
+    parser.add_argument("--suite", choices=("all", "extensions", "extension-actions", "extension-services", "extension-admission", "extension-search", "extension-management", "extension-uninstall", "extension-ui-owner", "extension-host", "history-mirror", "history-spa", "history-veto", "history-publication", "popup-close", "popup-adoption", "download-retirement", "windows", "hosted-selection", "resize", "peek", "navigation", "capture", "media", "sidebar", "space-input-construction", "space-swipe", "space-swipe-prelude", "application-reopening", "recovery", "interface", "interface-prelude"), default="all",
                         help="Run one application fixture group; focused reports do not establish full-app acceptance")
     parser.add_argument("--require-extensions", action="store_true", help="Require the custom native extension protocol and real MV3 integration fixture")
     args = parser.parse_args()
@@ -384,7 +384,7 @@ def main():
                             stop_owned()
                             process.wait(timeout=5)
                             raise SystemExit(f"FAIL: native UI input check; see {output / 'ui.log'}")
-                    driver_timeout = (640 if args.suite == "all" else 460) if args.integration else 45
+                    driver_timeout = (940 if args.suite == "all" else 460) if args.integration else 45
                     code = process.wait(timeout=driver_timeout)
                 except subprocess.TimeoutExpired:
                     stop_owned()

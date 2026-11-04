@@ -88,7 +88,8 @@ struct NativeCommandPalette: View {
           resultList
         }.padding(8).frame(width: min(590, available - 32))
           .background { NativeControlSurface().overlay(colors.chrome.opacity(0.86)).clipShape(NativePaneShape(radius: 12)) }
-          .overlay(NativePaneShape(radius: 12).stroke(colors.ink.opacity(0.08), lineWidth: 0.5))
+          .overlay(NativePaneShape(radius: 12).stroke(colors.ink.opacity(0.08), lineWidth: 0.5)
+            .allowsHitTesting(false).accessibilityHidden(true))
           .shadow(color: .black.opacity(0.14), radius: 16, y: 8)
           .opacity(entered || reduceMotion ? 1 : 0)
           .scaleEffect(entered || reduceMotion ? 1 : 0.99)
