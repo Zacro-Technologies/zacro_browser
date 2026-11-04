@@ -75,7 +75,7 @@ void SessionTabHelper::SetNativeInitialIDProvider(
     result[HELPER_CC] = replace(result[HELPER_CC], "session_id_(SessionID::NewUnique()),",
                                "session_id_(InitialSessionID(contents)),")
     result[DELEGATE] = replace(result[DELEGATE], '#include "cef/libcef/browser/devtools/devtools_window_runner.h"',
-                              '#include "cef/libcef/browser/devtools/devtools_window_runner.h"\n#include "cef/libcef/browser/devtools/zacro_tab_reservation.h"')
+                              '#include "cef/libcef/browser/devtools/devtools_window_runner.h"\n#include "cef/libcef/browser/devtools/zacro_tab_reservation.h"\n#include "chrome/browser/history/native_history_owner.h"')
     result[DELEGATE] = replace(result[DELEGATE], """void ChromeBrowserDelegate::OnWebContentsCreated(
     content::WebContents* new_contents) {
 """, """void ChromeBrowserDelegate::OnWebContentsCreated(
@@ -92,6 +92,15 @@ void SessionTabHelper::SetNativeInitialIDProvider(
     CHECK(ZacroConsumeTabReservation(new_contents, token));
   }
 """)
+    result[DELEGATE] = replace(result[DELEGATE], """  CreateBrowserHostForPopup(new_contents, settings, client, extra_info,
+                            std::move(platform_delegate),
+                            /*is_devtools_popup=*/false, opener);""", """  // Attach the exact public opener's provisional history token before CEF
+  // publishes this child or its first navigation. This grants no logical tab
+  // identity or Library publication; durable Core adoption is still required.
+  NativeHistoryOwner::RegisterProvisionalPopup(source_contents, opener_id, new_contents);
+  CreateBrowserHostForPopup(new_contents, settings, client, extra_info,
+                            std::move(platform_delegate),
+                            /*is_devtools_popup=*/false, opener);""")
     result[HOST] = replace(result[HOST], '#include "base/logging.h"',
                           '#include "base/functional/bind.h"\n#include "base/functional/callback_helpers.h"\n#include "base/logging.h"')
     result[HOST] = replace(result[HOST], '#include "cef/libcef/browser/thread_util.h"',

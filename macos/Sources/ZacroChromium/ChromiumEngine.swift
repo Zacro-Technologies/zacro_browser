@@ -15,6 +15,9 @@ public final class ChromiumEngine: NSObject {
   private var downloadControls: [String: CefDownloadControl] = [:]
   private var retiredProfiles: Set<String> = []
   private var profilesUnderMaintenance: Set<String> = []
+  private var auxiliaryMaintenanceLeases: [String: CefAuxiliaryAdmissionLease] = [:]
+  private var auxiliaryMaintenanceErrors: [String: Error] = [:]
+  private var sealedAuxiliaryProfiles: Set<String> = []
   private var profileMaintenanceEpochs: [String: UInt64] = [:]
   private var profileDownloadRetirements: [String: Task<Void, Error>] = [:]
   private var retirementPhase = ChromiumRetirementPhase()
@@ -36,6 +39,7 @@ public final class ChromiumEngine: NSObject {
   }
   public private(set) var isTerminating = false
   public var onTerminationChanged: ((Bool) -> Void)?
+  public var onAuxiliaryAdmissionFailure: ((Error) -> Void)?
   public var beforeTermination: (() async -> Void)?
   public var beforeClosingDocuments: (() async -> Bool)?
   private var closingPreparation: Task<Bool, Never>?
@@ -149,6 +153,18 @@ public final class ChromiumEngine: NSObject {
     // that CEF does not package. This leaves production defaults and sandbox
     // enforcement intact, including in a diagnostic non-official build.
     configuration.extraCommandLineSwitches.updateValue(nil, forKey: "disable-field-trial-config")
+    if ProcessInfo.processInfo.environment["ZACRO_NATIVE_SEARCH_FIXTURE"] == "1" {
+      guard CommandLine.arguments.contains("--engine-acceptance"),
+        CommandLine.arguments.contains("--native-integration-acceptance") else {
+        throw NSError(domain: "ZacroEngine", code: 1, userInfo: [NSLocalizedDescriptionKey:
+          "Native search fixtures require the fresh disposable application acceptance mode."])
+      }
+      // Exercise the actual selected-provider URL and navigation without
+      // sending generated queries to an external search provider. Resolver
+      // failure is ordinary Chromium page failure, not a security bypass.
+      configuration.extraCommandLineSwitches["host-resolver-rules"] =
+        "MAP www.google.com ^NOTFOUND, MAP duckduckgo.com ^NOTFOUND, MAP www.bing.com ^NOTFOUND, MAP search.brave.com ^NOTFOUND"
+    }
     // The native scoped lease follows actual document visibility. Its fresh
     // process acceptance proves retained trees without enabling hidden brokers
     // or never-shown documents through a process-wide renderer switch.
@@ -164,6 +180,9 @@ public final class ChromiumEngine: NSObject {
     configuration.defaultRuntimeStyle = .chrome
     configuration.logFile = dataDirectory.appendingPathComponent("chromium.log")
     try CefRuntime.shared.initialize(configuration: configuration)
+    CefRuntime.shared.onAuxiliaryAdmissionFailure = { [weak self] error in
+      self?.onAuxiliaryAdmissionFailure?(error)
+    }
     CefRuntime.shared.onTerminationChanged = { [weak self] terminating in
       guard let self else { return }
       self.isTerminating = terminating
@@ -233,6 +252,18 @@ public final class ChromiumEngine: NSObject {
         page.profileID == profileID && page.isPrivate == isPrivate,
         "Cannot move a live page across profiles")
       return page
+    }
+    let retirementID = "maintenance:retire:" + (isPrivate ? "private:" : "persistent:") + profileID
+    let isMaintenanceTransport = id == "maintenance:" + profileID
+      || id == "history-maintenance:" + profileID || id == retirementID
+    if profilesUnderMaintenance.contains(profileID), !isMaintenanceTransport {
+      // Closing the captured page set must stay closed until this transaction
+      // commits or is cancelled. Late bookmark/download/extension work may
+      // otherwise recreate its hidden broker and prevent profile retirement.
+      let rejected = ChromiumPage(id: id, profileID: profileID, isPrivate: isPrivate)
+      rejected.ownerWindowID = ownerWindowID
+      rejected.rejectCreation("This profile is being updated. Try again after the operation finishes.")
+      return rejected
     }
     precondition(host != nil, "Start Chromium before creating pages")
     precondition(ownerWindowID == nil || contexts[ownerWindowID!]?.isOpen == true,
@@ -357,7 +388,7 @@ public final class ChromiumEngine: NSObject {
         child.close(); return
       }
       let popup = ChromiumPage(id: "popup-" + UUID().uuidString, profileID: page.profileID, isPrivate: page.isPrivate)
-      popup.openerID = page.id
+      popup.openerID = request.sourceExtensionID == nil ? page.id : nil
       popup.ownerWindowID = page.ownerWindowID
       child.browser.delegate = popup
       self.attach(popup, chrome: child)
@@ -377,12 +408,32 @@ public final class ChromiumEngine: NSObject {
     return page
   }
 
+  /// Read-only identities of internal surfaces that can originate native
+  /// Chrome UI. This does not classify arbitrary pages by a name prefix.
+  public func ownsInternalPopupSource(_ page: ChromiumPage) -> Bool {
+    guard pages[page.id] === page else { return false }
+    if !page.isPrivate, pages["extensions:\(page.profileID)"] === page { return true }
+    if page.isPrivate, pages["private-components:\(page.profileID)"] === page { return true }
+    guard let ownerID = page.ownerWindowID, contexts[ownerID]?.isOpen == true else { return false }
+    return pages[panelParkingID(ownerWindowID: ownerID, profileID: page.profileID)] === page
+  }
+
   /// Prevents panel retention from creating documents while a profile-wide
   /// clear/delete transaction is closing its complete document snapshot.
   public func setProfileMaintenance(_ profileID: String, active: Bool) {
     let changed = active ? profilesUnderMaintenance.insert(profileID).inserted
       : profilesUnderMaintenance.remove(profileID) != nil
     if changed { profileMaintenanceEpochs[profileID, default: 0] &+= 1 }
+    for key in ["persistent:" + profileID, "private:" + profileID] {
+      if active {
+        guard auxiliaryMaintenanceLeases[key] == nil, let profile = profiles[key] else { continue }
+        do { auxiliaryMaintenanceLeases[key] = try profile.acquireAuxiliaryAdmission(); auxiliaryMaintenanceErrors[key] = nil }
+        catch { auxiliaryMaintenanceErrors[key] = error }
+      } else if !sealedAuxiliaryProfiles.contains(key) {
+        do { try auxiliaryMaintenanceLeases[key]?.release(); auxiliaryMaintenanceLeases[key] = nil; auxiliaryMaintenanceErrors[key] = nil }
+        catch { auxiliaryMaintenanceErrors[key] = error }
+      }
+    }
   }
 
   private func panelParkingID(ownerWindowID: String, profileID: String) -> String {
@@ -478,10 +529,34 @@ public final class ChromiumEngine: NSObject {
     guard let profile = profiles[key] else { return [] }
     return CefRuntime.shared.auxiliaryBrowsers.filter { $0.belongs(to: profile) }
   }
+  /// A trusted host lease for an already-open exact request context. This
+  /// never creates a profile or falls back to a global/foreground context.
+  public func acquireAuxiliaryAdmission(profileID: String, isPrivate: Bool) throws -> CefAuxiliaryAdmissionLease? {
+    let key = (isPrivate ? "private:" : "persistent:") + profileID
+    guard let profile = profiles[key] else { throw CefDevToolsError.browserClosed }
+    return try profile.acquireAuxiliaryAdmission()
+  }
+
+  public func isAuxiliaryAdmissionBlocked(profileID: String, isPrivate: Bool) throws -> Bool {
+    let key = (isPrivate ? "private:" : "persistent:") + profileID
+    guard let profile = profiles[key] else { throw CefDevToolsError.browserClosed }
+    return try profile.isAuxiliaryAdmissionBlocked()
+  }
+
   public func closeAuxiliaryBrowsers(profileID: String, isPrivate: Bool) async throws {
     let key = (isPrivate ? "private:" : "persistent:") + profileID
     guard let profile = profiles[key] else { return }
-    try await CefRuntime.shared.closeAuxiliaryBrowsers(in: profile)
+    if let error = auxiliaryMaintenanceErrors[key] { throw error }
+    let retained = auxiliaryMaintenanceLeases[key]
+    let lease = try retained ?? profile.acquireAuxiliaryAdmission()
+    do {
+      try await CefRuntime.shared.closeAuxiliaryBrowsers(in: profile)
+      try await lease?.waitForQuiescence()
+      if retained == nil { try lease?.release() }
+    } catch {
+      if retained == nil { try? lease?.release() }
+      throw error
+    }
   }
   private func hasAuxiliaryWindows(profileID: String, isPrivate: Bool) -> Bool {
     let key = (isPrivate ? "private:" : "persistent:") + profileID
@@ -499,7 +574,14 @@ public final class ChromiumEngine: NSObject {
     }
     // Startup replay and profiles never opened in this process have no native
     // transfers. Do not create a request context merely to remove one.
-    guard profiles[key] != nil else { return }
+    guard let existingProfile = profiles[key] else { return }
+    // This API requires Core's already-durable retirement authority. Seal
+    // before any await so a failed later file/download cleanup cannot reopen it.
+    if auxiliaryMaintenanceLeases[key] == nil {
+      auxiliaryMaintenanceLeases[key] = try existingProfile.acquireAuxiliaryAdmission()
+    }
+    try auxiliaryMaintenanceLeases[key]?.seal()
+    sealedAuxiliaryProfiles.insert(key)
     let task = Task { @MainActor in
       try await self.closeAuxiliaryBrowsers(profileID: profileID, isPrivate: isPrivate)
       guard self.retirementPhase.canCreateForExistingTask, !self.shuttingDown,
@@ -809,6 +891,7 @@ public final class ChromiumEngine: NSObject {
     capabilities = nil; unsupportedNativeCapabilities = false
     onLayout = nil
     onTerminationChanged = nil
+    onAuxiliaryAdmissionFailure = nil
     onDownload = nil
     onPageClosed = nil
     onPageCloseCancelled = nil
@@ -1073,6 +1156,12 @@ public final class ChromiumPage: CefBrowserDelegate {
   }
   public func browser(_ b: CefBrowser, didCommitNavigation url: URL) {
     guard browser === b else { return }
+    // CEF emits this only after a successful non-same-document commit. An
+    // admitted reload can still be aborted by Chromium's duplicate-error
+    // throttle, leaving the existing error document on screen.
+    if documentError != nil || error != nil {
+      documentError = nil; error = nil; onChange?()
+    }
     onCommittedNavigation?(url)
   }
   public func browser(_ b: CefBrowser, didChangeURL url: URL?) {
@@ -1083,7 +1172,7 @@ public final class ChromiumPage: CefBrowserDelegate {
     }
     self.url = url
     // Error pages may commit their URL after on_load_error. Keep the failure
-    // until a genuine subsequent main-frame navigation begins.
+    // until a successful main-frame commit replaces the document.
     onChange?()
   }
   public func browser(
@@ -1109,6 +1198,7 @@ public final class ChromiumPage: CefBrowserDelegate {
   }
   public func browser(_ b: CefBrowser, didFailLoad code: Int, errorText: String, failedURL: String)
   {
+    guard browser === b else { return }
     if code != -3 {
       let message = errorText.isEmpty ? "This page could not be loaded." : String(errorText.prefix(2000))
       error = message
@@ -1119,17 +1209,31 @@ public final class ChromiumPage: CefBrowserDelegate {
   public func browser(_ b: CefBrowser, decideWindowOpenFor request: CefWindowOpenRequest)
     -> CefWindowOpenAction
   {
+    func trace(_ decision: String) {
+      guard request.sourceExtensionID != nil,
+        CommandLine.arguments.contains("--engine-acceptance"),
+        CommandLine.arguments.contains("--native-integration-acceptance") else { return }
+      fputs("Native extension-host page policy decision=\(decision) logicalID=\(id) browser=\(b.id) window=\(ownerWindowID ?? "nil") disposition=\(request.disposition) gesture=\(request.userGesture) recentPopups=\(popupTimes.count) targetHost=\(request.targetURL?.host ?? "nil")\n", stderr)
+    }
     let blank = request.targetURL == nil || request.targetURL?.absoluteString == "about:blank"
-    guard blank || request.targetURL.map(allowedNewDocumentURL) == true else { return .deny }
+    let ownExtension = request.sourceExtensionID.map { identifier in
+      request.targetURL?.scheme == "chrome-extension" && request.targetURL?.host == identifier
+        && request.targetURL?.user == nil && request.targetURL?.password == nil
+    } == true
+    guard blank || ownExtension || request.targetURL.map(allowedNewDocumentURL) == true else {
+      trace("deny-url"); return .deny
+    }
     let now = Date()
     popupTimes.removeAll { now.timeIntervalSince($0) >= 1 }
-    guard popupTimes.count < 4 else { return .deny }
+    guard popupTimes.count < 4 else { trace("deny-rate"); return .deny }
     popupTimes.append(now)
-    if request.disposition == .newWindow, request.userGesture, let url = request.targetURL,
+    if request.sourceExtensionID == nil, request.disposition == .newWindow, request.userGesture, let url = request.targetURL,
       NSEvent.modifierFlags.contains(.shift), let onPeek { onPeek(url, nil); return .handled }
     // Never replace a Chromium-created popup with a GET of its URL: the live
     // document carries POST bodies, named-window identity and its opener.
-    return onPopupCreated != nil || canAdoptPopupInternally?() == true ? .allowNativePopup : .deny
+    let adoptable = onPopupCreated != nil || canAdoptPopupInternally?() == true
+    trace(adoptable ? "allow-native-popup" : "deny-no-owner")
+    return adoptable ? .allowNativePopup : .deny
   }
   private static func webURL(_ url: URL) -> Bool {
     ["http", "https"].contains(url.scheme?.lowercased() ?? "") && url.host?.isEmpty == false && url.user == nil && url.password == nil
@@ -1158,8 +1262,11 @@ public final class ChromiumPage: CefBrowserDelegate {
     guard isMainFrame else { return .allow }
     guard let url else { return .cancel }
     func allowMainFrameNavigation() -> CefNavigationDecision {
-      if documentError != nil || error != nil {
-        documentError = nil; error = nil; onChange?()
+      // A new request does not replace a committed error document. In
+      // particular, automatic network retries may end with ERR_ABORTED and
+      // no new error callback. Preserve that document's failure until commit.
+      if documentError == nil && error != nil {
+        error = nil; onChange?()
       }
       return .allow
     }

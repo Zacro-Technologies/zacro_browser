@@ -14,6 +14,7 @@ public struct CefNativeCapabilities: Decodable, Sendable {
     public let navigationState: Bool
     public let encryptedNavigation: Bool?
     public let retainedDiscard: Bool?
+    public let historyInstallation: Bool?
     public let extensionActions: Bool?
     public let legacyNavigation: Bool?
     public let extensionStorage: Bool?
@@ -21,7 +22,24 @@ public struct CefNativeCapabilities: Decodable, Sendable {
     public let volatileDiscard: Bool?
     public let bookmarks: Bool?
     public let historyRemoval: Bool?
+    public let historyMirror: Bool?
     public let downloads: Bool?
+}
+
+/// Cancellation can arrive off the main actor while a native event is queued.
+/// Keep that receipt inactive immediately; observers never infer installation
+/// from a final network response or a document's URL/loading state.
+private final class CefHistoryInstallationReceipt: @unchecked Sendable {
+    private let lock = NSLock()
+    private var active = true
+    private var installed = false
+    func consume() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard active, !installed else { return false }
+        installed = true; return true
+    }
+    func invalidate() { lock.lock(); active = false; lock.unlock() }
+    var wasInstalled: Bool { lock.lock(); defer { lock.unlock() }; return installed }
 }
 
 public struct CefDocumentSafetyState: Decodable, Sendable {
@@ -88,10 +106,10 @@ extension CefBrowser {
 
     /// Restores only a fresh initial document or the exact empty document
     /// retained by discardDocument. A live page can never be overwritten.
-    public func restoreNavigationState(_ state: Data) async throws {
+    public func restoreNavigationState(_ state: Data, onHistoryInstalled: (@MainActor () -> Void)? = nil) async throws {
         guard !state.isEmpty, state.count <= 6 * 1024 * 1024 else { throw CefDevToolsError.invalidMessage }
-        let response = try await devTools.call("Zacro.restoreNavigation", parameters: ["state": state.base64EncodedString()], timeout: 50)
-        guard response["restored"] as? Bool == true else { throw CefDevToolsError.invalidMessage }
+        try await restoreNativeHistory("Zacro.restoreNavigation", parameters: ["state": state.base64EncodedString()],
+            onHistoryInstalled: onHistoryInstalled)
     }
 
     /// Uses CEF's normal navigation path, but returns only after the issued
@@ -115,22 +133,50 @@ extension CefBrowser {
 
     /// Restores the native in-memory history retained while sleeping. Private
     /// documents use this route exclusively and never export their page state.
-    public func restoreDiscardedDocument() async throws {
-        let response = try await devTools.call("Zacro.restoreDiscardedDocument", timeout: 50)
-        guard response["restored"] as? Bool == true else { throw CefDevToolsError.invalidMessage }
+    public func restoreDiscardedDocument(onHistoryInstalled: (@MainActor () -> Void)? = nil) async throws {
+        try await restoreNativeHistory("Zacro.restoreDiscardedDocument", parameters: [:], onHistoryInstalled: onHistoryInstalled)
     }
 
     /// Imports a safe URL/title-only history from an older browser database.
     /// This intentionally carries no page forms, POST bodies or credentials.
-    public func restoreNavigationEntries(_ entries: [CefNavigationEntry], selectedIndex: Int) async throws {
+    public func restoreNavigationEntries(_ entries: [CefNavigationEntry], selectedIndex: Int,
+        onHistoryInstalled: (@MainActor () -> Void)? = nil) async throws {
         guard !entries.isEmpty, entries.count <= 500, entries.indices.contains(selectedIndex) else {
             throw CefDevToolsError.invalidMessage
         }
-        let response = try await devTools.call("Zacro.restoreNavigationEntries", parameters: [
+        try await restoreNativeHistory("Zacro.restoreNavigationEntries", parameters: [
             "entries": entries.map { ["url": $0.url.absoluteString, "title": $0.title] },
             "selectedIndex": selectedIndex,
-        ], timeout: 50)
-        guard response["restored"] as? Bool == true else { throw CefDevToolsError.invalidMessage }
+        ], onHistoryInstalled: onHistoryInstalled)
+    }
+
+    private func restoreNativeHistory(_ method: String, parameters: [String: Any],
+        onHistoryInstalled: (@MainActor () -> Void)?) async throws {
+        guard let onHistoryInstalled else {
+            let response = try await devTools.call(method, parameters: parameters, timeout: 50)
+            guard response["restored"] as? Bool == true else { throw CefDevToolsError.invalidMessage }
+            return
+        }
+        // An older/stock runtime cannot acknowledge this phase. Reject before
+        // submitting a restore, instead of waiting for an event it cannot emit.
+        guard try await nativeCapabilities().historyInstallation == true else { throw CefDevToolsError.unavailable }
+        try Task.checkCancellation()
+        let nonce = UUID().uuidString.lowercased(), browserID = id
+        let receipt = CefHistoryInstallationReceipt()
+        let observer = try devTools.observeEvents { [weak self] method, values in
+            guard method == "Zacro.navigationHistoryInstalled", values["token"] as? String == nonce,
+                values["browserID"] as? Int == Int(browserID), let self,
+                self.id == browserID, !self.isClosed, self.hasRawBrowser, receipt.consume() else { return }
+            onHistoryInstalled()
+        }
+        defer { receipt.invalidate(); devTools.removeEventObserver(observer) }
+        var parameters = parameters
+        parameters["installationToken"] = nonce
+        let response = try await withTaskCancellationHandler {
+            try await devTools.call(method, parameters: parameters, timeout: 50)
+        } onCancel: { receipt.invalidate() }
+        try Task.checkCancellation()
+        guard response["restored"] as? Bool == true, receipt.wasInstalled else { throw CefDevToolsError.invalidMessage }
     }
 
     /// Removes real profile storage including IndexedDB, localStorage, service

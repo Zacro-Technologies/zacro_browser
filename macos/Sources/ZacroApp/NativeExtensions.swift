@@ -148,7 +148,7 @@ final class NativeExtensionsModel: ObservableObject {
       refresh()
     case .actionChanged: refreshActions()
     case .commandsChanged: refreshShortcuts()
-    case .storageChanged, .hostRequest, .bookmarksChanged, .downloadChanged, .downloadRemoved: break
+    case .storageChanged, .hostRequest, .postUninstallNavigation, .bookmarksChanged, .historyChanged, .downloadChanged, .downloadRemoved: break
     }
   }
   /// Matching is synchronous so the native key monitor can consume precisely
@@ -491,6 +491,9 @@ struct NativeExtensionsView: View {
         }
       }.padding(14)
     }.foregroundStyle(palette.ink).tint(palette.accent).scrollIndicators(.hidden)
+      .buttonStyle(NativeChromeButtonStyle(colors: palette))
+      .toggleStyle(NativeChromeToggleStyle(colors: palette))
+      .disclosureGroupStyle(NativeChromeDisclosureStyle(colors: palette))
       .task { model.profileChanged(); model.refresh() }
   }
 
@@ -510,7 +513,7 @@ private struct NativeExtensionCard: View {
           Text(item.version + " · " + extensionStatus(item)).font(.system(size:11)).foregroundStyle(palette.muted)
         }
         Spacer()
-        Toggle("Enabled",isOn:Binding(get:{item.isUserEnabled},set:{model.perform($0 ? "enable":"disable",id:item.id)})).labelsHidden().toggleStyle(.switch).controlSize(.small).disabled(!item.userMayModify)
+        Toggle("Enabled",isOn:Binding(get:{item.isUserEnabled},set:{model.perform($0 ? "enable":"disable",id:item.id)})).labelsHidden().toggleStyle(NativeChromeToggleStyle(colors: palette, showsLabel: false)).disabled(!item.userMayModify)
       }
       Text(item.description).font(.system(size:12)).foregroundStyle(palette.muted).fixedSize(horizontal:false,vertical:true)
       let notices = extensionNotices(item)
@@ -606,22 +609,21 @@ private struct NativeExtensionPermissions: View {
           Toggle("Allow in private sessions",isOn:Binding(get:{item.incognitoAccess.isActive},set:{model.perform("incognito",id:item.id,value:String($0))}))
         }
         if let hosts = item.permissions.runtimeHostPermissions {
-          Picker("Site access",selection:Binding(get:{hosts.hostAccess},set:{model.perform("host-access",id:item.id,value:$0)})) {
-            Text("When selected").tag("ON_CLICK")
-            Text("On specific sites").tag("ON_SPECIFIC_SITES")
-            if hosts.hasAllHosts { Text("On all sites").tag("ON_ALL_SITES") }
-          }
+          NativeChromeSelect(title: "Site access", selection: Binding(get: { hosts.hostAccess },
+            set: { model.perform("host-access", id: item.id, value: $0) }),
+            options: [("ON_CLICK", "When selected"), ("ON_SPECIFIC_SITES", "On specific sites")]
+              + (hosts.hasAllHosts ? [("ON_ALL_SITES", "On all sites")] : []), colors: palette)
           if hosts.hostAccess == "ON_SPECIFIC_SITES" {
             ForEach(hosts.hosts,id:\.host) { host in
               Toggle(host.host,isOn:Binding(get:{host.granted},set:{model.perform($0 ? "host-allow":"host-remove",id:item.id,value:host.host)}))
             }
             HStack {
-              TextField("https://example.com/*",text:$sitePattern).textFieldStyle(.roundedBorder)
+              TextField("https://example.com/*",text:$sitePattern).textFieldStyle(NativeChromeTextFieldStyle(colors: palette))
               Button("Add") { model.perform("host-allow",id:item.id,value:sitePattern); sitePattern = "" }.disabled(sitePattern.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty)
             }
           }
         }
-      }.padding(.top,8).font(.system(size:11)).toggleStyle(.switch).controlSize(.small)
+      }.padding(.top,8).font(.system(size:11)).toggleStyle(NativeChromeToggleStyle(colors: palette))
         .disabled(!item.userMayModify)
     }.font(.system(size:12))
   }
@@ -696,13 +698,11 @@ private struct NativeExtensionCommands: View {
               }
             }
             HStack(spacing: 6) {
-              Picker("Scope", selection: Binding(get: { command.scope == "GLOBAL" }, set: { global in
+              NativeChromeSelect(title: "Scope", selection: Binding(get: { command.scope == "GLOBAL" }, set: { global in
                 stopRecording()
                 save(command.name) { try await model.updateCommandScope(extensionID: item.id, commandName: command.name, global: global) }
-              })) {
-                Text("In Zacro").tag(false)
-                Text("Global").tag(true)
-              }.labelsHidden().fixedSize().controlSize(.small)
+              }), options: [(false, "In Zacro"), (true, "Global")], colors: palette, showsLabel: false)
+                .frame(maxWidth: 150)
                 .disabled(!item.userMayModify || command.isExtensionAction || !command.isActive || saving != nil)
                 .accessibilityLabel("Shortcut scope for " + command.description)
               if item.isEnabled && !command.isActive && !command.keybinding.isEmpty {

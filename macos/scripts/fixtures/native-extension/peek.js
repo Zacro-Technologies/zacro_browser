@@ -32,11 +32,16 @@ globalThis.zacroPeekFixture = (() => {
   }
   async function activateSourceThenPeek(sourceID, peekID) {
     const initial = await inspect(sourceID, peekID);
-    await chrome.tabs.update(sourceID, { active: true });
+    const updatedSource = await chrome.tabs.update(sourceID, { active: true });
     const hidden = await chrome.tabs.get(peekID);
     const activeSource = await chrome.tabs.query({ active: true, windowId: initial.source.windowId });
+    const metadata = tab => tab && typeof tab === 'object' ? ({ id: tab.id, windowId: tab.windowId, active: tab.active,
+      highlighted: tab.highlighted, openerTabId: tab.openerTabId ?? null,
+      url: String(tab.url ?? '').slice(0, 500), status: tab.status, discarded: tab.discarded }) : { missing: true };
     assert(activeSource.length === 1 && activeSource[0].id === sourceID && !hidden.active,
-      'source activation hides, rather than closes, preview');
+      'source activation hides, rather than closes, preview; ' + JSON.stringify({ sourceID, peekID,
+        initialSource: metadata(initial.source), initialPreview: metadata(initial.preview),
+        updatedSource: metadata(updatedSource), hidden: metadata(hidden), activeSource: activeSource.slice(0, 8).map(metadata) }));
     assert(hidden.url === initial.preview.url, 'hidden preview retains its destination');
     await chrome.tabs.update(peekID, { active: true });
     return inspect(sourceID, peekID);

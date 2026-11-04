@@ -84,5 +84,9 @@ class NativeManagementOperation final
 // Defined by the platform adapter. Only windows in the current native process
 // may be used; no raw pointer is accepted from the host protocol.
 gfx::NativeWindow NativeManagementWindowForNumber(int number, int logical_window_id);
+// Resolves only a visible shell with the native logical identity. When a
+// source is supplied it must actually be a descendant of that exact shell.
+gfx::NativeWindow NativeExtensionUIWindowForLogicalWindow(
+    int logical_window_id, gfx::NativeWindow source = gfx::NativeWindow());
 }  // namespace extensions
 #endif

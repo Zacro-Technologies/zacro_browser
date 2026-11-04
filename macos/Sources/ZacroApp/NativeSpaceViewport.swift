@@ -23,7 +23,8 @@ final class NativeSpaceViewport: ObservableObject {
   private var ids: [String] = []
   private var position = 0.0
   private var animation: Motion?
-  private var task: Task<Void, Never>?
+  private let clock = NativeMotionClock()
+  private weak var motionView: NSView?
   private let automaticallyAdvance: Bool
   private struct Motion {
     let id = UUID()
@@ -37,7 +38,16 @@ final class NativeSpaceViewport: ObservableObject {
   }
 
   init(automaticallyAdvance: Bool = true) { self.automaticallyAdvance = automaticallyAdvance }
-  deinit { task?.cancel() }
+
+  /// The anchor supplies this viewport's exact window content view. A zero-size
+  /// SwiftUI attachment is only a locator, never the display-link source.
+  func attachMotionView(_ view: NSView?) {
+    guard motionView !== view else { return }
+    clock.stop(); motionView = view
+    guard automaticallyAdvance, let motion = animation else { return }
+    guard let view, view.window != nil else { finish(); return }
+    startClock(for: motion, in: view)
+  }
 
   func synchronize(ids next: [String], selectedID selected: String, motionScale: Double,
     at time: TimeInterval = ProcessInfo.processInfo.systemUptime) {
@@ -60,7 +70,7 @@ final class NativeSpaceViewport: ObservableObject {
         : direction > 0 ? min(-1, frame.offset - 1) : max(1, frame.offset + 1))
     }
     self.selectedID = selected
-    begin(Motion(started: time, duration: 0.22 * max(0, motionScale), fromPosition: nil,
+    begin(Motion(started: time, duration: NativeMotion.chrome * max(0, motionScale), fromPosition: nil,
       targetPosition: Double(nextIndex), starts: starts, ends: ends,
       appearance: .init(from: previous, to: selected, progress: 0)))
   }
@@ -96,7 +106,7 @@ final class NativeSpaceViewport: ObservableObject {
     guard time < motion.started + motion.duration else { finish(); return }
     let fraction = motion.duration > 0 ? min(1, max(0, (time - motion.started) / motion.duration)) : 1
     guard fraction < 1 else { finish(); return }
-    let progress = Self.easeOut(fraction)
+    let progress = NativeMotion.progress(fraction)
     if let start = motion.fromPosition {
       position = start + (motion.targetPosition - start) * progress
       presentPosition(position)
@@ -116,17 +126,19 @@ final class NativeSpaceViewport: ObservableObject {
     isAnimating = true
     advance(at: motion.started)
     guard automaticallyAdvance else { return }
+    guard let motionView, motionView.window != nil else { finish(); return }
+    startClock(for: motion, in: motionView)
+  }
+  private func startClock(for motion: Motion, in view: NSView) {
     let generation = motion.id
-    task = Task { [weak self] in
-      while !Task.isCancelled {
-        do { try await Task.sleep(for: .milliseconds(16)) } catch { return }
-        guard let self, self.animation?.id == generation else { return }
-        self.advance(at: ProcessInfo.processInfo.systemUptime)
-      }
+    clock.start(in: view, until: motion.started + motion.duration) { [weak self] time in
+      guard let self, self.animation?.id == generation else { return }
+      if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion { self.finish() }
+      else { self.advance(at: time) }
     }
   }
   private func cancelAnimation() {
-    task?.cancel(); task = nil; animation = nil; isAnimating = false
+    clock.stop(); animation = nil; isAnimating = false
   }
   private func finish() {
     cancelAnimation(); isTracking = false
@@ -146,18 +158,25 @@ final class NativeSpaceViewport: ObservableObject {
     }
     blend = .init(from: ids[lower], to: ids[upper], progress: clamped - Double(lower))
   }
-  private static func easeOut(_ progress: Double) -> Double {
-    if progress <= 0 { return 0 }
-    if progress >= 1 { return 1 }
-    // Original renderer --ease-out: cubic-bezier(.16, 1, .3, 1).
-    var low = 0.0, high = 1.0
-    for _ in 0..<14 {
-      let t = (low + high) / 2, inverse = 1 - t
-      let x = 3 * inverse * inverse * t * 0.16 + 3 * inverse * t * t * 0.3 + t * t * t
-      if x < progress { low = t } else { high = t }
-    }
-    let inverse = 1 - (low + high) / 2
-    return 1 - inverse * inverse * inverse
+}
+
+/// Resolve the exact owning window without a global key-window/display guess.
+struct NativeSpaceMotionAnchor: NSViewRepresentable {
+  let viewport: NativeSpaceViewport
+  func makeNSView(context: Context) -> Anchor {
+    let view = Anchor(); view.viewport = viewport; return view
+  }
+  func updateNSView(_ view: Anchor, context: Context) {
+    if view.viewport !== viewport { view.viewport?.attachMotionView(nil); view.viewport = viewport }
+    view.connect()
+  }
+  static func dismantleNSView(_ view: Anchor, coordinator: ()) { view.viewport?.attachMotionView(nil) }
+  final class Anchor: NSView {
+    weak var viewport: NativeSpaceViewport?
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    override func isAccessibilityElement() -> Bool { false }
+    override func viewDidMoveToWindow() { super.viewDidMoveToWindow(); connect() }
+    func connect() { viewport?.attachMotionView(window?.contentView) }
   }
 }
 

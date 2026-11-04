@@ -154,6 +154,7 @@ bool CefDevToolsController::DispatchZacroDownloads(int id, const std::string& me
   if (method != "Zacro.downloadSnapshot" && method != "Zacro.controlDownload" &&
       method != "Zacro.renameDownload" && method != "Zacro.retireProfileDownloads") return false;
   if (method == "Zacro.retireProfileDownloads") {
+    ZacroRetireProfileHistory(inspected_contents_->GetBrowserContext());
     // This is a browser-process transport command, not an extension API. It
     // requires no extension registry/sync observer and works for OTR contexts.
     std::string error;

@@ -116,6 +116,9 @@ public struct CefWindowOpenRequest: Sendable, Equatable {
     /// ``CefWindowOpenAction/openInCurrentBrowser`` or
     /// ``CefWindowOpenAction/handled`` here.
     public var isSourceOffscreen: Bool
+    /// Browser-process-verified ExtensionHost source, which has no public tab
+    /// identity. This is never inferred from a renderer-authored URL or frame.
+    public var sourceExtensionID: String?
 
     public init(
         targetURL: URL?,
@@ -123,7 +126,8 @@ public struct CefWindowOpenRequest: Sendable, Equatable {
         disposition: CefWindowOpenDisposition = .unknown,
         userGesture: Bool = false,
         features: CefPopupFeatures = .init(),
-        isSourceOffscreen: Bool = false
+        isSourceOffscreen: Bool = false,
+        sourceExtensionID: String? = nil
     ) {
         self.targetURL = targetURL
         self.frameName = frameName
@@ -131,6 +135,7 @@ public struct CefWindowOpenRequest: Sendable, Equatable {
         self.userGesture = userGesture
         self.features = features
         self.isSourceOffscreen = isSourceOffscreen
+        self.sourceExtensionID = sourceExtensionID
     }
 }
 

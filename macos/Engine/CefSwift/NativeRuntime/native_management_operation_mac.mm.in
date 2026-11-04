@@ -10,4 +10,48 @@ gfx::NativeWindow NativeManagementWindowForNumber(int number, int logical_window
       NSApp.modalWindow || ![window.identifier isEqualToString:identity]) return gfx::NativeWindow();
   return gfx::NativeWindow(window);
 }
+
+gfx::NativeWindow NativeExtensionUIWindowForLogicalWindow(
+    int logical_window_id, gfx::NativeWindow source) {
+  const bool tracing = [NSProcessInfo.processInfo.arguments containsObject:@"--engine-acceptance"] &&
+      [NSProcessInfo.processInfo.arguments containsObject:@"--native-integration-acceptance"];
+  if (logical_window_id <= 0 || NSApp.modalWindow) {
+    if (tracing) NSLog(@"Native extension-host Cocoa owner rejected window=%d modal=%ld",
+        logical_window_id, (long)(NSApp.modalWindow ? NSApp.modalWindow.windowNumber : -1));
+    return gfx::NativeWindow();
+  }
+  NSString* identity = [NSString stringWithFormat:@"ZacroBrowserWindow:%d", logical_window_id];
+  const auto trace = [&](NSString* reason, NSWindow* candidate = nil) {
+    if (!tracing) return;
+    NSMutableArray<NSNumber*>* chain = [NSMutableArray array];
+    NSWindow* native_source = source ? source.GetNativeNSWindow() : nil;
+    for (NSWindow* cursor = native_source; cursor && chain.count < 16; cursor = cursor.parentWindow)
+      [chain addObject:@(cursor.windowNumber)];
+    NSLog(@"Native extension-host Cocoa owner reason=%@ logical=%d source=%ld sourceVisible=%d ancestry=%@ candidate=%ld candidateVisible=%d miniaturized=%d sheet=%ld key=%ld",
+        reason, logical_window_id, (long)(native_source ? native_source.windowNumber : -1),
+        native_source.visible, chain, (long)(candidate ? candidate.windowNumber : -1),
+        candidate.visible, candidate.miniaturized,
+        (long)(candidate.attachedSheet ? candidate.attachedSheet.windowNumber : -1),
+        (long)(NSApp.keyWindow ? NSApp.keyWindow.windowNumber : -1));
+  };
+  for (NSWindow* window in NSApp.windows) {
+    if (!window.visible || window.miniaturized || window.attachedSheet ||
+        ![window.identifier isEqualToString:identity]) {
+      if (tracing && [window.identifier isEqualToString:identity]) trace(@"candidate-ineligible", window);
+      continue;
+    }
+    if (source) {
+      bool descendant = false;
+      for (NSWindow* current = source.GetNativeNSWindow(); current; current = current.parentWindow) {
+        if (current == window) { descendant = true; break; }
+      }
+      if (!descendant) trace(@"source-not-descendant", window);
+      if (!descendant) continue;
+    }
+    trace(@"accepted", window);
+    return gfx::NativeWindow(window);
+  }
+  trace(@"no-eligible-owner");
+  return gfx::NativeWindow();
+}
 }  // namespace extensions

@@ -43,9 +43,11 @@ class RuntimeReceiptTests(unittest.TestCase):
         self.here.start()
         self.addCleanup(self.here.stop)
 
-    def run_build(self, mutate=None, jobs=4):
+    def run_build(self, mutate=None, jobs=4, skip_generation=True):
         builds = []
+        self.executions = []
         def execute(command, cwd, environment, **kwargs):
+            self.executions.append((command, dict(environment)))
             if command[0] == "autoninja":
                 builds.append(command)
                 if mutate:
@@ -53,7 +55,7 @@ class RuntimeReceiptTests(unittest.TestCase):
         with mock.patch.object(build, "run", side_effect=execute), \
              mock.patch.object(build, "source_revision", side_effect=lambda p: build.CEF_COMMIT + "1234" if p.name == "cef" else build.CHROMIUM_COMMIT), \
              mock.patch.object(build.shutil, "disk_usage", return_value=type("Space", (), {"free": 100 * build.GIB})()), \
-             mock.patch.object(build.sys, "argv", ["build_runtime.py", "--download-dir", str(self.root), "--skip-generation", "--jobs", str(jobs)]), \
+             mock.patch.object(build.sys, "argv", ["build_runtime.py", "--download-dir", str(self.root), "--jobs", str(jobs)] + (["--skip-generation"] if skip_generation else [])), \
              contextlib.redirect_stdout(io.StringIO()):
             build.main()
         return builds, json.loads((self.out / "zacro-runtime-build.json").read_text())
@@ -67,13 +69,18 @@ class RuntimeReceiptTests(unittest.TestCase):
         self.assertEqual(receipt["symlinks"], {"Resources/link": "icudtl.dat"})
         self.assertEqual(receipt["chromiumCommit"], build.CHROMIUM_COMMIT)
 
-    def test_runtime_preparation_applies_hosted_extension_toolbar(self):
+    def test_runtime_preparation_applies_hosted_extension_presentation(self):
         with mock.patch.object(build, "run") as execute:
             build.apply_inputs(self.source, {})
         commands = [call.args[0] for call in execute.call_args_list]
-        self.assertIn([build.sys.executable,
-                       str(self.inputs / "apply_extension_toolbar_adapter.py"),
-                       "--chromium-root", str(self.source)], commands)
+        for adapter in ("extension_toolbar_adapter", "hosted_panel_layout", "auxiliary_admission", "history_mirror", "history_flush_adapter", "extension_host_navigation"):
+            self.assertIn([build.sys.executable,
+                           str(self.inputs / ("apply_" + adapter + ".py")),
+                           "--chromium-root", str(self.source)], commands)
+        self.assertLess(commands.index([build.sys.executable, str(self.inputs / "apply_history_mirror.py"),
+                                       "--chromium-root", str(self.source)]),
+                        commands.index([build.sys.executable, str(self.inputs / "apply_adapter.py"),
+                                       "--cef-root", str(self.source / "cef")]))
 
     def test_resumed_release_disables_developer_fieldtrial_matrix(self):
         args = self.out / "args.gn"
@@ -92,6 +99,26 @@ class RuntimeReceiptTests(unittest.TestCase):
         builds, receipt = self.run_build(change)
         self.assertEqual(len(builds), 2)
         self.assertEqual(receipt["nativeInputs"]["native.inc"], build.digest(self.inputs / "native.inc"))
+
+    def test_resumed_link_removes_superseded_global_reader_override(self):
+        args = self.out / "args.gn"
+        args.write_text('target_cpu="arm64"\nenable_lld_read_workers=false\n'
+                        ' enable_lld_read_workers = false\nsymbol_level=0\n')
+        _, receipt = self.run_build()
+        self.assertNotIn("enable_lld_read_workers", args.read_text())
+        self.assertIn("symbol_level=0\n", args.read_text())
+        self.assertIn('target_cpu="arm64"\n', args.read_text())
+        self.assertEqual(receipt["gnArgsSha256"], build.digest(args))
+        previous_mtime = args.stat().st_mtime_ns
+        self.run_build()
+        self.assertEqual(args.stat().st_mtime_ns, previous_mtime)
+
+    def test_fresh_generation_preserves_build_tool_linker_defaults(self):
+        self.run_build(skip_generation=False)
+        hooks = [environment for command, environment in self.executions
+                 if command[-1] == str(self.source / "cef/tools/gclient_hook.py")]
+        self.assertEqual(len(hooks), 1)
+        self.assertNotIn("enable_lld_read_workers", hooks[0]["GN_DEFINES"])
 
     def test_changed_gn_arguments_require_another_successful_build(self):
         def change(count):

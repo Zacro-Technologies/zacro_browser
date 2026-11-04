@@ -1,0 +1,253 @@
+--- a/chrome/browser/ui/views/frame/layout/browser_view_layout.cc
++++ b/chrome/browser/ui/views/frame/layout/browser_view_layout.cc
+@@ -163,7 +163,14 @@
+         return std::make_unique<BrowserViewAppLayoutImpl>(
+             std::move(delegate), std::move(views), is_web_app);
+       }
+-      case BrowserWindowInterface::Type::TYPE_POPUP:
++      case BrowserWindowInterface::Type::TYPE_POPUP: {
++        bool native_side_panel = false;
++#if BUILDFLAG(ENABLE_CEF)
++        native_side_panel = cef::IsViewsHostedBrowser(browser);
++#endif
++        return std::make_unique<BrowserViewPopupLayoutImpl>(
++            std::move(delegate), std::move(views), native_side_panel);
++      }
+       case BrowserWindowInterface::Type::TYPE_DEVTOOLS:
+       case BrowserWindowInterface::Type::TYPE_PICTURE_IN_PICTURE:
+         return std::make_unique<BrowserViewPopupLayoutImpl>(std::move(delegate),
+--- a/chrome/browser/ui/views/frame/layout/browser_view_popup_layout_impl.h
++++ b/chrome/browser/ui/views/frame/layout/browser_view_popup_layout_impl.h
+@@ -16,7 +16,7 @@
+  public:
+   BrowserViewPopupLayoutImpl(
+       std::unique_ptr<BrowserViewLayoutDelegate> delegate,
+-      BrowserViewLayoutViews views);
++      BrowserViewLayoutViews views, bool native_side_panel = false);
+   ~BrowserViewPopupLayoutImpl() override;
+ 
+  protected:
+@@ -27,6 +27,13 @@
+   gfx::Rect CalculateTopContainerLayout(ProposedLayout& layout,
+                                         BrowserLayoutParams params,
+                                         bool needs_exclusion) const override;
++  void DoPostLayoutVisualAdjustments(
++      const BrowserLayoutParams& params) override;
++
++ private:
++  void LayoutNativeSidePanel(ProposedLayout& layout,
++                            BrowserLayoutParams& params) const;
++  const bool native_side_panel_;
+ };
+ 
+ #endif  // CHROME_BROWSER_UI_VIEWS_FRAME_LAYOUT_BROWSER_VIEW_POPUP_LAYOUT_IMPL_H_
+--- a/chrome/browser/ui/views/frame/layout/browser_view_popup_layout_impl.cc
++++ b/chrome/browser/ui/views/frame/layout/browser_view_popup_layout_impl.cc
+@@ -4,15 +4,25 @@
+ 
+ #include "chrome/browser/ui/views/frame/layout/browser_view_popup_layout_impl.h"
+ 
++#include <algorithm>
++#include <optional>
++#include "base/i18n/rtl.h"
++#include "base/numerics/safe_conversions.h"
++#include "chrome/browser/ui/animation/browser_animation_controller.h"
++#include "chrome/browser/ui/views/animations/side_panel_animations.h"
+ #include "chrome/browser/ui/views/frame/multi_contents_view.h"
++#include "chrome/browser/ui/views/side_panel/side_panel.h"
++#include "chrome/browser/ui/views/side_panel/side_panel_animation_content_view.h"
++#include "ui/compositor/layer.h"
+ #include "chrome/browser/ui/views/frame/tab_strip_region_view.h"
+ #include "chrome/browser/ui/views/infobars/infobar_container_view.h"
+ #include "ui/views/controls/separator.h"
+ 
+ BrowserViewPopupLayoutImpl::BrowserViewPopupLayoutImpl(
+     std::unique_ptr<BrowserViewLayoutDelegate> delegate,
+-    BrowserViewLayoutViews views)
+-    : BrowserViewLayoutImpl(std::move(delegate), std::move(views)) {
++    BrowserViewLayoutViews views, bool native_side_panel)
++    : BrowserViewLayoutImpl(std::move(delegate), std::move(views)),
++      native_side_panel_(native_side_panel) {
+   // Some elements may be visible when they should not be. Remove them.
+   if (this->views().horizontal_tab_strip_region_view) {
+     this->views().horizontal_tab_strip_region_view->SetVisible(false);
+@@ -97,6 +107,10 @@
+     layout.AddChild(views().infobar_container, infobar_bounds, infobar_visible);
+   }
+ 
++  // A real native extension panel has already passed SidePanelCoordinator's
++  // profile/document policy. The ordinary popup layout has no side-panel slot.
++  LayoutNativeSidePanel(layout, params);
++
+   // Lay out contents container.
+   CHECK(IsParentedToAndVisible(views().multi_contents_view,
+                                views().browser_view));
+@@ -154,3 +168,109 @@
+                    params.visual_client_area.width(),
+                    params.visual_client_area.y() - original_top);
+ }
++
++void BrowserViewPopupLayoutImpl::LayoutNativeSidePanel(
++    ProposedLayout& layout, BrowserLayoutParams& params) const {
++  auto* panel = views().side_panel.get();
++  if (!native_side_panel_ ||
++      !IsParentedToAndVisible(panel, views().browser_view)) {
++    return;
++  }
++  // Keep the actual SidePanel's preference/resize state. Native shell layout
++  // can briefly be smaller than minimum size; never produce overlapping or
++  // negative document bounds during those resize passes.
++  const int minimum_panel = panel->GetMinimumSize().width();
++  const int minimum_document = std::min(kContentsContainerMinimumWidth,
++      std::max(1, params.visual_client_area.width() - minimum_panel));
++  const int available = std::max(0,
++      params.visual_client_area.width() - minimum_document);
++  const int preferred = std::max(minimum_panel,
++                                 panel->GetPreferredSize().width());
++  const int target_width = std::min(preferred, available);
++  const int visible_width = base::ClampFloor(
++      target_width * std::clamp(panel->GetAnimationValue(), 0.0, 1.0));
++  const bool leading = panel->IsRightAligned() == base::i18n::IsRTL();
++  const gfx::Rect area = params.visual_client_area;
++  const gfx::Rect panel_bounds(
++      leading ? area.x() - (target_width - visible_width)
++              : area.right() - visible_width,
++      area.y(), target_width, area.height());
++  layout.AddChild(panel, panel_bounds);
++
++  // Chromium reparents the same live extension view here for a content
++  // transition. Preserve its actual animation, rather than recreating it.
++  if (IsParentedToAndVisible(views().side_panel_animation_content,
++                            views().browser_view)) {
++    const gfx::Rect final_bounds(
++        leading ? area.x() : area.right() - target_width,
++        area.y(), target_width, area.height());
++    layout.AddChild(views().side_panel_animation_content,
++                    panel->GetContentAnimationBounds(final_bounds));
++  }
++  if (IsParentedTo(views().side_panel_content_transition_scrim,
++                    views().browser_view)) {
++    const double opacity = delegate().GetAnimationController()->GetCurrentValue(
++        SidePanelAnimations::kSidePanel,
++        SidePanelAnimations::kContentScrimOpacity).value_or(0.0);
++    layout.AddChild(views().side_panel_content_transition_scrim, area,
++                    opacity > 0.0);
++  }
++  params.InsetHorizontal(visible_width, leading);
++}
++
++void BrowserViewPopupLayoutImpl::DoPostLayoutVisualAdjustments(
++    const BrowserLayoutParams& params) {
++  auto* panel = views().side_panel.get();
++  if (!native_side_panel_ ||
++      !IsParentedToAndVisible(panel, views().browser_view)) {
++    return;
++  }
++  auto* controller = delegate().GetAnimationController();
++  if (auto* scrim = views().side_panel_content_transition_scrim.get();
++      IsParentedTo(scrim, views().browser_view) && scrim->layer()) {
++    scrim->layer()->SetOpacity(controller->GetCurrentValue(
++        SidePanelAnimations::kSidePanel,
++        SidePanelAnimations::kContentScrimOpacity).value_or(0.0));
++  }
++  auto* transition = views().side_panel_animation_content.get();
++  if (IsParentedToAndVisible(transition, views().browser_view)) {
++    double translation = controller->GetCurrentValue(
++        SidePanelAnimations::kSidePanel,
++        SidePanelAnimations::kContentTransitionOffset).value_or(0.0);
++    if (panel->IsRightAligned() != base::i18n::IsRTL()) translation = -translation;
++    transition->UpdateHorizontalTranslation(translation);
++    const auto panel_width = controller->GetCurrentValue(
++        SidePanelAnimations::kSidePanel, SidePanelAnimations::kPanelWidth);
++    const bool first_part = !panel_width || *panel_width == 0.0;
++    const gfx::Rect allowed = first_part ? views().multi_contents_view->bounds()
++                                        : params.visual_client_area;
++    gfx::Rect transformed = transition->bounds();
++    transformed.Offset(static_cast<int>(translation), 0);
++    gfx::Rect clipped = transformed;
++    clipped.Intersect(allowed);
++    if (clipped == transformed) {
++      transition->ClipBounds(gfx::Rect());
++    } else {
++      clipped.Offset(-transformed.x(), -transformed.y());
++      if (clipped.IsEmpty()) clipped = gfx::Rect(-1, 0, 1, std::max(1, transition->height()));
++      transition->ClipBounds(clipped);
++    }
++  }
++  // SidePanel's native WebContents must share the Views clip while revealing
++  // outside the client area; otherwise its Cocoa renderer can overlap chrome.
++  gfx::Rect visible = panel->bounds();
++  visible.Intersect(params.visual_client_area);
++  visible.Offset(-panel->x(), -panel->y());
++  if (visible == panel->GetLocalBounds()) {
++    panel->SetClipToVisibleArea(std::nullopt);
++  } else {
++    // NativeViewHost uses an empty clip to mean no clip. At animation zero,
++    // keep a one-pixel clip just OUTSIDE the panel's local content instead.
++    if (visible.IsEmpty()) {
++      visible = gfx::Rect(panel->IsRightAligned() == base::i18n::IsRTL()
++                             ? panel->width() : -1,
++                         0, 1, std::max(1, panel->height()));
++    }
++    panel->SetClipToVisibleArea(visible);
++  }
++}
+--- a/chrome/browser/ui/views/frame/BUILD.gn
++++ b/chrome/browser/ui/views/frame/BUILD.gn
+@@ -2424,7 +2424,12 @@
+   deps = [
+     ":frame",
+     ":multi_contents_view",
++    "//base:i18n",
++    "//chrome/browser/ui/animation",
++    "//chrome/browser/ui/views/animations",
+     "//chrome/browser/ui/views/infobars",
++    "//chrome/browser/ui/views/side_panel",
++    "//ui/compositor",
+     "//ui/gfx/geometry",
+     "//ui/views",
+   ]
+--- a/cef/libcef/browser/chrome/views/chrome_views_util.h
++++ b/cef/libcef/browser/chrome/views/chrome_views_util.h
+@@ -5,6 +5,8 @@
+ #ifndef CEF_LIBCEF_BROWSER_CHROME_VIEWS_CHROME_VIEWS_H_
+ #define CEF_LIBCEF_BROWSER_CHROME_VIEWS_CHROME_VIEWS_H_
+ #pragma once
++
++class BrowserWindowInterface;
+ 
+ namespace views {
+ class View;
+@@ -15,6 +17,10 @@
+ // Returns true if |view| is a CefView.
+ bool IsCefView(views::View* view);
+ 
++// Query the actual CEF Browser delegate without exposing its implementation
++// headers to Chrome layout targets. Null and ordinary Chrome windows are false.
++bool IsViewsHostedBrowser(BrowserWindowInterface* browser);
++
+ }  // namespace cef
+ 
+ #endif  // CEF_LIBCEF_BROWSER_CHROME_VIEWS_CHROME_VIEWS_H_
+--- a/cef/libcef/browser/chrome/views/chrome_views_util.cc
++++ b/cef/libcef/browser/chrome/views/chrome_views_util.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "cef/libcef/browser/chrome/views/chrome_views_util.h"
+ 
++#include "cef/libcef/browser/chrome/browser_delegate.h"
++#include "cef/libcef/browser/chrome/browser_util.h"
+ #include "cef/libcef/browser/views/view_util.h"
+ 
+ namespace cef {
+@@ -12,4 +14,10 @@
+   return view_util::GetFor(view, /*find_known_parent=*/false) != nullptr;
+ }
+ 
++bool IsViewsHostedBrowser(BrowserWindowInterface* browser) {
++  if (!browser) return false;
++  auto* delegate = BrowserForBWI(browser)->cef_delegate();
++  return delegate && delegate->IsViewsHosted();
++}
++
+ }  // namespace cef

@@ -25,7 +25,9 @@ PATHS = ("extensions/browser/extension_function.h", "extensions/browser/extensio
          "extensions/browser/api/runtime/runtime_api.h", "extensions/browser/api/runtime/runtime_api.cc",
          "chrome/browser/extensions/api/extension_action/extension_action_api.cc",
          "chrome/browser/extensions/api/extension_action/BUILD.gn",
-         "chrome/browser/ui/views/extensions/extensions_toolbar_desktop.cc")
+         "chrome/browser/ui/views/extensions/extensions_toolbar_desktop.cc",
+         "chrome/browser/extensions/chrome_extension_function_details.h",
+         "chrome/browser/extensions/chrome_extension_function_details.cc")
 
 def replace(text, old, new):
     if text.count(old) != 1:
@@ -252,8 +254,34 @@ bool OpenPopupInBrowser(BrowserWindowInterface& browser,""")
   }
 #endif
   return !popped_out_action_ && (browser_->GetWindow()->IsActive() || native_owner_active);""")
+    details_h = replace(originals[PATHS[14]], '#include "base/memory/raw_ptr.h"',
+        '#include "base/memory/raw_ptr.h"\n#include "base/functional/callback.h"')
+    details_h = replace(details_h, '  gfx::NativeWindow GetNativeWindowForUI();', '''  // Private native UI ownership only. The original API still enforces all
+  // user gestures, permissions, policies and original prompt result handling.
+  using NativeUIWindowResolver = base::RepeatingCallback<gfx::NativeWindow(ExtensionFunction*)>;
+  static void SetNativeUIWindowResolver(NativeUIWindowResolver resolver);
+  gfx::NativeWindow GetNativeWindowForUI();''')
+    details_c = replace(originals[PATHS[15]],
+        '#include "chrome/browser/extensions/chrome_extension_function_details.h"',
+        '#include "chrome/browser/extensions/chrome_extension_function_details.h"\n#include <utility>\n#include "base/no_destructor.h"\n#include "content/public/browser/browser_thread.h"')
+    details_c = replace(details_c, 'gfx::NativeWindow ChromeExtensionFunctionDetails::GetNativeWindowForUI() {', '''namespace {
+ChromeExtensionFunctionDetails::NativeUIWindowResolver& NativeUIWindowResolverStorage() {
+  static base::NoDestructor<ChromeExtensionFunctionDetails::NativeUIWindowResolver> resolver;
+  return *resolver;
+}
+}  // namespace
+
+void ChromeExtensionFunctionDetails::SetNativeUIWindowResolver(NativeUIWindowResolver resolver) {
+  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
+  NativeUIWindowResolverStorage() = std::move(resolver);
+}
+
+gfx::NativeWindow ChromeExtensionFunctionDetails::GetNativeWindowForUI() {
+  // A resolver's empty result means there is no eligible native shell. Never
+  // fall back to a hidden physical implementation window in that case.
+  if (auto& resolver = NativeUIWindowResolverStorage(); resolver) return resolver.Run(function_);''')
     return dict(zip(PATHS, (h, c, eh, ec, th, tc, messaging, debugger, downloads, runtime_h, runtime_c,
-                           action_c, action_build, desktop)))
+                           action_c, action_build, desktop, details_h, details_c)))
 
 def digest(s):
     return hashlib.sha256(s.encode()).hexdigest()

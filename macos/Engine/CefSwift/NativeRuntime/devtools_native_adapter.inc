@@ -3,6 +3,7 @@
 // as a page binding, socket, scheme handler, or extension API.
 #include <algorithm>
 #include <cmath>
+#include <optional>
 #include "base/base64.h"
 #include "base/containers/flat_set.h"
 #include "base/functional/bind.h"
@@ -11,6 +12,7 @@
 #include "base/strings/string_number_conversions.h"
 #include "base/strings/utf_string_conversions.h"
 #include "base/timer/timer.h"
+#include "base/uuid.h"
 #include "cef/libcef/browser/browser_host_base.h"
 #include "cef/include/views/cef_browser_view.h"
 #include "chrome/browser/browsing_data/chrome_browsing_data_remover_constants.h"
@@ -63,12 +65,34 @@ void ZacroRefreshSidePanelPresentation(content::WebContents* contents);
 #include "cef/libcef/browser/devtools/zacro_extensions_adapter.inc"
 #include "cef/libcef/browser/devtools/zacro_topology_adapter.inc"
 #include "cef/libcef/browser/devtools/zacro_bookmarks_adapter.inc"
+#include "cef/libcef/browser/devtools/zacro_history_adapter.inc"
 #include "cef/libcef/browser/devtools/zacro_downloads_adapter.inc"
 #include "cef/libcef/browser/devtools/zacro_management_adapter.inc"
 
 namespace {
 constexpr char kZacroBrowserSession[] = "zacro.native.browser.v1";
 constexpr size_t kZacroMaximumHistoryBytes = 6 * 1024 * 1024;
+
+// An optional native-only phase receipt separates installing the authenticated
+// controller history from waiting for its selected document to commit. The
+// caller must install its exact-browser observer before submitting this nonce.
+std::optional<std::string> ZacroHistoryInstallationToken(
+    const base::DictValue* params, content::WebContents* contents) {
+  const auto* value = params ? params->Find("installationToken") : nullptr;
+  if (!value) return std::string();
+  const auto* token = value->GetIfString();
+  if (!token || !base::Uuid::ParseLowercase(*token).is_valid() ||
+      !CefBrowserHostBase::GetBrowserForContents(contents)) return std::nullopt;
+  return *token;
+}
+
+base::DictValue ZacroHistoryInstallationReceipt(
+    content::WebContents* contents, const std::string& token) {
+  auto browser = CefBrowserHostBase::GetBrowserForContents(contents);
+  CHECK(browser);
+  return base::DictValue().Set("token", token)
+      .Set("browserID", browser->GetIdentifier());
+}
 
 std::string ZacroHistoryBinding(content::WebContents* contents) {
   return "zacro.navigation.v2:" +
@@ -592,6 +616,7 @@ bool CefDevToolsController::DispatchZacro(const std::string_view& message) {
   if (DispatchZacroTopology(*id, *method, request->FindDict("params"))) return true;
   if (DispatchZacroExtensions(*id, *method, request->FindDict("params"))) return true;
   if (DispatchZacroBookmarks(*id, *method, request->FindDict("params"))) return true;
+  if (DispatchZacroHistory(*id, *method, request->FindDict("params"))) return true;
   if (DispatchZacroDownloads(*id, *method, request->FindDict("params"))) return true;
   if (DispatchZacroManagement(*id, *method, request->FindDict("params"))) return true;
   if (*method == "Zacro.getExtensionOptions") {
@@ -641,9 +666,10 @@ bool CefDevToolsController::DispatchZacro(const std::string_view& message) {
   if (*method == "Zacro.getCapabilities") {
     ReplyZacro(*id, base::DictValue().Set("version", 1).Set("browserProtocol", true)
         .Set("documentState", true).Set("browsingData", true).Set("navigationState", true)
-        .Set("encryptedNavigation", true).Set("retainedDiscard", true)
+        .Set("encryptedNavigation", true).Set("retainedDiscard", true).Set("historyInstallation", true)
         .Set("extensionActions", true).Set("legacyNavigation", true).Set("extensionStorage", true).Set("extensionBrowser", true)
-        .Set("volatileDiscard", true).Set("bookmarks", true).Set("historyRemoval", true).Set("downloads", true));
+        .Set("volatileDiscard", true).Set("bookmarks", true).Set("historyRemoval", true)
+        .Set("historyMirror", true).Set("downloads", true));
     return true;
   }
   if (*method == "Zacro.extensionWorkerTarget") {
@@ -872,6 +898,8 @@ bool CefDevToolsController::DispatchZacro(const std::string_view& message) {
   }
   if (*method == "Zacro.restoreNavigationEntries") {
     const auto* params = request->FindDict("params");
+    const auto installation_token = ZacroHistoryInstallationToken(params, inspected_contents_);
+    if (!installation_token) { ReplyZacro(*id, {}, "Invalid native history installation token."); return true; }
     const auto* items = params ? params->FindList("entries") : nullptr;
     const auto selected = params ? params->FindInt("selectedIndex") : std::nullopt;
     auto& controller = inspected_contents_->GetController();
@@ -897,7 +925,11 @@ bool CefDevToolsController::DispatchZacro(const std::string_view& message) {
     auto entries = sessions::ContentSerializedNavigationBuilder::ToNavigationEntries(serialized, inspected_contents_->GetBrowserContext());
     controller.Restore(*selected, content::RestoreType::kRestored, &entries);
     if (StartZacroNavigationCommit(*id, controller.GetLastCommittedEntry()->GetURL(),
-        base::DictValue().Set("restored", true))) controller.LoadIfNecessary();
+        base::DictValue().Set("restored", true))) {
+      if (!installation_token->empty()) EmitZacro("Zacro.navigationHistoryInstalled",
+          ZacroHistoryInstallationReceipt(inspected_contents_, *installation_token));
+      controller.LoadIfNecessary();
+    }
     return true;
   }
   if (*method == "Zacro.getDocumentState") {
@@ -955,6 +987,8 @@ bool CefDevToolsController::DispatchZacro(const std::string_view& message) {
     return true;
   }
   if (*method == "Zacro.restoreDiscardedDocument") {
+    const auto installation_token = ZacroHistoryInstallationToken(request->FindDict("params"), inspected_contents_);
+    if (!installation_token) { ReplyZacro(*id, {}, "Invalid native history installation token."); return true; }
     auto& controller = inspected_contents_->GetController();
     if (zacro_navigation_commit_ || zacro_dormant_history_.empty() || zacro_discard_ || controller.GetEntryCount() != 1 ||
         !zacro_dormant_entry_ || controller.GetLastCommittedEntry()->GetUniqueID() != zacro_dormant_entry_ ||
@@ -968,7 +1002,11 @@ bool CefDevToolsController::DispatchZacro(const std::string_view& message) {
     CHECK(controller.RemoveEntryAtIndex(0));
     zacro_dormant_entry_ = 0; zacro_dormant_history_.clear();
     if (StartZacroNavigationCommit(*id, controller.GetLastCommittedEntry()->GetURL(),
-        base::DictValue().Set("restored", true))) controller.LoadIfNecessary();
+        base::DictValue().Set("restored", true))) {
+      if (!installation_token->empty()) EmitZacro("Zacro.navigationHistoryInstalled",
+          ZacroHistoryInstallationReceipt(inspected_contents_, *installation_token));
+      controller.LoadIfNecessary();
+    }
     return true;
   }
   if (*method == "Zacro.serializeNavigation") {
@@ -989,6 +1027,8 @@ bool CefDevToolsController::DispatchZacro(const std::string_view& message) {
   }
   if (*method == "Zacro.restoreNavigation") {
     const auto* params = request->FindDict("params");
+    const auto installation_token = ZacroHistoryInstallationToken(params, inspected_contents_);
+    if (!installation_token) { ReplyZacro(*id, {}, "Invalid native history installation token."); return true; }
     const auto* encoded = params ? params->FindString("state") : nullptr;
     std::string bytes;
     if (!encoded || encoded->size() > 8 * 1024 * 1024 ||
@@ -1010,7 +1050,7 @@ bool CefDevToolsController::DispatchZacro(const std::string_view& message) {
     if (!crypt) { ReplyZacro(*id, {}, "Native navigation encryption is unavailable."); return true; }
     crypt->GetInstance(base::BindOnce(
         [](base::WeakPtr<CefDevToolsController> self, int id,
-           std::string wrapped_key, std::string nonce, std::string ciphertext,
+           std::string installation_token, std::string wrapped_key, std::string nonce, std::string ciphertext,
            scoped_refptr<os_crypt_async::Encryptor> encryptor) {
           if (!self) return;
           auto key = encryptor->DecryptData(base::as_bytes(base::span(wrapped_key)));
@@ -1058,8 +1098,12 @@ bool CefDevToolsController::DispatchZacro(const std::string_view& message) {
             self->zacro_dormant_history_.clear();
           }
           if (self->StartZacroNavigationCommit(id, controller.GetLastCommittedEntry()->GetURL(),
-              base::DictValue().Set("restored", true))) controller.LoadIfNecessary();
-        }, weak_ptr_factory_.GetWeakPtr(), *id, std::move(wrapped_key), std::move(nonce), std::move(ciphertext)));
+              base::DictValue().Set("restored", true))) {
+            if (!installation_token.empty()) self->EmitZacro("Zacro.navigationHistoryInstalled",
+                ZacroHistoryInstallationReceipt(self->inspected_contents_, installation_token));
+            controller.LoadIfNecessary();
+          }
+        }, weak_ptr_factory_.GetWeakPtr(), *id, *installation_token, std::move(wrapped_key), std::move(nonce), std::move(ciphertext)));
     return true;
   }
   return false;

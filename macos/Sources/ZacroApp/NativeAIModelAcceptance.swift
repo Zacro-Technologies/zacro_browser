@@ -19,6 +19,11 @@ enum NativeAIModelAcceptance {
     }
     let first = try await Fixture(window:window)
     do {
+      first.store.updateSettings { $0.openSourcesLimit = 4 }
+      let customLimits = NativeLibrary.aiSourceLimitOptions(first.store.state.settings.openSourcesLimit)
+      try check(NativeLibrary.aiSourceLimitOptions(3).map { $0.0 } == [1, 2, 3, 5] &&
+        customLimits.map { $0.0 } == [1, 2, 3, 5, 4] && customLimits.last?.1 == "4 sources" && first.store.state.settings.openSourcesLimit == 4,
+        "AISourceLimitControlRetainsValidImportedValueAlongsideReferenceChoices")
       first.model.aiConversation.draft = "Keep this unfinished question"
       let answer = try await first.model.submitAIQuestion("Explicit palette question", expectedProfileID:first.profile)
       let calls = await first.transport.requests
@@ -160,7 +165,151 @@ enum NativeAIModelAcceptance {
       await replacement.close(); await old.close(); await lifetime.close()
       throw error
     }
+    checks += try await checkNewConversation(window:window)
+    checks += try await checkOrdinarySearch(window:window)
+    for (name, passed) in await NativeAIAnswerScrollAcceptance.check() { try check(passed, name) }
     return checks
+  }
+
+  private static func checkNewConversation(window: NSWindow) async throws -> [String] {
+    var checks: [String] = []
+    func check(_ condition: Bool, _ name: String) throws {
+      guard condition else { throw Failure(message:name) }; checks.append(name)
+    }
+    let fixture = try await Fixture(window:window)
+    var pending: Task<ServiceJSON, Error>?
+    do {
+      let conversation = fixture.model.aiConversation
+      try fixture.model.requestAIContextReview("page", selectedIDs:[fixture.tabID])
+      guard let review = conversation.pendingReview else { throw Failure(message:"Reset context review") }
+      try await fixture.model.confirmAIContextReview(reviewID:review.id, selectedIDs:[fixture.tabID])
+      conversation.draft = "Retain my unfinished question"; conversation.savedQuestions = ["Retain the saved question"]
+      await fixture.transport.holdNextResponse()
+      let answering = Task { try await fixture.model.submitAIQuestion("Old approved page question", expectedProfileID:fixture.profile) }
+      pending = answering
+      try await fixture.transport.waitUntilHeld()
+      try await fixture.model.newAIConversation(expectedProfileID:fixture.profile)
+      var stopped = false
+      do { _ = try await answering.value } catch { stopped = true }
+      try check(stopped && conversation.messages.isEmpty && !conversation.busy && !conversation.submitting &&
+        conversation.context == "research" && conversation.grants.isEmpty && conversation.pendingReview == nil &&
+        conversation.contextChangeID == nil && conversation.sources.isEmpty,
+        "newAIConversationCancelsActualRequestAndClearsOnlyConversationContext")
+      try check(conversation.draft == "Retain my unfinished question" && conversation.savedQuestions == ["Retain the saved question"],
+        "newAIConversationRetainsDraftAndSavedQuestions")
+      _ = try await fixture.model.submitAIQuestion("Fresh research question", expectedProfileID:fixture.profile)
+      let requests = await fixture.transport.requests
+      let contents = requests.last?.body?["messages"].array.filter { $0["role"] != "system" } ?? []
+      try check(contents.count == 1 && contents.first?["content"] == "Fresh research question",
+        "newAIConversationDoesNotReuseEarlierPageTextOrTurns")
+
+      // A reset waiting for actor authority must not publish to another owner.
+      await fixture.gate.arm()
+      let resetting = Task { try await fixture.model.newAIConversation(expectedProfileID:fixture.profile) }
+      try await fixture.gate.waitUntilEntered()
+      fixture.model.dialogWindow = { nil }
+      await fixture.gate.release()
+      var ownerRejected = false
+      do { try await resetting.value } catch { ownerRejected = true }
+      try check(ownerRejected && conversation.contextChangeID == nil,
+        "newAIConversationRechecksExactWindowAfterActorAwait")
+      await fixture.close()
+    } catch {
+      pending?.cancel(); await fixture.gate.release(); await fixture.transport.releaseResponse()
+      _ = await pending?.result; await fixture.close(); throw error
+    }
+
+    let preflight = try await Fixture(window:window)
+    await preflight.gate.arm()
+    let queuedQuestion = Task { try await preflight.model.submitAIQuestion("Old queued question", expectedProfileID:preflight.profile) }
+    do {
+      try await preflight.gate.waitUntilEntered()
+      try await preflight.model.newAIConversation(expectedProfileID:preflight.profile)
+      await preflight.gate.release()
+      var cancelled = false
+      do { _ = try await queuedQuestion.value } catch { cancelled = true }
+      let requests = await preflight.transport.requests
+      try check(cancelled && requests.isEmpty && preflight.model.aiConversation.messages.isEmpty,
+        "newAIConversationInvalidatesSubmissionStillAwaitingPreflight")
+      await preflight.close()
+    } catch {
+      queuedQuestion.cancel(); await preflight.gate.release(); _ = await queuedQuestion.result
+      await preflight.close(); throw error
+    }
+
+    // Closing while a reset is awaiting authority must not let that reset run
+    // after the replacement model has begun using the same conversation ID.
+    let lifetime = try await Fixture(window:window)
+    let old = NativeServicesModel(store:lifetime.store, sharing:lifetime.model)
+    old.dialogWindow = { [weak window] in window }; old.start()
+    var pendingReset: Task<Void, Error>?, pendingSuccessor: Task<ServiceJSON, Error>?
+    var replacementModel: NativeServicesModel?
+    do {
+      _ = try await old.aiAction("ai:status")
+      await lifetime.gate.arm()
+      let resetting = Task { try await old.newAIConversation(expectedProfileID:lifetime.profile) }
+      pendingReset = resetting
+      try await lifetime.gate.waitUntilEntered()
+      let retirement = old.beginShutdown()
+      let replacement = NativeServicesModel(store:lifetime.store, sharing:lifetime.model, predecessor:retirement)
+      replacementModel = replacement
+      replacement.dialogWindow = { [weak window] in window }; replacement.start()
+      var resolved = false
+      let successor = Task {
+        _ = try await replacement.aiAction("ai:status"); resolved = true
+        return try await replacement.submitAIQuestion("Replacement conversation", expectedProfileID:lifetime.profile)
+      }
+      pendingSuccessor = successor
+      for _ in 0..<20 { await Task.yield() }
+      try check(!resolved, "replacementAIModelWaitsForInFlightExplicitReset")
+      await lifetime.gate.release()
+      _ = await resetting.result
+      let answer = try await successor.value
+      await old.close()
+      let retained = await lifetime.model.aiService.status(for:AIProfileScope(id:lifetime.profile), conversationID:replacement.conversationID)
+      try check(answer["answer"] == "Deterministic fixture answer" &&
+        retained["latest"]["question"] == "Replacement conversation" && replacement.aiConversation.messages.count == 2,
+        "retiredExplicitAIResetCannotEraseReopenedConversation")
+      await replacement.close(); await lifetime.close()
+    } catch {
+      pendingReset?.cancel(); pendingSuccessor?.cancel(); await lifetime.gate.release()
+      _ = await pendingReset?.result; _ = await pendingSuccessor?.result
+      await replacementModel?.close(); await old.close(); await lifetime.close(); throw error
+    }
+    return checks
+  }
+
+  private static func checkOrdinarySearch(window: NSWindow) async throws -> [String] {
+    let fixture = try await Fixture(window:window)
+    do {
+      _ = try await fixture.model.aiAction("ai:configure", payload:["provider":"openai", "model":"fixture", "apiKey":"fixture-session-key", "storage":"session"])
+      let query = "https://example.invalid/path?q=1 & café"
+      let result = try await fixture.model.submitAIQuestion(query, expectedProfileID:fixture.profile)
+      let id = result["requestId"].string
+      var opened: [ServiceJSON] = []
+      fixture.model.sourceAction = { action, payload in
+        guard action == "ai:open-search" else { throw Failure(message:"Ordinary search used the citation action") }
+        opened.append(payload); return .null
+      }
+      guard result["searchQuery"] == .string(query), fixture.model.ordinaryAISearchQuery(requestID:id) == query else {
+        throw Failure(message:"Research fallback did not retain exact original query")
+      }
+      try await fixture.model.openAIOrdinarySearch(requestID:id)
+      guard opened.count == 1, opened[0]["query"] == .string(query),
+        opened[0]["profileId"].string == fixture.profile, opened[0]["conversationId"].string == fixture.model.conversationID else {
+        throw Failure(message:"Ordinary search did not use the exact retained turn and owner")
+      }
+      var rejected = 0
+      do { try await fixture.model.openAIOrdinarySearch(requestID:"invented-turn") } catch { rejected += 1 }
+      fixture.model.dialogWindow = { nil }
+      do { try await fixture.model.openAIOrdinarySearch(requestID:id) } catch { rejected += 1 }
+      fixture.model.dialogWindow = { [weak window] in window }
+      try await fixture.model.newAIConversation(expectedProfileID:fixture.profile)
+      do { try await fixture.model.openAIOrdinarySearch(requestID:id) } catch { rejected += 1 }
+      guard rejected == 3, opened.count == 1 else { throw Failure(message:"Stale ordinary search action was accepted") }
+      await fixture.close()
+      return ["ordinaryAISearchUsesExactOriginalResearchTurnAndOwner", "ordinaryAISearchRejectsMissingTurnWindowAndResetAnswer"]
+    } catch { await fixture.close(); throw error }
   }
 
   @MainActor private final class Fixture {
@@ -231,7 +380,8 @@ enum NativeAIModelAcceptance {
         } onCancel: { Task { await self.releaseResponse() } }
         try Task.checkCancellation()
       }
-      return ServiceHTTPResponse(status:200, body:["choices":[["message":["content":"Deterministic fixture answer"],"finish_reason":"stop"]]])
+      return ServiceHTTPResponse(status:200, body:["choices":[["message":["content":"Deterministic fixture answer"],"finish_reason":"stop"]],
+        "output":[["type":"message", "content":[["type":"output_text", "text":"Deterministic fixture answer", "annotations":[]]]]]])
     }
   }
   private actor ScopeGate {

@@ -99,7 +99,7 @@ struct NativeActionPopover: View {
         .background(colors.ink.opacity(focus == item.id || hovered == item.id ? 0.06 : 0), in: RoundedRectangle(cornerRadius: 6))
         .contentShape(Rectangle())
     }.buttonStyle(NativePressButtonStyle(motionScale: motionScale)).disabled(!item.enabled).opacity(item.enabled ? 1 : 0.4)
-      .focused($focus, equals: item.id).id(item.id).accessibilityLabel(item.title)
+      .focusable().focusEffectDisabled().focused($focus, equals: item.id).id(item.id).accessibilityLabel(item.title).accessibilityIdentifier("native-menu-action:" + item.id)
       .onHover { if $0 { hovered = item.id } else if hovered == item.id { hovered = nil } }
   }
   private func close() { if let onDismiss { onDismiss() } else { dismiss() } }
@@ -261,7 +261,7 @@ struct SiteControls: View {
         Spacer()
         Button { perform(actions.manageExtensions) } label: { NativeGlyph("plus").frame(width: 16, height: 16).frame(width: 26, height: 26) }
           .buttonStyle(.plain).foregroundStyle(accent).help("Manage extensions").accessibilityLabel("Manage extensions").disabled(actions.isPrivate)
-          .focused($focus, equals: "extensions")
+          .focusable().focusEffectDisabled().focused($focus, equals: "extensions")
           .id("extensions")
           .padding(.top, 8)
       }
@@ -292,7 +292,7 @@ struct SiteControls: View {
             NativeGlyph(actions.url?.scheme == "https" && !actions.pageError ? "lock" : "globe").frame(width: 15, height: 15).foregroundStyle(accent)
             Text(NativePageIdentity.securityLabel(actions.url, failed: actions.pageError))
           }.padding(.horizontal, 9).padding(.vertical, 7).background(colors.ink.opacity(0.045), in: RoundedRectangle(cornerRadius: 8))
-        }.buttonStyle(.plain).disabled(!actions.hasWebPage).help(actions.origin).focused($focus, equals: "security").id("security")
+        }.buttonStyle(.plain).disabled(!actions.hasWebPage).help(actions.origin).focusable().focusEffectDisabled().focused($focus, equals: "security").id("security")
         Spacer()
         moreActions
       }.padding(.top, 12).padding(.horizontal, 2)
@@ -322,8 +322,8 @@ struct SiteControls: View {
         .background(colors.card.opacity(selected ? 0.46 : 0.24), in: RoundedRectangle(cornerRadius: 10))
         .shadow(color: .black.opacity(0.08), radius: 1.5, y: 1)
     }.buttonStyle(.plain).foregroundStyle(accent).disabled(!(enabled ?? actions.hasDocument))
-      .focused($focus, equals: focusID ?? glyph)
-      .id(focusID ?? glyph)
+      .focusable().focusEffectDisabled().focused($focus, equals: focusID ?? glyph)
+      .id(focusID ?? glyph).accessibilityIdentifier("native-site-control:" + (focusID ?? glyph))
       .help(label).accessibilityLabel(label).accessibilityAddTraits(selected ? [.isSelected] : [])
   }
   private func sectionHeading(_ title: String) -> some View {
@@ -340,7 +340,7 @@ struct SiteControls: View {
           if !item.badgeText.isEmpty { badge(item, small: false) }
         }
     }.buttonStyle(.plain).help(item.name + (item.enabled ? "" : " · Disabled")).accessibilityLabel(item.name)
-      .focused($focus, equals: "extension:\(item.id)")
+      .focusable().focusEffectDisabled().focused($focus, equals: "extension:\(item.id)")
       .id("extension:\(item.id)")
       .overlay(alignment: .bottomTrailing) {
         Button(action: item.togglePin) {
@@ -350,7 +350,7 @@ struct SiteControls: View {
             .shadow(color: .black.opacity(0.13), radius: 1.5, y: 1)
         }.buttonStyle(.plain).offset(x: 4, y: 4).disabled(!item.canPin)
           .opacity(item.pinned || hoveredExtension == item.id || focus == "pin:\(item.id)" || focus == "extension:\(item.id)" ? 1 : 0)
-          .focused($focus, equals: "pin:\(item.id)")
+          .focusable().focusEffectDisabled().focused($focus, equals: "pin:\(item.id)")
           .id("pin:\(item.id)")
           .help((item.pinned ? "Unpin " : "Pin ") + item.name)
           .accessibilityLabel((item.pinned ? "Unpin " : "Pin ") + item.name)
@@ -367,12 +367,12 @@ struct SiteControls: View {
         }
         Spacer(minLength: 0)
       }.padding(10).contentShape(RoundedRectangle(cornerRadius: 9))
-    }.buttonStyle(.plain).disabled(disabled).focused($focus, equals: title).id(title)
+    }.buttonStyle(.plain).disabled(disabled).focusable().focusEffectDisabled().focused($focus, equals: title).id(title)
   }
   private var moreActions: some View {
     Button { perform(actions.pageActions) } label: {
       NativeGlyph("more").frame(width: 18, height: 18).frame(width: 32, height: 32).background(colors.ink.opacity(0.045), in: Circle())
-    }.buttonStyle(.plain).foregroundStyle(accent).help("More page actions").accessibilityLabel("More page actions").focused($focus, equals: "more").id("more")
+    }.buttonStyle(.plain).foregroundStyle(accent).help("More page actions").accessibilityLabel("More page actions").focusable().focusEffectDisabled().focused($focus, equals: "more").id("more")
   }
   private func badge(_ item: SiteExtensionItem, small: Bool) -> some View {
     Text(String(item.badgeText.prefix(4))).font(.system(size: small ? 8 : 9)).lineLimit(1)

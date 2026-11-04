@@ -13,6 +13,14 @@ final class NativeNavigationCoordinator {
   private var restores: [String: Task<Void, Never>] = [:]
   private var restoreTokens: [String: UUID] = [:]
   private var restoreFailures: [String: String] = [:]
+  @MainActor private final class HistoryInstallation {
+    weak var page: ChromiumPage?
+    let token: UUID
+    var result: Result<Void, Error>?
+    init(page: ChromiumPage, token: UUID) { self.page = page; self.token = token }
+    func failIfPending(_ error: Error) { if result == nil { result = .failure(error) } }
+  }
+  private var historyInstallations: [String: HistoryInstallation] = [:]
   private var captures: [String: Task<Void, Never>] = [:]
   private var inFlightCaptures: [String: (id: UUID, task: Task<CaptureOutcome, Never>)] = [:]
   private var captureIssues: [String: CaptureIssue] = [:]
@@ -44,6 +52,7 @@ final class NativeNavigationCoordinator {
   private var urlOnlyRestorations = Set<String>()
   private var resettingProfiles = Set<String>()
   var didRestore: ((String, Bool) -> Void)?
+  var didChangeRestoreState: ((ChromiumPage) -> Void)?
   var beforeRestore: ((ChromiumPage) async throws -> Void)?
   /// Renderer-side adapters must wait for the real restored/initial document.
   /// A temporary blank navigation would invalidate Chromium's fresh-history
@@ -60,7 +69,11 @@ final class NativeNavigationCoordinator {
     }
   }
 
-  func isRestoring(_ page: ChromiumPage) -> Bool { restores[page.id] != nil }
+  func isRestoring(_ page: ChromiumPage) -> Bool {
+    guard engine.pages[page.id] === page, let installation = historyInstallations[page.id],
+      installation.page === page, restoreTokens[page.id] == installation.token else { return false }
+    return restores[page.id] != nil
+  }
   func waitForRestore(_ page: ChromiumPage) async throws {
     while let task = restores[page.id] {
       await task.value
@@ -69,6 +82,28 @@ final class NativeNavigationCoordinator {
     }
     guard engine.pages[page.id] === page else { throw CancellationError() }
     if let failure = restoreFailures[page.id] { throw ShortcutError(failure) }
+  }
+
+  /// Navigation producers may replace an in-flight selected document once its
+  /// old Back/Forward stack is installed. Renderer APIs still waitForRestore.
+  /// The deadline can only reject; readiness comes from the native nonce
+  /// receipt (or proving that this fresh document has no saved stack to load).
+  func waitForNavigationInstallation(_ page: ChromiumPage) async throws {
+    try Task.checkCancellation()
+    guard engine.pages[page.id] === page, page.browser != nil else { throw CancellationError() }
+    guard let installation = historyInstallations[page.id] else {
+      guard restores[page.id] == nil else { throw CefDevToolsError.unavailable }
+      return
+    }
+    let deadline = ContinuousClock.now.advanced(by: .seconds(55))
+    while true {
+      try Task.checkCancellation()
+      guard engine.pages[page.id] === page, installation.page === page,
+        historyInstallations[page.id] === installation else { throw CancellationError() }
+      if let result = installation.result { try result.get(); return }
+      guard ContinuousClock.now < deadline else { throw CefDevToolsError.timeout }
+      try await Task.sleep(for: .milliseconds(10))
+    }
   }
 
   func validateDestination(of tab: BrowserTab) async throws -> ChromeNavigationApproval? {
@@ -120,17 +155,19 @@ final class NativeNavigationCoordinator {
 
   func restore(_ page: ChromiumPage, tabID: String, peek: Bool, address: String, dormant: Bool = false) {
     let id = page.id
+    historyInstallations.removeValue(forKey: id)?.failIfPending(CancellationError())
     restores[id]?.cancel()
     restoreFailures.removeValue(forKey: id)
     let token = UUID(); restoreTokens[id] = token
+    let installation = HistoryInstallation(page: page, token: token)
+    historyInstallations[id] = installation
     restores[id] = Task { [weak self, weak page] in
-      guard let self, let page else { return }
+      guard let self else { return }
       defer {
-        if self.restoreTokens[id] == token {
-          self.restores.removeValue(forKey: id)
-          self.restoreTokens.removeValue(forKey: id)
-        }
+        installation.failIfPending(CancellationError())
+        self.finishRestore(id: id, token: token, page: page)
       }
+      guard let page else { return }
       var restored = false
       var historyNavigationStarted = false
       var destinationApproval: ChromeNavigationApproval?
@@ -156,9 +193,16 @@ final class NativeNavigationCoordinator {
           return
         }
         if let tab = self.store.document(id: page.id) { try await self.authorizeHistory(page, tab: tab) }
+        let onHistoryInstalled: @MainActor @Sendable () -> Void = { [weak self, weak page, weak browser] in
+          guard let self, let page, let browser, page.browser === browser,
+            self.restoreTokens[id] == token, self.historyInstallations[id] === installation,
+            installation.page === page,
+            self.owns(page, tabID: tabID, peek: peek, address: address), installation.result == nil else { return }
+          installation.result = .success(())
+        }
         if dormant {
           historyNavigationStarted = true
-          try await browser.restoreDiscardedDocument()
+          try await browser.restoreDiscardedDocument(onHistoryInstalled: onHistoryInstalled)
           restored = true
         } else if !page.isPrivate, await self.supportsHistory(page) {
           let state = try await self.vault.read(profileID: page.profileID, tabID: tabID, peek: peek, address: address)
@@ -166,7 +210,7 @@ final class NativeNavigationCoordinator {
           guard self.owns(page, tabID: tabID, peek: peek, address: address) else { return }
           if let state {
             historyNavigationStarted = true
-            try await browser.restoreNavigationState(state)
+            try await browser.restoreNavigationState(state, onHistoryInstalled: onHistoryInstalled)
             restored = true
           } else if let tab = self.store.document(id: page.id), tab.navigation.count > 1,
             tab.navigation.indices.contains(tab.navigationIndex) {
@@ -176,7 +220,8 @@ final class NativeNavigationCoordinator {
             }
             if entries.count == tab.navigation.count {
               historyNavigationStarted = true
-              try await browser.restoreNavigationEntries(entries, selectedIndex: tab.navigationIndex)
+              try await browser.restoreNavigationEntries(entries, selectedIndex: tab.navigationIndex,
+                onHistoryInstalled: onHistoryInstalled)
               restored = true
             }
           }
@@ -196,6 +241,11 @@ final class NativeNavigationCoordinator {
         self.urlOnlyRestorations.insert(id)
       } else { self.urlOnlyRestorations.remove(id) }
       if !restored {
+        // No receipt is needed only after the vault/authorization checks have
+        // established that no saved native/legacy stack is being restored.
+        if (self.store.document(id: page.id)?.navigation.count ?? 0) <= 1 {
+          if installation.result == nil { installation.result = .success(()) }
+        } else { installation.failIfPending(CefDevToolsError.unavailable) }
         do {
           if let destinationApproval { try await page.loadApprovedNavigation(destinationApproval) }
           else if let url = BrowserAddress.documentURL(address) {
@@ -215,22 +265,39 @@ final class NativeNavigationCoordinator {
         return
       }
       guard !Task.isCancelled, self.owns(page, tabID: tabID, peek: peek, address: address) else { return }
-      self.restores.removeValue(forKey: id)
+      guard self.finishRestore(id: id, token: token, page: page) else { return }
       self.didRestore?(id, restored)
       self.observe(page, tabID: tabID, peek: peek)
     }
+    didChangeRestoreState?(page)
+  }
+
+  /// A replaced task must never clear or publish the newer task's state.
+  @discardableResult
+  private func finishRestore(id: String, token: UUID, page: ChromiumPage?) -> Bool {
+    guard restoreTokens[id] == token else { return false }
+    restoreTokens.removeValue(forKey: id)
+    let changed = restores.removeValue(forKey: id) != nil
+    if changed, let page, engine.pages[id] === page { didChangeRestoreState?(page) }
+    return changed
   }
 
   private func failPreparation(id: String, token: UUID, error: Error) {
     guard restoreTokens[id] == token else { return }
+    if let installation = historyInstallations[id], installation.token == token { installation.failIfPending(error) }
     restoreFailures[id] = error.localizedDescription
     didFailPreparation?(id, error.localizedDescription)
   }
 
   func cancelRestore(_ page: ChromiumPage) {
+    guard engine.pages[page.id] === page else { return }
+    historyInstallations.removeValue(forKey: page.id)?.failIfPending(CancellationError())
     restoreFailures.removeValue(forKey: page.id)
     restoreTokens.removeValue(forKey: page.id)
-    restores.removeValue(forKey: page.id)?.cancel()
+    if let task = restores.removeValue(forKey: page.id) {
+      task.cancel()
+      didChangeRestoreState?(page)
+    }
   }
 
   func observe(_ page: ChromiumPage, tabID: String, peek: Bool) {
@@ -470,13 +537,17 @@ final class NativeNavigationCoordinator {
   }
 
   func forget(_ pageID: String) {
+    historyInstallations.removeValue(forKey: pageID)?.failIfPending(CancellationError())
     if inFlightCaptures[pageID] != nil { captureEpochs[pageID, default: 0] &+= 1 }
     else { captureEpochs.removeValue(forKey: pageID) }
     captureIssues.removeValue(forKey: pageID)
     restoreFailures.removeValue(forKey: pageID)
     urlOnlyRestorations.remove(pageID)
     restoreTokens.removeValue(forKey: pageID)
-    restores.removeValue(forKey: pageID)?.cancel()
+    if let task = restores.removeValue(forKey: pageID) {
+      task.cancel()
+      if let page = engine.pages[pageID] { didChangeRestoreState?(page) }
+    }
     captures.removeValue(forKey: pageID)?.cancel()
   }
 

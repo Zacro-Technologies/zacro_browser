@@ -464,3 +464,59 @@
  }
  
  void ExtensionsToolbarDesktop::ToggleExtensionsMenu() {
+--- a/chrome/browser/extensions/chrome_extension_function_details.h
++++ b/chrome/browser/extensions/chrome_extension_function_details.h
+@@ -6,6 +6,7 @@
+ #define CHROME_BROWSER_EXTENSIONS_CHROME_EXTENSION_FUNCTION_DETAILS_H_
+ 
+ #include "base/memory/raw_ptr.h"
++#include "base/functional/callback.h"
+ #include "extensions/buildflags/buildflags.h"
+ #include "ui/gfx/native_ui_types.h"
+ 
+@@ -61,6 +62,10 @@
+   // - The sender web contents
+   // - Open app windows
+   // - A browser with the same profile
++  // Private native UI ownership only. The original API still enforces all
++  // user gestures, permissions, policies and original prompt result handling.
++  using NativeUIWindowResolver = base::RepeatingCallback<gfx::NativeWindow(ExtensionFunction*)>;
++  static void SetNativeUIWindowResolver(NativeUIWindowResolver resolver);
+   gfx::NativeWindow GetNativeWindowForUI();
+ 
+   // Returns a pointer to the associated ExtensionFunction
+--- a/chrome/browser/extensions/chrome_extension_function_details.cc
++++ b/chrome/browser/extensions/chrome_extension_function_details.cc
+@@ -3,6 +3,9 @@
+ // found in the LICENSE file.
+ 
+ #include "chrome/browser/extensions/chrome_extension_function_details.h"
++#include <utility>
++#include "base/no_destructor.h"
++#include "content/public/browser/browser_thread.h"
+ 
+ #include "chrome/browser/extensions/browser_extension_window_controller.h"
+ #include "chrome/browser/extensions/window_controller.h"
+@@ -79,7 +82,22 @@
+   return window_controller;
+ }
+ 
++namespace {
++ChromeExtensionFunctionDetails::NativeUIWindowResolver& NativeUIWindowResolverStorage() {
++  static base::NoDestructor<ChromeExtensionFunctionDetails::NativeUIWindowResolver> resolver;
++  return *resolver;
++}
++}  // namespace
++
++void ChromeExtensionFunctionDetails::SetNativeUIWindowResolver(NativeUIWindowResolver resolver) {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  NativeUIWindowResolverStorage() = std::move(resolver);
++}
++
+ gfx::NativeWindow ChromeExtensionFunctionDetails::GetNativeWindowForUI() {
++  // A resolver's empty result means there is no eligible native shell. Never
++  // fall back to a hidden physical implementation window in that case.
++  if (auto& resolver = NativeUIWindowResolverStorage(); resolver) return resolver.Run(function_);
+   // Try to use WindowControllerList first because WebContents's
+   // GetTopLevelNativeWindow() can't return the top level window when the tab
+   // is not focused.

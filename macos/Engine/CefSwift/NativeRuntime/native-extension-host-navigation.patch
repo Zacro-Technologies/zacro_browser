@@ -1,0 +1,575 @@
+--- a/extensions/browser/extension_host.h
++++ b/extensions/browser/extension_host.h
+@@ -56,6 +56,24 @@
+                       public ExtensionRegistryObserver {
+  public:
+   using CloseHandler = base::OnceCallback<void(ExtensionHost*)>;
++  // Private embedding hooks retain the real source RFH and created WebContents.
++  // They neither construct an ExtensionFunction nor override its permissions.
++  using NativePopupCreated = base::RepeatingCallback<void(ExtensionHost*,
++      content::WebContents*, const content::GlobalRenderFrameHostId&, const GURL&,
++      content::WebContents*)>;
++  using NativePopupAdded = base::RepeatingCallback<bool(ExtensionHost*,
++      content::WebContents*, std::unique_ptr<content::WebContents>&)>;
++  using NativeOpenURL = base::RepeatingCallback<bool(ExtensionHost*,
++      const content::OpenURLParams&, base::OnceCallback<void(content::NavigationHandle&)>&,
++      content::WebContents**)>;
++  static void SetNativeNavigationHooks(NativePopupCreated created,
++      NativePopupAdded added, NativeOpenURL open);
++  bool OpenURLWithNativeHost(const content::OpenURLParams& params,
++      base::OnceCallback<void(content::NavigationHandle&)>& callback,
++      content::WebContents** result);
++  void WebContentsCreated(content::WebContents* source,
++      const content::GlobalRenderFrameHostId& opener, const std::string& frame_name,
++      const GURL& target_url, content::WebContents* created) override;
+ 
+   ExtensionHost(const Extension* extension,
+                 content::BrowserContext* browser_context,
+--- a/extensions/browser/extension_host.cc
++++ b/extensions/browser/extension_host.cc
+@@ -52,6 +52,34 @@
+ using content::WebContents;
+ 
+ namespace extensions {
++namespace {
++struct NativeNavigationHooks {
++  ExtensionHost::NativePopupCreated created;
++  ExtensionHost::NativePopupAdded added;
++  ExtensionHost::NativeOpenURL open;
++};
++NativeNavigationHooks& NativeHostHooks() {
++  static base::NoDestructor<NativeNavigationHooks> value;
++  return *value;
++}
++}  // namespace
++void ExtensionHost::SetNativeNavigationHooks(NativePopupCreated created,
++    NativePopupAdded added, NativeOpenURL open) {
++  NativeHostHooks() = {std::move(created), std::move(added), std::move(open)};
++}
++bool ExtensionHost::OpenURLWithNativeHost(const content::OpenURLParams& params,
++    base::OnceCallback<void(content::NavigationHandle&)>& callback,
++    content::WebContents** result) {
++  auto& open = NativeHostHooks().open;
++  return open && open.Run(this, params, callback, result);
++}
++void ExtensionHost::WebContentsCreated(content::WebContents* source,
++    const content::GlobalRenderFrameHostId& opener, const std::string& frame_name,
++    const GURL& target_url, content::WebContents* created) {
++  auto& hook = NativeHostHooks().created;
++  if (hook) hook.Run(this, source, opener, target_url, created);
++}
++
+ 
+ namespace {
+ 
+@@ -543,6 +571,8 @@
+     const blink::mojom::WindowFeatures& window_features,
+     bool user_gesture,
+     bool* was_blocked) {
++  auto& native = NativeHostHooks().added;
++  if (native && native.Run(this, source, new_contents)) return nullptr;
+   delegate_->CreateTab(std::move(new_contents), target_url, extension_id_,
+                        disposition, window_features, user_gesture);
+ 
+--- a/chrome/browser/extensions/extension_view_host.cc
++++ b/chrome/browser/extensions/extension_view_host.cc
+@@ -114,6 +114,8 @@
+     const content::OpenURLParams& params,
+     base::OnceCallback<void(content::NavigationHandle&)>
+         navigation_handle_callback) {
++  content::WebContents* native_result = nullptr;
++  if (OpenURLWithNativeHost(params, navigation_handle_callback, &native_result)) return native_result;
+   // Allowlist the dispositions we will allow to be opened.
+   switch (params.disposition) {
+     case WindowOpenDisposition::SINGLETON_TAB:
+--- a/cef/libcef/browser/browser_info_manager.h
++++ b/cef/libcef/browser/browser_info_manager.h
+@@ -18,6 +18,7 @@
+ #include "cef/libcef/browser/browser_info.h"
+ #include "cef/libcef/common/mojom/cef.mojom.h"
+ #include "content/public/browser/global_routing_id.h"
++#include "content/public/browser/weak_document_ptr.h"
+ #include "content/public/browser/render_process_host_observer.h"
+ #include "third_party/blink/public/mojom/window_features/window_features.mojom.h"
+ #include "ui/base/window_open_disposition.h"
+@@ -34,8 +35,10 @@
+ class RenderViewHostDelegateView;
+ class WebContents;
+ class WebContentsView;
++class NavigationHandle;
+ }  // namespace content
+ 
++namespace extensions { class ExtensionHost; }
+ class CefBrowserHostBase;
+ class CefBrowserPlatformDelegate;
+ 
+@@ -79,6 +82,21 @@
+                        bool user_gesture,
+                        bool opener_suppressed,
+                        bool* no_javascript_access);
++
++  // Real ExtensionHost producers after Chrome's normal popup/navigation policy.
++  bool PrepareNativeExtensionHostPopup(content::RenderFrameHost* opener,
++      const GURL& target_url, const std::string& frame_name,
++      WindowOpenDisposition disposition, const blink::mojom::WindowFeatures& features,
++      bool user_gesture);
++  void NativeExtensionHostWebContentsCreated(extensions::ExtensionHost* source_host,
++      content::WebContents* source, const content::GlobalRenderFrameHostId& opener,
++      const GURL& target_url, content::WebContents* created);
++  bool AddNativeExtensionHostContents(extensions::ExtensionHost* source_host,
++      content::WebContents* source, std::unique_ptr<content::WebContents>& created);
++  bool OpenNativeExtensionHostURL(extensions::ExtensionHost* source_host,
++      const content::OpenURLParams& params,
++      base::OnceCallback<void(content::NavigationHandle&)>& callback,
++      content::WebContents** result);
+ 
+   // Called from ContentBrowserClient::CreateWindowResult if CanCreateWindow
+   // returns true. See comments on PendingPopup for more information.
+@@ -218,6 +236,13 @@
+     GURL target_url;
+     std::string target_frame_name;
+ 
++    // Separate provenance for an installed ExtensionHost, not a public tab or
++    // fabricated CefFrame. Revalidated at creation and ownership transfer.
++    content::WeakDocumentPtr native_host_document;
++    int native_host_owner_browser = 0;
++    int native_host_owner_window = 0;
++    std::string native_host_extension;
++
+     // Values specified by OnBeforePopup.
+     CefBrowserSettings settings;
+     CefRefPtr<CefClient> client;
+--- a/cef/libcef/browser/browser_info_manager.cc
++++ b/cef/libcef/browser/browser_info_manager.cc
+@@ -126,6 +126,13 @@
+                                 /*is_renderer_initiated=*/true);
+   params.user_gesture = user_gesture;
+ 
++  // ChromeContentBrowserClientCef has already applied the genuine opener's
++  // popup blocker, origin, sandbox and extension policy. A hosted extension UI
++  // has no CefFrame; retain that real RFH through its own native owner path.
++  if (!CefBrowserHostBase::GetBrowserForHost(opener)) {
++    return PrepareNativeExtensionHostPopup(opener, target_url, frame_name,
++        disposition, features, user_gesture);
++  }
+   CefRefPtr<CefBrowserHostBase> browser;
+   if (!MaybeAllowNavigation(opener, params, browser) || !browser) {
+     // Cancel the popup.
+--- a/cef/libcef/browser/chrome/chrome_browser_delegate.h
++++ b/cef/libcef/browser/chrome/chrome_browser_delegate.h
+@@ -91,6 +91,7 @@
+   Browser* browser() const { return browser_; }
+ 
+  private:
++  friend class CefBrowserInfoManager;
+   static CefRefPtr<ChromeBrowserHostImpl> CreateBrowserHost(
+       Browser* browser,
+       content::WebContents* web_contents,
+--- a/cef/libcef/browser/chrome/chrome_browser_host_impl.h
++++ b/cef/libcef/browser/chrome/chrome_browser_host_impl.h
+@@ -123,6 +123,7 @@
+ 
+  private:
+   friend class ChromeBrowserDelegate;
++  friend class CefBrowserInfoManager;
+ 
+   ChromeBrowserHostImpl(
+       const CefBrowserSettings& settings,
+--- a/cef/libcef_dll/ctocpp/client_ctocpp.cc
++++ b/cef/libcef_dll/ctocpp/client_ctocpp.cc
+@@ -18,6 +18,7 @@
+ #include "libcef_dll/cpptoc/process_message_cpptoc.h"
+ #include "libcef_dll/ctocpp/audio_handler_ctocpp.h"
+ #include "libcef_dll/ctocpp/client_ctocpp.h"
++#include "cef/libcef/browser/devtools/zacro_extension_host_client_bridge.h"
+ #include "libcef_dll/ctocpp/command_handler_ctocpp.h"
+ #include "libcef_dll/ctocpp/context_menu_handler_ctocpp.h"
+ #include "libcef_dll/ctocpp/dialog_handler_ctocpp.h"
+@@ -363,3 +364,17 @@
+ template<> CefWrapperType CefCToCppRefCounted<CefClient_0_CToCpp, CefClient, cef_client_0_t>::kWrapperType = WT_CLIENT;
+ 
+ 
++
++// Private native producer boundary. These helpers deliberately live after
++// CefClient's original generated wrapper-type specialization in this TU.
++CefRefPtr<CefClient> ZacroWrapExtensionHostClient(void* transferred) {
++  return CefClientCToCpp_Wrap(static_cast<cef_client_0_t*>(transferred));
++}
++void* ZacroUnwrapExtensionHostClient(CefRefPtr<CefClient> client) {
++  return CefClientCToCpp_Unwrap(client);
++}
++NO_SANITIZE("cfi-icall") void ZacroReleaseExtensionHostClient(void* transferred) {
++  if (!transferred) return;
++  auto* raw = static_cast<cef_client_0_t*>(transferred);
++  raw->base.release(&raw->base);
++}
+--- /dev/null
++++ b/cef/libcef/browser/devtools/zacro_extension_host_navigation.h
+@@ -0,0 +1,17 @@
++#ifndef CEF_LIBCEF_BROWSER_DEVTOOLS_ZACRO_EXTENSION_HOST_NAVIGATION_H_
++#define CEF_LIBCEF_BROWSER_DEVTOOLS_ZACRO_EXTENSION_HOST_NAVIGATION_H_
++#include <optional>
++#include <string>
++#include "base/functional/callback.h"
++#include "cef/include/cef_base.h"
++class CefBrowserHostBase;
++namespace content { class RenderFrameHost; }
++struct ZacroExtensionHostOwner {
++  CefRefPtr<CefBrowserHostBase> browser;
++  int logical_window_id = 0;
++  std::string extension_id;
++};
++using ZacroExtensionHostOwnerResolver = base::RepeatingCallback<
++    std::optional<ZacroExtensionHostOwner>(content::RenderFrameHost*)>;
++void ZacroInstallExtensionHostNavigation(ZacroExtensionHostOwnerResolver resolver);
++#endif
+--- /dev/null
++++ b/cef/libcef/browser/devtools/zacro_extension_host_navigation.cc
+@@ -0,0 +1,293 @@
++#include "cef/libcef/browser/devtools/zacro_extension_host_navigation.h"
++#include "cef/libcef/browser/devtools/zacro_extension_host_navigation_capi.h"
++
++#include <utility>
++#include "base/command_line.h"
++#include "base/compiler_specific.h"
++#include "base/functional/bind.h"
++#include "base/logging.h"
++#include "base/no_destructor.h"
++#include "cef/include/internal/cef_export.h"
++#include "cef/libcef/browser/browser_context.h"
++#include "cef/libcef/browser/browser_host_base.h"
++#include "cef/libcef/browser/browser_info_manager.h"
++#include "cef/libcef/browser/chrome/chrome_browser_context.h"
++#include "cef/libcef/browser/chrome/chrome_browser_delegate.h"
++#include "cef/libcef/browser/chrome/chrome_browser_host_impl.h"
++#include "cef/libcef/browser/browser_platform_delegate.h"
++#include "cef/libcef/browser/thread_util.h"
++#include "cef/libcef/browser/devtools/zacro_extension_host_client_bridge.h"
++#include "chrome/browser/history/native_history_owner.h"
++#include "chrome/browser/profiles/profile.h"
++#include "content/public/browser/browser_thread.h"
++#include "content/public/browser/navigation_controller.h"
++#include "content/public/browser/navigation_handle.h"
++#include "content/public/browser/page_navigator.h"
++#include "content/public/browser/render_frame_host.h"
++#include "content/public/browser/render_process_host.h"
++#include "content/public/browser/web_contents.h"
++#include "extensions/browser/extension_host.h"
++
++namespace {
++void TraceNativeHost(const char* stage, content::RenderFrameHost* frame = nullptr,
++                     int disposition = -1, int browser = 0, int window = 0,
++                     int requested_process = -1, int requested_frame = -1) {
++  const auto* command = base::CommandLine::ForCurrentProcess();
++  if (!command->HasSwitch("engine-acceptance") ||
++      !command->HasSwitch("native-integration-acceptance")) return;
++  LOG(ERROR) << "Native extension-host stage=" << stage
++             << " process=" << (frame ? frame->GetProcess()->GetDeprecatedID() : -1)
++             << " frame=" << (frame ? frame->GetRoutingID() : -1)
++             << " disposition=" << disposition << " browser=" << browser
++             << " window=" << window << " requested_process=" << requested_process
++             << " requested_frame=" << requested_frame;
++}
++auto& HostOwnerResolver() {
++  static base::NoDestructor<ZacroExtensionHostOwnerResolver> value;
++  return *value;
++}
++auto& HostNavigationCallbacks() {
++  static constinit ccef_extension_host_navigation_callbacks_t value{};
++  return value;
++}
++bool ManagedContext(content::BrowserContext* context) {
++  return context && CefBrowserContext::FromProfile(Profile::FromBrowserContext(context));
++}
++std::optional<ZacroExtensionHostOwner> ResolveHostOwner(content::RenderFrameHost* frame) {
++  if (!frame || !frame->IsRenderFrameLive() || !HostOwnerResolver()) {
++    TraceNativeHost(!frame ? "resolve-no-frame" : !frame->IsRenderFrameLive()
++        ? "resolve-frame-not-live" : "resolve-no-owner-resolver", frame);
++    return std::nullopt;
++  }
++  auto owner = HostOwnerResolver().Run(frame);
++  if (!owner || !owner->browser || owner->logical_window_id <= 0 || owner->extension_id.size() != 32 ||
++      owner->browser->IsAlloyStyle() || !owner->browser->IsValid() ||
++      !owner->browser->GetWebContents() ||
++      owner->browser->GetWebContents()->GetBrowserContext() != frame->GetBrowserContext()) {
++    TraceNativeHost(!owner ? "resolve-authority-rejected" : !owner->browser ? "resolve-no-browser"
++        : owner->logical_window_id <= 0 ? "resolve-invalid-window"
++        : owner->extension_id.size() != 32 ? "resolve-invalid-extension"
++        : owner->browser->IsAlloyStyle() ? "resolve-alloy-browser"
++        : !owner->browser->IsValid() ? "resolve-invalid-browser"
++        : !owner->browser->GetWebContents() ? "resolve-browser-without-contents"
++        : "resolve-browser-profile-mismatch", frame);
++    return std::nullopt;
++  }
++  TraceNativeHost("resolve-accepted", frame, -1, owner->browser->GetIdentifier(), owner->logical_window_id);
++  return owner;
++}
++NO_SANITIZE("cfi-icall") void AbortNativeHostPopup(CefRefPtr<CefClient> client, int popup_id) {
++  const auto callback = HostNavigationCallbacks().aborted;
++  if (!client || !callback) return;
++  void* original = ZacroUnwrapExtensionHostClient(client);
++  callback(original, popup_id);
++  ZacroReleaseExtensionHostClient(original);
++}
++}  // namespace
++
++extern "C" CEF_EXPORT int cef_zacro_extension_host_navigation_v1(
++    const ccef_extension_host_navigation_callbacks_t* callbacks) {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  if (!callbacks || callbacks->size != sizeof(*callbacks) || callbacks->reserved ||
++      !callbacks->prepare || !callbacks->aborted) return 0;
++  HostNavigationCallbacks() = *callbacks;
++  return 1;
++}
++
++NO_SANITIZE("cfi-icall") bool CefBrowserInfoManager::PrepareNativeExtensionHostPopup(
++    content::RenderFrameHost* opener, const GURL& target_url,
++    const std::string& frame_name, WindowOpenDisposition disposition,
++    const blink::mojom::WindowFeatures& features, bool user_gesture) {
++  CEF_REQUIRE_UIT();
++  TraceNativeHost("prepare-enter", opener, static_cast<int>(disposition));
++  auto owner = ResolveHostOwner(opener);
++  const auto callback = HostNavigationCallbacks().prepare;
++  if (!owner || !callback || target_url.spec().size() > 8192 || frame_name.size() > 1024 ||
++      (disposition != WindowOpenDisposition::NEW_FOREGROUND_TAB &&
++       disposition != WindowOpenDisposition::NEW_BACKGROUND_TAB &&
++       disposition != WindowOpenDisposition::NEW_POPUP &&
++       disposition != WindowOpenDisposition::NEW_WINDOW &&
++       disposition != WindowOpenDisposition::SINGLETON_TAB)) {
++    TraceNativeHost(!owner ? "prepare-no-owner" : !callback ? "prepare-no-callback"
++        : target_url.spec().size() > 8192 ? "prepare-url-too-long"
++        : frame_name.size() > 1024 ? "prepare-name-too-long" : "prepare-disposition-rejected",
++        opener, static_cast<int>(disposition));
++    return false;
++  }
++  const auto source_document = opener->GetWeakDocumentPtr();
++  auto client = owner->browser->GetClient();
++  if (!client) { TraceNativeHost("prepare-no-native-client", opener); return false; }
++  auto pending = std::make_unique<PendingPopup>();
++  pending->step = PendingPopup::CAN_CREATE_WINDOW;
++  pending->alloy_style = false;
++  pending->opener_global_id = opener->GetGlobalId();
++  pending->native_host_document = source_document;
++  pending->native_host_owner_browser = owner->browser->GetIdentifier();
++  pending->native_host_owner_window = owner->logical_window_id;
++  pending->native_host_extension = owner->extension_id;
++  pending->target_url = target_url;
++  pending->target_frame_name = frame_name;
++  pending->settings = owner->browser->settings();
++  const int popup_id = owner->browser->GetNextPopupId();
++  ccef_extension_host_navigation_request_t request{};
++  request.size = sizeof(request);
++  request.popup_id = popup_id;
++  request.disposition = static_cast<int>(disposition);
++  request.user_gesture = user_gesture;
++  request.owner_window_id = owner->logical_window_id;
++  request.x = features.bounds.x(); request.y = features.bounds.y();
++  request.width = features.bounds.width(); request.height = features.bounds.height();
++  request.feature_flags = (features.has_x ? 1 : 0) | (features.has_y ? 2 : 0) |
++      (features.has_width ? 4 : 0) | (features.has_height ? 8 : 0) | (features.is_popup ? 16 : 0);
++  request.target_url = target_url.spec().c_str();
++  request.frame_name = frame_name.c_str();
++  request.source_extension_id = owner->extension_id.c_str();
++  void* original = ZacroUnwrapExtensionHostClient(client);
++  void* replacement = nullptr;
++  const int accepted = callback(original, &request, &replacement);
++  ZacroReleaseExtensionHostClient(original);
++  if (accepted != 1 || !replacement) {
++    TraceNativeHost("prepare-swift-rejected", opener, static_cast<int>(disposition),
++        owner->browser->GetIdentifier(), owner->logical_window_id);
++    ZacroReleaseExtensionHostClient(replacement);
++    return false;
++  }
++  pending->client = ZacroWrapExtensionHostClient(replacement);
++  pending->aborted_callback = base::BindOnce(&AbortNativeHostPopup, client, popup_id);
++  const auto current = ResolveHostOwner(source_document.AsRenderFrameHostIfValid());
++  if (!current || current->browser->GetIdentifier() != pending->native_host_owner_browser ||
++      current->logical_window_id != pending->native_host_owner_window ||
++      current->extension_id != pending->native_host_extension) {
++    TraceNativeHost("prepare-owner-changed-after-swift", opener); return false;
++  }
++  CefBrowserCreateParams params;
++  params.popup_with_views_hosted_opener = true;
++  params.settings = pending->settings;
++  params.client = pending->client;
++  pending->platform_delegate = CefBrowserPlatformDelegate::Create(params);
++  if (!pending->platform_delegate || !pending->platform_delegate->IsChromeStyle()) {
++    TraceNativeHost("prepare-platform-delegate-rejected", opener); return false;
++  }
++  opener->GetProcess()->FilterURL(false, &pending->target_url);
++  pending_create_popup_ = pending.get();
++  PushPendingPopup(std::move(pending));
++  TraceNativeHost("prepare-accepted", opener, static_cast<int>(disposition));
++  return true;
++}
++
++void CefBrowserInfoManager::NativeExtensionHostWebContentsCreated(
++    extensions::ExtensionHost* source_host, content::WebContents* source,
++    const content::GlobalRenderFrameHostId& opener_id, const GURL& target_url,
++    content::WebContents* created) {
++  CEF_REQUIRE_UIT();
++  if (!source_host || !source || source_host->host_contents() != source || !ManagedContext(source->GetBrowserContext())) {
++    TraceNativeHost("created-source-rejected"); return;
++  }
++  auto pending = PopPendingPopup(PendingPopup::GET_CUSTOM_WEB_CONTENTS_VIEW,
++      PendingPopup::CAN_CREATE_WINDOW, opener_id, target_url);
++  if (!pending) { TraceNativeHost("created-no-pending"); return; }
++  if (pending_create_popup_ == pending.get()) pending_create_popup_ = nullptr;
++  auto* frame = pending->native_host_document.AsRenderFrameHostIfValid();
++  const auto owner = ResolveHostOwner(frame);
++  if (!owner || !created || created->GetBrowserContext() != source->GetBrowserContext() ||
++      content::WebContents::FromRenderFrameHost(frame) != source || frame->GetGlobalId() != opener_id ||
++      owner->browser->GetIdentifier() != pending->native_host_owner_browser ||
++      owner->logical_window_id != pending->native_host_owner_window ||
++      owner->extension_id != pending->native_host_extension) {
++    TraceNativeHost("created-ownership-rejected", frame); return;
++  }
++  if (!NativeHistoryOwner::RegisterProvisionalExtensionPopup(frame, owner->logical_window_id, created)) {
++    TraceNativeHost("created-history-owner-rejected", frame); return;
++  }
++  ChromeBrowserDelegate::CreateBrowserHostForPopup(created, pending->settings, pending->client,
++      pending->extra_info, std::move(pending->platform_delegate), false, owner->browser);
++  pending->step = PendingPopup::WEB_CONTENTS_CREATED;
++  pending->new_contents = created;
++  PushPendingPopup(std::move(pending));
++  TraceNativeHost("created-accepted");
++}
++
++bool CefBrowserInfoManager::AddNativeExtensionHostContents(extensions::ExtensionHost* source_host,
++    content::WebContents* source, std::unique_ptr<content::WebContents>& created) {
++  CEF_REQUIRE_UIT();
++  if (!source || !ManagedContext(source->GetBrowserContext())) {
++    TraceNativeHost("add-source-unmanaged"); return false;
++  }
++  if (!created) { TraceNativeHost("add-no-created-contents"); return true; }
++  auto pending = PopPendingPopup(PendingPopup::WEB_CONTENTS_CREATED,
++      PendingPopup::WEB_CONTENTS_CREATED, created.get());
++  auto* frame = pending ? pending->native_host_document.AsRenderFrameHostIfValid() : nullptr;
++  const auto owner = ResolveHostOwner(frame);
++  const auto child = ChromeBrowserHostImpl::GetBrowserForContents(created.get());
++  if (!source_host || source_host->host_contents() != source || !pending || !owner || !child ||
++      created->GetBrowserContext() != source->GetBrowserContext() ||
++      content::WebContents::FromRenderFrameHost(frame) != source ||
++      owner->browser->GetIdentifier() != pending->native_host_owner_browser ||
++      owner->logical_window_id != pending->native_host_owner_window ||
++      owner->extension_id != pending->native_host_extension) {
++    TraceNativeHost("add-ownership-rejected", frame); created.reset(); return true;
++  }
++  child->AddNewContents(std::move(created), std::nullopt);
++  pending->step = PendingPopup::CREATION_COMPLETE;
++  TraceNativeHost("add-accepted");
++  return true;
++}
++
++bool CefBrowserInfoManager::OpenNativeExtensionHostURL(extensions::ExtensionHost* source_host,
++    const content::OpenURLParams& params,
++    base::OnceCallback<void(content::NavigationHandle&)>& callback,
++    content::WebContents** result) {
++  CEF_REQUIRE_UIT();
++  TraceNativeHost("open-url-enter", nullptr, static_cast<int>(params.disposition), 0, 0,
++      params.source_render_process_id, params.source_render_frame_id);
++  if (!source_host || !ManagedContext(source_host->browser_context())) {
++    TraceNativeHost("open-url-unmanaged-host"); return false;
++  }
++  if (!result) { TraceNativeHost("open-url-no-result-receiver"); return true; }
++  *result = nullptr;
++  if (params.disposition == WindowOpenDisposition::SAVE_TO_DISK) {
++    TraceNativeHost("open-url-save-to-disk"); return false;
++  }
++  auto* frame = content::RenderFrameHost::FromID(params.source_render_process_id, params.source_render_frame_id);
++  if (!frame || content::WebContents::FromRenderFrameHost(frame) != source_host->host_contents()) {
++    TraceNativeHost(!frame ? "open-url-source-frame-missing" : "open-url-source-host-mismatch", frame);
++    return true;
++  }
++  const blink::mojom::WindowFeatures features;
++  if (!PrepareNativeExtensionHostPopup(frame, params.url, "", params.disposition, features, params.user_gesture)) {
++    TraceNativeHost("open-url-prepare-rejected", frame, static_cast<int>(params.disposition)); return true;
++  }
++  content::WebContents::CreateParams create(source_host->browser_context(), params.source_site_instance);
++  create.initially_hidden = true;
++  auto contents = content::WebContents::Create(create);
++  auto* raw = contents.get();
++  const auto alive = raw->GetWeakPtr();
++  NativeExtensionHostWebContentsCreated(source_host, source_host->host_contents(), frame->GetGlobalId(), params.url, raw);
++  if (!AddNativeExtensionHostContents(source_host, source_host->host_contents(), contents) || contents) {
++    TraceNativeHost("open-url-add-rejected", frame); return true;
++  }
++  if (!alive || !ChromeBrowserHostImpl::GetBrowserForContents(alive.get())) {
++    TraceNativeHost("open-url-native-child-missing", frame); return true;
++  }
++  const auto navigation = raw->GetController().LoadURLWithParams(content::NavigationController::LoadURLParams(params));
++  if (navigation && callback) std::move(callback).Run(*navigation);
++  *result = alive.get();
++  TraceNativeHost("open-url-accepted", nullptr, static_cast<int>(params.disposition));
++  return true;
++}
++
++void ZacroInstallExtensionHostNavigation(ZacroExtensionHostOwnerResolver resolver) {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  HostOwnerResolver() = std::move(resolver);
++  extensions::ExtensionHost::SetNativeNavigationHooks(
++      base::BindRepeating([](extensions::ExtensionHost* host, content::WebContents* source,
++          const content::GlobalRenderFrameHostId& opener, const GURL& target, content::WebContents* created) {
++        CefBrowserInfoManager::GetInstance()->NativeExtensionHostWebContentsCreated(host, source, opener, target, created);
++      }), base::BindRepeating([](extensions::ExtensionHost* host, content::WebContents* source,
++          std::unique_ptr<content::WebContents>& created) {
++        return CefBrowserInfoManager::GetInstance()->AddNativeExtensionHostContents(host, source, created);
++      }), base::BindRepeating([](extensions::ExtensionHost* host, const content::OpenURLParams& params,
++          base::OnceCallback<void(content::NavigationHandle&)>& callback, content::WebContents** result) {
++        return CefBrowserInfoManager::GetInstance()->OpenNativeExtensionHostURL(host, params, callback, result);
++      }));
++}
+--- /dev/null
++++ b/cef/libcef/browser/devtools/zacro_extension_host_navigation_capi.h
+@@ -0,0 +1,36 @@
++#ifndef CCEF_EXTENSION_HOST_NAVIGATION_H_
++#define CCEF_EXTENSION_HOST_NAVIGATION_H_
++#include <stdint.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++typedef struct {
++  uint32_t size;
++  uint32_t reserved;
++  int32_t popup_id;
++  int32_t disposition;
++  int32_t user_gesture;
++  int32_t owner_window_id;
++  int32_t x, y, width, height;
++  uint32_t feature_flags;
++  const char* target_url;
++  const char* frame_name;
++  const char* source_extension_id;
++} ccef_extension_host_navigation_request_t;
++typedef struct {
++  uint32_t size;
++  uint32_t reserved;
++  // owner_client is borrowed for this call. replacement_client transfers +1
++  // to native CEF on success; it must be null on refusal.
++  int (*prepare)(void* owner_client,
++      const ccef_extension_host_navigation_request_t* request,
++      void** replacement_client);
++  void (*aborted)(void* owner_client, int32_t popup_id);
++} ccef_extension_host_navigation_callbacks_t;
++int ccef_extension_host_navigation_available(void);
++int ccef_extension_host_navigation_install(
++    const ccef_extension_host_navigation_callbacks_t* callbacks);
++#ifdef __cplusplus
++}
++#endif
++#endif
+--- /dev/null
++++ b/cef/libcef/browser/devtools/zacro_extension_host_client_bridge.h
+@@ -0,0 +1,12 @@
++#ifndef CEF_LIBCEF_BROWSER_DEVTOOLS_ZACRO_EXTENSION_HOST_CLIENT_BRIDGE_H_
++#define CEF_LIBCEF_BROWSER_DEVTOOLS_ZACRO_EXTENSION_HOST_CLIENT_BRIDGE_H_
++#include "cef/include/cef_client.h"
++// Keep version-selected CEF wrapper instantiation in its official translation
++// unit, beside the original wrapper-type specialization. No duplicate wrapper
++// definition or warning suppression is needed by native browser producers.
++// Wrap consumes a transferred +1. Unwrap returns a transferred +1, released
++// with Release after a borrowed callback has returned.
++CefRefPtr<CefClient> ZacroWrapExtensionHostClient(void* transferred);
++void* ZacroUnwrapExtensionHostClient(CefRefPtr<CefClient> client);
++void ZacroReleaseExtensionHostClient(void* transferred);
++#endif

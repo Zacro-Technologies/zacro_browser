@@ -93,6 +93,7 @@ struct NativeInterfaceEditors: View {
       }
     }.padding(20).frame(width: 500)
       .font(.system(size: 13)).foregroundStyle(colors.ink).tint(colors.accent)
+      .buttonStyle(NativeChromeButtonStyle(colors: colors))
       .background { NativeControlSurface().overlay(colors.chrome.opacity(0.65)) }
       .background { NativeWindowDialogAnchor(owner: dialogs).frame(width: 0, height: 0) }
       .onChange(of: recording) { _, value in actions.recordingShortcut = value != nil }
@@ -263,26 +264,18 @@ struct NativeInterfaceEditors: View {
                   Button("Delete profile", role: .destructive) { deleteProfile(profile) }.disabled(!store.state.profiles.contains { !$0.isPrivate && $0.id != profile.id })
                 } label: { NativeGlyph.menuImage("ellipsis").frame(width: 22, height: 30) }.menuStyle(.borderlessButton).menuIndicator(.hidden).frame(width: 24)
               }
-              Picker("Archive inactive tabs", selection: Binding(get: { isDefault ? store.state.settings.archiveAfterHours : profile.archiveAfterHours ?? -1 }, set: { value in
-                store.setArchiveHours(profileID: profile.id, hours: value < 0 ? nil : value)
-              })) {
-                if !isDefault { Text("Use browser default").tag(-1.0) }
-                Text("Never").tag(0.0)
-                Text("After 1 hour").tag(1.0)
-                Text("After 6 hours").tag(6.0)
-                Text("After 12 hours").tag(12.0)
-                Text("After 1 day").tag(24.0)
-                Text("After 2 days").tag(48.0)
-                Text("After 3 days").tag(72.0)
-                Text("After 7 days").tag(168.0)
-                Text("After 30 days").tag(720.0)
-              }.font(.system(size: 12))
+              NativeChromeSelect(title: "Archive inactive tabs", selection: Binding(get: {
+                isDefault ? store.state.settings.archiveAfterHours : profile.archiveAfterHours ?? -1
+              }, set: { value in store.setArchiveHours(profileID: profile.id, hours: value < 0 ? nil : value) }),
+                options: (isDefault ? [] : [(-1.0, "Use browser default")]) + [(0.0, "Never"),
+                  (1, "After 1 hour"), (6, "After 6 hours"), (12, "After 12 hours"), (24, "After 1 day"),
+                  (48, "After 2 days"), (72, "After 3 days"), (168, "After 7 days"), (720, "After 30 days")], colors: colors)
             }.padding(12).background(colors.card.opacity(0.24), in: RoundedRectangle(cornerRadius: 10))
           }
         }
       }.scrollIndicators(.hidden).frame(maxHeight: 330)
       HStack {
-        TextField("New profile name", text: $profileName).textFieldStyle(.roundedBorder)
+        TextField("New profile name", text: $profileName).textFieldStyle(NativeChromeTextFieldStyle(colors: colors))
         Button("Create") {
           do {
             _ = try store.createProfileDurably(name: String(profileName.trimmingCharacters(in: .whitespacesAndNewlines).prefix(60)))

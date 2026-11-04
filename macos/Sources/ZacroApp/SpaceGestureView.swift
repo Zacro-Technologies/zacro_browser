@@ -2,6 +2,21 @@ import AppKit
 import SwiftUI
 import ZacroCore
 
+@MainActor private protocol NativeSpaceGestureInterruptible: AnyObject {
+  func cancelSpaceGesture()
+}
+
+@MainActor enum NativeSpaceGestureCancellation {
+  static func cancel(in window: NSWindow) {
+    guard let root = window.contentView else { return }
+    func visit(_ view: NSView) {
+      (view as? NativeSpaceGestureInterruptible)?.cancelSpaceGesture()
+      for child in view.subviews { visit(child) }
+    }
+    visit(root)
+  }
+}
+
 /// AppKit supplies real contact/momentum phases to the shared, tested recognizer.
 struct SpaceGestureSurface<Content: View>: NSViewRepresentable {
   var index: Int
@@ -23,7 +38,7 @@ struct SpaceGestureSurface<Content: View>: NSViewRepresentable {
   }
 }
 
-final class SpaceScrollHost<Content: View>: NSHostingView<Content> {
+final class SpaceScrollHost<Content: View>: NSHostingView<Content>, NativeSpaceGestureInterruptible {
   var index = 0
   var count = 1
   var contextKey = ""
@@ -45,6 +60,11 @@ final class SpaceScrollHost<Content: View>: NSHostingView<Content> {
   }
   func contextWillChange() {
     guard gesture.isTracking || gesture.isPending else { return }
+    fallbackRelease?.cancel(); fallbackRelease = nil
+    _ = gesture.interrupt(at: ProcessInfo.processInfo.systemUptime)
+    onProgress(0)
+  }
+  func cancelSpaceGesture() {
     fallbackRelease?.cancel(); fallbackRelease = nil
     _ = gesture.interrupt(at: ProcessInfo.processInfo.systemUptime)
     onProgress(0)

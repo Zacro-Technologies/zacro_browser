@@ -10,6 +10,7 @@ class NativeAuthFixture:
     def __init__(self):
         self.lock = threading.Lock()
         self.sessions = {}
+        self.pending = {}
 
     def handle(self, handler):
         request = urlsplit(handler.path)
@@ -25,7 +26,7 @@ class NativeAuthFixture:
         with self.lock:
             now = time.monotonic()
             self.sessions = {key: value for key, value in self.sessions.items() if now - value[0] < 120}
-        if request.path in ("/native-auth/redirect", "/native-auth/document"):
+        if request.path in ("/native-auth/redirect", "/native-auth/document", "/native-auth/pending"):
             try:
                 destination = urlsplit(callback)
                 valid = (destination.scheme == "https" and destination.port is None
@@ -47,6 +48,44 @@ class NativeAuthFixture:
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,96}", token):
             handler.send_error(400, "Invalid fixture identity")
             return True
+        if request.path in ("/native-auth/pending-status", "/native-auth/pending-release"):
+            with self.lock:
+                record = self.pending.get(token)
+                if record is None:
+                    handler.send_error(404)
+                    return True
+                if request.path.endswith("/pending-release"):
+                    record["release"].set()
+                result = {"entered": True, "released": record["release"].is_set(),
+                          "completed": record["completed"], "expired": record["expired"]}
+            self.reply(handler, json.dumps(result).encode(), "application/json")
+            return True
+        pending_record = None
+        if request.path == "/native-auth/pending":
+            # The HTTP arrival proves an actual native auth WebContents started
+            # navigation. Do not send headers until the host releases this
+            # exact token; no timer counts as successful release/presentation.
+            with self.lock:
+                now = time.monotonic()
+                self.pending = {key: value for key, value in self.pending.items()
+                                if now - value["created"] < 120}
+                if token in self.pending or len(self.pending) >= 256:
+                    handler.send_error(409)
+                    return True
+                pending_record = {"created": now, "release": threading.Event(),
+                                  "completed": False, "expired": False}
+                self.pending[token] = pending_record
+            if not pending_record["release"].wait(45):
+                with self.lock:
+                    pending_record["expired"] = True
+                    pending_record["completed"] = True
+                try:
+                    handler.send_error(410, "Pending fixture headers were not released")
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                return True
+            request = request._replace(path="/native-auth/document")
+            mode = "hold"
         if request.path == "/native-auth/document":
             if mode not in ("load", "async", "hold", "timeout"):
                 handler.send_error(400, "Invalid fixture mode")
@@ -90,7 +129,18 @@ setTimeout(() => {{
             body = (f"<!doctype html><meta charset=utf-8><title>Zacro auth fixture {token}</title>"
                     "<h1>Synthetic authorization page</h1><p>No account or credentials are used.</p>"
                     f"<script>{script}</script>").encode()
-            self.reply(handler, body, "text/html; charset=utf-8")
+            if pending_record is None:
+                self.reply(handler, body, "text/html; charset=utf-8")
+            else:
+                try:
+                    self.reply(handler, body, "text/html; charset=utf-8")
+                except (BrokenPipeError, ConnectionResetError):
+                    # Native cancellation is expected to close this one owned
+                    # response before release. Other server errors still fail.
+                    pass
+                finally:
+                    with self.lock:
+                        pending_record["completed"] = True
             return True
         if request.path in ("/native-auth/status", "/native-auth/release"):
             with self.lock:

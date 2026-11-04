@@ -32,7 +32,9 @@ def main():
              "libcef/browser/chrome/chrome_browser_main_extra_parts_cef.h",
              "libcef/browser/chrome/chrome_browser_main_extra_parts_cef.cc",
              "libcef/browser/net/throttle_handler.cc",
-             "libcef/browser/views/window_impl.cc"]
+             "libcef/browser/views/window_impl.cc",
+             "libcef/browser/browser_contents_delegate.cc",
+             "libcef/browser/views/ns_window.mm"]
     originals = {path: subprocess.check_output(["git", "show", f"HEAD:{path}"], cwd=cef, text=True) for path in paths}
     output = dict(originals)
     header = output[paths[0]]
@@ -46,6 +48,7 @@ def main():
   bool DispatchZacroExtensions(int id, const std::string& method, const base::DictValue* params);
   bool DispatchZacroTopology(int id, const std::string& method, const base::DictValue* params);
   bool DispatchZacroBookmarks(int id, const std::string& method, const base::DictValue* params);
+  bool DispatchZacroHistory(int id, const std::string& method, const base::DictValue* params);
   bool DispatchZacroDownloads(int id, const std::string& method, const base::DictValue* params);
   bool DispatchZacroManagement(int id, const std::string& method, const base::DictValue* params);
   base::CallbackListSubscription zacro_extension_subscription_;
@@ -111,7 +114,35 @@ def main():
 
   devtools_util::ProtocolParser parser;""")
     output[paths[1]] = code
-    output[paths[2]] = replace_once(output[paths[2]], '    "//components/services/print_compositor/public/mojom",', '    "//components/services/print_compositor/public/mojom",\n    "//components/sessions",\n    "//components/os_crypt/async/browser",\n    "//components/os_crypt/async/common",\n    "//chrome/browser/ui/views/extensions:extension_popup",\n    "//extensions/browser/api/runtime",')
+    output[paths[2]] = replace_once(output[paths[2]],
+        '    "libcef/browser/devtools/devtools_controller.cc",',
+        '    "libcef/browser/devtools/devtools_controller.cc",\n    "libcef/browser/devtools/zacro_extension_host_navigation.cc",\n    "libcef/browser/devtools/zacro_extension_host_navigation.h",\n    "libcef/browser/devtools/zacro_extension_host_navigation_capi.h",\n    "libcef/browser/devtools/zacro_extension_host_client_bridge.h",')
+    output[paths[2]] = replace_once(output[paths[2]], '    "//components/services/print_compositor/public/mojom",', '    "//components/services/print_compositor/public/mojom",\n    "//components/sessions",\n    "//components/history/core/browser",\n    "//chrome/browser/history",\n    "//chrome/browser/extensions",\n    "//chrome/browser/extensions/api/runtime",\n    "//components/os_crypt/async/browser",\n    "//components/os_crypt/async/common",\n    "//chrome/browser/ui/views/extensions:extension_popup",\n    "//extensions/browser/api/runtime",')
+    output[paths[2]] = replace_once(output[paths[2]],
+        'import("//build/config/features.gni")',
+        'import("//build/config/compiler/compiler.gni")\nimport("//build/config/features.gni")')
+    output[paths[2]] = replace_once(output[paths[2]],
+        '  mac_framework_bundle("cef_framework") {', '''  # Append after the default compiler config so these final-link settings
+  # override its eager reader count without relinking build tools or codegen.
+  config("zacro_framework_linking") {
+    if (is_mac && use_lld) {
+      ldflags = [ "-Wl,--threads=1", "-Wl,--read-workers=0" ]
+    }
+  }
+
+  mac_framework_bundle("cef_framework") {''')
+    output[paths[2]] = replace_once(output[paths[2]], '''    configs += [
+      ":libcef_autogen_config",
+      ":libcef_includes_config",
+    ]
+
+    # We don't link the framework''', '''    configs += [
+      ":libcef_autogen_config",
+      ":libcef_includes_config",
+      ":zacro_framework_linking",
+    ]
+
+    # We don't link the framework''')
     platform_header = replace_once(output[paths[3]], "class WebContents;", "class WebContents;\nclass ScopedAccessibilityMode;")
     output[paths[3]] = replace_once(platform_header,
         "  raw_ptr<content::WebContents> web_contents_ = nullptr;",
@@ -168,6 +199,30 @@ namespace throttle {""")
     } else {
       widget_->Show();
     }""")
+    output[paths[9]] = replace_once(output[paths[9]], """    OnLoadError(frame.get(), navigation_handle->GetURL(), error_code);
+  }
+}
+
+void CefBrowserContentsDelegate::DidFailLoad(""", """    OnLoadError(frame.get(), navigation_handle->GetURL(), error_code);
+    // A committed error document owns a real NavigationEntry even though it
+    // has no successful OnLoadStart. Keep the host address/history in sync
+    // without promoting a provisional failure or clearing its error state.
+    if (navigation_handle->IsInPrimaryMainFrame() &&
+        navigation_handle->HasCommitted()) {
+      OnAddressChange(navigation_handle->GetURL());
+    }
+  }
+}
+
+void CefBrowserContentsDelegate::DidFailLoad(""")
+    output[paths[10]] = replace_once(output[paths[10]], """+ (Class)frameViewClassForStyleMask:(NSUInteger)windowStyle {
+  if (Class custom_frame = [CefThemeFrame class]) {""", """+ (Class)frameViewClassForStyleMask:(NSUInteger)windowStyle {
+  // Hosted borderless windows must use Chromium's borderless frame rather
+  // than the title-bearing CEF frame, whose independent contour stays rounded.
+  if (!(windowStyle & NSWindowStyleMaskTitled)) {
+    return [super frameViewClassForStyleMask:windowStyle];
+  }
+  if (Class custom_frame = [CefThemeFrame class]) {""")
     adapter_path = "libcef/browser/devtools/zacro_native_adapter.inc"
     originals[adapter_path] = ""
     output[adapter_path] = (ROOT / "devtools_native_adapter.inc").read_text()
@@ -180,6 +235,12 @@ namespace throttle {""")
     bookmarks_path = "libcef/browser/devtools/zacro_bookmarks_adapter.inc"
     originals[bookmarks_path] = ""
     output[bookmarks_path] = (ROOT / "devtools_bookmarks_adapter.inc").read_text()
+    for name in ["devtools_history_adapter.inc", "history_db_tasks.h.inc", "devtools_history_legacy_adapter.inc"]:
+        destination = "libcef/browser/devtools/" + {"devtools_history_adapter.inc": "zacro_history_adapter.inc",
+            "history_db_tasks.h.inc": "zacro_history_db_tasks.inc",
+            "devtools_history_legacy_adapter.inc": "zacro_history_legacy_adapter.inc"}[name]
+        originals[destination] = ""
+        output[destination] = (ROOT / name).read_text()
     downloads_path = "libcef/browser/devtools/zacro_downloads_adapter.inc"
     originals[downloads_path] = ""
     output[downloads_path] = (ROOT / "devtools_downloads_adapter.inc").read_text()

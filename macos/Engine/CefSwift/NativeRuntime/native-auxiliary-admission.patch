@@ -1,0 +1,500 @@
+--- a/chrome/browser/extensions/api/identity/web_auth_flow.h
++++ b/chrome/browser/extensions/api/identity/web_auth_flow.h
+@@ -6,6 +6,8 @@
+ #define CHROME_BROWSER_EXTENSIONS_API_IDENTITY_WEB_AUTH_FLOW_H_
+ 
+ #include <optional>
++#include <cstdint>
++#include <memory>
+ #include <string>
+ 
+ #include "base/functional/callback_forward.h"
+@@ -14,6 +16,7 @@
+ #include "base/memory/weak_ptr.h"
+ #include "base/scoped_observation.h"
+ #include "base/time/time.h"
++#include "base/unguessable_token.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/profiles/profile_observer.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+@@ -37,6 +40,47 @@
+ }  // namespace base
+ 
+ namespace extensions {
++
++// Private embedding interface. No extension API or OAuth data crosses it.
++// All methods run on the browser UI sequence.
++struct NativeWebAuthAdmissionState {
++  uint32_t size = sizeof(NativeWebAuthAdmissionState);
++  uint32_t reserved = 0;
++  uint64_t high = 0;
++  uint64_t low = 0;
++  uint64_t requests = 0;
++  uint64_t presented = 0;
++  uint64_t unpresented = 0;
++};
++enum class NativeWebAuthAdmissionOperation {
++  kAcquireContext = 1, kAcquireProcess = 2, kStatus = 3,
++  kRelease = 4, kSeal = 5, kIsBlocked = 6,
++};
++enum class NativeWebAuthAdmissionResult {
++  kOk = 1, kInvalidArgument = -1, kUnknownLease = -2,
++  kContextDestroyed = -3, kSealed = -4, kCapacity = -5,
++};
++
++class NativeWebAuthFlowRegistration {
++ public:
++  explicit NativeWebAuthFlowRegistration(base::UnguessableToken id,
++                                        bool admitted = true, bool overflow = false);
++  ~NativeWebAuthFlowRegistration();
++  bool is_admitted() const { return admitted_; }
++  NativeWebAuthFlowRegistration(const NativeWebAuthFlowRegistration&) = delete;
++  NativeWebAuthFlowRegistration& operator=(const NativeWebAuthFlowRegistration&) = delete;
++ private:
++  const base::UnguessableToken id_;
++  const bool admitted_;
++  const bool overflow_;
++};
++std::unique_ptr<NativeWebAuthFlowRegistration> RegisterNativeWebAuthFlow(
++    Profile* profile, base::RepeatingClosure cancel_unpresented,
++    base::RepeatingCallback<bool()> is_presented);
++bool IsNativeWebAuthAdmissionBlocked(Profile* profile);
++NativeWebAuthAdmissionResult UpdateNativeWebAuthAdmission(
++    NativeWebAuthAdmissionOperation operation, Profile* profile,
++    uint64_t high, uint64_t low, NativeWebAuthAdmissionState* output);
+ 
+ class WebAuthFlowInfoBarDelegate;
+ 
+@@ -165,6 +209,9 @@
+   void BeforeUrlLoaded(const GURL& url);
+   void AfterUrlLoaded();
+ 
++  // Cancels only requests which have never been presented. Shown auth pages
++  // retain the ordinary native beforeunload path and its original delegate.
++  void CancelUnpresentedForNativeAdmission();
+   void MaybeStartTimeout();
+   void OnTimeout();
+ 
+@@ -177,6 +224,10 @@
+   void DisplayInfoBar();
+   void CloseInfoBar();
+ 
++  // Declared first so registration dies LAST, after owned WebContents and
++  // all callbacks/observers. Its destructor posts actual quiescence afterward.
++  std::unique_ptr<NativeWebAuthFlowRegistration> native_admission_registration_;
++  bool native_admission_cancelled_ = false;
+   raw_ptr<Delegate> delegate_ = nullptr;
+   raw_ptr<Profile> profile_;
+   const GURL provider_url_;
+@@ -215,8 +266,8 @@
+   base::ScopedObservation<Profile, ProfileObserver> profile_observation_{this};
+ #if BUILDFLAG(ENABLE_DESKTOP_ANDROID_EXTENSIONS)
+   base::OnceClosure popup_displayed_callback_for_testing_;
++#endif
+   base::WeakPtrFactory<WebAuthFlow> weak_factory_{this};
+-#endif
+ };
+ 
+ }  // namespace extensions
+--- a/chrome/browser/extensions/api/identity/web_auth_flow.cc
++++ b/chrome/browser/extensions/api/identity/web_auth_flow.cc
+@@ -5,12 +5,14 @@
+ #include "chrome/browser/extensions/api/identity/web_auth_flow.h"
+ 
+ #include <memory>
++#include <map>
+ #include <optional>
+ #include <string>
+ #include <utility>
+ #include <vector>
+ 
+ #include "base/check.h"
++#include "base/no_destructor.h"
+ #include "base/check_op.h"
+ #include "base/functional/bind.h"
+ #include "base/task/single_thread_task_runner.h"
+@@ -30,6 +32,7 @@
+ #include "components/sessions/core/session_id.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "content/public/browser/browser_context.h"
++#include "content/public/browser/browser_thread.h"
+ #include "content/public/browser/navigation_controller.h"
+ #include "content/public/browser/navigation_entry.h"
+ #include "content/public/browser/navigation_handle.h"
+@@ -68,6 +71,157 @@
+ using content::WebContentsObserver;
+ 
+ namespace extensions {
++
++// Included in web_auth_flow.cc, within namespace extensions. The registration
++// member is declared before the flow's owned WebContents, so its destructor
++// runs after those contents and all later members have actually been destroyed.
++namespace {
++struct NativeAuthLease {
++  bool process = false;
++  bool sealed = false;
++  base::WeakPtr<Profile> profile;
++};
++struct NativeAuthRequest {
++  base::WeakPtr<Profile> profile;
++  base::RepeatingClosure cancel_unpresented;
++  base::RepeatingCallback<bool()> is_presented;
++};
++struct NativeAuthRegistry {
++  std::map<base::UnguessableToken, NativeAuthLease> leases;
++  std::map<base::UnguessableToken, NativeAuthRequest> requests;
++  // Capacity-refused flows still have an original asynchronous failure and
++  // destructor. A counter keeps their lifetime visible without growing the
++  // bounded request map or presenting a truncated quiescent snapshot.
++  uint64_t overflow_requests = 0;
++};
++NativeAuthRegistry& NativeAuthState() {
++  static base::NoDestructor<NativeAuthRegistry> state;
++  return *state;
++}
++bool NativeAuthMatches(const NativeAuthLease& lease, const NativeAuthRequest& request) {
++  return lease.process || (lease.profile && request.profile.get() == lease.profile.get());
++}
++void ForgetNativeAuthRequest(const base::UnguessableToken& id) {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  NativeAuthState().requests.erase(id);
++}
++void ForgetNativeAuthOverflow() {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  DCHECK(NativeAuthState().overflow_requests);
++  --NativeAuthState().overflow_requests;
++}
++}  // namespace
++
++NativeWebAuthFlowRegistration::NativeWebAuthFlowRegistration(base::UnguessableToken id,
++                                                           bool admitted, bool overflow)
++    : id_(id), admitted_(admitted), overflow_(overflow) {}
++NativeWebAuthFlowRegistration::~NativeWebAuthFlowRegistration() {
++  // A status query must not observe quiescence reentrantly inside the enclosing
++  // destructor/notification stack. Keep the identity until the next UI task.
++  if (overflow_) {
++    base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(&ForgetNativeAuthOverflow));
++  } else {
++    base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(&ForgetNativeAuthRequest, id_));
++  }
++}
++std::unique_ptr<NativeWebAuthFlowRegistration> RegisterNativeWebAuthFlow(
++    Profile* profile, base::RepeatingClosure cancel_unpresented,
++    base::RepeatingCallback<bool()> is_presented) {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  auto& state = NativeAuthState();
++  if (!profile) return nullptr;
++  const auto id = base::UnguessableToken::Create();
++  if (state.requests.size() >= 8192) {
++    ++state.overflow_requests;
++    return std::make_unique<NativeWebAuthFlowRegistration>(id, false, true);
++  }
++  state.requests.emplace(id, NativeAuthRequest{profile->GetWeakPtr(),
++      std::move(cancel_unpresented), std::move(is_presented)});
++  return std::make_unique<NativeWebAuthFlowRegistration>(id, !profile->ShutdownStarted());
++}
++bool IsNativeWebAuthAdmissionBlocked(Profile* profile) {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  if (!profile || profile->ShutdownStarted()) return true;
++  for (const auto& [id, lease] : NativeAuthState().leases) {
++    if (lease.process || lease.profile.get() == profile) return true;
++  }
++  return false;
++}
++NativeWebAuthAdmissionResult UpdateNativeWebAuthAdmission(
++    NativeWebAuthAdmissionOperation operation, Profile* profile,
++    uint64_t high, uint64_t low, NativeWebAuthAdmissionState* output) {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  using Result = NativeWebAuthAdmissionResult;
++  using Operation = NativeWebAuthAdmissionOperation;
++  if (!output || output->size != sizeof(*output) || output->reserved) return Result::kInvalidArgument;
++  *output = NativeWebAuthAdmissionState();
++  if (operation == Operation::kIsBlocked) {
++    if (!profile) return Result::kInvalidArgument;
++    output->requests = IsNativeWebAuthAdmissionBlocked(profile) ? 1 : 0;
++    return Result::kOk;
++  }
++  auto& state = NativeAuthState();
++  std::optional<base::UnguessableToken> token;
++  const bool acquire = operation == Operation::kAcquireContext || operation == Operation::kAcquireProcess;
++  // Refused flow objects can still have pending failure/destruction callbacks.
++  // Do not allocate an unreturned lease or report zero while they drain.
++  // Explicit release remains possible, including cancellation of an old Quit.
++  if (state.overflow_requests &&
++      (acquire || operation == Operation::kStatus || operation == Operation::kSeal)) return Result::kCapacity;
++  if (acquire) {
++    if (high || low || (operation == Operation::kAcquireContext && (!profile || profile->ShutdownStarted())) ||
++        (operation == Operation::kAcquireProcess && profile)) return Result::kInvalidArgument;
++    // Expired profile leases cannot transfer authority to a recycled address.
++    std::erase_if(state.leases, [](const auto& entry) {
++      return !entry.second.process && !entry.second.profile;
++    });
++    if (state.leases.size() >= 128) return Result::kCapacity;
++    token = base::UnguessableToken::Create();
++    state.leases.emplace(*token, NativeAuthLease{operation == Operation::kAcquireProcess,
++        false, profile ? profile->GetWeakPtr() : base::WeakPtr<Profile>()});
++  } else {
++    token = base::UnguessableToken::Deserialize(high, low);
++    if (!token) return Result::kInvalidArgument;
++  }
++  auto it = state.leases.find(*token);
++  if (it == state.leases.end()) return Result::kUnknownLease;
++  // Copy before any delegate callback, which may mutate the registry.
++  const auto lease = it->second;
++  if (!lease.process && !lease.profile) return Result::kContextDestroyed;
++  if (operation == Operation::kRelease) {
++    if (lease.sealed) return Result::kSealed;
++    state.leases.erase(it);
++    return Result::kOk;
++  }
++  if (operation == Operation::kSeal) it->second.sealed = true;
++  else if (!acquire && operation != Operation::kStatus) return Result::kInvalidArgument;
++  if (acquire) {
++    std::vector<base::UnguessableToken> ids;
++    for (const auto& [id, request] : state.requests) if (NativeAuthMatches(lease, request)) ids.push_back(id);
++    // Admission is already closed. A failure callback may reenter, remove a
++    // request, or destroy the Profile. Never retain a raw request across it.
++    for (const auto& id : ids) {
++      auto request = state.requests.find(id);
++      if (request == state.requests.end()) continue;
++      auto cancel = request->second.cancel_unpresented;
++      cancel.Run();
++    }
++  }
++  output->high = token->GetHighForSerialization();
++  output->low = token->GetLowForSerialization();
++  // Count a fresh registry. Entries whose flow WeakPtr has expired remain
++  // pending until the destructor's posted Forget task; false is unpresented.
++  for (const auto& [id, request] : state.requests) {
++    if (!NativeAuthMatches(lease, request)) continue;
++    ++output->requests;
++    if (request.is_presented.Run()) ++output->presented;
++    else ++output->unpresented;
++  }
++  return Result::kOk;
++}
++
+ 
+ WebAuthFlow::WebAuthFlow(
+     Delegate* delegate,
+@@ -99,7 +253,17 @@
+ 
+   // profile_ can be null in unit tests.
+   if (profile_ != nullptr) {
+-    profile_observation_.Observe(profile_);
++    const bool native_profile_closing = profile_->ShutdownStarted();
++    if (!native_profile_closing) profile_observation_.Observe(profile_);
++    native_admission_registration_ = RegisterNativeWebAuthFlow(
++        profile_, base::BindRepeating(&WebAuthFlow::CancelUnpresentedForNativeAdmission,
++                                    weak_factory_.GetWeakPtr()),
++        base::BindRepeating([](base::WeakPtr<WebAuthFlow> flow) {
++          return flow && !flow->web_contents_ && flow->web_contents();
++        }, weak_factory_.GetWeakPtr()));
++    // A request rejected during profile teardown must not retain a raw Profile
++    // or install an observer after its destruction notification has begun.
++    if (native_profile_closing) profile_ = nullptr;
+   }
+ }
+ 
+@@ -136,6 +300,15 @@
+ }
+ 
+ void WebAuthFlow::Start() {
++  if (!native_admission_registration_ || !native_admission_registration_->is_admitted() || !profile_ ||
++      IsNativeWebAuthAdmissionBlocked(profile_)) {
++    // Run() owns an extra ref and still needs to return RespondLater. Use the
++    // normal async failure path; do not create a provider WebContents first.
++    base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(&WebAuthFlow::CancelUnpresentedForNativeAdmission,
++                                 weak_factory_.GetWeakPtr()));
++    return;
++  }
+   DCHECK(profile_);
+   DCHECK(!profile_->IsOffTheRecord());
+   DCHECK(!profile_->ShutdownStarted());
+@@ -162,6 +335,15 @@
+   web_contents_->GetController().LoadURLWithParams(load_params);
+ 
+   MaybeStartTimeout();
++}
++
++void WebAuthFlow::CancelUnpresentedForNativeAdmission() {
++  if (native_admission_cancelled_ || !delegate_ || (!web_contents_ && web_contents())) return;
++  native_admission_cancelled_ = true;
++  non_interactive_timeout_timer_->Stop();
++  // May detach the delegate and schedule this object's destruction. Nothing
++  // below this call may touch the flow or attempt a second response.
++  delegate_->OnAuthFlowFailure(WebAuthFlow::WINDOW_CLOSED);
+ }
+ 
+ void WebAuthFlow::DetachDelegateAndDelete() {
+@@ -281,6 +463,7 @@
+ #endif
+ 
+ bool WebAuthFlow::DisplayAuthPageInPopupWindow() {
++  if (native_admission_cancelled_ || IsNativeWebAuthAdmissionBlocked(profile_)) return false;
+   if (GetBrowserWindowCreationStatusForProfile(*profile_) !=
+       BrowserWindowInterface::CreationStatus::kOk) {
+     return false;
+--- a/cef/libcef/browser/request_context_impl.h
++++ b/cef/libcef/browser/request_context_impl.h
+@@ -69,6 +69,10 @@
+   // Verify that the browser context can be directly accessed (e.g. on the UI
+   // thread and initialized).
+   bool VerifyBrowserContext() const;
++
++  // Trusted private embedding ABI: never creates/initializes a context and
++  // returns null instead of triggering VerifyBrowserContext's DCHECK.
++  content::BrowserContext* GetInitializedBrowserContextForNativeAdmission();
+ 
+   // Returns the browser context object. Can only be called on the UI thread
+   // after the browser context has been initialized.
+--- a/cef/libcef/browser/request_context_impl.cc
++++ b/cef/libcef/browser/request_context_impl.cc
+@@ -3,6 +3,8 @@
+ // can be found in the LICENSE file.
+ 
+ #include "cef/libcef/browser/request_context_impl.h"
++#include "cef/libcef_dll/cpptoc/request_context_cpptoc.h"
++#include "chrome/browser/extensions/api/identity/web_auth_flow.h"
+ 
+ #include "base/atomic_sequence_num.h"
+ #include "base/logging.h"
+@@ -237,6 +239,12 @@
+   return profile;
+ }
+ 
++content::BrowserContext* CefRequestContextImpl::GetInitializedBrowserContextForNativeAdmission() {
++  if (!CEF_CURRENTLY_ON_UIT()) return nullptr;
++  auto* existing = browser_context();
++  return existing && existing->IsInitialized() ? existing->AsBrowserContext() : nullptr;
++}
++
+ bool CefRequestContextImpl::VerifyBrowserContext() const {
+   if (!CEF_CURRENTLY_ON_UIT()) {
+     DCHECK(false) << "called on invalid thread";
+@@ -1095,3 +1103,27 @@
+ CefBrowserContext* CefRequestContextImpl::browser_context() const {
+   return browser_context_;
+ }
++
++// Optional versioned private embedding ABI. The opaque request-context pointer
++// is borrowed, never dereferenced in Swift, and must be an existing CEF object.
++// Unlike a DevTools transport this remains callable after all WebContents close.
++extern "C" CEF_EXPORT int cef_zacro_auxiliary_admission_v1(
++    int operation, void* borrowed_context, uint64_t high, uint64_t low,
++    extensions::NativeWebAuthAdmissionState* output) {
++  if (!CEF_CURRENTLY_ON_UIT()) return -10;
++  Profile* profile = nullptr;
++  if (borrowed_context) {
++    auto* raw = static_cast<cef_request_context_0_t*>(borrowed_context);
++    if (!raw->base.base.add_ref) return -11;
++    raw->base.base.add_ref(&raw->base.base);
++    CefRefPtr<CefRequestContext> context = CefRequestContextCppToC_Unwrap(raw);
++    if (!context) return -11;
++    auto* impl = static_cast<CefRequestContextImpl*>(context.get());
++    auto* existing = impl->GetInitializedBrowserContextForNativeAdmission();
++    if (!existing) return -12;
++    profile = Profile::FromBrowserContext(existing);
++  }
++  return static_cast<int>(extensions::UpdateNativeWebAuthAdmission(
++      static_cast<extensions::NativeWebAuthAdmissionOperation>(operation),
++      profile, high, low, output));
++}
+--- a/chrome/browser/extensions/api/search/search_api.cc
++++ b/chrome/browser/extensions/api/search/search_api.cc
+@@ -8,6 +8,7 @@
+ #include "base/strings/stringprintf.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "chrome/browser/extensions/extension_tab_util.h"
++#include "chrome/browser/extensions/api/identity/web_auth_flow.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/search_engines/template_url_service_factory.h"
+ #include "chrome/browser/tab_list/tab_list_interface.h"
+@@ -90,6 +91,9 @@
+   }
+ 
+   Profile* profile = Profile::FromBrowserContext(browser_context());
++  if (IsNativeWebAuthAdmissionBlocked(profile)) {
++    return RespondNow(Error("The browser context is closing."));
++  }
+ 
+   // We need to find which tab to navigate, which may be a specific tab or a
+   // new tab.
+--- a/chrome/browser/extensions/api/runtime/chrome_runtime_api_delegate.cc
++++ b/chrome/browser/extensions/api/runtime/chrome_runtime_api_delegate.cc
+@@ -16,12 +16,15 @@
+ #include "base/location.h"
+ #include "base/metrics/histogram_macros.h"
+ #include "base/notimplemented.h"
++#include "base/no_destructor.h"
++#include "content/public/browser/browser_thread.h"
+ #include "base/task/single_thread_task_runner.h"
+ #include "base/time/tick_clock.h"
+ #include "base/time/time.h"
+ #include "build/build_config.h"
+ #include "build/chromeos_buildflags.h"
+ #include "chrome/browser/extensions/browser_window_util.h"
++#include "chrome/browser/extensions/api/identity/web_auth_flow.h"
+ #include "chrome/browser/extensions/extension_tab_util.h"
+ #include "chrome/browser/extensions/updater/extension_updater.h"
+ #include "chrome/browser/profiles/profile.h"
+@@ -65,6 +68,10 @@
+ #endif
+ 
+ namespace {
++ChromeRuntimeAPIDelegate::NativeUninstallURLHandler& NativeUninstallURLHandlerStorage() {
++  static base::NoDestructor<ChromeRuntimeAPIDelegate::NativeUninstallURLHandler> handler;
++  return *handler;
++}
+ 
+ using extensions::Extension;
+ using extensions::ExtensionSystem;
+@@ -280,8 +287,22 @@
+   return true;
+ }
+ 
++void ChromeRuntimeAPIDelegate::SetNativeUninstallURLHandler(
++    NativeUninstallURLHandler handler) {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  NativeUninstallURLHandlerStorage() = std::move(handler);
++}
++
+ void ChromeRuntimeAPIDelegate::OpenURL(const GURL& uninstall_url) {
+   Profile* profile = Profile::FromBrowserContext(browser_context_);
++  // This is a post-uninstall optional navigation, not a pending extension API
++  // invocation. Preserve the completed uninstall result without opening a new
++  // Browser during profile retirement or application shutdown.
++  if (extensions::IsNativeWebAuthAdmissionBlocked(profile)) return;
++  if (auto& handler = NativeUninstallURLHandlerStorage(); handler) {
++    handler.Run(browser_context_, uninstall_url);
++    return;
++  }
+ 
+   NavigateParams params(profile, uninstall_url,
+                         ui::PAGE_TRANSITION_CLIENT_REDIRECT);
+--- a/chrome/browser/extensions/api/runtime/chrome_runtime_api_delegate.h
++++ b/chrome/browser/extensions/api/runtime/chrome_runtime_api_delegate.h
+@@ -10,6 +10,7 @@
+ #include <utility>
+ 
+ #include "base/memory/raw_ptr.h"
++#include "base/functional/callback.h"
+ #include "base/scoped_observation.h"
+ #include "extensions/browser/api/runtime/runtime_api.h"
+ #include "extensions/browser/api/runtime/runtime_api_delegate.h"
+@@ -41,6 +42,12 @@
+   ChromeRuntimeAPIDelegate& operator=(const ChromeRuntimeAPIDelegate&) = delete;
+ 
+   ~ChromeRuntimeAPIDelegate() override;
++
++  // Private embedding producer, called after uninstall has already completed.
++  // This does not impersonate or revive the removed extension's API authority.
++  using NativeUninstallURLHandler =
++      base::RepeatingCallback<void(content::BrowserContext*, const GURL&)>;
++  static void SetNativeUninstallURLHandler(NativeUninstallURLHandler handler);
+ 
+   // Sets a custom TickClock to use in tests.
+   static void set_tick_clock_for_tests(const base::TickClock* clock);

@@ -2,6 +2,50 @@ import XCTest
 @testable import ZacroServices
 
 final class AIServiceTests: XCTestCase {
+  func testResearchFallbackRetainsOriginalQueryAndDistinguishesSearchFailure() async throws {
+    let subscription = FixtureSubscription()
+    let ai = NativeAIService(directory:try directory(), currentProfile:{ AIProfileScope(id:"personal") },
+      context:{ _ in [] }, secrets:MemorySecrets(), codex:subscription)
+    let query = "https://example.invalid/a?x=1 & café"
+    for failed in [false, true] {
+      await subscription.setAnswer(["answer":"Unverified answer", "historyContent":"Unverified answer",
+        "sources":[], "citations":[], "searchError":.bool(failed), "searchQuery":"Provider must not choose this"])
+      let result = try await ai.handle("ai:ask", payload:["question":.string(query)], conversationID:"window-a")
+      expectEqual(result["searchQuery"], .string(query))
+      expectEqual(result["warning"], .string(failed
+        ? "Web search did not finish successfully. This answer has no supporting sources."
+        : "No supporting web sources were returned. Treat this answer as unverified."))
+      expectEqual(result["mode"], "research")
+      expectFalse(result.contains("searchError"))
+    }
+    await ai.close()
+  }
+  func testOrdinarySearchFallbackIsAbsentForSourcedResearchAndPageAnswers() async throws {
+    let subscription = FixtureSubscription()
+    let ai = NativeAIService(directory:try directory(), currentProfile:{ AIProfileScope(id:"personal") },
+      context:{ grants in grants.map { AIPageExtract(id:$0.id,url:$0.url,title:"Evidence",text:"Actual page text") } },
+      secrets:MemorySecrets(), codex:subscription)
+    await subscription.setAnswer(["answer":"Supported answer", "historyContent":"Supported answer",
+      "sources":[["title":"Evidence", "url":"https://example.com/evidence"]], "citations":[], "searchError":true,
+      "searchQuery":"Untrusted injected query", "searchUrl":"https://example.invalid/provider-destination"])
+    let sourced = try await ai.handle("ai:ask", payload:["question":"Research"], conversationID:"window-a")
+    expectFalse(sourced.contains("searchQuery")); expectFalse(sourced.contains("searchUrl")); expectFalse(sourced.contains("warning"))
+    await subscription.setAnswer(["answer":"Page evidence [1:1]", "historyContent":"Page evidence [1:1]",
+      "sources":[], "citations":[], "searchError":true])
+    let page = try await ai.handle("ai:ask", payload:["question":"Read page", "tabIds":["page"],
+      "contextTabs":[["id":"page","url":"https://example.com/page"]]], conversationID:"window-b")
+    expectEqual(page["mode"], "pages"); expectFalse(page.contains("searchQuery"))
+    await ai.close()
+  }
+  func testGeneralChatNeverOffersOrdinaryResearchFallback() async throws {
+    let transport = FixtureTransport(["choices":[["message":["content":"General knowledge"],"finish_reason":"stop"]]])
+    let ai = NativeAIService(directory:try directory(), currentProfile:{ AIProfileScope(id:"personal") },
+      context:{ _ in [] }, transport:transport, secrets:MemorySecrets(), codex:FixtureSubscription())
+    _ = try await ai.handle("ai:configure", payload:["provider":"compatible", "baseUrl":"http://127.0.0.1:1/v1", "model":"fixture"])
+    let answer = try await ai.handle("ai:ask", payload:["question":"A general question"], conversationID:"window-a")
+    expectEqual(answer["mode"], "general"); expectFalse(answer.contains("searchQuery"))
+    await ai.close()
+  }
   func testSavedSessionOnlySubscriptionPolicyPrecedesEveryOperationAfterRestart() async throws {
     let root = try directory(), firstConnection = FixtureSubscription(), secrets = MemorySecrets()
     let first = NativeAIService(directory: root, currentProfile: { AIProfileScope(id: "personal") },

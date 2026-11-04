@@ -27,6 +27,10 @@ final class BrowserClient {
     weak var chromeOwner: CefChromeBrowser?
     var popupClientFactory: ((Int32, CefWindowOpenRequest) -> BrowserClient?)?
     var popupAborted: ((Int32) -> Void)?
+    /// Native ExtensionHost children have a real CEF browser before a view.
+    /// Keep the pending wrapper weak, so an aborted creation cannot form a
+    /// Browser -> Client -> pending Browser retain cycle.
+    var adoptCreatedNativePopup = false
 
     // Buffered early state (pre-attach).
     private var pendingTitle: String?
@@ -109,6 +113,7 @@ final class BrowserClient {
     /// reference owned by the caller (transferred to CEF at browser
     /// creation).
     func makeClient() -> UnsafeMutablePointer<cef_client_t> {
+        CefExtensionHostNavigation.installIfAvailable()
         let lifeSpan = cefAllocate(cef_life_span_handler_t.self, owner: self)
         lifeSpan.pointee.on_after_created = { handlerSelf, browser in
             // For windowed browsers the wrapper already owns the raw browser
@@ -126,6 +131,12 @@ final class BrowserClient {
                         pending.adoptRaw(browser)
                     }
                     client.pendingOSRBrowser = nil
+                } else if client.adoptCreatedNativePopup, let pending = client.browser {
+                    client.adoptCreatedNativePopup = false
+                    if !pending.hasRawBrowser {
+                        cefAddRef(UnsafeMutableRawPointer(browser))
+                        pending.adoptRaw(browser)
+                    }
                 }
             }
             cefRelease(UnsafeMutableRawPointer(browser))

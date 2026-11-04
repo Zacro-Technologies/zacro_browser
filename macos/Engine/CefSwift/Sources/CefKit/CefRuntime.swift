@@ -137,6 +137,12 @@ public final class CefRuntime {
     private var scheduledTerminationAttemptID: UUID?
     private var isPreparingTermination = false
     private var terminationAttemptID: UUID?
+    public var onAuxiliaryAdmissionFailure: ((Error) -> Void)?
+    private var auxiliaryAdmission: CefAuxiliaryAdmissionLease?
+    private var auxiliaryDrainTask: Task<Void, Never>?
+    private var auxiliaryDrainAttemptID: UUID?
+    private var auxiliaryAdmissionFailureAttemptID: UUID?
+    private var auxiliaryFinalCleanupStarted = false
     private var finalTerminationAttemptID: UUID?
     private var finalTerminationCompletion: (attempt: UUID, run: () -> Void)?
 
@@ -254,16 +260,29 @@ public final class CefRuntime {
         }
     }
 
-    /// Shuts CEF down and unloads the framework. All browsers must already
-    /// be closed. Call once, at process exit.
+    /// Shuts CEF down and unloads the framework. All browsers and pending
+    /// authorization operations must already be drained. Call once, at exit.
     public func shutdown() {
         guard isInitialized else { return }
         precondition(browsers.isEmpty && !CefChromeBrowser.hasLiveWindows && !hasLiveAuxiliaryWindows,
                      "Close all Chromium browsers and windows before shutdown")
+        if CefAuxiliaryAdmissionLease.isSupported {
+            do {
+                // Direct SDK shutdown cannot bypass the pre-Browser auth
+                // barrier. Acquire synchronously and keep it through shutdown.
+                if auxiliaryAdmission == nil { auxiliaryAdmission = try CefAuxiliaryAdmissionLease.acquireProcess() }
+                guard let lease = auxiliaryAdmission, try lease.status().isQuiescent else {
+                    preconditionFailure("Drain native authorization operations before shutdown")
+                }
+            } catch {
+                preconditionFailure("Native authorization cleanup is unavailable: \(error.localizedDescription)")
+            }
+        }
         messagePump?.stop()
         messagePump = nil
         CEFApplication.setTerminateHandler(nil)
         onReadyToTerminate = nil
+        auxiliaryFinalCleanupStarted = false
         onTerminationChanged = nil
         beforeClosingDocuments = nil
         terminationAttemptID = nil
@@ -272,7 +291,13 @@ public final class CefRuntime {
         scheduledTerminationAttemptID = nil
         isPreparingTermination = false
         isTerminationRequested = false
+        // Keep admission closed through native shutdown. The optional export
+        // must never be called after unloading its framework.
+        auxiliaryDrainTask?.cancel(); auxiliaryDrainTask = nil
+        auxiliaryDrainAttemptID = nil
         cef_shutdown()
+        auxiliaryAdmission = nil
+        onAuxiliaryAdmissionFailure = nil
         ccef_unload_framework()
         appContext = nil
         settings = nil
@@ -587,6 +612,7 @@ public final class CefRuntime {
         guard isTerminationRequested, !isPreparingTermination, let attempt = terminationAttemptID,
               browsers.isEmpty, !CefChromeBrowser.hasLiveWindows, !hasLiveAuxiliaryWindows,
               scheduledTerminationAttemptID == nil else { return }
+        guard auxiliaryAdmissionIsQuiescent(attempt: attempt) else { return }
         // on_before_close is still on CEF's message-loop stack. Calling
         // cef_shutdown synchronously here destroys objects that the enclosing
         // close callback still needs. Let that callback and work slice return
@@ -600,6 +626,7 @@ public final class CefRuntime {
             guard isInitialized, isTerminationRequested, !isPreparingTermination,
                   terminationAttemptID == attempt, browsers.isEmpty,
                   !CefChromeBrowser.hasLiveWindows, !hasLiveAuxiliaryWindows else { return }
+            guard auxiliaryAdmissionIsQuiescent(attempt: attempt) else { return }
             if let final = finalTerminationCompletion, final.attempt == attempt {
                 finalTerminationCompletion = nil
                 // This final check and the event-loop stop are synchronous on
@@ -608,6 +635,7 @@ public final class CefRuntime {
             } else if finalTerminationAttemptID == attempt {
                 return // The exact final completion already ran.
             } else if let onReadyToTerminate {
+                auxiliaryFinalCleanupStarted = true
                 onReadyToTerminate()
             } else {
                 shutdown()
@@ -639,9 +667,124 @@ public final class CefRuntime {
 
     /// Called from CEFApplication's terminate:. Returns true when the app
     /// may terminate immediately.
+    private func auxiliaryAdmissionIsQuiescent(attempt: UUID) -> Bool {
+        guard let lease = auxiliaryAdmission else { return true }
+        // A broken native lease cannot be repaired by repeatedly scheduling
+        // termination. Keep the context and report once for this attempt.
+        guard auxiliaryAdmissionFailureAttemptID != attempt else { return false }
+        do {
+            if try lease.status().isQuiescent { return true }
+        } catch {
+            reportAuxiliaryAdmissionFailure(error, attempt: attempt)
+            return false
+        }
+        guard auxiliaryDrainAttemptID != attempt else { return false }
+        auxiliaryDrainAttemptID = attempt
+        auxiliaryDrainTask = Task { @MainActor [weak self] in
+            do {
+                try await lease.waitForQuiescence()
+                guard let self, self.terminationAttemptID == attempt,
+                      self.auxiliaryDrainAttemptID == attempt,
+                      self.isTerminationRequested else { return }
+                self.auxiliaryDrainTask = nil
+                self.auxiliaryDrainAttemptID = nil
+                self.scheduleTerminationIfReady()
+            } catch is CancellationError {
+                // Only the matching attempt owns its task/lease. Cancellation
+                // clears fields synchronously before a replacement can start.
+            } catch {
+                guard let self, self.terminationAttemptID == attempt,
+                      self.auxiliaryDrainAttemptID == attempt else { return }
+                self.auxiliaryDrainTask = nil
+                self.auxiliaryDrainAttemptID = nil
+                self.reportAuxiliaryAdmissionFailure(error, attempt: attempt)
+            }
+        }
+        return false
+    }
+
+    private func reportAuxiliaryAdmissionFailure(_ error: Error, attempt: UUID) {
+        guard terminationAttemptID == attempt,
+              auxiliaryAdmissionFailureAttemptID != attempt else { return }
+        auxiliaryAdmissionFailureAttemptID = attempt
+        onAuxiliaryAdmissionFailure?(error)
+    }
+
+    @discardableResult
+    private func releaseAuxiliaryAdmissionForCancelledAttempt(attempt: UUID) -> Bool {
+        guard terminationAttemptID == attempt else { return false }
+        auxiliaryDrainAttemptID = nil
+        let pending = auxiliaryDrainTask; auxiliaryDrainTask = nil
+        pending?.cancel()
+        do { try auxiliaryAdmission?.release() }
+        catch {
+            // A native fence which could not be released still owns the Quit
+            // attempt. Do not publish a usable cancellation with admission shut.
+            reportAuxiliaryAdmissionFailure(error, attempt: attempt)
+            return false
+        }
+        auxiliaryAdmission = nil
+        auxiliaryAdmissionFailureAttemptID = nil
+        return true
+    }
+
+    /// Opaque authority to act on one failed Quit attempt. A delayed sheet
+    /// cannot cancel or retry a replacement attempt.
+    public struct AuxiliaryTerminationFailure {
+        fileprivate let attempt: UUID
+        public let canCancelQuit: Bool
+    }
+
+    public var auxiliaryTerminationFailure: AuxiliaryTerminationFailure? {
+        guard isInitialized, isTerminationRequested, let attempt = terminationAttemptID,
+              auxiliaryAdmissionFailureAttemptID == attempt else { return nil }
+        return AuxiliaryTerminationFailure(attempt: attempt,
+            canCancelQuit: !auxiliaryFinalCleanupStarted)
+    }
+
+    @discardableResult
+    public func retryAuxiliaryTermination(_ failure: AuxiliaryTerminationFailure) -> Bool {
+        guard isInitialized, isTerminationRequested,
+              terminationAttemptID == failure.attempt,
+              auxiliaryAdmissionFailureAttemptID == failure.attempt else { return false }
+        // Only this explicit host action clears the error latch. A scheduler
+        // callback cannot create a repeated alert or spin on a failing ABI.
+        auxiliaryAdmissionFailureAttemptID = nil
+        _ = handleTerminationRequest()
+        return true
+    }
+
+    @discardableResult
+    public func cancelAuxiliaryTermination(_ failure: AuxiliaryTerminationFailure) throws -> Bool {
+        guard isInitialized, isTerminationRequested, !auxiliaryFinalCleanupStarted,
+              failure.canCancelQuit, terminationAttemptID == failure.attempt,
+              auxiliaryAdmissionFailureAttemptID == failure.attempt else { return false }
+        // Release must succeed before cancellation is published. On failure,
+        // retain both the lease and the original failed-attempt authority.
+        try auxiliaryAdmission?.release()
+        auxiliaryAdmission = nil
+        auxiliaryAdmissionFailureAttemptID = nil
+        auxiliaryDrainAttemptID = nil
+        let pending = auxiliaryDrainTask; auxiliaryDrainTask = nil
+        pending?.cancel()
+        terminationAttemptID = nil
+        finalTerminationAttemptID = nil
+        finalTerminationCompletion = nil
+        scheduledTerminationAttemptID = nil
+        isPreparingTermination = false
+        isTerminationRequested = false
+        onTerminationChanged?(false)
+        return true
+    }
+
     func handleTerminationRequest() -> Bool {
         guard isInitialized else { return true }
         if !isTerminationRequested {
+            // Synchronous native admission precedes every async preparation.
+            // This authority outlives the last browser/DevTools transport.
+            do {
+                if auxiliaryAdmission == nil { auxiliaryAdmission = try CefAuxiliaryAdmissionLease.acquireProcess() }
+            } catch { onAuxiliaryAdmissionFailure?(error); return false }
             let attempt = UUID()
             let prepare = beforeClosingDocuments
             terminationAttemptID = attempt
@@ -664,6 +807,7 @@ public final class CefRuntime {
                     self.isPreparingTermination = false
                     if accepted { _ = self.handleTerminationRequest() }
                     else {
+                        guard self.releaseAuxiliaryAdmissionForCancelledAttempt(attempt: attempt) else { return }
                         self.terminationAttemptID = nil
                         self.isTerminationRequested = false
                         self.onTerminationChanged?(false)
@@ -687,7 +831,8 @@ public final class CefRuntime {
 
     func cancelTerminationRequest(for browser: CefBrowser) {
         browser.closingForTermination = false
-        guard isTerminationRequested else { return }
+        guard isTerminationRequested, let attempt = terminationAttemptID else { return }
+        guard releaseAuxiliaryAdmissionForCancelledAttempt(attempt: attempt) else { return }
         terminationAttemptID = nil
         finalTerminationAttemptID = nil
         finalTerminationCompletion = nil

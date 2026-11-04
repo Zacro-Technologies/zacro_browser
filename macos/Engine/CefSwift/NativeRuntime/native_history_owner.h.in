@@ -1,0 +1,106 @@
+// Staged native owner seam. Included by Chrome/CEF, never exposed to renderers.
+#ifndef CHROME_BROWSER_HISTORY_NATIVE_HISTORY_OWNER_H_
+#define CHROME_BROWSER_HISTORY_NATIVE_HISTORY_OWNER_H_
+
+#include <optional>
+#include <string>
+
+#include "base/functional/callback.h"
+#include "base/memory/raw_ptr.h"
+#include "base/memory/weak_ptr.h"
+#include "components/history/core/browser/history_types.h"
+#include "content/public/browser/global_routing_id.h"
+#include "content/public/browser/weak_document_ptr.h"
+#include "content/public/browser/web_contents_observer.h"
+#include "content/public/browser/web_contents_user_data.h"
+
+namespace content { class NavigationHandle; class BrowserContext; class RenderFrameHost; }
+
+// The token belongs to one actual WebContents, including its normal navigations
+// and transfers. It is not an authorizing property of a portable Core tab.
+class NativeHistoryOwner final
+    : public content::WebContentsObserver,
+      public content::WebContentsUserData<NativeHistoryOwner> {
+ public:
+  using Authority = base::RepeatingCallback<bool(
+      content::WebContents*, const std::string&, int)>;
+  using Closed = base::RepeatingCallback<void(content::BrowserContext*, const std::string&)>;
+  struct Snapshot {
+    std::string document_token;
+    std::string logical_id;
+    int owner_window_id = 0;
+    bool preview = false;
+    bool provisional = false;
+    std::string current_event_id;
+  };
+  struct Publication {
+    std::string lease_id;
+    Snapshot captured;
+  };
+
+  // Install from ZacroBrowserContext::InstallHooks. The callback must capture
+  // no profile/contents and use Find, never Get/create a context for a stranger.
+  static void InstallProvider(Authority authority, Closed closed);
+  static bool RegisterOwned(content::WebContents*, const std::string& logical_id,
+                            int owner_window_id, bool preview);
+  // Exact CEF OnPopupWebContentsCreated hook, before CreateBrowserHostForPopup.
+  static bool RegisterProvisionalPopup(content::WebContents* source,
+      const content::GlobalRenderFrameHostId& opener,
+      content::WebContents* created);
+  // Only the installed ExtensionHost/native-window broker calls this separate
+  // path after validating its real RFH, extension object and logical owner.
+  // An ExtensionHost never gains the ordinary registered Core-source authority.
+  static bool RegisterProvisionalExtensionPopup(content::RenderFrameHost* source,
+      int native_owner_window_id, content::WebContents* created);
+  static const std::string& ProducerEpoch();
+  // Exact live native event metadata, never a URL-based title association.
+  static std::optional<std::string> TitleForEvent(content::BrowserContext*,
+      const std::string& event_id, const std::string& url);
+
+  ~NativeHistoryOwner() override;
+  std::optional<Snapshot> Describe() const;
+  // Executes on UI before any async DB task. Subsequent commits are retained
+  // unpublished while PrepareNativeMirrorPublication is queued/running.
+  std::optional<Publication> BeginPublication(const std::string& request_id,
+      const std::string& expected_token, const std::string& expected_logical_id,
+      int expected_owner_window_id);
+  // Called only after the matching checked DB commit. A stale task cannot alter
+  // a replacement lease. Already-durable Core receipts also replay without a
+  // live owner; this method merely updates a surviving producer's next events.
+  bool PublicationCommitted(const Publication&, const std::string& logical_id);
+  bool PublicationCancelled(const Publication&);
+  // Before native DB finalization, after Core receipt+recovery-copy ack, or
+  // after a cancellation is durable. Does not grant publication on its own.
+  bool FinishPublication(const Publication&);
+  base::WeakPtr<NativeHistoryOwner> GetWeakPtr();
+
+ private:
+  friend class content::WebContentsUserData<NativeHistoryOwner>;
+  explicit NativeHistoryOwner(content::WebContents*);
+  static std::optional<history::NativeHistoryDocument> Produce(
+      content::WebContents*, content::NavigationHandle*);
+  bool IsLivePublic() const;
+  bool HasRegisteredAuthority() const;
+  bool Matches(const Publication&) const;
+  void WebContentsDestroyed() override;
+
+  const std::string token_;
+  raw_ptr<content::BrowserContext> context_;
+  std::string logical_id_;
+  int owner_window_id_ = 0;
+  bool registered_ = false;
+  bool preview_ = false;
+  bool provisional_ = false;
+  bool published_ = false;
+  bool destroyed_ = false;
+  std::optional<Publication> publication_;
+  enum class Disposition { kPrepared, kCommitted, kCancelled };
+  Disposition disposition_ = Disposition::kPrepared;
+  content::WeakDocumentPtr current_document_;
+  int64_t current_navigation_id_ = 0;
+  std::string current_event_id_;
+  base::WeakPtrFactory<NativeHistoryOwner> weak_factory_{this};
+  WEB_CONTENTS_USER_DATA_KEY_DECL();
+};
+
+#endif  // CHROME_BROWSER_HISTORY_NATIVE_HISTORY_OWNER_H_

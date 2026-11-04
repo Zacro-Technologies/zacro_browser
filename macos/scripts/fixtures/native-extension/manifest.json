@@ -17,6 +17,7 @@
     "sessions",
     "downloads",
     "identity",
+    "search",
     "nativeMessaging",
     "declarativeNetRequestWithHostAccess",
     "webRequest"

@@ -32,9 +32,10 @@ enum NativeCommandInterfaceAcceptance {
       == "custom action Custom category"
     result.merge(shortcutChecks()) { _, new in new }
     result.merge(NativeCommandSearchAcceptance.check()) { _, new in new }
+    result.merge(NativeSidebarSplitAcceptance.check()) { _, new in new }
 
     let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 304, height: 240),
-      styleMask: [.borderless], backing: .buffered, defer: false)
+      styleMask: [.titled], backing: .buffered, defer: false)
     window.isReleasedWhenClosed = false
     defer { window.close() }
     var actions = SiteControlActions()
@@ -72,6 +73,7 @@ enum NativeCommandInterfaceAcceptance {
     result["siteControlsViewportClampsShortAndChangedOwnerBounds"] = NativeSiteControlsLayout.height(content: 900, maximum: 240) == 240
       && NativeSiteControlsLayout.height(content: 900, maximum: 380) == 380
       && NativeSiteControlsLayout.height(content: 310, maximum: 700) == 310
+    result.merge(await NativeControlFocusAcceptance.check(in: window), uniquingKeysWith: { _, new in new })
     return result
   }
 

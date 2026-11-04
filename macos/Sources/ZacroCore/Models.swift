@@ -389,6 +389,12 @@ public struct BrowserState: Codable, Equatable, Sendable {
   // Browser-owned deletion authority. Collection import/export and sync must
   // never author this metadata; only the durable profile deletion transaction.
   var pendingNativeProfileRetirements: [String] = []
+  var nativeHistoryPublicationReceipts: [String: NativeHistoryPublicationReceipt] = [:]
+  var nativeHistoryBindings: [String: NativeHistoryBinding] = [:]
+  var nativeHistoryVisitReceipts: [String: NativeHistoryVisitReceipt] = [:]
+  var nativeHistoryLegacyImportReceipts: [String: NativeHistoryLegacyReceipt] = [:]
+  var nativeHistoryLegacyBoundaries: [String: NativeHistoryLegacyBoundaryReceipt] = [:]
+  var pendingNativeHistoryAcknowledgements: [String: NativeHistoryAcknowledgement] = [:]
   public var archive: [ArchivedTab] = []
   public var downloads: [DownloadRecord] = []
   public var permissions: [WebsitePermission] = []
@@ -407,7 +413,7 @@ public struct BrowserState: Codable, Equatable, Sendable {
     activeSpaceID = "home"
   }
   private enum CodingKeys: String, CodingKey {
-    case version, profiles, spaces, tabs, folders, splits, tabGroups, history, bookmarks, bookmarkImportAcknowledgements, pendingNativeProfileRetirements, archive, downloads,
+    case version, profiles, spaces, tabs, folders, splits, tabGroups, history, bookmarks, bookmarkImportAcknowledgements, pendingNativeProfileRetirements, nativeHistoryPublicationReceipts, nativeHistoryBindings, nativeHistoryVisitReceipts, nativeHistoryLegacyImportReceipts, nativeHistoryLegacyBoundaries, pendingNativeHistoryAcknowledgements, archive, downloads,
       permissions, settings, windowBounds, windowSessions, focusedWindowID, activeSpaceID, activeTabID
   }
   public init(from decoder: Decoder) throws {
@@ -430,6 +436,15 @@ public struct BrowserState: Codable, Equatable, Sendable {
         debugDescription: "Invalid native profile retirement receipts")
     }
     pendingNativeProfileRetirements = Array(Set(retirements)).sorted()
+    nativeHistoryPublicationReceipts = try c.decodeIfPresent([String: NativeHistoryPublicationReceipt].self, forKey: .nativeHistoryPublicationReceipts) ?? [:]
+    nativeHistoryVisitReceipts = try c.decodeIfPresent([String: NativeHistoryVisitReceipt].self, forKey: .nativeHistoryVisitReceipts) ?? [:]
+    nativeHistoryLegacyImportReceipts = try c.decodeIfPresent([String: NativeHistoryLegacyReceipt].self, forKey: .nativeHistoryLegacyImportReceipts) ?? [:]
+    nativeHistoryLegacyBoundaries = try c.decodeIfPresent([String: NativeHistoryLegacyBoundaryReceipt].self, forKey: .nativeHistoryLegacyBoundaries) ?? [:]
+    nativeHistoryBindings = try c.decodeIfPresent([String: NativeHistoryBinding].self, forKey: .nativeHistoryBindings) ?? [:]
+    pendingNativeHistoryAcknowledgements = try c.decodeIfPresent([String: NativeHistoryAcknowledgement].self, forKey: .pendingNativeHistoryAcknowledgements) ?? [:]
+    guard nativeHistoryPublicationReceipts.count <= 1_000, nativeHistoryPublicationReceipts.values.allSatisfy(\.isValid), nativeHistoryBindings.count <= 20_000, nativeHistoryVisitReceipts.count <= 20_000, nativeHistoryLegacyImportReceipts.count <= 20_000, nativeHistoryLegacyImportReceipts.values.allSatisfy(\.isValid), nativeHistoryLegacyBoundaries.count <= 20_000, nativeHistoryLegacyBoundaries.values.allSatisfy(\.isValid), pendingNativeHistoryAcknowledgements.count <= 1_000 else {
+      throw DecodingError.dataCorruptedError(forKey: .nativeHistoryBindings, in: c, debugDescription: "Native history metadata exceeds its bounds")
+    }
     archive = try c.decodeIfPresent([ArchivedTab].self, forKey: .archive) ?? []
     downloads = try c.decodeIfPresent([DownloadRecord].self, forKey: .downloads) ?? []
     permissions = try c.decodeIfPresent([WebsitePermission].self, forKey: .permissions) ?? []

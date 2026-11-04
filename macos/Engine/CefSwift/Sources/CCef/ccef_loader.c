@@ -24,6 +24,11 @@ static struct {
 #undef CCEF_SYM_VOID
 } g_ptrs;
 
+typedef int (*ccef_auxiliary_admission_fn)(int, void*, uint64_t, uint64_t,
+    ccef_auxiliary_admission_state_t*);
+static ccef_auxiliary_admission_fn g_auxiliary_admission = NULL;
+typedef int (*ccef_extension_host_navigation_fn)(const ccef_extension_host_navigation_callbacks_t*);
+static ccef_extension_host_navigation_fn g_extension_host_navigation = NULL;
 static void* g_handle = NULL;
 static char g_error[1024];
 
@@ -75,6 +80,9 @@ int ccef_load_framework(const char* framework_binary_path) {
 #undef CCEF_RESOLVE
 
   g_handle = handle;
+  // Optional private, versioned export; stock CEF's required ABI is unchanged.
+  *(void**)(&g_auxiliary_admission) = dlsym(handle, "cef_zacro_auxiliary_admission_v1");
+  *(void**)(&g_extension_host_navigation) = dlsym(handle, "cef_zacro_extension_host_navigation_v1");
   return 1;
 }
 
@@ -82,6 +90,8 @@ void ccef_unload_framework(void) {
   if (!g_handle) {
     return;
   }
+  g_auxiliary_admission = NULL;
+  g_extension_host_navigation = NULL;
   dlclose(g_handle);
   g_handle = NULL;
   memset(&g_ptrs, 0, sizeof(g_ptrs));
@@ -121,3 +131,13 @@ void ccef_unload_framework(void) {
 #undef CCEF_SYM
 #undef CCEF_SYM_VOID
 #undef CCEF_REQUIRE
+
+int ccef_auxiliary_admission_available(void) { return g_auxiliary_admission != NULL; }
+int ccef_extension_host_navigation_available(void) { return g_extension_host_navigation != NULL; }
+int ccef_extension_host_navigation_install(const ccef_extension_host_navigation_callbacks_t* callbacks) {
+  return g_extension_host_navigation ? g_extension_host_navigation(callbacks) : 0;
+}
+int ccef_auxiliary_admission(int op, void* context, uint64_t high, uint64_t low,
+                            ccef_auxiliary_admission_state_t* result) {
+  return g_auxiliary_admission ? g_auxiliary_admission(op, context, high, low, result) : 0;
+}

@@ -35,7 +35,22 @@ def generated(originals):
 #endif
   raw_ptr<BrowserWindowInterface> browser_;""")
     result[POPUP_CC] = replace(result[POPUP_CC], '#include "base/message_loop/message_pump_apple.h"',
-                              '#include "base/message_loop/message_pump_apple.h"\n#include "chrome/browser/ui/views/extensions/native_extension_popup_anchor.h"')
+                              '#include "base/message_loop/message_pump_apple.h"\n#include "base/command_line.h"\n#include "base/logging.h"\n#include "chrome/browser/ui/views/extensions/native_extension_popup_anchor.h"')
+    result[POPUP_CC] = replace(result[POPUP_CC], """void ExtensionPopup::CloseDeferredIfNecessary(
+    views::Widget::ClosedReason reason) {
+""", """void ExtensionPopup::CloseDeferredIfNecessary(
+    views::Widget::ClosedReason reason) {
+#if BUILDFLAG(IS_MAC)
+  const auto* command = base::CommandLine::ForCurrentProcess();
+  if (native_anchor_ && command->HasSwitch("engine-acceptance") &&
+      command->HasSwitch("native-integration-acceptance")) {
+    LOG(ERROR) << "Native action popup Chrome close reason=" << static_cast<int>(reason)
+               << " visible=" << GetWidget()->IsVisible()
+               << " has_host=" << static_cast<bool>(host_)
+               << " browser_deleting=" << (!browser_ || browser_->IsDeleteScheduled());
+  }
+#endif
+""")
     result[POPUP_CC] = replace(result[POPUP_CC], """  auto* popup = new ExtensionPopup(browser, std::move(host), anchor, arrow,
 """, """#if BUILDFLAG(IS_MAC)
   auto native_anchor = NativeExtensionPopupAnchor::Take(
@@ -98,6 +113,38 @@ def generated(originals):
     toolbar_target = replace(toolbar_target, '    ":extension_action_delegate_desktop",',
                              '    ":extension_action_delegate_desktop",\n    ":extension_popup",')
     result[BUILD] = result[BUILD][:toolbar_start] + toolbar_target + result[BUILD][toolbar_end:]
+    result[POPUP_H] = replace(result[POPUP_H], '#include "base/functional/callback.h"',
+        '#include "base/callback_list.h"\n#include "base/functional/callback.h"')
+    result[POPUP_H] = replace(result[POPUP_H], "  std::unique_ptr<NativeExtensionPopupAnchor> native_anchor_;", """  void OnNativeBrowserDidClose(BrowserWindowInterface* browser);
+  std::unique_ptr<NativeExtensionPopupAnchor> native_anchor_;
+  base::CallbackListSubscription native_browser_close_subscription_;""")
+    result[POPUP_CC] = replace(result[POPUP_CC], """  if (popup->native_anchor_) {
+    popup->native_anchor_->Attach""", """  if (popup->native_anchor_) {
+    // RegisterBrowserDidClose does not replay an already accepted close.
+    if (browser->IsDeleteScheduled()) {
+      popup->OnNativeBrowserDidClose(browser);
+      return;
+    }
+    popup->native_browser_close_subscription_ = browser->RegisterBrowserDidClose(
+        base::BindRepeating(&ExtensionPopup::OnNativeBrowserDidClose,
+                            base::Unretained(popup)));
+    popup->native_anchor_->Attach""")
+    result[POPUP_CC] = replace(result[POPUP_CC], """void ExtensionPopup::OnWidgetDestroying(views::Widget* widget) {
+  BubbleDialogDelegateView::OnWidgetDestroying(widget);""", """void ExtensionPopup::OnWidgetDestroying(views::Widget* widget) {
+#if BUILDFLAG(IS_MAC)
+  native_browser_close_subscription_ = {};
+#endif
+  BubbleDialogDelegateView::OnWidgetDestroying(widget);""")
+    result[POPUP_CC] = replace(result[POPUP_CC], """  if (!GetWidget()->IsVisible()) {
+    return;
+  }""", """  if (!browser_ || !host_ || !GetWidget()->IsVisible()) {
+    return;
+  }""")
+    result[POPUP_CC] = replace(result[POPUP_CC], "void ExtensionPopup::ShowBubble() {", """void ExtensionPopup::ShowBubble() {
+  if (!browser_ || !host_) {
+    return;
+  }""")
+    result[POPUP_CC] = replace(result[POPUP_CC], 'void ExtensionPopup::HandleCloseExtensionHost(', "#if BUILDFLAG(IS_MAC)\nvoid ExtensionPopup::OnNativeBrowserDidClose(BrowserWindowInterface* browser) {\n  if (!native_anchor_ || browser_ != browser) {\n    return;\n  }\n\n  // This callback runs only after close has been accepted, before Browser is\n  // deleted. The native shell anchor is outside its Widget tree, so deferred\n  // bubble destruction alone cannot bound ExtensionViewHost's Browser delegate.\n  native_browser_close_subscription_ = {};\n  deferred_close_weak_ptr_factory_.InvalidateWeakPtrs();\n  auto weak_this = deferred_close_weak_ptr_factory_.GetWeakPtr();\n  Observe(nullptr);\n  anchor_widget_observation_.Reset();\n  extension_registry_observation_.Reset();\n  security_dialog_tracker_observation_.Reset();\n  withheld_from_view_.reset();\n  browser_->GetTabStripModel()->RemoveObserver(this);\n  browser_ = nullptr;\n  auto shown_callback = std::move(shown_callback_);\n\n  // Match OnExtensionUnloaded: destroy the view first so it cannot message the\n  // host while the macOS Widget closes asynchronously. Host destruction also\n  // notifies the original action delegate while its Browser is still alive.\n  if (extension_view_) {\n    RemoveChildViewT(extension_view_.ExtractAsDangling());\n  }\n  if (weak_this) {\n    weak_this->host_.reset();\n  }\n  if (weak_this) {\n    weak_this->CloseDeferredIfNecessary();\n  }\n  // A popup that never finished loading still completes exactly once. The\n  // callback is external and may destroy the popup; do not access this after it.\n  if (shown_callback) {\n    std::move(shown_callback).Run(nullptr);\n  }\n}\n#endif\n\n" + 'void ExtensionPopup::HandleCloseExtensionHost(')
     return result
 
 

@@ -1,0 +1,12 @@
+#ifndef CEF_LIBCEF_BROWSER_DEVTOOLS_ZACRO_EXTENSION_HOST_CLIENT_BRIDGE_H_
+#define CEF_LIBCEF_BROWSER_DEVTOOLS_ZACRO_EXTENSION_HOST_CLIENT_BRIDGE_H_
+#include "cef/include/cef_client.h"
+// Keep version-selected CEF wrapper instantiation in its official translation
+// unit, beside the original wrapper-type specialization. No duplicate wrapper
+// definition or warning suppression is needed by native browser producers.
+// Wrap consumes a transferred +1. Unwrap returns a transferred +1, released
+// with Release after a borrowed callback has returned.
+CefRefPtr<CefClient> ZacroWrapExtensionHostClient(void* transferred);
+void* ZacroUnwrapExtensionHostClient(CefRefPtr<CefClient> client);
+void ZacroReleaseExtensionHostClient(void* transferred);
+#endif

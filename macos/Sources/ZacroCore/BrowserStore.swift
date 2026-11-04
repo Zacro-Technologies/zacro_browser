@@ -1147,6 +1147,7 @@ public final class BrowserStore: ObservableObject {
     }
     BrowserWindowState.normalize(&state)
     BrowserTabGroupState.normalize(&state)
+    Self.normalizeNativeHistoryMetadata(&state)
   }
   private func boundedText(_ value: String, limit: Int, fallback: String = "") -> String {
     let clean = String(value.trimmingCharacters(in: .whitespacesAndNewlines).prefix(limit))

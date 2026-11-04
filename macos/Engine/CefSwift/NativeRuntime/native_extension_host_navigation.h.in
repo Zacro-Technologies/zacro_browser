@@ -1,0 +1,17 @@
+#ifndef CEF_LIBCEF_BROWSER_DEVTOOLS_ZACRO_EXTENSION_HOST_NAVIGATION_H_
+#define CEF_LIBCEF_BROWSER_DEVTOOLS_ZACRO_EXTENSION_HOST_NAVIGATION_H_
+#include <optional>
+#include <string>
+#include "base/functional/callback.h"
+#include "cef/include/cef_base.h"
+class CefBrowserHostBase;
+namespace content { class RenderFrameHost; }
+struct ZacroExtensionHostOwner {
+  CefRefPtr<CefBrowserHostBase> browser;
+  int logical_window_id = 0;
+  std::string extension_id;
+};
+using ZacroExtensionHostOwnerResolver = base::RepeatingCallback<
+    std::optional<ZacroExtensionHostOwner>(content::RenderFrameHost*)>;
+void ZacroInstallExtensionHostNavigation(ZacroExtensionHostOwnerResolver resolver);
+#endif

@@ -43,14 +43,26 @@
         } finally { await context.close(); }
       });
       await check('webRTCLoopbackMediaAndData', async () => {
+        // A genuine local TURN relay makes this transport check independent of
+        // ambient LAN/mDNS discovery and macOS Local Network permission state.
+        // Browser privacy policies and native DTLS/SCTP/RTP remain unchanged.
+        const response = await fetch(asset('ice-config.json'), { cache: 'no-store', credentials: 'omit' });
+        assert(response.ok, 'The owned authenticated TURN fixture is unavailable');
+        const configuration = await response.json();
+        const server = configuration?.iceServers?.[0];
+        const endpoint = typeof server?.urls === 'string' && /^turn:127\.0\.0\.1:(\d+)\?transport=udp$/.exec(server.urls);
+        assert(configuration?.iceTransportPolicy === 'relay' && configuration.iceServers.length === 1
+          && endpoint && Number(endpoint[1]) >= 1024 && Number(endpoint[1]) <= 65535
+          && /^[0-9a-f]{48}$/.test(server.username) && /^[0-9a-f]{48}$/.test(server.credential),
+        'Media acceptance requires its exact authenticated IPv4 loopback relay');
         const canvas = document.createElement('canvas'); canvas.width = 160; canvas.height = 96;
         const painting = canvas.getContext('2d'); let frame = 0;
         const animation = setInterval(() => {
           painting.fillStyle = `hsl(${frame++ * 7 % 360} 70% 50%)`; painting.fillRect(0, 0, 160, 96);
         }, 33);
         const stream = canvas.captureStream(30);
-        const sender = new RTCPeerConnection({ iceServers: [] });
-        const receiver = new RTCPeerConnection({ iceServers: [] });
+        const sender = new RTCPeerConnection(configuration);
+        const receiver = new RTCPeerConnection(configuration);
         const received = [];
         const candidates = [], candidateErrors = [];
         const forward = (peer, event) => {
@@ -77,6 +89,15 @@
           await until(async () => [...(await receiver.getStats()).values()].some(report =>
             report.type === 'inbound-rtp' && report.kind === 'video' && report.framesDecoded >= 2),
           'WebRTC did not decode loopback video frames');
+          const statistics = await receiver.getStats();
+          const selected = [...statistics.values()].filter(report => report.type === 'transport'
+            && report.selectedCandidatePairId).map(report => statistics.get(report.selectedCandidatePairId));
+          assert(selected.length > 0 && selected.every(pair => {
+            const local = statistics.get(pair?.localCandidateId), remote = statistics.get(pair?.remoteCandidateId);
+            return pair?.state === 'succeeded' && local?.candidateType === 'relay'
+              && local.address === '127.0.0.1' && remote?.candidateType === 'relay' && remote.address === '127.0.0.1';
+          }), 'The actual selected ICE pair did not use the owned loopback TURN relay');
+          checks.webRTCSelectedPairUsesOwnedAuthenticatedLoopbackRelay = true;
           await Promise.all(candidates);
           assert(!candidateErrors.length, candidateErrors.join('; '));
         } finally {

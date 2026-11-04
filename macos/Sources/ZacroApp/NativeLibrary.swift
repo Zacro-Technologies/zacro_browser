@@ -77,6 +77,7 @@ struct NativeLibrary: View {
           TextField("Search \(section.lowercased())", text: $query)
             .textFieldStyle(.plain).focused($focus, equals: "search")
             .accessibilityLabel("Search \(section.lowercased())")
+            .accessibilityIdentifier("native-library-search")
             .onKeyPress(.downArrow) {
               guard let first = focusableIDs.first else { return .ignored }
               focus = first
@@ -91,6 +92,7 @@ struct NativeLibrary: View {
     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     .foregroundStyle(colors.ink).tint(colors.accent).font(.system(size: 13))
     .buttonStyle(LibraryActionStyle(colors: colors))
+    .disclosureGroupStyle(NativeChromeDisclosureStyle(colors: colors))
     .background { NativeWindowDialogAnchor(owner: dialogs).frame(width: 0, height: 0) }
     .onAppear { focus = isRecords ? "search" : "section" }
     .onDisappear { dialogs.cancel() }
@@ -129,8 +131,9 @@ struct NativeLibrary: View {
           NativeGlyph.menuImage("chevron.down", size: 10)
         }.frame(height: 28).contentShape(Rectangle())
       }.menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
-        .focused($focus, equals: "section").accessibilityLabel("Choose Library section")
+        .focusable().focusEffectDisabled().focused($focus, equals: "section").accessibilityLabel("Choose Library section")
       Spacer(minLength: 0)
+      if let action = actions.libraryHeaderContent(section) { action }
       if section == "History" || section == "Archive" {
         Button { confirmClear() } label: { NativeGlyph("trash").frame(width: 24, height: 26) }
           .buttonStyle(.plain).help(section == "History" ? "Clear history" : "Empty archive")
@@ -246,7 +249,8 @@ struct NativeLibrary: View {
         else { NativeGlyph("arrow.uturn.backward").foregroundStyle(colors.muted) }
       }.padding(.vertical, 9).padding(.horizontal, 7).contentShape(Rectangle())
         .background(colors.card.opacity(focus == item.id ? 0.46 : 0), in: RoundedRectangle(cornerRadius: 8))
-    }.buttonStyle(.plain).focused($focus, equals: item.id)
+    }.buttonStyle(.plain).focusable().focusEffectDisabled().focused($focus, equals: item.id)
+      .accessibilityIdentifier("native-library-window:" + item.id)
       .disabled(busy.contains(item.id) || !actions.libraryCapabilities.contains("window:restore"))
       .accessibilityLabel("Reopen \(item.title), \(item.tabCount) tabs, \(item.profileName)")
       .onKeyPress(.downArrow) { moveFocus(item.id, offset: 1); return .handled }
@@ -264,8 +268,8 @@ struct NativeLibrary: View {
   }
   private var emptyState: some View {
     VStack(spacing: 9) {
-      NativeGlyph(query.isEmpty ? symbol(section) : "magnifyingglass")
-        .font(.system(size: 24)).foregroundStyle(colors.accent).padding(.bottom, 4)
+      NativeGlyph(query.isEmpty ? symbol(section) : "magnifyingglass", size: 24)
+        .foregroundStyle(colors.accent).padding(.bottom, 4)
       Text(query.isEmpty ? emptyTitle : "No matches").font(.system(size: 14, weight: .semibold))
       Text(query.isEmpty ? emptyDescription : "Try a different title or address.")
         .font(.system(size: 12)).foregroundStyle(colors.muted).multilineTextAlignment(.center)
@@ -305,7 +309,8 @@ struct NativeLibrary: View {
           Text(URL(string: row.url)?.host ?? row.url).font(.system(size: 11))
             .foregroundStyle(colors.muted).lineLimit(1)
         }.frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
-      }.buttonStyle(.plain).focused($focus, equals: row.id)
+      }.buttonStyle(.plain).focusable().focusEffectDisabled().focused($focus, equals: row.id)
+        .accessibilityIdentifier("native-library-row:" + row.id)
         .onKeyPress(.downArrow) { moveFocus(row.id, offset: 1); return .handled }
         .onKeyPress(.upArrow) { moveFocus(row.id, offset: -1); return .handled }
         .onKeyPress(.home) { focus = filteredRows.first?.id; return .handled }
@@ -350,14 +355,14 @@ struct NativeLibrary: View {
     let resumable = item.status == "interrupted" && item.canResume == true && item.isDangerous != true
     let running = ["downloading", "progressing", "paused"].contains(item.status)
     return HStack(alignment: .top, spacing: 8) {
-      NativeGlyph("doc").font(.system(size: 19)).foregroundStyle(colors.accent).frame(width: 22, height: 32)
+      NativeGlyph("doc", size: 18).foregroundStyle(colors.accent).frame(width: 22, height: 32)
       VStack(alignment: .leading, spacing: 5) {
         Text(item.filename).lineLimit(2)
         Text(item.isDangerous == true ? "Blocked download" : complete ? bytes(max(item.totalBytes, item.receivedBytes)) : paused ? "Paused" : running ? "\(bytes(item.receivedBytes)) / \(bytes(item.totalBytes))" : item.status.capitalized)
           .font(.system(size: 11)).foregroundStyle(colors.muted)
         if running {
           ProgressView(value: item.totalBytes > 0 ? Double(item.receivedBytes) / Double(item.totalBytes) : nil)
-            .progressViewStyle(.linear).accessibilityLabel("Download progress")
+            .progressViewStyle(NativeChromeProgressStyle(colors: colors)).accessibilityLabel("Download progress")
         }
       }.frame(maxWidth: .infinity, alignment: .leading)
       if complete, let path = item.path {
@@ -431,7 +436,7 @@ struct NativeLibrary: View {
           choice("Sidebar width", value: setting(\.sidebarWidth), options: customOptions([224, 260, 300], current: store.state.settings.sidebarWidth) {
             [224.0: "Compact", 260: "Comfortable", 300: "Spacious"][$0] ?? "\(Int($0))px"
           })
-          Toggle("Restore session", isOn: setting(\.restoreSession)).toggleStyle(.switch).controlSize(.mini)
+          Toggle("Restore session", isOn: setting(\.restoreSession)).toggleStyle(NativeChromeToggleStyle(colors: colors))
           HStack {
             Button("Customize Space") { _ = actions.performInterfaceCommand("space-theme") }
             Button("Profiles") { _ = actions.performInterfaceCommand("profiles") }
@@ -439,6 +444,8 @@ struct NativeLibrary: View {
           }
         }
         if let serviceSettings = actions.settingsContent() { serviceSettings }
+        NativeChromeSelect(title: "Pages to open from each answer", selection: setting(\.openSourcesLimit),
+          options: Self.aiSourceLimitOptions(store.state.settings.openSourcesLimit), colors: colors)
         settingsSection("Site Search") {
           Button("Manage Site Search…") { _ = actions.performInterfaceCommand("site-searches") }
         }
@@ -488,6 +495,11 @@ struct NativeLibrary: View {
   private func customOptions(_ values: [Double], current: Double, title: (Double) -> String) -> [(Double, String)] {
     (values.contains(current) ? values : values + [current]).map { ($0, title($0)) }
   }
+  static func aiSourceLimitOptions(_ current: Int) -> [(Int, String)] {
+    var values = [1, 2, 3, 5]
+    if (1...10).contains(current), !values.contains(current) { values.append(current) }
+    return values.map { ($0, "\($0) " + ($0 == 1 ? "source" : "sources")) }
+  }
   private var archiveOptions: [(Double, String)] {
     var options: [(Double, String)] = [(12, "After 12 hours"), (24, "After 24 hours"), (72, "After 3 days"), (168, "After 7 days"), (720, "After 30 days"), (0, "Never")]
     let defaultID = store.state.profiles.first(where: { $0.id == "default" && !$0.isPrivate })?.id
@@ -523,12 +535,6 @@ struct NativeLibrary: View {
           .background(colors.card.opacity(0.35), in: RoundedRectangle(cornerRadius: 7))
       }.menuStyle(.borderlessButton).menuIndicator(.hidden).frame(width: 142)
         .accessibilityLabel(title).accessibilityValue(selected)
-    }
-  }
-  private func metricSlider(_ title: String, value: Binding<Double>, range: ClosedRange<Double>, suffix: String) -> some View {
-    VStack(spacing: 4) {
-      HStack { Text(title); Spacer(); Text("\(Int(value.wrappedValue))\(suffix)").foregroundStyle(colors.muted).monospacedDigit() }
-      Slider(value: value, in: range, step: 1).labelsHidden().accessibilityLabel(title)
     }
   }
   private var archiveSetting: Binding<Double> {

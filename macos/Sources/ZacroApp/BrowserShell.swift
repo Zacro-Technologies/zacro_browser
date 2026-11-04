@@ -31,6 +31,11 @@ final class BrowserActions: ObservableObject {
   @Published var library: String?
   @Published var themeEditor = false
   weak var themeEditorWindow: NSWindow?
+  weak var paletteWindow: NSWindow?
+  weak var browserMenuWindow: NSWindow?
+  var toggleSidebar: (Bool) -> Void = { _ in }
+  var sidebarToggleOwnsFocus: (NSWindow?) -> Bool = { _ in false }
+  var focusPageAfterSidebarToggle: () -> Void = {}
   @Published var siteControls = SiteControlActions()
   @Published var canGoBack = false
   @Published var canGoForward = false
@@ -61,6 +66,7 @@ final class BrowserActions: ObservableObject {
   var updateFind: (String) -> Void = { _ in }
   @Published var nativePageVisible = false
   @Published var contentFrame = CGRect.zero
+  @Published var contentSplitRatio: Double?
   @Published var paletteRequest: NativePaletteRequest?
   @Published var runtimeCommands: [BrowserRuntimeCommand] = []
   @Published var libraryCapabilities: Set<String> = []
@@ -74,6 +80,7 @@ final class BrowserActions: ObservableObject {
   var resetWindowPresentation: () -> Void = {}
   var interfacePresentationState: () -> Set<String> = { [] }
   var libraryContent: (String) -> AnyView? = { _ in nil }
+  var libraryHeaderContent: (String) -> AnyView? = { _ in nil }
   var settingsContent: () -> AnyView? = { nil }
   var pinnedExtensionsContent: () -> AnyView? = { nil }
   var performLibraryAction: ((String, [String: String]) async throws -> Void)?
@@ -131,6 +138,7 @@ struct BrowserShell<Content: View>: View {
   @StateObject private var drag = SidebarDragSession()
   @StateObject private var spaceViewport = NativeSpaceViewport()
   @StateObject private var dialogs = NativeWindowDialogOwner()
+  @StateObject private var sidebarToggleHandoff = NativeSidebarToggleHandoff()
   @State private var spaceScroll = NativeSpaceScrollCache()
   @State private var name = ""
   @State private var creation: String?
@@ -151,6 +159,7 @@ struct BrowserShell<Content: View>: View {
   @State private var nameError: String?
   @FocusState private var sidebarFocus: String?
   @State private var libraryReturnFocus: String?
+  @State private var sidebarToggleLibraryDismissalPending = false
   @State private var paletteReturnFocus: NativePaletteFocusContext?
   @Environment(\.accessibilityReduceMotion) private var reduceMotion
   @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
@@ -181,12 +190,15 @@ struct BrowserShell<Content: View>: View {
     return value
   }
   private var effectiveMotion: Double { reduceMotion ? 0 : store.state.settings.motionScale }
+  private var needsTransparentResizeHitArea: Bool {
+    !reduceTransparency && contrast != .increased && theme.opacity <= 0 && theme.blur <= 0
+  }
   private var allowsRowMotion: Bool {
     effectiveMotion > 0 && rowMotionSpaceID == store.state.activeSpaceID
       && !spaceViewport.isTracking && !spaceViewport.isAnimating && drag.id == nil
   }
   private var rowAnimation: Animation? {
-    allowsRowMotion ? .timingCurve(0.16, 1, 0.3, 1, duration: 0.14 * effectiveMotion) : nil
+    allowsRowMotion ? NativeMotion.animation(0.14, scale: effectiveMotion) : nil
   }
   private var isPopup: Bool {
     store.state.windowSessions?.first(where: { $0.id == store.owningWindowID })?.kind == .popup
@@ -297,19 +309,18 @@ struct BrowserShell<Content: View>: View {
 
   private var standardShell: some View {
     ZStack {
+      // One continuous backdrop also sits below the native page's antialiased
+      // edge. A second inverse mask here exposes the desktop between two
+      // partially covered edges, producing a bright seam.
       NativeThemeBackground(theme: theme)
-        .mask(
-          WindowMaterialMask(
-            hole: (hasPage || actions.nativePageVisible) ? actions.contentFrame : .zero,
-            radius: store.state.settings.pageRadius
-          ).fill(style: FillStyle(eoFill: true)))
       VStack(spacing: 0) {
        HStack(spacing: 0) {
         if sidebarWidth > 0 {
           sidebar.frame(width: sidebarWidth)
             .overlay(alignment: .trailing) {
               NativeResizeHandle(value: sidebarWidth, range: sidebarResizeRange,
-                reset: 224, label: "Resize sidebar", preview: { sidebarWidthDraft = $0.rounded() },
+                reset: 224, label: "Resize sidebar", needsTransparentHitArea: needsTransparentResizeHitArea,
+                preview: { sidebarWidthDraft = $0.rounded() },
                 commit: { saveRailWidth($0, sidebar: true) }, cancel: { sidebarWidthDraft = nil })
                 .frame(width: 5)
             }
@@ -321,7 +332,8 @@ struct BrowserShell<Content: View>: View {
             .frame(width: libraryWidth)
             .overlay(alignment: .leading) {
               NativeResizeHandle(value: libraryWidth, range: libraryResizeRange, direction: -1,
-                reset: 336, label: "Resize Library", preview: { libraryWidthDraft = $0.rounded() },
+                reset: 336, label: "Resize Library", needsTransparentHitArea: needsTransparentResizeHitArea,
+                preview: { libraryWidthDraft = $0.rounded() },
                 commit: { saveRailWidth($0, sidebar: false) }, cancel: { libraryWidthDraft = nil })
                 .frame(width: 5)
             }
@@ -344,7 +356,9 @@ struct BrowserShell<Content: View>: View {
       }
     }
     .ignoresSafeArea()
+    .background { NativeSpaceMotionAnchor(viewport: spaceViewport).frame(width: 0, height: 0).allowsHitTesting(false) }
     .background { NativeWindowDialogAnchor(owner: dialogs).frame(width: 0, height: 0) }
+    .background { NativeSidebarToggleAnchor(handoff: sidebarToggleHandoff).frame(width: 0, height: 0) }
     .background {
       GeometryReader { geometry in
         Color.clear.onAppear { availableWindowWidth = geometry.size.width; availableWindowHeight = geometry.size.height }
@@ -360,11 +374,13 @@ struct BrowserShell<Content: View>: View {
           palette.tint(accent).environment(\.presentedSpaceTheme, theme)
             .preferredColorScheme(
               theme.appearance == "dark" ? .dark : theme.appearance == "light" ? .light : nil)),
-        motionScale: effectiveMotion,
+        motionScale: effectiveMotion, animatesOpacity: false,
         frame: actions.contentFrame.width > 0 ? actions.contentFrame : nil,
         presentationID: actions.paletteSession, restoresResponder: true,
         canRestoreFocus: { canRestorePaletteFocus },
-        onRestoreFocus: restorePaletteFocus
+        onRestoreFocus: restorePaletteFocus,
+        onPresentationWindow: { [weak actions = actions] in actions?.paletteWindow = $0 },
+        onDidHide: { sidebarToggleHandoff.retry() }
       )
       .frame(width: 0, height: 0).allowsHitTesting(false)
     }
@@ -394,7 +410,10 @@ struct BrowserShell<Content: View>: View {
             onDismiss: { showBrowserMenu = false; showPageActions = false })),
           motionScale: effectiveMotion,
           frame: CGRect(x: actions.contentFrame.minX + 8, y: actions.contentFrame.minY + 40, width: 242,
-            height: max(80, min(actions.contentFrame.height - 48, CGFloat((items.count - (showPageActions ? 2 : 0)) * 31 + items.filter(\.divider).count * 9 + 10)))))
+            height: max(80, min(actions.contentFrame.height - 48, CGFloat((items.count - (showPageActions ? 2 : 0)) * 31 + items.filter(\.divider).count * 9 + 10)))),
+          canRestoreFocus: { !sidebarToggleHandoff.hasPending },
+          onPresentationWindow: { [weak actions = actions] in actions?.browserMenuWindow = $0 },
+          onDidHide: { sidebarToggleHandoff.retry() })
           .frame(width: 0, height: 0).allowsHitTesting(false)
       }
     }
@@ -402,15 +421,18 @@ struct BrowserShell<Content: View>: View {
     .font(.system(size: 13))
     .foregroundStyle(colors.ink)
     .tint(accent)
+    .progressViewStyle(NativeChromeProgressStyle(colors: colors))
     .preferredColorScheme(
       theme.appearance == "dark" ? .dark : theme.appearance == "light" ? .light : nil
     )
     .environment(\.presentedSpaceTheme, theme)
+    .environment(\.nativeChromeControlContext,
+      "\(store.owningWindowID ?? ""):\(store.activeProfileID):\(store.state.activeSpaceID)")
     .animation(
-      reduceMotion ? nil : .easeInOut(duration: 0.18 * effectiveMotion),
+      NativeMotion.animation(NativeMotion.chrome, scale: effectiveMotion),
       value: store.state.settings.sidebarVisible
     )
-    .animation(reduceMotion ? nil : .easeOut(duration: 0.16 * effectiveMotion), value: actions.library != nil)
+    .animation(NativeMotion.animation(NativeMotion.chrome, scale: effectiveMotion), value: actions.library != nil)
     .onReceive(Timer.publish(every: 0.15, on: .main, in: .common).autoconnect()) { _ in
       if drag.id != nil && !drag.native.isDragging && NSEvent.pressedMouseButtons == 0 { drag.cancel() }
     }
@@ -430,6 +452,7 @@ struct BrowserShell<Content: View>: View {
     .onChange(of: actions.themeEditor) { _, presented in
       themeError = nil
       if presented {
+        sidebarToggleHandoff.cancel()
         actions.palette = false; showSiteControls = false; showBrowserMenu = false; showPageActions = false
         if creatingSpace {
           var initial = SpaceTheme(); initial.appearance = store.state.settings.appearance
@@ -439,6 +462,7 @@ struct BrowserShell<Content: View>: View {
       } else { themeDraft = nil; creatingSpace = false; actions.themeEditorWindow = nil }
     }
     .onChange(of: store.state.activeSpaceID) { _, _ in
+      sidebarToggleHandoff.cancel()
       synchronizeSpaces()
       rowMotionSpaceID = store.state.activeSpaceID
       drag.resetReflow(store: store)
@@ -447,28 +471,33 @@ struct BrowserShell<Content: View>: View {
     }
     .onChange(of: spaces.map(\.id)) { _, _ in synchronizeSpaces() }
     .onChange(of: effectiveMotion) { _, _ in synchronizeSpaces() }
-    .onDisappear { dialogs.cancel(); spaceViewport.stop() }
+    .onDisappear { sidebarToggleHandoff.cancel(); dialogs.cancel(); spaceViewport.stop() }
     .onChange(of: isOwnedWindowOpen) { _, open in
       if !open { resetWindowPresentation() }
       else { maybeOpenBlankPalette() }
     }
-    .onChange(of: store.activeProfileID) { _, _ in dialogs.cancel(); drag.cancel() }
+    .onChange(of: store.activeProfileID) { _, _ in sidebarToggleHandoff.cancel(); dialogs.cancel(); drag.cancel() }
     .onChange(of: store.state.tabs) { _, _ in drag.reconcile(store: store) }
-    .onChange(of: store.state.activeTabID) { _, _ in maybeOpenBlankPalette() }
+    .onChange(of: store.state.activeTabID) { _, _ in sidebarToggleHandoff.cancel(); maybeOpenBlankPalette() }
     .onChange(of: actions.palette) { _, presented in
       if presented {
+        sidebarToggleHandoff.cancel()
         paletteReturnFocus = .init(windowID: store.owningWindowID, profileID: store.activeProfileID, sidebarKey: sidebarFocus)
         discardThemePreview()
       }
     }
     .onChange(of: editor) { _, value in
-      if value != nil { pendingEditorNavigation = nil; discardThemePreview() }
+      if value != nil { sidebarToggleHandoff.cancel(); pendingEditorNavigation = nil; discardThemePreview() }
     }
     .onChange(of: actions.library) { previous, value in
       if value == nil {
-        restoreLibraryFocus()
+        if sidebarToggleLibraryDismissalPending {
+          sidebarToggleLibraryDismissalPending = false
+          sidebarToggleHandoff.retry()
+        } else { restoreLibraryFocus() }
         maybeOpenBlankPalette()
       } else {
+        sidebarToggleLibraryDismissalPending = false
         if previous == nil { libraryReturnFocus = sidebarFocus ?? "library" }
         discardThemePreview()
       }
@@ -489,7 +518,7 @@ struct BrowserShell<Content: View>: View {
             renameTarget = nil
             nameError = nil
           }
-        })) {
+        }), onDismiss: { sidebarToggleHandoff.retry() }) {
       NativeNameEditor(title: renameTarget.map { "Rename \($0.kind)" } ?? "New \(creation ?? "item")",
         name: $name, limit: nameLimit, saveTitle: renameTarget == nil ? "Create" : "Save", error: nameError, colors: colors,
         save: saveName, cancel: { creation = nil; renameTarget = nil; nameError = nil })
@@ -516,13 +545,10 @@ struct BrowserShell<Content: View>: View {
         NativeContentFrameReporter { frame in publishContentFrame(frame) }
           .frame(maxWidth: .infinity, maxHeight: .infinity).allowsHitTesting(false)
       }
-      .clipShape(RoundedRectangle(cornerRadius: store.state.settings.pageRadius))
+      .clipShape(NativePaneShape(radius: store.state.settings.pageRadius))
       .background {
-        // Chromium pages are sibling native windows. The clear overlay has no
-        // alpha to cast a shadow, so the pane needs a retained solid underlay.
-        RoundedRectangle(cornerRadius: store.state.settings.pageRadius)
-          .fill(colors.chrome)
-          .shadow(color: Color(red: 32 / 255, green: 19 / 255, blue: 36 / 255).opacity(0.11), radius: 9, y: 4)
+        NativePaneShadows(radius: store.state.settings.pageRadius,
+          splitRatio: actions.contentSplitRatio)
       }
       .padding(.horizontal, store.state.settings.pageGutter)
       .padding(.bottom, store.state.settings.pageGutter)
@@ -677,7 +703,7 @@ struct BrowserShell<Content: View>: View {
       }.font(.system(size: 12)).foregroundStyle(accent).padding(.horizontal, 8).frame(height: 32)
       ForEach(store.state.folders.filter { $0.spaceID == space.id }) { folder in
         HStack(spacing: 8) {
-          NativeGlyph("folder").font(.system(size: 16)).foregroundStyle(accent).frame(width: 16)
+          NativeGlyph("folder", size: 16).foregroundStyle(accent).frame(width: 16)
           Text(folder.name).fontWeight(.semibold)
           Spacer()
         }.padding(.horizontal, 8).frame(height: tabHeight)
@@ -773,13 +799,14 @@ struct BrowserShell<Content: View>: View {
         actions.openPalette(address: hasPage ? currentAddress : "")
       } label: {
         HStack(spacing: 7) {
-          NativeGlyph(hasPage ? (currentAddress.hasPrefix("https://") ? "lock" : "globe") : "magnifyingglass")
-            .font(.system(size: 12)).foregroundStyle(accent)
+          NativeGlyph(hasPage ? (currentAddress.hasPrefix("https://") ? "lock" : "globe") : "magnifyingglass", size: 13)
+            .foregroundStyle(accent)
           Text(hasPage ? NativePageIdentity.label(currentAddress) : "Search or enter URL")
             .lineLimit(1).font(.system(size: 13, weight: .medium))
         }.frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 8)
           .frame(height: 32).contentShape(Rectangle())
-      }.buttonStyle(.plain).accessibilityLabel("Edit address or search").focused($sidebarFocus, equals: "address")
+      }.buttonStyle(.plain).accessibilityLabel("Edit address or search")
+        .focusable().focusEffectDisabled().focused($sidebarFocus, equals: "address")
         .contextMenu { NativeMenuCommands(items: pageMenuItems) }
         .popover(isPresented: $showPageActions, arrowEdge: .bottom) {
           NativeActionPopover(title: "Page actions", items: pageMenuItems, colors: colors, compactZoom: true, motionScale: effectiveMotion)
@@ -787,7 +814,7 @@ struct BrowserShell<Content: View>: View {
       Button {
         showSiteControls.toggle()
       } label: {
-        NativeGlyph("slider.horizontal.3").font(.system(size: 12, weight: .medium))
+        NativeGlyph("slider.horizontal.3", size: 15)
           .frame(width: 28, height: 28).contentShape(RoundedRectangle(cornerRadius: 8))
       }.buttonStyle(.plain).padding(.trailing, 4)
         .help("Site controls").accessibilityLabel("Site controls")
@@ -812,6 +839,8 @@ struct BrowserShell<Content: View>: View {
           NativeGlyph("chevron.down", size: 12)
         }.font(.system(size: 12)).padding(.horizontal, 8).frame(height: 32).contentShape(Rectangle())
       }.buttonStyle(.plain).foregroundStyle(accent).accessibilityLabel("Spaces & profiles")
+        .accessibilityIdentifier("space-picker")
+        .focusable().focusEffectDisabled().focused($sidebarFocus, equals: "space-picker")
         .contextMenu {
           if let space = store.state.activeSpace { spaceMenu(space) }
         }
@@ -825,16 +854,16 @@ struct BrowserShell<Content: View>: View {
                 NativeGlyph("folder").opacity(hoveredFolder == folder.id || sidebarFocus == "folder:\(folder.id)" ? 0 : 1)
                 NativeGlyph("chevron.down")
                   .rotationEffect(.degrees(folder.isExpanded ? 0 : -90))
-                  .animation(effectiveMotion > 0 ? .timingCurve(0.16, 1, 0.3, 1, duration: 0.12 * effectiveMotion) : nil, value: folder.isExpanded)
+                  .animation(NativeMotion.animation(0.12, scale: effectiveMotion), value: folder.isExpanded)
                   .opacity(hoveredFolder == folder.id || sidebarFocus == "folder:\(folder.id)" ? 1 : 0)
               }.foregroundStyle(accent).frame(width: 16, height: 16)
-                .animation(effectiveMotion > 0 ? .easeOut(duration: 0.12 * effectiveMotion) : nil, value: hoveredFolder == folder.id || sidebarFocus == "folder:\(folder.id)")
+                .animation(NativeMotion.animation(NativeMotion.fast, scale: effectiveMotion), value: hoveredFolder == folder.id || sidebarFocus == "folder:\(folder.id)")
               Text(folder.name).font(.system(size: 13, weight: .semibold)).lineLimit(1)
               Spacer(minLength: 0)
             }.padding(.horizontal, 8).frame(height: tabHeight).contentShape(Rectangle())
           }.buttonStyle(NativeHoverPressButtonStyle(hover: colors.hover, radius: 6, scale: 1, motionScale: effectiveMotion))
             .accessibilityLabel("\(folder.isExpanded ? "Collapse" : "Expand") \(folder.name)")
-            .focused($sidebarFocus, equals: "folder:\(folder.id)").id("folder:\(folder.id)")
+            .focusable().focusEffectDisabled().focused($sidebarFocus, equals: "folder:\(folder.id)").id("folder:\(folder.id)")
             .onHover { if $0 { hoveredFolder = folder.id } else if hoveredFolder == folder.id { hoveredFolder = nil } }
           if folder.isExpanded {
             VStack(spacing: 2) {
@@ -861,7 +890,7 @@ struct BrowserShell<Content: View>: View {
         actions.openPalette()
       } label: {
         HStack(spacing: 8) {
-          NativeGlyph("plus").font(.system(size: 16)).foregroundStyle(accent).frame(width: 16)
+          NativeGlyph("plus", size: 16).foregroundStyle(accent).frame(width: 16)
           Text("New Tab")
           Spacer(minLength: 0)
           Text(NativeInterfaceEditors.keyLabel(BrowserShortcut.catalog(overrides: store.state.settings.shortcutOverrides)
@@ -873,7 +902,7 @@ struct BrowserShell<Content: View>: View {
       }
       .buttonStyle(NativeHoverPressButtonStyle(hover: colors.hover, radius: 6, scale: 0.985,
         pressDuration: 0.1, motionScale: effectiveMotion)).foregroundStyle(colors.muted)
-        .focused($sidebarFocus, equals: "new-tab").onHover { hoveredNewTab = $0 }
+        .focusable().focusEffectDisabled().focused($sidebarFocus, equals: "new-tab").onHover { hoveredNewTab = $0 }
         .background { NativeSidebarDropRegion(controller: drag.native, id: SidebarSection.regular.regionID(space: store.state.activeSpaceID)) }
         .onDrop(of: [.plainText], delegate: dropDelegate(section: .regular, before: todayTabs.first?.id))
       VStack(spacing: 2) {
@@ -957,7 +986,9 @@ struct BrowserShell<Content: View>: View {
               Spacer(minLength: 0)
               Text("\(members.count)").font(.system(size: 10)).foregroundStyle(colors.muted)
             }.padding(.leading, 8).padding(.trailing, 4).frame(height: 36).contentShape(Rectangle())
-          }.buttonStyle(.plain).focused($sidebarFocus, equals: "group:\(group.id)").id("group:\(group.id)")
+          }.buttonStyle(.plain).focusable().focusEffectDisabled()
+            .focused($sidebarFocus, equals: "group:\(group.id)").id("group:\(group.id)")
+            .accessibilityIdentifier("tab-group:\(group.id)")
             .accessibilityLabel("\(group.collapsed ? "Expand" : "Collapse") \(group.title.isEmpty ? "tab group" : group.title), \(members.count) tabs")
           Button { editingGroupColor = group.id } label: {
             Circle().fill(groupColor(group.color)).frame(width: 10, height: 10).frame(width: 27, height: 28).contentShape(Rectangle())
@@ -986,7 +1017,7 @@ struct BrowserShell<Content: View>: View {
             .overlay(alignment: .leading) { Rectangle().fill(groupColor(group.color).opacity(0.35)).frame(width: 1) }
             .padding(.leading, 8)
         }
-      }.animation(reduceMotion ? nil : .easeOut(duration: 0.14 * effectiveMotion), value: group.collapsed)
+      }.animation(NativeMotion.animation(0.14, scale: effectiveMotion), value: group.collapsed)
         .contextMenu { NativeMenuCommands(items: groupMenuItems(group)) }
         .background { menuAnchor(id: "group:\(group.id)", items: groupMenuItems(group)) }
         .onDrop(of: [.plainText], isTargeted: nil) { _ in
@@ -1116,7 +1147,11 @@ struct BrowserShell<Content: View>: View {
           ? "\(tab.displayTitle) — \(tab.isClosed ? "Closed" : actions.loadedTabIDs.contains(tab.id) ? "Loaded" : "Sleeping")"
           : tab.displayTitle)
         .accessibilityIdentifier("tab-activate:\(tab.id)")
-        .focused($sidebarFocus, equals: tab.id).id(tab.id)
+        // This is a continuous keyboard-navigation surface, not merely a
+        // button activated through the system's optional Keyboard navigation.
+        // Explicit participation supports the browser's Focus Sidebar command
+        // with that preference off; the browser draws its own focus treatment.
+        .focusable().focusEffectDisabled().focused($sidebarFocus, equals: tab.id).id(tab.id)
       if !favorite && (tab.isMuted || actions.audibleTabIDs.contains(tab.id)) {
         Button { performTabAction("tab:mute", tab: tab) } label: {
           NativeGlyph(tab.isMuted ? "speaker.slash" : "speaker.wave.2", size: 14).frame(width: 24, height: 24)
@@ -1172,7 +1207,10 @@ struct BrowserShell<Content: View>: View {
     }
     items.append(.init(id: "duplicate", title: "Duplicate tab", glyph: "copy", divider: true) { if let duplicate = store.duplicateTab(id: tab.id) { actions.activate(duplicate.id) } })
     if store.split(for: tab.id) != nil { items.append(.init(id: "split", title: "Unsplit tabs", glyph: "split") { store.unsplit(tabID: tab.id) }) }
-    else { items.append(.init(id: "split", title: "Open in split view", glyph: "split") { store.selectTab(id: tab.id); actions.activate(tab.id); showPalette(.split) }) }
+    else { items.append(.init(id: "split", title: "Open in split view", glyph: "split") {
+      do { try NativeSidebarSplit.open(tabID: tab.id, store: store) }
+      catch { operationError = error.localizedDescription; store.clearError() }
+    }) }
     if !tab.isClosed {
       items.append(.init(id: "group", title: tab.groupID == nil ? "Group selected tabs" : "Remove from group", glyph: "folder") {
         let ids = highlightedTabIDs.contains(tab.id) ? Array(highlightedTabIDs) : [tab.id]
@@ -1228,7 +1266,7 @@ struct BrowserShell<Content: View>: View {
       } label: {
         NativeGlyph.menuImage("archivebox")
       }.menuStyle(.borderlessButton).menuIndicator(.hidden).frame(width: 28, height: 28)
-        .focused($sidebarFocus, equals: "library").accessibilityLabel("Library")
+        .focusable().focusEffectDisabled().focused($sidebarFocus, equals: "library").accessibilityLabel("Library")
       spaceDots
       Menu {
         Button("New tab") { actions.openPalette() }
@@ -1244,11 +1282,10 @@ struct BrowserShell<Content: View>: View {
         ThemeEditor(theme: themeBinding,
           identity: AnyView(VStack(alignment: .leading, spacing: 10) {
             NativeSpaceIdentity(name: Binding(get: { themeDraft?.name ?? "" }, set: { themeDraft?.name = $0 }),
-              icon: Binding(get: { themeDraft?.icon ?? "circle" }, set: { themeDraft?.icon = $0 }), initiallyExpanded: creatingSpace)
+              icon: Binding(get: { themeDraft?.icon ?? "circle" }, set: { themeDraft?.icon = $0 }), colors: colors, initiallyExpanded: creatingSpace)
             if creatingSpace {
-              Picker("Profile", selection: Binding(get: { themeDraft?.profileID ?? store.activeProfileID }, set: { themeDraft?.profileID = $0 })) {
-                ForEach(store.state.profiles) { profile in Text(profile.name).tag(profile.id) }
-              }.font(.system(size: 12))
+              NativeChromeSelect(title: "Profile", selection: Binding(get: { themeDraft?.profileID ?? store.activeProfileID },
+                set: { themeDraft?.profileID = $0 }), options: store.state.profiles.map { ($0.id, $0.name) }, colors: colors)
             }
           }),
           canSave: !(themeDraft?.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true),
@@ -1257,6 +1294,7 @@ struct BrowserShell<Content: View>: View {
           motionScale: effectiveMotion,
           onPresentationWindow: { [weak actions = actions] window in if actions?.themeEditor == true { actions?.themeEditorWindow = window } },
           onSave: saveTheme, onCancel: { actions.themeEditor = false })
+          .onDisappear { sidebarToggleHandoff.retry() }
       }
   }
   private var spaceDots: some View {
@@ -1268,7 +1306,7 @@ struct BrowserShell<Content: View>: View {
               Button {
                 store.selectSpace(id: space.id)
               } label: {
-                NativeGlyph(space.icon).font(.system(size: 14)).opacity(
+                NativeGlyph(space.icon, size: 14).opacity(
                   space.id == store.state.activeSpaceID ? 1 : 0.55)
                   .frame(width: 24, height: 28)
                   .background(colors.card.opacity(space.id == store.state.activeSpaceID ? 0.546 : 0), in: RoundedRectangle(cornerRadius: 6))
@@ -1276,7 +1314,7 @@ struct BrowserShell<Content: View>: View {
               }.buttonStyle(NativePressButtonStyle(scale: 0.96, motionScale: effectiveMotion)).help(space.name).accessibilityLabel("Switch to \(space.name)")
                 .accessibilityAddTraits(space.id == store.state.activeSpaceID ? [.isSelected] : [])
                 .contextMenu { spaceMenu(space) }
-                .focused($sidebarFocus, equals: "space:\(space.id)")
+                .focusable().focusEffectDisabled().focused($sidebarFocus, equals: "space:\(space.id)")
                 .onKeyPress(keys: [KeyEquivalent("\u{F70D}"), KeyEquivalent("\u{F735}")]) { key in
                   guard isContextMenuKey(key) else { return .ignored }
                   contextMenuRequest = "space:\(space.id)"; return .handled
@@ -1318,6 +1356,7 @@ struct BrowserShell<Content: View>: View {
     editor = nil
   }
   private func finishEditorNavigation() {
+    if sidebarToggleHandoff.hasPending { pendingEditorNavigation = nil; sidebarToggleHandoff.retry(); return }
     guard let intent = pendingEditorNavigation else { maybeOpenBlankPalette(); return }
     pendingEditorNavigation = nil
     guard editor == nil, intent.windowID == store.owningWindowID,
@@ -1327,18 +1366,64 @@ struct BrowserShell<Content: View>: View {
       !showSiteControls, !showBrowserMenu, !showPageActions else { return }
     _ = performInterfaceCommand(intent.command)
   }
-  private func toggleSidebar() {
-    if store.state.settings.sidebarVisible && sidebarWidth == 0 { actions.library = nil }
-    else { store.updateSettings { $0.sidebarVisible.toggle() } }
+  private func toggleSidebar(fromPage: Bool = false) {
+    guard isOwnedWindowOpen, let window = sidebarToggleHandoff.window, window.isVisible else { return }
+    // An unrelated security/save sheet cannot be dismissed by a rail command.
+    guard window.attachedSheet == nil || ((editor != nil || creation != nil || renameTarget != nil)
+      && window.attachedSheet?.attachedSheet == nil) else { return }
+    let ownerID = store.owningWindowID, profileID = store.activeProfileID
+    let spaceID = store.state.activeSpaceID, tabID = store.state.activeTabID
+    let plan = NativeSidebarTogglePlan.make(visiblePreference: store.state.settings.sidebarVisible,
+      effectiveWidth: sidebarWidth, libraryOpen: actions.library != nil, fromPage: fromPage)
+    let blockers = [actions.paletteWindow, actions.browserMenuWindow, actions.themeEditorWindow, window.attachedSheet].compactMap { $0 }
+    sidebarToggleHandoff.begin(blockingWindows: blockers, ownsFocus: actions.sidebarToggleOwnsFocus, valid: {
+      isOwnedWindowOpen && store.owningWindowID == ownerID && store.activeProfileID == profileID
+        && store.state.activeSpaceID == spaceID && store.state.activeTabID == tabID && NSApp.isActive
+        && !actions.palette && !actions.themeEditor && editor == nil && creation == nil && renameTarget == nil
+        && !showSiteControls && !showBrowserMenu && !showPageActions && pendingEditorNavigation == nil
+    }, ready: {
+      // orderOut emits occlusion/key notifications inside the presenter's
+      // hide transaction. Wait until it has relinquished its exact window
+      // references, so generic responder restoration cannot follow and steal
+      // the document focus that this handoff is about to deliver.
+      !sidebarToggleLibraryDismissalPending && actions.paletteWindow == nil
+        && actions.browserMenuWindow == nil && actions.themeEditorWindow == nil
+    }, focus: {
+      switch plan.focus {
+      case .page: sidebarFocus = nil; actions.focusPageAfterSidebarToggle()
+      case .address: window.makeKeyAndOrderFront(nil); sidebarFocus = "address"
+      case .library: window.makeKeyAndOrderFront(nil); restoreLibraryFocus()
+      }
+    })
+    // Settle native input as well as the rendered Space strip before resizing.
+    NativeResizeHandle.cancel(in: window)
+    NativeSpaceGestureCancellation.cancel(in: window)
+    cancelWindowInteractions()
+    dialogs.cancel()
+    actions.palette = false; actions.paletteRequest = nil; paletteReturnFocus = nil
+    pendingEditorNavigation = nil; editor = nil; creation = nil; renameTarget = nil
+    actions.recordingShortcut = false
+    showSiteControls = false; showBrowserMenu = false; showPageActions = false
+    contextMenuRequest = nil; editingGroupColor = nil
+    nameError = nil; operationError = nil
+    discardThemePreview()
+    switch plan {
+    case .closeLibrary:
+      sidebarToggleLibraryDismissalPending = true
+      actions.library = nil
+    case .setVisible(let visible, _): store.updateSettings { $0.sidebarVisible = visible }
+    }
+    sidebarToggleHandoff.activate()
   }
   private func restoreLibraryFocus() {
+    guard !sidebarToggleHandoff.hasPending else { return }
     let requested = libraryReturnFocus ?? "library"
     libraryReturnFocus = nil
     guard !actions.palette, !actions.themeEditor, editor == nil,
       creation == nil, renameTarget == nil, !showSiteControls, !showBrowserMenu,
       !showPageActions, !actions.findVisible else { return }
     guard sidebarWidth > 0 else { actions.focusPage(); return }
-    let exists = requested == "library" || requested == "address"
+    let exists = requested == "library" || requested == "address" || requested == "space-picker"
       || sidebarKeyboardItems.contains(requested)
       || spaces.contains { "space:\($0.id)" == requested }
     sidebarFocus = exists ? requested : "library"
@@ -1348,7 +1433,7 @@ struct BrowserShell<Content: View>: View {
     paletteReturnFocus = nil
     guard canRestorePaletteFocus, previous?.windowID == store.owningWindowID else { return }
     if sidebarWidth > 0, previous?.profileID == store.activeProfileID, let requested = previous?.sidebarKey,
-      requested == "address" || requested == "library" || sidebarKeyboardItems.contains(requested)
+      requested == "address" || requested == "library" || requested == "space-picker" || sidebarKeyboardItems.contains(requested)
         || spaces.contains(where: { "space:\($0.id)" == requested }) {
       sidebarFocus = requested
     } else if store.state.activeTab?.homePage == true, store.state.activeTab?.url == "about:blank", !actions.nativePageVisible {
@@ -1356,7 +1441,7 @@ struct BrowserShell<Content: View>: View {
     } else if sidebarWidth > 0 { sidebarFocus = "address" }
   }
   private var canRestorePaletteFocus: Bool {
-    isOwnedWindowOpen && !actions.palette && !actions.themeEditor && actions.library == nil && editor == nil
+    isOwnedWindowOpen && !sidebarToggleHandoff.hasPending && !actions.palette && !actions.themeEditor && actions.library == nil && editor == nil
       && pendingEditorNavigation == nil && creation == nil && renameTarget == nil
       && !showSiteControls && !showBrowserMenu && !showPageActions && !actions.findVisible
   }
@@ -1402,7 +1487,18 @@ struct BrowserShell<Content: View>: View {
       store.updateSettings { $0.sidebarVisible = true }
       if sidebarWidth == 0 { actions.library = nil }
       if let tab = store.state.activeTab, let folder = tab.folderID { store.updateFolder(id: folder, isExpanded: true) }
-      sidebarFocus = store.state.activeTabID ?? sidebarKeyboardItems.first ?? "address"
+      // A new blank document has no sidebar row; collapsed groups can also
+      // hide the selected tab. Match the renderer's visible-item fallback.
+      let items = sidebarKeyboardItems
+      let target = store.state.activeTabID.flatMap { items.contains($0) ? $0 : nil }
+        ?? items.first ?? "space-picker"
+      if CommandLine.arguments.contains("--native-integration-acceptance") {
+        fputs("Native sidebar focus hook entered: command=\(id) window=\(store.owningWindowID ?? "nil") before=\(sidebarFocus ?? "nil") target=\(target) items=\(items.count)\n", stderr)
+      }
+      sidebarFocus = target
+      if CommandLine.arguments.contains("--native-integration-acceptance") {
+        fputs("Native sidebar focus hook assigned: command=\(id) window=\(store.owningWindowID ?? "nil") value=\(sidebarFocus ?? "nil")\n", stderr)
+      }
     case "browser-menu":
       showSiteControls = false; showPageActions = false; showBrowserMenu = true
     case "page-actions":
@@ -1422,6 +1518,7 @@ struct BrowserShell<Content: View>: View {
     return true
   }
   private func installPresentationHooks() {
+    actions.toggleSidebar = { toggleSidebar(fromPage: $0) }
     actions.cancelWindowInteractions = cancelWindowInteractions
     actions.resetWindowPresentation = resetWindowPresentation
     actions.interfacePresentationState = {
@@ -1442,6 +1539,22 @@ struct BrowserShell<Content: View>: View {
       if actions.recordingShortcut { state.insert("shortcut-recording") }
       if themeError != nil || nameError != nil || operationError != nil || actions.interfaceError != nil { state.insert("error") }
       if drag.id != nil || drag.native.isDragging { state.insert("drag") }
+      if CommandLine.arguments.contains("--native-integration-acceptance") {
+        let keys = sidebarKeyboardItems
+        let diagnostics: [String: Any] = [
+          "windowID": store.owningWindowID ?? "nil", "profileID": store.activeProfileID,
+          "activeTabID": store.state.activeTabID ?? "nil", "sidebarFocus": sidebarFocus ?? "nil",
+          "sidebarKeys": Array(keys.prefix(100)), "sidebarKeyCount": keys.count,
+          "sidebarWidth": sidebarWidth, "palette": actions.palette,
+          "pendingPaletteFocus": paletteReturnFocus != nil,
+          "paletteFocusKey": paletteReturnFocus?.sidebarKey ?? "nil",
+          "paletteFocusWindow": paletteReturnFocus?.windowID ?? "nil",
+          "paletteFocusProfile": paletteReturnFocus?.profileID ?? "nil",
+          "pendingEditorNavigation": pendingEditorNavigation != nil,
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: diagnostics, options: [.sortedKeys]),
+          let text = String(data: data, encoding: .utf8) { fputs("Native sidebar focus model: \(text)\n", stderr) }
+      }
       return state
     }
   }
@@ -1452,6 +1565,8 @@ struct BrowserShell<Content: View>: View {
     sidebarWidthDraft = nil; libraryWidthDraft = nil
   }
   private func resetWindowPresentation() {
+    sidebarToggleHandoff.cancel()
+    sidebarToggleLibraryDismissalPending = false
     cancelWindowInteractions()
     drag.native.suspend()
     dialogs.cancel()
@@ -1769,27 +1884,22 @@ private struct NativeContentFrameReporter: NSViewRepresentable {
     func report() {
       guard !pending else { return }
       pending = true
-      DispatchQueue.main.async { [weak self] in
-        guard let self else { return }
-        self.pending = false
-        guard let root = self.window?.contentView, self.bounds.width > 0, self.bounds.height > 0 else { return }
-        let native = root.convert(self.bounds, from: self)
-        let frame = root.isFlipped ? native : CGRect(x: native.minX, y: root.bounds.height - native.maxY, width: native.width, height: native.height)
-        guard frame != self.last else { return }
-        self.last = frame; self.changed(frame)
+      // Border drags use AppKit's event-tracking mode. A dispatch-queue block
+      // can remain pending until that nested loop exits, leaving Chromium at
+      // the old size throughout a live resize. Keep deferred/coalesced layout
+      // while allowing the actual tracking loop to publish the new rectangle.
+      RunLoop.main.perform(inModes: [.common]) { [weak self] in
+        MainActor.assumeIsolated {
+          guard let self else { return }
+          self.pending = false
+          guard let root = self.window?.contentView, self.bounds.width > 0, self.bounds.height > 0 else { return }
+          let native = root.convert(self.bounds, from: self)
+          let frame = root.isFlipped ? native : CGRect(x: native.minX, y: root.bounds.height - native.maxY, width: native.width, height: native.height)
+          guard frame != self.last else { return }
+          self.last = frame; self.changed(frame)
+        }
       }
     }
-  }
-}
-private struct WindowMaterialMask: Shape {
-  var hole: CGRect
-  var radius: Double
-  func path(in rect: CGRect) -> Path {
-    var path = Path(rect)
-    if !hole.isEmpty {
-      path.addRoundedRect(in: hole, cornerSize: CGSize(width: radius, height: radius))
-    }
-    return path
   }
 }
 private enum SidebarNamedItem: Equatable {
@@ -1905,6 +2015,7 @@ private struct NativePalettePresenter: NSViewRepresentable {
   var ownerIsOpen: Bool
   var content: AnyView
   var motionScale: Double
+  var animatesOpacity = true
   var frame: CGRect? = nil
   var presentationID: UInt64 = 0
   var takesKey = true
@@ -1913,6 +2024,8 @@ private struct NativePalettePresenter: NSViewRepresentable {
   var restoresResponder = false
   var canRestoreFocus: () -> Bool = { true }
   var onRestoreFocus: () -> Void = {}
+  var onPresentationWindow: (NSWindow?) -> Void = { _ in }
+  var onDidHide: () -> Void = {}
 
   func makeCoordinator() -> Coordinator { Coordinator(self) }
   func makeNSView(context: Context) -> PaletteAnchorView {
@@ -1982,15 +2095,17 @@ private struct NativePalettePresenter: NSViewRepresentable {
       panel.contentView = hosting
       self.hosting = hosting
       self.panel = panel
+      presenter.onPresentationWindow(panel)
       lastPresentationID = presenter.presentationID
       if presenter.restoresResponder { returnFocus.capture(in: parent) }
       parent.addChildWindow(panel, ordered: .above)
-      panel.alphaValue = presenter.motionScale > 0 ? 0 : 1
+      panel.alphaValue = presenter.animatesOpacity && presenter.motionScale > 0 ? 0 : 1
       if presenter.takesKey { panel.makeKeyAndOrderFront(nil) } else { panel.orderFront(nil) }
       trace("show panel \(panel.windowNumber) parent \(parent.windowNumber) frame \(panel.frame)")
-      if presenter.motionScale > 0 {
+      if presenter.animatesOpacity && presenter.motionScale > 0 {
         NSAnimationContext.runAnimationGroup { context in
-          context.duration = 0.12 * presenter.motionScale
+          context.duration = NativeMotion.fast * presenter.motionScale
+          context.timingFunction = NativeMotion.timingFunction
           panel.animator().alphaValue = 1
         }
       }
@@ -2071,13 +2186,15 @@ private struct NativePalettePresenter: NSViewRepresentable {
       panel.contentView = nil
       hosting = nil
       self.panel = nil
+      presenter.onPresentationWindow(nil)
       lastPresentationID = nil
-      if restoreFocus, restoreKey, !presenter.restoresResponder || presenter.canRestoreFocus(),
+      if restoreFocus, restoreKey, presenter.canRestoreFocus(),
         let parent, parent.isVisible, parent.attachedSheet == nil, NSApp.isActive {
         parent.makeKey()
         if presenter.restoresResponder, presenter.canRestoreFocus(), !returnFocus.restore(in: parent) { presenter.onRestoreFocus() }
       }
       returnFocus.clear()
+      presenter.onDidHide()
     }
     private func trace(_ message: String) {
       guard ProcessInfo.processInfo.environment["ZACRO_NATIVE_LAYOUT_TRACE"] == "1" else { return }
@@ -2125,7 +2242,7 @@ private struct NativeSplitDropOverlay: View {
     HStack(spacing: 6) {
       ForEach(["left", "right"], id: \.self) { side in
         ZStack {
-          RoundedRectangle(cornerRadius: store.state.settings.pageRadius)
+          NativePaneShape(radius: store.state.settings.pageRadius)
             .fill(colors.chrome.opacity(hovered == side ? 0.58 : 0))
           Text("Split \(side)").font(.system(size: 13, weight: .semibold))
             .foregroundStyle(colors.ink).padding(.horizontal, 14).padding(.vertical, 9)

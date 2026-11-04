@@ -131,6 +131,37 @@ public final class CefProfile {
         return compare(context, raw) != 0
     }
 
+    /// Acquire only from this already-open native identity; never create a
+    /// context just to fence it. Global access is explicit and already exists
+    /// after cef_initialize, unlike a nil context's implicit fallback.
+    public func acquireAuxiliaryAdmission() throws -> CefAuxiliaryAdmissionLease? {
+        guard CefAuxiliaryAdmissionLease.isSupported else { return nil }
+        if kind == .global {
+            guard CefRuntime.shared.isInitialized, let existing = cef_request_context_get_global_context() else {
+                throw CefDevToolsError.browserClosed
+            }
+            defer { cefRelease(UnsafeMutableRawPointer(existing)) }
+            return try CefAuxiliaryAdmissionLease.acquireContext(existing)
+        }
+        guard let raw, initialized else { throw CefDevToolsError.browserClosed }
+        return try CefAuxiliaryAdmissionLease.acquireContext(raw)
+    }
+
+    /// Checks only this existing native identity before an optional native
+    /// producer is translated into a logical host navigation.
+    public func isAuxiliaryAdmissionBlocked() throws -> Bool {
+        guard CefAuxiliaryAdmissionLease.isSupported else { return false }
+        if kind == .global {
+            guard CefRuntime.shared.isInitialized, let existing = cef_request_context_get_global_context() else {
+                throw CefDevToolsError.browserClosed
+            }
+            defer { cefRelease(UnsafeMutableRawPointer(existing)) }
+            return try CefAuxiliaryAdmissionLease.isBlocked(existing)
+        }
+        guard let raw, initialized else { throw CefDevToolsError.browserClosed }
+        return try CefAuxiliaryAdmissionLease.isBlocked(raw)
+    }
+
     /// Chrome BrowserViews require a fully initialized request context.
     /// Disk profile initialization is asynchronous, unlike an OTR context.
     func whenReady(_ callback: @escaping () -> Void) {

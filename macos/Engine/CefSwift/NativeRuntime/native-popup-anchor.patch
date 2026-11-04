@@ -33,7 +33,7 @@
 +#endif
 --- /dev/null
 +++ b/chrome/browser/ui/views/extensions/native_extension_popup_anchor_mac.mm
-@@ -0,0 +1,190 @@
+@@ -0,0 +1,207 @@
 +#import <AppKit/AppKit.h>
 +
 +#include "chrome/browser/ui/views/extensions/native_extension_popup_anchor.h"
@@ -41,6 +41,7 @@
 +#include <utility>
 +#include <vector>
 +#include <cmath>
++#include "base/command_line.h"
 +#include "base/functional/callback.h"
 +#include "base/supports_user_data.h"
 +#include "base/task/sequenced_task_runner.h"
@@ -76,7 +77,17 @@
 +  __weak NSWindow* owner;
 +  __weak NSWindow* popup;
 +  base::RepeatingClosure close;
-+  void Close() {
++  void Close(const char* reason, NSWindow* trigger = nil) {
++    const auto* command = base::CommandLine::ForCurrentProcess();
++    if (command->HasSwitch("engine-acceptance") &&
++        command->HasSwitch("native-integration-acceptance")) {
++      NSLog(@"Native action popup close request reason=%s popup=%ld owner=%ld trigger=%ld key=%ld active=%d visible=%d",
++            reason, (long)(popup ? popup.windowNumber : -1),
++            (long)(owner ? owner.windowNumber : -1),
++            (long)(trigger ? trigger.windowNumber : -1),
++            (long)(NSApp.keyWindow ? NSApp.keyWindow.windowNumber : -1),
++            NSApp.active, popup.visible);
++    }
 +    // Closing the bubble can synchronously destroy its anchor and reset the
 +    // stored callback. Keep this invocation's bind state alive until it returns.
 +    auto callback = close;
@@ -140,13 +151,18 @@
 +                                    NSWindowWillMiniaturizeNotification,
 +                                    NSWindowDidResizeNotification]) {
 +      observers_.push_back([center addObserverForName:name object:state_->owner queue:nil
-+          usingBlock:^(NSNotification*) { if (auto state = weak.lock()) state->Close(); }]);
++          usingBlock:^(NSNotification* event) {
++            if (auto state = weak.lock()) state->Close(event.name.UTF8String, event.object);
++          }]);
 +    }
 +    observers_.push_back([center addObserverForName:NSApplicationDidResignActiveNotification object:NSApp queue:nil
-+        usingBlock:^(NSNotification*) { if (auto state = weak.lock()) state->Close(); }]);
++        usingBlock:^(NSNotification*) {
++          if (auto state = weak.lock()) state->Close("application-resigned-active");
++        }]);
 +    observers_.push_back([center addObserverForName:NSWindowDidBecomeKeyNotification object:nil queue:nil
 +        usingBlock:^(NSNotification* event) {
-+          if (auto state = weak.lock(); state && state->popup.visible && !Descendant(event.object, state->popup)) state->Close();
++          if (auto state = weak.lock(); state && state->popup.visible && !Descendant(event.object, state->popup))
++            state->Close("other-window-became-key", event.object);
 +        }]);
 +    monitor_ = [NSEvent addLocalMonitorForEventsMatchingMask:
 +        NSEventMaskLeftMouseDown | NSEventMaskRightMouseDown | NSEventMaskOtherMouseDown
@@ -154,7 +170,8 @@
 +          if (auto state = weak.lock(); state && !Descendant(event.window, state->popup)) {
 +            // Keep native menus usable. The popup's existing close routine also
 +            // preserves its DevTools and JavaScript-dialog exceptions.
-+            if (!event.window || event.window.level < NSPopUpMenuWindowLevel) state->Close();
++            if (!event.window || event.window.level < NSPopUpMenuWindowLevel)
++              state->Close("outside-mouse-down", event.window);
 +          }
 +          return event;
 +        }];
@@ -226,7 +243,15 @@
 +}
 --- a/chrome/browser/ui/views/extensions/extension_popup.h
 +++ b/chrome/browser/ui/views/extensions/extension_popup.h
-@@ -23,6 +23,7 @@
+@@ -5,6 +5,7 @@
+ #ifndef CHROME_BROWSER_UI_VIEWS_EXTENSIONS_EXTENSION_POPUP_H_
+ #define CHROME_BROWSER_UI_VIEWS_EXTENSIONS_EXTENSION_POPUP_H_
+ 
++#include "base/callback_list.h"
+ #include "base/functional/callback.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/scoped_observation.h"
+@@ -23,6 +24,7 @@
  #include "ui/views/widget/widget_observer.h"
  
  class BrowserWindowInterface;
@@ -234,27 +259,31 @@
  class ExtensionViewViews;
  
  namespace content {
-@@ -137,6 +138,9 @@
+@@ -137,6 +139,11 @@
    // Handles a signal from the extension host to close.
    void HandleCloseExtensionHost(extensions::ExtensionHost* host);
  
 +#if BUILDFLAG(IS_MAC)
++  void OnNativeBrowserDidClose(BrowserWindowInterface* browser);
 +  std::unique_ptr<NativeExtensionPopupAnchor> native_anchor_;
++  base::CallbackListSubscription native_browser_close_subscription_;
 +#endif
    raw_ptr<BrowserWindowInterface> browser_;
  
    // The contained host for the view.
 --- a/chrome/browser/ui/views/extensions/extension_popup.cc
 +++ b/chrome/browser/ui/views/extensions/extension_popup.cc
-@@ -41,6 +41,7 @@
+@@ -41,6 +41,9 @@
  
  #if BUILDFLAG(IS_MAC)
  #include "base/message_loop/message_pump_apple.h"
++#include "base/command_line.h"
++#include "base/logging.h"
 +#include "chrome/browser/ui/views/extensions/native_extension_popup_anchor.h"
  #endif
  
  constexpr gfx::Size ExtensionPopup::kMinSize;
-@@ -63,9 +64,27 @@
+@@ -63,9 +66,35 @@
      views::BubbleBorder::Arrow arrow,
      PopupShowAction show_action,
      ShowPopupCallback callback) {
@@ -274,6 +303,14 @@
    views::BubbleDialogDelegateView::CreateBubble(popup);
 +#if BUILDFLAG(IS_MAC)
 +  if (popup->native_anchor_) {
++    // RegisterBrowserDidClose does not replay an already accepted close.
++    if (browser->IsDeleteScheduled()) {
++      popup->OnNativeBrowserDidClose(browser);
++      return;
++    }
++    popup->native_browser_close_subscription_ = browser->RegisterBrowserDidClose(
++        base::BindRepeating(&ExtensionPopup::OnNativeBrowserDidClose,
++                            base::Unretained(popup)));
 +    popup->native_anchor_->Attach(popup->GetWidget(), base::BindRepeating(
 +        &ExtensionPopup::CloseUnlessBlockedByInspectionOrJSDialog,
 +        popup->deferred_close_weak_ptr_factory_.GetWeakPtr()));
@@ -282,6 +319,100 @@
  
    // Check that the preferred adjustment is set to mirror to match
    // the assumption in the logic to calculate max bounds.
+@@ -128,6 +157,9 @@
+ }
+ 
+ void ExtensionPopup::OnWidgetDestroying(views::Widget* widget) {
++#if BUILDFLAG(IS_MAC)
++  native_browser_close_subscription_ = {};
++#endif
+   BubbleDialogDelegateView::OnWidgetDestroying(widget);
+   anchor_widget_observation_.Reset();
+   extension_registry_observation_.Reset();
+@@ -141,7 +173,7 @@
+                                            views::Widget* active_widget) {
+   // The widget is shown asynchronously and may take a long time to appear, so
+   // only close if it's actually been shown.
+-  if (!GetWidget()->IsVisible()) {
++  if (!browser_ || !host_ || !GetWidget()->IsVisible()) {
+     return;
+   }
+ 
+@@ -324,6 +356,9 @@
+ }
+ 
+ void ExtensionPopup::ShowBubble() {
++  if (!browser_ || !host_) {
++    return;
++  }
+   // Don't show the popup if there are visible security dialogs. This protects
+   // the security dialogs from spoofing.
+   if (extensions::SecurityDialogTracker::GetInstance()
+@@ -391,6 +426,16 @@
+ 
+ void ExtensionPopup::CloseDeferredIfNecessary(
+     views::Widget::ClosedReason reason) {
++#if BUILDFLAG(IS_MAC)
++  const auto* command = base::CommandLine::ForCurrentProcess();
++  if (native_anchor_ && command->HasSwitch("engine-acceptance") &&
++      command->HasSwitch("native-integration-acceptance")) {
++    LOG(ERROR) << "Native action popup Chrome close reason=" << static_cast<int>(reason)
++               << " visible=" << GetWidget()->IsVisible()
++               << " has_host=" << static_cast<bool>(host_)
++               << " browser_deleting=" << (!browser_ || browser_->IsDeleteScheduled());
++  }
++#endif
+ #if BUILDFLAG(IS_MAC)
+   // On Mac, defer close if we're in a nested run loop (for example, showing a
+   // context menu) to avoid messaging deallocated objects.
+@@ -409,6 +454,47 @@
+   GetWidget()->CloseWithReason(reason);
+ }
+ 
++#if BUILDFLAG(IS_MAC)
++void ExtensionPopup::OnNativeBrowserDidClose(BrowserWindowInterface* browser) {
++  if (!native_anchor_ || browser_ != browser) {
++    return;
++  }
++
++  // This callback runs only after close has been accepted, before Browser is
++  // deleted. The native shell anchor is outside its Widget tree, so deferred
++  // bubble destruction alone cannot bound ExtensionViewHost's Browser delegate.
++  native_browser_close_subscription_ = {};
++  deferred_close_weak_ptr_factory_.InvalidateWeakPtrs();
++  auto weak_this = deferred_close_weak_ptr_factory_.GetWeakPtr();
++  Observe(nullptr);
++  anchor_widget_observation_.Reset();
++  extension_registry_observation_.Reset();
++  security_dialog_tracker_observation_.Reset();
++  withheld_from_view_.reset();
++  browser_->GetTabStripModel()->RemoveObserver(this);
++  browser_ = nullptr;
++  auto shown_callback = std::move(shown_callback_);
++
++  // Match OnExtensionUnloaded: destroy the view first so it cannot message the
++  // host while the macOS Widget closes asynchronously. Host destruction also
++  // notifies the original action delegate while its Browser is still alive.
++  if (extension_view_) {
++    RemoveChildViewT(extension_view_.ExtractAsDangling());
++  }
++  if (weak_this) {
++    weak_this->host_.reset();
++  }
++  if (weak_this) {
++    weak_this->CloseDeferredIfNecessary();
++  }
++  // A popup that never finished loading still completes exactly once. The
++  // callback is external and may destroy the popup; do not access this after it.
++  if (shown_callback) {
++    std::move(shown_callback).Run(nullptr);
++  }
++}
++#endif
++
+ void ExtensionPopup::HandleCloseExtensionHost(extensions::ExtensionHost* host) {
+   DCHECK_EQ(host, host_.get());
+   CloseDeferredIfNecessary();
 --- a/chrome/browser/ui/views/extensions/extension_action_delegate_desktop.cc
 +++ b/chrome/browser/ui/views/extensions/extension_action_delegate_desktop.cc
 @@ -13,6 +13,11 @@

@@ -211,6 +211,10 @@ def main():
     if not args.check:
         for path, contents in output.items():
             target = source / path
+            # Exact validation above still runs on every preparation. Preserve
+            # unchanged input mtimes so a resumed link reuses its real objects.
+            if target.read_text() == contents:
+                continue
             temporary = target.with_suffix(target.suffix + ".zacro-tmp")
             temporary.write_text(contents)
             temporary.replace(target)

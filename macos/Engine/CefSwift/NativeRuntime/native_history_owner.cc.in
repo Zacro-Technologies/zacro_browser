@@ -1,0 +1,270 @@
+#include "chrome/browser/history/native_history_owner.h"
+
+#include <map>
+
+#include "base/check.h"
+#include "base/functional/bind.h"
+#include "base/no_destructor.h"
+#include "base/strings/string_util.h"
+#include "base/strings/utf_string_conversions.h"
+#include "base/uuid.h"
+#include "chrome/browser/history/history_tab_helper.h"
+#include "content/public/browser/browser_context.h"
+#include "content/public/browser/browser_thread.h"
+#include "content/public/browser/navigation_handle.h"
+#include "content/public/browser/render_frame_host.h"
+#include "content/public/browser/web_contents.h"
+
+namespace {
+NativeHistoryOwner::Authority& NativeHistoryAuthority() {
+  static base::NoDestructor<NativeHistoryOwner::Authority> value;
+  return *value;
+}
+NativeHistoryOwner::Closed& NativeHistoryClosed() {
+  static base::NoDestructor<NativeHistoryOwner::Closed> value;
+  return *value;
+}
+std::map<std::string, base::WeakPtr<NativeHistoryOwner>>& NativeHistoryTitles() {
+  static base::NoDestructor<std::map<std::string, base::WeakPtr<NativeHistoryOwner>>> value;
+  return *value;
+}
+bool ValidLogicalID(const std::string& value) {
+  return !value.empty() && value.size() <= 1024 && base::IsStringUTF8(value) &&
+      value.find('\0') == std::string::npos;
+}
+bool IsPublic(content::WebContents* contents) {
+  return contents && !contents->IsBeingDestroyed() &&
+      !contents->GetBrowserContext()->IsOffTheRecord();
+}
+}  // namespace
+
+WEB_CONTENTS_USER_DATA_KEY_IMPL(NativeHistoryOwner);
+
+NativeHistoryOwner::NativeHistoryOwner(content::WebContents* contents)
+    : content::WebContentsObserver(contents),
+      content::WebContentsUserData<NativeHistoryOwner>(*contents),
+      token_(base::Uuid::GenerateRandomV4().AsLowercaseString()),
+      context_(contents->GetBrowserContext()) {}
+NativeHistoryOwner::~NativeHistoryOwner() {
+  NativeHistoryTitles().erase(current_event_id_);
+  if (context_ && NativeHistoryClosed()) NativeHistoryClosed().Run(context_, token_);
+}
+const std::string& NativeHistoryOwner::ProducerEpoch() {
+  static base::NoDestructor<std::string> value(base::Uuid::GenerateRandomV4().AsLowercaseString());
+  return *value;
+}
+
+void NativeHistoryOwner::InstallProvider(Authority authority, Closed closed) {
+  CHECK_CURRENTLY_ON(content::BrowserThread::UI);
+  CHECK(authority);
+  NativeHistoryAuthority() = std::move(authority);
+  NativeHistoryClosed() = std::move(closed);
+  HistoryTabHelper::SetNativeMirrorDocumentProvider(
+      base::BindRepeating(&NativeHistoryOwner::Produce));
+}
+
+bool NativeHistoryOwner::RegisterOwned(content::WebContents* contents,
+    const std::string& logical_id, int owner_window_id, bool preview) {
+  CHECK_CURRENTLY_ON(content::BrowserThread::UI);
+  if (!IsPublic(contents) || !ValidLogicalID(logical_id) || owner_window_id <= 0)
+    return false;
+  auto* value = FromWebContents(contents);
+  if (!value) {
+    CreateForWebContents(contents);
+    value = FromWebContents(contents);
+    value->logical_id_ = logical_id;
+    value->owner_window_id_ = owner_window_id;
+    value->preview_ = preview;
+    value->published_ = !preview;
+    value->registered_ = true;
+    return true;
+  }
+  if (value->destroyed_) return false;
+  // Only a Core-atomic publication handoff can change a Peek to an ordinary
+  // published tab. Merely updating the native catalog cannot grant this.
+  if (value->preview_ && !preview && !value->publication_) return false;
+  if (value->published_ && preview) return false;
+  value->logical_id_ = logical_id;
+  value->owner_window_id_ = owner_window_id;
+  value->registered_ = true;
+  // Keep provisional/preview disposition until its DB commit is acknowledged.
+  // A newly registered popup retains all earlier events, still unpublished.
+  return true;
+}
+
+bool NativeHistoryOwner::RegisterProvisionalPopup(content::WebContents* source,
+    const content::GlobalRenderFrameHostId& opener,
+    content::WebContents* created) {
+  CHECK_CURRENTLY_ON(content::BrowserThread::UI);
+  if (!IsPublic(source) || !IsPublic(created) || source == created ||
+      source->GetBrowserContext() != created->GetBrowserContext() ||
+      FromWebContents(created)) return false;
+  auto* origin = FromWebContents(source);
+  auto* frame = content::RenderFrameHost::FromID(opener);
+  if (!origin || !origin->HasRegisteredAuthority() || !frame ||
+      !frame->IsRenderFrameLive() ||
+      content::WebContents::FromRenderFrameHost(frame) != source ||
+      frame->GetBrowserContext() != source->GetBrowserContext()) return false;
+  const auto opener_document = frame->GetWeakDocumentPtr();
+  if (opener_document.AsRenderFrameHostIfValid() != frame) return false;
+  CreateForWebContents(created);
+  auto* value = FromWebContents(created);
+  value->logical_id_ = "popup:" + value->token_;
+  value->owner_window_id_ = origin->owner_window_id_;
+  value->provisional_ = true;
+  // This does not make a logical tab. Only a later durable Core publication
+  // receipt may publish its events. Rejected adoption never creates Core rows.
+  return true;
+}
+
+bool NativeHistoryOwner::IsLivePublic() const {
+  return !destroyed_ && IsPublic(web_contents());
+}
+
+bool NativeHistoryOwner::RegisterProvisionalExtensionPopup(content::RenderFrameHost* source,
+    int native_owner_window_id, content::WebContents* created) {
+  CHECK_CURRENTLY_ON(content::BrowserThread::UI);
+  auto* contents = source ? content::WebContents::FromRenderFrameHost(source) : nullptr;
+  if (!source || !source->IsRenderFrameLive() || !IsPublic(contents) || !IsPublic(created) ||
+      contents == created || native_owner_window_id <= 0 || FromWebContents(created) ||
+      contents->GetBrowserContext() != created->GetBrowserContext() ||
+      source->GetBrowserContext() != created->GetBrowserContext()) return false;
+  const auto document = source->GetWeakDocumentPtr();
+  if (document.AsRenderFrameHostIfValid() != source) return false;
+  CreateForWebContents(created);
+  auto* value = FromWebContents(created);
+  value->logical_id_ = "extension-popup:" + value->token_;
+  value->owner_window_id_ = native_owner_window_id;
+  value->provisional_ = true;
+  return true;
+}
+bool NativeHistoryOwner::HasRegisteredAuthority() const {
+  return IsLivePublic() && registered_ && NativeHistoryAuthority() &&
+      NativeHistoryAuthority().Run(web_contents(), logical_id_, owner_window_id_);
+}
+
+std::optional<NativeHistoryOwner::Snapshot> NativeHistoryOwner::Describe() const {
+  CHECK_CURRENTLY_ON(content::BrowserThread::UI);
+  if (!IsLivePublic() || (!provisional_ && !HasRegisteredAuthority()))
+    return std::nullopt;
+  Snapshot result{token_, logical_id_, owner_window_id_, preview_, provisional_, {}};
+  auto* frame = current_document_.AsRenderFrameHostIfValid();
+  if (frame && frame == web_contents()->GetPrimaryMainFrame())
+    result.current_event_id = current_event_id_;
+  return result;
+}
+
+std::optional<history::NativeHistoryDocument> NativeHistoryOwner::Produce(
+    content::WebContents* contents, content::NavigationHandle* navigation) {
+  CHECK_CURRENTLY_ON(content::BrowserThread::UI);
+  auto* value = contents ? FromWebContents(contents) : nullptr;
+  if (!value || !navigation || navigation->GetWebContents() != contents ||
+      !navigation->HasCommitted() || !navigation->IsInPrimaryMainFrame() ||
+      navigation->IsErrorPage() ||
+      !navigation->GetURL().SchemeIsHTTPOrHTTPS() ||
+      navigation->GetURL().has_username() || navigation->GetURL().has_password() ||
+      navigation->GetURL().spec().size() > 8192 || !value->Describe())
+    return std::nullopt;
+  auto* frame = navigation->GetRenderFrameHost();
+  if (!frame || frame != contents->GetPrimaryMainFrame()) return std::nullopt;
+  if (value->current_navigation_id_ != navigation->GetNavigationId()) {
+    NativeHistoryTitles().erase(value->current_event_id_);
+    value->current_navigation_id_ = navigation->GetNavigationId();
+    value->current_event_id_ = base::Uuid::GenerateRandomV4().AsLowercaseString();
+    value->current_document_ = frame->GetWeakDocumentPtr();
+    NativeHistoryTitles()[value->current_event_id_] = value->GetWeakPtr();
+  }
+  history::NativeHistoryDocument result;
+  result.document_token = value->token_;
+  result.producer_epoch = ProducerEpoch();
+  result.logical_id = value->logical_id_;
+  result.event_id = value->current_event_id_;
+  result.publish = value->published_;
+  result.preview = value->preview_;
+  result.library_visit = !navigation->IsSameDocument();
+  if (value->publication_ && value->disposition_ == Disposition::kPrepared) {
+    result.publish = false;
+    result.preview = false;
+  }
+  return result;
+}
+
+std::optional<std::string> NativeHistoryOwner::TitleForEvent(content::BrowserContext* context,
+    const std::string& event_id, const std::string& url) {
+  CHECK_CURRENTLY_ON(content::BrowserThread::UI);
+  auto found = NativeHistoryTitles().find(event_id);
+  auto* value = found == NativeHistoryTitles().end() ? nullptr : found->second.get();
+  if (!value || value->context_ != context || value->current_event_id_ != event_id || !value->Describe())
+    return std::nullopt;
+  auto* contents = value->web_contents();
+  auto* frame = value->current_document_.AsRenderFrameHostIfValid();
+  if (!frame || frame != contents->GetPrimaryMainFrame() || contents->GetLastCommittedURL().spec() != url)
+    return std::nullopt;
+  return std::string(base::TruncateUTF8ToByteSize(base::UTF16ToUTF8(contents->GetTitle()), 8192));
+}
+
+std::optional<NativeHistoryOwner::Publication> NativeHistoryOwner::BeginPublication(
+    const std::string& request_id, const std::string& expected_token,
+    const std::string& expected_logical_id, int expected_owner_window_id) {
+  CHECK_CURRENTLY_ON(content::BrowserThread::UI);
+  auto captured = Describe();
+  if (!captured || published_ || publication_ ||
+      !base::Uuid::ParseLowercase(request_id).is_valid() ||
+      token_ != expected_token || logical_id_ != expected_logical_id ||
+      owner_window_id_ != expected_owner_window_id || (!preview_ && !provisional_))
+    return std::nullopt;
+  if (!preview_) captured->current_event_id.clear();
+  publication_ = Publication{request_id, std::move(*captured)};
+  disposition_ = Disposition::kPrepared;
+  return publication_;
+}
+
+bool NativeHistoryOwner::Matches(const Publication& value) const {
+  return publication_ && value.lease_id == publication_->lease_id &&
+      value.captured.document_token == token_ &&
+      value.captured.logical_id == publication_->captured.logical_id &&
+      value.captured.owner_window_id == publication_->captured.owner_window_id &&
+      value.captured.preview == publication_->captured.preview &&
+      value.captured.provisional == publication_->captured.provisional &&
+      value.captured.current_event_id == publication_->captured.current_event_id;
+}
+
+bool NativeHistoryOwner::PublicationCommitted(const Publication& value,
+    const std::string& logical_id) {
+  CHECK_CURRENTLY_ON(content::BrowserThread::UI);
+  if (!Matches(value) || disposition_ == Disposition::kCancelled ||
+      !ValidLogicalID(logical_id)) return false;
+  // DB replay remains authoritative even if this WebContents closed or moved.
+  // A surviving producer must already have this Core-registered final identity.
+  if (!HasRegisteredAuthority() || logical_id_ != logical_id) return false;
+  disposition_ = Disposition::kCommitted;
+  preview_ = false; provisional_ = false; published_ = true;
+  return true;
+}
+bool NativeHistoryOwner::PublicationCancelled(const Publication& value) {
+  CHECK_CURRENTLY_ON(content::BrowserThread::UI);
+  if (!Matches(value) || disposition_ == Disposition::kCommitted) return false;
+  disposition_ = Disposition::kCancelled;
+  preview_ = value.captured.preview;
+  published_ = false;
+  return true;
+}
+bool NativeHistoryOwner::FinishPublication(const Publication& value) {
+  CHECK_CURRENTLY_ON(content::BrowserThread::UI);
+  if (!Matches(value) || disposition_ == Disposition::kPrepared) return false;
+  publication_.reset();
+  return true;
+}
+base::WeakPtr<NativeHistoryOwner> NativeHistoryOwner::GetWeakPtr() {
+  CHECK_CURRENTLY_ON(content::BrowserThread::UI);
+  return weak_factory_.GetWeakPtr();
+}
+void NativeHistoryOwner::WebContentsDestroyed() {
+  destroyed_ = true;
+  weak_factory_.InvalidateWeakPtrs();
+  if (context_) {
+    if (NativeHistoryClosed()) NativeHistoryClosed().Run(context_, token_);
+    context_ = nullptr;
+  }
+  Observe(nullptr);
+}

@@ -216,8 +216,9 @@ def apply_inputs(source, environment):
     # their output is stable, so the receipt covers exactly what was applied.
     for _ in range(8):
         before = native_inputs()
+        run([sys.executable, str(HERE / "apply_history_mirror.py"), "--chromium-root", str(source)], source, environment)
         run([sys.executable, str(HERE / "apply_adapter.py"), "--cef-root", str(source / "cef")], source, environment)
-        for name in ["storage_adapter", "bookmark_adapter", "sidepanel_adapter", "popup_anchor", "topology_adapter", "tab_reservation", "native_messaging_adapter", "install_lease_adapter", "management_prompt_adapter", "management_adapter", "gpu_cache_cleanup", "history_flush_adapter", "tab_capture_adapter", "download_adapter", "extension_toolbar_adapter"]:
+        for name in ["storage_adapter", "bookmark_adapter", "sidepanel_adapter", "popup_anchor", "topology_adapter", "tab_reservation", "native_messaging_adapter", "install_lease_adapter", "management_prompt_adapter", "management_adapter", "gpu_cache_cleanup", "history_flush_adapter", "tab_capture_adapter", "download_adapter", "extension_toolbar_adapter", "hosted_panel_layout", "auxiliary_admission", "extension_host_navigation"]:
             run([sys.executable, str(HERE / ("apply_" + name + ".py")), "--chromium-root", str(source)], source, environment)
         if before == native_inputs():
             return before
@@ -308,14 +309,17 @@ def main():
     elif not (source / "out/Release_GN_arm64/build.ninja").is_file():
         raise SystemExit("Generate the pinned Release build before using --skip-generation.")
     else:
-        # A resumed build may predate the explicit media/release settings.
+        # A resumed build may predate the explicit media/release/link settings.
         # Preserve every other generated CEF option and let Ninja regenerate
-        # only the graph/objects affected by these required media features.
+        # only the graph/objects affected by these required settings. Remove the
+        # superseded global reader override: CEF's final link config owns its
+        # memory settings without changing build-tool/code-generator links.
         argument_file = source / "out/Release_GN_arm64/args.gn"
         previous = argument_file.read_text()
         lines = [line for line in previous.splitlines()
                  if line.split("=", 1)[0].strip() not in {
-                     "proprietary_codecs", "ffmpeg_branding", "disable_fieldtrial_testing_config"}]
+                     "proprietary_codecs", "ffmpeg_branding", "disable_fieldtrial_testing_config",
+                     "enable_lld_read_workers"}]
         current = "\n".join(lines + ["proprietary_codecs=true", 'ffmpeg_branding="Chrome"',
                                      "disable_fieldtrial_testing_config=true"]) + "\n"
         if previous != current:

@@ -16,6 +16,7 @@ import ZacroCore
   private weak var application: ApplicationCoordinator?
   private var entries: [ObjectIdentifier: Entry] = [:]
   private var stopped = false
+  var nativeMirrorEnabled = false
 
   init(application: ApplicationCoordinator) { self.application = application }
 
@@ -32,6 +33,10 @@ import ZacroCore
       // Any actual new document invalidates the previous title association,
       // including a privileged/internal document that is not Library history.
       entry.visitID = nil; entry.address = nil
+      if self.nativeMirrorEnabled {
+        self.application?.historyMirror.nativeHistoryChanged(profileID: entry.profileID)
+        return
+      }
       guard !page.id.hasPrefix("peek:"), let application = self.application,
         let address = BrowserAddress.webURL(url.absoluteString)?.absoluteString else { return }
       entry.address = address
@@ -39,7 +44,12 @@ import ZacroCore
         address: address, title: url.host ?? address)
     }
     page.onTitleChanged = { [weak self, weak page, weak entry] title in
-      guard let self, let page, let entry, self.entries[key] === entry,
+      guard let self, let page, let entry, self.entries[key] === entry, self.owns(page, entry: entry) else { return }
+      if self.nativeMirrorEnabled {
+        self.application?.historyMirror.nativeHistoryChanged(profileID: entry.profileID)
+        return
+      }
+      guard
         self.owns(page, entry: entry), !page.id.hasPrefix("peek:"),
         let visitID = entry.visitID, let address = entry.address,
         page.url.flatMap({ BrowserAddress.webURL($0.absoluteString)?.absoluteString }) == address else { return }
@@ -52,6 +62,7 @@ import ZacroCore
   /// Bind its existing ID so a later title event cannot create a second visit.
   func didPromote(_ page: ChromiumPage) {
     connect(page)
+    if nativeMirrorEnabled { application?.historyMirror.nativeHistoryChanged(profileID: page.profileID); return }
     guard let entry = entries[ObjectIdentifier(page)], owns(page, entry: entry),
       !page.id.hasPrefix("peek:"), let application,
       let document = application.store.document(id: page.id),

@@ -21,6 +21,8 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
       if let oldValue { engine.setProfileMaintenance(oldValue, active: false) }
       if let deletingProfileID { engine.setProfileMaintenance(deletingProfileID, active: true) }
       else { resumeApplicationIntents() }
+      if let deletingProfileID { popupAdoptions.beginNativeClose(profileID: deletingProfileID) }
+      else { popupAdoptions.resumeAvailable() }
       for owner in windows.values { owner.peekOpening.cancel() }
       peekLinks.refresh()
       webDialogs.refresh()
@@ -35,7 +37,17 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
   lazy var peekLinks = NativePeekLinkCoordinator(application: self)
   lazy var webDialogs = NativeWebDialogCoordinator(application: self)
   lazy var historyVisits = NativeHistoryCoordinator(application: self)
+  lazy var historyMirror = NativeHistoryMirrorDrain(store: store, available: { [weak self] id in
+    guard let self else { return false }
+    return self.runtimeCapabilities?.historyMirror == true && !self.engine.isTerminating
+      && self.deletingProfileID != id && !self.clearingHistoryProfiles.contains(id)
+      && self.store.state.profiles.contains { $0.id == id && !$0.isPrivate }
+  }, sessionFactory: { [weak self] id in
+    guard let self, !self.engine.isTerminating else { throw CancellationError() }
+    return try await ChromeExtensionManager(engine: self.engine, profileID: id).historyMirrorSession()
+  })
   lazy var pageRetirements = NativePageRetirementCoordinator(application: self)
+  lazy var popupAdoptions = NativePopupAdoptionCoordinator(application: self)
   lazy var services = NativeServicesModel(store: store, directory: engine.dataDirectory,
     conversationProfile: { [weak self] identifier in
       guard let coordinator = self else { return nil }
@@ -55,6 +67,7 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
   private(set) var runtimeCapabilityTask: Task<Void, Never>?
   private(set) var runtimeCapabilitiesChecked = false
   private var runtimeCapabilities: CefNativeCapabilities?
+  var supportsHistoryMirror: Bool { runtimeCapabilities?.historyMirror == true }
   private var observedNativeProfiles: Set<String> = []
   private var libraryStatus: [String: [String: String]] = [:]
   private var privateProfileCleanup: [String: Task<Void, Never>] = [:]
@@ -63,6 +76,17 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
   private var applicationIntents = ApplicationIntentQueue()
   private var applicationReady = false
   private var drainingApplicationIntents = false
+  private var auxiliaryRecoveryEpisode: UUID?
+  private var auxiliaryRecoveryMessage = ""
+  private lazy var auxiliaryTerminationRecovery = NativeAuxiliaryTerminationRecovery(
+    capability: { [weak self] in self?.auxiliaryRecoveryCapability() },
+    preferredWindow: { [weak self] in
+      guard let self else { return nil }
+      if let owner = self.focusedCoordinator, owner.windowContext.isOpen,
+        !owner.windowContext.isClosing, owner.window?.isVisible == true { return owner.window }
+      return self.windows.values.sorted { $0.windowContext.nativeID < $1.windowContext.nativeID }
+        .first { $0.windowContext.isOpen && !$0.windowContext.isClosing && $0.window?.isVisible == true }?.window
+    })
   var pendingApplicationIntentCount: Int { applicationIntents.count }
 
   init(engine: ChromiumEngine, repository: BrowserRepository) {
@@ -150,6 +174,7 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
     inspectRuntimeCapabilities()
     NSApp.activate(ignoringOtherApps: true)
     if !CommandLine.arguments.contains("--native-integration-acceptance"),
+      !(CommandLine.arguments.contains("--engine-acceptance") && CommandLine.arguments.contains("--native-performance-acceptance")),
       let address = ProcessInfo.processInfo.environment["ZACRO_NATIVE_SMOKE_URL"] {
       focusedCoordinator?.navigate(address)
     }
@@ -175,12 +200,36 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
     return failure
   }
 
+  private func auxiliaryRecoveryCapability() -> NativeAuxiliaryTerminationRecovery.Capability? {
+    guard let episode = auxiliaryRecoveryEpisode,
+      let failure = CefRuntime.shared.auxiliaryTerminationFailure else { return nil }
+    return .init(id: episode, message: auxiliaryRecoveryMessage, canCancelQuit: failure.canCancelQuit,
+      retry: {
+        guard CefRuntime.shared.retryAuxiliaryTermination(failure) else { throw CancellationError() }
+      }, cancelQuit: {
+        guard try CefRuntime.shared.cancelAuxiliaryTermination(failure) else { throw CancellationError() }
+      })
+  }
+
   private func installRuntimeCallbacks() {
+    engine.onAuxiliaryAdmissionFailure = { [weak self] error in
+      guard let self else { return }
+      fputs("Zacro native authorization cleanup: \(error.localizedDescription)\n", stderr)
+      guard CefRuntime.shared.auxiliaryTerminationFailure != nil else {
+        self.focusedCoordinator?.showError(error.localizedDescription)
+        return
+      }
+      // This UUID identifies the UI episode only. Each provider read below
+      // obtains the actual opaque authority from the current failed Quit.
+      self.auxiliaryRecoveryEpisode = UUID()
+      self.auxiliaryRecoveryMessage = error.localizedDescription
+      self.auxiliaryTerminationRecovery.refresh(error: error)
+    }
     engine.onUnownedPopupCreated = { [weak self] source, popup, foreground in
       guard let self else { popup.close(); return }
       do {
         let owner = try self.windowForManagedPage(source, foreground: foreground)
-        if !owner.adoptPopup(popup, foreground: foreground) { popup.close() }
+        self.popupAdoptions.begin(popup: popup, source: source, owner: owner, foreground: foreground)
       } catch { popup.close(); self.focusedCoordinator?.showError(error.localizedDescription) }
     }
     engine.onUnownedOpenURL = { [weak self] source, url, foreground in
@@ -194,7 +243,10 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
         owner.scheduleLayout()
       } catch { self.focusedCoordinator?.showError(error.localizedDescription) }
     }
-    engine.onPageClosed = { [weak self] _ in self?.scheduleAllWindows() }
+    engine.onPageClosed = { [weak self] _ in
+      self?.popupAdoptions.refresh()
+      self?.scheduleAllWindows()
+    }
     engine.onPageCloseCancelled = { [weak self] id in
       self?.cancelProfileOperation(forPage: id)
       self?.resumeApplicationIntents()
@@ -203,6 +255,9 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
       guard let self, self.store.document(id: page.id) != nil else { return }
       self.inspectRuntimeCapabilities()
       await self.runtimeCapabilityTask?.value
+      guard self.runtimeCapabilitiesChecked else {
+        throw ShortcutError("Chromium’s browser capabilities could not be verified. Try again.")
+      }
       if self.extensionBrowser.enabled { try await self.extensionBrowser.prepareInitialNavigation(page) }
       try await self.peekLinks.prepareBootstrap(page)
     }
@@ -220,13 +275,21 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
     navigation.didRestore = { [weak self] id, restored in
       self?.owner(tabID: id)?.didRestorePage(id, restored: restored)
     }
+    navigation.didChangeRestoreState = { [weak self] page in
+      guard let self, self.engine.pages[page.id] === page else { return }
+      self.extensionBrowser.reconcile()
+    }
     engine.onTerminationChanged = { [weak self] terminating in
       guard let self else { return }
+      self.auxiliaryRecoveryEpisode = nil
+      self.auxiliaryTerminationRecovery.cancel()
       self.peekLinks.refresh()
       if terminating {
+        self.popupAdoptions.beginNativeClose()
         self.store.save()
         do { try self.store.flush() } catch { self.focusedCoordinator?.showError(error.localizedDescription) }
       } else {
+        self.popupAdoptions.resumeAvailable()
         for id in self.retiredPrivateProfileIDs { self.scheduleRetiredPrivateProfileCleanup(id) }
         self.scheduleAllWindows(); self.resumeApplicationIntents()
       }
@@ -238,6 +301,7 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
       for owner in self.windows.values { owner.prepareTermination() }
       await self.peekLinks.close()
       self.historyVisits.close()
+      await self.historyMirror.close()
       await self.webDialogs.close()
       for owner in self.windows.values { await owner.closeServicesPresentation() }
       await self.downloads.close()
@@ -256,6 +320,28 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
       try await self.navigation.waitForRestore(page)
       guard self.engine.pages[tab.id] === page else { throw CancellationError() }
       return page
+    }
+    extensionBrowser.materializeNavigationPage = { [weak self] tab, preserveHistory in
+      guard let self, let owner = self.owner(tabID: tab.id) else { throw CancellationError() }
+      let page = try await owner.ensurePageReady(tab)
+      if preserveHistory { try await self.navigation.waitForNavigationInstallation(page) }
+      guard self.engine.pages[tab.id] === page else { throw CancellationError() }
+      return page
+    }
+    extensionBrowser.interruptDocumentRestore = { [weak self] page in
+      guard let self, self.engine.pages[page.id] === page else { return }
+      self.navigation.cancelRestore(page)
+    }
+    extensionBrowser.isNavigationRestoring = { [weak self] page in
+      guard let self, self.engine.pages[page.id] === page,
+        let owner = self.owner(tabID: page.id), owner.windowPages[page.id] === page,
+        owner.windowContext.isOpen, !owner.windowContext.isClosing,
+        page.ownerWindowID == owner.windowContext.id,
+        let tab = owner.store.document(id: page.id), !tab.isClosed,
+        owner.store.profileID(for: tab) == page.profileID,
+        let profile = owner.store.state.profiles.first(where: { $0.id == page.profileID }),
+        profile.isPrivate == page.isPrivate else { return false }
+      return self.navigation.isRestoring(page)
     }
     extensionBrowser.prepareActionPopupDocument = { [weak self] windowID, profileID, authorize in
       guard let self, let owner = self.windows[windowID], self.focusedCoordinator === owner else {
@@ -294,10 +380,17 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
     extensionSync.nativeEvent = { [weak self] profile, event in
       guard let self else { return }
       self.bookmarks.nativeEvent(profileID: profile, event: event)
+      if case .historyChanged = event, self.runtimeCapabilities?.historyMirror == true {
+        self.historyMirror.nativeHistoryChanged(profileID: profile)
+      }
       self.downloads.nativeEvent(profileID: profile, event: event)
       for owner in self.windows.values { owner.extensionEvent(profileID: profile, event: event) }
       if case let .hostRequest(request) = event {
         Task { [weak self] in await self?.extensionBrowser.handle(profileID: profile, request: request) }
+      } else if case let .postUninstallNavigation(requestID) = event {
+        Task { [weak self] in
+          await self?.extensionBrowser.handlePostUninstallNavigation(profileID: profile, requestID: requestID)
+        }
       }
     }
     bookmarks.ensureObservation = { [weak self] id in
@@ -308,9 +401,11 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
       guard let self else { return }
       self.observedNativeProfiles.insert(id)
       self.bookmarks.observationReady(profileID: id)
+      if self.runtimeCapabilities?.historyMirror == true { self.historyMirror.observationReady(profileID: id) }
       Task { [weak self] in try? await self?.downloads.refresh(profileID: id) }
     }
     bookmarks.onStatus = { [weak self] id, message in self?.publishLibraryStatus(profileID: id, section: "Bookmarks", message: message) }
+    historyMirror.onStatus = { [weak self] id, message in self?.publishLibraryStatus(profileID: id, section: "History", message: message) }
     downloads.onStatus = { [weak self] id, message in self?.publishLibraryStatus(profileID: id, section: "Downloads", message: message) }
     services.sourceAction = { [weak self] action, payload in
       guard let owner = self?.focusedCoordinator else { throw CancellationError() }
@@ -329,7 +424,9 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
 
   private func focusChanged(_ window: NSWindow) {
     var parent = window
-    while let next = parent.parent { parent = next }
+    var visited = Set<ObjectIdentifier>()
+    while visited.insert(ObjectIdentifier(parent)).inserted,
+      let next = parent.sheetParent ?? parent.parent { parent = next }
     let context = engine.contexts.values.first { $0.window === parent }
       ?? engine.pages.values.first { $0.nativeWindow === window }.flatMap { $0.ownerWindowID.flatMap(engine.context(id:)) }
     guard let context, context.isOpen, let owner = windows[context.id] else { return }
@@ -347,7 +444,15 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
     let cancel = scopeCloseCancelled; scopeCloseCancelled = nil
     // The async clear operation owns its lock until its defer runs. Releasing
     // it here would let another window start before the old operation unwinds.
-    if let cancel { cancel() } else { deletingProfileID = nil }
+    if let cancel { cancel() }
+    else {
+      let profile = deletingProfileID
+      deletingProfileID = nil
+      if let profile {
+        extensionSync.resumeProfile(profile)
+        historyMirror.resume(profileID: profile)
+      }
+    }
     scheduleAllWindows()
   }
   func libraryMessages(profileID: String) -> [String: String] { libraryStatus[profileID, default: [:]] }
@@ -360,6 +465,13 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
   private func windowForManagedPage(_ page: ChromiumPage, foreground: Bool) throws -> BrowserWindowCoordinator {
     guard deletingProfileID != page.profileID, !engine.isTerminating,
       store.state.profiles.contains(where: { $0.id == page.profileID && $0.isPrivate == page.isPrivate }) else { throw CancellationError() }
+    if let id = page.ownerWindowID, let owner = windows[id] {
+      guard owner.windowContext.isOpen, !owner.windowContext.isClosing,
+        owner.store.activeProfileID == page.profileID,
+        owner.store.state.activeProfile?.isPrivate == page.isPrivate else { throw CancellationError() }
+      if foreground { repository.focusWindow(id); owner.windowContext.show() }
+      return owner
+    }
     let matching = windows.values.filter { $0.windowContext.isOpen && !$0.windowContext.isClosing && $0.store.activeProfileID == page.profileID }
     if let owner = matching.first(where: { $0 === focusedCoordinator }) ?? matching.first {
       if foreground { repository.focusWindow(owner.windowContext.id); owner.windowContext.show() }
@@ -475,6 +587,7 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
     if let value = request.width { bounds.width = Double(value) }
     if let value = request.height { bounds.height = Double(value) }
     if request.state == "maximized" { bounds.maximized = true }
+    let existingTabIDs = Set(store.state.tabs.map(\.id))
     let scope = try repository.makeWindow(profileID: request.profileID, movingTabIDs: moving,
       addresses: request.urls, bounds: bounds, nativeAuthorizations: request.nativeAuthorizations,
       kind: request.kind == .popup ? .popup : .normal, focus: request.focused)
@@ -492,8 +605,20 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
     default: break
     }
     coordinator.scheduleLayout()
-    if request.openerRequestID != nil {
-      for tab in created { _ = try await coordinator.ensurePageReady(tab) }
+    for tab in created {
+      try await request.authorize()
+      guard windows[id] === coordinator, coordinator.windowContext.isOpen,
+        !coordinator.windowContext.isClosing, coordinator.store.activeProfileID == request.profileID else {
+        throw CancellationError()
+      }
+      let page = try await extensionBrowser.prepareNavigationDocument(tab,
+        preserveHistory: existingTabIDs.contains(tab.id))
+      try await request.authorize()
+      guard windows[id] === coordinator, coordinator.windowContext.isOpen,
+        !coordinator.windowContext.isClosing, coordinator.store.activeProfileID == request.profileID,
+        engine.pages[tab.id] === page, page.ownerWindowID == id, page.profileID == request.profileID else {
+        throw CancellationError()
+      }
     }
     return id
   }
@@ -572,6 +697,10 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
         self.extensionBrowser.enabled = capabilities.extensionBrowser == true
         self.bookmarks.enabled = capabilities.bookmarks == true
         self.downloads.enabled = capabilities.downloads == true
+        self.historyVisits.nativeMirrorEnabled = capabilities.historyMirror == true
+        if capabilities.historyMirror == true {
+          for id in self.observedNativeProfiles { self.historyMirror.observationReady(profileID: id) }
+        }
         for id in self.observedNativeProfiles { Task { [weak self] in try? await self?.downloads.refresh(profileID: id) } }
         for owner in self.windows.values { self.applyRuntimeCapabilities(to: owner) }
         self.extensionBrowser.reconcile()

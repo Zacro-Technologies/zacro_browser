@@ -4,13 +4,13 @@
 
 Zacro is an open-source, Arc-inspired browser by Zacro Technologies. Keep your everyday sites close, give each project its own Space, and follow your curiosity without losing your place.
 
-![Zacro with Favorites, Spaces and vertical tabs beside a webpage](docs/screenshots/0.10.2/workspace.png)
+![Zacro with Favorites, Spaces and vertical tabs beside a webpage](docs/screenshots/0.11.0-native/workspace.png)
 
 ## A place for everything
 
-Your sidebar brings Favorites, folders and tabs together. Keep the sites you use every day in Favorites, pin useful pages to a Space, and let temporary tabs clear away with automatic archiving. Closing a Favorite or pin keeps its saved destination ready for next time. Their site icons remain available offline.
+Keep everyday sites in **Favorites**, pin useful pages to a Space, and organize them in folders. Temporary tabs can clear away with automatic archiving. Closing a Favorite or pin keeps its saved destination ready for next time, with site icons available offline.
 
-Create **Spaces** for work, personal projects or whatever you're exploring. Give each one its own colors, texture and icon. Shape the look with tactile theme controls and an instant preview. Use separate **profiles** when you want to keep accounts and browsing data apart.
+Give work, personal projects and new interests their own **Spaces**, each with its own colors, texture and icon. Tactile theme controls let you shape the look as you browse. Separate **profiles** keep accounts and browsing data apart.
 
 ## Follow a link without losing your place
 
@@ -18,37 +18,30 @@ Create **Spaces** for work, personal projects or whatever you're exploring. Give
 
 | Peek | Make each Space yours |
 | --- | --- |
-| ![A link preview over the current page](docs/screenshots/0.10.2/peek.png) | ![Space colors and appearance controls](docs/screenshots/0.10.2/space-theme.png) |
+| ![A link preview over the current page](docs/screenshots/0.11.0-native/peek.png) | ![Space colors and appearance controls](docs/screenshots/0.11.0-native/space-theme.png) |
 
-Screenshots show version 0.10.2 on macOS. See the [gallery and capture notes](docs/screenshots/README.md) for more.
+Screenshots show the native macOS 0.11.0 build with local demo pages. See the [capture notes](docs/screenshots/README.md).
 
 ## Move at the speed of a thought
 
-Press **⌘T / Ctrl+T** to find a tab, open a site or search the web. The command bar also finds bookmarks, history, Spaces and browser actions. Shortcuts are yours to customize.
+Press **⌘T** to find a tab, open a site or search the web. The command bar also finds bookmarks, history, Spaces and browser actions. Google is the default search engine; you can choose another in Settings.
 
-Press **⌘S / Ctrl+S** for a content-only view, or **⌘L / Ctrl+L** to edit the address. Your bookmarks, history and downloads are always within reach in Library.
+Press **⌘S** for a content-only view, **⌘L** to edit the address, or **⌘← / ⌘→** to go back and forward. Bookmarks, history and downloads are within reach in Library. Shortcuts are yours to customize.
 
 ## Bring your tools along
 
-Install compatible extensions from the Chrome Web Store and pin your most-used tools beneath the address bar. Open Site controls for extensions and page actions. Optional account sync can share your extension library and, with separate consent, extension settings across linked desktop profiles. Sync currently requires a separately configured service; browsing works without an account. See [extension compatibility](docs/EXTENSIONS.md) and [sync setup](docs/SYNC.md).
+Install Chrome extensions and pin your most-used tools beneath the address bar. Site controls bring extensions and page actions together. See the [native extension support and limits](docs/native-parity/engine-extensions.md).
 
-Optional **Ask Zacro** brings questions, summaries and comparisons into your browsing workflow. Choose a connection, review the page or PDF text you want to share, and ask follow-up questions. Supported connections can research the web and let you open the answer's sources when you're ready. See [AI connections and current limits](docs/AI.md).
+Optional **Ask Zacro** helps you ask questions, summarize pages and compare ideas. Choose a connection and review the page or PDF text you want to share. Supported connections can research the web and link to their sources. [AI connections](docs/AI.md) · [Optional sync](docs/SYNC.md).
 
 ## Try Zacro
 
-**0.10.2 is an early desktop preview for Windows and macOS.** It is still being refined before a signed public release. Some extensions are unsupported, direct Google sign-in is currently reported blocked, and live AI-provider acceptance remains in progress. Read the [release notes](docs/RELEASE-NOTES-0.10.md) and [website sign-in notes](docs/WEB-SIGN-IN.md) before relying on it as your everyday browser.
+The **native macOS 0.11.0 implementation** is on the `swift-rewrite` branch. See the [Mac build guide](macos/README.md) and [verification record](docs/native-parity/verification.md). The local build is development-signed; public distribution signing and notarization remain separate release steps.
 
-To run from source, install Node.js 24 or later:
-
-```sh
-npm ci
-npm start
-```
-
-For more detail: [Mac guide](docs/MACOS.md) · [Roadmap](docs/ROADMAP.md) · [Validation](docs/VALIDATION.md) · [Security](docs/SECURITY.md).
+The earlier Electron desktop preview remains documented in the [0.10 release notes](docs/RELEASE-NOTES-0.10.md). [Website sign-in notes](docs/WEB-SIGN-IN.md) · [Security](docs/SECURITY.md).
 
 ## Help shape it
 
-Share a browsing workflow you'd love to improve, report a bug, or contribute a change. Contributors can start with the [implementation guide](docs/IMPLEMENTATION-CONTRACT.md) and run `npm run verify` before submitting changes.
+Share a browsing workflow you'd love to improve, report a bug, or contribute a change. Start with the [native implementation guide](macos/README.md) or the [Electron implementation guide](docs/IMPLEMENTATION-CONTRACT.md).
 
 Zacro is an independent project, unaffiliated with The Browser Company. Original code is licensed under [MIT](LICENSE); third-party components retain their own licenses.

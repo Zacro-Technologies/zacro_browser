@@ -44,7 +44,33 @@ jobs:
         run: |
           node macos/scripts/check-command-search-reference.cjs --native
           node macos/scripts/check-peek-link-bridge.cjs --check
+          python3 -B macos/scripts/check-peek-link-refresh.py
           python3 -B macos/scripts/check-runtime-termination.py
+          python3 -B macos/Engine/CefSwift/NativeRuntime/test_admission_recovery.py
+          python3 -B macos/scripts/check-document-error.py
+          python3 -B macos/scripts/check-sidebar-toggle.py
+          python3 -B macos/scripts/test_native_foreground_process.py
+      - name: Test pane shadow transparency and native modal-parent lifetime
+        run: |
+          python3 -B macos/scripts/check-pane-shadow.py
+          python3 -B macos/Engine/CefSwift/NativeRuntime/test_external_modal_parent.py --sanitizers
+      # Portable provenance/receipt tests mock build tools and use temporary
+      # fixtures. They do not certify a custom framework or live pinned tree.
+      - name: Test runtime provenance and portable history driver boundaries
+        run: |
+          python3 -B macos/scripts/test_check_app_report.py
+          python3 -B -m unittest macos.Engine.CefSwift.NativeRuntime.test_build_runtime.RuntimeReceiptTests
+          python3 -B -m unittest \
+            macos.Engine.CefSwift.NativeRuntime.test_build_runtime.ResourceGuardTests.test_thresholds_use_swap_delta_not_existing_swap \
+            macos.Engine.CefSwift.NativeRuntime.test_build_runtime.ResourceGuardTests.test_process_scope_excludes_unrelated_compilers \
+            macos.Engine.CefSwift.NativeRuntime.test_build_runtime.ResourceGuardTests.test_missing_telemetry_fails_closed_and_logs_reason \
+            macos.Engine.CefSwift.NativeRuntime.test_history_mirror.HistoryMirrorDriverTests.test_renderer_flush_and_native_mirror_own_disjoint_paths \
+            macos.Engine.CefSwift.NativeRuntime.test_history_mirror.HistoryMirrorDriverTests.test_raw_pinned_adoption_and_repeat_output_are_allowed \
+            macos.Engine.CefSwift.NativeRuntime.test_history_mirror.HistoryMirrorDriverTests.test_exact_previous_receipt_allows_only_known_owned_upgrade \
+            macos.Engine.CefSwift.NativeRuntime.test_history_mirror.HistoryMirrorDriverTests.test_foreign_pin_receipt_and_unreceipted_edits_are_rejected \
+            macos.Engine.CefSwift.NativeRuntime.test_history_mirror.HistoryMirrorDriverTests.test_ambiguous_source_anchor_is_not_silently_applied
+      # The separate live-pinned-transform test needs a verified Chromium tree;
+      # hosted stock diagnostics deliberately make no claim about that coverage.
       - name: Native state and application tests
         run: |
           swift build --package-path macos --product ZacroTextExtractor

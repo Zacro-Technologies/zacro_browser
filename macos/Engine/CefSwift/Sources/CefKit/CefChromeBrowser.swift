@@ -1,6 +1,7 @@
 import AppKit
 import CCef
 import Foundation
+import SwiftUI
 
 /// Options for a chrome-style browser window created via
 /// ``CefChromeBrowser/create(url:options:delegate:)``.
@@ -26,6 +27,10 @@ public struct CefChromeBrowserOptions {
     /// standard close/minimize/zoom buttons). Used by `CefChromeWebView` to
     /// blend the window into a host app; for standalone windows keep `false`.
     public var isFrameless: Bool = false
+
+    /// Hosted page windows are resized by their owning shell, rather than by
+    /// Chromium's independent nonclient resize border.
+    public var isResizable: Bool = true
 
     /// Initial window frame in AppKit screen coordinates (points,
     /// bottom-left origin). `nil` centers a default-sized window.
@@ -109,6 +114,12 @@ public final class CefChromeBrowser {
     private var manualFrame: CGRect?
     private var manualVisible = true
     private var pageCornerRadius: CGFloat = 0
+    private var pageClippingConfigured = false
+    private let pageClipMask = CAShapeLayer()
+    private weak var clippedPageLayer: CALayer?
+    private var pageClipGeometry: CGRect?
+    private var appliedPageClipRadius: CGFloat?
+    private var appliedPageClipScale: CGFloat?
     private var closeRequested = false
     private var pendingPopups: [Int32: CefChromeBrowser] = [:]
     private var popupRequest: CefWindowOpenRequest?
@@ -222,6 +233,7 @@ public final class CefChromeBrowser {
             var options = self.options
             options.nativeTabReservation = nil
             options.isFrameless = true
+            options.isResizable = false
             options.showsWindowOnCreation = false
             options.activatesWhenShown = false
             options.initialBounds = CGRect(x: -16000, y: -16000, width: 600, height: 400)
@@ -294,6 +306,7 @@ public final class CefChromeBrowser {
         pageOptions.profile = profile
         pageOptions.nativeTabReservation = nativeTabReservation
         pageOptions.isFrameless = true
+        pageOptions.isResizable = false
         pageOptions.showsWindowOnCreation = false
         pageOptions.activatesWhenShown = false
         pageOptions.initialBounds = CGRect(x: -16000, y: -16000, width: 600, height: 400)
@@ -323,6 +336,7 @@ public final class CefChromeBrowser {
     /// Clip the actual native document window; a SwiftUI mask cannot clip an
     /// independently composited Chromium child window.
     public func setPageCornerRadius(_ radius: CGFloat) {
+        pageClippingConfigured = true
         pageCornerRadius = radius.isFinite ? max(0, min(64, radius)) : 0
         applyPageCornerRadius()
     }
@@ -351,17 +365,46 @@ public final class CefChromeBrowser {
     }
 
     private func applyPageCornerRadius() {
-        guard let window = nsWindow, let content = window.contentView else { return }
+        guard pageClippingConfigured, let window = nsWindow else { return }
+        // CEF's macOS frameless option removes the titlebar height but creates
+        // a titled, resizable NSWindow. Its AppKit frame still rounds and bevels
+        // the page independently, including when the selected page radius is 0.
+        // Hosted documents have their own contour and are resized by the shell.
+        // Changing the style may rebuild the view hierarchy: refetch it below.
+        if windowOwner != nil, options.isFrameless {
+            let frameStyles: NSWindow.StyleMask = [.titled, .resizable, .closable, .miniaturizable, .fullSizeContentView]
+            if !window.styleMask.intersection(frameStyles).isEmpty {
+                window.styleMask.subtract(frameStyles)
+            }
+        }
+        guard let content = window.contentView else { return }
         window.isOpaque = false
         window.backgroundColor = .clear
         window.hasShadow = false
         content.wantsLayer = true
+        guard let layer = content.layer else { return }
+        let bounds = layer.bounds
+        guard clippedPageLayer !== layer || pageClipGeometry != bounds
+            || appliedPageClipRadius != pageCornerRadius || layer.mask !== pageClipMask
+            || appliedPageClipScale != window.backingScaleFactor else { return }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        content.layer?.cornerRadius = pageCornerRadius
-        content.layer?.masksToBounds = pageCornerRadius > 0
-        content.layer?.cornerCurve = .continuous
+        // CALayer's continuous corner curve and SwiftUI's continuous shape are
+        // not identical contours. Use the very same path as the shell opening,
+        // rather than stacking two independently rounded compositor surfaces.
+        layer.cornerRadius = 0
+        layer.masksToBounds = false
+        pageClipMask.frame = bounds
+        pageClipMask.path = RoundedRectangle(cornerRadius: pageCornerRadius, style: .continuous)
+            .path(in: CGRect(origin: .zero, size: bounds.size)).cgPath
+        pageClipMask.fillColor = NSColor.black.cgColor
+        pageClipMask.contentsScale = window.backingScaleFactor
+        layer.mask = pageClipMask
         CATransaction.commit()
+        clippedPageLayer = layer
+        pageClipGeometry = bounds
+        appliedPageClipRadius = pageCornerRadius
+        appliedPageClipScale = window.backingScaleFactor
     }
 
     public func setPageVisible(_ visible: Bool) {
@@ -401,6 +444,7 @@ public final class CefChromeBrowser {
             }
             window.setFrame(target, display: true)
         }
+        applyPageCornerRadius()
     }
 
     /// Chromium owns document/window destruction; release only after didClose.
@@ -409,6 +453,7 @@ public final class CefChromeBrowser {
     }
 
     fileprivate func handleLayout() {
+        applyPageCornerRadius()
         for page in hostedBrowsers { page.applyPageFrame() }
         onLayout?()
     }
@@ -805,6 +850,12 @@ final class ChromeWindowDelegate {
                 return 1
             }
             return MainActor.assumeIsolated { me.options.isFrameless ? 0 : 1 }
+        }
+
+        d.pointee.can_resize = { delegateSelf, window in
+            cefRelease(window.map(UnsafeMutableRawPointer.init))
+            guard let me = ChromeWindowDelegate.owner(delegateSelf.map(UnsafeMutableRawPointer.init)) else { return 0 }
+            return MainActor.assumeIsolated { me.options.isResizable ? 1 : 0 }
         }
 
         d.pointee.get_initial_bounds = { delegateSelf, window in

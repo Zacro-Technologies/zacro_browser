@@ -19,7 +19,15 @@ VIEW = "chrome/browser/ui/views/extensions/extension_install_dialog_view.cc"
 UNINSTALL_H = BASE + "extension_uninstall_dialog.h"
 UNINSTALL_CC = BASE + "extension_uninstall_dialog.cc"
 CONSTRAINED = "components/constrained_window/constrained_window_views.cc"
-PATHS = (INSTALL_H, INSTALL_CC, PARAMS, VIEW, UNINSTALL_H, UNINSTALL_CC, CONSTRAINED)
+CONSTRAINED_BUILD = "components/constrained_window/BUILD.gn"
+BRIDGE = "components/remote_cocoa/app_shim/native_widget_ns_window_bridge.mm"
+BRIDGE_BUILD = "components/remote_cocoa/app_shim/BUILD.gn"
+EXTERNAL_PARENT = "components/remote_cocoa/app_shim/external_window_modal_parent.h"
+EXTERNAL_PARENT_IMPL = "components/remote_cocoa/app_shim/zacro_external_window_modal_parent.inc"
+NEW = {EXTERNAL_PARENT: "native_external_window_modal_parent.h.in",
+       EXTERNAL_PARENT_IMPL: "native_external_window_modal_parent.inc"}
+PATHS = (INSTALL_H, INSTALL_CC, PARAMS, VIEW, UNINSTALL_H, UNINSTALL_CC, CONSTRAINED,
+         CONSTRAINED_BUILD, BRIDGE, BRIDGE_BUILD, *NEW)
 
 
 def replace(text, old, new):
@@ -296,7 +304,17 @@ void ExtensionUninstallDialog::CancelNativeOperation() {
         parent ? CurrentBrowserModalClient()
                      ->GetModalDialogHost(parent)
                      ->GetAcceleratedWidget()
-               : gfx::kNullAcceleratedWidget;''', '''    auto* parent_host = parent
+               : gfx::kNullAcceleratedWidget;''', '''#if BUILDFLAG(IS_MAC)
+    // AppKit shells have their own sheet owner, not a Chrome/Alloy browser
+    // ModalDialogHost. Looking one up may borrow another focused browser or
+    // DCHECK when the exact shell has no document. The external-parent bridge
+    // below still validates the actual owner before any consent is displayed.
+    const bool has_external_parent_view = parent_view &&
+        !views::Widget::GetWidgetForNativeView(parent_view);
+#else
+    constexpr bool has_external_parent_view = false;
+#endif
+    auto* parent_host = parent && !has_external_parent_view
         ? CurrentBrowserModalClient()->GetModalDialogHost(parent) : nullptr;
     gfx::AcceleratedWidget parent_widget = parent_host
         ? parent_host->GetAcceleratedWidget() : gfx::kNullAcceleratedWidget;''')
@@ -304,11 +322,88 @@ void ExtensionUninstallDialog::CancelNativeOperation() {
                                              ? CurrentBrowserModalClient()
                                                    ->GetModalDialogHost(parent)
                                                    ->GetAcceleratedWidget()
-                                             : gfx::kNullAcceleratedWidget;''', '''  // Native AppKit owners have a host view but no Chrome ModalDialogHost.
-  auto* parent_host = parent
+                                             : gfx::kNullAcceleratedWidget;''', '''#if BUILDFLAG(IS_MAC)
+  // Match BrowserModalHelper: an external AppKit sheet owner must never
+  // resolve its ModalDialogHost through an unrelated focused CEF browser.
+  const bool has_external_parent_view = parent_view &&
+      !views::Widget::GetWidgetForNativeView(parent_view);
+#else
+  constexpr bool has_external_parent_view = false;
+#endif
+  auto* parent_host = parent && !has_external_parent_view
       ? CurrentBrowserModalClient()->GetModalDialogHost(parent) : nullptr;
   gfx::AcceleratedWidget parent_widget = parent_host
       ? parent_host->GetAcceleratedWidget() : gfx::kNullAcceleratedWidget;''')
+    output[CONSTRAINED] = replace(output[CONSTRAINED], '#if BUILDFLAG(IS_OZONE)', '''#if BUILDFLAG(IS_MAC)
+#include "components/remote_cocoa/app_shim/external_window_modal_parent.h"
+#endif
+
+#if BUILDFLAG(IS_OZONE)''')
+    output[CONSTRAINED] = replace(output[CONSTRAINED], '''  bool requires_positioning = dialog->use_custom_frame();''', '''#if BUILDFLAG(IS_MAC)
+  if (parent && !views::Widget::GetWidgetForNativeView(parent_view) &&
+      !remote_cocoa::SetExternalWindowModalParent(widget->GetNativeWindow(), parent)) {
+    // Unsupported remote/closed native owners must not display orphan consent.
+    widget->Close();
+  }
+#endif
+
+  bool requires_positioning = dialog->use_custom_frame();''')
+    output[CONSTRAINED] = replace(output[CONSTRAINED], '''    widget->Show();
+    return widget;
+  }
+};''', '''    if (!widget->IsClosed()) widget->Show();
+    return widget;
+  }
+};''')
+    output[CONSTRAINED_BUILD] = replace(output[CONSTRAINED_BUILD], '''  if (use_aura) {''', '''  if (is_mac) {
+    deps += [ "//components/remote_cocoa/app_shim" ]
+  }
+
+  if (use_aura) {''')
+    output[BRIDGE_BUILD] = replace(output[BRIDGE_BUILD], '''    "drag_drop_client.h",''', '''    "drag_drop_client.h",
+    "external_window_modal_parent.h",
+    "zacro_external_window_modal_parent.inc",''')
+    output[BRIDGE] = replace(output[BRIDGE], '''using remote_cocoa::mojom::VisibilityTransition;''', '''#include "components/remote_cocoa/app_shim/external_window_modal_parent.h"
+#include "components/remote_cocoa/app_shim/zacro_external_window_modal_parent.inc"
+
+using remote_cocoa::mojom::VisibilityTransition;''')
+    output[BRIDGE] = replace(output[BRIDGE], '''  return parent_ && modal_type_ == ui::mojom::ModalType::kWindow;''', '''  return (parent_ || ExternalWindowModalParent(window_)) &&
+      modal_type_ == ui::mojom::ModalType::kWindow;''')
+    output[BRIDGE] = replace(output[BRIDGE], '''void NativeWidgetNSWindowBridge::ShowAsModalSheet() {
+  // -[NSWindow beginSheet''', '''void NativeWidgetNSWindowBridge::ShowAsModalSheet() {
+  auto* external_parent = ExternalWindowModalParent(window_);
+  NSWindow* parent_window = external_parent ? external_parent.parent : parent_->ns_window();
+  if (external_parent && !ExternalWindowModalParentIsReady(window_, parent_window)) {
+    CloseWindow();
+    return;
+  }
+  // -[NSWindow beginSheet''')
+    output[BRIDGE] = replace(output[BRIDGE], '''  NSWindow* parent_window = parent_->ns_window();
+  if (NativeWidgetMacNSWindow* parent_widget_window =
+          base::apple::ObjCCast<NativeWidgetMacNSWindow>(parent_window)) {''', '''  if (NativeWidgetMacNSWindow* parent_widget_window = !external_parent
+          ? base::apple::ObjCCast<NativeWidgetMacNSWindow>(parent_window) : nil) {''')
+    output[BRIDGE] = replace(output[BRIDGE], '''        [parent_window beginSheet:bridge->ns_window()''', '''        if (ExternalWindowModalParent(bridge->ns_window()) &&
+            !ExternalWindowModalParentIsReady(bridge->ns_window(), parent_window)) {
+          bridge->CloseWindow();
+          return;
+        }
+        [parent_window beginSheet:bridge->ns_window()''')
+    output[BRIDGE] = replace(output[BRIDGE], '''  base::WeakPtr<NativeWidgetNSWindowBridge> weak_this = factory_.GetWeakPtr();
+  // AppKit's sheet presentation''', '''  // Retain a normal Views parent's original lifetime contract, while the
+  // external AppKit shell stays weak even across the posted presentation task.
+  NSWindow* __weak external_sheet_parent = external_parent ? parent_window : nil;
+  NSWindow* owned_sheet_parent = external_parent ? nil : parent_window;
+  const bool has_external_parent = external_parent != nil;
+  base::WeakPtr<NativeWidgetNSWindowBridge> weak_this = factory_.GetWeakPtr();
+  // AppKit's sheet presentation''')
+    output[BRIDGE] = replace(output[BRIDGE], '''        if (ExternalWindowModalParent(bridge->ns_window()) &&
+            !ExternalWindowModalParentIsReady(bridge->ns_window(), parent_window)) {''', '''        NSWindow* sheet_parent_window = has_external_parent
+            ? external_sheet_parent : owned_sheet_parent;
+        if (has_external_parent &&
+            !ExternalWindowModalParentIsReady(bridge->ns_window(), sheet_parent_window)) {''')
+    output[BRIDGE] = replace(output[BRIDGE], '''        [parent_window beginSheet:bridge->ns_window()''',
+        '''        [sheet_parent_window beginSheet:bridge->ns_window()''')
+    for path, template in NEW.items(): output[path] = (ROOT / template).read_text()
     return output
 
 
@@ -317,21 +412,23 @@ def digest(text):
 
 
 def source_baselines(source):
-    originals = {p: subprocess.check_output(["git", "show", "HEAD:" + p], cwd=source, text=True) for p in PATHS}
+    originals = {p: "" if p in NEW else subprocess.check_output(["git", "show", "HEAD:" + p], cwd=source, text=True) for p in PATHS}
     cef = source / "cef"
     revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=cef, text=True).strip()
     if not revision.startswith(CEF_PIN):
         raise SystemExit("Unexpected pinned CEF revision: " + revision)
-    patch = subprocess.check_output(["git", "show", "HEAD:patch/patches/chrome_browser_dialogs_widget.patch"], cwd=cef, text=True)
-    selected = ["diff --git " + section for section in patch.split("diff --git ")[1:]
-                if section.splitlines()[0].split()[0] == CONSTRAINED]
-    if len(selected) != 1:
-        raise SystemExit("Pinned CEF constrained-window patch changed")
-    with tempfile.TemporaryDirectory(prefix="zacro-prompt-baseline-") as temporary:
-        root = Path(temporary); target = root / CONSTRAINED
-        target.parent.mkdir(parents=True); target.write_text(originals[CONSTRAINED])
-        subprocess.run(["git", "apply", "-p0", "--unsafe-paths", "-"], input=selected[0], cwd=root, text=True, check=True)
-        originals[CONSTRAINED] = target.read_text()
+    for patch_name, path in [("chrome_browser_dialogs_widget.patch", CONSTRAINED),
+                             ("mac_print_preview_modal.patch", BRIDGE)]:
+        patch = subprocess.check_output(["git", "show", "HEAD:patch/patches/" + patch_name], cwd=cef, text=True)
+        selected = ["diff --git " + section for section in patch.split("diff --git ")[1:]
+                    if section.splitlines()[0].split()[0] == path]
+        if len(selected) != 1:
+            raise SystemExit("Pinned CEF native-window patch changed: " + patch_name)
+        with tempfile.TemporaryDirectory(prefix="zacro-prompt-baseline-") as temporary:
+            root = Path(temporary); target = root / path
+            target.parent.mkdir(parents=True); target.write_text(originals[path])
+            subprocess.run(["git", "apply", "-p0", "--unsafe-paths", "-"], input=selected[0], cwd=root, text=True, check=True)
+            originals[path] = target.read_text()
     return originals
 
 
@@ -355,15 +452,16 @@ def main():
     originals = source_baselines(source); output = generated(originals)
     receipt = source / "out/zacro-native-management-prompts.json"
     prior = json.loads(receipt.read_text()) if receipt.exists() else {}
-    validate_current(originals, output, {p: (source / p).read_text() for p in PATHS}, prior)
+    validate_current(originals, output, {p: (source / p).read_text() if (source / p).exists() else "" for p in PATHS}, prior)
     patch = "".join("".join(difflib.unified_diff(originals[p].splitlines(True), output[p].splitlines(True),
-        fromfile="a/" + p, tofile="b/" + p)) for p in PATHS)
+        fromfile="a/" + p if originals[p] else "/dev/null", tofile="b/" + p)) for p in PATHS)
     if args.emit_patch or not args.check:
         (ROOT / "native-management-prompts.patch").write_text(patch)
     if not args.check and not args.emit_patch:
         for path, contents in output.items():
             target = source / path
-            if target.read_text() != contents:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.exists() or target.read_text() != contents:
                 temporary = target.with_suffix(target.suffix + ".zacro-tmp")
                 temporary.write_text(contents); temporary.replace(target)
         receipt.parent.mkdir(parents=True, exist_ok=True)

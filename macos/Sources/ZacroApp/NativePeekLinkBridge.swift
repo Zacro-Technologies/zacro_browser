@@ -237,9 +237,7 @@ final class NativePeekLinkBridge {
 
   func refresh() {
     guard !stopped else { return }
-    if let armed, snapshot() == armed.observedSnapshot,
-      page?.url?.absoluteString == armed.frame.url,
-      contexts[armed.context.id]?.uniqueID == armed.context.uniqueID { return }
+    if hasCurrentObservation { return }
     desiredRevision &+= 1
     guard started, refreshTask == nil else { return }
     refreshTask = Task { @MainActor [weak self] in
@@ -247,11 +245,25 @@ final class NativePeekLinkBridge {
       defer { self.refreshTask = nil }
       while !self.stopped, self.handledRevision != self.desiredRevision {
         let revision = self.desiredRevision
-        do { try await self.armCurrentDocument() }
-        catch { self.trace("arm.deferred \(error.localizedDescription)") }
+        // Several layout/context notifications may arrive while the same
+        // document's first installation is awaiting its renderer response.
+        // Once that installation succeeds, consume the redundant revisions
+        // without replacing its nonce. An already-intercepted trusted click
+        // must not lose its authority to an identical second installation.
+        if !self.hasCurrentObservation {
+          do { try await self.armCurrentDocument() }
+          catch { self.trace("arm.deferred \(error.localizedDescription)") }
+        }
         self.handledRevision = revision
       }
     }
+  }
+
+  private var hasCurrentObservation: Bool {
+    guard let armed, snapshot() == armed.observedSnapshot,
+      page?.url?.absoluteString == armed.frame.url,
+      contexts[armed.context.id]?.uniqueID == armed.context.uniqueID else { return false }
+    return true
   }
 
   /// Revokes authority immediately. Await the returned cleanup when retaining
@@ -261,19 +273,60 @@ final class NativePeekLinkBridge {
     trace("stop.revoke")
     stopped = true; invalidate()
     finishBootstrap(.failure(CancellationError()))
-    if let eventToken { browser?.devTools.removeEventObserver(eventToken); self.eventToken = nil }
     startTask?.cancel(); pageEnableTask?.cancel(); refreshTask?.cancel()
     let attachment = attachmentTask
     let diagnosticScript = diagnosticScriptTask
     let task = Task { @MainActor [self] in
+      defer {
+        if let eventToken { self.browser?.devTools.removeEventObserver(eventToken); self.eventToken = nil }
+        contexts.removeAll(); boundContexts.removeAll(); self.browser = nil; sessionID = nil
+        trace("stop.finished")
+      }
       _ = try? await attachment?.value
       _ = try? await diagnosticScript?.value
-      guard let browser, !browser.isClosed else { self.browser = nil; return }
+      guard let browser, !browser.isClosed else { return }
+      if eventToken == nil {
+        // Stop may precede beginStart's observer installation. Even then, only
+        // this exact session/world's cleanup lifecycle may be observed.
+        let sourceSession = sessionID
+        eventToken = try? browser.devTools.observeProtocolEvents { [weak self] method, params, source in
+          guard source == sourceSession else { return }
+          self?.receive(method, params)
+        }
+      }
       // Do not disable shared CDP domains. Remove only our own world state,
       // binding and document-start script.
       let bindingLiteral = String(decoding: try! JSONSerialization.data(withJSONObject: bindingName,
         options: [.fragmentsAllowed]), as: UTF8.self)
-      for context in boundContexts.values {
+      var cleanupContexts = boundContexts
+      do {
+        // Native commands already submitted by a cancelled arm still run.
+        // Keep observing their exact contexts, then reacquire the current
+        // main frame's same private world. Never infer a unique context from
+        // a reusable numeric ID or evaluate in the page's default world.
+        _ = try await call("Runtime.enable", on: browser, timeout: 1)
+        let current = try await frame(in: browser, timeout: 1)
+        let world = try await call("Page.createIsolatedWorld", on: browser, parameters: [
+          "frameId": current.id, "worldName": worldName,
+        ], timeout: 1)
+        guard let id = world["executionContextId"] as? Int, let context = contexts[id],
+          context.frameID == current.id, try await frame(in: browser, timeout: 1) == current else {
+          throw CancellationError()
+        }
+        mainFrameID = current.id
+        cleanupContexts[context.uniqueID] = context
+      } catch { trace("stop.currentWorldUnavailable \(error.localizedDescription)") }
+      // The document-start bootstrap owns pagehide before arming adds its
+      // binding. Rapid Back/Forward may stop between executionContextCreated
+      // and that binding registration. Retire that already-observed exact
+      // world too; unrelated/subframe worlds never enter this cleanup set.
+      if let mainFrameID {
+        for context in contexts.values where context.frameID == mainFrameID {
+          cleanupContexts[context.uniqueID] = context
+        }
+      }
+      trace("stop.dispose contexts=\(cleanupContexts.count)")
+      for context in cleanupContexts.values {
         _ = try? await call("Runtime.evaluate", on: browser, parameters: [
           // Runtime.removeBinding removes the inspector registration, not the
           // JavaScript function. Abort the listener and remove that function
@@ -296,8 +349,6 @@ final class NativePeekLinkBridge {
             parameters: ["identifier": scriptID], timeout: 1)
         }
       }
-      contexts.removeAll(); boundContexts.removeAll(); self.browser = nil; sessionID = nil
-      trace("stop.finished")
     }
     cleanupTask = task
     return task
@@ -345,7 +396,15 @@ final class NativePeekLinkBridge {
   }
 
   private func receive(_ method: String, _ params: [String: Any]) {
-    guard !stopped else { return }
+    if stopped {
+      // Revocation is immediate; late renderer replies may contribute only
+      // exact-world cleanup identities, never click or arming authority.
+      switch method {
+      case "Runtime.executionContextCreated", "Runtime.executionContextDestroyed",
+        "Runtime.executionContextsCleared", "Page.frameNavigated", "Page.frameDetached": break
+      default: return
+      }
+    }
     switch method {
     case "Runtime.executionContextCreated":
       guard let value = params["context"] as? [String: Any], value["name"] as? String == worldName,
@@ -354,7 +413,7 @@ final class NativePeekLinkBridge {
         aux["isDefault"] as? Bool == false else { return }
       contexts[id] = Context(id: id, uniqueID: uniqueID, frameID: frameID)
       trace("event.worldCreated context=\(id) frame=\(frameID)")
-      refresh()
+      if !stopped { refresh() }
     case "Runtime.executionContextDestroyed":
       guard let id = params["executionContextId"] as? Int else { return }
       if let uniqueID = params["executionContextUniqueId"] as? String,
@@ -362,15 +421,15 @@ final class NativePeekLinkBridge {
       if let context = contexts.removeValue(forKey: id) {
         boundContexts.removeValue(forKey: context.uniqueID)
       }
-      if armed?.context.id == id { invalidate(); refresh() }
+      if armed?.context.id == id { invalidate(); if !stopped { refresh() } }
     case "Runtime.executionContextsCleared":
       trace("event.contextsCleared")
-      contexts.removeAll(); boundContexts.removeAll(); invalidate(); refresh()
+      contexts.removeAll(); boundContexts.removeAll(); invalidate(); if !stopped { refresh() }
     case "Page.frameNavigated":
       guard let frame = params["frame"] as? [String: Any], frame["parentId"] == nil else { return }
       mainFrameID = frame["id"] as? String
       trace("event.mainFrameNavigated")
-      invalidate(); refresh()
+      invalidate(); if !stopped { refresh() }
     case "Page.navigatedWithinDocument":
       guard let frameID = params["frameId"] as? String, mainFrameID == frameID else { return }
       trace("event.withinDocument")
@@ -384,8 +443,8 @@ final class NativePeekLinkBridge {
     }
   }
 
-  private func frame(in browser: CefBrowser) async throws -> Frame {
-    let result = try await call("Page.getFrameTree", on: browser)
+  private func frame(in browser: CefBrowser, timeout: TimeInterval = 15) async throws -> Frame {
+    let result = try await call("Page.getFrameTree", on: browser, timeout: timeout)
     guard let tree = result["frameTree"] as? [String: Any], let value = tree["frame"] as? [String: Any],
       let id = value["id"] as? String, let loaderID = value["loaderId"] as? String,
       let url = value["url"] as? String, !id.isEmpty, !loaderID.isEmpty else { throw CefDevToolsError.invalidMessage }
@@ -463,7 +522,12 @@ final class NativePeekLinkBridge {
         guard self.generation == epoch, self.requestGeneration == request,
           self.armed?.nonce == armed.nonce, self.contexts[contextID]?.uniqueID == armed.context.uniqueID,
           self.browser === browser, currentFrame == armed.frame, self.valid(expected),
-          NativePeekLinkPolicy.destination(click, snapshot: expected) == destination else { return }
+          NativePeekLinkPolicy.destination(click, snapshot: expected) == destination else {
+          self.trace("click.retired epoch=\(self.generation == epoch) request=\(self.requestGeneration == request)"
+            + " nonce=\(self.armed?.nonce == armed.nonce) context=\(self.contexts[contextID]?.uniqueID == armed.context.uniqueID)"
+            + " browser=\(self.browser === browser) frame=\(currentFrame == armed.frame) snapshot=\(self.valid(expected))")
+          return
+        }
         // DOM client coordinates are CSS pixels, unlike CEF context-menu
         // coordinates. Match Electron's getZoomFactor conversion once here.
         let zoom = pow(1.2, browser.zoomLevel)
@@ -524,7 +588,7 @@ final class NativePeekLinkBridge {
         if (!request) return;
         event.preventDefault(); globalThis[binding](JSON.stringify(request));
       }, { signal: controller.signal });
-      window.addEventListener('pagehide', () => { state.configuration = null; }, { signal: controller.signal });
+      window.addEventListener('pagehide', () => { state.dispose(); }, { signal: controller.signal });
     })()
     """#
   }

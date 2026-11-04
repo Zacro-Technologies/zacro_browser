@@ -1,0 +1,63 @@
+{
+  "version": "0.11.0",
+  "build": "1",
+  "implementation": "Native Swift macOS",
+  "package": "custom-47",
+  "baseCommit": "93e68b5b12b664b2b9d1bbab5169c4788abe9817",
+  "nativeExecutableSHA256": "c3d8b5bfa4ca30e7bdb21ce73f673ca381501cc7b908f1c33cb6111f134590d0",
+  "frameworkSHA256": "6ece980fc86ca3a5c369c7e447e7bccf6e200e2f12921685229e52294e42a730",
+  "capture": {
+    "method": "Intact macOS screencapture region at exact browser window bounds; Computer Use for all final interactions",
+    "logicalBounds": {
+      "x": 80,
+      "y": 149,
+      "width": 1440,
+      "height": 940
+    },
+    "scale": 2,
+    "retouched": false,
+    "desktopInputUsed": true,
+    "normalAppExitCode": 0,
+    "profile": "Fresh disposable acceptance profile, deleted after normal Quit",
+    "content": "Original local demo pages in macos/scripts/fixtures/native-showcase",
+    "theme": {
+      "appearance": "light",
+      "primary": "#486786",
+      "secondary": "#78B8A2",
+      "intensity": 0.65,
+      "blend": 0.5,
+      "grain": 0.12,
+      "opacity": 1,
+      "blur": 0
+    },
+    "notes": [
+      "The macOS sharing indicator covers the traffic-light controls and is preserved.",
+      "Opaque chrome is selected for these captures; they do not demonstrate behind-window desktop blur.",
+      "Stills document appearance, not animation, physical trackpad input, or universal extension compatibility."
+    ]
+  },
+  "images": {
+    "peek.png": {
+      "sha256": "aaa8c9c00519ba140f82de7996f6236216825aa5eb16bb07362c18e85172be8b",
+      "width": 2880,
+      "height": 1880,
+      "bytes": 2589082,
+      "capturedAtUTC": "2026-11-04T00:48:23.469335+00:00"
+    },
+    "space-theme.png": {
+      "sha256": "797d77f364a58be4bef4e5ff73a7030734ac3778675b04fb80de47adb167b27c",
+      "width": 2880,
+      "height": 1880,
+      "bytes": 1936424,
+      "capturedAtUTC": "2026-11-04T00:47:46.317131+00:00"
+    },
+    "workspace.png": {
+      "sha256": "2b978652f7133ae8d38ae3e38ac18ff47da1b6af8098af7a8c10180af296176c",
+      "width": 2880,
+      "height": 1880,
+      "bytes": 1950820,
+      "capturedAtUTC": "2026-11-04T00:48:01.974127+00:00"
+    }
+  },
+  "sourceState": "Uncommitted swift-rewrite work at package47 build; the exact packaged executable hash identifies the captured runtime."
+}

@@ -52,6 +52,32 @@ import Foundation
 @MainActor enum DispatchQueue {static let main=FixtureQueue()}
 @MainActor final class FixtureApp {func terminate(_ sender:Any?) {fatalError("Unexpected real termination")}}
 @MainActor let NSApp=FixtureApp()
+enum AdmissionFailure:Error {case status,release}
+@MainActor final class CefAuxiliaryAdmissionLease {
+  struct Status {let requests:Int;var isQuiescent:Bool {requests==0}}
+  static var next:CefAuxiliaryAdmissionLease?
+  var requests=0,waiters=0
+  var statusFails=false,releaseFails=false,released=false
+  static func acquireProcess() throws->CefAuxiliaryAdmissionLease? {
+    defer {next=nil};return next ?? CefAuxiliaryAdmissionLease()
+  }
+  func status() throws->Status {
+    if statusFails || released {throw AdmissionFailure.status}
+    return Status(requests:requests)
+  }
+  func waitForQuiescence() async throws {
+    waiters += 1;defer {waiters -= 1}
+    while true {
+      try Task.checkCancellation()
+      if try status().isQuiescent {return}
+      await Task.yield()
+    }
+  }
+  func release() throws {
+    if releaseFails {throw AdmissionFailure.release}
+    released=true
+  }
+}
 @MainActor final class CefRuntime {
   static var shared=CefRuntime()
   var isInitialized=true
@@ -65,6 +91,12 @@ import Foundation
   var onTerminationChanged:((Bool)->Void)?
   var beforeClosingDocuments:(() async->Bool)?
   var onReadyToTerminate:(()->Void)?
+  var auxiliaryAdmission:CefAuxiliaryAdmissionLease?
+  var auxiliaryDrainTask:Task<Void,Never>?
+  var auxiliaryDrainAttemptID:UUID?
+  var auxiliaryAdmissionFailureAttemptID:UUID?
+  var auxiliaryFinalCleanupStarted=false
+  var onAuxiliaryAdmissionFailure:((Error)->Void)?
   // The host boundary is a real native-window lifetime in production. These
   // deterministic signals never stand in for an actual AppKit/window test.
   var hasLiveAuxiliaryWindows=false
@@ -119,7 +151,7 @@ FIXTURE = r'''
       for _ in 0..<1000 {if condition(){return};await Task.yield()}
       fatalError("Fixture continuation did not drain")
     }
-    func reset(){DispatchQueue.main.jobs=[];CefChromeBrowser.rootBrowserIDs=[];CefChromeBrowser.hasHostedWindows=false;CefChromeBrowser.hasLiveWindows=true}
+    func reset(){DispatchQueue.main.jobs=[];CefChromeBrowser.rootBrowserIDs=[];CefChromeBrowser.hasHostedWindows=false;CefChromeBrowser.hasLiveWindows=true;CefAuxiliaryAdmissionLease.next=nil}
     for oldResult in [false,true] {
       reset();let runtime=CefRuntime(), browser=CefBrowser(1), a=Gate(), b=Gate()
       runtime.browsers[1]=browser
@@ -257,7 +289,58 @@ FIXTURE = r'''
       require(engine.finished==1 && cleanupCalls==1 && !engine.retirementPhase.canBeginTask,
         "replacementReusesCleanupAndKeepsAdmissionClosed_"+String(cleanupCompletesBeforeRetry))
     }
-    let data=try JSONSerialization.data(withJSONObject:["checks":checks,"count":checks.count,"nativeCEFVerified":false],options:[.prettyPrinted,.sortedKeys])
+    require(checks.count==35,"allPreviousLifecycleChecksRetained")
+    do {
+      reset();CefChromeBrowser.hasLiveWindows=false
+      let runtime=CefRuntime(),lease=CefAuxiliaryAdmissionLease();lease.requests=1
+      CefAuxiliaryAdmissionLease.next=lease;var ready=0
+      runtime.onReadyToTerminate={ready += 1}
+      _=runtime.handleTerminationRequest();await spin{lease.waiters==1}
+      require(ready==0 && DispatchQueue.main.jobs.isEmpty && runtime.auxiliaryAdmission===lease,
+        "unpresentedNativeRequestRetainsQuitBarrier")
+      lease.requests=0;await spin{!DispatchQueue.main.jobs.isEmpty};DispatchQueue.main.drain()
+      require(ready==1,"actualNativeRequestQuiescenceReleasesQuitBarrier")
+    }
+    do {
+      reset();CefChromeBrowser.hasLiveWindows=false
+      let runtime=CefRuntime(),lease=CefAuxiliaryAdmissionLease();lease.statusFails=true
+      CefAuxiliaryAdmissionLease.next=lease;var ready=0,alerts=0
+      runtime.onReadyToTerminate={ready += 1};runtime.onAuxiliaryAdmissionFailure={_ in alerts += 1}
+      _=runtime.handleTerminationRequest();runtime.chromeWindowDidClose();runtime.chromeWindowDidClose()
+      require(ready==0 && alerts==1 && runtime.auxiliaryTerminationFailure != nil,
+        "failedNativeStatusRetainsAttemptAndReportsOnce")
+      let failure=runtime.auxiliaryTerminationFailure!;lease.statusFails=false
+      require(runtime.retryAuxiliaryTermination(failure),"onlyExactExplicitFailureRetryIsAccepted")
+      DispatchQueue.main.drain();require(ready==1,"explicitRetryRechecksActualNativeStatus")
+    }
+    do {
+      reset();CefChromeBrowser.hasLiveWindows=false
+      let runtime=CefRuntime(),browser=CefBrowser(11),lease=CefAuxiliaryAdmissionLease()
+      runtime.browsers[11]=browser;lease.releaseFails=true;CefAuxiliaryAdmissionLease.next=lease
+      var cancelled=0;runtime.onTerminationChanged={if !$0 {cancelled += 1}}
+      _=runtime.handleTerminationRequest();let attempt=runtime.terminationAttemptID
+      runtime.cancelTerminationRequest(for:browser)
+      require(runtime.isTerminationRequested && runtime.terminationAttemptID==attempt && cancelled==0
+        && runtime.auxiliaryAdmission===lease && runtime.auxiliaryTerminationFailure != nil,
+        "failedStayLeaseReleaseCannotPublishUsableCancellation")
+      lease.releaseFails=false;runtime.cancelTerminationRequest(for:browser)
+      require(!runtime.isTerminationRequested && cancelled==1 && lease.released,
+        "ordinaryStayPublishesCancellationOnlyAfterNativeRelease")
+    }
+    do {
+      reset();CefChromeBrowser.hasLiveWindows=false
+      let runtime=CefRuntime(),browser=CefBrowser(12),old=CefAuxiliaryAdmissionLease(),new=CefAuxiliaryAdmissionLease()
+      old.requests=1;new.requests=1;CefAuxiliaryAdmissionLease.next=old;var ready=0
+      runtime.onReadyToTerminate={ready += 1};_=runtime.handleTerminationRequest();await spin{old.waiters==1}
+      runtime.cancelTerminationRequest(for:browser);CefAuxiliaryAdmissionLease.next=new
+      _=runtime.handleTerminationRequest();let attempt=runtime.terminationAttemptID;await spin{new.waiters==1}
+      old.requests=0;for _ in 0..<30 {await Task.yield()};DispatchQueue.main.drain()
+      require(ready==0 && runtime.terminationAttemptID==attempt && runtime.auxiliaryAdmission===new && !new.released,
+        "staleNativeDrainCannotReleaseReplacementAdmission")
+      new.requests=0;await spin{!DispatchQueue.main.jobs.isEmpty};DispatchQueue.main.drain()
+      require(ready==1,"replacementDrainWaitsForItsExactNativeRequests")
+    }
+    let data=try JSONSerialization.data(withJSONObject:["checks":checks,"count":checks.count,"previousLifecycleChecks":35,"nativeCEFVerified":false],options:[.prettyPrinted,.sortedKeys])
     print(String(decoding:data,as:UTF8.self))
   }
 }
@@ -274,6 +357,13 @@ def main():
                 "    func chromeWindowDidClose()", "    private func scheduleTerminationIfReady()",
                 "    public func deferredTerminationCompletion(_ completion: @escaping () -> Void)",
                 "    private func completeTermination(attempt: UUID, completion: @escaping () -> Void)",
+                "    private func auxiliaryAdmissionIsQuiescent(attempt: UUID)",
+                "    private func reportAuxiliaryAdmissionFailure(_ error: Error, attempt: UUID)",
+                "    private func releaseAuxiliaryAdmissionForCancelledAttempt(attempt: UUID)",
+                "    public struct AuxiliaryTerminationFailure",
+                "    public var auxiliaryTerminationFailure: AuxiliaryTerminationFailure?",
+                "    public func retryAuxiliaryTermination(_ failure: AuxiliaryTerminationFailure)",
+                "    public func cancelAuxiliaryTermination(_ failure: AuxiliaryTerminationFailure)",
                 "    func handleTerminationRequest()", "    func cancelTerminationRequest(for browser: CefBrowser)"]
     engine=ENGINE.read_text()
     fixture=PRELUDE+"\n".join(method(source,signature) for signature in signatures)+ENGINE_PRELUDE
@@ -288,7 +378,7 @@ def main():
         subprocess.run(["xcrun","swiftc","-parse-as-library",str(swift),"-o",str(binary)],check=True)
         result=subprocess.check_output([str(binary)],text=True)
         parsed=json.loads(result)
-        if len(parsed["checks"])!=35 or len(set(parsed["checks"]))!=35:
+        if len(parsed["checks"])!=45 or len(set(parsed["checks"]))!=45:
             raise SystemExit("Incomplete termination lifecycle fixture")
         if args.output:
             args.output.parent.mkdir(parents=True,exist_ok=True);args.output.write_text(result)

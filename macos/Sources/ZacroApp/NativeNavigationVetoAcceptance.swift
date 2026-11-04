@@ -32,9 +32,14 @@ enum NativeNavigationVetoAcceptance {
     }
     originalOwner.windowContext.show()
     application.repository.focusWindow(originalOwner.windowContext.id)
+    let previousWindows = Set(application.windows.keys)
     application.newWindow()
-    guard let owner = application.focusedCoordinator, owner !== originalOwner else {
-      throw ShortcutError("Missing navigation veto fixture owner")
+    let added = application.windows.values.filter {
+      !previousWindows.contains($0.windowContext.id) && $0.windowContext.isOpen && !$0.windowContext.isClosing
+    }
+    guard added.count == 1, let owner = added.first,
+      owner.store.activeProfileID == originalOwner.store.activeProfileID else {
+      throw ShortcutError("Missing exact new navigation veto fixture owner")
     }
     let window = owner.windowContext.window
     owner.actions.palette = false
@@ -49,6 +54,28 @@ enum NativeNavigationVetoAcceptance {
     let browser = try await page.ready()
     var promptTask: Task<String?, Error>?
     var restoredOwner: BrowserWindowCoordinator?
+    @MainActor func diagnostics(_ phase: String) async {
+      var details: [String: Any] = [
+        "phase": phase, "appActive": NSApp.isActive, "ownerID": owner.windowContext.id,
+        "ownerOpen": owner.windowContext.isOpen, "ownerClosing": owner.windowContext.isClosing,
+        "ownerWindow": window.windowNumber, "keyWindow": NSApp.keyWindow?.windowNumber ?? -1,
+        "firstResponder": (NSApp.keyWindow?.firstResponder).map { String(reflecting: type(of: $0)) } ?? "nil",
+        "pageID": page.id, "pageOwnerID": page.ownerWindowID ?? "nil", "profileID": page.profileID,
+        "exactPage": application.engine.pages[page.id] === page, "exactBrowser": page.browser === browser,
+        "selectedID": owner.selectedDocumentID ?? "nil", "activePage": owner.activePage === page,
+        "loading": page.isLoading, "pageURL": page.url?.absoluteString ?? "nil",
+        "savedURL": owner.store.document(id: tab.id)?.url ?? "nil", "palette": owner.actions.palette,
+        "nativeVisible": page.nativeWindow?.isVisible == true, "sheet": window.attachedSheet?.identifier?.rawValue ?? "nil",
+        "pendingDialogs": application.webDialogs.pendingRequestCount(for: page),
+      ]
+      if !browser.isClosed, let value = try? await browser.devTools.evaluate("""
+        ({focused:document.hasFocus(),ready:document.readyState,viewport:[innerWidth,innerHeight],
+          hit:document.elementFromPoint(60,36)?.id??null,sticky:navigator.userActivation.hasBeenActive,
+          click:globalThis.vetoActivationClick??null,guard:typeof window.onbeforeunload==='function'})
+        """, timeout: 2) { details["document"] = value }
+      if let data = try? JSONSerialization.data(withJSONObject: details, options: [.sortedKeys]),
+        let text = String(data: data, encoding: .utf8) { fputs("Native navigation veto diagnostics: \(text)\n", stderr) }
+    }
     func ownedSheet(_ page: ChromiumPage, owner: BrowserWindowCoordinator,
       kind: String) -> NSWindow? {
       guard let sheet = owner.windowContext.window.attachedSheet,
@@ -61,6 +88,29 @@ enum NativeNavigationVetoAcceptance {
         guard !page.isLoading, page.url == formURL else { return false }
         return try await browser.devTools.evaluate("!!document.getElementById('retained')") as? Bool == true
       }
+      var previousFrame: NSRect?
+      var previousViewport: [Double]?
+      var stableFrames = 0
+      try await wait("stable exact owner viewport") {
+        guard owner.windowContext.isOpen, !owner.windowContext.isClosing,
+          application.engine.pages[tab.id] === page, page.browser === browser,
+          page.ownerWindowID == owner.windowContext.id, owner.activePage === page,
+          owner.selectedDocumentID == tab.id, !owner.actions.palette, owner.actions.library == nil,
+          let view = browser.nativeView, let nativeWindow = view.window,
+          nativeWindow.isVisible, view.bounds.width > 180, view.bounds.height > 90,
+          let viewport = try await browser.devTools.evaluate("[innerWidth,innerHeight]") as? [Double],
+          viewport.count == 2, viewport[0] > 180, viewport[1] > 90 else {
+          stableFrames = 0; previousFrame = nil; previousViewport = nil; return false
+        }
+        let frame = nativeWindow.convertToScreen(view.convert(view.bounds, to: nil))
+        stableFrames = previousFrame == frame && previousViewport == viewport ? stableFrames + 1 : 0
+        previousFrame = frame; previousViewport = viewport
+        return stableFrames >= 2
+      }
+      page.focus()
+      try await wait("actual document focus") {
+        try await browser.devTools.evaluate("document.hasFocus()") as? Bool == true
+      }
       _ = try await browser.devTools.evaluate("""
         (() => {
           const field = document.getElementById('retained');
@@ -71,16 +121,21 @@ enum NativeNavigationVetoAcceptance {
           button.id='vetoActivation'; button.textContent='Edit document';
           button.style.cssText='position:fixed;left:20px;top:20px;width:160px;height:36px;z-index:99999';
           document.body.appendChild(button);
+          globalThis.vetoActivationClick=null;
+          button.addEventListener('click',event=>{globalThis.vetoActivationClick={trusted:event.isTrusted,button:event.button};});
           window.onbeforeunload = event => { event.preventDefault(); event.returnValue='Unsaved draft'; };
           return true;
         })()
         """)
-      for type in ["mousePressed", "mouseReleased"] {
-        _ = try await browser.devTools.call("Input.dispatchMouseEvent", parameters: [
-          "type": type, "x": 60, "y": 36, "button": "left", "clickCount": 1,
-          "buttons": type == "mousePressed" ? 1 : 0,
-        ])
+      try await wait("actual primary-input target") {
+        try await browser.devTools.evaluate("document.hasFocus() && document.elementFromPoint(60,36)?.id==='vetoActivation'") as? Bool == true
       }
+      await diagnostics("before-primary-input")
+      let activation = try await NativeDocumentActivationAcceptance.click(application: application,
+        owner: owner, page: page, buttonID: "vetoActivation", label: "ordinary-navigation-veto")
+      await diagnostics("after-primary-input")
+      try require(["trusted", "primary", "sticky", "focused"].allSatisfy { activation[$0] as? Bool == true },
+        "navigationVetoUsesActualTrustedPrimaryAndStickyActivation")
       let originalHistory = owner.store.document(id: tab.id)?.navigation
       owner.navigate(destination.absoluteString)
       try await wait("beforeunload sheet") { ownedSheet(page, owner: owner, kind: "beforeunload") != nil }
@@ -174,6 +229,7 @@ enum NativeNavigationVetoAcceptance {
       originalOwner.windowContext.show()
       return checks
     } catch {
+      await diagnostics("failed: " + error.localizedDescription)
       promptTask?.cancel()
       if let sheet = window.attachedSheet, application.webDialogs.owns(sheet, page: page) {
         window.endSheet(sheet, returnCode: .alertSecondButtonReturn)

@@ -298,6 +298,7 @@ struct ThemeEditor: View {
         }.buttonStyle(.plain).keyboardShortcut(.defaultAction).disabled(!valid)
       }.padding(.horizontal, 14).padding(.vertical, 12)
     }.foregroundStyle(colors.ink).tint(colors.accent)
+      .disclosureGroupStyle(NativeChromeDisclosureStyle(colors: colors))
       .background { NativeControlSurface().overlay(colors.chrome.opacity(0.32)) }
       .background { NativeThemeScrollbars(onWindow: onPresentationWindow).frame(width: 0, height: 0) }
       .onAppear { if saveTitle != "Create Space" { focusedPuck = true } }
@@ -403,8 +404,8 @@ struct ThemeEditor: View {
         Button {
           theme.appearance = appearance
         } label: {
-          NativeGlyph(appearance == "system" ? "sparkles" : appearance == "light" ? "sun.max" : "moon.stars.fill")
-            .font(.system(size: 17)).frame(width: 34, height: 32)
+          NativeGlyph(appearance == "system" ? "sparkles" : appearance == "light" ? "sun.max" : "moon.stars.fill", size: 17)
+            .frame(width: 34, height: 32)
             .background(colors.ink.opacity(theme.appearance == appearance ? 0.09 : 0), in: RoundedRectangle(cornerRadius: 9))
         }.buttonStyle(.plain).help("\(appearance.capitalized) appearance")
           .accessibilityLabel("\(appearance.capitalized) appearance")
@@ -713,14 +714,15 @@ struct NativeControlSurface: View {
 struct NativeSpaceIdentity: View {
   @Binding var name: String
   @Binding var icon: String
+  let colors: NativeSpacePalette
   var initiallyExpanded = false
   @State private var query = ""
   @State private var expanded = false
   var body: some View {
     DisclosureGroup("Name & icon", isExpanded: $expanded) {
       VStack(alignment: .leading, spacing: 10) {
-        TextField("Space name", text: Binding(get: { name }, set: { name = String($0.prefix(60)) })).textFieldStyle(.roundedBorder)
-        TextField("Find an icon", text: $query).textFieldStyle(.roundedBorder)
+        TextField("Space name", text: Binding(get: { name }, set: { name = String($0.prefix(60)) })).textFieldStyle(NativeChromeTextFieldStyle(colors: colors))
+        TextField("Find an icon", text: $query).textFieldStyle(NativeChromeTextFieldStyle(colors: colors))
         LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 2), count: 12), spacing: 2) {
           ForEach(NativeGlyph.spaceNames.filter { query.isEmpty || $0.localizedCaseInsensitiveContains(query) }, id: \.self) { icon in
             Button { self.icon = icon; ThemeHaptics.tick() } label: {

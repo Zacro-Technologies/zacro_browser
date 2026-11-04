@@ -122,8 +122,8 @@ enum SidebarSection: Equatable {
     }
     projected.insert(moved, at: min(projected.count, destination))
     guard projected != preview else { return }
-    let duration = 0.14 * store.state.settings.motionScale
-    withAnimation(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? nil : .easeInOut(duration: duration)) {
+    withAnimation(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? nil
+      : NativeMotion.animation(0.14, scale: store.state.settings.motionScale)) {
       preview = projected
     }
   }

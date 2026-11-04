@@ -67,7 +67,7 @@ import ZacroCore
     for (key, entry) in Array(entries) where entry.page == nil || entry.browser?.isClosed != false {
       entries.removeValue(forKey: key)
     }
-    for (key, item) in Array(blocked) where item.page == nil || item.page?.browser?.isClosed == true {
+    for (key, item) in Array(blocked) where item.page == nil || item.page?.browser?.isClosed != false {
       blocked.removeValue(forKey: key)
     }
     for page in application.engine.pages.values { remember(page) }

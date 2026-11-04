@@ -23,6 +23,7 @@ def configure(plist_path: Path, package_path: Path, version: str) -> None:
     for key in (
         "NSCameraUsageDescription",
         "NSMicrophoneUsageDescription",
+        "NSLocalNetworkUsageDescription",
         "NSLocationUsageDescription",
         "NSLocationWhenInUseUsageDescription",
     ):

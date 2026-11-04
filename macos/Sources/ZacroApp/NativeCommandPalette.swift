@@ -82,13 +82,13 @@ struct NativeCommandPalette: View {
       let available = max(200, geometry.size.width)
       ZStack(alignment: .topLeading) {
         Color.clear.contentShape(Rectangle()).onTapGesture { actions.palette = false }
-        VStack(spacing: 4) {
+        VStack(spacing: 0) {
           input
           if !isNested { filters }
           resultList
         }.padding(8).frame(width: min(590, available - 32))
-          .background { NativeControlSurface().overlay(colors.chrome.opacity(0.86)).clipShape(RoundedRectangle(cornerRadius: 12)) }
-          .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(colors.ink.opacity(0.08), lineWidth: 0.5))
+          .background { NativeControlSurface().overlay(colors.chrome.opacity(0.86)).clipShape(NativePaneShape(radius: 12)) }
+          .overlay(NativePaneShape(radius: 12).stroke(colors.ink.opacity(0.08), lineWidth: 0.5))
           .shadow(color: .black.opacity(0.14), radius: 16, y: 8)
           .opacity(entered || reduceMotion ? 1 : 0)
           .scaleEffect(entered || reduceMotion ? 1 : 0.99)
@@ -99,7 +99,7 @@ struct NativeCommandPalette: View {
     }.font(.system(size: 13)).foregroundStyle(colors.ink).tint(colors.accent)
       .onAppear {
         resetSession()
-        withAnimation(reduceMotion ? nil : .timingCurve(0.16, 1, 0.3, 1, duration: 0.16 * store.state.settings.motionScale)) {
+        withAnimation(NativeMotion.animation(NativeMotion.entrance, scale: reduceMotion ? 0 : store.state.settings.motionScale)) {
           entered = true
         }
         actions.handlePaletteEscape = {
@@ -132,7 +132,7 @@ struct NativeCommandPalette: View {
   }
   private var input: some View {
     HStack(spacing: 10) {
-      NativeGlyph("magnifyingglass").font(.system(size: 16)).foregroundStyle(colors.muted)
+      NativeGlyph("magnifyingglass", size: 18).foregroundStyle(colors.muted)
       CommandSearchField(text: $actions.query, placeholder: placeholder, accessibilityLabel: inputLabel, resultStatus: resultStatus, textColor: NSColor(colors.ink), placeholderColor: NSColor(colors.muted), focusRequest: focusRequest, selectAllRequest: actions.paletteSession,
         submit: { activate(separate: $0) }, move: moveSelection,
         cancel: { if !back() { actions.palette = false } }, tab: enterSelected,
@@ -149,20 +149,24 @@ struct NativeCommandPalette: View {
       .background(colors.ink.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
   }
   private var filters: some View {
-    HStack(spacing: 3) {
-      ForEach(scopes, id: \.0) { value, label in
-        Button {
-          scope = value
-          if prefix != nil { actions.query = query }
-          selection = 0; selectedID = nil; focusRequest += 1
-        } label: {
-          Text(label).font(.system(size: 10, weight: filter == value ? .semibold : .regular))
-            .padding(.horizontal, 7).padding(.vertical, 5)
-            .background(colors.card.opacity(filter == value ? 0.4 : 0), in: RoundedRectangle(cornerRadius: 6))
-        }.buttonStyle(.plain).accessibilityAddTraits(filter == value ? [.isSelected] : [])
+    ScrollView(.horizontal) {
+      HStack(spacing: 3) {
+        ForEach(scopes, id: \.0) { value, label in
+          Button {
+            scope = value
+            if prefix != nil { actions.query = query }
+            selection = 0; selectedID = nil; focusRequest += 1
+          } label: {
+            Text(label).font(.system(size: 11)).fixedSize()
+              .foregroundStyle(filter == value ? colors.ink : colors.muted)
+              .padding(.horizontal, 8).padding(.vertical, 5)
+              .background(colors.card.opacity(filter == value ? 0.55 : 0), in: RoundedRectangle(cornerRadius: 7))
+          }.buttonStyle(.plain).accessibilityAddTraits(filter == value ? [.isSelected] : [])
+        }
       }
-      Spacer(minLength: 0)
-    }.padding(.vertical, 2).accessibilityElement(children: .contain).accessibilityLabel("Search scope")
+    }.scrollIndicators(.hidden).frame(height: 24)
+      .padding(.horizontal, 2).padding(.top, 8).padding(.bottom, 2)
+      .accessibilityElement(children: .contain).accessibilityLabel("Search scope")
   }
   private var resultList: some View {
     ScrollViewReader { reader in
@@ -178,10 +182,10 @@ struct NativeCommandPalette: View {
                 Group {
                   if let image = resultImage(item) {
                     Image(nsImage: image).resizable().scaledToFit().frame(width: 16, height: 16)
-                  } else { NativeGlyph(item.url != nil && item.kind != "navigation" ? "globe" : item.icon).font(.system(size: 14)) }
-                }.frame(width: 22, height: 24).foregroundStyle(selection == index ? colors.ink : colors.muted)
-                VStack(alignment: .leading, spacing: 2) {
-                  Text(item.title).lineLimit(1)
+                  } else { NativeGlyph(item.url != nil && item.kind != "navigation" ? "globe" : item.icon, size: 16) }
+                }.frame(width: 22, height: 24).foregroundStyle(selection == index ? colors.ink : colors.accent)
+                HStack(alignment: .firstTextBaseline, spacing: 9) {
+                  Text(item.title).fontWeight(selection == index ? .medium : .regular).lineLimit(1)
                   if !item.detail.isEmpty { Text(item.detail).font(.system(size: 11)).foregroundStyle(selection == index ? colors.ink : colors.muted).lineLimit(1) }
                 }.frame(maxWidth: .infinity, alignment: .leading)
                 Text(item.type).font(.system(size: 10)).foregroundStyle(colors.muted).lineLimit(1)
@@ -189,7 +193,12 @@ struct NativeCommandPalette: View {
                 .background(colors.card.opacity(selection == index ? 0.46 : 0), in: RoundedRectangle(cornerRadius: 10))
                 .modifier(NativeSelectionContrast(selected: selection == index, color: colors.ink, radius: 10))
                 .shadow(color: .black.opacity(selection == index ? 0.07 : 0), radius: 1.5, y: 1).contentShape(Rectangle())
-            }.buttonStyle(.plain).onHover { if $0 { selection = index } }
+            // Pointer hover is presentation only, as in the renderer's CSS.
+            // Moving keyboard selection here scrolls the hovered row under
+            // the pointer and can repeatedly select another row during layout.
+            }.buttonStyle(NativeHoverPressButtonStyle(
+              hover: selection == index ? .clear : colors.card.opacity(0.3),
+              radius: 10, scale: 1, motionScale: store.state.settings.motionScale))
               .accessibilityLabel(item.title + (item.detail.isEmpty ? "" : ", \(item.detail)"))
               .accessibilityAddTraits(selection == index ? [.isSelected] : []).id(item.id)
               .contextMenu {
@@ -198,12 +207,15 @@ struct NativeCommandPalette: View {
                 }
               }
           }
-        }
+        }.padding(.top, 4)
       }.scrollIndicators(.hidden)
-        .frame(height: min(360, min(max(46, Double(results.count) * 44), max(120, Double(actions.contentFrame.height) - 200))))
+        .frame(height: min(360, min(results.isEmpty ? 54 : Double(results.count) * 42 + 2,
+          max(120, Double(actions.contentFrame.height) - 200))))
         .onChange(of: selection) { _, index in
           guard results.indices.contains(index) else { return }
-          withAnimation(reduceMotion ? nil : .easeOut(duration: 0.1 * store.state.settings.motionScale)) { reader.scrollTo(results[index].id, anchor: .center) }
+          // Match the reference's scrollIntoView({block: 'nearest'}): visible
+          // keyboard targets stay still instead of recentering the whole list.
+          withAnimation(reduceMotion ? nil : .easeOut(duration: 0.1 * store.state.settings.motionScale)) { reader.scrollTo(results[index].id) }
         }
     }
   }
@@ -379,7 +391,7 @@ struct NativeCommandPalette: View {
         items.append(task("result:newtab", "Open in new tab", "plus") { duplicate(tab) })
       }
       if NativePageIdentity.hasDocument(URL(string: pageURL)) {
-        items.append(task("result:copy", "Copy address", "link") { close { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(pageURL, forType: .string) } })
+        items.append(task("result:copy", "Copy address", "copy") { close { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(pageURL, forType: .string) } })
       }
       if let tab {
         if tab.id != store.state.activeTabID, tab.spaceID == store.state.activeSpaceID,
@@ -495,7 +507,10 @@ struct NativeCommandPalette: View {
           catch { self.error = error.localizedDescription; store.clearError() }
         }.keyboardShortcut(.defaultAction)
       }
-    }.textFieldStyle(.roundedBorder).padding(20).frame(width: 410)
+    }.textFieldStyle(NativeChromeTextFieldStyle(colors: colors))
+      .buttonStyle(NativeChromeButtonStyle(colors: colors))
+      .padding(20).frame(width: 410).foregroundStyle(colors.ink)
+      .background { NativeControlSurface().overlay(colors.chrome.opacity(0.65)) }
   }
   private static func fuzzy(_ query: String, _ value: String) -> Double {
     NativeCommandSearchMatching.score(query, value)

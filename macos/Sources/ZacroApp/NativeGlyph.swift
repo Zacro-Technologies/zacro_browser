@@ -7,18 +7,17 @@ struct NativeGlyph: View {
   var size: CGFloat = 16
   init(_ name: String, size: CGFloat = 16) { self.name = name; self.size = size }
   var body: some View {
-    let key = Self.aliases[name] ?? name
+    let key = Self.resolvedName(name)
     Group {
       if let commands = Self.paths[key] { GlyphPath(commands: commands).stroke(style: StrokeStyle(lineWidth: size * 1.7 / 24, lineCap: .round, lineJoin: .round)) }
-      else { Image(systemName: name).resizable().scaledToFit() }
+
     }.frame(width: size, height: size).accessibilityHidden(true)
   }
   /// AppKit-backed SwiftUI menus extract an Image or Text from their label;
   /// a Shape-only label becomes an empty NSPopUpButton. Keep the exact same
   /// vector paths in a template image for that native control boundary.
   static func menuImage(_ name: String, size: CGFloat = 16) -> Image {
-    let key = aliases[name] ?? name
-    guard let commands = paths[key] else { return Image(systemName: name) }
+    let commands = paths[resolvedName(name)] ?? []
     let image = NSImage(size: NSSize(width: size, height: size), flipped: true) { rect in
       guard let context = NSGraphicsContext.current?.cgContext else { return false }
       context.setStrokeColor(NSColor.black.cgColor)
@@ -31,6 +30,21 @@ struct NativeGlyph: View {
     image.isTemplate = true
     return Image(nsImage: image)
   }
+  /// AppKit controls draw the same source paths without asking an Aqua cell
+  /// to substitute a system symbol or its own pop-up indicator.
+  static func cgPath(_ name: String, in rect: CGRect) -> CGPath {
+    // Shape rendering normally supplies an origin-zero rect. AppKit chrome
+    // also places the original glyph inside a control's nonzero content rect.
+    GlyphPath(commands: paths[resolvedName(name)] ?? [])
+      .path(in: CGRect(origin: .zero, size: rect.size))
+      .applying(CGAffineTransform(translationX: rect.minX, y: rect.minY)).cgPath
+  }
+  /// Unknown imported/custom names use renderer icon()'s original globe fallback;
+  /// browser chrome never silently switches to the operating system icon set.
+  static func resolvedName(_ name: String) -> String {
+    let key = aliases[name] ?? name
+    return paths[key] == nil ? "globe" : key
+  }
   static let aliases: [String: String] = [
     "sidebar.left": "sidebar", "arrow.left": "back", "arrow.right": "forward", "arrow.clockwise": "reload",
     "magnifyingglass": "search", "xmark": "close", "slider.horizontal.3": "pageControls", "archivebox": "library",
@@ -42,15 +56,23 @@ struct NativeGlyph: View {
     "pencil": "edit", "doc": "file", "refresh": "reload",
     "clock": "history", "arrow.down": "download", "square.and.arrow.up": "external", "checkmark": "check",
     "doc.on.doc": "copy", "printer": "print", "person": "user", "person.crop.circle": "user", "sun.max": "sun",
+    "lock.shield": "shield", "checkmark.shield": "shield", "doc.text": "file",
+    "arrow.up.right": "external", "arrow.up.right.square": "external", "stop.fill": "stop", "arrow.up": "up",
     "moon.stars.fill": "moon", "moon": "moon", "info.circle": "info", "exclamationmark.triangle": "alert",
     "envelope": "mail", "airplane": "plane", "gamecontroller": "gamepad", "flask": "beaker", "bolt.fill": "bolt",
   ]
   static let spaceNames = ["circle", "briefcase", "home", "code", "book", "leaf", "star", "heart", "globe", "sun", "moon", "music", "coffee", "plane", "camera", "gamepad", "palette", "beaker", "rocket", "compass", "mountain", "flame", "cloud", "bolt", "diamond", "flower", "smile", "headphones", "calendar", "film", "building", "bag"]
   static func commandName(_ id: String) -> String {
     [
-      "command-palette": "plus", "open-location": "search", "sidebar-toggle": "sidebar", "focus-sidebar": "sidebar",
+      "command-palette": "plus", "open-location": "search", "paste-search": "search",
+      "sidebar-toggle": "sidebar", "focus-sidebar": "sidebar", "focus-chrome": "monitor",
       "reveal-tab": "eye", "browser-menu": "more", "onboarding": "sparkle", "save-page": "download", "reopen-tab": "undo",
-      "next-tab": "forward", "previous-tab": "back", "next-space": "layers", "previous-space": "layers", "bookmark": "bookmark",
+      "next-tab": "forward", "previous-tab": "back", "recent-tab": "forward", "previous-recent-tab": "back",
+      "next-space": "layers", "previous-space": "layers", "bookmark": "bookmark",
+      "tab-1": "file", "tab-2": "file", "tab-3": "file", "tab-4": "file", "tab-5": "file",
+      "tab-6": "file", "tab-7": "file", "tab-8": "file", "tab-9": "file",
+      "space-1": "layers", "space-2": "layers", "space-3": "layers", "space-4": "layers", "space-5": "layers",
+      "space-6": "layers", "space-7": "layers", "space-8": "layers", "space-9": "layers",
       "pin-tab": "pin", "duplicate-tab": "copy", "rename-tab": "edit", "move-tab": "folder", "mute-tab": "volume",
       "new-folder": "folderPlus", "new-space": "layers", "new-private-space": "shield", "preferences": "settings",
       "shortcuts": "keyboard", "history": "history", "downloads": "download", "bookmarks": "bookmark", "archive": "archive", "windows": "layers", "reopen-window": "undo",

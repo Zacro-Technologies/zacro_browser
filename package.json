@@ -99,6 +99,7 @@
       "extendInfo": {
         "NSCameraUsageDescription": "Allow websites you approve in Zacro to use your camera.",
         "NSMicrophoneUsageDescription": "Allow websites you approve in Zacro to use your microphone.",
+        "NSLocalNetworkUsageDescription": "Allow local websites and real-time connections you use in Zacro to reach your local network.",
         "NSLocationUsageDescription": "Allow websites you approve in Zacro to use your location.",
         "NSLocationWhenInUseUsageDescription": "Allow websites you approve in Zacro to use your location.",
         "CFBundleURLTypes": [

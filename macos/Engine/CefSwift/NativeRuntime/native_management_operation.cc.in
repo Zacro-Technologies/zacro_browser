@@ -32,6 +32,9 @@ auto& NativeFunctionOperations() {
 
 #if !BUILDFLAG(IS_MAC)
 gfx::NativeWindow NativeManagementWindowForNumber(int, int) { return gfx::NativeWindow(); }
+gfx::NativeWindow NativeExtensionUIWindowForLogicalWindow(int, gfx::NativeWindow) {
+  return gfx::NativeWindow();
+}
 #endif
 
 scoped_refptr<NativeManagementOperation> NativeManagementOperation::Create(

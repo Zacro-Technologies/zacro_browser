@@ -67,6 +67,22 @@ async function loaded(tabId) {
   throw new Error(`Tab ${tabId} did not finish loading`);
 }
 
+// Diagnostic context for the two repeated real dormancy scenarios. Preserve
+// the original single API attempt and every native safety rejection.
+async function discardObservedFixture(tabId, phase) {
+  try { return await chrome.tabs.discard(tabId); }
+  catch (error) {
+    let state;
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      state = { id: tab.id, windowId: tab.windowId, status: tab.status,
+        active: tab.active, discarded: tab.discarded,
+        urlScheme: (tab.url || "").split(":", 1)[0], urlLength: (tab.url || "").length };
+    } catch (inspection) { state = { inspectionError: String(inspection).slice(0, 400) }; }
+    throw new Error(`Discard phase=${phase}: ${String(error?.message || error).slice(0, 1200)}; state=${JSON.stringify(state)}`);
+  }
+}
+
 globalThis.zacroAcceptance = {
   events,
   setPanelEventObservation(enabled) {
@@ -327,28 +343,28 @@ globalThis.zacroAcceptance = {
       const sleeper = await chrome.tabs.create({ windowId: sourceWindowID, url: new URL("native-sleeper", origin).href, active: true });
       created.push(sleeper.id); await loaded(sleeper.id);
       await chrome.tabs.update(first.id, { active: true });
-      const sleeping = await chrome.tabs.discard(sleeper.id);
+      const sleeping = await discardObservedFixture(sleeper.id, "dormant.initial");
       assert(sleeping.id === sleeper.id && sleeping.discarded, "Sleeping changed the native tab identity");
       const zoom = await chrome.tabs.getZoom(sleeper.id);
       assert(Number.isFinite(zoom) && zoom > 0, "Dormant API did not resume the actual native function");
       assert((await chrome.tabs.get(sleeper.id)).id === sleeper.id, "Waking replaced the native tab identity");
-      const sleepAgain = async () => {
-        const value = await chrome.tabs.discard(sleeper.id);
+      const sleepAgain = async phase => {
+        const value = await discardObservedFixture(sleeper.id, phase);
         assert(value.id === sleeper.id && value.discarded, "Native document did not return to sleep");
       };
-      await sleepAgain();
+      await sleepAgain("dormant.after-getZoom");
       const script = await chrome.scripting.executeScript({ target: { tabId: sleeper.id }, func: () => location.href });
       assert(script[0].result === sleeper.url, "Scripting did not restore the intended dormant document");
-      await sleepAgain();
+      await sleepAgain("dormant.after-executeScript");
       const css = "body { --zacro-native-wake: restored; }";
       await chrome.scripting.insertCSS({ target: { tabId: sleeper.id }, css });
       const style = await chrome.scripting.executeScript({ target: { tabId: sleeper.id },
         func: () => getComputedStyle(document.body).getPropertyValue("--zacro-native-wake").trim() });
       assert(style[0].result === "restored", "CSS injection ran before native document restoration");
-      await sleepAgain();
+      await sleepAgain("dormant.after-insertCSS");
       await chrome.scripting.removeCSS({ target: { tabId: sleeper.id }, css });
       assert(!(await chrome.tabs.get(sleeper.id)).discarded, "CSS removal did not prepare the dormant document");
-      await sleepAgain();
+      await sleepAgain("dormant.after-removeCSS");
       const target = { tabId: sleeper.id };
       await chrome.debugger.attach(target, "1.3");
       try {
@@ -403,7 +419,7 @@ globalThis.zacroAcceptance = {
       created.push(tab.id); await loaded(tab.id);
       assert((await chrome.tabs.get(tab.id)).url === url, "Large approved URL was truncated in the host model");
       await chrome.tabs.update(first.id, { active: true });
-      await chrome.tabs.discard(tab.id);
+      await discardObservedFixture(tab.id, "large-approved.initial");
       assert((await chrome.tabs.get(tab.id)).discarded, "Large approved document was not discarded");
       const target = { tabId: tab.id };
       await chrome.debugger.attach(target, "1.3");

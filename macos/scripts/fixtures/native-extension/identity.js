@@ -16,11 +16,11 @@
     const base = origin(baseURL);
     const callback = new URL(chrome.identity.getRedirectURL("zacro-native/" + token));
     callback.searchParams.set("state", token); callback.hash = "fixture=complete";
-    const url = new URL(mode === "redirect" ? "/native-auth/redirect" : "/native-auth/document", base);
+    const url = new URL(mode === "redirect" ? "/native-auth/redirect" : mode === "pending" ? "/native-auth/pending" : "/native-auth/document", base);
     url.searchParams.set("callback", callback.href); url.searchParams.set("token", token);
     if (mode !== "redirect") url.searchParams.set("mode", mode);
     if (holdMilliseconds !== undefined) {
-      assert(mode === "hold" && Number.isInteger(holdMilliseconds) && holdMilliseconds >= 20000 && holdMilliseconds <= 90000,
+      assert((mode === "hold" || mode === "pending") && Number.isInteger(holdMilliseconds) && holdMilliseconds >= 20000 && holdMilliseconds <= 90000,
         "Invalid bounded identity fixture hold duration");
       url.searchParams.set("hold_ms", String(holdMilliseconds));
     }
@@ -98,12 +98,39 @@
       );
       return { token: run.token, title: "Zacro auth fixture " + run.token, callback: run.callback };
     },
+    startPending(options) {
+      const request = input(options, "pending");
+      assert(!runs.has(request.token), "Fixture token is already active");
+      assert(runs.size < 16, "Finish existing identity fixture flows first");
+      const run = { ...request, state: "pending", startedAt: Date.now() };
+      runs.set(request.token, run);
+      chrome.identity.launchWebAuthFlow({ url: request.url, interactive: true }).then(
+        value => { run.state = "resolved"; run.result = value; run.exactCallback = value === request.callback; },
+        error => { run.state = "rejected"; run.error = String(error?.message || error); }
+      );
+      return { token: run.token, title: "Zacro auth fixture " + run.token, callback: run.callback };
+    },
+    async pendingServerState(token) {
+      const run = runs.get(token); assert(run, "Unknown identity fixture token");
+      const url = new URL("/native-auth/pending-status", run.baseURL); url.searchParams.set("token", token);
+      const response = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(5000) });
+      if (response.status === 404) return { entered: false, released: false, completed: false, expired: false };
+      assert(response.ok, "Pending auth server status failed");
+      return response.json();
+    },
+    async releasePending(token) {
+      const run = runs.get(token); assert(run, "Unknown identity fixture token");
+      const url = new URL("/native-auth/pending-release", run.baseURL); url.searchParams.set("token", token);
+      const response = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(5000) });
+      assert(response.ok, "Pending auth request never reached the owned server");
+      return true;
+    },
     async status(token) {
       const run = runs.get(token); assert(run, "Unknown identity fixture token");
       const tabs = await chrome.tabs.query({});
       const windows = await chrome.windows.getAll({ populate: true });
       const matches = tab => {
-        try { const url = new URL(tab.url); return url.pathname === "/native-auth/document" && url.searchParams.get("token") === token; }
+        try { const url = new URL(tab.url); return url.origin === new URL(run.baseURL).origin && ["/native-auth/document", "/native-auth/pending"].includes(url.pathname) && url.searchParams.get("token") === token; }
         catch { return false; }
       };
       return { ...run, logicalAuthTabIDs: tabs.filter(matches).map(tab => tab.id),

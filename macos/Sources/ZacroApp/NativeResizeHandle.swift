@@ -23,6 +23,7 @@ struct NativeResizeHandle: NSViewRepresentable {
   var reset: Double
   var pixelsPerUnit: Double = 1
   var label: String
+  var needsTransparentHitArea = false
   var valueDescription: (Double) -> String = { "\(Int($0.rounded())) pixels" }
   var preview: (Double) -> Void
   var commit: (Double) -> Void
@@ -64,8 +65,13 @@ final class NativeResizeHandleView: NSView {
   override func mouseEntered(with event: NSEvent) { hovered = true; needsDisplay = true }
   override func mouseExited(with event: NSEvent) { hovered = false; needsDisplay = true }
   override func draw(_ dirtyRect: NSRect) {
-    guard hovered || startValue != nil || window?.firstResponder === self else { return }
-    NSColor.labelColor.withAlphaComponent(startValue != nil ? 0.14 : 0.08).setFill()
+    // Only fully clear chrome needs a painted WindowServer hit target. An
+    // always-painted idle handle makes a visible stripe through the gradient.
+    let highlighted = hovered || window?.firstResponder === self
+    let opacity = startValue != nil ? 0.14 : highlighted ? 0.08
+      : configuration?.needsTransparentHitArea == true ? 0.01 : 0
+    guard opacity > 0 else { return }
+    NSColor.labelColor.withAlphaComponent(opacity).setFill()
     bounds.fill()
   }
   override func becomeFirstResponder() -> Bool { needsDisplay = true; return true }

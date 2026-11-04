@@ -9,8 +9,14 @@ import ZacroServices
 enum ZacroApplication {
   @MainActor static func main() {
     let integrationRequested = CommandLine.arguments.contains("--native-integration-acceptance")
-    guard !integrationRequested || CommandLine.arguments.contains("--engine-acceptance") else {
+    let performanceRequested = CommandLine.arguments.contains("--native-performance-acceptance")
+    guard !(integrationRequested || performanceRequested) || CommandLine.arguments.contains("--engine-acceptance") else {
       fputs("Application integration requires the disposable engine acceptance mode.\n", stderr)
+      exit(1)
+    }
+    guard !performanceRequested || (!integrationRequested &&
+      ProcessInfo.processInfo.environment["ZACRO_PERFORMANCE_OUTPUT"]?.isEmpty == false) else {
+      fputs("Performance diagnostics require their own disposable run and an output path.\n", stderr)
       exit(1)
     }
     let base =
@@ -23,7 +29,7 @@ enum ZacroApplication {
       defer { engine.shutdown() }
       if CommandLine.arguments.contains("--engine-acceptance"),
         !CommandLine.arguments.contains("--native-ui-review"),
-        !integrationRequested,
+        !integrationRequested, !performanceRequested,
         ProcessInfo.processInfo.environment["ZACRO_NATIVE_DATA"] != nil,
         let raw = ProcessInfo.processInfo.environment["ZACRO_NATIVE_SMOKE_URL"],
         let url = URL(string: raw), url.host == "127.0.0.1"
@@ -35,7 +41,7 @@ enum ZacroApplication {
         return
       }
       let coordinator = ApplicationCoordinator(engine: engine, repository: BrowserRepository(directory: base))
-      if integrationRequested { coordinator.store.updateSettings { $0.onboardingCompleted = true } }
+      if integrationRequested || performanceRequested { coordinator.store.updateSettings { $0.onboardingCompleted = true } }
       NSApplication.shared.delegate = coordinator
       NSApplication.shared.setActivationPolicy(.regular)
       coordinator.install()
@@ -43,7 +49,9 @@ enum ZacroApplication {
       if let integration, let raw = ProcessInfo.processInfo.environment["ZACRO_NATIVE_SMOKE_URL"], let url = URL(string: raw) {
         integration.run(url: url)
       }
-      withExtendedLifetime((coordinator, integration)) { NSApplication.shared.run() }
+      let performance = performanceRequested ? NativePerformanceAcceptance(application: coordinator) : nil
+      performance?.run()
+      withExtendedLifetime((coordinator, integration, performance)) { NSApplication.shared.run() }
       coordinator.store.save()
       try coordinator.store.flush()
     } catch {
@@ -55,7 +63,7 @@ enum ZacroApplication {
 }
 
 @MainActor
-final class BrowserWindowCoordinator: NSObject {
+final class BrowserWindowCoordinator: NSObject, NSMenuItemValidation {
   unowned let application: ApplicationCoordinator
   let windowContext: ChromiumWindowContext
   var window: NSWindow? { windowContext.window }
@@ -84,6 +92,45 @@ final class BrowserWindowCoordinator: NSObject {
   private var observedDocumentBounds: [String: CGRect] = [:]
   private var selectionFocusIntent = DocumentFocusIntent()
   private var selectionFocusTask: Task<Void, Never>?
+  private var reservedSelectionFocusToken: DocumentFocusIntent.Token?
+  private struct SelectionFocusDiagnostic {
+    let time: TimeInterval
+    let event: String
+    let phase: DocumentFocusIntent.Phase
+    let requestedID: String?
+    let intentID: String?
+    let intentProfileID: String?
+    let selectedID: String?
+    let activeTabID: String?
+    let profileID: String
+    let ownerNativeID: Int
+    let ownerOpen: Bool
+    let ownerClosing: Bool
+    let terminating: Bool
+    let deletingProfileID: String?
+    let appActive: Bool
+    let mouseButtons: Int
+    let environmentAllowed: Bool
+    let transitionAllowed: Bool
+    let focusAllowed: Bool
+    let keyWindow: Int
+    let keyOwned: Bool
+    let responderType: Any.Type?
+    let ownerWindow: Int
+    let ownerSheet: Int
+    let modalWindow: Int
+    let nativeID: Int32
+    let pageWindow: Int
+    let pageVisible: Bool
+    let requestedNativeID: Int32
+    let requestedWindow: Int
+    let requestedKey: Bool
+  }
+  private let selectionFocusDiagnosticsAvailable = CommandLine.arguments.contains("--engine-acceptance")
+    && CommandLine.arguments.contains("--native-integration-acceptance")
+  private var selectionFocusDiagnosticIDs = Set<String>()
+  private var selectionFocusDiagnostics: [SelectionFocusDiagnostic] = []
+  private var selectionFocusDiagnosticNext = 0
   private var collectionPanelTask: Task<Void, Never>?
   private var deferredWindowError: String?
   private weak var retiringPaletteEditor: NSTextView?
@@ -359,28 +406,75 @@ final class BrowserWindowCoordinator: NSObject {
     if let page = engine.pages[id] { updateIcon(page, tab: tab) }
     scheduleLayout()
   }
-  func adoptPopup(_ popup: ChromiumPage, spaceID: String? = nil, foreground: Bool) -> Bool {
+  func adoptPopup(_ popup: ChromiumPage, spaceID: String? = nil, foreground: Bool,
+    validateAdoption: (() throws -> Void)? = nil) async -> Bool {
     let profileID = spaceID.flatMap { id in store.state.spaces.first { $0.id == id }?.profileID } ?? store.activeProfileID
     guard engine.pages[popup.id] === popup, !popup.creationFailed,
       popup.profileID == profileID, !windowContext.isClosing else { return false }
-    let address = popup.browser?.url?.absoluteString ?? "about:blank"
-    let destination = BrowserAddress.extensionURL(address) != nil
-      ? store.createExtensionTab(url: address, spaceID: spaceID, activate: false)
-      : store.createTab(address: address, spaceID: spaceID, activate: false)
-    guard let tab = destination else { return false }
-    guard engine.movePage(id: popup.id, toWindowID: windowContext.id),
-      engine.adoptPage(fromID: popup.id, toID: tab.id) != nil else {
-      store.closeTab(id: tab.id); return false
+    var preparation: NativeHistoryPublicationPreparation?
+    var committed = false
+    do {
+      try validateAdoption?()
+      if !popup.isPrivate {
+        application.inspectRuntimeCapabilities()
+        await application.runtimeCapabilityTask?.value
+        try validateAdoption?()
+        guard application.runtimeCapabilitiesChecked else {
+          throw ShortcutError("Chromium’s browser capabilities could not be verified. Try again.")
+        }
+      }
+      if !popup.isPrivate && application.supportsHistoryMirror {
+        preparation = try await application.historyMirror.preparePublication(popup)
+        try validateAdoption?()
+      }
+      guard engine.pages[popup.id] === popup, !popup.creationFailed, !engine.isTerminating,
+        popup.profileID == profileID, !windowContext.isClosing,
+        store.state.profiles.contains(where: { $0.id == profileID }),
+        store.state.spaces.contains(where: { $0.id == (spaceID ?? store.state.activeSpaceID) && $0.profileID == profileID }) else {
+        throw CancellationError()
+      }
+      let address = popup.browser?.url?.absoluteString ?? "about:blank"
+      try validateAdoption?()
+      let tab: BrowserTab
+      if let preparation {
+        try preparation.validate()
+        var candidate = BrowserTab(spaceID: spaceID ?? store.state.activeSpaceID,
+          url: address, title: popup.title.isEmpty ? (URL(string: address)?.host ?? "New tab") : popup.title)
+        candidate.windowID = windowContext.id
+        candidate.navigation = [NavigationEntry(url: address)]; candidate.navigationIndex = 0
+        if let openerID = popup.openerID, let opener = application.store.document(id: openerID),
+          !opener.isClosed, application.store.profileID(for: opener) == profileID { candidate.openerTabID = openerID }
+        tab = try store.adoptNativeHistoryPopupDurably(candidate, publication: preparation.publication, activate: false)
+        committed = true
+      } else {
+        let destination = BrowserAddress.extensionURL(address) != nil
+          ? store.createExtensionTab(url: address, spaceID: spaceID, activate: false)
+          : store.createTab(address: address, spaceID: spaceID, activate: false)
+        guard let destination else { throw CancellationError() }; tab = destination
+      }
+      application.popupAdoptions.didCommitCore(popup, tabID: tab.id)
+      guard engine.movePage(id: popup.id, toWindowID: windowContext.id),
+        engine.adoptPage(fromID: popup.id, toID: tab.id) != nil else {
+        if !committed { store.closeTab(id: tab.id) }
+        throw CancellationError()
+      }
+      if preparation == nil, let openerID = popup.openerID, let opener = application.store.document(id: openerID),
+        !opener.isClosed, application.store.profileID(for: opener) == profileID {
+        store.updateTab(tab.id) { $0.openerTabID = openerID }
+      }
+      modelURLs[tab.id] = popup.browser?.url?.absoluteString ?? tab.url
+      wire(popup, tabID: tab.id, peek: false)
+      application.popupAdoptions.didAdopt(popup)
+      if foreground { store.selectTab(id: tab.id); focusSelectedDocument(force: true) }
+      extensionBrowser.reconcile()
+      scheduleLayout()
+      await preparation?.finish(committed: committed)
+      return true
+    } catch {
+      await preparation?.finish(committed: committed)
+      if !(error is CancellationError) { showError(error.localizedDescription) }
+      return false
     }
-    if let openerID = popup.openerID, let opener = application.store.document(id: openerID),
-      !opener.isClosed, application.store.profileID(for: opener) == profileID {
-      store.updateTab(tab.id) { $0.openerTabID = openerID }
-    }
-    modelURLs[tab.id] = popup.browser?.url?.absoluteString ?? tab.url
-    wire(popup, tabID: tab.id, peek: false)
-    if foreground { store.selectTab(id: tab.id); focusSelectedDocument(force: true) }
-    scheduleLayout()
-    return true
   }
   var activePage: ChromiumPage? {
     guard let tab = store.state.activeTab else { return nil }
@@ -478,6 +572,29 @@ final class BrowserWindowCoordinator: NSObject {
         self.actions.library == nil, self.window?.attachedSheet == nil, NSApp.modalWindow == nil else { return }
       self.activePage?.focus()
     }
+    actions.sidebarToggleOwnsFocus = { [weak self] candidate in
+      self?.ownsSidebarToggleFocus(candidate) == true
+    }
+    actions.focusPageAfterSidebarToggle = { [weak self] in
+      // The handoff has synchronously checked exact key-window ownership,
+      // including a just-detached owned palette. Do not infer it a second time.
+      guard let self, NSApp.isActive, self.application.focusedCoordinator === self,
+        self.windowContext.isOpen, !self.windowContext.isClosing, !self.engine.isTerminating,
+        self.deletingProfileID == nil, self.window?.isVisible == true,
+        !self.actions.palette, !self.actions.themeEditor, !self.actions.recordingShortcut,
+        self.window?.attachedSheet == nil, NSApp.modalWindow == nil else { return }
+      // Library can remain open while its rail hides. The toggle explicitly
+      // returns focus to the selected document, not to a different control.
+      let selected = self.selectedDocumentID, profile = self.store.activeProfileID
+      self.cancelSelectionFocus()
+      self.layoutPages()
+      guard self.selectedDocumentID == selected, self.store.activeProfileID == profile else { return }
+      if let page = self.activePage, page.documentError == nil,
+        page.ownerWindowID == self.windowContext.id, page.profileID == self.store.activeProfileID,
+        page.id == self.selectedDocumentID, page.nativeWindow?.isVisible == true {
+        page.focus()
+      } else { self.window?.makeKeyAndOrderFront(nil) }
+    }
     actions.findNext = { [weak self] in guard let self else { return }; self.activePage?.find(self.actions.findQuery) }
     actions.findPrevious = { [weak self] in guard let self else { return }; self.activePage?.find(self.actions.findQuery, forward: false) }
     actions.updateFind = { [weak self] value in self?.activePage?.find(String(value.prefix(1000))) }
@@ -529,6 +646,7 @@ final class BrowserWindowCoordinator: NSObject {
       self.application.didCloseWindow(self)
     }
     windowContext.onCloseCancelled = { [weak self] in
+      self?.application.popupAdoptions.resumeAvailable()
       self?.finishWindowCloseWaiters(accepted: false)
       self?.scheduleLayout()
       self?.application.resumeApplicationIntents()
@@ -557,6 +675,7 @@ final class BrowserWindowCoordinator: NSObject {
       if let window = self.window { NativeResizeHandle.cancel(in: window) }
       for task in self.pageCreations.values { task.cancel() }
       self.cancelPermissionPrompts()
+      await self.application.popupAdoptions.prepareForNativeClose(ownerID: self.windowContext.id)
       for task in self.dormantNavigations.values { task.cancel() }
       for task in Array(self.discardOperations.values) { _ = try? await task.value }
       for task in Array(self.dormantNavigations.values) { _ = try? await task.value }
@@ -569,6 +688,11 @@ final class BrowserWindowCoordinator: NSObject {
     store.$state.dropFirst().sink { [weak self] next in
       guard let self else { return }
       let previous = self.store.state
+      if self.focusSelection(in: next) != self.focusSelection(in: previous) {
+        // Reserve before presentation can restore a different native key pane.
+        // Layout may coalesce transitions, but cannot replace this selection.
+        self.reserveSelectionFocus(self.focusSelection(in: next))
+      }
       if next.activeTabID != previous.activeTabID || next.activeSpaceID != previous.activeSpaceID
         || next.activeTab?.peek?.isPresented != previous.activeTab?.peek?.isPresented {
         self.peekOpening.cancel()
@@ -578,7 +702,7 @@ final class BrowserWindowCoordinator: NSObject {
     actions.$palette.dropFirst().sink { [weak self] presented in
       guard let self else { return }
       if presented {
-        self.abandonSelectionFocus()
+        self.abandonSelectionFocus(reason: "palette.presented")
         self.retiringPaletteEditor = nil
         self.retiringPaletteWindow = nil
       } else if self.actions.palette, let key = NSApp.keyWindow,
@@ -596,27 +720,27 @@ final class BrowserWindowCoordinator: NSObject {
       in: &observations)
     actions.$library.dropFirst().sink { [weak self] section in
       guard let self else { return }
-      if section != nil { self.abandonSelectionFocus(); self.window?.makeKeyAndOrderFront(nil) }
+      if section != nil { self.abandonSelectionFocus(reason: "library.presented"); self.window?.makeKeyAndOrderFront(nil) }
       self.scheduleLayout()
     }.store(in: &observations)
     for publisher in [actions.$themeEditor.eraseToAnyPublisher(), actions.$findVisible.eraseToAnyPublisher(),
       actions.$recordingShortcut.eraseToAnyPublisher()] {
       publisher.dropFirst().sink { [weak self] shown in
-        if shown { self?.abandonSelectionFocus() }
+        if shown { self?.abandonSelectionFocus(reason: "interface.presented") }
       }.store(in: &observations)
     }
     for name in [NSApplication.didResignActiveNotification, NSWindow.willBeginSheetNotification,
       NSText.didBeginEditingNotification, NSControl.textDidBeginEditingNotification] {
       NotificationCenter.default.publisher(for: name).sink { [weak self] _ in
         guard let self, self.selectionFocusIntent.phase == .pending else { return }
-        self.abandonSelectionFocus()
+        self.abandonSelectionFocus(reason: "notification." + name.rawValue)
       }.store(in: &observations)
     }
     NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification).sink { [weak self] event in
       self?.schedulePermissionPresentation()
       guard let self, self.selectionFocusIntent.phase == .pending,
         !self.ownsDocumentFocusWindow(event.object as? NSWindow) else { return }
-      self.abandonSelectionFocus()
+      self.abandonSelectionFocus(reason: "foreign-key.\((event.object as? NSWindow)?.windowNumber ?? -1)")
     }.store(in: &observations)
     for name in [NSApplication.didBecomeActiveNotification, NSWindow.didEndSheetNotification,
       NSWindow.didDeminiaturizeNotification] {
@@ -634,7 +758,10 @@ final class BrowserWindowCoordinator: NSObject {
       guard let self else { return event }
       // This runs before the event's selection/navigation action. That action
       // may create a new intent; an older asynchronous completion may not.
-      if event.type != .flagsChanged { self.abandonSelectionFocus() }
+      if event.type != .flagsChanged {
+        self.abandonSelectionFocus(reason: "input.\(event.type.rawValue)")
+        self.selectSplitPaneForInteraction(event)
+      }
       guard event.type == .keyDown || event.type == .flagsChanged else { return event }
       return self.handleKey(event) ? nil : event
     }
@@ -722,19 +849,167 @@ final class BrowserWindowCoordinator: NSObject {
       pinnedURL: pinned, visible: visible)
   }
   private func cancelSelectionFocus() {
+    traceSelectionFocus("cancel.before-clear")
     selectionFocusTask?.cancel(); selectionFocusTask = nil
+    reservedSelectionFocusToken = nil
     selectionFocusIntent.clear()
   }
-  private var focusSelection: DocumentFocusIntent.Selection? {
-    selectedDocumentID.map { .init(documentID: $0, profileID: store.activeProfileID) }
+  private func reserveSelectionFocus(_ selection: DocumentFocusIntent.Selection?) {
+    cancelSelectionFocus()
+    guard let selection else { return }
+    reservedSelectionFocusToken = selectionFocusIntent.begin(selection)
+    traceSelectionFocus("selection.reserved", requestedID: selection.documentID)
   }
-  private func abandonSelectionFocus() {
+  private var hasPendingSelectionFocus: Bool {
+    selectionFocusIntent.phase == .pending && selectionFocusIntent.selection == focusSelection
+  }
+  private var focusSelection: DocumentFocusIntent.Selection? {
+    focusSelection(in: store.state)
+  }
+  private func focusSelection(in state: BrowserState) -> DocumentFocusIntent.Selection? {
+    guard let tab = state.activeTab else { return nil }
+    let documentID = tab.peek != nil && tab.peek?.isPresented != false ? "peek:" + tab.id : tab.id
+    return .init(documentID: documentID, profileID: state.activeSpace?.profileID ?? "default")
+  }
+  private func abandonSelectionFocus(reason: String = "interaction") {
+    traceSelectionFocus("abandon.before." + reason)
     selectionFocusTask?.cancel(); selectionFocusTask = nil
+    reservedSelectionFocusToken = nil
     selectionFocusIntent.abandon(focusSelection)
+    traceSelectionFocus("abandon.after." + reason)
+  }
+  private func selectSplitPaneForInteraction(_ event: NSEvent) {
+    guard [.leftMouseDown, .rightMouseDown, .otherMouseDown, .keyDown].contains(event.type),
+      permitsSplitPaneInteraction,
+      event.type != .keyDown || !(NSApp.keyWindow?.firstResponder is NSTextView),
+      store.state.activeTab?.peek == nil || store.state.activeTab?.peek?.isPresented == false,
+      let split = visibleSplit, let targetWindow = event.window else { return }
+    let targets = split.tabIDs.compactMap { engine.pages[$0] }.filter { page in
+      owns(page, tabID: page.id) && page.documentError == nil
+        && page.ownerWindowID == windowContext.id && store.tab(page.id)?.windowID == windowContext.id
+        && page.profileID == store.activeProfileID
+        && visiblePageFrames[page.id] != nil && page.nativeWindow === targetWindow
+        && targetWindow.isVisible
+    }
+    guard targets.count == 1, let target = targets.first,
+      store.state.activeTabID != target.id else { return }
+    // An automatic restoration may already have made this pane key. A real
+    // input event still selects its exact document without another focus edge.
+    store.selectTab(id: target.id)
+  }
+  private var permitsSplitPaneInteraction: Bool {
+    // Find stays open while the user interacts with a document. Automatic
+    // focus uses the stricter environment below and never leaves its editor.
+    NSApp.isActive && windowContext.isOpen && !windowContext.isClosing && !engine.isTerminating
+      && deletingProfileID == nil && !actions.palette && !actions.themeEditor && actions.library == nil
+      && !actions.recordingShortcut && window?.attachedSheet == nil && NSApp.modalWindow == nil
+  }
+  func beginSelectionFocusDiagnostics(tabIDs: Set<String>) {
+    guard selectionFocusDiagnosticsAvailable, tabIDs.allSatisfy({ id in
+      guard let tab = store.document(id: id), tab.windowID == windowContext.id,
+        let url = URL(string: tab.url), url.host == "127.0.0.1" else { return false }
+      return url.path == "/focus-left" || url.path == "/focus-right"
+    }) else { return }
+    selectionFocusDiagnosticIDs = tabIDs
+    selectionFocusDiagnostics.removeAll(keepingCapacity: true)
+    selectionFocusDiagnostics.reserveCapacity(64)
+    selectionFocusDiagnosticNext = 0
+  }
+
+  /// Flush only after the unchanged acceptance predicate has succeeded/failed.
+  /// During focus transitions the ring stores values without JSON or stderr.
+  func flushSelectionFocusDiagnostics(outcome: String) {
+    guard selectionFocusDiagnosticsAvailable, !selectionFocusDiagnosticIDs.isEmpty else { return }
+    let ordered = Array(selectionFocusDiagnostics[selectionFocusDiagnosticNext...])
+      + Array(selectionFocusDiagnostics[..<selectionFocusDiagnosticNext])
+    let rows: [[String: Any]] = ordered.map { value in
+      ["time": value.time, "event": value.event, "phase": String(describing: value.phase),
+        "requestedID": value.requestedID ?? "nil", "intentID": value.intentID ?? "nil",
+        "intentProfileID": value.intentProfileID ?? "nil", "selectedID": value.selectedID ?? "nil",
+        "activeTabID": value.activeTabID ?? "nil", "profileID": value.profileID,
+        "ownerNativeID": value.ownerNativeID, "ownerOpen": value.ownerOpen,
+        "ownerClosing": value.ownerClosing, "terminating": value.terminating,
+        "deletingProfileID": value.deletingProfileID ?? "nil", "appActive": value.appActive,
+        "mouseButtons": value.mouseButtons, "environmentAllowed": value.environmentAllowed,
+        "transitionAllowed": value.transitionAllowed, "focusAllowed": value.focusAllowed,
+        "keyWindow": value.keyWindow, "keyOwned": value.keyOwned,
+        "keyResponder": value.responderType.map { String(reflecting: $0) } ?? "nil",
+        "ownerWindow": value.ownerWindow, "ownerSheet": value.ownerSheet,
+        "modalWindow": value.modalWindow, "pageNativeID": value.nativeID,
+        "pageWindow": value.pageWindow, "pageVisible": value.pageVisible,
+        "requestedNativeID": value.requestedNativeID, "requestedWindow": value.requestedWindow,
+        "requestedKey": value.requestedKey]
+    }
+    if let data = try? JSONSerialization.data(withJSONObject: [
+      "ownerID": windowContext.id, "outcome": outcome, "events": rows,
+    ], options: [.sortedKeys]) {
+      fputs("Native hosted focus snapshot ring: \(String(decoding: data, as: UTF8.self))\n", stderr)
+    }
+    selectionFocusDiagnosticIDs.removeAll()
+    selectionFocusDiagnostics.removeAll(keepingCapacity: true)
+    selectionFocusDiagnosticNext = 0
+  }
+
+  /// A bounded read-only ring for explicitly registered loopback fixture IDs.
+  private func traceSelectionFocus(_ event: String, requestedID: String? = nil) {
+    guard selectionFocusDiagnosticsAvailable, !selectionFocusDiagnosticIDs.isEmpty else { return }
+    let selectedID = selectedDocumentID
+    guard selectedID.map(selectionFocusDiagnosticIDs.contains) == true
+      || selectionFocusIntent.selection.map({ selectionFocusDiagnosticIDs.contains($0.documentID) }) == true
+      || requestedID.map(selectionFocusDiagnosticIDs.contains) == true else { return }
+    let key = NSApp.keyWindow
+    let page = selectedID.flatMap { engine.pages[$0] }
+    let requestedPage = requestedID.flatMap { engine.pages[$0] }
+    let value = SelectionFocusDiagnostic(time: ProcessInfo.processInfo.systemUptime,
+      event: event, phase: selectionFocusIntent.phase, requestedID: requestedID,
+      intentID: selectionFocusIntent.selection?.documentID, intentProfileID: selectionFocusIntent.selection?.profileID,
+      selectedID: selectedID, activeTabID: store.state.activeTabID, profileID: store.activeProfileID,
+      ownerNativeID: windowContext.nativeID, ownerOpen: windowContext.isOpen,
+      ownerClosing: windowContext.isClosing, terminating: engine.isTerminating,
+      deletingProfileID: deletingProfileID, appActive: NSApp.isActive,
+      mouseButtons: Int(NSEvent.pressedMouseButtons), environmentAllowed: permitsDocumentFocusEnvironment,
+      transitionAllowed: permitsSelectionFocusTransition, focusAllowed: permitsDocumentFocus,
+      keyWindow: key?.windowNumber ?? -1, keyOwned: ownsDocumentFocusWindow(key),
+      responderType: (key?.firstResponder).map { type(of: $0) },
+      ownerWindow: window?.windowNumber ?? -1, ownerSheet: window?.attachedSheet?.windowNumber ?? -1,
+      modalWindow: NSApp.modalWindow?.windowNumber ?? -1, nativeID: page?.browser?.id ?? -1,
+      pageWindow: page?.nativeWindow?.windowNumber ?? -1, pageVisible: page?.nativeWindow?.isVisible == true,
+      requestedNativeID: requestedPage?.browser?.id ?? -1,
+      requestedWindow: requestedPage?.nativeWindow?.windowNumber ?? -1,
+      requestedKey: requestedPage?.nativeWindow?.isKeyWindow == true)
+    if event == "begin.same-selection-skipped", !selectionFocusDiagnostics.isEmpty {
+      let last = selectionFocusDiagnostics[selectionFocusDiagnostics.count < 64
+        ? selectionFocusDiagnostics.count - 1 : (selectionFocusDiagnosticNext + 63) % 64]
+      if last.event == value.event, last.phase == value.phase,
+        last.intentID == value.intentID, last.selectedID == value.selectedID,
+        last.keyWindow == value.keyWindow, last.mouseButtons == value.mouseButtons,
+        last.deletingProfileID == value.deletingProfileID, last.focusAllowed == value.focusAllowed,
+        last.transitionAllowed == value.transitionAllowed, last.nativeID == value.nativeID,
+        last.pageWindow == value.pageWindow, last.pageVisible == value.pageVisible { return }
+    }
+    if selectionFocusDiagnostics.count < 64 { selectionFocusDiagnostics.append(value) }
+    else {
+      selectionFocusDiagnostics[selectionFocusDiagnosticNext] = value
+      selectionFocusDiagnosticNext = (selectionFocusDiagnosticNext + 1) % 64
+    }
   }
   private func ownsDocumentFocusWindow(_ candidate: NSWindow?) -> Bool {
     guard let candidate else { return false }
     return candidate === window || windowPages.values.contains { $0.nativeWindow === candidate }
+  }
+  private func ownsSidebarToggleFocus(_ candidate: NSWindow?) -> Bool {
+    guard NSApp.isActive, application.focusedCoordinator === self,
+      windowContext.isOpen, !windowContext.isClosing, !engine.isTerminating,
+      deletingProfileID == nil, let window, window.isVisible, !window.isMiniaturized else { return false }
+    guard let candidate else { return window.isMainWindow }
+    if ownsDocumentFocusWindow(candidate) || documentErrorPanels.owns(candidate)
+      || engine.extensionPopupOwner(candidate) === windowContext { return true }
+    var owner: NSWindow? = candidate
+    while let current = owner {
+      if current === window { return true }
+      owner = current.sheetParent ?? current.parent
+    }
+    return false
   }
   private var permitsDocumentFocusEnvironment: Bool {
     guard NSApp.isActive, windowContext.isOpen, !windowContext.isClosing, !engine.isTerminating,
@@ -760,44 +1035,72 @@ final class BrowserWindowCoordinator: NSObject {
   /// of the focused browser may take focus after asynchronous materialization.
   private func focusSelectedDocument(force: Bool = false) {
     guard let selection = focusSelection else { cancelSelectionFocus(); return }
-    guard let token = selectionFocusIntent.begin(selection, explicit: force) else { return }
+    let token: DocumentFocusIntent.Token
+    if !force, let reserved = reservedSelectionFocusToken,
+      reserved.selection == selection, selectionFocusIntent.isPending(reserved) {
+      reservedSelectionFocusToken = nil
+      token = reserved
+      traceSelectionFocus("begin.reserved")
+    } else {
+      reservedSelectionFocusToken = nil
+      guard let next = selectionFocusIntent.begin(selection, explicit: force) else {
+        traceSelectionFocus("begin.same-selection-skipped"); return
+      }
+      token = next
+      traceSelectionFocus(force ? "begin.explicit" : "begin.selection")
+    }
     selectionFocusTask?.cancel()
     let id = selection.documentID, profileID = selection.profileID
     guard let tab = store.document(id: id), !tab.isClosed, tab.url != "about:blank",
-      permitsSelectionFocusTransition else { abandonSelectionFocus(); return }
+      permitsSelectionFocusTransition else { abandonSelectionFocus(reason: "admission.denied"); return }
     let transitionDeadline = ProcessInfo.processInfo.systemUptime + 0.25
     selectionFocusTask = Task { [weak self] in
       guard let self else { return }
       defer {
-        if self.selectionFocusIntent.isPending(token) { self.abandonSelectionFocus() }
+        if self.selectionFocusIntent.isPending(token) { self.abandonSelectionFocus(reason: "task.finished-pending") }
       }
       do {
+        self.traceSelectionFocus("task.entered", requestedID: id)
         while !self.permitsDocumentFocus {
           try Task.checkCancellation()
           let now = ProcessInfo.processInfo.systemUptime
           guard self.selectionFocusIntent.isPending(token), self.focusSelection == selection,
             self.permitsSelectionFocusTransition,
-            now < transitionDeadline else { return }
+            now < transitionDeadline else { self.traceSelectionFocus("task.transition-rejected", requestedID: id); return }
           if let editor = NSApp.keyWindow?.firstResponder as? NSTextView {
-            guard editor === self.retiringPaletteEditor, now < self.retiringPaletteDeadline else { return }
+            guard editor === self.retiringPaletteEditor, now < self.retiringPaletteDeadline else {
+              self.traceSelectionFocus("task.editor-rejected", requestedID: id); return
+            }
           }
           try await Task.sleep(for: .milliseconds(16))
         }
         try Task.checkCancellation()
-        guard self.selectionFocusIntent.isPending(token), self.focusSelection == selection else { return }
+        guard self.selectionFocusIntent.isPending(token), self.focusSelection == selection else {
+          self.traceSelectionFocus("task.selection-changed", requestedID: id); return
+        }
+        self.traceSelectionFocus("task.materializing", requestedID: id)
         let page = try await self.ensurePageReady(tab)
+        self.traceSelectionFocus("task.materialized", requestedID: id)
         try await self.navigation.waitForRestore(page)
+        self.traceSelectionFocus("task.restored", requestedID: id)
         try Task.checkCancellation()
         guard self.selectionFocusIntent.isPending(token), self.selectedDocumentID == id,
           self.store.activeProfileID == profileID, self.permitsDocumentFocus,
-          self.engine.pages[id] === page, page.documentError == nil else { return }
+          self.engine.pages[id] === page, page.documentError == nil else {
+          self.traceSelectionFocus("task.after-restore-rejected", requestedID: id); return
+        }
         self.layoutPages()
         guard self.selectionFocusIntent.isPending(token), self.selectedDocumentID == id,
           page.nativeWindow?.isVisible == true,
-          self.permitsDocumentFocus else { return }
+          self.permitsDocumentFocus else { self.traceSelectionFocus("task.after-layout-rejected", requestedID: id); return }
+        self.traceSelectionFocus("task.focusing", requestedID: id)
         page.focus()
         if self.selectionFocusIntent.complete(token) { self.selectionFocusTask = nil }
-      } catch { /* The page's own error/retry presentation owns failure reporting. */ }
+        self.traceSelectionFocus("task.completed", requestedID: id)
+      } catch {
+        self.traceSelectionFocus("task.error." + error.localizedDescription, requestedID: id)
+        /* The page's own error/retry presentation owns failure reporting. */
+      }
     }
   }
   func retryDocument(_ id: String) {
@@ -814,9 +1117,13 @@ final class BrowserWindowCoordinator: NSObject {
   func scheduleLayout() {
     guard !engine.isTerminating, !layoutQueued else { return }
     layoutQueued = true
-    DispatchQueue.main.async { [weak self] in
-      self?.layoutQueued = false
-      self?.layoutPages()
+    // Native window border drags run a nested event-tracking loop. Keep the
+    // coalesced pass available there so child document windows resize live.
+    RunLoop.main.perform(inModes: [.common]) { [weak self] in
+      MainActor.assumeIsolated {
+        self?.layoutQueued = false
+        self?.layoutPages()
+      }
     }
   }
   private func page(for tab: BrowserTab) -> ChromiumPage? {
@@ -1228,7 +1535,8 @@ final class BrowserWindowCoordinator: NSObject {
     }
     page.onPopupCreated = { [weak self, weak page] popup, foreground in
       guard let self, let page, self.owns(page, tabID: tabID), let source = self.store.tab(tabID) else { popup.close(); return }
-      if !self.adoptPopup(popup, spaceID: source.spaceID, foreground: foreground) { popup.close() }
+      self.application.popupAdoptions.begin(popup: popup, source: page, owner: self,
+        spaceID: source.spaceID, foreground: foreground)
     }
     page.onPeek = { [weak self, weak page] url, invocationPoint in
       guard let self, let page, self.owns(page, tabID: tabID) else { return }
@@ -1281,11 +1589,15 @@ final class BrowserWindowCoordinator: NSObject {
     }
     page.onFocused = { [weak self, weak page] in
       guard let self, let page, self.owns(page, tabID: tabID) else { return }
+      self.traceSelectionFocus("native-focus-callback", requestedID: tabID)
       // Showing/reparenting native split windows can emit focus callbacks. A
       // document beneath the modal Peek cannot take logical selection from it.
       if !peek, let preview = self.store.state.activeTab?.peek, preview.isPresented != false { return }
       if !peek, self.store.state.activeTabID != tabID,
-        self.visibleSplit?.tabIDs.contains(tabID) == true {
+        self.visibleSplit?.tabIDs.contains(tabID) == true,
+        !self.hasPendingSelectionFocus,
+        let nativeWindow = page.nativeWindow, nativeWindow.isKeyWindow,
+        NSApp.keyWindow === nativeWindow {
         self.store.selectTab(id: tabID)
       }
       self.updateNavigationState(self.activePage)
@@ -1375,6 +1687,7 @@ final class BrowserWindowCoordinator: NSObject {
       }
     }
     guard let page = engine.pages[id], page.ownerWindowID == windowContext.id,
+      !application.popupAdoptions.isPending(page),
       !application.pageRetirements.isBlocked(page), retiringPageIDs.insert(id).inserted else { return }
     if isInertRetirement(page) {
       closeInertRetirement(page)
@@ -1484,6 +1797,7 @@ final class BrowserWindowCoordinator: NSObject {
     for page in windowPages.values where !page.id.hasPrefix("extensions:")
       && !page.id.hasPrefix("extension-store:") && !page.id.hasPrefix("maintenance:")
       && !page.id.hasPrefix("panel-parking:") {
+      if application.popupAdoptions.isPending(page) { continue }
       if store.document(id: page.id)?.isClosed != false, !isInertRetirement(page) {
         application.pageRetirements.block(page,
           reason: "A live page must be recovered before this window can close. Its unsaved contents remain in memory.")
@@ -1537,6 +1851,12 @@ final class BrowserWindowCoordinator: NSObject {
     refreshCommands()
   }
   func layoutPages() {
+    let liveRetirementObjects = Set(windowPages.values.map(ObjectIdentifier.init))
+    for (key, review) in Array(retirementReviews) where !liveRetirementObjects.contains(key) {
+      review.task.cancel()
+      if retirementReviews[key]?.id == review.id { retirementReviews.removeValue(forKey: key) }
+    }
+    application.popupAdoptions.refresh()
     application.pageRetirements.refresh()
     application.webDialogs.refresh()
     for (id, prompt) in permissionPrompts {
@@ -1608,6 +1928,7 @@ final class BrowserWindowCoordinator: NSObject {
         height: max(1, bounds.height - top - gutter))
     }
     guard contentFrame.width > 0 else { return }
+    if actions.contentSplitRatio != visibleSplit?.ratio { actions.contentSplitRatio = visibleSplit?.ratio }
     var desired: [String: (ChromiumPage, CGRect)] = [:]
     if let current = store.state.activeTab, !current.isClosed,
       current.url != "about:blank" || engine.pages[current.id]?.isSidePanelVisible == true
@@ -1800,14 +2121,15 @@ final class BrowserWindowCoordinator: NSObject {
         submittedBrowser = browser
         try Task.checkCancellation()
         guard self.liveNavigations[id]?.id == request, isCurrentOwner() else { return }
-        let result = try await browser.devTools.call("Page.navigate",
+        _ = try await browser.devTools.call("Page.navigate",
           parameters: ["url": destination.absoluteString], timeout: 120)
         try Task.checkCancellation()
         guard self.liveNavigations[id]?.id == request, isCurrentOwner() else { return }
-        if let error = result["errorText"] as? String, !error.isEmpty,
-          error != "net::ERR_ABORTED", page.documentError == nil {
-          self.showError("This page could not be opened: " + error)
-        }
+        // Network failures reach CEF's main-frame load-error callback and the
+        // inline document error surface. Page.navigate can reply before that
+        // callback; interpreting its errorText as a separate UI failure creates
+        // a duplicate modal sheet over the page. Protocol/transport failures
+        // still throw and follow the exact-owner error path below.
       } catch {
         if !(error is CancellationError), self.liveNavigations[id]?.id == request,
           isCurrentOwner() { self.showError(error.localizedDescription) }
@@ -1890,8 +2212,12 @@ final class BrowserWindowCoordinator: NSObject {
         guard self.selectedDocumentID == "peek:" + source.id else { throw CancellationError() }
         let complete = { [weak self] in
           guard let self, self.selectedDocumentID == "peek:" + source.id else { return }
-          do { _ = try self.commitPeekPromotion(sourceID: source.id, activate: true) }
-          catch { self.showError(error.localizedDescription) }
+          Task { [weak self] in
+            guard let self else { return }
+            do { _ = try await self.promotePeekDocument(sourceID: source.id, activate: true, authorize: {}) }
+            catch is CancellationError { }
+            catch { self.showError(error.localizedDescription) }
+          }
         }
         if !self.peekPanel.animateExpand(completion: complete) { complete() }
       } catch is CancellationError { }
@@ -1904,6 +2230,13 @@ final class BrowserWindowCoordinator: NSObject {
     let page = try await ensurePageReady(document)
     try await settleLiveNavigation(page)
     try await navigation.waitForRestore(page)
+    if !page.isPrivate {
+      application.inspectRuntimeCapabilities()
+      await application.runtimeCapabilityTask?.value
+      guard application.runtimeCapabilitiesChecked else {
+        throw ShortcutError("Chromium’s browser capabilities could not be verified. Try again.")
+      }
+    }
     try await extensionBrowser.prepareInitialNavigation(page)
     guard page.id == "peek:" + sourceID, engine.pages[page.id] === page,
       page.ownerWindowID == windowContext.id, owns(page, tabID: sourceID),
@@ -1913,20 +2246,31 @@ final class BrowserWindowCoordinator: NSObject {
   }
   func promotePeekDocument(sourceID: String, activate: Bool, authorize: @MainActor () async throws -> Void) async throws -> BrowserTab {
     let page = try await preparePeekPromotion(sourceID: sourceID)
-    try await authorize()
-    guard page.id == "peek:" + sourceID, engine.pages[page.id] === page,
-      page.ownerWindowID == windowContext.id, owns(page, tabID: sourceID),
-      liveNavigations[page.id] == nil, store.tab(sourceID)?.peek != nil,
-      !windowContext.isClosing, !engine.isTerminating else { throw CancellationError() }
-    return try commitPeekPromotion(sourceID: sourceID, activate: activate)
+    let preparation = !page.isPrivate && application.supportsHistoryMirror
+      ? try await application.historyMirror.preparePublication(page) : nil
+    do {
+      try await authorize()
+      guard page.id == "peek:" + sourceID, engine.pages[page.id] === page,
+        page.ownerWindowID == windowContext.id, owns(page, tabID: sourceID),
+        liveNavigations[page.id] == nil, store.tab(sourceID)?.peek != nil,
+        !windowContext.isClosing, !engine.isTerminating else { throw CancellationError() }
+      try preparation?.validate()
+      let promoted = try commitPeekPromotion(sourceID: sourceID, activate: activate, publication: preparation?.publication)
+      await preparation?.finish(committed: true)
+      return promoted
+    } catch {
+      await preparation?.finish(committed: false)
+      throw error
+    }
   }
-  private func commitPeekPromotion(sourceID id: String, activate: Bool) throws -> BrowserTab {
+  private func commitPeekPromotion(sourceID id: String, activate: Bool, publication: NativeHistoryPublication? = nil) throws -> BrowserTab {
     guard !peekOpening.isReplacing(sourceTabID: id) else { throw CancellationError() }
     let previewID = "peek:" + id
     guard let preview = engine.pages[previewID], owns(preview, tabID: id), preview.browser != nil,
       preview.ownerWindowID == windowContext.id, liveNavigations[previewID] == nil,
       !windowContext.isClosing, !engine.isTerminating else { throw CancellationError() }
-    let promoted = try store.promotePeekDurably(tabID: id, activate: activate)
+    let promoted = try publication.map { try store.promoteNativeHistoryPeekDurably(tabID: id, publication: $0, activate: activate) }
+      ?? store.promotePeekDurably(tabID: id, activate: activate)
     if let page = engine.adoptPage(fromID: previewID, toID: promoted.id) {
       extensionBrowser.didPromotePeek(sourceID: id, targetID: promoted.id)
       navigation.forget(previewID)
@@ -2007,7 +2351,12 @@ final class BrowserWindowCoordinator: NSObject {
     if event.isARepeat && !repeatable.contains(command.id) { return true }
     if command.id.contains("recent-tab") { recentModifiers = flags.subtracting(.shift) }
     else { recentTabCycle = nil; recentModifiers = [] }
-    runCommand(command.id)
+    // Only this accepted key event carries document origin. Native menu and
+    // palette commands use the default shell origin even when a page is key.
+    let fromPage = event.window.map { source in
+      windowPages.values.contains { $0.nativeWindow === source }
+    } ?? false
+    runCommand(command.id, fromPage: fromPage)
     return true
   }
   private func dispatchExtensionShortcut(_ event: NSEvent) -> Bool {
@@ -2078,12 +2427,15 @@ final class BrowserWindowCoordinator: NSObject {
     app.addItem(.separator()); app.addItem(withTitle: "Quit Zacro", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
     _ = append("File", [("command-palette","Command Palette…"),("new-tab","New Tab Page"),("open-browser","New Window"),("new-private-space","New Private Space"),("open-location","Open Location…"),("reopen-tab","Reopen Closed Tab"),("reopen-window","Reopen Closed Window"),("",""),("close-tab","Close Tab"),("close-window","Close Window"),("",""),("import","Import Browser Data…"),("export","Export Browser Data…"),("",""),("save-page","Save Page As…"),("print","Print…")])
     let edit = append("Edit", [])
+    edit.autoenablesItems = true
     for (id,title,key,flags): (String,String,String,NSEvent.ModifierFlags) in [
       ("undo","Undo","z",.command),("redo","Redo","z",[.command,.shift]),
       ("cut","Cut","x",.command),("copy","Copy","c",.command),("paste","Paste","v",.command),
       ("paste-match-style","Paste and Match Style","v",[.command,.option,.shift]),("select-all","Select All","a",.command)] {
       if id == "cut" { edit.addItem(.separator()) }
-      let item = command("edit:" + id,title); item.keyEquivalent = key; item.keyEquivalentModifierMask = flags; edit.addItem(item)
+      let item = command("edit:" + id,title)
+      NativeEditingMenu.configure(item, id: id)
+      item.keyEquivalent = key; item.keyEquivalentModifierMask = flags; edit.addItem(item)
     }
     edit.addItem(.separator()); edit.addItem(command("find","Find…"))
     let speech = NSMenuItem(title: "Speech", action: nil, keyEquivalent: ""), speechMenu = NSMenu(title: "Speech")
@@ -2110,67 +2462,100 @@ final class BrowserWindowCoordinator: NSObject {
     }
     if let space { store.deleteSpace(id: space); return }
     guard let profile, let profileRecord = store.state.profiles.first(where: { $0.id == profile }) else { return }
-    let ids = Set(engine.pages.values.filter { $0.profileID == profile }.map(\.id))
     deletingProfileID = profile
-    let completion = { [weak self] in
-      guard let self else { return }
-      Task { [weak self] in
+    Task { @MainActor [self] in
+      do {
+        if !profileRecord.isPrivate {
+          try await application.historyMirror.suspend(profileID: profile)
+          // Retire the observer before its hidden transport can close. A veto
+          // reconnects through a fresh manager, rather than keeping a dead
+          // DevTools registration that can no longer publish native changes.
+          await extensionSync.pauseProfile(profile)
+        }
+      } catch {
+        if deletingProfileID == profile { deletingProfileID = nil }
+        if !profileRecord.isPrivate { extensionSync.resumeProfile(profile) }
+        application.historyMirror.resume(profileID: profile)
+        showError(error.localizedDescription)
+        return
+      }
+      guard deletingProfileID == profile, !engine.isTerminating,
+        store.state.profiles.contains(where: { $0.id == profile && $0.isPrivate == profileRecord.isPrivate }) else {
+        if deletingProfileID == profile { deletingProfileID = nil }
+        if !profileRecord.isPrivate { extensionSync.resumeProfile(profile) }
+        application.historyMirror.resume(profileID: profile)
+        return
+      }
+      // The mirror's actual DB barrier must complete while its transport is
+      // alive, before any page/profile broker can enter the close sequence.
+      await application.popupAdoptions.prepareForNativeClose(profileID: profile)
+      let ids = Set(engine.pages.values.filter { $0.profileID == profile }.map(\.id))
+      let completion = { [weak self] in
         guard let self else { return }
-        defer { self.deletingProfileID = nil; self.application.scheduleAllWindows() }
-        var committed = false
-        do {
-          try await self.engine.closeAuxiliaryBrowsers(profileID: profile, isPrivate: profileRecord.isPrivate)
-          guard self.deletingProfileID == profile,
-            self.store.state.profiles.contains(where: { $0.id == profile && $0.isPrivate == profileRecord.isPrivate }) else {
-            throw CancellationError()
+        Task { [weak self] in
+          guard let self else { return }
+          defer {
+            self.deletingProfileID = nil; self.application.scheduleAllWindows()
+            if !profileRecord.isPrivate { self.extensionSync.resumeProfile(profile) }
+            self.application.historyMirror.resume(profileID: profile)
           }
-          try await self.services.prepareProfileDeletion(profile)
-          // Provider cleanup can suspend while an extension opens another
-          // native auth window. Drain that exact context again before commit.
-          try await self.engine.closeAuxiliaryBrowsers(profileID: profile, isPrivate: profileRecord.isPrivate)
-          guard self.deletingProfileID == profile, !self.engine.isTerminating,
-            self.store.state.profiles.contains(where: { $0.id == profile && $0.isPrivate == profileRecord.isPrivate }) else {
-            throw CancellationError()
-          }
-          let ids = self.application.store.state.tabs.filter { self.store.profileID(for: $0) == profile }.map(\.id)
-          try self.store.deleteProfileDurably(id: profile)
-          committed = true
-          self.application.bookmarks.removeProfile(profile)
-          self.downloads.removeProfile(profile)
-          if profileRecord.isPrivate {
-            try await self.application.retirePrivateProfileAfterModelRemoval(profile)
-          }
-          else {
-            try await self.engine.retireProfileDownloads(profileID: profile, isPrivate: false)
-            try self.engine.retireProfile(profile)
-          }
-          self.favicons.clear(profile: profile)
-          try await self.navigation.removeProfile(profile)
-          await self.extensionSync.removeProfile(profile)
-          for owner in self.application.windows.values {
-            for id in ids {
-              owner.actions.icons.removeValue(forKey: id); owner.actions.iconColors.removeValue(forKey: id)
-              owner.actions.peekIcons.removeValue(forKey: id)
+          var committed = false
+          do {
+            try await self.engine.closeAuxiliaryBrowsers(profileID: profile, isPrivate: profileRecord.isPrivate)
+            guard self.deletingProfileID == profile,
+              self.store.state.profiles.contains(where: { $0.id == profile && $0.isPrivate == profileRecord.isPrivate }) else {
+              throw CancellationError()
             }
+            try await self.services.prepareProfileDeletion(profile)
+            // Provider cleanup can suspend while an extension opens another
+            // native auth window. Drain that exact context again before commit.
+            try await self.engine.closeAuxiliaryBrowsers(profileID: profile, isPrivate: profileRecord.isPrivate)
+            guard self.deletingProfileID == profile, !self.engine.isTerminating,
+              self.store.state.profiles.contains(where: { $0.id == profile && $0.isPrivate == profileRecord.isPrivate }) else {
+              throw CancellationError()
+            }
+            let ids = self.application.store.state.tabs.filter { self.store.profileID(for: $0) == profile }.map(\.id)
+            try self.store.deleteProfileDurably(id: profile)
+            committed = true
+            self.application.bookmarks.removeProfile(profile)
+            self.application.historyMirror.removeProfile(profile)
+            self.downloads.removeProfile(profile)
+            if profileRecord.isPrivate {
+              try await self.application.retirePrivateProfileAfterModelRemoval(profile)
+            }
+            else {
+              try await self.engine.retireProfileDownloads(profileID: profile, isPrivate: false)
+              try self.engine.retireProfile(profile)
+            }
+            self.favicons.clear(profile: profile)
+            try await self.navigation.removeProfile(profile)
+            await self.extensionSync.removeProfile(profile)
+            for owner in self.application.windows.values {
+              for id in ids {
+                owner.actions.icons.removeValue(forKey: id); owner.actions.iconColors.removeValue(forKey: id)
+                owner.actions.peekIcons.removeValue(forKey: id)
+              }
+            }
+            try await self.services.didDeleteProfile(profile)
+            if !profileRecord.isPrivate {
+              try NativeProfileArtifacts.remove(directory: self.engine.dataDirectory, profileID: profile)
+              try self.store.acknowledgeNativeProfileRetirement(profile)
+            }
+          } catch {
+            if !committed { try? await self.services.cancelProfileDeletion(profile) }
+            self.showError(error.localizedDescription)
           }
-          try await self.services.didDeleteProfile(profile)
-          if !profileRecord.isPrivate {
-            try NativeProfileArtifacts.remove(directory: self.engine.dataDirectory, profileID: profile)
-            try self.store.acknowledgeNativeProfileRetirement(profile)
-          }
-        } catch {
-          if !committed { try? await self.services.cancelProfileDeletion(profile) }
-          self.showError(error.localizedDescription)
         }
       }
+      if ids.isEmpty {
+        completion()
+        return
+      }
+      pendingDeletion = (ids, completion)
+      profileDeletionPageIDs.formUnion(ids)
+      application.popupAdoptions.willCloseProfileDocuments(profileID: profile, ids: ids)
+      for id in ids { engine.close(id: id) }
     }
-    if ids.isEmpty {
-      completion()
-      return
-    }
-    pendingDeletion = (ids, completion)
-    profileDeletionPageIDs.formUnion(ids)
-    for id in ids { engine.close(id: id) }
   }
   private func refreshSiteControls() {
     let profileChanged = siteControlProfileID != store.activeProfileID
@@ -2357,9 +2742,9 @@ extension BrowserWindowCoordinator {
       BrowserRuntimeCommand(id: entry.id, title: entry.title, icon: commandIcon(entry.id),
         shortcut: entry.accelerator.isEmpty ? nil : entry.accelerator, keywords: entry.category,
         available: commandAvailable(entry.id)) { [weak self] in self?.runCommand(entry.id) }
-    } + [BrowserRuntimeCommand(id: "unsplit", title: "Unsplit tabs", icon: "rectangle", keywords: "split separate", available: commandAvailable("unsplit")) { [weak self] in self?.runCommand("unsplit") },
-      BrowserRuntimeCommand(id: "reopen-window", title: "Reopen closed window", icon: "rectangle", keywords: "restore session tabs", available: commandAvailable("reopen-window")) { [weak self] in self?.runCommand("reopen-window") },
-      BrowserRuntimeCommand(id: "windows", title: "Saved windows", icon: "rectangle", keywords: "restore session tabs", available: true) { [weak self] in self?.runCommand("windows") },
+    } + [BrowserRuntimeCommand(id: "unsplit", title: "Unsplit tabs", icon: commandIcon("unsplit"), keywords: "split separate", available: commandAvailable("unsplit")) { [weak self] in self?.runCommand("unsplit") },
+      BrowserRuntimeCommand(id: "reopen-window", title: "Reopen closed window", icon: commandIcon("reopen-window"), keywords: "restore session tabs", available: commandAvailable("reopen-window")) { [weak self] in self?.runCommand("reopen-window") },
+      BrowserRuntimeCommand(id: "windows", title: "Saved windows", icon: commandIcon("windows"), keywords: "restore session tabs", available: true) { [weak self] in self?.runCommand("windows") },
       BrowserRuntimeCommand(id: "about", title: "About Zacro", icon: "info", keywords: "version browser", available: true) { [weak self] in self?.runCommand("about") }]
     if application.focusedCoordinator === self { installMenus() }
   }
@@ -2375,26 +2760,23 @@ extension BrowserWindowCoordinator {
     }
   }
   private func editCommand(_ id: String) {
-    let selector = ["undo":"undo:","redo":"redo:","cut":"cut:","copy":"copy:","paste":"paste:","paste-match-style":"pasteAsPlainText:","select-all":"selectAll:"][id] ?? ""
-    guard !selector.isEmpty else { return }
-    if let page = engine.pages.values.first(where: { $0.nativeWindow === NSApp.keyWindow }), let browser = page.browser {
-      switch id {
-      case "undo": browser.undo()
-      case "redo": browser.redo()
-      case "cut": browser.cutSelection()
-      case "copy": browser.copySelection()
-      case "paste": browser.paste()
-      case "paste-match-style": browser.pasteAndMatchStyle()
-      case "select-all": browser.selectAll()
-      default: break
-      }
-    } else { NSApp.sendAction(Selector(selector), to: nil, from: self) }
+    NativeEditingMenu.perform(id, sender: self)
+  }
+  func validateMenuItem(_ item: NSMenuItem) -> Bool {
+    guard let id = item.representedObject as? String else { return true }
+    return commandAvailable(id)
   }
   private var orderedTabs: [BrowserTab] {
     store.sidebarTabs()
   }
-  func runCommand(_ id: String) {
-    guard application.permitWindowCommand(id, from: self) else { return }
+  func runCommand(_ id: String, fromPage: Bool = false) {
+    let tracingSidebarFocus = ["focus-sidebar", "reveal-tab"].contains(id)
+      && CommandLine.arguments.contains("--native-integration-acceptance")
+    guard application.permitWindowCommand(id, from: self) else {
+      if tracingSidebarFocus { fputs("Native sidebar command rejected: window=\(windowContext.id) command=\(id) stage=application-admission\n", stderr) }
+      return
+    }
+    if tracingSidebarFocus { fputs("Native sidebar command admitted: window=\(windowContext.id) command=\(id) popup=\(isPopup)\n", stderr) }
     if isPopup {
       if id == "close-tab" || id == "close-window" {
         if id == "close-tab", store.state.activeTab?.peek != nil, store.state.activeTab?.peek?.isPresented != false { closePeek() }
@@ -2411,8 +2793,24 @@ extension BrowserWindowCoordinator {
         return
       }
     }
-    guard commandAvailable(id) else { return }
-    if actions.performInterfaceCommand(id) {
+    guard commandAvailable(id) else {
+      if tracingSidebarFocus { fputs("Native sidebar command rejected: window=\(windowContext.id) command=\(id) stage=availability\n", stderr) }
+      return
+    }
+    if id == "sidebar-toggle" {
+      actions.toggleSidebar(fromPage)
+      // The UI dismissal handoff owns focus. Generic shell activation here
+      // would immediately steal focus back from the selected native document.
+      return
+    }
+    if ["focus-sidebar", "reveal-tab"].contains(id), !actions.palette, !actions.themeEditor {
+      // The selected Chromium document can own a separate key window. Make
+      // the intended shell key before setting its custom keyboard-focus target.
+      window?.makeKeyAndOrderFront(nil)
+    }
+    let interfaceHandled = actions.performInterfaceCommand(id)
+    if tracingSidebarFocus { fputs("Native sidebar interface dispatch: window=\(windowContext.id) command=\(id) handled=\(interfaceHandled) key=\(window?.isKeyWindow == true)\n", stderr) }
+    if interfaceHandled {
       if !actions.palette && !actions.themeEditor { window?.makeKeyAndOrderFront(nil) }
       return
     }
@@ -2427,7 +2825,6 @@ extension BrowserWindowCoordinator {
       if let text = NSPasteboard.general.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty {
         if text.count <= 8_000 { actions.newTab(text) } else { showError("Paste up to 8,000 characters.") }
       }
-    case "sidebar-toggle": store.updateSettings { $0.sidebarVisible.toggle() }
     case "history-back": goBack()
     case "history-forward": goForward()
     case "copy-url":
@@ -2549,6 +2946,7 @@ extension BrowserWindowCoordinator {
     }
   }
   func showError(_ message: String) {
+    NativeSidePanelPresentationDiagnostics.showError(message, owner: self)
     guard let window, windowContext.isOpen else {
       fputs("Zacro: \(message)\n", stderr); return
     }
@@ -2684,6 +3082,10 @@ extension BrowserWindowCoordinator {
       }
       return nil
     }
+    actions.libraryHeaderContent = { [weak self] section in
+      guard let self, section == "AI" else { return nil }
+      return AnyView(NativeAINewConversationButton(model:self.services))
+    }
     actions.settingsContent = { [weak self] in
       guard let self else { return nil }
       return AnyView(VStack(alignment: .leading, spacing: 18) {
@@ -2699,6 +3101,20 @@ extension BrowserWindowCoordinator {
   }
   func openAISources(action: String, payload: ServiceJSON) async throws -> ServiceJSON {
     guard store.state.activeProfile?.isPrivate == false else { throw ServiceError("PRIVATE", "AI is unavailable in private profiles.") }
+    if action == "ai:open-search" {
+      try Task.checkCancellation()
+      guard windowContext.isOpen, !windowContext.isClosing, !engine.isTerminating,
+        payload["profileId"].string == store.activeProfileID,
+        payload["conversationId"].string == services.conversationID,
+        services.ordinaryAISearchQuery(requestID:payload["requestId"].string) == payload["query"].string,
+        let url = BrowserAddress.searchURL(payload["query"].string, engine:store.state.settings.searchEngine) else {
+        throw ServiceError("CONTEXT_CHANGED", "This answer or its browser window changed.")
+      }
+      // Search is an explicit action, not a claim that the provider verified
+      // this destination. Resolve the current search setting at the click.
+      actions.newTab(url.absoluteString)
+      return .null
+    }
     let profileID = store.activeProfileID
     let status = await services.aiService.status(for: AIProfileScope(id: profileID), conversationID: services.conversationID)
     guard status["profileId"].string == profileID, store.activeProfileID == profileID else { throw ServiceError("CONTEXT_CHANGED", "The active profile changed.") }
@@ -2970,7 +3386,18 @@ extension BrowserWindowCoordinator {
       application.clearingHistoryProfiles.insert(profileID).inserted else {
       throw ShortcutError("Finish the current profile operation first.")
     }
-    defer { application.clearingHistoryProfiles.remove(profileID) }
+    defer {
+      application.clearingHistoryProfiles.remove(profileID)
+      application.historyMirror.resume(profileID: profileID)
+    }
+    if !profile.isPrivate {
+      application.inspectRuntimeCapabilities()
+      await application.runtimeCapabilityTask?.value
+      guard application.runtimeCapabilitiesChecked else {
+        throw ShortcutError("Chromium’s browser capabilities could not be verified. Try again.")
+      }
+      try await application.historyMirror.suspend(profileID: profileID)
+    }
     navigation.beginProfileReset(profileID)
     defer {
       navigation.endProfileReset(profileID)
@@ -2985,7 +3412,12 @@ extension BrowserWindowCoordinator {
       maintenance.hide()
       try await maintenance.ready().clearProfileBrowsingData(siteData: false, cache: false, history: true)
     } else {
-      try await ChromeExtensionManager(engine: engine, profileID: profileID).clearBrowsingHistory()
+      let manager = ChromeExtensionManager(engine: engine, profileID: profileID)
+      try await manager.clearBrowsingHistory()
+      if application.supportsHistoryMirror {
+        let barrier = try await manager.historyMirrorSession()
+        await barrier.close()
+      }
     }
     for page in engine.pages.values where page.profileID == profileID
       && (application.store.tab(page.id) != nil || page.id.hasPrefix("peek:")) {
@@ -3007,7 +3439,18 @@ extension BrowserWindowCoordinator {
     // Reserve the shared profile operation before creating or awaiting a native
     // maintenance page. A second window must not replace its close continuation.
     deletingProfileID = profileID
-    defer { deletingProfileID = nil; application.scheduleAllWindows() }
+    defer {
+      deletingProfileID = nil; application.scheduleAllWindows()
+      application.historyMirror.resume(profileID: profileID)
+    }
+    if !profile.isPrivate {
+      application.inspectRuntimeCapabilities()
+      await application.runtimeCapabilityTask?.value
+      guard application.runtimeCapabilitiesChecked else {
+        throw ShortcutError("Chromium’s browser capabilities could not be verified. Try again.")
+      }
+      try await application.historyMirror.suspend(profileID: profileID)
+    }
     let maintenance = engine.page(id: "maintenance:" + profileID, profileID: profileID,
       isPrivate: profile.isPrivate, url: URL(string: "about:blank")!, ownerWindowID: nil)
     defer { maintenance.close() }
@@ -3032,11 +3475,13 @@ extension BrowserWindowCoordinator {
       navigation.endProfileReset(profileID)
       extensionSync.resumeProfile(profileID)
     }
+    await application.popupAdoptions.prepareForNativeClose(profileID: profileID)
     let documents = engine.pages.values.filter { $0.profileID == profileID && $0 !== maintenance }
     let ids = Set(documents.map(\.id))
     if !ids.isEmpty {
       let closed = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
         profileDeletionPageIDs.formUnion(ids)
+        application.popupAdoptions.willCloseProfileDocuments(profileID: profileID, ids: ids)
         scopeCloseCancelled = { continuation.resume(returning: false) }
         pendingDeletion = (ids, { [weak self] in
           self?.scopeCloseCancelled = nil
@@ -3052,6 +3497,12 @@ extension BrowserWindowCoordinator {
       throw CancellationError()
     }
     try await browser.clearProfileBrowsingData(siteData: true, cache: true, history: true)
+    if !profile.isPrivate && application.supportsHistoryMirror {
+      // BrowsingDataRemover completion alone does not report a failed History
+      // SQL commit. Check the existing live maintenance page before Core clears.
+      let barrier = try await maintenance.historyMirrorSession()
+      await barrier.close()
+    }
     try await engine.clearNetworkData(profileID: profileID, isPrivate: profile.isPrivate,
       selected: [.cookies, .cache, .httpAuthentication])
     try store.clearHistoryDurably(profileID: profileID)
@@ -3116,8 +3567,48 @@ extension BrowserWindowCoordinator {
   }
 
   private func traceDiscardRefusal(_ id: String, reason: String) {
-    guard CommandLine.arguments.contains("--native-integration-acceptance") else { return }
-    fputs("Native discard refused \(id): \(reason)\n", stderr)
+    guard CommandLine.arguments.contains("--engine-acceptance"),
+      CommandLine.arguments.contains("--native-integration-acceptance") else { return }
+    let tab = store.tab(id), page = engine.pages[id]
+    var state: [String: Any] = [
+      "id": id, "reason": reason, "ownerID": windowContext.id,
+      "windowOpen": windowContext.isOpen, "windowClosing": windowContext.isClosing,
+      "engineTerminating": engine.isTerminating, "taskCancelled": Task.isCancelled,
+      "activeID": store.state.activeTabID ?? "nil", "activeProfile": store.activeProfileID,
+      "sleepAvailable": actions.libraryCapabilities.contains("tab:sleep"),
+      "modelExists": tab != nil, "pageExists": page != nil,
+      "visibleFrame": visiblePageFrames.keys.contains(id),
+      "visibleSplitMember": visibleSplit?.tabIDs.contains(id) == true,
+      "reserved": reservedPages.contains(id), "dormant": dormantPages.contains(id),
+      "discarding": discardingPages.contains(id), "mediaPermission": mediaPermissionPages.contains(id),
+      "creating": pageCreations[id] != nil, "waking": dormantNavigations[id] != nil,
+      "liveNavigation": liveNavigations[id] != nil,
+    ]
+    if let tab {
+      state["closed"] = tab.isClosed; state["modelWindow"] = tab.windowID ?? "nil"
+      state["profile"] = store.profileID(for: tab) ?? "nil"
+      state["peek"] = tab.peek != nil; state["autoDiscardable"] = tab.autoDiscardable != false
+      state["modelURLLength"] = tab.url.utf8.count
+      if let page {
+        state["ownsPage"] = owns(page, tabID: tab.id)
+        state["downloadProtected"] = downloads.protects(tab, profileID: page.profileID)
+        state["nativeURLMatchesModel"] = page.url?.absoluteString == tab.url
+      }
+    }
+    if let page {
+      state["browserID"] = page.browser?.id ?? -1
+      state["nativeClosed"] = page.browser?.isClosed ?? true
+      state["nativeLoading"] = page.isLoading
+      state["nativeVisible"] = page.nativeWindow?.isVisible ?? false
+      state["nativeOwner"] = page.ownerWindowID ?? "nil"
+      state["restoring"] = navigation.isRestoring(page)
+      state["pendingAuthentication"] = page.hasPendingAuthentication
+      state["liveOpener"] = page.openerID.flatMap({ engine.pages[$0] }) != nil
+      state["liveChildren"] = engine.pages.values.filter { $0.openerID == page.id }.count
+    }
+    if let data = try? JSONSerialization.data(withJSONObject: state, options: [.sortedKeys]) {
+      fputs("Native discard refused state: \(String(decoding: data, as: UTF8.self))\n", stderr)
+    } else { fputs("Native discard refused \(id): \(reason)\n", stderr) }
   }
 
   private func unloadWithSuspendedLinks(_ id: String, automatically: Bool) async throws -> Bool {
@@ -3225,6 +3716,13 @@ private struct NativeContentOverlay: View {
   @ObservedObject var actions: BrowserActions
   let coordinator: BrowserWindowCoordinator
   @State private var resizeRatio: Double?
+  @Environment(\.presentedSpaceTheme) private var presentedTheme
+  @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+  @Environment(\.colorSchemeContrast) private var contrast
+  private var needsTransparentResizeHitArea: Bool {
+    let theme = presentedTheme ?? store.state.activeSpace?.theme ?? SpaceTheme()
+    return !reduceTransparency && contrast != .increased && theme.opacity <= 0 && theme.blur <= 0
+  }
   var body: some View {
     GeometryReader { geometry in
       ZStack {
@@ -3237,6 +3735,7 @@ private struct NativeContentOverlay: View {
             range: coordinator.splitResizeRange(width: geometry.size.width),
             step: 0.02, fineStep: 0.02, largeStep: 0.1, reset: 0.5,
             pixelsPerUnit: max(2, geometry.size.width - 6), label: "Resize split view",
+            needsTransparentHitArea: needsTransparentResizeHitArea,
             valueDescription: { "\(Int(($0 * 100).rounded()))% left, \(Int(((1 - $0) * 100).rounded()))% right" },
             preview: { value in
               resizeRatio = value
@@ -3264,7 +3763,7 @@ private struct NativeContentOverlay: View {
             NativePageErrorView(message: message, url: store.document(id: pane.id)?.url ?? "",
               theme: coordinator.presentationTheme,
               retry: { coordinator.retryDocument(pane.id) }, editAddress: { coordinator.editDocumentAddress(pane.id) })
-              .clipShape(RoundedRectangle(cornerRadius: coordinator.isPopup ? 0 : store.state.settings.pageRadius))
+              .clipShape(NativePaneShape(radius: coordinator.isPopup ? 0 : store.state.settings.pageRadius))
               .frame(width: pane.frame.width, height: pane.frame.height)
               .position(x: pane.frame.midX, y: pane.frame.midY)
           }

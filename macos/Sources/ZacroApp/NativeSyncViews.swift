@@ -52,7 +52,7 @@ struct NativeSyncSettingsView: View {
             Text(model.sync["startupError"].string).font(.system(size:11)).foregroundStyle(palette.muted).textSelection(.enabled)
           }
           if !model.sync["endpoint"].string.isEmpty { Text(model.sync["endpoint"].string).font(.system(size:10)).foregroundStyle(palette.muted).textSelection(.enabled) }
-          Button("Configure service") { open("configure") }.buttonStyle(NativeServiceButtonStyle(palette:palette))
+          Button("Configure service") { open("configure") }.buttonStyle(NativeChromeButtonStyle(colors:palette))
           if !model.sync["endpoint"].string.isEmpty && !signedIn {
             ViewThatFits(in:.horizontal) {
               HStack(spacing:5) { accountButtons }
@@ -62,11 +62,11 @@ struct NativeSyncSettingsView: View {
           if signedIn { account }
           ForEach(model.sync["native"]["pending"].array, id:\.text) { entry in
             HStack(spacing:8) {
-              Image(systemName:"puzzlepiece.extension")
+              NativeGlyph("extension")
               Text(entry["name"].string.isEmpty ? entry["extensionId"].string : entry["name"].string).font(.system(size:10)).lineLimit(2)
               Spacer(minLength:0)
               Button(reviewLabel(entry["action"].string)) { perform("native-review",payload:["review":entry]) }
-                .buttonStyle(NativeServiceButtonStyle(palette:palette)).disabled(busy)
+                .buttonStyle(NativeChromeButtonStyle(colors:palette)).disabled(busy)
             }
           }
           ForEach(model.sync["native"]["errors"].array, id:\.text) { issue in
@@ -79,33 +79,34 @@ struct NativeSyncSettingsView: View {
                   if signedIn, current["settingsSync"].bool {
                     Button("Use synced settings") { perform("native-use-remote",payload:["id":issue["extensionId"]]) }
                   }
-                }.buttonStyle(NativeServiceButtonStyle(palette:palette)).disabled(busy)
+                }.buttonStyle(NativeChromeButtonStyle(colors:palette)).disabled(busy)
               }
             }
           }
           if !model.sync["native"]["errors"].array.isEmpty {
             Button("Retry extension synchronization") { perform("native-retry") }
-              .buttonStyle(NativeServiceButtonStyle(palette:palette)).disabled(busy)
+              .buttonStyle(NativeChromeButtonStyle(colors:palette)).disabled(busy)
           }
           if !model.sync["cleanupError"].string.isEmpty {
             Text("A deleted profile still has local service data to remove. " + model.sync["cleanupError"].string)
               .font(.system(size:11)).foregroundStyle(palette.muted)
             Button("Retry profile cleanup") { perform("finish-profile-cleanup") }
-              .buttonStyle(NativeServiceButtonStyle(palette:palette)).disabled(busy)
+              .buttonStyle(NativeChromeButtonStyle(colors:palette)).disabled(busy)
           }
           if !error.isEmpty { Text(error).font(.system(size:11)).foregroundStyle(.red).textSelection(.enabled) }
         }
       }.padding(.top,12).padding(.bottom,8)
     }.font(.system(size:12,weight:.semibold)).foregroundStyle(palette.ink).tint(palette.accent)
+      .disclosureGroupStyle(NativeChromeDisclosureStyle(colors: palette))
       .sheet(isPresented:$presenting,onDismiss: { cancelOperation(); clearSecrets() }) { dialog }
       .onChange(of:profileID) { _,_ in cancelOperation(); presenting = false; clearSecrets(); error = "" }
       .onDisappear { cancelOperation() }
       .onChange(of:model.sync["state"]) { _,state in if state == "private" { dismissDialog() } }
   }
   @ViewBuilder private var accountButtons: some View {
-    Button("Create account") { open("register") }.buttonStyle(NativeServiceButtonStyle(palette:palette,prominent:true))
-    Button("Sign in") { open("login") }.buttonStyle(NativeServiceButtonStyle(palette:palette))
-    Button("Recover account") { open("recover") }.buttonStyle(NativeServiceButtonStyle(palette:palette))
+    Button("Create account") { open("register") }.buttonStyle(NativeChromeButtonStyle(colors:palette,prominent:true))
+    Button("Sign in") { open("login") }.buttonStyle(NativeChromeButtonStyle(colors:palette))
+    Button("Recover account") { open("recover") }.buttonStyle(NativeChromeButtonStyle(colors:palette))
   }
   private var account: some View {
     VStack(alignment:.leading,spacing:12) {
@@ -114,7 +115,7 @@ struct NativeSyncSettingsView: View {
         Button("Devices") { loadDevices() }
         Button("Sync now") { perform("now") }
         Button("Sign out") { perform("logout") }
-      }.buttonStyle(NativeServiceButtonStyle(palette:palette)).disabled(busy)
+      }.buttonStyle(NativeChromeButtonStyle(colors:palette)).disabled(busy)
       if current != .null {
         Text(current["name"].string).fontWeight(.semibold) + Text(" is linked to this profile.")
         Text("Library sync: \(current["librarySync"] == false ? "Off" : "On") · Settings sync: \(current["settingsSync"].bool ? "On" : "Off")").font(.system(size:10)).foregroundStyle(palette.muted)
@@ -132,10 +133,10 @@ struct NativeSyncSettingsView: View {
             Button("Unlink profile") { perform("unlink") }
             Button("Delete cloud profile") { selectedID = current["datasetId"].string; open("delete-dataset") }
           }
-        }.buttonStyle(NativeServiceButtonStyle(palette:palette)).disabled(busy)
+        }.buttonStyle(NativeChromeButtonStyle(colors:palette)).disabled(busy)
       } else {
         Text("This browser profile is not linked. Local extensions keep working.").font(.system(size:11)).foregroundStyle(palette.muted)
-        Button("Link profile") { loadDatasets() }.buttonStyle(NativeServiceButtonStyle(palette:palette,prominent:true)).disabled(busy)
+        Button("Link profile") { loadDatasets() }.buttonStyle(NativeChromeButtonStyle(colors:palette,prominent:true)).disabled(busy)
       }
       ForEach(current["rejected"].array,id:\.text) { rejected in
         VStack(alignment:.leading,spacing:7) {
@@ -145,7 +146,7 @@ struct NativeSyncSettingsView: View {
             Button("Retry") { perform("retry",payload:["id":rejected["id"]]) }
             Button("Export") { perform("export",payload:["id":rejected["id"]]) }
             Button("Discard") { selectedID = rejected["id"].string; open("discard") }
-          }.buttonStyle(NativeServiceButtonStyle(palette:palette)).disabled(busy)
+          }.buttonStyle(NativeChromeButtonStyle(colors:palette)).disabled(busy)
         }.padding(9).background(palette.card.opacity(0.45),in:RoundedRectangle(cornerRadius:8))
       }
       VStack(alignment:.leading,spacing:5) {
@@ -154,7 +155,7 @@ struct NativeSyncSettingsView: View {
           Button("Recovery codes") { open("codes") }
         }
         Button("Delete account") { open("delete-account") }.foregroundStyle(.red)
-      }.buttonStyle(NativeServiceButtonStyle(palette:palette)).disabled(busy)
+      }.buttonStyle(NativeChromeButtonStyle(colors:palette)).disabled(busy)
     }.font(.system(size:12,weight:.regular))
   }
   private var dialog: some View {
@@ -162,7 +163,7 @@ struct NativeSyncSettingsView: View {
       HStack {
         Text(title).font(.system(size:16,weight:.semibold))
         Spacer()
-        Button { dismissDialog() } label: { Image(systemName:"xmark").font(.system(size:12)).frame(width:24,height:24) }.buttonStyle(.plain).accessibilityLabel("Close")
+        Button { dismissDialog() } label: { NativeGlyph("close", size: 12).frame(width:24,height:24) }.buttonStyle(.plain).accessibilityLabel("Close")
       }
       if !description.isEmpty { Text(description).font(.system(size:12)).foregroundStyle(palette.muted).lineSpacing(3) }
       ScrollView {
@@ -174,9 +175,9 @@ struct NativeSyncSettingsView: View {
         if busy { ProgressView().controlSize(.small) }
         Spacer()
         Button(mode == "recovery" ? "I saved my recovery codes" : mode == "devices" ? "Done" : "Cancel") { dismissDialog() }
-          .buttonStyle(NativeServiceButtonStyle(palette:palette))
+          .buttonStyle(NativeChromeButtonStyle(colors:palette))
         if !["devices","recovery"].contains(mode) {
-          Button(submitTitle) { submit() }.buttonStyle(NativeServiceButtonStyle(palette:palette,prominent:true)).disabled(busy || !valid)
+          Button(submitTitle) { submit() }.buttonStyle(NativeChromeButtonStyle(colors:palette,prominent:true)).disabled(busy || !valid)
         }
       }
     }.padding(20).frame(width:450,height:dialogHeight).background(palette.chrome).foregroundStyle(palette.ink).tint(palette.accent)
@@ -232,7 +233,7 @@ struct NativeSyncSettingsView: View {
       if mode == "password" { field("New password") { SecureField("At least 12 characters",text:$newPassword) } }
     case "delete-account","delete-dataset":
       field("Current password") { SecureField("Current password",text:$password) }
-      Toggle("I understand this cloud data will be deleted",isOn:$confirm).toggleStyle(.checkbox).font(.system(size:12))
+      Toggle("I understand this cloud data will be deleted",isOn:$confirm).toggleStyle(NativeChromeCheckboxStyle(colors: palette)).font(.system(size:12))
     case "recovery":
       VStack(alignment:.leading,spacing:9) {
         ForEach(recoveryCodes,id:\.self) { code in Text(code).font(.system(size:13,design:.monospaced)).textSelection(.enabled) }
@@ -242,8 +243,9 @@ struct NativeSyncSettingsView: View {
     case "rename-device": field("Name") { TextField("Device name",text:$name) }
     case "link":
       if !records.isEmpty {
-        Picker("Existing sync profile",selection:$selectedID) { ForEach(records,id:\.text) { Text($0["name"].string).tag($0["id"].string) } }
-        Button("Review selected profile") { review(selectedID) }.buttonStyle(NativeServiceButtonStyle(palette:palette)).disabled(busy || selectedID.isEmpty)
+        NativeChromeSelect(title: "Existing sync profile", selection: $selectedID,
+          options: records.map { ($0["id"].string, $0["name"].string) }, colors: palette)
+        Button("Review selected profile") { review(selectedID) }.buttonStyle(NativeChromeButtonStyle(colors:palette)).disabled(busy || selectedID.isEmpty)
       }
       field("New sync profile name") { TextField("Name",text:$name) }
     case "review","library":
@@ -251,16 +253,14 @@ struct NativeSyncSettingsView: View {
       Text("\(preview["extensions"].array.filter { $0["state"] != "removed" }.count) extensions in the sync profile; \(preview["localExtensions"].array.count) portable extensions on this device.")
         .font(.system(size:11)).foregroundStyle(palette.muted)
       ForEach(preview["extensions"].array.filter { $0["state"] != "removed" },id:\.text) { entry in
-        Label("\(entry["name"].string.isEmpty ? entry["extensionId"].string : entry["name"].string) · \(entry["state"].string)",systemImage:"puzzlepiece.extension").font(.system(size:11)).lineLimit(2)
+        Label { Text("\(entry["name"].string.isEmpty ? entry["extensionId"].string : entry["name"].string) · \(entry["state"].string)") } icon: { NativeGlyph("extension", size: 14) }.font(.system(size:11)).lineLimit(2)
       }
       if mode == "review" {
-        Toggle("Sync extension library",isOn:$libraryEnabled).toggleStyle(.switch).controlSize(.small)
+        Toggle("Sync extension library",isOn:$libraryEnabled).toggleStyle(NativeChromeToggleStyle(colors: palette))
         Text("Share which portable extensions are installed, enabled or removed. With this off, settings can still sync for extensions already in the sync profile.").font(.system(size:10)).foregroundStyle(palette.muted)
       }
-      Picker("Extension library",selection:$libraryChoice) {
-        Text("Use the sync profile’s library").tag("remote-only")
-        Text("Also share this device’s portable extensions").tag("merge-local")
-      }
+      NativeChromeSelect(title: "Extension library", selection: $libraryChoice,
+        options: [("remote-only", "Use the sync profile’s library"), ("merge-local", "Also share this device’s portable extensions")], colors: palette)
       if mode == "review" { settingsConsent }
     case "settings": settingsConsent
     default: EmptyView()
@@ -268,13 +268,12 @@ struct NativeSyncSettingsView: View {
   }
   private var settingsConsent: some View {
     VStack(alignment:.leading,spacing:10) {
-      Toggle("Sync extension settings",isOn:$settingsEnabled).toggleStyle(.switch).controlSize(.small)
+      Toggle("Sync extension settings",isOn:$settingsEnabled).toggleStyle(NativeChromeToggleStyle(colors: palette))
       Text("Extensions choose what they save. Settings may contain personal information or credentials. The synchronization service can read these values. Enabling this option means you agree to share them with your configured service.")
         .font(.system(size:11)).foregroundStyle(palette.muted).lineSpacing(3)
-      Picker("Choose settings",selection:$settingsChoice) {
-        Text("Use settings from the sync profile").tag("use-remote")
-        Text("Upload settings from this device").tag("upload-local")
-      }.disabled(!settingsEnabled)
+      NativeChromeSelect(title: "Choose settings", selection: $settingsChoice,
+        options: [("use-remote", "Use settings from the sync profile"), ("upload-local", "Upload settings from this device")], colors: palette)
+        .disabled(!settingsEnabled)
     }
   }
   private func deviceRow(_ device: ServiceJSON) -> some View {
@@ -287,7 +286,7 @@ struct NativeSyncSettingsView: View {
         HStack {
           Button("Rename") { selectedID = device["id"].string; name = device["name"].string; mode = "rename-device" }
           Button("Revoke") { selectedID = device["id"].string; mode = "revoke-device" }
-        }.buttonStyle(NativeServiceButtonStyle(palette:palette))
+        }.buttonStyle(NativeChromeButtonStyle(colors:palette))
       }
     }.frame(maxWidth:.infinity,alignment:.leading).padding(11).background(palette.card.opacity(0.45),in:RoundedRectangle(cornerRadius:9))
   }

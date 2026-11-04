@@ -1,0 +1,52 @@
+#ifndef CHROME_BROWSER_EXTENSIONS_API_IDENTITY_NATIVE_WEB_AUTH_ADMISSION_H_
+#define CHROME_BROWSER_EXTENSIONS_API_IDENTITY_NATIVE_WEB_AUTH_ADMISSION_H_
+
+#include <cstdint>
+#include <memory>
+#include "base/functional/callback.h"
+#include "base/unguessable_token.h"
+
+class Profile;
+namespace extensions {
+// Private embedding interface. No extension API or OAuth data crosses it.
+// All methods run on the browser UI sequence.
+struct NativeWebAuthAdmissionState {
+  uint32_t size = sizeof(NativeWebAuthAdmissionState);
+  uint32_t reserved = 0;
+  uint64_t high = 0;
+  uint64_t low = 0;
+  uint64_t requests = 0;
+  uint64_t presented = 0;
+  uint64_t unpresented = 0;
+};
+enum class NativeWebAuthAdmissionOperation {
+  kAcquireContext = 1, kAcquireProcess = 2, kStatus = 3,
+  kRelease = 4, kSeal = 5, kIsBlocked = 6,
+};
+enum class NativeWebAuthAdmissionResult {
+  kOk = 1, kInvalidArgument = -1, kUnknownLease = -2,
+  kContextDestroyed = -3, kSealed = -4, kCapacity = -5,
+};
+
+class NativeWebAuthFlowRegistration {
+ public:
+  explicit NativeWebAuthFlowRegistration(base::UnguessableToken id,
+                                        bool admitted = true, bool overflow = false);
+  ~NativeWebAuthFlowRegistration();
+  bool is_admitted() const { return admitted_; }
+  NativeWebAuthFlowRegistration(const NativeWebAuthFlowRegistration&) = delete;
+  NativeWebAuthFlowRegistration& operator=(const NativeWebAuthFlowRegistration&) = delete;
+ private:
+  const base::UnguessableToken id_;
+  const bool admitted_;
+  const bool overflow_;
+};
+std::unique_ptr<NativeWebAuthFlowRegistration> RegisterNativeWebAuthFlow(
+    Profile* profile, base::RepeatingClosure cancel_unpresented,
+    base::RepeatingCallback<bool()> is_presented);
+bool IsNativeWebAuthAdmissionBlocked(Profile* profile);
+NativeWebAuthAdmissionResult UpdateNativeWebAuthAdmission(
+    NativeWebAuthAdmissionOperation operation, Profile* profile,
+    uint64_t high, uint64_t low, NativeWebAuthAdmissionState* output);
+}  // namespace extensions
+#endif

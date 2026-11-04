@@ -31,6 +31,24 @@ class ManagementPromptTests(unittest.TestCase):
         self.assertEqual(output.count("? parent_host->GetAcceleratedWidget()"), 2)
         self.assertIn("CreateDialogWidget(\n      dialog, gfx::NativeWindow(), parent_view, parent_widget)", output)
 
+    def test_external_native_parent_preserves_pinned_sheet_lifecycle(self):
+        original = self.originals[adapter.BRIDGE]
+        self.assertIn("RestoreChildModalFocusAfterResize", original)
+        output = adapter.generated(self.originals)
+        bridge = output[adapter.BRIDGE]
+        self.assertIn("RestoreChildModalFocusAfterResize", bridge)
+        original_close = method(original, "void NativeWidgetNSWindowBridge::CloseWindow()", "void NativeWidgetNSWindowBridge::CloseWindowNow()")
+        current_close = method(bridge, "void NativeWidgetNSWindowBridge::CloseWindow()", "void NativeWidgetNSWindowBridge::CloseWindowNow()")
+        self.assertEqual(original_close, current_close)
+        show = method(bridge, "void NativeWidgetNSWindowBridge::ShowAsModalSheet()", "}  // namespace remote_cocoa")
+        self.assertLess(show.index("ExternalWindowModalParentIsReady"), show.index("window_visible_ = true"))
+        self.assertIn("NSWindow* __weak external_sheet_parent", show)
+        self.assertIn("owned_sheet_parent = external_parent ? nil : parent_window", show)
+        self.assertLess(show.rindex("ExternalWindowModalParentIsReady"), show.index("beginSheet:bridge->ns_window()"))
+        constrained = output[adapter.CONSTRAINED]
+        self.assertIn("!views::Widget::GetWidgetForNativeView(parent_view)", constrained)
+        self.assertIn("if (!widget->IsClosed()) widget->Show();", constrained)
+
     def test_generation_is_repeatable_and_rejects_source_drift(self):
         output = adapter.generated(self.originals)
         self.assertEqual(output, adapter.generated(self.originals))

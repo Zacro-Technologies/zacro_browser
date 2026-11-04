@@ -10,6 +10,8 @@
 
 // Pin the API version before any CEF header.
 #include "ccef_config.h"
+#include "ccef_auxiliary_admission.h"
+#include "ccef_extension_host_navigation.h"
 
 // Version / API hash.
 #include "include/cef_api_hash.h"

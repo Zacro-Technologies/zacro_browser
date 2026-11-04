@@ -5,6 +5,7 @@
 #include <utility>
 #include <vector>
 #include <cmath>
+#include "base/command_line.h"
 #include "base/functional/callback.h"
 #include "base/supports_user_data.h"
 #include "base/task/sequenced_task_runner.h"
@@ -40,7 +41,17 @@ struct PopupState {
   __weak NSWindow* owner;
   __weak NSWindow* popup;
   base::RepeatingClosure close;
-  void Close() {
+  void Close(const char* reason, NSWindow* trigger = nil) {
+    const auto* command = base::CommandLine::ForCurrentProcess();
+    if (command->HasSwitch("engine-acceptance") &&
+        command->HasSwitch("native-integration-acceptance")) {
+      NSLog(@"Native action popup close request reason=%s popup=%ld owner=%ld trigger=%ld key=%ld active=%d visible=%d",
+            reason, (long)(popup ? popup.windowNumber : -1),
+            (long)(owner ? owner.windowNumber : -1),
+            (long)(trigger ? trigger.windowNumber : -1),
+            (long)(NSApp.keyWindow ? NSApp.keyWindow.windowNumber : -1),
+            NSApp.active, popup.visible);
+    }
     // Closing the bubble can synchronously destroy its anchor and reset the
     // stored callback. Keep this invocation's bind state alive until it returns.
     auto callback = close;
@@ -104,13 +115,18 @@ class NativeExtensionPopupAnchor::Impl {
                                     NSWindowWillMiniaturizeNotification,
                                     NSWindowDidResizeNotification]) {
       observers_.push_back([center addObserverForName:name object:state_->owner queue:nil
-          usingBlock:^(NSNotification*) { if (auto state = weak.lock()) state->Close(); }]);
+          usingBlock:^(NSNotification* event) {
+            if (auto state = weak.lock()) state->Close(event.name.UTF8String, event.object);
+          }]);
     }
     observers_.push_back([center addObserverForName:NSApplicationDidResignActiveNotification object:NSApp queue:nil
-        usingBlock:^(NSNotification*) { if (auto state = weak.lock()) state->Close(); }]);
+        usingBlock:^(NSNotification*) {
+          if (auto state = weak.lock()) state->Close("application-resigned-active");
+        }]);
     observers_.push_back([center addObserverForName:NSWindowDidBecomeKeyNotification object:nil queue:nil
         usingBlock:^(NSNotification* event) {
-          if (auto state = weak.lock(); state && state->popup.visible && !Descendant(event.object, state->popup)) state->Close();
+          if (auto state = weak.lock(); state && state->popup.visible && !Descendant(event.object, state->popup))
+            state->Close("other-window-became-key", event.object);
         }]);
     monitor_ = [NSEvent addLocalMonitorForEventsMatchingMask:
         NSEventMaskLeftMouseDown | NSEventMaskRightMouseDown | NSEventMaskOtherMouseDown
@@ -118,7 +134,8 @@ class NativeExtensionPopupAnchor::Impl {
           if (auto state = weak.lock(); state && !Descendant(event.window, state->popup)) {
             // Keep native menus usable. The popup's existing close routine also
             // preserves its DevTools and JavaScript-dialog exceptions.
-            if (!event.window || event.window.level < NSPopUpMenuWindowLevel) state->Close();
+            if (!event.window || event.window.level < NSPopUpMenuWindowLevel)
+              state->Close("outside-mouse-down", event.window);
           }
           return event;
         }];

@@ -83,6 +83,12 @@ extension BrowserStore {
       guard root["version"] as? Int == 1 else { throw LegacyImportError.invalidState }
       var collection = root
       collection.removeValue(forKey: "pendingNativeProfileRetirements")
+      collection.removeValue(forKey: "nativeHistoryPublicationReceipts")
+      collection.removeValue(forKey: "nativeHistoryBindings")
+      collection.removeValue(forKey: "nativeHistoryVisitReceipts")
+      collection.removeValue(forKey: "nativeHistoryLegacyImportReceipts")
+      collection.removeValue(forKey: "nativeHistoryLegacyBoundaries")
+      collection.removeValue(forKey: "pendingNativeHistoryAcknowledgements")
       try mergeCollection(JSONDecoder().decode(BrowserState.self,
         from: JSONSerialization.data(withJSONObject: collection)))
     } else { throw LegacyImportError.invalidState }
@@ -91,6 +97,12 @@ extension BrowserStore {
   func mergeCollection(_ source: BrowserState, includeHistory: Bool = false) throws {
     var sanitized = source
     sanitized.pendingNativeProfileRetirements = []
+    sanitized.nativeHistoryPublicationReceipts = [:]
+    sanitized.nativeHistoryBindings = [:]
+    sanitized.nativeHistoryVisitReceipts = [:]
+    sanitized.nativeHistoryLegacyImportReceipts = [:]
+    sanitized.nativeHistoryLegacyBoundaries = [:]
+    sanitized.pendingNativeHistoryAcknowledgements = [:]
     for i in sanitized.tabs.indices {
       sanitized.tabs[i].nativeNavigation = nil; sanitized.tabs[i].savedNativeNavigation = nil
       sanitized.tabs[i].peek?.nativeNavigation = nil

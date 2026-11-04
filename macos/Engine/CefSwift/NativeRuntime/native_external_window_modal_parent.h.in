@@ -1,0 +1,13 @@
+#ifndef COMPONENTS_REMOTE_COCOA_APP_SHIM_EXTERNAL_WINDOW_MODAL_PARENT_H_
+#define COMPONENTS_REMOTE_COCOA_APP_SHIM_EXTERNAL_WINDOW_MODAL_PARENT_H_
+
+#include "components/remote_cocoa/app_shim/remote_cocoa_app_shim_export.h"
+#include "ui/gfx/native_ui_types.h"
+
+namespace remote_cocoa {
+// In-process native window-modal widgets may have an AppKit owner that is not
+// a Views widget. Set before Show; the original sheet/close lifecycle owns UI.
+REMOTE_COCOA_APP_SHIM_EXPORT bool SetExternalWindowModalParent(
+    gfx::NativeWindow child, gfx::NativeWindow parent);
+}  // namespace remote_cocoa
+#endif

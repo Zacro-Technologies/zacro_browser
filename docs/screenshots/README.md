@@ -1,5 +1,11 @@
 # Screenshot assets
 
+## Native macOS 0.11.0 captures
+
+The three PNGs in `0.11.0-native/` show the Swift macOS workspace, Peek and Space theme editor from package 47. All are intact native screen captures at the browser window bounds, visually inspected after Computer Use interactions in a disposable profile. The pages are original [local demo content](../../macos/scripts/fixtures/native-showcase/). No interface was composited, retouched or generated. The app quit normally with actual exit 0.
+
+Window tint is set to 100% opacity for these images, so other desktop windows are excluded. These stills do not demonstrate desktop blur or animation. The macOS sharing indicator over the traffic lights is preserved. Exact dimensions, hashes, executable/framework provenance and theme settings are in the [capture manifest](0.11.0-native/manifest.json). See the [native verification record](../native-parity/verification.md) for separate runtime results and remaining qualification.
+
 ## 0.10.2 macOS captures
 
 The three PNGs in `0.10.2/` show the current workspace, Peek, and Space theme editor. They are intact native macOS window captures of the 0.10.2 source runtime, prepared with `scripts/review-captures.cjs --source` in a disposable profile using local demo pages. All three were visually inspected; no interface was composited or retouched. See the [capture manifest](0.10.2/manifest.json) for dimensions and hashes. These stills document appearance, not physical trackpad behavior or packaged-release acceptance.

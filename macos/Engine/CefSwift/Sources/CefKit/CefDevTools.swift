@@ -70,8 +70,12 @@ public final class CefDevTools {
     ) async throws -> [String: Any] {
         try Task.checkCancellation()
         guard !closed, let browser, browser.hasRawBrowser else { throw CefDevToolsError.browserClosed }
+        // Chrome's original consent/download operation may outlive a document
+        // command. Only its native root-channel request gets the longer bound;
+        // cancellation still revokes the exact native operation identity.
+        let timeoutLimit: TimeInterval = method == "Zacro.extensionManagement" && sessionID == nil ? 600 : 120
         guard !method.isEmpty, method.count < 256, pending.count < 32,
-              timeout.isFinite, timeout > 0, timeout <= 120,
+              timeout.isFinite, timeout > 0, timeout <= timeoutLimit,
               JSONSerialization.isValidJSONObject(parameters) else { throw CefDevToolsError.invalidMessage }
         if let sessionID, sessionID.isEmpty || sessionID.utf8.count > 1024 { throw CefDevToolsError.invalidMessage }
         try attach(to: browser)

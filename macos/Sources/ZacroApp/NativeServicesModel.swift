@@ -225,6 +225,72 @@ final class NativeServicesModel: ObservableObject {
       ai["profileId"].string == store.activeProfileID && ai["configured"].bool && !ai["busy"].bool &&
       !aiConversation.busy && !aiConversation.submitting && aiConversation.contextChangeID == nil && aiConversation.pendingReview == nil
   }
+  /// Reset only this window's conversation. The draft and saved questions are
+  /// presentation state and deliberately survive, as in the original client.
+  func newAIConversation(expectedProfileID: String? = nil) async throws {
+    let profile = expectedProfileID ?? store.activeProfileID
+    try requireAIProfile(profile)
+    guard let window = dialogWindow(), window.isVisible, !window.isMiniaturized else {
+      throw ServiceError("CANCELLED", "The conversation's browser window is unavailable.")
+    }
+    let conversation = aiConversation, identifier = window.identifier, number = window.windowNumber
+    guard let token = conversation.beginConversationReset() else {
+      throw ServiceError("BUSY", "Finish changing the conversation first.")
+    }
+    defer { conversation.endContextChange(token) }
+    // A submission waiting for status/context must not start after this reset.
+    aiSubmissionID = nil; conversation.submitting = false
+    let previous = aiContextReset, conversationID = conversationID
+    @MainActor func validate() throws {
+      try Task.checkCancellation(); try requireAIProfile(profile)
+      guard conversation.profileID == profile, conversation.contextChangeID == token,
+        dialogWindow() === window, window.identifier == identifier, window.windowNumber == number,
+        window.isVisible, !window.isMiniaturized else {
+        throw ServiceError("CONTEXT_CHANGED", "The conversation's browser window or profile changed.")
+      }
+    }
+    let operation = Task { @MainActor in
+      await previous?.value
+      try validate()
+      let reset = try await aiService.handle("ai:reset", expectedProfileID:profile, conversationID:conversationID)
+      try validate()
+      conversation.receive(reset)
+      conversation.context = "research"; conversation.grants = []; conversation.pendingReview = nil
+      let status = await aiService.status(for:AIProfileScope(id:profile), conversationID:conversationID)
+      try validate(); applyAI(status)
+    }
+    // Window close/profile change/reopen must drain this reset before clearing
+    // or reusing the same stable conversation ID.
+    aiContextReset = Task { _ = await operation.result }
+    try await withTaskCancellationHandler { try await operation.value } onCancel: { operation.cancel() }
+  }
+  func ordinaryAISearchQuery(requestID: String) -> String? {
+    guard !requestID.isEmpty, aiConversation.profileID == store.activeProfileID,
+      let answer = aiConversation.messages.first(where: { $0.requestID == requestID && $0.role == "assistant" }),
+      !answer.error, !answer.incomplete, answer.result["complete"].bool,
+      answer.result["mode"] == "research", answer.result["sources"].array.isEmpty,
+      let question = aiConversation.messages.first(where: { $0.requestID == requestID && $0.role == "user" }),
+      answer.result["searchQuery"].string == question.text,
+      BrowserAddress.searchURL(question.text, engine:store.state.settings.searchEngine) != nil else { return nil }
+    return question.text
+  }
+  func openAIOrdinarySearch(requestID: String) async throws {
+    let profile = store.activeProfileID
+    try requireAIProfile(profile)
+    guard let window = dialogWindow(), window.isVisible, !window.isMiniaturized,
+      let query = ordinaryAISearchQuery(requestID:requestID), let sourceAction else {
+      throw ServiceError("CONTEXT_CHANGED", "This answer or its browser window is no longer available.")
+    }
+    let identifier = window.identifier, number = window.windowNumber
+    await aiContextReset?.value
+    try Task.checkCancellation(); try requireAIProfile(profile)
+    guard dialogWindow() === window, window.identifier == identifier, window.windowNumber == number,
+      window.isVisible, !window.isMiniaturized, ordinaryAISearchQuery(requestID:requestID) == query else {
+      throw ServiceError("CONTEXT_CHANGED", "This answer or its browser window changed.")
+    }
+    _ = try await sourceAction("ai:open-search", ["query":.string(query), "profileId":.string(profile),
+      "conversationId":.string(conversationID), "requestId":.string(requestID)])
+  }
   /// Shared by the Library composer and the explicit palette Ask action. Merely
   /// opening the Library never invokes this method or shares page context.
   func submitAIQuestion(_ value: String, expectedProfileID: String? = nil) async throws -> ServiceJSON {

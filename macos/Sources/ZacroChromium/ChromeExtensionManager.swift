@@ -158,12 +158,16 @@ public enum ChromeExtensionEvent {
   case registryChanged
   case commandsChanged
   case bookmarksChanged(revision: String)
+  case historyChanged(revision: String)
   case downloadChanged(ChromeNativeDownload)
   case downloadRemoved(guid: String)
   case installationChanged(extensionID: String, kind: String)
   case actionChanged(extensionID: String, nativeTabID: Int?)
   case storageChanged(extensionID: String, installationID: String, changes: [String: Any], origin: String)
   case hostRequest(ChromeExtensionHostRequest)
+  /// One-use receipt from Chrome's completed-uninstall URL producer. The
+  /// removed extension has no outstanding API invocation or retained authority.
+  case postUninstallNavigation(requestID: String)
 }
 
 public enum ChromeExtensionError: Error, LocalizedError {
@@ -319,6 +323,8 @@ public final class ChromeExtensionManager {
           let value = try? JSONDecoder().decode(ChromeNativeDownload.self, from: data) { callback(.downloadChanged(value)) }
       case "Zacro.downloadRemoved":
         if let guid = params["guid"] as? String { callback(.downloadRemoved(guid: guid)) }
+      case "Zacro.historyChanged":
+        if let revision = params["revision"] as? String { callback(.historyChanged(revision: revision)) }
       case "Zacro.bookmarksChanged":
         if let revision = params["revision"] as? String { callback(.bookmarksChanged(revision: revision)) }
       case "Zacro.extensionInstallationChanged":
@@ -340,6 +346,10 @@ public final class ChromeExtensionManager {
             method: method, argumentsJSON: data, sourceTabID: params["sourceTabID"] as? Int,
             sourceWindowID: params["sourceWindowID"] as? Int,
             userGesture: gesture, incognito: incognito)))
+        }
+      case "Zacro.postUninstallNavigation":
+        if let requestID = params["requestID"] as? String {
+          callback(.postUninstallNavigation(requestID: requestID))
         }
       default: break
       }
@@ -384,6 +394,20 @@ public final class ChromeExtensionManager {
   public func validateHostRequest(requestID: String) async throws {
     guard !requestID.isEmpty, requestID.count <= 128 else { throw ChromeExtensionError.invalidResponse }
     _ = try await nativeBrowser().devTools.call("Zacro.validateExtensionHostRequest", parameters: ["requestID": requestID])
+  }
+
+  /// Consumes an exact-profile native receipt once. This does not authorize a
+  /// caller as the extension which was already uninstalled.
+  public func takePostUninstallNavigation(requestID: String) async throws -> URL {
+    guard !isPrivate, !requestID.isEmpty, requestID.count <= 128 else { throw ChromeExtensionError.invalidResponse }
+    let result = try await nativeBrowser().devTools.call("Zacro.takePostUninstallNavigation",
+      parameters: ["requestID": requestID])
+    guard let address = result["url"] as? String, address.utf8.count <= 8192,
+      let url = URL(string: address), ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
+      url.host?.isEmpty == false, url.user == nil, url.password == nil else {
+      throw ChromeExtensionError.invalidResponse
+    }
+    return url
   }
 
   public func completeHostRequest(_ requestID: String, results: [Any] = [], error: String? = nil) async throws {

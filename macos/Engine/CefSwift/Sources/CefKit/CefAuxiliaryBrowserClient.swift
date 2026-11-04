@@ -67,6 +67,26 @@ final class CefAuxiliaryBrowserClient {
                 browser?.handleBeforeClose()
             }
         }
+        life.pointee.on_before_popup = {
+            pointer, raw, frame, _, _, _, _, _, _, _, popupClient, _, extraInfo, _ in
+            let context = raw.flatMap { $0.pointee.get_host?($0) }.flatMap { host -> UnsafeMutablePointer<cef_request_context_t>? in
+                defer { cefRelease(UnsafeMutableRawPointer(host)) }
+                return host.pointee.get_request_context?(host)
+            }
+            let incomingClient = popupClient?.pointee
+            let incomingExtraInfo = extraInfo?.pointee
+            defer {
+                cefRelease(raw.map(UnsafeMutableRawPointer.init)); cefRelease(frame.map(UnsafeMutableRawPointer.init))
+                cefRelease(context.map(UnsafeMutableRawPointer.init))
+                cefRelease(incomingClient.map(UnsafeMutableRawPointer.init))
+                cefRelease(incomingExtraInfo.map(UnsafeMutableRawPointer.init))
+            }
+            return MainActor.assumeIsolated {
+                guard let context else { return 1 }
+                do { return try CefAuxiliaryAdmissionLease.isBlocked(context) ? 1 : 0 }
+                catch { CefRuntime.shared.onAuxiliaryAdmissionFailure?(error); return 1 }
+            }
+        }
         lifeSpan = life
 
         let display = cefAllocate(cef_display_handler_t.self, owner: self)

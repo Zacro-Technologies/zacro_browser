@@ -62,6 +62,10 @@ struct NativeAIMessage: Identifiable {
     guard !busy, !submitting, contextChangeID == nil else { return nil }
     let token = UUID(); contextChangeID = token; return token
   }
+  func beginConversationReset() -> UUID? {
+    guard contextChangeID == nil else { return nil }
+    let token = UUID(); contextChangeID = token; return token
+  }
   func endContextChange(_ token: UUID) { if contextChangeID == token { contextChangeID = nil } }
   func prepare(_ question: String) {
     let question = String(question.prefix(8000))
@@ -111,22 +115,32 @@ struct NativeAIMessage: Identifiable {
   }
 }
 
-struct NativeServiceButtonStyle: ButtonStyle {
-  var palette: NativeSpacePalette
-  var prominent = false
-  func makeBody(configuration: Configuration) -> some View {
-    configuration.label.font(.system(size:11,weight:.medium)).padding(.horizontal,9).padding(.vertical,7)
-      .foregroundStyle(prominent ? (palette.dark ? Color.black.opacity(0.85) : .white) : palette.ink)
-      .background(prominent ? palette.accent.opacity(configuration.isPressed ? 0.8 : 1) : palette.ink.opacity(configuration.isPressed ? 0.13 : 0.06),
-                  in:RoundedRectangle(cornerRadius:7))
-      .contentShape(RoundedRectangle(cornerRadius:7))
-  }
-}
-
 struct NativeAIView: View {
   @ObservedObject var model: NativeServicesModel
   let palette: NativeSpacePalette
   var body: some View { NativeAIConversationView(model:model,conversation:model.aiConversation,palette:palette) }
+}
+
+struct NativeAINewConversationButton: View {
+  @ObservedObject var model: NativeServicesModel
+  var body: some View { Control(model:model, conversation:model.aiConversation) }
+  private struct Control: View {
+    @ObservedObject var model: NativeServicesModel
+    @ObservedObject var conversation: NativeAIConversationState
+    var body: some View {
+      if !model.ai["private"].bool {
+        Button {
+          let profile = conversation.profileID, generation = conversation.generation
+          Task {
+            do { try await model.newAIConversation(expectedProfileID:profile) }
+            catch { if conversation.profileID == profile, conversation.generation == generation { conversation.notice = error.localizedDescription } }
+          }
+        } label: { NativeGlyph("plus").frame(width:24,height:26) }
+          .buttonStyle(.plain).help("New conversation").accessibilityLabel("New conversation")
+          .disabled(conversation.contextChangeID != nil)
+      }
+    }
+  }
 }
 
 private struct NativeAIConversationView: View {
@@ -154,7 +168,7 @@ private struct NativeAIConversationView: View {
                 .foregroundStyle(palette.muted).accessibilityLabel(conversation.progress)
             }
             Color.clear.frame(height:1).id("end")
-          }.padding(16)
+          }.padding(16).background(NativeAIAnswerScrollFollower())
         }.scrollIndicators(.hidden)
           .onChange(of:conversation.messages.count) { _,_ in withAnimation(.easeOut(duration:0.16)) { reader.scrollTo("end",anchor:.bottom) } }
       }
@@ -177,7 +191,7 @@ private struct NativeAIConversationView: View {
   }
   private var welcome: some View {
     VStack(spacing:12) {
-      Image(systemName:privateMode ? "lock.shield" : "sparkles").font(.system(size:27)).foregroundStyle(palette.accent)
+      NativeGlyph(privateMode ? "shield" : "sparkle", size: 27).foregroundStyle(palette.accent)
       Text(privateMode ? "Private session" : "Understand what you’re browsing").font(.system(size:15,weight:.semibold))
       Text(privateMode ? "AI is unavailable in private browsing." : "Choose a starting point and review your question and context before sending.")
         .foregroundStyle(palette.muted).multilineTextAlignment(.center).font(.system(size:11)).lineSpacing(4)
@@ -194,7 +208,7 @@ private struct NativeAIConversationView: View {
   }
   private func intent(_ title: String,_ icon: String,_ action: String) -> some View {
     Button { prepare(action) } label: {
-      HStack(spacing:9) { Image(systemName:icon).frame(width:16); Text(title); Spacer(); Image(systemName:"arrow.right").font(.system(size:11)) }
+      HStack(spacing:9) { NativeGlyph(icon, size: 16); Text(title); Spacer(); NativeGlyph("forward", size: 11) }
         .padding(9).contentShape(RoundedRectangle(cornerRadius:7))
     }.buttonStyle(.plain).disabled(locked).foregroundStyle(palette.ink)
   }
@@ -210,17 +224,19 @@ private struct NativeAIConversationView: View {
               if !previous.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty && previous != question { conversation.savedQuestions.append(previous) }
             }.disabled(locked)
             Button("Discard") { conversation.savedQuestions.removeAll { $0 == question } }
-          }.buttonStyle(NativeServiceButtonStyle(palette:palette))
+          }.buttonStyle(NativeChromeButtonStyle(colors:palette))
         }
       }.padding(.top,9)
     }.font(.system(size:11)).foregroundStyle(palette.muted)
+      .disclosureGroupStyle(NativeChromeDisclosureStyle(colors: palette))
   }
   private func messageView(_ message: NativeAIMessage) -> some View {
     VStack(alignment:.leading,spacing:9) {
       Text(message.role == "user" ? "You" : message.error ? "Couldn’t finish" : "Zacro")
         .font(.system(size:10,weight:.semibold)).foregroundStyle(palette.accent)
       if message.role == "user" {
-        Label(message.request["contextTabs"].array.isEmpty ? (model.ai["researchSupported"] == false ? "Chat · no page text" : "Web research · no page text") : message.request["contextTabs"].array.map { $0["title"].string }.joined(separator:" · "),systemImage:message.request["contextTabs"].array.isEmpty ? "globe" : "doc.text")
+        Label { Text(message.request["contextTabs"].array.isEmpty ? (model.ai["researchSupported"] == false ? "Chat · no page text" : "Web research · no page text") : message.request["contextTabs"].array.map { $0["title"].string }.joined(separator:" · ")) }
+          icon: { NativeGlyph(message.request["contextTabs"].array.isEmpty ? "globe" : "file", size: 12) }
           .font(.system(size:10)).foregroundStyle(palette.muted)
         Text(message.text).textSelection(.enabled).lineSpacing(5).frame(maxWidth:.infinity,alignment:.leading).padding(12)
           .background(palette.accent.opacity(0.075),in:UnevenRoundedRectangle(topLeadingRadius:12,bottomLeadingRadius:12,bottomTrailingRadius:3,topTrailingRadius:12))
@@ -244,9 +260,20 @@ private struct NativeAIConversationView: View {
       }
       ForEach(Array(message.result["sources"].array.enumerated()),id:\.offset) { index,source in
         Button { openSource(source) } label: {
-          HStack(spacing:8) { Text("\(index+1)").foregroundStyle(palette.accent); Text(source["title"].string.isEmpty ? source["url"].string : source["title"].string).lineLimit(1); Spacer(); Image(systemName:"arrow.up.right") }
+          HStack(spacing:8) { Text("\(index+1)").foregroundStyle(palette.accent); Text(source["title"].string.isEmpty ? source["url"].string : source["title"].string).lineLimit(1); Spacer(); NativeGlyph("external") }
             .font(.system(size:10)).padding(10).frame(maxWidth:.infinity).background(palette.card.opacity(0.55),in:RoundedRectangle(cornerRadius:9))
         }.buttonStyle(.plain).help(source["url"].string)
+      }
+      if model.ordinaryAISearchQuery(requestID:message.requestID) != nil, message.role == "assistant" {
+        Button {
+          let profile = conversation.profileID
+          Task {
+            do { try await model.openAIOrdinarySearch(requestID:message.requestID) }
+            catch { if conversation.profileID == profile { conversation.notice = error.localizedDescription } }
+          }
+        } label: {
+          Label { Text("Open ordinary search results") } icon: { NativeGlyph("magnifyingglass", size:12) }
+        }.buttonStyle(NativeChromeButtonStyle(colors:palette))
       }
       HStack(spacing:4) {
         if message.role == "user" { Button("Edit question") { review(message) }.disabled(locked) }
@@ -262,30 +289,28 @@ private struct NativeAIConversationView: View {
         if message.error || message.incomplete {
           Button("Retry question") { if let user = conversation.messages.first(where: { $0.role == "user" && $0.requestID == message.requestID }) { review(user,retry:true) } }.disabled(locked)
         }
-      }.buttonStyle(NativeServiceButtonStyle(palette:palette))
+      }.buttonStyle(NativeChromeButtonStyle(colors:palette))
     }
   }
   private var composer: some View {
     VStack(alignment:.leading,spacing:9) {
       if !configured {
-        HStack { Text("Connect to send your question.").font(.system(size:10)).foregroundStyle(palette.muted); Spacer(); Button("Connect AI") { connections = true }.buttonStyle(NativeServiceButtonStyle(palette:palette)) }
+        HStack { Text("Connect to send your question.").font(.system(size:10)).foregroundStyle(palette.muted); Spacer(); Button("Connect AI") { connections = true }.buttonStyle(NativeChromeButtonStyle(colors:palette)) }
       }
       if !conversation.sources.isEmpty && !conversation.busy {
-        Button { action("ai:open-sources") } label: { Label("Open sources",systemImage:"arrow.up.right.square").frame(maxWidth:.infinity) }
-          .buttonStyle(NativeServiceButtonStyle(palette:palette)).keyboardShortcut(.return,modifiers:.command)
+        Button { action("ai:open-sources") } label: { Label { Text("Open sources") } icon: { NativeGlyph("external", size: 14) }.frame(maxWidth:.infinity) }
+          .buttonStyle(NativeChromeButtonStyle(colors:palette)).keyboardShortcut(.return,modifiers:.command)
       }
       HStack(spacing:5) {
-        Image(systemName:"checkmark.shield").foregroundStyle(palette.muted)
-        Picker("Content to share",selection:Binding(get:{ conversation.context },set:{ value in
-          if value == "research" { changeContext("research",grants:[]) }
+        NativeGlyph("shield", size: 14).foregroundStyle(palette.muted)
+        NativeChromeSelect(title: "Content to share", selection: Binding(get: { conversation.context }, set: { value in
+          if value == "research" { changeContext("research", grants: []) }
           else { openContextReview(value, selected: Set(conversation.grants.map(\.id))) }
-        })) {
-          Text(model.ai["researchSupported"] == false ? "Chat · no page sharing" : "Web research · no page sharing").tag("research")
-          Text("One page").tag("page"); Text("Selected tabs").tag("tabs")
-        }.labelsHidden().controlSize(.small).disabled(locked)
+        }), options: [("research", model.ai["researchSupported"] == false ? "Chat · no page sharing" : "Web research · no page sharing"),
+          ("page", "One page"), ("tabs", "Selected tabs")], colors: palette, showsLabel: false).disabled(locked)
         if conversation.context != "research" {
-          Button { openContextReview(conversation.context, selected: Set(conversation.grants.map(\.id))) } label: { Image(systemName:"plus") }.buttonStyle(.plain).help("Choose pages").disabled(locked)
-          Button { changeContext("research",grants:[]) } label: { Image(systemName:"xmark") }.buttonStyle(.plain).help("Clear shared context and conversation").disabled(locked)
+          Button { openContextReview(conversation.context, selected: Set(conversation.grants.map(\.id))) } label: { NativeGlyph("plus") }.buttonStyle(.plain).help("Choose pages").disabled(locked)
+          Button { changeContext("research",grants:[]) } label: { NativeGlyph("close") }.buttonStyle(.plain).help("Clear shared context and conversation").disabled(locked)
         }
       }.font(.system(size:10))
       if !conversation.grants.isEmpty {
@@ -295,7 +320,7 @@ private struct NativeAIConversationView: View {
               HStack(spacing:6) {
                 VStack(alignment:.leading,spacing:2) { Text(page.title).lineLimit(1); Text(URL(string:page.url)?.host ?? page.url).font(.system(size:10)).foregroundStyle(palette.muted).lineLimit(1) }
                 Spacer()
-                Button { changeContext(conversation.context,grants:conversation.grants.filter { $0.id != page.id }) } label: { Image(systemName:"xmark").font(.system(size:9)) }.buttonStyle(.plain).disabled(locked).help("Remove \(page.title) from context")
+                Button { changeContext(conversation.context,grants:conversation.grants.filter { $0.id != page.id }) } label: { NativeGlyph("close", size: 9) }.buttonStyle(.plain).disabled(locked).help("Remove \(page.title) from context")
               }.font(.system(size:11)).padding(7).background(palette.card.opacity(0.55),in:RoundedRectangle(cornerRadius:7)).help(page.url)
             }
           }
@@ -315,8 +340,8 @@ private struct NativeAIConversationView: View {
           }
         Button {
           if conversation.busy { action("ai:cancel") } else { submit() }
-        } label: { Image(systemName:conversation.busy ? "stop.fill" : "arrow.up").font(.system(size:12,weight:.semibold)).frame(width:22,height:22) }
-          .buttonStyle(NativeServiceButtonStyle(palette:palette,prominent:true))
+        } label: { NativeGlyph(conversation.busy ? "stop" : "send", size: 16).frame(width:22,height:22) }
+          .buttonStyle(NativeChromeButtonStyle(colors:palette,prominent:true))
           .disabled(!conversation.busy && (!configured || locked || stale || conversation.draft.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty))
           .accessibilityLabel(conversation.busy ? "Stop response" : "Send question")
       }.padding(6).background(palette.card.opacity(0.7),in:RoundedRectangle(cornerRadius:9))
@@ -336,7 +361,7 @@ private struct NativeAIConversationView: View {
               else { candidates.remove(page.id) }
             })) {
               VStack(alignment:.leading,spacing:3) { Text(page.title).fontWeight(.medium); Text(page.url).font(.system(size:10)).foregroundStyle(palette.muted).textSelection(.enabled) }
-            }.toggleStyle(.checkbox).padding(8).background(palette.card.opacity(0.5),in:RoundedRectangle(cornerRadius:8))
+            }.toggleStyle(NativeChromeCheckboxStyle(colors: palette)).padding(8).background(palette.card.opacity(0.5),in:RoundedRectangle(cornerRadius:8))
           }
           if conversation.pendingReview?.choices.isEmpty != false { Text("Open a web page or text PDF first.").foregroundStyle(palette.muted) }
         }
@@ -353,7 +378,7 @@ private struct NativeAIConversationView: View {
           }
         }.disabled(candidates.isEmpty || conversation.contextChangeID != nil)
       }
-        .buttonStyle(NativeServiceButtonStyle(palette:palette))
+        .buttonStyle(NativeChromeButtonStyle(colors:palette))
     }.padding(20).frame(width:460,height:420).background(palette.chrome).foregroundStyle(palette.ink)
   }
   private func prepare(_ intent: String) {
@@ -412,10 +437,10 @@ private struct NativeAIConversationView: View {
   private func submitQuestion(_ value: String) {
     let question = value.trimmingCharacters(in:.whitespacesAndNewlines)
     guard !question.isEmpty, !locked, !stale, configured, !privateMode else { return }
-    let profile = conversation.profileID
+    let profile = conversation.profileID, generation = conversation.generation
     Task {
       do { _ = try await model.submitAIQuestion(question, expectedProfileID:profile) }
-      catch { if conversation.profileID == profile { conversation.notice = error.localizedDescription } }
+      catch { if conversation.profileID == profile, conversation.generation == generation { conversation.notice = error.localizedDescription } }
     }
   }
   private func action(_ name: String) { Task { do { _ = try await model.aiAction(name) } catch { conversation.notice = error.localizedDescription } } }
@@ -497,9 +522,10 @@ struct NativeAIConnectionView: View {
     VStack(alignment:.leading,spacing:12) {
       if model.ai["private"].bool { Text("AI is unavailable in private browsing.").foregroundStyle(palette.muted) }
       else {
-        Picker("Provider",selection:Binding(get:{ provider },set:{ value in perform("ai:configure",payload:["provider":.string(value)]) })) {
-          ForEach(NativeAIProvider.allCases,id:\.rawValue) { provider in Text(provider.name).tag(provider.rawValue) }
-        }.disabled(busy || model.ai["busy"].bool)
+        NativeChromeSelect(title: "Provider", selection: Binding(get: { provider }, set: { value in
+          perform("ai:configure", payload: ["provider": .string(value)])
+        }), options: NativeAIProvider.allCases.map { ($0.rawValue, $0.name) }, colors: palette)
+          .disabled(busy || model.ai["busy"].bool)
         HStack(spacing:7) {
           Circle().fill(connected ? palette.accent : palette.muted.opacity(0.35)).frame(width:6,height:6)
           Text(connected ? (api ? "Key saved" : model.ai["account"]["email"].string.isEmpty ? "Signed in" : model.ai["account"]["email"].string) : pending ? "Waiting for sign-in…" : "Not connected")
@@ -509,6 +535,7 @@ struct NativeAIConnectionView: View {
         if api { apiFields } else { subscriptionFields }
       }
     }.font(.system(size:12)).foregroundStyle(palette.ink).tint(palette.accent)
+      .disclosureGroupStyle(NativeChromeDisclosureStyle(colors: palette))
       .task { populate(); perform("ai:status",payload:["refresh":true]) }
       .onChange(of:model.ai["provider"]) { _,_ in key = ""; populate() }
       .onChange(of:model.ai["profileId"]) { _,_ in key = ""; error = ""; notice = ""; populate() }
@@ -527,17 +554,18 @@ struct NativeAIConnectionView: View {
       field("API key") { SecureField(connected ? "Leave blank to keep saved key" : "Paste an API key",text:$key) }
       if provider == "compatible" { field("Base URL") { TextField("https://example.com/v1",text:$endpoint) } }
       field("Model") { TextField("Model ID",text:$selectedModel) }
-      Picker("Keep key",selection:$storage) { Text("Encrypted on this device").tag("encrypted"); Text("This session only").tag("session") }
+      NativeChromeSelect(title: "Keep key", selection: $storage,
+        options: [("encrypted", "Encrypted on this device"), ("session", "This session only")], colors: palette)
       HStack {
         Button("Save connection") {
           var payload: ServiceJSON = ["provider":.string(provider),"model":.string(selectedModel),"storage":.string(storage)]
           if !key.isEmpty { payload["apiKey"] = .string(key) }
           if provider == "compatible" { payload["baseUrl"] = .string(endpoint) }
           perform("ai:configure",payload:payload,message:"Connection saved."); key = ""
-        }.buttonStyle(NativeServiceButtonStyle(palette:palette,prominent:true)).disabled(busy)
-        if connected { Button("Test connection") { perform("ai:test-connection") }.buttonStyle(NativeServiceButtonStyle(palette:palette)).disabled(busy) }
+        }.buttonStyle(NativeChromeButtonStyle(colors:palette,prominent:true)).disabled(busy)
+        if connected { Button("Test connection") { perform("ai:test-connection") }.buttonStyle(NativeChromeButtonStyle(colors:palette)).disabled(busy) }
       }
-      if connected { Button("Remove key") { perform("ai:disconnect") }.buttonStyle(NativeServiceButtonStyle(palette:palette)).disabled(busy) }
+      if connected { Button("Remove key") { perform("ai:disconnect") }.buttonStyle(NativeChromeButtonStyle(colors:palette)).disabled(busy) }
       Text("Uses your provider’s API billing." + (storage == "session" ? " This key is cleared when Zacro quits." : " Keys are protected by macOS Keychain."))
         .font(.system(size:10)).foregroundStyle(palette.muted)
       if provider == "compatible" { Text("Keys stay with their endpoint. Localhost can run without a key.").font(.system(size:10)).foregroundStyle(palette.muted) }
@@ -546,9 +574,11 @@ struct NativeAIConnectionView: View {
   private var subscriptionFields: some View {
     VStack(alignment:.leading,spacing:11) {
       if provider == "codex" {
-        Picker("Keep sign-in",selection:Binding(get:{ model.ai["credentialStorage"] == "session" ? "session" : "keyring" },set:{ perform("ai:configure",payload:["authStorage":.string($0)]) })) {
-          Text("Operating system keychain").tag("keyring"); Text("This session only").tag("session")
-        }.disabled(busy || pending || model.ai["busy"].bool)
+        NativeChromeSelect(title: "Keep sign-in", selection: Binding(get: {
+          model.ai["credentialStorage"] == "session" ? "session" : "keyring"
+        }, set: { perform("ai:configure", payload: ["authStorage": .string($0)]) }),
+          options: [("keyring", "Operating system keychain"), ("session", "This session only")], colors: palette)
+          .disabled(busy || pending || model.ai["busy"].bool)
         Text("Changing storage ends the current sign-in.").font(.system(size:10)).foregroundStyle(palette.muted)
       }
       if !model.ai["storageNotice"].string.isEmpty { Text(model.ai["storageNotice"].string).font(.system(size:10)).foregroundStyle(palette.muted) }
@@ -558,7 +588,7 @@ struct NativeAIConnectionView: View {
         else if model.ai["available"] == false && provider == "claude-code" { Button("Install Claude Code") { perform("ai:install") } }
         else { Button(provider == "codex" ? "Sign in with ChatGPT" : "Sign in with Claude") { perform("ai:login") }.disabled(model.ai["available"] == false) }
         if connected { Button("Test connection") { perform("ai:test-connection") } }
-      }.buttonStyle(NativeServiceButtonStyle(palette:palette)).disabled(busy)
+      }.buttonStyle(NativeChromeButtonStyle(colors:palette)).disabled(busy)
       if provider == "codex" && !connected && !pending && model.ai["credentialStorage"] != "session" {
         Button("Use only for this session") {
           busy = true; Task {
@@ -570,10 +600,10 @@ struct NativeAIConnectionView: View {
       }
       Text(provider == "codex" ? "Uses your Codex subscription and its usage limits. No API key required." : "Uses your Claude subscription through Claude Code.").font(.system(size:10)).foregroundStyle(palette.muted)
       if connected && !model.ai["models"].array.isEmpty {
-        Picker("Model",selection:$selectedModel) {
-          ForEach(model.ai["models"].array,id:\.text) { item in Text(item["name"].string.isEmpty ? item["id"].string : item["name"].string).tag(item["id"].string) }
-        }
-        Button("Use model") { perform("ai:configure",payload:["model":.string(selectedModel)]) }.buttonStyle(NativeServiceButtonStyle(palette:palette)).disabled(busy)
+        NativeChromeSelect(title: "Model", selection: $selectedModel, options: model.ai["models"].array.map {
+          ($0["id"].string, $0["name"].string.isEmpty ? $0["id"].string : $0["name"].string)
+        }, colors: palette)
+        Button("Use model") { perform("ai:configure",payload:["model":.string(selectedModel)]) }.buttonStyle(NativeChromeButtonStyle(colors:palette)).disabled(busy)
       }
     }
   }

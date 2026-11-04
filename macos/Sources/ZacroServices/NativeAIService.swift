@@ -461,9 +461,16 @@ public actor NativeAIService {
     _ = try await scope(conversationKey); try Task.checkCancellation()
     guard revision == original, conversationRevisions[conversationKey, default: 0] == conversationRevision else { throw ServiceError("CANCELLED", "The conversation changed.") }
     if !context.pages.isEmpty { answer = answer.merging(Self.pageCitations(answer["answer"].string, pages: context.pages)) }
-    var complete = answer.removing("historyContent","searchError").merging(["type":"ai:answer","question":.string(question),"sharedTabs":.array(shared),"unreadable":.array(context.unreadable),"mode":.string(research ? "research" : general ? "general" : "pages"),"complete":true,"profileId":.string(profile.id),"conversationId":.string(conversationKey.id),"requestId":.string(id),"provider":.string(provider.rawValue),"model":config["model"]])
+    var complete = answer.removing("historyContent","searchError","searchQuery","searchUrl").merging(["type":"ai:answer","question":.string(question),"sharedTabs":.array(shared),"unreadable":.array(context.unreadable),"mode":.string(research ? "research" : general ? "general" : "pages"),"complete":true,"profileId":.string(profile.id),"conversationId":.string(conversationKey.id),"requestId":.string(id),"provider":.string(provider.rawValue),"model":config["model"]])
     if general { complete["warning"] = "This connection does not provide web research. This answer has no verified web sources." }
-    if research && answer["sources"].array.isEmpty { complete["warning"] = "No supporting web sources were returned. Treat this answer as unverified." }
+    if research && answer["sources"].array.isEmpty {
+      complete["warning"] = answer["searchError"].bool
+        ? "Web search did not finish successfully. This answer has no supporting sources."
+        : "No supporting web sources were returned. Treat this answer as unverified."
+      // An explicit browser action resolves this original question with the
+      // user's selected search engine. Provider output cannot supply its URL.
+      complete["searchQuery"] = .string(question)
+    }
     complete["resetRevision"] = latestReset(conversationKey)["resetRevision"]
     conversation["turns"] = .array(Self.history(messages + [["role":"assistant","content":answer["historyContent"]]]))
     conversation["latest"] = complete; conversations[conversationKey] = conversation

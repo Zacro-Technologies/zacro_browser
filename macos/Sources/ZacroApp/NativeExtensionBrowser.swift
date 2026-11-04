@@ -43,6 +43,11 @@ enum NativePrivateComponentPolicy {
 final class NativeExtensionBrowser {
   var enabled = false
   var materializePage: ((BrowserTab) async throws -> ChromiumPage)?
+  /// Navigation-producing APIs need a real registered native document, while
+  /// their callback must not depend on the destination server loading.
+  var materializeNavigationPage: ((BrowserTab, Bool) async throws -> ChromiumPage)?
+  var interruptDocumentRestore: ((ChromiumPage) -> Void)?
+  var isNavigationRestoring: (ChromiumPage) -> Bool = { _ in false }
   var prepareActionPopupDocument: ((String, String, @MainActor () async throws -> Void) async throws -> ChromiumPage)?
   var closeTab: (String) async -> Bool = { _ in false }
   var promotePeek: ((String, Bool, @MainActor () async throws -> Void) async throws -> BrowserTab)?
@@ -62,6 +67,7 @@ final class NativeExtensionBrowser {
   private var store: BrowserStore { repository.canonicalStore }
   private let engine: ChromiumEngine
   private var lastFocusedWindows: [String: String] = [:]
+  private var lastFocusedSearchWindows: [String: String] = [:]
   private var identities: [String: Identity] = [:]
   private var creationOpeners: [String: String] = [:]
   private var optionsWindows: [String: OptionsWindow] = [:]
@@ -473,6 +479,7 @@ final class NativeExtensionBrowser {
     for profile in store.state.profiles {
       if let window = windows(profile.id).first(where: { isWindowFocused($0.id, profile: profile.id) }) {
         lastFocusedWindows[profile.id] = window.id
+        if window.kind == .normal { lastFocusedSearchWindows[profile.id] = window.id }
       }
     }
     reconcile()
@@ -525,6 +532,65 @@ final class NativeExtensionBrowser {
     try checkProfile(profile, request: request)
     try await manager.validateHostRequest(requestID: request.requestID)
     try checkProfile(profile, request: request)
+  }
+
+  /// Chrome calls its uninstall URL producer after the extension is gone. The
+  /// native single-use receipt is the authority here; no API request, user
+  /// gesture, installation incarnation or extension permissions are invented.
+  func handlePostUninstallNavigation(profileID profile: String, requestID: String) async {
+    do {
+      try checkPostUninstallNavigation(profile)
+      let url = try await manager(for: profile).takePostUninstallNavigation(requestID: requestID)
+      try checkPostUninstallNavigation(profile)
+      let address = url.absoluteString
+      let normal = windows(profile).filter { $0.kind == .normal }
+      let target = lastFocusedSearchWindows[profile].flatMap { id in normal.first { $0.id == id } }
+        ?? normal.first { $0.id == repository.focusedWindowID } ?? normal.first
+      if let target, let scope = repository.store(for: target.id) {
+        try canActivate(profile, in: target.id)
+        guard store.state.tabs.count < 1_000 else { throw Failure("Close some tabs before opening more.") }
+        guard let space = store.state.spaces.first(where: { $0.id == scope.state.activeSpaceID && $0.profileID == profile })
+          ?? store.state.spaces.first(where: { $0.profileID == profile }) else { throw Failure("Profile has no Space.") }
+        var tab = BrowserTab(spaceID: space.id, url: address, title: NativePageIdentity.label(address))
+        tab.windowID = target.id
+        tab.navigation = [NavigationEntry(url: address)]; tab.navigationIndex = 0
+        try checkPostUninstallNavigation(profile)
+        try scope.commit { $0.tabs.append(tab) }
+        navigateTab(tab, address)
+        _ = try await prepareNavigationDocument(tab, preserveHistory: false)
+        try checkPostUninstallNavigation(profile)
+        try canActivate(profile, in: target.id)
+        try activateTab(tab.id)
+      } else {
+        guard let createWindow else { throw Failure("Native window creation is unavailable.") }
+        let creation = NativeExtensionWindowRequest(profileID: profile, kind: .normal,
+          urls: [address], nativeAuthorizations: [:], movingTabID: nil, focused: true,
+          state: nil, left: nil, top: nil, width: nil, height: nil, openerRequestID: nil,
+          authorize: { [weak self] in
+            guard let self else { throw CancellationError() }
+            try self.checkPostUninstallNavigation(profile)
+          })
+        let id = try await createWindow(creation)
+        try checkPostUninstallNavigation(profile)
+        guard let tab = tabs(profile, in: id).first(where: { $0.url == address }) else {
+          throw Failure("The optional uninstall navigation window closed.")
+        }
+        _ = try await prepareNavigationDocument(tab, preserveHistory: false)
+      }
+      didChange()
+    } catch {
+      // The uninstall has already completed. Optional navigation failure must
+      // neither resurrect its extension nor create a physical fallback Browser.
+      NSLog("Native optional uninstall navigation omitted: %@", error.localizedDescription)
+    }
+  }
+
+  private func checkPostUninstallNavigation(_ profile: String) throws {
+    try checkProfile(profile)
+    guard !isPrivateProfile(profile),
+      try !engine.isAuxiliaryAdmissionBlocked(profileID: profile, isPrivate: false) else {
+      throw Failure("The browser context is closing.")
+    }
   }
 
   private func windows(_ profile: String) -> [BrowserWindowSession] {
@@ -704,12 +770,13 @@ final class NativeExtensionBrowser {
     let page = engine.pages[tab.id], active = activeDocumentID(window) == tab.id
     let highlighted = highlightedDocuments(window).contains(tab.id)
     let muted = page?.browser?.isAudioMuted ?? tab.isMuted
+    let loading = page.map { $0.isLoading || isNavigationRestoring($0) } ?? false
     var value: [String: Any] = [
       "id": identity.id, "windowId": context.nativeID, "index": index,
       "active": active, "highlighted": highlighted, "pinned": tab.isPinned, "incognito": isPrivateProfile(profile),
       "selected": active, "groupId": nativeGroupID(tab), "splitViewId": try splitIdentity(tab.id, profile: profile), "frozen": false,
       "lastAccessed": tab.lastAccessedAt.timeIntervalSince1970 * 1_000,
-      "url": tab.url, "title": tab.title, "status": page?.isLoading == true ? "loading" : "complete",
+      "url": tab.url, "title": tab.title, "status": loading ? "loading" : "complete",
       "audible": isAudible(tab.id), "mutedInfo": ["muted": muted], "muted": muted,
       "discarded": documentIsDiscarded(tab.id), "autoDiscardable": tab.autoDiscardable != false,
     ]
@@ -953,6 +1020,9 @@ final class NativeExtensionBrowser {
     func arg(_ index: Int) -> Any? { arguments.indices.contains(index) ? arguments[index] : nil }
     try await authorize(request, profile: profile, manager: manager)
     switch request.method {
+    case "search.query":
+      try await performSearch(request, profile: profile, arguments: arguments, manager: manager)
+      return []
     case "runtime.openOptionsPage":
       guard arguments.isEmpty else { throw Failure("Invalid options-page arguments.") }
       try await openOptions(profileID: profile, extensionID: request.extensionID,
@@ -1048,7 +1118,10 @@ final class NativeExtensionBrowser {
         tab = try await persistentTab(tab, request: request, profile: profile, manager: manager)
       }
       try await authorize(request, profile: profile, manager: manager)
-      guard let currentTab = documentTab(tab.id), !currentTab.isClosed else { throw Failure("Unknown profile tab.") }
+      guard var currentTab = documentTab(tab.id), !currentTab.isClosed else { throw Failure("Unknown profile tab.") }
+      if destination != nil {
+        currentTab = try await prepareNavigationReplacement(currentTab, request: request, profile: profile, manager: manager)
+      }
       scope = try owner(currentTab)
       if activate || props["highlighted"] as? Bool == true { try canActivate(profile, in: currentTab.windowID) }
       guard documentTab(tab.id)?.isClosed == false else { throw Failure("Unknown profile tab.") }
@@ -1091,7 +1164,7 @@ final class NativeExtensionBrowser {
       if let muted = props["muted"] as? Bool { engine.pages[tab.id]?.browser?.isAudioMuted = muted }
       if let destination, let current = documentTab(tab.id) {
         navigateTab(current, destination.url)
-        _ = try await requireDocument(current)
+        _ = try await prepareNavigationDocument(current, preserveHistory: false)
         try await authorize(request, profile: profile, manager: manager)
       }
       if activate { try canActivate(profile, in: documentTab(tab.id)?.windowID); try activateTab(tab.id) }
@@ -1119,18 +1192,35 @@ final class NativeExtensionBrowser {
       try validateTabProperties(props)
       let tab = try defaultRecord(profile, id: propertiesFirst ? nil : arg(0), request: request)
       try await authorize(request, profile: profile, manager: manager)
-      let wasDiscarded = documentIsDiscarded(tab.id)
-      let page = try await requireDocument(tab)
+      let current = try await prepareNavigationReplacement(tab, request: request, profile: profile, manager: manager)
+      guard let page = engine.pages[current.id], let interruptDocumentRestore,
+        let windowID = current.windowID, let window = engine.context(id: windowID),
+        window.isOpen, !window.isClosing else {
+        throw Failure("The native navigation controller is unavailable.")
+      }
+      let nativeWindowID = window.nativeID
       let browser = try await page.ready()
       try await authorize(request, profile: profile, manager: manager)
-      guard engine.pages[tab.id] === page, documentTab(tab.id)?.isClosed == false else { throw Failure("Unknown profile tab.") }
+      guard engine.pages[tab.id] === page, page.browser === browser,
+        engine.context(id: windowID) === window, window.nativeID == nativeWindowID,
+        window.isOpen, !window.isClosing,
+        let latest = documentTab(tab.id), !latest.isClosed, latest.windowID == current.windowID,
+        store.profileID(for: latest) == profile, latest.url == current.url,
+        latest.nativeNavigation == current.nativeNavigation,
+        latest.navigation.map(\.url) == current.navigation.map(\.url),
+        latest.navigation.map(\.nativeNavigation) == current.navigation.map(\.nativeNavigation),
+        latest.navigationIndex == current.navigationIndex else { throw Failure("The navigation tab changed.") }
+      _ = try owner(latest)
       if request.method == "tabs.reload" {
-        if !wasDiscarded { browser.reload(ignoreCache: props["bypassCache"] as? Bool ?? false) }
+        interruptDocumentRestore(page)
+        browser.reload(ignoreCache: props["bypassCache"] as? Bool ?? false)
       }
       else if request.method == "tabs.goBack" {
-        guard browser.canGoBack else { throw Failure("The tab has no previous page.") }; page.goBack()
+        guard browser.canGoBack else { throw Failure("The tab has no previous page.") }
+        interruptDocumentRestore(page); page.goBack()
       } else {
-        guard browser.canGoForward else { throw Failure("The tab has no next page.") }; page.goForward()
+        guard browser.canGoForward else { throw Failure("The tab has no next page.") }
+        interruptDocumentRestore(page); page.goForward()
       }
       return []
     case "tabs.duplicate":
@@ -1344,6 +1434,95 @@ final class NativeExtensionBrowser {
     }
   }
 
+  /// Chrome retains schema/permission/installation authority for the original
+  /// search.query request. Its destination uses Zacro's actual selected search
+  /// provider and logical windows; hidden implementation browsers are excluded.
+  private func performSearch(_ request: ChromeExtensionHostRequest, profile: String,
+                             arguments: [Any], manager: ChromeExtensionManager) async throws {
+    guard arguments.count == 1 else { throw Failure("Invalid search query arguments.") }
+    let props = try properties(arguments[0], allowed: ["text", "disposition", "tabId"])
+    guard let text = props["text"] as? String, !text.isEmpty else { throw Failure("Empty text parameter.") }
+    guard props["tabId"] == nil || props["disposition"] == nil else {
+      throw Failure("Cannot set both 'disposition' and 'tabId'.")
+    }
+    let disposition = props["disposition"] as? String ?? "CURRENT_TAB"
+    guard ["CURRENT_TAB", "NEW_TAB", "NEW_WINDOW"].contains(disposition),
+      props["disposition"] == nil || props["disposition"] is String else {
+      throw Failure("Invalid search disposition.")
+    }
+    try await synchronizeCatalog(profile)
+    let source = try props["tabId"].map { try record(profile, nativeID: integer($0)) }
+      ?? request.sourceTabID.map { try record(profile, nativeID: $0) }
+    let target: BrowserWindowSession
+    if let source, let id = source.windowID, let window = windows(profile).first(where: { $0.id == id }) {
+      target = window
+    } else {
+      let normal = windows(profile).filter { $0.kind == .normal }
+      let sourceWindow = request.sourceWindowID.flatMap { number in normal.first { engine.context(id: $0.id)?.nativeID == number } }
+      let previous = lastFocusedSearchWindows[profile].flatMap { id in normal.first { $0.id == id } }
+      let current = normal.first { $0.id == repository.focusedWindowID }
+      guard let window = sourceWindow ?? previous ?? current ?? normal.first else { throw Failure("No active browser.") }
+      target = window
+    }
+    guard let address = BrowserAddress.searchURL(text, engine: store.state.settings.searchEngine)?.absoluteString else {
+      throw Failure("The search query exceeds the supported navigation size.")
+    }
+    try await authorize(request, profile: profile, manager: manager)
+    if disposition == "NEW_WINDOW" || (disposition == "NEW_TAB" && target.kind == .popup) {
+      guard let createWindow else { throw Failure("Native window creation is unavailable.") }
+      let creation = NativeExtensionWindowRequest(profileID: profile, kind: .normal,
+        urls: [address], nativeAuthorizations: [:], movingTabID: nil, focused: true,
+        state: nil, left: nil, top: nil, width: nil, height: nil, openerRequestID: nil,
+        authorize: { [weak self] in
+          guard let self else { throw CancellationError() }
+          try await self.authorize(request, profile: profile, manager: manager)
+        })
+      let id = try await createWindow(creation)
+      try await authorize(request, profile: profile, manager: manager)
+      let created = tabs(profile, in: id)
+      guard created.count == 1, let tab = created.first, tab.url == address else {
+        throw Failure("The search window changed before its document could load.")
+      }
+      _ = try await prepareNavigationDocument(tab, preserveHistory: false)
+      try await authorize(request, profile: profile, manager: manager)
+    } else if disposition == "NEW_TAB" {
+      guard let nativeID = engine.context(id: target.id)?.nativeID else { throw Failure("The browser window closed.") }
+      _ = try await create(["url": address, "windowId": nativeID, "active": true],
+        request: request, profile: profile, manager: manager)
+    } else {
+      guard let tab = source ?? tabs(profile, in: target.id).first(where: { $0.id == activeDocumentID(target) }) else {
+        throw Failure("This profile has no active tab in that window.")
+      }
+      try await authorize(request, profile: profile, manager: manager)
+      guard let current = documentTab(tab.id), !current.isClosed, current.windowID == target.id,
+        store.profileID(for: current) == profile else { throw Failure("The search tab closed before navigation.") }
+      let ready = try await prepareNavigationReplacement(current, request: request, profile: profile, manager: manager)
+      let scope = try owner(ready)
+      if let sourceID = peekSourceID(tab.id) {
+        try scope.updatePeekDurably(tabID: sourceID) { peek in
+          let previous = peek.navigation ?? [NavigationEntry(url: peek.url, title: peek.title, nativeNavigation: peek.nativeNavigation)]
+          let index = peek.navigationIndex ?? max(0, previous.count - 1)
+          peek.url = address; peek.nativeNavigation = nil
+          peek.navigation = Array((Array(previous.prefix(max(0, index + 1))) + [NavigationEntry(url: address)]).suffix(100))
+          peek.navigationIndex = (peek.navigation?.count ?? 1) - 1
+        }
+      } else {
+        try scope.commit { state in
+          guard let index = state.tabs.firstIndex(where: { $0.id == tab.id }) else { return }
+          state.tabs[index].url = address; state.tabs[index].nativeNavigation = nil; state.tabs[index].homePage = nil
+          let history = Array(state.tabs[index].navigation.prefix(max(0, state.tabs[index].navigationIndex + 1))) + [NavigationEntry(url: address)]
+          state.tabs[index].navigation = Array(history.suffix(100))
+          state.tabs[index].navigationIndex = state.tabs[index].navigation.count - 1
+        }
+      }
+      guard let navigating = documentTab(tab.id), !navigating.isClosed else { throw Failure("The search tab closed before navigation.") }
+      navigateTab(navigating, address)
+      _ = try await prepareNavigationDocument(navigating, preserveHistory: false)
+      try await authorize(request, profile: profile, manager: manager)
+    }
+    didChange()
+  }
+
   private func create(_ props: [String: Any], request: ChromeExtensionHostRequest, profile: String,
                       manager: ChromeExtensionManager, duplicateOf: BrowserTab? = nil) async throws -> [String: Any] {
     var props = try properties(props, allowed: ["url", "active", "selected", "index", "pinned", "windowId", "openerTabId"])
@@ -1385,7 +1564,8 @@ final class NativeExtensionBrowser {
     if active { try canActivate(profile, in: target.id) }
     guard documentTab(tab.id)?.isClosed == false else { throw Failure("The tab closed before the operation completed.") }
     if address != "about:blank" { navigateTab(tab, address) }
-    _ = try await requireDocument(tab)
+    if duplicateOf == nil { _ = try await prepareNavigationDocument(tab, preserveHistory: false) }
+    else { _ = try await requireDocument(tab) }
     try await authorize(request, profile: profile, manager: manager)
     if active { try canActivate(profile, in: documentTab(tab.id)?.windowID); try activateTab(tab.id) }
     didChange()
@@ -1512,11 +1692,56 @@ final class NativeExtensionBrowser {
     try canActivate(profile, in: target.id)
     guard let scope = repository.store(for: target.id) else { throw Failure("Unknown profile window.") }
     let tab = try scope.restoreSessionTabDurably(id: entry.id)
-    _ = try await requireDocument(tab)
+    _ = try await prepareNavigationDocument(tab, preserveHistory: true)
     try await authorize(request, profile: profile, manager: manager)
     try canActivate(profile, in: documentTab(tab.id)?.windowID)
     try activateTab(tab.id); didChange()
     return [["lastModified": now, "tab": try await tabData(tab.id, profile: profile)]]
+  }
+
+  /// Chrome reports tab/window/search navigation creation even when the
+  /// destination later shows a network error. Register the actual native ID
+  /// and revalidate ownership without weakening strict renderer API restores.
+  func prepareNavigationDocument(_ tab: BrowserTab, preserveHistory: Bool = true) async throws -> ChromiumPage {
+    guard let current = documentTab(tab.id), !current.isClosed,
+      let profile = store.profileID(for: current), store.profileID(for: tab) == profile else {
+      throw Failure("The navigation tab closed before its document could be created.")
+    }
+    try checkProfile(profile)
+    let page: ChromiumPage
+    if let materializeNavigationPage { page = try await materializeNavigationPage(current, preserveHistory) }
+    else { page = try await requireDocument(current) }
+    try await registerMaterialized(page, profile: profile)
+    try checkProfile(profile)
+    guard engine.pages[tab.id] === page, let current = documentTab(tab.id), !current.isClosed,
+      store.profileID(for: current) == profile, page.profileID == profile,
+      page.ownerWindowID == current.windowID, let identity = identities[tab.id],
+      identity.page === page, identity.profile == profile, identity.id > 0 else {
+      throw Failure("The navigation document's native owner changed.")
+    }
+    return page
+  }
+
+  /// Install a saved/dormant controller stack before changing its model URL.
+  /// The selected request may be offline; only its installation is required.
+  private func prepareNavigationReplacement(_ tab: BrowserTab, request: ChromeExtensionHostRequest,
+    profile: String, manager: ChromeExtensionManager) async throws -> BrowserTab {
+    guard let windowID = tab.windowID, let window = engine.context(id: windowID),
+      window.isOpen, !window.isClosing else { throw Failure("The tab's window is closed.") }
+    let nativeWindowID = window.nativeID
+    _ = try await prepareNavigationDocument(tab, preserveHistory: true)
+    try await authorize(request, profile: profile, manager: manager)
+    guard engine.context(id: windowID) === window, window.nativeID == nativeWindowID,
+      window.isOpen, !window.isClosing,
+      let current = documentTab(tab.id), !current.isClosed, current.windowID == windowID,
+      store.profileID(for: current) == profile, current.url == tab.url,
+      current.nativeNavigation == tab.nativeNavigation,
+      current.navigation.map(\.url) == tab.navigation.map(\.url),
+      current.navigation.map(\.nativeNavigation) == tab.navigation.map(\.nativeNavigation),
+      current.navigationIndex == tab.navigationIndex else {
+      throw Failure("The tab changed before navigation.")
+    }
+    return current
   }
 
   private func requireDocument(_ tab: BrowserTab) async throws -> ChromiumPage {

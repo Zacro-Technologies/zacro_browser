@@ -1,52 +1,38 @@
 # Zacro Native for macOS
 
-This directory contains the Swift rewrite on `swift-rewrite`. It is **in progress, not a feature-complete replacement** for the Electron browser. Chromium and Chrome extension compatibility are requirements, not optional follow-ups. See the [migration and acceptance contract](../docs/SWIFT-REWRITE.md).
+Zacro's native macOS edition pairs a custom Swift interface with Chromium. Organize browsing in Spaces, keep Favorites and pinned tabs close, compare pages in saved split views, and open links in Peek without losing your place.
 
-## Build
+The native interface includes the command palette, website search, offline tab icons, theme controls, Library, downloads, permissions, AI and sync settings, and Chrome extension management, actions and side panels. Google is the default search engine; the default page spacing is 4px. The Electron browser remains the behavior and design reference while native acceptance is completed.
+
+## Build and run
 
 Requires Xcode, Swift 6, and macOS 14 or later. The current tested target is Apple silicon.
 
 ```sh
-swift build --package-path macos
-swift test --package-path macos
 bash macos/scripts/build-app.sh --runtime-build /path/to/Release_GN_arm64/zacro-runtime-build.json
+open "macos/dist/Zacro Native.app"
 ```
 
-The bundle is `macos/dist/Zacro Native.app`. Packaging requires a completed custom Chromium framework and its matching build receipt; it verifies the pinned revisions, native adapters, framework and resources. See the [engine build instructions](Engine/README.md). `--stock-runtime` creates a diagnostic app without the native extension integration. Binaries/build products are ignored by Git. Development bundles are ad hoc signed, not notarized. Normal browsing uses the Chromium sandbox and macOS Keychain; no mock-keychain fallback is permitted for real profiles.
+Build the pinned custom Chromium framework first using the [engine instructions](Engine/README.md). Packaging verifies its matching receipt, native adapters and resources. Development bundles are ad hoc signed, not notarized. Normal browsing uses Chromium's sandbox and macOS Keychain.
 
 Native state is stored separately in `~/Library/Application Support/Zacro Native`. Import Electron collection JSON explicitly through Library → Settings. The importer does not modify the original profile or copy cookies, passwords, extension storage, or authentication tokens.
 
-## Implementation
+## Validation
 
-- `ZacroCore`: validated state, atomic persistence, profile privacy boundaries, saved tabs, Spaces, folders, splits, Peek, navigation stacks, Library records, settings, and explicit legacy import.
-- `ZacroApp`: SwiftUI/AppKit interface, native palette and Peek overlay panels, gestures, theme controls, haptics, site controls, menu/shortcut handling, and browser lifecycle coordination.
-- `ZacroChromium`: Chrome-runtime-only CEF integration. Each page retains an independent native Chromium child window because CEF permits only one Chrome-style browser view per window. No Alloy or WebKit fallback.
-- `ZacroServices`: AI connections, selected page/PDF context, account sync, durable extension-sync review and navigation-history storage. The app coordinates native downloads, permissions and extension management with the engine.
-- `Engine/CefSwift`: pinned third-party source with documented Zacro patches and original licenses. Website content has no privileged application bridge.
+The latest completed Core/Services run passed 321 tests. Build 61's native extension suite passed all 306 checks with normal application exit. Focused interface, navigation, restoration, window-transfer and accessibility checks also passed; the verification record gives exact builds and coverage. The updated custom framework 66 has passed provenance validation.
 
-## Validation and remaining work
+Build 70 passed 10 media checks, 28 extension-host checks and 71 independent engine/window/accessibility checks, all with normal exits. The pane-edge and motion changes passed 155 focused checks in 68 and actual visual review. Full 70 attempts stopped at foreground readiness; full-application acceptance remains open. The delivered `dist` apps remain build 40.
 
-Completed suites include 263 Core/Services tests, 51 custom-engine checks, 28 Peek checks, 33 navigation checks, 11 real tab-capture checks, 11 scoped renderer accessibility checks, seven sidebar accessibility checks, nine window-transfer checks, and sixteen download-retirement checks. The latest packaged popup ownership checks pass, but an open popup exposed a shutdown lifetime defect. Side panels now open in the correct logical window; retention when the page fails still needs correction. Full custom application/extension acceptance and new live tab-recovery cases remain incomplete. The earlier stock-engine checkpoint passed all 243 application checks, but does not validate native extension support. See the verification record for exact builds, partial runs and failures.
+Desktop review confirmed the corrected pane contour, live tinted content beneath Peek, expansion retaining its draft, content-only mode, Unsplit, Favorite/pin/folder creation and saved themes. Physical drag/trackpad, VoiceOver, production Keychain and distribution checks remain separate gates. Universal Chrome extension compatibility is not established; some APIs have [external requirements](../docs/native-parity/compatibility-boundaries.md).
 
-The native Extensions Library, pinned actions, settings synchronization, browser API adapters and Chromium consent integration are implemented in source. The complete custom framework has built and passed receipt validation; its packaged real-extension fixtures must still pass before the integration can be accepted. Google token APIs and third-party native hosts also have [external compatibility requirements](../docs/native-parity/compatibility-boundaries.md); universal extension compatibility is not established.
-
-Desktop pointer/trackpad, VoiceOver, visual animation and performance review, production Keychain behavior, signed distribution and notarization remain required. The Electron implementation remains the feature reference. See the [current verification record](../docs/native-parity/verification.md) and [parity contract](../docs/SWIFT-REWRITE.md).
-
-## Disposable engine acceptance
-
-`--engine-acceptance` is a test-only entry point requiring a fresh empty direct child of the system temporary directory named `zacro-native-acceptance-*` and a credential-free loopback HTTP fixture. Only that entry point selects mock cookie encryption; the Chromium sandbox stays enabled. It tests independently retained Chrome documents and persistent/private context isolation without authorizing access to the user's Keychain. It does **not** validate production cookie encryption or extension compatibility.
-
-After a force-terminated development run, pass `-ApplePersistenceIgnoreState YES` to prevent AppKit’s unrelated window-restoration dialog from blocking the test event loop.
-
-Set `ZACRO_NATIVE_DATA`, `ZACRO_NATIVE_SMOKE_URL`, and `ZACRO_ACCEPTANCE_OUTPUT` for the packaged executable. A JSON `passed: false` or missing report is a failure, regardless of the process exit code.
-
-The same isolated mode accepts `--native-ui-review` to exercise the full Swift interface against the local fixture. Native input review confirmed command-palette opening, new-tab submission, retained tab results, and theme editor presentation/dismissal. It does not waive the remaining parity or production Keychain requirements.
-
-After bundling, run the engine check and full custom-runtime application check:
+Run the isolated checks after packaging:
 
 ```sh
-python3 -B macos/scripts/check-app.py
-python3 -B macos/scripts/check-app.py --integration --require-extensions
+swift test --package-path macos
+python3 -B macos/scripts/check-app.py --foreground
+ZACRO_TURNSERVER=/path/to/turnserver python3 -B macos/scripts/check-app.py --integration --require-extensions --foreground
 ```
 
-Both require a successful native report and a clean process exit, so a shutdown crash fails validation. Reports are saved under `macos/dist/acceptance`. AppKit view renders verify their captured native views only; they do not capture composed Chromium windows or establish physical-input acceptance.
+Full and focused media acceptance require a locally built coturn `turnserver` on the host, selected with `ZACRO_TURNSERVER`. This is a disposable loopback test dependency; the browser app does not depend on coturn. To run media alone, use `--integration --suite media --foreground` with the same environment variable.
+
+Application checks use fresh disposable profiles and local fixtures, require a valid passing report and clean exit, and do not validate real-profile Keychain behavior. See the [verification record](../docs/native-parity/verification.md), [interface ledger](../docs/native-parity/interface.md) and [rewrite contract](../docs/SWIFT-REWRITE.md) for exact evidence and remaining acceptance work.

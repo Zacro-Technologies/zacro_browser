@@ -36,15 +36,18 @@ extension BrowserStore {
 
   /// Also used within Peek's existing durable promotion transaction.
   @discardableResult static func appendHistoryVisit(to state: inout BrowserState,
-      profileID: String, address: String, title: String, visitedAt: Date) -> String? {
+      profileID: String, address: String, title: String, visitedAt: Date, historical: Bool = false) -> String? {
     guard state.profiles.contains(where: { $0.id == profileID && !$0.isPrivate }),
       let url = BrowserAddress.webURL(address)?.absoluteString,
       visitedAt.timeIntervalSince1970.isFinite, visitedAt.timeIntervalSince1970 > 0 else { return nil }
     let title = String(title.trimmingCharacters(in: .whitespacesAndNewlines).prefix(500))
     let id: String
     if let recent = state.history.firstIndex(where: { $0.profileID == profileID }),
-      state.history[recent].url == url, visitedAt.timeIntervalSince(state.history[recent].visitedAt) < 60 {
+      state.history[recent].url == url,
+      visitedAt.timeIntervalSince(state.history[recent].visitedAt) >= 0,
+      visitedAt.timeIntervalSince(state.history[recent].visitedAt) < 60 {
       if !title.isEmpty { state.history[recent].title = title }
+      state.nativeHistoryBindings.removeValue(forKey: state.history[recent].id)
       state.history[recent].visitedAt = visitedAt
       id = state.history[recent].id
     } else {
@@ -53,6 +56,9 @@ extension BrowserStore {
       state.history.insert(entry, at: 0)
       id = entry.id
     }
+    // A durable native journal can replay older commits after restart. Never
+    // move a newer visible visit backwards or evict it in favor of older replay.
+    if historical { state.history.sort { $0.visitedAt > $1.visitedAt } }
     state.history = Array(state.history.prefix(20_000))
     return id
   }

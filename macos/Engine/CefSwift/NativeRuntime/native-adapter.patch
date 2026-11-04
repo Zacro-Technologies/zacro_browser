@@ -30,7 +30,7 @@
  
  class CefDevToolsController : public content::DevToolsAgentHostClient {
   public:
-@@ -68,6 +81,33 @@
+@@ -68,6 +81,34 @@
                                 base::span<const uint8_t> message) override;
  
    bool EnsureAgentHost();
@@ -40,6 +40,7 @@
 +  bool DispatchZacroExtensions(int id, const std::string& method, const base::DictValue* params);
 +  bool DispatchZacroTopology(int id, const std::string& method, const base::DictValue* params);
 +  bool DispatchZacroBookmarks(int id, const std::string& method, const base::DictValue* params);
++  bool DispatchZacroHistory(int id, const std::string& method, const base::DictValue* params);
 +  bool DispatchZacroDownloads(int id, const std::string& method, const base::DictValue* params);
 +  bool DispatchZacroManagement(int id, const std::string& method, const base::DictValue* params);
 +  base::CallbackListSubscription zacro_extension_subscription_;
@@ -138,11 +139,34 @@
    devtools_util::ProtocolParser parser;
 --- a/BUILD.gn
 +++ b/BUILD.gn
-@@ -981,6 +981,11 @@
+@@ -94,6 +94,7 @@
+ #
+ 
+ import("//base/allocator/allocator.gni")
++import("//build/config/compiler/compiler.gni")
+ import("//build/config/features.gni")
+ import("//build/config/locales.gni")
+ import("//build/config/ozone.gni")
+@@ -605,6 +606,10 @@
+     "libcef/browser/crashpad_runner.cc",
+     "libcef/browser/crashpad_runner.h",
+     "libcef/browser/devtools/devtools_controller.cc",
++    "libcef/browser/devtools/zacro_extension_host_navigation.cc",
++    "libcef/browser/devtools/zacro_extension_host_navigation.h",
++    "libcef/browser/devtools/zacro_extension_host_navigation_capi.h",
++    "libcef/browser/devtools/zacro_extension_host_client_bridge.h",
+     "libcef/browser/devtools/devtools_controller.h",
+     "libcef/browser/devtools/devtools_protocol_manager.cc",
+     "libcef/browser/devtools/devtools_protocol_manager.h",
+@@ -981,6 +986,15 @@
      "//components/proxy_config",
      "//components/services/print_compositor/public/cpp",
      "//components/services/print_compositor/public/mojom",
 +    "//components/sessions",
++    "//components/history/core/browser",
++    "//chrome/browser/history",
++    "//chrome/browser/extensions",
++    "//chrome/browser/extensions/api/runtime",
 +    "//components/os_crypt/async/browser",
 +    "//components/os_crypt/async/common",
 +    "//chrome/browser/ui/views/extensions:extension_popup",
@@ -150,6 +174,29 @@
      "//components/update_client",
      "//components/url_formatter",
      "//components/user_prefs",
+@@ -1886,6 +1900,14 @@
+     ]
+   }
+ 
++  # Append after the default compiler config so these final-link settings
++  # override its eager reader count without relinking build tools or codegen.
++  config("zacro_framework_linking") {
++    if (is_mac && use_lld) {
++      ldflags = [ "-Wl,--threads=1", "-Wl,--read-workers=0" ]
++    }
++  }
++
+   mac_framework_bundle("cef_framework") {
+     # Necessary because the libcef_test_support target is testonly.
+     testonly = true
+@@ -1914,6 +1936,7 @@
+     configs += [
+       ":libcef_autogen_config",
+       ":libcef_includes_config",
++      ":zacro_framework_linking",
+     ]
+ 
+     # We don't link the framework so just use the path from the main executable.
 --- a/libcef/browser/browser_platform_delegate.h
 +++ b/libcef/browser/browser_platform_delegate.h
 @@ -42,6 +42,7 @@
@@ -284,14 +331,45 @@
    }
  }
  
+--- a/libcef/browser/browser_contents_delegate.cc
++++ b/libcef/browser/browser_contents_delegate.cc
+@@ -578,6 +578,13 @@
+     // RenderFrameHostImpl::OnDidFailProvisionalLoadWithError.
+     // OnLoadStart/OnLoadEnd will not be called.
+     OnLoadError(frame.get(), navigation_handle->GetURL(), error_code);
++    // A committed error document owns a real NavigationEntry even though it
++    // has no successful OnLoadStart. Keep the host address/history in sync
++    // without promoting a provisional failure or clearing its error state.
++    if (navigation_handle->IsInPrimaryMainFrame() &&
++        navigation_handle->HasCommitted()) {
++      OnAddressChange(navigation_handle->GetURL());
++    }
+   }
+ }
+ 
+--- a/libcef/browser/views/ns_window.mm
++++ b/libcef/browser/views/ns_window.mm
+@@ -98,6 +98,11 @@
+ 
+ // NSWindow (PrivateAPI) overrides.
+ + (Class)frameViewClassForStyleMask:(NSUInteger)windowStyle {
++  // Hosted borderless windows must use Chromium's borderless frame rather
++  // than the title-bearing CEF frame, whose independent contour stays rounded.
++  if (!(windowStyle & NSWindowStyleMaskTitled)) {
++    return [super frameViewClassForStyleMask:windowStyle];
++  }
+   if (Class custom_frame = [CefThemeFrame class]) {
+     return custom_frame;
+   }
 --- /dev/null
 +++ b/libcef/browser/devtools/zacro_native_adapter.inc
-@@ -0,0 +1,1141 @@
+@@ -0,0 +1,1185 @@
 +// Zacro's browser-process adapter, included by CefDevToolsController.
 +// This channel is reachable only through CEF's native API. It is never exposed
 +// as a page binding, socket, scheme handler, or extension API.
 +#include <algorithm>
 +#include <cmath>
++#include <optional>
 +#include "base/base64.h"
 +#include "base/containers/flat_set.h"
 +#include "base/functional/bind.h"
@@ -300,6 +378,7 @@
 +#include "base/strings/string_number_conversions.h"
 +#include "base/strings/utf_string_conversions.h"
 +#include "base/timer/timer.h"
++#include "base/uuid.h"
 +#include "cef/libcef/browser/browser_host_base.h"
 +#include "cef/include/views/cef_browser_view.h"
 +#include "chrome/browser/browsing_data/chrome_browsing_data_remover_constants.h"
@@ -352,12 +431,34 @@
 +#include "cef/libcef/browser/devtools/zacro_extensions_adapter.inc"
 +#include "cef/libcef/browser/devtools/zacro_topology_adapter.inc"
 +#include "cef/libcef/browser/devtools/zacro_bookmarks_adapter.inc"
++#include "cef/libcef/browser/devtools/zacro_history_adapter.inc"
 +#include "cef/libcef/browser/devtools/zacro_downloads_adapter.inc"
 +#include "cef/libcef/browser/devtools/zacro_management_adapter.inc"
 +
 +namespace {
 +constexpr char kZacroBrowserSession[] = "zacro.native.browser.v1";
 +constexpr size_t kZacroMaximumHistoryBytes = 6 * 1024 * 1024;
++
++// An optional native-only phase receipt separates installing the authenticated
++// controller history from waiting for its selected document to commit. The
++// caller must install its exact-browser observer before submitting this nonce.
++std::optional<std::string> ZacroHistoryInstallationToken(
++    const base::DictValue* params, content::WebContents* contents) {
++  const auto* value = params ? params->Find("installationToken") : nullptr;
++  if (!value) return std::string();
++  const auto* token = value->GetIfString();
++  if (!token || !base::Uuid::ParseLowercase(*token).is_valid() ||
++      !CefBrowserHostBase::GetBrowserForContents(contents)) return std::nullopt;
++  return *token;
++}
++
++base::DictValue ZacroHistoryInstallationReceipt(
++    content::WebContents* contents, const std::string& token) {
++  auto browser = CefBrowserHostBase::GetBrowserForContents(contents);
++  CHECK(browser);
++  return base::DictValue().Set("token", token)
++      .Set("browserID", browser->GetIdentifier());
++}
 +
 +std::string ZacroHistoryBinding(content::WebContents* contents) {
 +  return "zacro.navigation.v2:" +
@@ -881,6 +982,7 @@
 +  if (DispatchZacroTopology(*id, *method, request->FindDict("params"))) return true;
 +  if (DispatchZacroExtensions(*id, *method, request->FindDict("params"))) return true;
 +  if (DispatchZacroBookmarks(*id, *method, request->FindDict("params"))) return true;
++  if (DispatchZacroHistory(*id, *method, request->FindDict("params"))) return true;
 +  if (DispatchZacroDownloads(*id, *method, request->FindDict("params"))) return true;
 +  if (DispatchZacroManagement(*id, *method, request->FindDict("params"))) return true;
 +  if (*method == "Zacro.getExtensionOptions") {
@@ -930,9 +1032,10 @@
 +  if (*method == "Zacro.getCapabilities") {
 +    ReplyZacro(*id, base::DictValue().Set("version", 1).Set("browserProtocol", true)
 +        .Set("documentState", true).Set("browsingData", true).Set("navigationState", true)
-+        .Set("encryptedNavigation", true).Set("retainedDiscard", true)
++        .Set("encryptedNavigation", true).Set("retainedDiscard", true).Set("historyInstallation", true)
 +        .Set("extensionActions", true).Set("legacyNavigation", true).Set("extensionStorage", true).Set("extensionBrowser", true)
-+        .Set("volatileDiscard", true).Set("bookmarks", true).Set("historyRemoval", true).Set("downloads", true));
++        .Set("volatileDiscard", true).Set("bookmarks", true).Set("historyRemoval", true)
++        .Set("historyMirror", true).Set("downloads", true));
 +    return true;
 +  }
 +  if (*method == "Zacro.extensionWorkerTarget") {
@@ -1161,6 +1264,8 @@
 +  }
 +  if (*method == "Zacro.restoreNavigationEntries") {
 +    const auto* params = request->FindDict("params");
++    const auto installation_token = ZacroHistoryInstallationToken(params, inspected_contents_);
++    if (!installation_token) { ReplyZacro(*id, {}, "Invalid native history installation token."); return true; }
 +    const auto* items = params ? params->FindList("entries") : nullptr;
 +    const auto selected = params ? params->FindInt("selectedIndex") : std::nullopt;
 +    auto& controller = inspected_contents_->GetController();
@@ -1186,7 +1291,11 @@
 +    auto entries = sessions::ContentSerializedNavigationBuilder::ToNavigationEntries(serialized, inspected_contents_->GetBrowserContext());
 +    controller.Restore(*selected, content::RestoreType::kRestored, &entries);
 +    if (StartZacroNavigationCommit(*id, controller.GetLastCommittedEntry()->GetURL(),
-+        base::DictValue().Set("restored", true))) controller.LoadIfNecessary();
++        base::DictValue().Set("restored", true))) {
++      if (!installation_token->empty()) EmitZacro("Zacro.navigationHistoryInstalled",
++          ZacroHistoryInstallationReceipt(inspected_contents_, *installation_token));
++      controller.LoadIfNecessary();
++    }
 +    return true;
 +  }
 +  if (*method == "Zacro.getDocumentState") {
@@ -1244,6 +1353,8 @@
 +    return true;
 +  }
 +  if (*method == "Zacro.restoreDiscardedDocument") {
++    const auto installation_token = ZacroHistoryInstallationToken(request->FindDict("params"), inspected_contents_);
++    if (!installation_token) { ReplyZacro(*id, {}, "Invalid native history installation token."); return true; }
 +    auto& controller = inspected_contents_->GetController();
 +    if (zacro_navigation_commit_ || zacro_dormant_history_.empty() || zacro_discard_ || controller.GetEntryCount() != 1 ||
 +        !zacro_dormant_entry_ || controller.GetLastCommittedEntry()->GetUniqueID() != zacro_dormant_entry_ ||
@@ -1257,7 +1368,11 @@
 +    CHECK(controller.RemoveEntryAtIndex(0));
 +    zacro_dormant_entry_ = 0; zacro_dormant_history_.clear();
 +    if (StartZacroNavigationCommit(*id, controller.GetLastCommittedEntry()->GetURL(),
-+        base::DictValue().Set("restored", true))) controller.LoadIfNecessary();
++        base::DictValue().Set("restored", true))) {
++      if (!installation_token->empty()) EmitZacro("Zacro.navigationHistoryInstalled",
++          ZacroHistoryInstallationReceipt(inspected_contents_, *installation_token));
++      controller.LoadIfNecessary();
++    }
 +    return true;
 +  }
 +  if (*method == "Zacro.serializeNavigation") {
@@ -1278,6 +1393,8 @@
 +  }
 +  if (*method == "Zacro.restoreNavigation") {
 +    const auto* params = request->FindDict("params");
++    const auto installation_token = ZacroHistoryInstallationToken(params, inspected_contents_);
++    if (!installation_token) { ReplyZacro(*id, {}, "Invalid native history installation token."); return true; }
 +    const auto* encoded = params ? params->FindString("state") : nullptr;
 +    std::string bytes;
 +    if (!encoded || encoded->size() > 8 * 1024 * 1024 ||
@@ -1299,7 +1416,7 @@
 +    if (!crypt) { ReplyZacro(*id, {}, "Native navigation encryption is unavailable."); return true; }
 +    crypt->GetInstance(base::BindOnce(
 +        [](base::WeakPtr<CefDevToolsController> self, int id,
-+           std::string wrapped_key, std::string nonce, std::string ciphertext,
++           std::string installation_token, std::string wrapped_key, std::string nonce, std::string ciphertext,
 +           scoped_refptr<os_crypt_async::Encryptor> encryptor) {
 +          if (!self) return;
 +          auto key = encryptor->DecryptData(base::as_bytes(base::span(wrapped_key)));
@@ -1347,8 +1464,12 @@
 +            self->zacro_dormant_history_.clear();
 +          }
 +          if (self->StartZacroNavigationCommit(id, controller.GetLastCommittedEntry()->GetURL(),
-+              base::DictValue().Set("restored", true))) controller.LoadIfNecessary();
-+        }, weak_ptr_factory_.GetWeakPtr(), *id, std::move(wrapped_key), std::move(nonce), std::move(ciphertext)));
++              base::DictValue().Set("restored", true))) {
++            if (!installation_token.empty()) self->EmitZacro("Zacro.navigationHistoryInstalled",
++                ZacroHistoryInstallationReceipt(self->inspected_contents_, installation_token));
++            controller.LoadIfNecessary();
++          }
++        }, weak_ptr_factory_.GetWeakPtr(), *id, *installation_token, std::move(wrapped_key), std::move(nonce), std::move(ciphertext)));
 +    return true;
 +  }
 +  return false;
@@ -1687,11 +1808,13 @@
 +}
 --- /dev/null
 +++ b/libcef/browser/devtools/zacro_topology_adapter.inc
-@@ -0,0 +1,1397 @@
+@@ -0,0 +1,1631 @@
 +// The Swift shell owns logical tabs and windows. Chromium still owns the
 +// extension caller, schema, permission grants and real WebContents identities.
 +#include "base/strings/pattern.h"
 +#include "base/no_destructor.h"
++#include "base/command_line.h"
++#include "base/logging.h"
 +#include "chrome/browser/extensions/extension_tab_util.h"
 +#include "chrome/browser/extensions/window_controller.h"
 +#include "chrome/browser/extensions/extension_view_host.h"
@@ -1707,7 +1830,15 @@
 +#include "chrome/common/extensions/api/tab_groups.h"
 +#include "chrome/common/extensions/api/windows.h"
 +#include "chrome/common/extensions/api/sessions.h"
++#include "chrome/common/extensions/api/search.h"
++#include "chrome/browser/extensions/api/runtime/chrome_runtime_api_delegate.h"
++#include "chrome/browser/extensions/chrome_extension_function_details.h"
++#include "chrome/browser/extensions/window_controller.h"
++#include "extensions/browser/extension_host.h"
++#include "extensions/browser/extension_host_registry.h"
++#include "cef/libcef/browser/devtools/zacro_extension_host_navigation.h"
 +#include "chrome/common/extensions/api/side_panel.h"
++#include "chrome/browser/extensions/api/identity/web_auth_flow.h"
 +#include "components/tab_groups/tab_group_id.h"
 +#include "extensions/browser/event_router.h"
 +#include "extensions/browser/api/runtime/runtime_api.h"
@@ -1719,6 +1850,11 @@
 +#include "crypto/hash.h"
 +#include "url/origin.h"
 +#include "cef/libcef/browser/devtools/zacro_tab_reservation.h"
++#include "chrome/browser/history/native_history_owner.h"
++
++void ZacroObserveProfileHistory(content::BrowserContext* context);
++void ZacroNativeHistoryDocumentChanged(content::BrowserContext* context);
++void ZacroNativeHistoryDocumentClosed(content::BrowserContext* context, const std::string& token);
 +
 +namespace {
 +using ZacroNativeResponse = ExtensionFunction::NativeResponse;
@@ -1786,6 +1922,7 @@
 +  if (method == "sessions.getRecentlyClosed") return extensions::api::sessions::GetRecentlyClosed::Params::Create(args).has_value();
 +  if (method == "sessions.getDevices") return extensions::api::sessions::GetDevices::Params::Create(args).has_value();
 +  if (method == "sessions.restore") return extensions::api::sessions::Restore::Params::Create(args).has_value();
++  if (method == "search.query") return extensions::api::search::Query::Params::Create(args).has_value();
 +  if (method == "tabs.getCurrent") return args.empty();
 +  if (method == "runtime.openOptionsPage") return args.empty();
 +  // The pinned action API has no generated C++ Params type. Match the native
@@ -1882,6 +2019,38 @@
 +  destinations[key] = {extension_id, incarnation}; return true;
 +}
 +
++// BEGIN ZACRO POST-UNINSTALL NAVIGATION QUEUE
++// These are native post-uninstall producer receipts, never extension requests.
++// Context ownership and native random single-use tokens prevent replay across
++// profiles or a later installation of the same extension.
++class ZacroPostUninstallNavigationQueue {
++ public:
++  std::optional<std::string> Enqueue(const GURL& url, bool blocked) {
++    if (blocked || urls_.size() >= 128 || !url.is_valid() ||
++        !url.SchemeIsHTTPOrHTTPS() || url.has_username() || url.has_password() ||
++        url.spec().size() > 8192) return std::nullopt;
++    const auto token = base::UnguessableToken::Create().ToString();
++    urls_.emplace(token, url);
++    return token;
++  }
++  std::optional<GURL> Take(const std::string& token, bool blocked) {
++    const auto found = urls_.find(token);
++    if (found == urls_.end()) return std::nullopt;
++    const auto url = found->second;
++    urls_.erase(found);
++    if (blocked) return std::nullopt;
++    return url;
++  }
++  std::vector<std::string> Pending() const {
++    std::vector<std::string> tokens;
++    for (const auto& [token, url] : urls_) tokens.push_back(token);
++    return tokens;
++  }
++ private:
++  std::map<std::string, GURL> urls_;
++};
++// END ZACRO POST-UNINSTALL NAVIGATION QUEUE
++
 +class ZacroBrowserContext : public base::SupportsUserData::Data {
 + public:
 +  static constexpr char kKey[] = "zacro.native.browser-model";
@@ -1895,6 +2064,104 @@
 +  }
 +  explicit ZacroBrowserContext(content::BrowserContext* context) : context_(context) {}
 +  static void InstallHooks() {
++    ZacroInstallExtensionHostNavigation(base::BindRepeating(
++        [](content::RenderFrameHost* frame) -> std::optional<ZacroExtensionHostOwner> {
++          const auto trace = [frame](const char* reason, int window = 0, int native_browser = 0) {
++            const auto* command = base::CommandLine::ForCurrentProcess();
++            if (command->HasSwitch("engine-acceptance") &&
++                command->HasSwitch("native-integration-acceptance")) {
++              LOG(ERROR) << "Native extension-host owner reason=" << reason
++                         << " process=" << (frame ? frame->GetProcess()->GetDeprecatedID() : -1)
++                         << " frame=" << (frame ? frame->GetRoutingID() : -1)
++                         << " window=" << window << " browser=" << native_browser;
++            }
++          };
++          if (!frame || !frame->IsRenderFrameLive()) {
++            trace(!frame ? "no-frame" : "frame-not-live"); return std::nullopt;
++          }
++          auto* contents = content::WebContents::FromRenderFrameHost(frame);
++          if (!contents || contents->IsBeingDestroyed()) {
++            trace(!contents ? "no-source-contents" : "source-being-destroyed"); return std::nullopt;
++          }
++          auto* context = contents->GetBrowserContext();
++          auto* state = Find(context);
++          if (!state || context->IsOffTheRecord() ||
++              extensions::IsNativeWebAuthAdmissionBlocked(Profile::FromBrowserContext(context))) {
++            trace(!state ? "no-logical-profile-state" : context->IsOffTheRecord()
++                ? "private-profile" : "profile-or-process-admission-fenced"); return std::nullopt;
++          }
++          auto* hosts = extensions::ExtensionHostRegistry::Get(context);
++          auto* host = hosts ? hosts->GetExtensionHostForPrimaryMainFrame(contents->GetPrimaryMainFrame()) : nullptr;
++          if (!host || host->host_contents() != contents || host->browser_context() != context ||
++              !host->extension() || (host->extension_host_type() != extensions::mojom::ViewType::kExtensionPopup &&
++              host->extension_host_type() != extensions::mojom::ViewType::kExtensionSidePanel)) {
++            trace(!host ? "no-primary-main-frame-extension-host" : host->host_contents() != contents
++                ? "extension-host-contents-mismatch" : host->browser_context() != context
++                ? "extension-host-profile-mismatch" : !host->extension()
++                ? "extension-host-not-installed" : "extension-host-type-rejected"); return std::nullopt;
++          }
++          auto* registry = extensions::ExtensionRegistry::Get(context);
++          if (!registry || registry->enabled_extensions().GetByID(host->extension_id()) != host->extension()) {
++            trace("enabled-extension-incarnation-mismatch"); return std::nullopt;
++          }
++          auto* controller = host->GetExtensionWindowController();
++          auto* browser = controller ? controller->GetBrowserWindowInterface() : nullptr;
++          if (!browser || browser->IsDeleteScheduled() || browser->GetProfile() != context) {
++            trace(!browser ? "no-extension-window-browser" : browser->IsDeleteScheduled()
++                ? "extension-window-browser-closing" : "extension-window-profile-mismatch"); return std::nullopt;
++          }
++          auto* active = browser->GetActiveTabInterface();
++          auto* anchor = active ? active->GetContents() : nullptr;
++          if (!anchor || anchor->IsBeingDestroyed() || anchor->GetBrowserContext() != context) {
++            trace(!anchor ? "extension-browser-has-no-active-anchor" : anchor->IsBeingDestroyed()
++                ? "active-anchor-being-destroyed" : "active-anchor-profile-mismatch"); return std::nullopt;
++          }
++          int window = 0;
++          for (const auto& [id, tab] : state->tabs_) {
++            if (tab->web_contents() == anchor && !tab->closing && !tab->discarded) { window = tab->window; break; }
++          }
++          if (!window) for (const auto& [id, parked] : state->panel_parking_) {
++            if (parked.get() == anchor) { window = id; break; }
++          }
++          const auto source_window = contents->GetTopLevelNativeWindow();
++          if (!window || !source_window ||
++              !extensions::NativeExtensionUIWindowForLogicalWindow(window, source_window)) {
++            trace(!window ? "anchor-not-in-live-logical-tabs-or-parking" : !source_window
++                ? "extension-host-has-no-native-window" : "native-source-window-not-owned-shell", window);
++            return std::nullopt;
++          }
++          auto native = CefBrowserHostBase::GetBrowserForContents(anchor);
++          if (!native) { trace("active-anchor-has-no-cef-browser", window); return std::nullopt; }
++          trace("accepted", window, native->GetIdentifier());
++          return ZacroExtensionHostOwner{native, window, host->extension_id()};
++        }));
++    extensions::ChromeExtensionFunctionDetails::SetNativeUIWindowResolver(base::BindRepeating(
++        [](ExtensionFunction* function) {
++          if (!function) return gfx::NativeWindow();
++          if (auto operation = extensions::NativeManagementOperation::ForFunction(function))
++            return operation->IsValid() ? operation->parent() : gfx::NativeWindow();
++          auto* context = function->browser_context();
++          auto* state = Find(context);
++          if (!state || extensions::IsNativeWebAuthAdmissionBlocked(Profile::FromBrowserContext(context)))
++            return gfx::NativeWindow();
++          return state->NativeUIWindowForFunction(function);
++        }));
++    ChromeRuntimeAPIDelegate::SetNativeUninstallURLHandler(base::BindRepeating(
++        [](content::BrowserContext* context, const GURL& url) {
++          if (context && !context->IsOffTheRecord()) Get(context)->QueuePostUninstallNavigation(url);
++        }));
++    NativeHistoryOwner::InstallProvider(base::BindRepeating(
++        [](content::WebContents* contents, const std::string& logical, int window) {
++          if (!contents || contents->IsBeingDestroyed() ||
++              contents->GetBrowserContext()->IsOffTheRecord()) return false;
++          auto* state = Find(contents->GetBrowserContext());
++          if (!state) return false;
++          for (const auto& [id, tab] : state->tabs_) {
++            if (tab->web_contents() == contents && tab->logical_id == logical &&
++                tab->window == window && window > 0 && !tab->closing && !tab->discarded) return true;
++          }
++          return false;
++        }), base::BindRepeating(&ZacroNativeHistoryDocumentClosed));
 +    SidePanelUI::SetNativeHostedPanelPolicy(base::BindRepeating(
 +        [](BrowserWindowInterface* browser, const SidePanelEntryKey& key) {
 +          if (!browser || browser->GetProfile()->IsOffTheRecord() ||
@@ -2038,6 +2305,44 @@
 +        ZacroExtensionContext::Get(context_)->NotifyHost(request->event);
 +      }
 +    }
++    for (const auto& token : post_uninstall_.Pending()) NotifyPostUninstallNavigation(token);
++  }
++  void QueuePostUninstallNavigation(const GURL& url) {
++    const auto token = post_uninstall_.Enqueue(url,
++        extensions::IsNativeWebAuthAdmissionBlocked(Profile::FromBrowserContext(context_)));
++    if (token && observed_) NotifyPostUninstallNavigation(*token);
++  }
++  gfx::NativeWindow NativeUIWindowForFunction(ExtensionFunction* function) {
++    // An exact source document keeps its logical owner even when a different
++    // window is focused. Worker requests use the profile's published focus.
++    if (auto* sender = function->GetSenderWebContents()) {
++      if (sender->GetBrowserContext() != context_) return gfx::NativeWindow();
++      for (const auto& [id, tab] : tabs_) {
++        if (tab->web_contents() == sender) {
++          if (tab->closing || tab->discarded) return gfx::NativeWindow();
++          return extensions::NativeExtensionUIWindowForLogicalWindow(tab->window);
++        }
++      }
++      // A real extension action popup is a descendant of its initiating shell,
++      // although it does not itself own a public logical tab identity.
++      if (const auto source = sender->GetTopLevelNativeWindow(); source) {
++        for (const auto& [id, tab] : tabs_) {
++          if (tab->closing || tab->discarded) continue;
++          if (const auto owner = extensions::NativeExtensionUIWindowForLogicalWindow(tab->window, source); owner)
++            return owner;
++        }
++      }
++    }
++    const auto window = focused_window_ ? focused_window_ : last_focused_window_;
++    return window ? extensions::NativeExtensionUIWindowForLogicalWindow(*window) : gfx::NativeWindow();
++  }
++  std::optional<GURL> TakePostUninstallNavigation(const std::string& token) {
++    return post_uninstall_.Take(token, context_->IsOffTheRecord() ||
++        extensions::IsNativeWebAuthAdmissionBlocked(Profile::FromBrowserContext(context_)));
++  }
++  void NotifyPostUninstallNavigation(const std::string& token) {
++    ZacroExtensionContext::Get(context_)->NotifyNative("Zacro.postUninstallNavigation",
++        base::DictValue().Set("requestID", token));
 +  }
 +  void SetFocusedWindow(std::optional<int> window, std::optional<int> last_focused) {
 +    focused_window_ = window;
@@ -2126,17 +2431,25 @@
 +  struct Tab : content::WebContentsObserver {
 +    explicit Tab(content::WebContents* contents) { Bind(contents); }
 +    void Bind(content::WebContents* contents) {
-+      detach_subscription = {}; closing = false; Observe(contents);
-+      if (contents) if (auto* tab = tabs::TabInterface::MaybeGetFromContents(contents)) {
-+        detach_subscription = tab->RegisterWillDetach(base::BindRepeating(
-+            [](Tab* self, tabs::TabInterface* tab, tabs::TabInterface::DetachReason reason) {
-+              if (reason != tabs::TabInterface::DetachReason::kDelete || !self->web_contents()) return;
-+              self->closing = true;
-+              // Chrome invokes WillDetach only once beforeunload has accepted
-+              // closure. Move a global panel before its containing view dies.
-+              Get(self->web_contents()->GetBrowserContext())->ReconcileGlobalPanels(self->web_contents());
-+            }, base::Unretained(this)));
-+      }
++      detach_subscription = {}; observed_tab = {}; closing = false; Observe(contents);
++      ObserveTabLifecycle();
++    }
++    void ObserveTabLifecycle() {
++      auto* contents = web_contents();
++      auto* tab = contents ? tabs::TabInterface::MaybeGetFromContents(contents) : nullptr;
++      if (tab && tab == observed_tab.get() && detach_subscription) return;
++      detach_subscription = {}; observed_tab = {};
++      if (!tab || tab->GetContents() != contents) return;
++      observed_tab = tab->GetWeakPtr();
++      detach_subscription = tab->RegisterWillDetach(base::BindRepeating(
++          [](Tab* self, tabs::TabInterface* tab, tabs::TabInterface::DetachReason reason) {
++            if (reason != tabs::TabInterface::DetachReason::kDelete || self->closing ||
++                !self->web_contents() || self->observed_tab.get() != tab ||
++                tab->GetContents() != self->web_contents()) return;
++            self->closing = true;
++            // Transfer only from this exact native tab's accepted deletion.
++            Get(self->web_contents()->GetBrowserContext())->ReconcileGlobalPanels(self->web_contents());
++          }, base::Unretained(this)));
 +    }
 +    std::string logical_id;
 +    int window = 1;
@@ -2150,6 +2463,7 @@
 +    int group_id = -1;
 +    std::optional<int> opener_tab_id;
 +    bool closing = false;
++    base::WeakPtr<tabs::TabInterface> observed_tab;
 +    base::CallbackListSubscription detach_subscription;
 +  };
 +  // Snapshot publication reserves identities without allocating WebContents,
@@ -2302,6 +2616,11 @@
 +    const int id = found->second.tab_id;
 +    contents->SetUserData(kZacroReservedTabID, std::make_unique<ZacroReservedTabID>(SessionID::FromSerializedValue(id)));
 +    tab->second->Bind(contents);
++    if (!context_->IsOffTheRecord()) {
++      ZacroObserveProfileHistory(context_);
++      if (!NativeHistoryOwner::RegisterOwned(contents, tab->second->logical_id,
++          tab->second->window, tab->second->logical_id.starts_with("peek:"))) return false;
++    }
 +    reservations_.erase(found); return true;
 +  }
 +  void Abort(const std::string& token) { reservations_.erase(token); }
@@ -2324,12 +2643,24 @@
 +    auto& tab = tabs_[native_id]; if (!tab) tab = std::make_unique<Tab>(contents);
 +    if (tab->web_contents() && tab->web_contents() != contents) { error = "The native tab identity changed."; return 0; }
 +    if (!tab->web_contents()) tab->Bind(contents);
++    // Reservation consumption precedes Chrome's TabModel construction. Retry
++    // only the exact bound document's native lifecycle subscription once the
++    // materialized page is registered; never reset an accepted-close state.
++    tab->ObserveTabLifecycle();
++    const bool history_identity_changed = tab->logical_id != *logical || tab->window != *window;
 +    tab->logical_id = *logical; tab->window = *window; tab->index = *index;
 +    tab->active = *active; tab->highlighted = params.FindBool("highlighted").value_or(*active);
 +    tab->pinned = *pinned; tab->discarded = *discarded;
 +    tab->auto_discardable = params.FindBool("autoDiscardable").value_or(true);
 +    tab->split_view_id = split; tab->opener_tab_id = opener;
 +    tab->group_id = params.FindInt("groupID").value_or(-1);
++    if (!context_->IsOffTheRecord()) {
++      ZacroObserveProfileHistory(context_);
++      if (!NativeHistoryOwner::RegisterOwned(contents, *logical, *window, logical->starts_with("peek:"))) {
++        error = "The native history document publication has not settled."; return 0;
++      }
++      if (history_identity_changed) ZacroNativeHistoryDocumentChanged(context_);
++    }
 +    ReconcileGlobalPanels();
 +    ReconcileKeyboardFocus();
 +    return native_id;
@@ -2559,6 +2890,21 @@
 +    const auto valid = ZacroValidateFunction(method, args);
 +    if (!valid) return false;
 +    if (!*valid) { function->SetBadMessage(); std::move(response).Run({}, "Invalid extension API arguments."); return true; }
++    if (method == "search.query") {
++      // Retain the original API's parsed schema, validation and extension
++      // permission authority. Only logical destination selection is hosted.
++      auto params = extensions::api::search::Query::Params::Create(args);
++      if (params->query_info.text.empty()) {
++        std::move(response).Run({}, "Empty text parameter."); return true;
++      }
++      if (params->query_info.tab_id &&
++          params->query_info.disposition != extensions::api::search::Disposition::kNone) {
++        std::move(response).Run({}, "Cannot set both 'disposition' and 'tabId'."); return true;
++      }
++      if (extensions::IsNativeWebAuthAdmissionBlocked(Profile::FromBrowserContext(context_))) {
++        std::move(response).Run({}, "The browser context is closing."); return true;
++      }
++    }
 +    if (context_->IsOffTheRecord()) {
 +      const bool pdf_method = method == "tabs.get" || method == "tabs.getCurrent" ||
 +          method == "tabs.getZoom" || method == "tabs.setZoom" ||
@@ -2873,7 +3219,7 @@
 +      return true;
 +    }
 +    const bool window = method.starts_with("windows.") || method == "tabs.highlight";
-+    if (method == "runtime.openOptionsPage" || method == "tabs.remove" || method == "tabs.reload" || method == "tabs.goBack" || method == "tabs.goForward" ||
++    if (method == "search.query" || method == "runtime.openOptionsPage" || method == "tabs.remove" || method == "tabs.reload" || method == "tabs.goBack" || method == "tabs.goForward" ||
 +        method == "windows.remove" || method == "tabs.unsplit") return results.empty();
 +    if (method == "tabs.createSplit") return results.size() == 1 && results[0].is_int() && results[0].GetInt() >= 0;
 +    if (method == "tabs.getCurrent" && results.empty()) return true;
@@ -2944,6 +3290,7 @@
 +  std::map<std::string, Group> groups_;
 +  std::map<std::string, Reservation> reservations_;
 +  std::map<std::string, std::unique_ptr<Request>> pending_;
++  ZacroPostUninstallNavigationQueue post_uninstall_;
 +  base::WeakPtrFactory<ZacroBrowserContext> weak_{this};
 +};
 +}  // namespace
@@ -2993,10 +3340,18 @@
 +      method != "Zacro.authorizeHostNavigation" && method != "Zacro.validateNavigation" &&
 +      method != "Zacro.hasOwnedGlobalPanel" && method != "Zacro.registerPanelParking" &&
 +      method != "Zacro.prepareExtensionActionPopup" &&
++      method != "Zacro.takePostUninstallNavigation" &&
 +      method != "Zacro.navigateApproved") return false;
 +  if (!params) { ReplyZacro(id, {}, "The native browser parameters are missing."); return true; }
 +  auto* state = ZacroBrowserContext::Get(inspected_contents_->GetBrowserContext());
 +  std::string error;
++  if (method == "Zacro.takePostUninstallNavigation") {
++    const auto* token = params->FindString("requestID");
++    const auto url = token ? state->TakePostUninstallNavigation(*token) : std::nullopt;
++    if (url) ReplyZacro(id, base::DictValue().Set("url", url->spec()));
++    else ReplyZacro(id, {}, "The optional uninstall navigation expired or its profile is closing.");
++    return true;
++  }
 +  if (method == "Zacro.prepareExtensionActionPopup") {
 +    const auto* request = params->FindString("requestID");
 +    const auto* anchor = params->FindDict("anchor");
@@ -3317,8 +3672,969 @@
 +  return true;
 +}
 --- /dev/null
++++ b/libcef/browser/devtools/zacro_history_adapter.inc
+@@ -0,0 +1,469 @@
++// Native-only, profile-owned HistoryService projection. SQL completion and an
++// unchanged observer revision authorize absence; notifications are hints only.
++#include "base/task/cancelable_task_tracker.h"
++#include "chrome/browser/history/history_service_factory.h"
++#include "chrome/browser/history/native_history_owner.h"
++#include "components/history/core/browser/history_service.h"
++#include "components/history/core/browser/history_service_observer.h"
++#include "cef/libcef/browser/devtools/zacro_history_db_tasks.inc"
++
++namespace {
++using ZacroHistoryPresence = history::HistoryDatabase::NativeVisitPresence;
++using ZacroHistoryPublication = history::HistoryDatabase::NativeMirrorPublication;
++using ZacroHistoryReply = base::OnceCallback<void(base::DictValue, std::string)>;
++
++bool ZacroHistoryUUID(const std::string& value) {
++  return base::Uuid::ParseLowercase(value).is_valid();
++}
++bool ZacroHistoryDecimal(const std::string& value, int64_t* parsed, bool zero = false) {
++  return base::StringToInt64(value, parsed) && *parsed >= (zero ? 0 : 1) &&
++      base::NumberToString(*parsed) == value;
++}
++std::string ZacroHistoryPresenceName(ZacroHistoryPresence presence) {
++  switch (presence) {
++    case ZacroHistoryPresence::kPresent: return "present";
++    case ZacroHistoryPresence::kAbsent: return "absent";
++    case ZacroHistoryPresence::kError: return "error";
++  }
++}
++base::DictValue ZacroHistoryIdentity(const history::HistoryDatabase::NativeMirrorEvent& event) {
++  return base::DictValue().Set("generation", event.generation)
++      .Set("visitID", base::NumberToString(event.visit_id))
++      .Set("timeMicroseconds", base::NumberToString(event.time_microseconds))
++      .Set("url", event.url).Set("originator", event.originator);
++}
++base::DictValue ZacroHistoryEvent(const history::HistoryDatabase::NativeMirrorEvent& event) {
++  auto result = base::DictValue().Set("eventID", event.event_id)
++      .Set("documentToken", event.document_token).Set("logicalID", event.logical_id)
++      .Set("sequence", base::NumberToString(event.sequence)).Set("publish", event.publish)
++      .Set("libraryVisit", event.library_visit)
++      .Set("presence", ZacroHistoryPresenceName(event.presence)).Set("title", event.title);
++  if (event.presence == ZacroHistoryPresence::kPresent) result.Set("identity", ZacroHistoryIdentity(event));
++  return result;
++}
++base::DictValue ZacroHistoryPublicationValue(const ZacroHistoryPublication& lease,
++    const std::optional<history::HistoryDatabase::NativeMirrorEvent>& event = std::nullopt) {
++  using Disposition = ZacroHistoryPublication::Disposition;
++  auto result = base::DictValue().Set("leaseID", lease.lease_id)
++      .Set("documentToken", lease.document_token).Set("kind", lease.preview ? "preview" : "popup")
++      .Set("disposition", lease.disposition == Disposition::kCommitted ? "committed" :
++          lease.disposition == Disposition::kCancelled ? "cancelled" : "prepared");
++  if (!lease.captured_event_id.empty()) result.Set("capturedEventID", lease.captured_event_id);
++  if (!lease.logical_id.empty()) result.Set("logicalID", lease.logical_id);
++  if (event) result.Set("capturedEvent", ZacroHistoryEvent(*event));
++  return result;
++}
++
++class ZacroHistoryContext final : public base::SupportsUserData::Data,
++                                  public history::HistoryServiceObserver {
++ public:
++  static ZacroHistoryContext* Find(content::BrowserContext* context) {
++    return context ? static_cast<ZacroHistoryContext*>(context->GetUserData(kKey)) : nullptr;
++  }
++  static ZacroHistoryContext* Get(content::BrowserContext* context) {
++    if (auto* value = Find(context)) return value;
++    auto value = std::make_unique<ZacroHistoryContext>(context);
++    auto* result = value.get(); context->SetUserData(kKey, std::move(value)); return result;
++  }
++  explicit ZacroHistoryContext(content::BrowserContext* context) : context_(context) {
++    if (!context->IsOffTheRecord()) service_ = HistoryServiceFactory::GetForProfile(
++        Profile::FromBrowserContext(context), ServiceAccessType::EXPLICIT_ACCESS);
++    if (service_) service_->AddObserver(this);
++  }
++  ~ZacroHistoryContext() override {
++    Retire();
++    if (service_) service_->RemoveObserver(this);
++  }
++  void Retire() {
++    retired_ = true; tracker_.TryCancelAll(); leases_.clear();
++    auto pending = std::move(pending_);
++    for (auto& [id, reply] : pending) std::move(reply).Run({}, "The native history profile closed.");
++    weak_.InvalidateWeakPtrs();
++  }
++  void OnURLVisitedWithNavigationId(history::HistoryService*, const history::VisitedURLInfo&) override { Changed(); }
++  void OnURLsModified(history::HistoryService*, const history::URLRows&) override { Changed(); }
++  void OnHistoryDeletions(history::HistoryService*, const history::DeletionInfo&) override { Changed(); }
++  void OnHistoryServiceLoaded(history::HistoryService*) override { Changed(); }
++  void HistoryServiceBeingDeleted(history::HistoryService* service) override {
++    if (service_ != service) return;
++    service_->RemoveObserver(this); service_ = nullptr; Retire();
++  }
++  void Changed() {
++    if (retired_) return;
++    ++revision_; leases_.clear();
++    ZacroExtensionContext::Get(context_)->NotifyNative("Zacro.historyChanged",
++        base::DictValue().Set("revision", Revision()));
++  }
++  void DocumentClosed(const std::string& token) {
++    if (retired_ || !ZacroHistoryUUID(token)) return;
++    if (closed_documents_.size() >= 20000 && !closed_documents_.contains(token)) {
++      Retire(); return;  // Preserve data rather than grow an unbounded proof queue.
++    }
++    closed_documents_.insert(token); Changed();
++  }
++  void Execute(content::WebContents* document, const std::string& method,
++               const base::DictValue& params, ZacroHistoryReply reply) {
++    if (!service_ || retired_ || !document || document->GetBrowserContext() != context_ ||
++        context_->IsOffTheRecord() || pending_.size() >= 64) {
++      std::move(reply).Run({}, "The native history database is unavailable."); return;
++    }
++    if (method == "Zacro.replaceHistoryRetention" || method == "Zacro.historyRetentionStatus") {
++      Retention(method, params, std::move(reply)); return;
++    }
++    if (method == "Zacro.historyMirrorBarrier") {
++      const auto request = Queue(std::move(reply));
++      service_->ScheduleDBTask(FROM_HERE, std::make_unique<ZacroHistoryBarrierTask>(base::BindOnce(
++          [](base::WeakPtr<ZacroHistoryContext> self, std::string request, bool ready) {
++            if (self) self->MutationComplete(request, ready);
++          }, weak_.GetWeakPtr(), request)), &tracker_);
++      return;
++    }
++    if (method == "Zacro.historyDocument") {
++      auto* owner = NativeHistoryOwner::FromWebContents(document);
++      auto snapshot = owner ? owner->Describe() : std::nullopt;
++      if (!snapshot) { std::move(reply).Run({}, "The document has no native history identity."); return; }
++      auto result = base::DictValue().Set("documentToken", snapshot->document_token)
++          .Set("logicalID", snapshot->logical_id).Set("ownerWindowID", snapshot->owner_window_id)
++          .Set("preview", snapshot->preview).Set("provisional", snapshot->provisional);
++      if (!snapshot->current_event_id.empty()) result.Set("currentEventID", snapshot->current_event_id);
++      std::move(reply).Run(std::move(result), {}); return;
++    }
++    if (method == "Zacro.releaseHistoryVerification" || method == "Zacro.acknowledgeHistoryVerification") {
++      const auto* lease = params.FindString("lease");
++      const auto* revision = params.FindString("revision");
++      if (!lease || !ZacroHistoryUUID(*lease) ||
++          (method == "Zacro.acknowledgeHistoryVerification" && (!revision || revision->empty() || revision->size() > 128))) {
++        std::move(reply).Run({}, "Invalid history lease acknowledgement."); return;
++      }
++      auto found = leases_.find(*lease);
++      if (found != leases_.end() && method == "Zacro.acknowledgeHistoryVerification" &&
++          (found->second.revision != *revision || !found->second.confirmed)) {
++        std::move(reply).Run({}, "The history verification lease was not confirmed."); return;
++      }
++      leases_.erase(*lease);
++      // Release is idempotent and never grants deletion authority or new proof.
++      std::move(reply).Run(base::DictValue().Set("acknowledged", true), {}); return;
++    }
++    if (method == "Zacro.beginHistoryVerification") {
++      const auto total = params.FindInt("total");
++      if (!total || *total < 0 || *total > 20000 || leases_.size() >= 16) {
++        std::move(reply).Run({}, "Invalid or excessive history verification request."); return;
++      }
++      const auto token = base::Uuid::GenerateRandomV4().AsLowercaseString();
++      const auto revision = Revision();
++      leases_.emplace(token, Lease{revision, *total, 0, false, false});
++      std::move(reply).Run(base::DictValue().Set("lease", token).Set("revision", revision).Set("total", *total), {});
++      return;
++    }
++    if (method == "Zacro.verifyHistoryPage") { Verify(params, std::move(reply)); return; }
++    if (method == "Zacro.confirmHistoryVerification") { Confirm(params, std::move(reply)); return; }
++    if (method == "Zacro.historyEventPage" || method == "Zacro.observeHistory") {
++      const auto* after = params.FindString("afterSequence");
++      int64_t sequence = 0; const int limit = params.FindInt("limit").value_or(512);
++      if ((after && !ZacroHistoryDecimal(*after, &sequence, true)) || limit < 1 || limit > 512) {
++        std::move(reply).Run({}, "Invalid native history event page."); return;
++      }
++      const auto request = Queue(std::move(reply));
++      const auto closed_documents = closed_documents_;
++      service_->ScheduleDBTask(FROM_HERE, std::make_unique<ZacroHistoryEventPageTask>(sequence, limit,
++          NativeHistoryOwner::ProducerEpoch(), closed_documents, base::BindOnce(
++          [](base::WeakPtr<ZacroHistoryContext> self, std::string request, int64_t after,
++             bool observation, std::set<std::string> closed_documents,
++             std::optional<ZacroHistoryEventPageTask::Page> page) {
++            if (!self) return;
++            if (!page) { self->Complete(request, {}, "Chromium could not read and commit its history journal."); return; }
++            for (const auto& token : closed_documents) self->closed_documents_.erase(token);
++            if (observation) {
++              self->Complete(request, base::DictValue().Set("ready", true).Set("revision", self->Revision()), {}); return;
++            }
++            base::ListValue records;
++            size_t bytes = 0, emitted = 0;
++            for (const auto& event : page->events) {
++              auto value = ZacroHistoryEvent(event);
++              auto encoded = base::WriteJson(value);
++              if (!encoded) { self->Complete(request, {}, "The native history event could not be encoded."); return; }
++              if (bytes + encoded->size() > 1536 * 1024) break;
++              bytes += encoded->size(); ++emitted; records.Append(std::move(value));
++            }
++            if (!page->events.empty() && !emitted) {
++              self->Complete(request, {}, "A native history record exceeds its response bound."); return;
++            }
++            const auto next = emitted ? page->events[emitted - 1].sequence : after;
++            self->Complete(request, base::DictValue().Set("events", std::move(records))
++                .Set("complete", page->complete && emitted == page->events.size())
++                .Set("nextSequence", base::NumberToString(next)), {});
++          }, weak_.GetWeakPtr(), request, sequence, method == "Zacro.observeHistory", closed_documents)), &tracker_);
++      return;
++    }
++    if (method == "Zacro.acknowledgeHistoryEvents") {
++      const auto* entries = params.FindList("eventIDs"); std::vector<std::string> ids;
++      if (!entries || entries->size() > 512) { std::move(reply).Run({}, "Invalid history event acknowledgement."); return; }
++      std::set<std::string> unique;
++      for (const auto& value : *entries) {
++        if (!value.is_string() || !ZacroHistoryUUID(value.GetString()) || !unique.insert(value.GetString()).second) {
++          std::move(reply).Run({}, "Invalid history event acknowledgement."); return;
++        }
++        ids.push_back(value.GetString());
++      }
++      const auto request = Queue(std::move(reply));
++      service_->ScheduleDBTask(FROM_HERE, std::make_unique<ZacroHistoryAcknowledgeTask>(std::move(ids),
++          base::BindOnce([](base::WeakPtr<ZacroHistoryContext> self, std::string request, bool okay) {
++            if (self) self->MutationComplete(request, okay);
++          }, weak_.GetWeakPtr(), request)), &tracker_); return;
++    }
++    if (method == "Zacro.prepareHistoryPublication") { Prepare(document, params, std::move(reply)); return; }
++    if (method == "Zacro.historyPublications" || method == "Zacro.commitHistoryPublication" ||
++        method == "Zacro.cancelHistoryPublication" || method == "Zacro.finalizeHistoryPublication") {
++      Publication(method, params, std::move(reply)); return;
++    }
++    Legacy(method, params, std::move(reply));
++  }
++ private:
++  static constexpr char kKey[] = "zacro.native.history-mirror.v1";
++  struct Lease { std::string revision; int total; int next; bool busy; bool confirmed; };
++  struct PreparedOwner { base::WeakPtr<NativeHistoryOwner> owner; NativeHistoryOwner::Publication publication; };
++  std::string Revision() const { return epoch_ + ":" + base::NumberToString(revision_); }
++  std::string Queue(ZacroHistoryReply reply) {
++    const auto id = base::Uuid::GenerateRandomV4().AsLowercaseString();
++    pending_.emplace(id, std::move(reply)); return id;
++  }
++  void Complete(const std::string& id, base::DictValue value, std::string error) {
++    auto item = pending_.extract(id); if (item.empty()) return;
++    std::move(item.mapped()).Run(std::move(value), std::move(error));
++  }
++  void MutationComplete(const std::string& id, bool okay) {
++    Complete(id, base::DictValue().Set("acknowledged", okay),
++        okay ? "" : "Chromium could not commit the native history operation.");
++  }
++  std::optional<std::pair<std::string, Lease*>> FindLease(const base::DictValue& params) {
++    const auto* id = params.FindString("lease"), *revision = params.FindString("revision");
++    if (!id || !revision) return std::nullopt;
++    auto found = leases_.find(*id);
++    if (found == leases_.end() || found->second.revision != *revision || *revision != Revision() || found->second.busy)
++      return std::nullopt;
++    return std::make_pair(*id, &found->second);
++  }
++  void Verify(const base::DictValue& params, ZacroHistoryReply reply) {
++    auto found = FindLease(params); const auto offset = params.FindInt("offset");
++    const auto* values = params.FindList("inputs");
++    if (!found || !offset || *offset != found->second->next || !values || values->size() > 512 ||
++        values->empty() || *offset + static_cast<int>(values->size()) > found->second->total) {
++      std::move(reply).Run({}, "The native history verification snapshot changed."); return;
++    }
++    std::vector<ZacroHistoryVerificationInput> inputs;
++    for (const auto& value : *values) {
++      const auto* item = value.GetIfDict();
++      const auto* generation = item ? item->FindString("generation") : nullptr;
++      const auto* visit = item ? item->FindString("visitID") : nullptr;
++      const auto* time = item ? item->FindString("timeMicroseconds") : nullptr;
++      const auto* url = item ? item->FindString("url") : nullptr;
++      const auto* originator = item ? item->FindString("originator") : nullptr;
++      const auto* event = item ? item->FindString("eventID") : nullptr;
++      int64_t visit_id = 0, microseconds = 0;
++      if (!generation || generation->empty() || generation->size() > 64 || !visit || !time ||
++          (event && !ZacroHistoryUUID(*event)) ||
++          !ZacroHistoryDecimal(*visit, &visit_id) || !ZacroHistoryDecimal(*time, &microseconds) ||
++          !url || url->size() > 8192 || !GURL(*url).SchemeIsHTTPOrHTTPS() ||
++          GURL(*url).has_username() || GURL(*url).has_password() || !originator || originator->size() > 256) {
++        std::move(reply).Run({}, "A native history verification identity is invalid."); return;
++      }
++      inputs.push_back({*generation, visit_id, microseconds, *url, *originator});
++    }
++    auto encoded = base::WriteJson(*values);
++    if (!encoded || encoded->size() > 512 * 1024) { std::move(reply).Run({}, "The history page is too large."); return; }
++    const auto lease = found->first, revision = found->second->revision;
++    const int end = *offset + inputs.size(); found->second->busy = true;
++    const auto request = Queue(std::move(reply));
++    service_->ScheduleDBTask(FROM_HERE, std::make_unique<ZacroHistoryVerificationTask>(std::move(inputs),
++        base::BindOnce([](base::WeakPtr<ZacroHistoryContext> self, std::string request,
++          std::string lease, std::string revision, int offset, int end, base::ListValue inputs,
++          ZacroHistoryVerificationTask::Result rows) {
++          if (!self) return;
++          auto live = self->leases_.find(lease);
++          if (!rows || live == self->leases_.end() || self->Revision() != revision ||
++              live->second.revision != revision || live->second.next != offset || rows->size() != inputs.size()) {
++            self->leases_.erase(lease);
++            self->Complete(request, {}, "The native history verification snapshot changed or could not be read."); return;
++          }
++          live->second.busy = false; live->second.next = end;
++          base::ListValue results;
++          // Reserve the full request bound for mandatory identities that have
++          // not yet been appended. Optional titles cannot crowd out proof rows.
++          size_t response_bytes = 512 * 1024;
++          for (size_t index = 0; index < rows->size(); ++index) {
++            const auto* input = inputs[index].GetIfDict();
++            const auto* event = input ? input->FindString("eventID") : nullptr;
++            const auto* url = input ? input->FindString("url") : nullptr;
++            const auto native_title = event && url ? NativeHistoryOwner::TitleForEvent(self->context_, *event, *url) : std::nullopt;
++            auto row = base::DictValue().Set("input", std::move(inputs[index]))
++                .Set("presence", ZacroHistoryPresenceName((*rows)[index].presence));
++            if ((*rows)[index].presence == ZacroHistoryPresence::kPresent && native_title) {
++              auto title = *native_title;
++              auto encoded = base::WriteJson(base::Value(title));
++              while (encoded && encoded->size() > 2000) {
++                title = std::string(base::TruncateUTF8ToByteSize(title, title.size() / 2));
++                encoded = base::WriteJson(base::Value(title));
++              }
++              auto with_title = row.Clone(); with_title.Set("title", title);
++              auto encoded_row = base::WriteJson(with_title);
++              if (encoded && encoded_row && response_bytes + encoded_row->size() <= 1536 * 1024) {
++                row = std::move(with_title);
++              }
++            }
++            auto encoded_row = base::WriteJson(row);
++            if (!encoded_row) { self->Complete(request, {}, "A native history proof could not be encoded."); return; }
++            response_bytes += encoded_row->size();
++            results.Append(std::move(row));
++          }
++          self->Complete(request, base::DictValue().Set("lease", lease).Set("revision", revision)
++              .Set("offset", offset).Set("complete", end == live->second.total).Set("results", std::move(results)), {});
++        }, weak_.GetWeakPtr(), request, lease, revision, *offset, end, values->Clone())), &tracker_);
++  }
++  void Confirm(const base::DictValue& params, ZacroHistoryReply reply) {
++    auto found = FindLease(params);
++    if (!found || found->second->next != found->second->total) {
++      std::move(reply).Run({}, "The history verification is incomplete or stale."); return;
++    }
++    const auto lease = found->first, revision = found->second->revision;
++    found->second->busy = true; const auto request = Queue(std::move(reply));
++    service_->ScheduleDBTask(FROM_HERE, std::make_unique<ZacroHistoryVerificationTask>(
++        std::vector<ZacroHistoryVerificationInput>(), base::BindOnce(
++        [](base::WeakPtr<ZacroHistoryContext> self, std::string request, std::string lease,
++           std::string revision, ZacroHistoryVerificationTask::Result result) {
++          if (!self) return;
++          auto found = self->leases_.find(lease);
++          if (!result || found == self->leases_.end() || found->second.revision != revision || self->Revision() != revision) {
++            self->leases_.erase(lease); self->Complete(request, {}, "The history changed before confirmation."); return;
++          }
++          found->second.busy = false; found->second.confirmed = true;
++          self->Complete(request, base::DictValue().Set("revision", revision), {});
++        }, weak_.GetWeakPtr(), request, lease, revision)), &tracker_);
++  }
++  void Prepare(content::WebContents* document, const base::DictValue& params, ZacroHistoryReply reply) {
++    const auto* id = params.FindString("leaseID"), *token = params.FindString("documentToken"),
++        *logical = params.FindString("logicalID");
++    const auto window = params.FindInt("ownerWindowID");
++    if (owners_.size() >= 1000) {
++      std::move(reply).Run({}, "Too many pending native history publications."); return;
++    }
++    auto* owner = NativeHistoryOwner::FromWebContents(document);
++    auto captured = owner && id && token && logical && window
++        ? owner->BeginPublication(*id, *token, *logical, *window) : std::nullopt;
++    if (!captured) {
++      std::move(reply).Run({}, "The history publication document changed."); return;
++    }
++    ZacroHistoryPublication lease;
++    lease.lease_id = captured->lease_id; lease.document_token = captured->captured.document_token;
++    lease.preview = captured->captured.preview; lease.captured_event_id = captured->captured.current_event_id;
++    owners_.emplace(lease.lease_id, PreparedOwner{owner->GetWeakPtr(), *captured});
++    const auto request = Queue(std::move(reply));
++    service_->ScheduleDBTask(FROM_HERE, std::make_unique<ZacroHistoryPreparePublicationTask>(lease,
++        base::BindOnce([](base::WeakPtr<ZacroHistoryContext> self, std::string request,
++           std::optional<ZacroHistoryPreparePublicationTask::Prepared> result) {
++          if (!self) return;
++          if (!result) { self->Complete(request, {}, "Chromium could not prepare the history publication."); return; }
++          self->Complete(request, ZacroHistoryPublicationValue(result->lease, result->captured), {});
++        }, weak_.GetWeakPtr(), request)), &tracker_);
++  }
++  void Publication(const std::string& method, const base::DictValue& params, ZacroHistoryReply reply) {
++    const auto* id = params.FindString("leaseID"), *token = params.FindString("documentToken");
++    const auto* logical = params.FindString("logicalID");
++    if (method != "Zacro.historyPublications" && (!id || !token || !ZacroHistoryUUID(*id) || !ZacroHistoryUUID(*token) ||
++        (logical && (logical->empty() || logical->size() > 1024)))) {
++      std::move(reply).Run({}, "The native publication lease is invalid."); return;
++    }
++    const auto request = Queue(std::move(reply));
++    service_->ScheduleDBTask(FROM_HERE, std::make_unique<ZacroHistoryPublicationListTask>(base::BindOnce(
++        [](base::WeakPtr<ZacroHistoryContext> self, std::string request, std::string method,
++          std::string id, std::string token, std::string logical, ZacroHistoryPublicationListTask::Result values) {
++          if (!self) return;
++          if (!values) { self->Complete(request, {}, "Chromium could not read its publication journal."); return; }
++          if (method == "Zacro.historyPublications") {
++            base::ListValue records;
++            for (const auto& lease : *values) records.Append(ZacroHistoryPublicationValue(lease));
++            self->Complete(request, base::DictValue().Set("publications", std::move(records)), {}); return;
++          }
++          auto found = std::ranges::find_if(*values, [&](const auto& value) { return value.lease_id == id; });
++          if (found == values->end()) {
++            // Cancel/finalize cannot grant publication, including a cancelled
++            // prepare whose response never arrived. Commit requires evidence.
++            const bool okay = method != "Zacro.commitHistoryPublication";
++            if (okay) self->FinishOwner(id, token, logical, method);
++            self->MutationComplete(request, okay); return;
++          }
++          if (found->document_token != token) { self->Complete(request, {}, "The history publication token changed."); return; }
++          using Action = ZacroHistoryPublicationMutationTask::Action;
++          const auto action = method == "Zacro.commitHistoryPublication" ? Action::kCommit :
++              method == "Zacro.cancelHistoryPublication" ? Action::kCancel : Action::kFinalize;
++          self->service_->ScheduleDBTask(FROM_HERE, std::make_unique<ZacroHistoryPublicationMutationTask>(action, *found,
++              logical, base::BindOnce([](base::WeakPtr<ZacroHistoryContext> self, std::string request,
++                std::string id, std::string token, std::string logical, std::string method, bool okay) {
++                if (!self) return;
++                if (okay) okay = self->FinishOwner(id, token, logical, method);
++                self->MutationComplete(request, okay);
++              }, self->weak_.GetWeakPtr(), request, id, token, logical, method)), &self->tracker_);
++        }, weak_.GetWeakPtr(), request, method, id ? *id : "", token ? *token : "", logical ? *logical : "")), &tracker_);
++  }
++  bool FinishOwner(const std::string& id, const std::string& token, const std::string& logical,
++                   const std::string& method) {
++    auto found = owners_.find(id);
++    if (found == owners_.end()) return true;
++    if (found->second.publication.captured.document_token != token) return false;
++    auto* owner = found->second.owner.get();
++    if (owner) {
++      if (method == "Zacro.commitHistoryPublication" && !owner->PublicationCommitted(found->second.publication, logical)) return false;
++      if (method == "Zacro.cancelHistoryPublication" && !owner->PublicationCancelled(found->second.publication)) return false;
++      if (method == "Zacro.finalizeHistoryPublication" && !owner->FinishPublication(found->second.publication)) return false;
++    }
++    if (method == "Zacro.finalizeHistoryPublication") owners_.erase(found);
++    return true;
++  }
++  void Retention(const std::string& method, const base::DictValue& params, ZacroHistoryReply reply);
++  void Legacy(const std::string& method, const base::DictValue& params, ZacroHistoryReply reply);
++  raw_ptr<content::BrowserContext> context_;
++  raw_ptr<history::HistoryService> service_ = nullptr;
++  bool retired_ = false;
++  const std::string epoch_ = base::Uuid::GenerateRandomV4().AsLowercaseString();
++  uint64_t revision_ = 0;
++  std::map<std::string, Lease> leases_;
++  std::map<std::string, PreparedOwner> owners_;
++  std::set<std::string> closed_documents_;
++  std::map<std::string, ZacroHistoryReply> pending_;
++  base::CancelableTaskTracker tracker_;
++  base::WeakPtrFactory<ZacroHistoryContext> weak_{this};
++};
++#include "cef/libcef/browser/devtools/zacro_history_legacy_adapter.inc"
++}  // namespace
++
++void ZacroRetireProfileHistory(content::BrowserContext* context) {
++  if (auto* state = ZacroHistoryContext::Find(context)) state->Retire();
++}
++void ZacroNativeHistoryDocumentChanged(content::BrowserContext* context) {
++  if (auto* state = ZacroHistoryContext::Find(context)) state->Changed();
++}
++void ZacroNativeHistoryDocumentClosed(content::BrowserContext* context, const std::string& token) {
++  if (auto* state = ZacroHistoryContext::Find(context)) state->DocumentClosed(token);
++}
++void ZacroObserveProfileHistory(content::BrowserContext* context) {
++  if (context && !context->IsOffTheRecord()) ZacroHistoryContext::Get(context);
++}
++
++bool CefDevToolsController::DispatchZacroHistory(int id, const std::string& method,
++                                               const base::DictValue* params) {
++  static const base::NoDestructor<std::set<std::string>> methods({
++      "Zacro.observeHistory", "Zacro.historyMirrorBarrier", "Zacro.historyDocument", "Zacro.historyEventPage", "Zacro.acknowledgeHistoryEvents",
++      "Zacro.beginHistoryVerification", "Zacro.verifyHistoryPage", "Zacro.confirmHistoryVerification",
++      "Zacro.acknowledgeHistoryVerification", "Zacro.releaseHistoryVerification", "Zacro.prepareHistoryPublication",
++      "Zacro.historyPublications", "Zacro.commitHistoryPublication", "Zacro.cancelHistoryPublication",
++      "Zacro.finalizeHistoryPublication", "Zacro.createLegacyHistoryBoundary", "Zacro.legacyHistoryBoundaries",
++      "Zacro.finalizeLegacyHistoryBoundary", "Zacro.replaceHistoryRetention", "Zacro.historyRetentionStatus", "Zacro.importLegacyHistory", "Zacro.acknowledgeLegacyHistoryImports"});
++  if (!methods->contains(method)) return false;
++  auto* context = inspected_contents_->GetBrowserContext();
++  if (context->IsOffTheRecord()) { ReplyZacro(id, {}, "Private history cannot be mirrored."); return true; }
++  const base::DictValue empty;
++  ZacroHistoryContext::Get(context)->Execute(inspected_contents_, method, params ? *params : empty,
++      base::BindOnce([](base::WeakPtr<CefDevToolsController> self, int id, base::DictValue result, std::string error) {
++        if (self) self->ReplyZacro(id, std::move(result), error);
++      }, weak_ptr_factory_.GetWeakPtr(), id));
++  return true;
++}
+--- /dev/null
++++ b/libcef/browser/devtools/zacro_history_db_tasks.inc
+@@ -0,0 +1,323 @@
++// Staged browser-process DB tasks. Include only after the pinned History hooks.
++// Ownership: HistoryService owns the task, its CancelableTaskTracker belongs to
++// the exact live profile observer. Done callbacks must still validate that
++// observer's lease/revision before replying to the native protocol caller.
++#include "base/functional/callback.h"
++#include "components/history/core/browser/history_backend.h"
++#include "components/history/core/browser/history_database.h"
++#include "components/history/core/browser/history_db_task.h"
++
++class ZacroHistoryBarrierTask final : public history::HistoryDBTask {
++ public:
++  using Completion = base::OnceCallback<void(bool)>;
++  explicit ZacroHistoryBarrierTask(Completion completion) : completion_(std::move(completion)) {}
++  bool RunOnDBThread(history::HistoryBackend* backend, history::HistoryDatabase* database) override {
++    // Ordering only. No rows, deletion result or durability claim is exposed.
++    ready_ = backend && database;
++    return true;
++  }
++  void DoneRunOnMainThread() override { std::move(completion_).Run(ready_); }
++ private:
++  Completion completion_;
++  bool ready_ = false;
++};
++
++struct ZacroHistoryVerificationInput {
++  std::string generation;
++  int64_t visit_id = 0;
++  int64_t time_microseconds = 0;
++  std::string url;
++  std::string originator;
++};
++
++class ZacroHistoryVerificationTask final : public history::HistoryDBTask {
++ public:
++  struct Row { history::HistoryDatabase::NativeVisitPresence presence; std::string title; };
++  using Result = std::optional<std::vector<Row>>;
++  using Completion = base::OnceCallback<void(Result)>;
++  ZacroHistoryVerificationTask(std::vector<ZacroHistoryVerificationInput> inputs,
++                              Completion completion)
++      : inputs_(std::move(inputs)), completion_(std::move(completion)) {}
++  bool RunOnDBThread(history::HistoryBackend* backend,
++                     history::HistoryDatabase* database) override {
++    // Bound both record count and native message allocation. A caller with
++    // long addresses uses smaller pages, not truncated identities.
++    size_t bytes = 0;
++    if (!backend || !database || inputs_.size() > 512) return true;
++    for (const auto& input : inputs_) {
++      if (input.generation.size() > 64 || input.visit_id <= 0 ||
++          input.time_microseconds <= 0 || input.url.size() > 8192 ||
++          input.originator.size() > 256) return true;
++      bytes += input.generation.size() + input.url.size() + input.originator.size() + 64;
++      if (bytes > 1024 * 1024) return true;
++    }
++    if (!database->InitializeNativeMirrorJournal() ||
++        !backend->FlushForNativeMirror()) return true;
++    std::vector<Row> values;
++    values.reserve(inputs_.size());
++    for (const auto& input : inputs_) {
++      std::string title;
++      const auto value = database->CheckNativeHistoryVisit(input.generation,
++          input.visit_id, input.time_microseconds, input.url, input.originator, &title);
++      if (value == history::HistoryDatabase::NativeVisitPresence::kError)
++        return true;  // Entire page fails; never return the successful prefix.
++      values.push_back(Row{value, std::move(title)});
++    }
++    result_ = std::move(values);
++    return true;
++  }
++  void DoneRunOnMainThread() override {
++    std::move(completion_).Run(std::move(result_));
++  }
++ private:
++  std::vector<ZacroHistoryVerificationInput> inputs_;
++  Completion completion_;
++  Result result_;
++};
++
++class ZacroHistoryEventPageTask final : public history::HistoryDBTask {
++ public:
++  struct Page {
++    std::vector<history::HistoryDatabase::NativeMirrorEvent> events;
++    bool complete = false;
++  };
++  using Completion = base::OnceCallback<void(std::optional<Page>)>;
++  ZacroHistoryEventPageTask(int64_t after_sequence, size_t limit,
++      std::string producer_epoch, std::set<std::string> closed_documents, Completion completion)
++      : after_sequence_(after_sequence), limit_(limit), producer_epoch_(std::move(producer_epoch)), closed_documents_(std::move(closed_documents)),
++        completion_(std::move(completion)) {}
++  bool RunOnDBThread(history::HistoryBackend* backend,
++                     history::HistoryDatabase* database) override {
++    if (!backend || !database || after_sequence_ < 0 || limit_ < 1 || limit_ > 512 ||
++        !database->InitializeNativeMirrorJournal() ||
++        !database->PruneNativeMirrorOrphans(producer_epoch_, closed_documents_) ||
++        !backend->FlushForNativeMirror()) return true;
++    auto rows = database->ReadNativeMirrorEvents(after_sequence_, limit_ + 1);
++    // Read also validates/initializes the private schema. No future caller may
++    // accidentally publish newly created metadata before its checked COMMIT.
++    if (!rows || !backend->FlushForNativeMirror()) return true;
++    Page page;
++    page.complete = rows->size() <= limit_;
++    if (!page.complete) rows->resize(limit_);
++    page.events = std::move(*rows);
++    result_ = std::move(page);
++    return true;
++  }
++  void DoneRunOnMainThread() override {
++    std::move(completion_).Run(std::move(result_));
++  }
++ private:
++  int64_t after_sequence_;
++  size_t limit_;
++  std::string producer_epoch_;
++  std::set<std::string> closed_documents_;
++  Completion completion_;
++  std::optional<Page> result_;
++};
++
++class ZacroHistoryAcknowledgeTask final : public history::HistoryDBTask {
++ public:
++  using Completion = base::OnceCallback<void(bool)>;
++  ZacroHistoryAcknowledgeTask(std::vector<std::string> event_ids, Completion completion)
++      : event_ids_(std::move(event_ids)), completion_(std::move(completion)) {}
++  bool RunOnDBThread(history::HistoryBackend* backend,
++                     history::HistoryDatabase* database) override {
++    // Ack is deliberately idempotent. A previously removed event is successful
++    // only after this same native DB's checked transaction commit succeeds.
++    result_ = backend && database &&
++        database->AcknowledgeNativeMirrorEvents(event_ids_) && backend->FlushForNativeMirror();
++    return true;
++  }
++  void DoneRunOnMainThread() override { std::move(completion_).Run(result_); }
++ private:
++  std::vector<std::string> event_ids_;
++  Completion completion_;
++  bool result_ = false;
++};
++
++// Preparation is two-phase: its UI producer already retains unpublished
++// handoffs before this task is posted. A DBTask may be rescheduled behind a
++// newer AddPage, so the SQL disposition also overrides stale producer flags.
++class ZacroHistoryPreparePublicationTask final : public history::HistoryDBTask {
++ public:
++  struct Prepared {
++    history::HistoryDatabase::NativeMirrorPublication lease;
++    std::optional<history::HistoryDatabase::NativeMirrorEvent> captured;
++  };
++  using Completion = base::OnceCallback<void(std::optional<Prepared>)>;
++  ZacroHistoryPreparePublicationTask(
++      history::HistoryDatabase::NativeMirrorPublication lease, Completion completion)
++      : lease_(std::move(lease)), completion_(std::move(completion)) {}
++  bool RunOnDBThread(history::HistoryBackend* backend,
++                     history::HistoryDatabase* database) override {
++    if (!backend || !database || !database->InitializeNativeMirrorJournal() ||
++        !backend->FlushForNativeMirror() ||
++        !database->PrepareNativeMirrorPublication(lease_)) return true;
++    Prepared result;
++    result.lease = lease_;
++    if (!lease_.captured_event_id.empty()) {
++      result.captured = database->ReadNativeMirrorEvent(lease_.captured_event_id);
++      if (!result.captured || result.captured->document_token != lease_.document_token ||
++          result.captured->publish) return true;
++    }
++    if (backend->FlushForNativeMirror()) result_ = std::move(result);
++    return true;
++  }
++  void DoneRunOnMainThread() override { std::move(completion_).Run(std::move(result_)); }
++ private:
++  history::HistoryDatabase::NativeMirrorPublication lease_;
++  Completion completion_;
++  std::optional<Prepared> result_;
++};
++
++class ZacroHistoryPublicationMutationTask final : public history::HistoryDBTask {
++ public:
++  enum class Action { kCommit, kCancel, kFinalize };
++  using Completion = base::OnceCallback<void(bool)>;
++  ZacroHistoryPublicationMutationTask(Action action,
++      history::HistoryDatabase::NativeMirrorPublication lease,
++      std::string logical_id, Completion completion)
++      : action_(action), lease_(std::move(lease)), logical_id_(std::move(logical_id)),
++        completion_(std::move(completion)) {}
++  bool RunOnDBThread(history::HistoryBackend* backend,
++                     history::HistoryDatabase* database) override {
++    if (!backend || !database || !database->InitializeNativeMirrorJournal() ||
++        !backend->FlushForNativeMirror()) return true;
++    bool changed = false;
++    switch (action_) {
++      case Action::kCommit:
++        changed = database->CommitNativeMirrorPublication(lease_, logical_id_); break;
++      case Action::kCancel:
++        changed = logical_id_.empty() && database->CancelNativeMirrorPublication(lease_); break;
++      case Action::kFinalize:
++        changed = database->FinalizeNativeMirrorPublication(lease_, logical_id_); break;
++    }
++    result_ = changed && backend->FlushForNativeMirror();
++    return true;
++  }
++  void DoneRunOnMainThread() override { std::move(completion_).Run(result_); }
++ private:
++  Action action_;
++  history::HistoryDatabase::NativeMirrorPublication lease_;
++  std::string logical_id_;
++  Completion completion_;
++  bool result_ = false;
++};
++
++class ZacroHistoryPublicationListTask final : public history::HistoryDBTask {
++ public:
++  using Result = std::optional<std::vector<history::HistoryDatabase::NativeMirrorPublication>>;
++  using Completion = base::OnceCallback<void(Result)>;
++  explicit ZacroHistoryPublicationListTask(Completion completion)
++      : completion_(std::move(completion)) {}
++  bool RunOnDBThread(history::HistoryBackend* backend,
++                     history::HistoryDatabase* database) override {
++    if (!backend || !database || !database->InitializeNativeMirrorJournal() ||
++        !backend->FlushForNativeMirror()) return true;
++    auto result = database->ReadNativeMirrorPublications();
++    // The schema/generation reader can mutate. Its post-read commit is part of
++    // the proof even when a preceding checked flush succeeded.
++    if (result && backend->FlushForNativeMirror()) result_ = std::move(result);
++    return true;
++  }
++  void DoneRunOnMainThread() override { std::move(completion_).Run(std::move(result_)); }
++ private:
++  Completion completion_;
++  Result result_;
++};
++
++class ZacroHistoryLegacyImportTask final : public history::HistoryDBTask {
++ public:
++  using Result = std::optional<std::vector<history::NativeHistoryLegacyResult>>;
++  using Completion = base::OnceCallback<void(Result)>;
++  ZacroHistoryLegacyImportTask(std::vector<history::NativeHistoryLegacyInput> inputs, Completion completion)
++      : inputs_(std::move(inputs)), completion_(std::move(completion)) {}
++  bool RunOnDBThread(history::HistoryBackend* backend, history::HistoryDatabase* database) override {
++    if (backend && database) result_ = backend->ImportNativeLegacyHistory(inputs_);
++    return true;
++  }
++  void DoneRunOnMainThread() override { std::move(completion_).Run(std::move(result_)); }
++ private:
++  std::vector<history::NativeHistoryLegacyInput> inputs_;
++  Completion completion_;
++  Result result_;
++};
++
++class ZacroHistoryLegacyAcknowledgeTask final : public history::HistoryDBTask {
++ public:
++  using Completion = base::OnceCallback<void(bool)>;
++  ZacroHistoryLegacyAcknowledgeTask(std::vector<std::pair<std::string, std::string>> entries, Completion completion)
++      : entries_(std::move(entries)), completion_(std::move(completion)) {}
++  bool RunOnDBThread(history::HistoryBackend* backend, history::HistoryDatabase* database) override {
++    result_ = backend && database && database->InitializeNativeMirrorJournal() &&
++        backend->FlushForNativeMirror() && database->AcknowledgeNativeLegacyImports(entries_) &&
++        backend->FlushForNativeMirror();
++    return true;
++  }
++  void DoneRunOnMainThread() override { std::move(completion_).Run(result_); }
++ private:
++  std::vector<std::pair<std::string, std::string>> entries_;
++  Completion completion_;
++  bool result_ = false;
++};
++
++class ZacroHistoryRetentionTask final : public history::HistoryDBTask {
++ public:
++  using Completion = base::OnceCallback<void(bool)>;
++  ZacroHistoryRetentionTask(std::vector<history::NativeHistoryRetention> identities, Completion completion)
++      : identities_(std::move(identities)), completion_(std::move(completion)) {}
++  bool RunOnDBThread(history::HistoryBackend* backend, history::HistoryDatabase* database) override {
++    result_ = backend && database && backend->ReplaceNativeHistoryRetention(identities_);
++    return true;
++  }
++  void DoneRunOnMainThread() override { std::move(completion_).Run(result_); }
++ private:
++  std::vector<history::NativeHistoryRetention> identities_;
++  Completion completion_;
++  bool result_ = false;
++};
++
++class ZacroHistoryRetentionStatusTask final : public history::HistoryDBTask {
++ public:
++  using Result = std::optional<std::pair<int64_t, int>>;
++  using Completion = base::OnceCallback<void(Result)>;
++  explicit ZacroHistoryRetentionStatusTask(Completion completion) : completion_(std::move(completion)) {}
++  bool RunOnDBThread(history::HistoryBackend* backend, history::HistoryDatabase* database) override {
++    if (backend && database && database->InitializeNativeMirrorJournal() && backend->FlushForNativeMirror())
++      result_ = database->NativeHistoryRetentionStatus();
++    return true;
++  }
++  void DoneRunOnMainThread() override { std::move(completion_).Run(std::move(result_)); }
++ private:
++  Completion completion_;
++  Result result_;
++};
++
++class ZacroHistoryLegacyBoundaryTask final : public history::HistoryDBTask {
++ public:
++  enum class Action { kCreate, kList, kFinalize };
++  using Result = std::optional<std::vector<std::string>>;
++  using Completion = base::OnceCallback<void(Result)>;
++  ZacroHistoryLegacyBoundaryTask(Action action, std::string lease, bool completed_initial, Completion completion)
++      : action_(action), lease_(std::move(lease)), completed_initial_(completed_initial), completion_(std::move(completion)) {}
++  bool RunOnDBThread(history::HistoryBackend* backend, history::HistoryDatabase* database) override {
++    if (!backend || !database || !database->InitializeNativeMirrorJournal() || !backend->FlushForNativeMirror()) return true;
++    if (action_ == Action::kCreate) {
++      const auto lease = database->CreateNativeLegacyBoundary();
++      if (lease && backend->FlushForNativeMirror()) result_ = std::vector<std::string>{*lease};
++    } else if (action_ == Action::kList) {
++      result_ = database->ReadNativeLegacyBoundaries();
++      if (!backend->FlushForNativeMirror()) result_.reset();
++    } else if (database->FinalizeNativeLegacyBoundary(lease_, completed_initial_) && backend->FlushForNativeMirror()) {
++      result_ = std::vector<std::string>{};
++    }
++    return true;
++  }
++  void DoneRunOnMainThread() override { std::move(completion_).Run(std::move(result_)); }
++ private:
++  Action action_;
++  std::string lease_;
++  bool completed_initial_;
++  Completion completion_;
++  Result result_;
++};
+--- /dev/null
++++ b/libcef/browser/devtools/zacro_history_legacy_adapter.inc
+@@ -0,0 +1,160 @@
++bool ZacroHistoryLegacyHash(const std::string& value) {
++  return value.size() == 64 && std::ranges::all_of(value, [](char c) {
++    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
++  });
++}
++
++void ZacroHistoryContext::Legacy(const std::string& method, const base::DictValue& params,
++                                 ZacroHistoryReply reply) {
++  if (method == "Zacro.createLegacyHistoryBoundary" || method == "Zacro.legacyHistoryBoundaries" ||
++      method == "Zacro.finalizeLegacyHistoryBoundary") {
++    using Action = ZacroHistoryLegacyBoundaryTask::Action;
++    const auto* lease = params.FindString("leaseID");
++    const auto completed = params.FindBool("completedInitial");
++    if (method == "Zacro.finalizeLegacyHistoryBoundary" && (!lease || !ZacroHistoryUUID(*lease) || !completed)) {
++      std::move(reply).Run({}, "Invalid legacy migration boundary."); return;
++    }
++    const auto action = method == "Zacro.createLegacyHistoryBoundary" ? Action::kCreate :
++        method == "Zacro.legacyHistoryBoundaries" ? Action::kList : Action::kFinalize;
++    const auto request = Queue(std::move(reply));
++    service_->ScheduleDBTask(FROM_HERE, std::make_unique<ZacroHistoryLegacyBoundaryTask>(action,
++        lease ? *lease : "", completed.value_or(false), base::BindOnce(
++        [](base::WeakPtr<ZacroHistoryContext> self, std::string request, Action action,
++           ZacroHistoryLegacyBoundaryTask::Result result) {
++          if (!self) return;
++          if (!result || (action == Action::kCreate && result->size() != 1)) {
++            self->Complete(request, {}, "The native legacy migration boundary is unavailable."); return;
++          }
++          if (action == Action::kCreate) {
++            self->Complete(request, base::DictValue().Set("leaseID", result->front()), {});
++          } else if (action == Action::kList) {
++            base::ListValue leases; for (const auto& value : *result) leases.Append(value);
++            self->Complete(request, base::DictValue().Set("leases", std::move(leases)), {});
++          } else self->MutationComplete(request, true);
++        }, weak_.GetWeakPtr(), request, action)), &tracker_); return;
++  }
++  if (method == "Zacro.importLegacyHistory") {
++    const auto* records = params.FindList("inputs");
++    auto encoded = records ? base::WriteJson(*records) : std::nullopt;
++    if (!records || records->empty() || records->size() > 512 || !encoded || encoded->size() > 512 * 1024) {
++      std::move(reply).Run({}, "Invalid or excessive legacy history import."); return;
++    }
++    std::set<std::string> unique;
++    std::vector<history::NativeHistoryLegacyInput> inputs;
++    for (const auto& record : *records) {
++      const auto* data = record.GetIfDict();
++      const auto* id = data ? data->FindString("importID") : nullptr;
++      const auto* url = data ? data->FindString("url") : nullptr;
++      const auto* time = data ? data->FindString("timeMicroseconds") : nullptr;
++      const auto* title = data ? data->FindString("title") : nullptr;
++      const auto* boundary = data ? data->FindString("boundaryLeaseID") : nullptr;
++      const GURL address(url ? *url : ""); int64_t microseconds = 0;
++      if (!id || !ZacroHistoryLegacyHash(*id) || !unique.insert(*id).second || !url || url->size() > 8192 ||
++          !address.is_valid() || !address.SchemeIsHTTPOrHTTPS() || address.has_username() || address.has_password() ||
++          !time || !ZacroHistoryDecimal(*time, &microseconds) || !title || title->size() > 8192 ||
++          !boundary || !ZacroHistoryUUID(*boundary)) {
++        std::move(reply).Run({}, "A legacy history import identity is invalid."); return;
++      }
++      inputs.push_back({*id, address, base::HexEncodeLower(crypto::hash::Sha256(*url)),
++          base::Time::FromDeltaSinceWindowsEpoch(base::Microseconds(microseconds)), base::UTF8ToUTF16(*title), *boundary});
++    }
++    const auto request = Queue(std::move(reply));
++    service_->ScheduleDBTask(FROM_HERE, std::make_unique<ZacroHistoryLegacyImportTask>(std::move(inputs),
++        base::BindOnce([](base::WeakPtr<ZacroHistoryContext> self, std::string request, base::ListValue inputs,
++          ZacroHistoryLegacyImportTask::Result result) {
++          if (!self) return;
++          if (!result || result->size() != inputs.size()) {
++            self->Complete(request, {}, "Chromium could not atomically import and journal the Library visits."); return;
++          }
++          base::ListValue records;
++          for (size_t index = 0; index < result->size(); ++index) {
++            const auto& value = (*result)[index];
++            // The DB checked the request-address hash stored beside this exact
++            // import ID. Attest that request spelling without altering the real
++            // GURL/VisitID identity; Foundation and Chromium can canonicalize
++            // the same input differently (IDN, escapes and dot segments).
++            auto record = base::DictValue().Set("importID", value.import_id).Set("generation", value.generation)
++                .Set("boundaryLeaseID", value.boundary_id)
++                .Set("sourceAddress", *inputs[index].GetDict().FindString("url"))
++                .Set("presence", value.present ? "present" : "absent");
++            if (value.present) record.Set("identity", base::DictValue().Set("generation", value.generation)
++                .Set("visitID", base::NumberToString(value.visit_id))
++                .Set("timeMicroseconds", base::NumberToString(value.time_microseconds))
++                .Set("url", value.url).Set("originator", ""));
++            records.Append(std::move(record));
++          }
++          self->Complete(request, base::DictValue().Set("results", std::move(records)), {});
++        }, weak_.GetWeakPtr(), request, records->Clone())), &tracker_);
++    return;
++  }
++  if (method == "Zacro.acknowledgeLegacyHistoryImports") {
++    const auto* records = params.FindList("entries");
++    if (!records || records->size() > 512) { std::move(reply).Run({}, "Invalid legacy history acknowledgement."); return; }
++    std::vector<std::pair<std::string, std::string>> values;
++    std::set<std::string> unique;
++    for (const auto& record : *records) {
++      const auto* data = record.GetIfDict();
++      const auto* id = data ? data->FindString("importID") : nullptr;
++      const auto* generation = data ? data->FindString("generation") : nullptr;
++      if (!id || !ZacroHistoryLegacyHash(*id) || !unique.insert(*id).second || !generation ||
++          generation->empty() || generation->size() > 64) {
++        std::move(reply).Run({}, "Invalid legacy history acknowledgement identity."); return;
++      }
++      values.emplace_back(*id, *generation);
++    }
++    const auto request = Queue(std::move(reply));
++    service_->ScheduleDBTask(FROM_HERE, std::make_unique<ZacroHistoryLegacyAcknowledgeTask>(std::move(values),
++        base::BindOnce([](base::WeakPtr<ZacroHistoryContext> self, std::string request, bool okay) {
++          if (self) self->MutationComplete(request, okay);
++        }, weak_.GetWeakPtr(), request)), &tracker_); return;
++  }
++  std::move(reply).Run({}, "Unknown native history operation.");
++}
++
++
++void ZacroHistoryContext::Retention(const std::string& method, const base::DictValue& params,
++                                   ZacroHistoryReply reply) {
++  if (method == "Zacro.historyRetentionStatus") {
++    const auto request = Queue(std::move(reply));
++    service_->ScheduleDBTask(FROM_HERE, std::make_unique<ZacroHistoryRetentionStatusTask>(base::BindOnce(
++        [](base::WeakPtr<ZacroHistoryContext> self, std::string request,
++           ZacroHistoryRetentionStatusTask::Result result) {
++          if (!self) return;
++          if (!result) { self->Complete(request, {}, "Native retention status is unavailable."); return; }
++          self->Complete(request, base::DictValue()
++              .Set("automaticExpirationReads", base::NumberToString(result->first))
++              .Set("retainedVisits", result->second), {});
++        }, weak_.GetWeakPtr(), request)), &tracker_); return;
++  }
++  const auto* groups = params.FindList("groups");
++  auto encoded = groups ? base::WriteJson(*groups) : std::nullopt;
++  if (!groups || groups->size() > 20000 || !encoded || encoded->size() > 960 * 1024) {
++    std::move(reply).Run({}, "Invalid native retention snapshot."); return;
++  }
++  std::vector<history::NativeHistoryRetention> identities;
++  std::set<std::pair<std::string, int64_t>> unique;
++  for (const auto& group : *groups) {
++    const auto* data = group.GetIfDict();
++    const auto* generation = data ? data->FindString("generation") : nullptr;
++    const auto* visits = data ? data->FindList("visits") : nullptr;
++    if (!generation || generation->empty() || generation->size() > 64 || !visits ||
++        visits->empty() || visits->size() > 20000 - identities.size()) {
++      std::move(reply).Run({}, "Invalid native retention identity group."); return;
++    }
++    for (const auto& pair : *visits) {
++      const auto* values = pair.GetIfList();
++      int64_t id = 0, time = 0;
++      if (!values || values->size() != 2 || !(*values)[0].is_string() || !(*values)[1].is_string() ||
++          !ZacroHistoryDecimal((*values)[0].GetString(), &id) ||
++          !ZacroHistoryDecimal((*values)[1].GetString(), &time) || !unique.emplace(*generation, id).second) {
++        std::move(reply).Run({}, "Invalid or duplicate retained visit."); return;
++      }
++      identities.push_back({*generation, id, time});
++    }
++  }
++  const auto request = Queue(std::move(reply));
++  service_->ScheduleDBTask(FROM_HERE, std::make_unique<ZacroHistoryRetentionTask>(std::move(identities), base::BindOnce(
++      [](base::WeakPtr<ZacroHistoryContext> self, std::string request, bool okay) {
++        if (self) self->MutationComplete(request, okay);
++      }, weak_.GetWeakPtr(), request)), &tracker_);
++}
+--- /dev/null
 +++ b/libcef/browser/devtools/zacro_downloads_adapter.inc
-@@ -0,0 +1,194 @@
+@@ -0,0 +1,195 @@
 +// Profile-wide observation includes extension workers and downloads whose
 +// originating WebContents has already closed. Chromium retains all file policy.
 +#include "content/public/browser/download_item_utils.h"
@@ -3475,6 +4791,7 @@
 +  if (method != "Zacro.downloadSnapshot" && method != "Zacro.controlDownload" &&
 +      method != "Zacro.renameDownload" && method != "Zacro.retireProfileDownloads") return false;
 +  if (method == "Zacro.retireProfileDownloads") {
++    ZacroRetireProfileHistory(inspected_contents_->GetBrowserContext());
 +    // This is a browser-process transport command, not an extension API. It
 +    // requires no extension registry/sync observer and works for OTR contexts.
 +    std::string error;

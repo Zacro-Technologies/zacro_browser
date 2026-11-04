@@ -80,15 +80,16 @@
  SessionTabHelper::~SessionTabHelper() = default;
 --- a/cef/libcef/browser/chrome/chrome_browser_delegate.cc
 +++ b/cef/libcef/browser/chrome/chrome_browser_delegate.cc
-@@ -16,6 +16,7 @@
+@@ -16,6 +16,8 @@
  #include "cef/libcef/browser/chrome/views/chrome_browser_view.h"
  #include "cef/libcef/browser/chrome/views/chrome_child_window.h"
  #include "cef/libcef/browser/devtools/devtools_window_runner.h"
 +#include "cef/libcef/browser/devtools/zacro_tab_reservation.h"
++#include "chrome/browser/history/native_history_owner.h"
  #include "cef/libcef/browser/request_context_impl.h"
  #include "cef/libcef/browser/views/browser_view_impl.h"
  #include "cef/libcef/browser/views/window_impl.h"
-@@ -223,6 +224,17 @@
+@@ -223,6 +225,17 @@
  
  void ChromeBrowserDelegate::OnWebContentsCreated(
      content::WebContents* new_contents) {
@@ -106,6 +107,17 @@
    // Necessary to receive LoadingStateChanged calls during initial navigation.
    // This will be called again in Browser::SetAsDelegate, which should be
    // fine.
+@@ -493,6 +506,10 @@
+   // WebContents is destroyed. Associate that browser host with the
+   // WebContents and execute initial client callbacks. Deliver required
+   // information to the renderer process.
++  // Attach the exact public opener's provisional history token before CEF
++  // publishes this child or its first navigation. This grants no logical tab
++  // identity or Library publication; durable Core adoption is still required.
++  NativeHistoryOwner::RegisterProvisionalPopup(source_contents, opener_id, new_contents);
+   CreateBrowserHostForPopup(new_contents, settings, client, extra_info,
+                             std::move(platform_delegate),
+                             /*is_devtools_popup=*/false, opener);
 --- a/cef/libcef/browser/chrome/chrome_browser_host_impl.cc
 +++ b/cef/libcef/browser/chrome/chrome_browser_host_impl.cc
 @@ -4,6 +4,8 @@

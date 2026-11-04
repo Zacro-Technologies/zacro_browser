@@ -12,7 +12,14 @@ final class PeekPanelController {
   private weak var orderedPreview: NSWindow?
   private enum Phase { case opening, open, closing, expanding }
   private var phase = Phase.open
-  private var timer: Timer?
+  private let clock = NativeMotionClock()
+  private var motion: Motion?
+  private struct Motion {
+    let from: Double
+    let to: Double
+    let started: TimeInterval
+    let duration: TimeInterval
+  }
   private var progress = 1.0
   private var motionScale = 1.0
   private var contentFrame = CGRect.zero
@@ -24,7 +31,7 @@ final class PeekPanelController {
   private var closingSnapshot = false
   private(set) var presentationFrame = CGRect.zero
   var presentationWindow: NSWindow? { panel }
-  var isAnimating: Bool { timer != nil }
+  var isAnimating: Bool { clock.isRunning }
 
   /// The geometry in src/main/layout.cjs, including the room for the side controls.
   static func targetFrame(in content: CGRect) -> CGRect {
@@ -135,37 +142,38 @@ final class PeekPanelController {
     cancelMotion()
     phase = next; self.completion = completion
     let from = progress, to = next == .closing ? 0.0 : 1.0
-    let duration = (next == .closing ? 0.12 : next == .expanding ? 0.24 : 0.22) * motionScale * abs(to - from)
+    let duration = (next == .closing ? NativeMotion.peekClosing
+      : next == .expanding ? NativeMotion.peekExpansion : NativeMotion.peekOpening) * motionScale * abs(to - from)
     guard duration >= 0.001 else { progress = to; finishMotion(); return }
+    guard let hosting else { progress = to; finishMotion(); return }
     let started = ProcessInfo.processInfo.systemUptime
-    let timer = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] _ in
-      MainActor.assumeIsolated {
-        guard let self else { return }
-        let elapsed = min(1, (ProcessInfo.processInfo.systemUptime - started) / duration)
-        let eased = next == .closing ? elapsed * elapsed : 1 - pow(1 - elapsed, 3)
-        self.progress = from + (to - from) * eased
-        self.applyPresentation()
-        if elapsed >= 1 || NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
-          self.progress = to; self.finishMotion()
-        }
+    motion = Motion(from: from, to: to, started: started, duration: duration)
+    clock.start(in: hosting, until: started + duration) { [weak self] time in
+      guard let self, let motion = self.motion else { return }
+      let elapsed = min(1, max(0, (time - motion.started) / motion.duration))
+      self.progress = motion.from + (motion.to - motion.from) * NativeMotion.progress(elapsed)
+      self.applyPresentation()
+      if elapsed >= 1 || NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+        self.progress = motion.to; self.finishMotion()
       }
     }
-    self.timer = timer
-    RunLoop.main.add(timer, forMode: .common)
     applyPresentation()
   }
   private func finishMotion() {
-    timer?.invalidate(); timer = nil
+    clock.stop(); motion = nil
     if phase == .opening { phase = .open }
     applyPresentation()
     let done = completion; completion = nil
     done?()
   }
-  private func cancelMotion() { timer?.invalidate(); timer = nil; completion = nil }
+  private func cancelMotion() { clock.stop(); motion = nil; completion = nil }
   private func applyPresentation() {
     let start = phase == .expanding ? expansionOrigin : origin
     let end = phase == .expanding ? contentFrame : target
-    func mix(_ a: CGFloat, _ b: CGFloat) -> CGFloat { (a + (b - a) * progress).rounded() }
+    let scale = panel?.backingScaleFactor ?? 2
+    func mix(_ a: CGFloat, _ b: CGFloat) -> CGFloat {
+      ((a + (b - a) * progress) * scale).rounded() / scale
+    }
     let frame = phase == .open ? target : CGRect(x: mix(start.minX, end.minX), y: mix(start.minY, end.minY),
       width: max(1, mix(start.width, end.width)), height: max(1, mix(start.height, end.height)))
     if presentationFrame != frame { presentationFrame = frame; updatePreview?(frame) }
@@ -186,6 +194,9 @@ final class PeekPanelController {
 
 private final class TransparentPeekHostingView<Content: View>: NSHostingView<Content> {
   override var isOpaque: Bool { false }
+  // The retained nonactivating panel intentionally leaves document keyboard
+  // focus in place. Its visible controls must accept that first mouse click.
+  override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 }
 
 @MainActor
@@ -240,17 +251,19 @@ private struct PeekBackdrop: View {
           .offset(x: model.frame.minX, y: model.frame.minY).opacity(model.opacity)
       }
       VStack(spacing: 8) {
-        peekButton("xmark", label: "Close Peek", action: model.close)
-        peekButton("arrow.up.left.and.arrow.down.right", label: "Open Peek as a tab", action: model.expand)
+        peekButton("xmark", id: "peek-control-close", label: "Close Peek", action: model.close)
+        peekButton("arrow.up.left.and.arrow.down.right", id: "peek-control-expand", label: "Open Peek as a tab", action: model.expand)
       }.offset(x: model.frame.maxX + 8, y: model.frame.minY).opacity(model.opacity)
         .allowsHitTesting(model.opacity > 0.5 && model.snapshot == nil)
     }.preferredColorScheme(model.theme.appearance == "dark" ? .dark : model.theme.appearance == "light" ? .light : nil)
   }
-  private func peekButton(_ glyph: String, label: String, action: @escaping () -> Void) -> some View {
-    Button(action: action) { NativeGlyph(glyph).frame(width: 16, height: 16).frame(width: 32, height: 32) }
+  private func peekButton(_ glyph: String, id: String, label: String, action: @escaping () -> Void) -> some View {
+    Button(action: action) {
+      NativeGlyph(glyph).frame(width: 16, height: 16).frame(width: 32, height: 32).contentShape(Circle())
+    }
       .buttonStyle(.plain).foregroundStyle(colors.ink)
       .background(colors.card.opacity(0.78), in: Circle())
       .shadow(color: .black.opacity(0.12), radius: 4, y: 2)
-      .help(label).accessibilityLabel(label)
+      .help(label).accessibilityLabel(label).accessibilityIdentifier(id)
   }
 }

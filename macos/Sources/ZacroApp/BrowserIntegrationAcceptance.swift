@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import CryptoKit
 import Darwin
 import Foundation
@@ -22,13 +23,28 @@ final class BrowserIntegrationAcceptance {
   init(application: ApplicationCoordinator) { self.application = application }
 
   func run(url: URL) {
+    // The measured prelude and extension catalog alone take about six minutes.
+    // Give the complete catalog room for capture, media and window retirement;
+    // each individual fixture retains its own existing deadline.
+    let aggregateSeconds = suite == "all" ? 600 : 420
     deadline = Task { [weak self] in
-      do { try await Task.sleep(for: .seconds(420)) } catch { return }
+      do { try await Task.sleep(for: .seconds(aggregateSeconds)) } catch { return }
       self?.finish("The application integration check timed out.")
     }
     task = Task { [weak self] in
       guard let self else { return }
       do {
+        if ProcessInfo.processInfo.environment["ZACRO_NATIVE_AWAIT_FOREGROUND"] == "1" {
+          guard let owner = self.application.focusedCoordinator, let window = owner.window else {
+            throw Failure("Foreground readiness has no owned browser window")
+          }
+          fputs("Native application awaiting Computer activation: pid=\(ProcessInfo.processInfo.processIdentifier) window=\(window.windowNumber)\n", stderr)
+          try await self.wait("actualForegroundOwnershipBeforeFixtures", timeout: 60) {
+            self.application.focusedCoordinator === owner && owner.window === window
+              && owner.windowContext.isOpen && !owner.windowContext.isClosing
+              && window.isVisible && NSApp.isActive && NSApp.keyWindow === window
+          }
+        }
         if self.suite == "all" { try await self.checkApplication(url: url) }
         else { try await self.checkFocusedSuite(url: url) }
         self.finish(nil)
@@ -40,7 +56,7 @@ final class BrowserIntegrationAcceptance {
   /// Focused runs use the same production fixtures and disposable application
   /// owners. Their report names the suite and never claims full-app acceptance.
   private func checkFocusedSuite(url: URL) async throws {
-    guard ["extensions", "extension-actions", "extension-services", "download-retirement", "windows", "peek", "navigation", "capture", "sidebar"].contains(suite),
+    guard ["extensions", "extension-actions", "extension-services", "extension-admission", "extension-search", "extension-management", "extension-uninstall", "extension-ui-owner", "extension-host", "history-mirror", "history-spa", "history-veto", "history-publication", "popup-close", "popup-adoption", "download-retirement", "windows", "hosted-selection", "resize", "peek", "navigation", "capture", "media", "sidebar", "recovery", "interface"].contains(suite),
       let owner = application.focusedCoordinator else { throw Failure("Unknown acceptance suite or missing owner") }
     let engine = application.engine
     nativeExtensions = try await engine.nativeCapabilities().extensionBrowser == true
@@ -58,19 +74,82 @@ final class BrowserIntegrationAcceptance {
     try await application.navigation.waitForRestore(page)
     try await loaded(page)
     try await page.ready().setDownloadDirectory(directory)
-    if suite == "sidebar" {
+    if suite == "recovery" {
+      for name in try await NativeAuxiliaryTerminationRecoveryAcceptance.run() { try require(true, name) }
+    } else if suite == "history-mirror" {
+      for name in try await NativeHistoryMirrorRuntimeAcceptance.run(application: application, url: url) { try require(true, name) }
+    } else if suite == "history-veto" {
+      for name in try await NativeHistoryProfileVetoAcceptance.run(application: application,
+        url: url, originalOwner: owner) { try require(true, name) }
+    } else if suite == "history-publication" {
+      for name in try await NativeHistoryPublicationRaceAcceptance.run(application: application,
+        url: url, originalOwner: owner) { try require(true, name) }
+    } else if suite == "interface" {
+      for (name, passed) in await NativeCommandInterfaceAcceptance.check() { try require(passed, name) }
+      for name in try await NativeEditingRuntimeAcceptance.run(application: application, url: url, owner: owner) { try require(true, name) }
+      guard let window = owner.window else { throw Failure("AI interface fixture owner disappeared") }
+      owner.windowContext.show()
+      for name in try await NativeAIModelAcceptance.run(window:window) { try require(true, name) }
+    } else if suite == "sidebar" {
+      for (name, passed) in NativeSidebarSplitAcceptance.check() { try require(passed, name) }
       for name in try await NativeSidebarAccessibilityAcceptance.run(application: application, url: url, originalOwner: owner) {
+        try require(true, name)
+      }
+      for name in try await NativeSidebarFocusAcceptance.run(application: application, url: url, originalOwner: owner) {
+        try require(true, name)
+      }
+      for name in try await NativeSidebarToggleAcceptance.run(application: application, url: url, originalOwner: owner) {
+        try require(true, name)
+      }
+    } else if suite == "resize" {
+      for (name, passed) in NativePaneShadowAcceptance.check() { try require(passed, name) }
+      try await NativeChromeControlRenderEvidence.capture(directory: engine.dataDirectory)
+      for name in try await NativeWindowResizeAcceptance.run(application: application, url: url, originalOwner: owner) {
+        try require(true, name)
+      }
+      for name in try await NativeSplitDragRuntimeAcceptance.run(application: application, url: url, originalOwner: owner) {
         try require(true, name)
       }
     } else if suite == "windows" {
       for name in try await NativeWindowTransferAcceptance.run(application: application, url: url, originalOwner: owner) {
         try require(true, name)
       }
+    } else if suite == "hosted-selection" {
+      try await checkNativePDF(url: url, owner: owner)
+      try await checkPrivateNativePDF(url: url, owner: owner)
+      try await checkHostedSelection(url: url, owner: owner, survivor: page)
     } else if suite == "extension-actions" {
       try await checkExtensionFixture(url: url, owner: owner, page: page, includeProtocolFixtures: false)
+    } else if suite == "popup-close" {
+      try await checkExtensionFixture(url: url, owner: owner, page: page,
+        includeProtocolFixtures: false, popupCloseOnly: true)
+    } else if suite == "popup-adoption" {
+      for name in try await NativePendingPopupAcceptance.run(application: application,
+        url: url, originalOwner: owner) { try require(true, name) }
     } else if suite == "extension-services" {
       try await checkExtensionFixture(url: url, owner: owner, page: page,
         includeProtocolFixtures: false, servicesOnly: true)
+    } else if suite == "extension-admission" {
+      try await checkExtensionFixture(url: url, owner: owner, page: page,
+        includeProtocolFixtures: false, featureOnly: .admission)
+    } else if suite == "extension-search" {
+      try await checkExtensionFixture(url: url, owner: owner, page: page,
+        includeProtocolFixtures: false, featureOnly: .search)
+    } else if suite == "extension-management" {
+      try await checkExtensionFixture(url: url, owner: owner, page: page,
+        includeProtocolFixtures: false, featureOnly: .management)
+    } else if suite == "extension-uninstall" {
+      try await checkExtensionFixture(url: url, owner: owner, page: page,
+        includeProtocolFixtures: false, featureOnly: .uninstall)
+    } else if suite == "extension-ui-owner" {
+      try await checkExtensionFixture(url: url, owner: owner, page: page,
+        includeProtocolFixtures: false, featureOnly: .uiOwner)
+    } else if suite == "extension-host" {
+      try await checkExtensionFixture(url: url, owner: owner, page: page,
+        includeProtocolFixtures: false, featureOnly: .hostNavigation)
+    } else if suite == "history-spa" {
+      try await checkExtensionFixture(url: url, owner: owner, page: page,
+        includeProtocolFixtures: false, featureOnly: .sameDocumentHistory)
     } else if suite == "download-retirement" {
       for name in try await NativeDownloadRetirementAcceptance.run(application: application, owner: owner, url: url) {
         try require(true, name)
@@ -79,6 +158,8 @@ final class BrowserIntegrationAcceptance {
       try await checkPrivateNativePDF(url: url, owner: owner)
       try await checkExtensionFixture(url: url, owner: owner, page: page)
     } else if suite == "peek" {
+      guard let window = owner.window else { throw Failure("No owned window for motion acceptance") }
+      for name in try await NativeMotionAcceptance.run(in: window) { try require(true, name) }
       for name in try await NativePeekBootstrapAcceptance.run(application: application, url: url, originalOwner: owner) {
         try require(true, name)
       }
@@ -88,10 +169,15 @@ final class BrowserIntegrationAcceptance {
       for name in try await NativePeekReplacementAcceptance.run(application: application, url: url, originalOwner: owner) {
         try require(true, name)
       }
+      for name in try await NativePeekControlAcceptance.run(application: application, url: url, originalOwner: owner) {
+        try require(true, name)
+      }
     } else if suite == "capture" {
       for name in try await NativeTabCaptureAcceptance.run(application: application, url: url, originalOwner: owner) {
         try require(true, name)
       }
+    } else if suite == "media" {
+      try await checkNativeMedia(url: url, owner: owner)
     } else {
       for name in try await NativeNavigationCloseAcceptance.run(application: application, url: url, originalOwner: owner) {
         try require(true, name)
@@ -118,18 +204,28 @@ final class BrowserIntegrationAcceptance {
     guard let first = application.focusedCoordinator else { throw Failure("No application window") }
     try await wait("initialShellLayout") { first.actions.contentFrame.width > 400 }
     guard let firstWindow = first.window else { throw Failure("No application window presentation") }
+    for name in try await NativeMotionAcceptance.run(in: firstWindow) { try require(true, name) }
     for (name, passed) in NativeSidebarDragAcceptance.check(in: firstWindow) { try require(passed, name) }
     for (name, passed) in NativeSpaceViewportAcceptance.check() { try require(passed, name) }
     for (name, passed) in NativeThemeColorWellAcceptance.check() { try require(passed, name) }
     for (name, passed) in NativeThemeColorAcceptance.check() { try require(passed, name) }
+    for (name, passed) in NativePaneShadowAcceptance.check() { try require(passed, name) }
     for (name, passed) in await NativeCommandInterfaceAcceptance.check() { try require(passed, name) }
+    for name in try await NativeEditingRuntimeAcceptance.run(application: application, url: url, owner: first) { try require(true, name) }
     for (name, passed) in NativePageContextMenuAcceptance.check() { try require(passed, name) }
     for (name, passed) in NativePeekLinkAcceptance.check() { try require(passed, name) }
     for (name, passed) in await NativeWindowDialogOwnerAcceptance.check() { try require(passed, name) }
     try await checkNativeWindowSheets(owner: firstWindow)
+    for name in try await NativeAuxiliaryTerminationRecoveryAcceptance.run() { try require(true, name) }
     first.windowContext.show()
     for name in try await NativeAIModelAcceptance.run(window: firstWindow) { try require(true, name) }
     for name in try await NativeSidebarAccessibilityAcceptance.run(application: application, url: url, originalOwner: first) {
+      try require(true, name)
+    }
+    for name in try await NativeSidebarFocusAcceptance.run(application: application, url: url, originalOwner: first) {
+      try require(true, name)
+    }
+    for name in try await NativeSidebarToggleAcceptance.run(application: application, url: url, originalOwner: first) {
       try require(true, name)
     }
     first.actions.palette = false
@@ -142,6 +238,12 @@ final class BrowserIntegrationAcceptance {
         && first.actions.runtimeCommands.first(where: { $0.id == "stop" })?.available == false
     }
     let browser = try await page.ready(), nativeID = browser.id
+    for name in try await NativeWindowResizeAcceptance.run(application: application, url: url, originalOwner: first) {
+      try require(true, name)
+    }
+    for name in try await NativeSplitDragRuntimeAcceptance.run(application: application, url: url, originalOwner: first) {
+      try require(true, name)
+    }
     try browser.setDownloadDirectory(downloadDirectory)
     try require(true, "downloadDestinationUsesExactBrowserRequestContext")
     var permissionOrigin = URLComponents()
@@ -190,6 +292,7 @@ final class BrowserIntegrationAcceptance {
     try await Task.sleep(for: .milliseconds(220))
     try NativeViewRenderEvidence.capture("theme-editor", window: themeWindow)
     try await NativeHomePageRenderEvidence.capture(directory: engine.dataDirectory)
+    try await NativeChromeControlRenderEvidence.capture(directory: engine.dataDirectory)
     for (name, passed) in NativeThemeColorWellAcceptance.checkHosted(in: themeWindow) { try require(passed, name) }
     first.actions.themeEditor = false
     try await wait("themeEditorDismissesItsOwnedView", record: false) {
@@ -319,6 +422,8 @@ final class BrowserIntegrationAcceptance {
     second.store.updateSettings { $0.sidebarWidth = 288 }
     try require(first.store.state.settings.sidebarWidth == 256 && second.store.state.settings.sidebarWidth == 288,
       "windowSidebarWidthsAreIndependent")
+    for name in try await NativePendingPopupAcceptance.run(application: application,
+      url: url, originalOwner: second) { try require(true, name) }
     try await checkPermissionSheets(owner: second, other: first, url: url)
     _ = try await browser.devTools.evaluate("document.body.insertAdjacentHTML('beforeend','<p>Approved context from its owning window.</p>'); null")
     first.windowContext.show()
@@ -422,6 +527,17 @@ final class BrowserIntegrationAcceptance {
     for name in try await NativeHistoryRuntimeAcceptance.run(application: application, url: url, originalOwner: second) {
       try require(true, name)
     }
+    if application.supportsHistoryMirror {
+      for name in try await NativeHistoryMirrorRuntimeAcceptance.run(application: application, url: url) {
+        try require(true, name)
+      }
+      for name in try await NativeHistoryProfileVetoAcceptance.run(application: application,
+        url: url, originalOwner: second) { try require(true, name) }
+      for name in try await NativeHistoryPublicationRaceAcceptance.run(application: application,
+        url: url, originalOwner: second) { try require(true, name) }
+    } else if ProcessInfo.processInfo.environment["ZACRO_REQUIRE_NATIVE_EXTENSIONS"] == "1" {
+      throw Failure("The packaged runtime does not implement durable native history reconciliation")
+    }
     if nativeExtensions {
       for name in try await NativePeekBootstrapAcceptance.run(application: application, url: url, originalOwner: second) {
         try require(true, name)
@@ -431,6 +547,9 @@ final class BrowserIntegrationAcceptance {
       try require(true, name)
     }
     for name in try await NativePeekReplacementAcceptance.run(application: application, url: url, originalOwner: second) {
+      try require(true, name)
+    }
+    for name in try await NativePeekControlAcceptance.run(application: application, url: url, originalOwner: second) {
       try require(true, name)
     }
     if nativeExtensions {
@@ -684,6 +803,87 @@ final class BrowserIntegrationAcceptance {
   }
 
   private func checkPermissionSheets(owner: BrowserWindowCoordinator,
+    other originalOther: BrowserWindowCoordinator, url: URL) async throws {
+    if let sheet = originalOther.window?.attachedSheet {
+      var pending = sheet.contentView.map { [$0] } ?? []
+      var visited = 0, labels: [String] = [], buttons: [String] = []
+      while let view = pending.popLast(), visited < 256 {
+        visited += 1
+        guard view.window === sheet else { continue }
+        if let field = view as? NSTextField, !(field is NSSecureTextField), !field.isEditable,
+          !field.stringValue.isEmpty, labels.count < 8 {
+          labels.append(String(field.stringValue.prefix(512)))
+        }
+        if let button = view as? NSButton, !button.title.isEmpty, buttons.count < 8 {
+          buttons.append(String(button.title.prefix(80)))
+        }
+        pending.append(contentsOf: view.subviews.prefix(max(0, 256 - visited - pending.count)))
+      }
+      let state: [String: Any] = ["identifier": sheet.identifier?.rawValue ?? "nil",
+        "title": String(sheet.title.prefix(256)), "windowNumber": sheet.windowNumber,
+        "sheetParent": sheet.sheetParent?.windowNumber ?? -1,
+        "owner": originalOther.windowContext.id, "labels": labels, "buttons": buttons]
+      let data = try JSONSerialization.data(withJSONObject: state, options: [.sortedKeys])
+      fputs("Native permission original-other sheet: \(String(decoding: data, as: UTF8.self))\n", stderr)
+    }
+    // The other browser must be usable before testing whether the permission
+    // sheet blocks it. Keep the original browser and its existing alert intact.
+    let previousWindows = Set(application.windows.keys)
+    application.newWindow()
+    let added = application.windows.values.filter {
+      !previousWindows.contains($0.windowContext.id) && $0.windowContext.isOpen && !$0.windowContext.isClosing
+    }
+    guard added.count == 1, let other = added.first, let otherWindow = other.window,
+      otherWindow.attachedSheet == nil else { throw Failure("Exact clean permission focus fixture") }
+    do {
+      try await checkOwnedSheetFocus(owner: other, other: owner)
+      try await checkPermissionSheetLifecycle(owner: owner, other: other, url: url)
+      try require(await other.requestCloseWindow(), "permissionFocusFixtureClosesCleanly")
+      if owner.windowContext.isOpen { owner.windowContext.show() }
+    } catch {
+      if other.windowContext.isOpen { _ = await other.requestCloseWindow() }
+      if owner.windowContext.isOpen { owner.windowContext.show() }
+      throw error
+    }
+  }
+
+  private func checkOwnedSheetFocus(owner: BrowserWindowCoordinator,
+    other: BrowserWindowCoordinator) async throws {
+    guard let ownerWindow = owner.window, ownerWindow.attachedSheet == nil else {
+      throw Failure("Owned-sheet focus fixture")
+    }
+    owner.windowContext.show()
+    let alert = NSAlert(); alert.messageText = "Disposable owned-sheet focus fixture"
+    alert.window.identifier = NSUserInterfaceItemIdentifier("ZacroAcceptanceOwnedSheetFocus:" + UUID().uuidString)
+    var response: NSApplication.ModalResponse?
+    let presentation = Task { response = await NativeWindowSheet.present(alert, for: ownerWindow) }
+    do {
+      try await wait("ownedSheetFocusFixturePresentsExactAlert", record: false) {
+        ownerWindow.attachedSheet === alert.window && alert.window.sheetParent === ownerWindow
+      }
+      other.windowContext.show()
+      try await wait("ownedSheetFocusFixtureSelectsOtherBrowser", record: false) {
+        self.application.focusedCoordinator === other
+          && (NSApp.keyWindow === other.window || other.windowPages.values.contains { $0.nativeWindow === NSApp.keyWindow })
+      }
+      owner.windowContext.show()
+      try await wait("ownedAlertSheetFocusUpdatesExactBrowserOwner") {
+        NSApp.keyWindow === alert.window && alert.window.sheetParent === ownerWindow
+          && NSApp.mainWindow === ownerWindow && self.application.focusedCoordinator === owner
+          && self.application.repository.focusedWindowID == owner.windowContext.id
+          && ownerWindow.attachedSheet === alert.window && NSApp.modalWindow == nil
+      }
+      presentation.cancel(); await presentation.value
+      try await wait("ownedSheetFocusFixtureCancelsOnlyItsExactAlert") {
+        response == .cancel && ownerWindow.attachedSheet == nil && ownerWindow.isVisible
+      }
+    } catch {
+      presentation.cancel(); await presentation.value
+      throw error
+    }
+  }
+
+  private func checkPermissionSheetLifecycle(owner: BrowserWindowCoordinator,
     other: BrowserWindowCoordinator, url: URL) async throws {
     let previous = owner.store.state.activeTabID
     owner.windowContext.show()
@@ -693,43 +893,82 @@ final class BrowserIntegrationAcceptance {
       throw Failure("Permission sheet fixture")
     }
     let page = try await owner.ensurePageReady(tab)
-    try await application.navigation.waitForRestore(page)
-    try await loaded(page)
-    try await wait("permissionFixtureHasOwnFocus", record: false) {
-      self.application.focusedCoordinator === owner
-        && (NSApp.keyWindow === ownerWindow || NSApp.keyWindow === page.nativeWindow)
+    let fixtureProfileID = page.profileID
+    do {
+      try await application.navigation.waitForRestore(page)
+      try await loaded(page)
+      try await wait("permissionFixtureHasOwnFocus", record: false) {
+        self.application.focusedCoordinator === owner
+          && (NSApp.keyWindow === ownerWindow || NSApp.keyWindow === page.nativeWindow)
+      }
+      let browser = try await page.ready()
+      _ = try await browser.devTools.evaluate("window.permissionResult='pending'; Notification.requestPermission().then(result=>window.permissionResult=result); true", userGesture: true)
+      try await wait("sitePermissionUsesAnOwnedNonblockingSheet") {
+        ownerWindow.attachedSheet != nil && NSApp.modalWindow == nil
+      }
+      fputs("Native permission focus before showing other: key=\(NSApp.keyWindow?.windowNumber ?? -1)"
+        + " main=\(NSApp.mainWindow?.windowNumber ?? -1) other=\(other.window?.windowNumber ?? -1)"
+        + " otherVisible=\(other.window?.isVisible == true) otherKey=\(other.window?.isKeyWindow == true)\n", stderr)
+      other.windowContext.show()
+      var previousPermissionFocusState: String?
+      var permissionFocusDiagnosticCount = 0
+      try await wait("permissionSheetLeavesAnotherWindowUsable") {
+        let usable = self.application.focusedCoordinator === other
+          && (NSApp.keyWindow === other.window || other.windowPages.values.contains { $0.nativeWindow === NSApp.keyWindow })
+          && ownerWindow.attachedSheet != nil && NSApp.modalWindow == nil
+        let key = NSApp.keyWindow
+        let focusState = "focused=\(self.application.focusedCoordinator?.windowContext.id ?? "nil")"
+          + " expected=\(other.windowContext.id) key=\(key?.windowNumber ?? -1)"
+          + " keyClass=\(key.map { String(reflecting: type(of: $0)) } ?? "nil")"
+          + " keyParent=\(key?.parent?.windowNumber ?? -1) keySheetParent=\(key?.sheetParent?.windowNumber ?? -1)"
+          + " main=\(NSApp.mainWindow?.windowNumber ?? -1)"
+          + " other=\(other.window?.windowNumber ?? -1) otherKey=\(other.window?.isKeyWindow == true)"
+          + " otherMain=\(other.window?.isMainWindow == true) otherCanKey=\(other.window?.canBecomeKey == true)"
+          + " otherVisible=\(other.window?.isVisible == true) otherMini=\(other.window?.isMiniaturized == true)"
+          + " otherOpen=\(other.windowContext.isOpen) otherClosing=\(other.windowContext.isClosing)"
+          + " otherNativeID=\(other.windowContext.nativeID) otherProfile=\(other.store.activeProfileID)"
+          + " otherSheet=\(other.window?.attachedSheet?.windowNumber ?? -1)"
+          + " owner=\(ownerWindow.windowNumber) ownerSheet=\(ownerWindow.attachedSheet?.windowNumber ?? -1)"
+          + " ownerMain=\(ownerWindow.isMainWindow) ownerVisible=\(ownerWindow.isVisible)"
+          + " ownerNativeID=\(owner.windowContext.nativeID) ownerProfile=\(owner.store.activeProfileID)"
+          + " requests=\(owner.pendingPermissionRequestCount) appActive=\(NSApp.isActive)"
+          + " modal=\(NSApp.modalWindow?.windowNumber ?? -1) usable=\(usable)"
+        if focusState != previousPermissionFocusState, permissionFocusDiagnosticCount < 8 {
+          previousPermissionFocusState = focusState; permissionFocusDiagnosticCount += 1
+          fputs("Native permission focus: \(focusState)\n", stderr)
+        }
+        return usable
+      }
+      page.load(url.appendingPathComponent("permission-cancelled-by-navigation"))
+      try await loaded(page)
+      try await wait("navigationDismissesItsPendingPermission") { ownerWindow.attachedSheet == nil }
+      try require(owner.store.savedPermission(profileID: page.profileID, origin: origin, permission: "notifications") == nil,
+        "cancelledPermissionCannotPersistAChoice")
+      _ = try await browser.devTools.evaluate("window.permissionResult='pending'; Notification.requestPermission().then(result=>window.permissionResult=result); true", userGesture: true)
+      try await wait("backgroundPermissionWaitsWithoutTakingFocus") {
+        owner.pendingPermissionRequestCount == 1 && ownerWindow.attachedSheet == nil
+          && self.application.focusedCoordinator === other && NSApp.modalWindow == nil
+      }
+      owner.windowContext.show()
+      try await wait("queuedPermissionAppearsOnlyInItsOwnWindow") {
+        ownerWindow.attachedSheet != nil && owner.pendingPermissionRequestCount == 1 && NSApp.modalWindow == nil
+      }
+      try require(await owner.requestCloseTab(tab.id), "permissionFixtureClosesCleanly")
+      try await wait("closingSourceCancelsQueuedOrPresentedPermission") {
+        owner.pendingPermissionRequestCount == 0 && ownerWindow.attachedSheet == nil
+      }
+      if let previous { owner.store.selectTab(id: previous) }
+      owner.layoutPages()
+    } catch {
+      // Close only this exact fixture document through its normal owner.
+      // Await native closure so its own prompt drains before reporting failure.
+      if self.application.engine.pages[tab.id] === page,
+        page.ownerWindowID == owner.windowContext.id, page.profileID == fixtureProfileID {
+        let closed = await owner.requestCloseTab(tab.id)
+        fputs("Native permission failure cleanup exact page: closed=\(closed)\n", stderr)
+      }
+      throw error
     }
-    let browser = try await page.ready()
-    _ = try await browser.devTools.evaluate("window.permissionResult='pending'; Notification.requestPermission().then(result=>window.permissionResult=result); true", userGesture: true)
-    try await wait("sitePermissionUsesAnOwnedNonblockingSheet") {
-      ownerWindow.attachedSheet != nil && NSApp.modalWindow == nil
-    }
-    other.windowContext.show()
-    try await wait("permissionSheetLeavesAnotherWindowUsable") {
-      self.application.focusedCoordinator === other
-        && (NSApp.keyWindow === other.window || other.windowPages.values.contains { $0.nativeWindow === NSApp.keyWindow })
-        && ownerWindow.attachedSheet != nil && NSApp.modalWindow == nil
-    }
-    page.load(url.appendingPathComponent("permission-cancelled-by-navigation"))
-    try await loaded(page)
-    try await wait("navigationDismissesItsPendingPermission") { ownerWindow.attachedSheet == nil }
-    try require(owner.store.savedPermission(profileID: page.profileID, origin: origin, permission: "notifications") == nil,
-      "cancelledPermissionCannotPersistAChoice")
-    _ = try await browser.devTools.evaluate("window.permissionResult='pending'; Notification.requestPermission().then(result=>window.permissionResult=result); true", userGesture: true)
-    try await wait("backgroundPermissionWaitsWithoutTakingFocus") {
-      owner.pendingPermissionRequestCount == 1 && ownerWindow.attachedSheet == nil
-        && self.application.focusedCoordinator === other && NSApp.modalWindow == nil
-    }
-    owner.windowContext.show()
-    try await wait("queuedPermissionAppearsOnlyInItsOwnWindow") {
-      ownerWindow.attachedSheet != nil && owner.pendingPermissionRequestCount == 1 && NSApp.modalWindow == nil
-    }
-    try require(await owner.requestCloseTab(tab.id), "permissionFixtureClosesCleanly")
-    try await wait("closingSourceCancelsQueuedOrPresentedPermission") {
-      owner.pendingPermissionRequestCount == 0 && ownerWindow.attachedSheet == nil
-    }
-    if let previous { owner.store.selectTab(id: previous) }
-    owner.layoutPages()
   }
 
   private func checkHostedSelection(url: URL, owner: BrowserWindowCoordinator, survivor: ChromiumPage) async throws {
@@ -738,21 +977,86 @@ final class BrowserIntegrationAcceptance {
       let right = owner.store.createTab(address: url.appendingPathComponent("focus-right").absoluteString) else {
       throw Failure("Hosted focus fixture tabs")
     }
+    owner.beginSelectionFocusDiagnostics(tabIDs: [left.id, right.id])
+    var hostedSelectionPassed = false
+    defer {
+      owner.flushSelectionFocusDiagnostics(outcome: hostedSelectionPassed ? "passed" : "failed")
+      if !hostedSelectionPassed {
+        let key = NSApp.keyWindow
+        let leftNative = application.engine.pages[left.id], rightNative = application.engine.pages[right.id]
+        let state: [String: Any] = [
+          "activeTabID": owner.store.state.activeTabID ?? "nil",
+          "selectedDocumentID": owner.selectedDocumentID ?? "nil",
+          "expectedLeftID": left.id, "expectedRightID": right.id,
+          "ownerID": owner.windowContext.id, "ownerWindow": owner.window?.windowNumber ?? -1,
+          "ownerOpen": owner.windowContext.isOpen, "ownerClosing": owner.windowContext.isClosing,
+          "ownerSheet": owner.window?.attachedSheet?.identifier?.rawValue ?? "nil",
+          "deletingProfileID": application.deletingProfileID ?? "nil",
+          "appActive": NSApp.isActive, "mouseButtons": NSEvent.pressedMouseButtons,
+          "modalWindow": NSApp.modalWindow?.windowNumber ?? -1,
+          "keyWindow": key?.windowNumber ?? -1,
+          "keyClass": key.map { String(reflecting: type(of: $0)) } ?? "nil",
+          "keyParent": key?.parent?.windowNumber ?? -1,
+          "keyResponder": (key?.firstResponder).map { String(reflecting: type(of: $0)) } ?? "nil",
+          "leftWindow": leftNative?.nativeWindow?.windowNumber ?? -1,
+          "leftVisible": leftNative?.nativeWindow?.isVisible == true, "leftLoading": leftNative?.isLoading == true,
+          "rightWindow": rightNative?.nativeWindow?.windowNumber ?? -1,
+          "rightVisible": rightNative?.nativeWindow?.isVisible == true, "rightLoading": rightNative?.isLoading == true,
+          "presentation": owner.actions.interfacePresentationState().sorted(),
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: state, options: [.sortedKeys]) {
+          fputs("Native hosted selection failure: \(String(decoding: data, as: UTF8.self))\n", stderr)
+        }
+      }
+    }
     owner.store.setSplit(left: left.id, right: right.id)
     owner.store.selectTab(id: left.id)
+    var selectionChangedDuringMaterialization = false
+    let selectionObservation = owner.store.$state.sink { state in
+      if state.activeTabID != left.id { selectionChangedDuringMaterialization = true }
+    }
+    defer { selectionObservation.cancel() }
     let leftPage = try await owner.ensurePageReady(left), rightPage = try await owner.ensurePageReady(right)
     try await loaded(leftPage); try await loaded(rightPage)
     try await wait("hostedSplitShowPreservesSelectedPane") {
       owner.store.state.activeTabID == left.id && leftPage.nativeWindow?.isVisible == true
         && rightPage.nativeWindow?.isVisible == true && NSApp.keyWindow === leftPage.nativeWindow
     }
+    selectionObservation.cancel()
+    try require(!selectionChangedDuringMaterialization,
+      "splitMaterializationPreservesExplicitLeftSelectionAcrossNativeCreationCallbacks")
+    rightPage.focus()
+    try await wait("nativeSplitPaneActivationSelectsItsActualDocument") {
+      owner.store.state.activeTabID == right.id && owner.activePage === rightPage
+        && NSApp.keyWindow === rightPage.nativeWindow && rightPage.nativeWindow?.isKeyWindow == true
+    }
+    owner.store.selectTab(id: left.id)
+    try await wait("logicalSplitSelectionCanReturnToItsLeftDocument") {
+      owner.activePage === leftPage && NSApp.keyWindow === leftPage.nativeWindow
+    }
     owner.store.selectTab(id: right.id)
     try await wait("logicalSplitSelectionFocusesItsActualDocument") {
       owner.activePage === rightPage && NSApp.keyWindow === rightPage.nativeWindow
     }
+    for name in try await NativeSplitSelectionInputAcceptance.run(application: application,
+      owner: owner, left: leftPage, right: rightPage) {
+      try require(true, name)
+    }
+    owner.actions.openFind()
+    do {
+      for name in try await NativeSplitSelectionInputAcceptance.run(application: application,
+        owner: owner, left: leftPage, right: rightPage, withFindBar: true) {
+        try require(true, name)
+      }
+      owner.actions.closeFind()
+    } catch {
+      owner.actions.closeFind()
+      throw error
+    }
     try require(await owner.requestCloseTab(left.id), "inactiveSplitFocusFixtureCloses")
     try require(await owner.requestCloseTab(right.id), "activeSplitFocusFixtureCloses")
     owner.store.selectTab(id: survivor.id)
+    hostedSelectionPassed = true
   }
 
   private func checkFailedDocuments(url: URL, owner: BrowserWindowCoordinator, survivor: ChromiumPage) async throws {
@@ -1036,8 +1340,11 @@ final class BrowserIntegrationAcceptance {
     owner.windowContext.show()
   }
 
+  private enum ExtensionFixtureFeature { case admission, search, management, uninstall, uiOwner, hostNavigation, sameDocumentHistory }
+
   private func checkExtensionFixture(url: URL, owner: BrowserWindowCoordinator, page: ChromiumPage,
-    includeProtocolFixtures: Bool = true, servicesOnly: Bool = false) async throws {
+    includeProtocolFixtures: Bool = true, servicesOnly: Bool = false, popupCloseOnly: Bool = false,
+    featureOnly: ExtensionFixtureFeature? = nil) async throws {
     guard let fixture = ProcessInfo.processInfo.environment["ZACRO_NATIVE_EXTENSION_FIXTURE"] else {
       throw Failure("Missing real-extension acceptance fixture")
     }
@@ -1052,6 +1359,77 @@ final class BrowserIntegrationAcceptance {
     try require(NSImage(data: icon) != nil, "extensionToolbarIconDecodesWithoutBlockedDataURLFetch")
     let worker = try await manager.workerSession(identifier)
     do {
+      if let featureOnly {
+        switch featureOnly {
+        case .admission:
+          for name in try await NativeAuxiliaryAdmissionAcceptance.run(application: application,
+            url: url, owner: owner, worker: worker) { checks[name] = true }
+        case .search:
+          for name in try await NativeExtensionSearchAcceptance.run(application: application,
+            url: url, owner: owner, page: page, worker: worker) { checks[name] = true }
+        case .management:
+          // The focused disposable run deliberately has no guest document.
+          // Its real AppKit shell must host Chrome consent without borrowing
+          // a previously focused CEF browser from another tab or window.
+          guard suite == "extension-management", application.engine.pages[page.id] === page,
+            page.ownerWindowID == owner.windowContext.id, !page.isPrivate,
+            owner.store.activeProfileID == page.profileID,
+            owner.store.state.tabs.filter({ !$0.isClosed && $0.windowID == owner.windowContext.id }).map(\.id) == [page.id]
+          else { throw Failure("The focused management fixture does not own its only fresh source document.") }
+          let closedSource = try await page.ready()
+          try owner.store.commit { $0.activeTabID = nil }
+          owner.layoutPages()
+          try require(owner.activePage == nil && owner.store.state.activeTabID == nil,
+            "nativeManagementEmptyShellSelectsBlankBeforeClosingItsOnlySource")
+          try require(await owner.requestCloseTab(page.id), "nativeManagementEmptyShellClosesItsExactSourceNormally")
+          try await wait("nativeManagementEmptyShellHasNoGuestBrowser") {
+            closedSource.isClosed && self.application.engine.pages[page.id] == nil
+              && owner.activePage == nil && owner.store.state.activeTabID == nil
+              && !owner.store.state.tabs.contains { !$0.isClosed && $0.windowID == owner.windowContext.id }
+              && !self.application.engine.pages.values.contains {
+                $0.ownerWindowID == owner.windowContext.id && $0.browser?.isClosed != true
+              }
+          }
+          owner.windowContext.show(); owner.actions.openPalette(); owner.layoutPages()
+          defer { owner.actions.palette = false; owner.layoutPages() }
+          try await wait("nativeManagementEmptyShellRetainsItsRealOwnedPalette") {
+            guard let shell = owner.window, shell.isVisible, owner.actions.palette else { return false }
+            return NSApp.windows.contains { $0.isVisible && $0.parent === shell
+              && $0.identifier == NSUserInterfaceItemIdentifier("ZacroBrowserControls") }
+          }
+          for (name, passed) in try await NativeManagementAcceptance.check(manager: manager,
+            identifier: identifier, owner: owner.windowContext) { try require(passed, name) }
+          try require(closedSource.isClosed && application.engine.pages[page.id] == nil
+            && owner.activePage == nil && owner.store.state.activeTabID == nil
+            && !application.engine.pages.values.contains {
+              $0.ownerWindowID == owner.windowContext.id && $0.browser?.isClosed != true
+            },
+            "nativeManagementConsentOnEmptyShellDoesNotCreateOrBorrowAGuestDocument")
+        case .uninstall:
+          for name in try await NativeExtensionUninstallAcceptance.run(application: application,
+            url: url, owner: owner, page: page, triggerWorker: worker) { checks[name] = true }
+        case .uiOwner:
+          for name in try await NativeExtensionUIOwnerAcceptance.run(application: application,
+            url: url, owner: owner, page: page, triggerWorker: worker) { checks[name] = true }
+        case .hostNavigation:
+          for name in try await NativeExtensionHostNavigationAcceptance.run(application: application,
+            url: url, owner: owner, page: page, triggerWorker: worker) { checks[name] = true }
+        case .sameDocumentHistory:
+          for name in try await NativeHistoryMirrorRuntimeAcceptance.runSameDocument(application: application,
+            url: url, owner: owner, worker: worker) { checks[name] = true }
+        }
+        extensionFixturePassed = false
+        await worker.close()
+        return
+      }
+      if popupCloseOnly {
+        for name in try await NativeExtensionPopupLifetimeAcceptance.run(application: application,
+          url: url, originalOwner: owner, unrelatedPage: page, manager: manager,
+          identifier: identifier, worker: worker, mode: .acceptedCloseOnly) { checks[name] = true }
+        extensionFixturePassed = false
+        await worker.close()
+        return
+      }
       // A separate, explicitly partial suite reaches services independently of
       // action-popup acceptance. Full/extensions keep their original sequence
       // and strict popup gate below; this path cannot mark that fixture passed.
@@ -1091,6 +1469,18 @@ final class BrowserIntegrationAcceptance {
         try await checkNativeIdentity(worker: worker, baseURL: url, profileID: page.profileID)
         for name in try await NativeAuxiliaryBrowserAcceptance.run(application: application,
           url: url, owner: owner, worker: worker) { checks[name] = true }
+        for name in try await NativeAuxiliaryAdmissionAcceptance.run(application: application,
+          url: url, owner: owner, worker: worker) { checks[name] = true }
+        for name in try await NativeExtensionSearchAcceptance.run(application: application,
+          url: url, owner: owner, page: page, worker: worker) { checks[name] = true }
+        for name in try await NativeExtensionUninstallAcceptance.run(application: application,
+          url: url, owner: owner, page: page, triggerWorker: worker) { checks[name] = true }
+        for name in try await NativeExtensionUIOwnerAcceptance.run(application: application,
+          url: url, owner: owner, page: page, triggerWorker: worker) { checks[name] = true }
+        for name in try await NativeExtensionHostNavigationAcceptance.run(application: application,
+          url: url, owner: owner, page: page, triggerWorker: worker) { checks[name] = true }
+        for name in try await NativeHistoryMirrorRuntimeAcceptance.runSameDocument(application: application,
+          url: url, owner: owner, worker: worker) { checks[name] = true }
       }
       try await checkNativeMessaging(worker: worker, identifier: identifier)
       owner.store.selectTab(id: page.id)
@@ -1109,7 +1499,12 @@ final class BrowserIntegrationAcceptance {
       try await checkProgrammaticActionPopup(worker: worker, owner: owner, source: page, url: url)
       try await checkNativeBookmarkMigration(manager: manager, profileID: page.profileID, url: url)
       try await checkNativeDownload(worker: worker, page: page, url: url)
-      try await checkNativePeek(manager: manager, identifier: identifier, worker: worker, owner: owner, source: page, url: url)
+      if suite == "extension-actions" {
+        try await checkNativePeekInPersistentSplit(manager: manager, identifier: identifier,
+          worker: worker, owner: owner, source: page, url: url)
+      } else {
+        try await checkNativePeek(manager: manager, identifier: identifier, worker: worker, owner: owner, source: page, url: url)
+      }
       guard let blank = owner.store.createTab(address: "about:blank") else { throw Failure("Blank action tab") }
       let blankPage = try await owner.extensionActionPage(profileID: page.profileID)
       try await manager.performAction(identifier, on: blankPage)
@@ -1130,8 +1525,15 @@ final class BrowserIntegrationAcceptance {
       try require(popup["windowID"] as? Int == owner.windowContext.nativeID
         && (popup["tabIDs"] as? [Int]) == [blankPage.reservedNativeTabID].compactMap { $0 },
         "extensionPopupOnBlankUsesLogicalOwnerAndActiveTab")
+      _ = try await worker.evaluate("zacroAcceptance.closePopup()")
+      try await wait("blankActionPopupClosesBeforeIndependentFixtures") {
+        !NSApp.windows.contains { self.application.engine.extensionPopupOwner($0) === owner.windowContext }
+      }
       _ = try await worker.evaluate("zacroAcceptance.configureAction('record')")
       owner.store.selectTab(id: page.id)
+      for name in try await NativeExtensionPopupLifetimeAcceptance.run(application: application,
+        url: url, originalOwner: owner, unrelatedPage: page, manager: manager,
+        identifier: identifier, worker: worker) { checks[name] = true }
       _ = try await worker.evaluate("zacroAcceptance.setPanelEventObservation(false)")
       try await checkNativeSidePanel(manager: manager, identifier: identifier, worker: worker,
                                      owner: owner, source: page, url: url)
@@ -1449,13 +1851,37 @@ final class BrowserIntegrationAcceptance {
       let instance = initial["instance"] as? String else { throw Failure("Native side panel document") }
     try require(initial["windowID"] as? Int == owner.windowContext.nativeID,
       "sidePanelUsesLogicalBrowserWindow")
+    NativeSidePanelPresentationDiagnostics.report("before-error-navigation",
+      snapshot: NativeSidePanelPresentationDiagnostics.snapshot(page: hostPage, owner: owner))
     owner.navigate("http://127.0.0.1:1/panel-error")
-    try await wait("failedDocumentKeepsNativeSidePanelVisible") {
-      guard let bounds = hostPage.documentBounds, let window = hostPage.nativeWindow else { return false }
-      return hostPage.documentError != nil && hostPage.isSidePanelVisible && window.isVisible
-        && bounds.width > 0 && bounds.width < window.frame.width - 20
-        && owner.hasPresentedDocumentError(host.id)
+    var lastPresentation: String?, presentationChanges = 0
+    do {
+      try await wait("failedDocumentKeepsNativeSidePanelVisible") {
+        let state = NativeSidePanelPresentationDiagnostics.snapshot(page: hostPage, owner: owner)
+        if state != lastPresentation, presentationChanges < 32 {
+          presentationChanges += 1; lastPresentation = state
+          NativeSidePanelPresentationDiagnostics.report("waiting-\(presentationChanges)", snapshot: state)
+        }
+        guard let bounds = hostPage.documentBounds, let window = hostPage.nativeWindow else { return false }
+        return hostPage.documentError != nil && hostPage.isSidePanelVisible && window.isVisible
+          && bounds.width > 0 && bounds.width < window.frame.width - 20
+          && owner.hasPresentedDocumentError(host.id)
+      }
+    } catch {
+      NativeSidePanelPresentationDiagnostics.report("predicate-failed",
+        snapshot: NativeSidePanelPresentationDiagnostics.snapshot(page: hostPage, owner: owner))
+      await NativeSidePanelPresentationDiagnostics.nativeFailureSnapshot(page: hostPage, owner: owner)
+      throw error
     }
+    let failedAddress = "http://127.0.0.1:1/panel-error"
+    try await wait("committedErrorKeepsNativeAndSavedAddressInSync") {
+      hostPage.url?.absoluteString == failedAddress
+        && hostPage.browser?.url?.absoluteString == failedAddress
+        && owner.store.document(id: host.id)?.url == failedAddress
+        && hostPage.documentError?.url?.absoluteString == failedAddress
+    }
+    try require(owner.windowContext.window.attachedSheet == nil,
+      "failedDocumentUsesInlineErrorWithoutDuplicateModalAlert")
     guard let documentBounds = hostPage.documentBounds,
       let errorBounds = owner.presentedDocumentErrorBounds(host.id) else {
       throw Failure("Side panel error presentation bounds")
@@ -1507,6 +1933,89 @@ final class BrowserIntegrationAcceptance {
     _ = try await worker.evaluate("zacroAcceptance.configureAction('record')")
   }
 
+  private func checkNativePeekInPersistentSplit(manager: ChromeExtensionManager, identifier: String,
+    worker: ChromeExtensionWorkerSession, owner: BrowserWindowCoordinator,
+    source: ChromiumPage, url: URL) async throws {
+    guard suite == "extension-actions", application.engine.pages[source.id] === source,
+      let sourceTab = owner.store.tab(source.id), !sourceTab.isClosed, sourceTab.peek == nil,
+      sourceTab.spaceID == owner.store.state.activeSpaceID,
+      sourceTab.windowID == owner.windowContext.id, source.profileID == owner.store.activeProfileID else {
+      throw Failure("The focused extension Peek split fixture lost its exact source.")
+    }
+    let previousSplit = owner.store.split(for: source.id), previousSelection = owner.store.state.activeTabID
+    var siblingID: String?, fixtureSplitID: String?, cleaned = false
+    func cleanup() async throws {
+      guard !cleaned else { return }; cleaned = true
+      var failure: Error?
+      if let peek = owner.store.tab(source.id)?.peek,
+        ["extension-peek", "extension-peek-close"].contains(URL(string: peek.url)?.lastPathComponent ?? ""),
+        !(await owner.requestCloseTab("peek:" + source.id)) {
+        failure = Failure("The exact owned focused Peek did not accept normal close.")
+      }
+      if let siblingID, owner.store.tab(siblingID)?.isClosed == false,
+        !(await owner.requestCloseTab(siblingID)) {
+        failure = failure ?? Failure("The exact owned Peek split sibling did not accept normal close.")
+      }
+      do {
+        if let previousSplit {
+          guard previousSplit.tabIDs.allSatisfy({ owner.store.tab($0)?.isClosed == false }) else {
+            throw Failure("The original Peek fixture split no longer has both live members.")
+          }
+          guard !owner.store.state.splits.contains(where: {
+            $0.id != fixtureSplitID && !Set($0.tabIDs).isDisjoint(with: previousSplit.tabIDs)
+          }) else { throw Failure("The original Peek fixture split acquired a conflicting owner.") }
+        }
+        try owner.store.commit { state in
+          if let fixtureSplitID { state.splits.removeAll { $0.id == fixtureSplitID } }
+          if let previousSplit { state.splits.append(previousSplit) }
+        }
+        guard owner.store.split(for: source.id) == previousSplit else {
+          throw Failure("The focused Peek fixture did not restore its exact previous split.")
+        }
+      } catch { failure = failure ?? error }
+      if let previousSelection, owner.store.tab(previousSelection)?.isClosed == false {
+        owner.store.selectTab(id: previousSelection)
+      }
+      owner.layoutPages()
+      if let failure { throw failure }
+    }
+    do {
+      if previousSplit != nil { owner.store.unsplit(tabID: source.id) }
+      guard let sibling = owner.store.createTab(address: url.appendingPathComponent("extension-peek-sibling-" + UUID().uuidString).absoluteString,
+        spaceID: sourceTab.spaceID, activate: false) else { throw Failure("No exact owned extension Peek split sibling.") }
+      siblingID = sibling.id
+      owner.store.setSplit(left: source.id, right: sibling.id)
+      guard let split = owner.store.split(for: source.id), split.leftTabID == source.id,
+        split.rightTabID == sibling.id else { throw Failure("The focused Peek source did not enter its real persistent split.") }
+      fixtureSplitID = split.id
+      let siblingPage = try await owner.ensurePageReady(sibling)
+      try await application.navigation.waitForRestore(siblingPage)
+      try await loaded(siblingPage)
+      owner.store.selectTab(id: sibling.id); owner.windowContext.show(); owner.layoutPages(); siblingPage.focus()
+      try await wait("extensionPeekStartsFromRealPersistentSplitWithSiblingNativeFocus") {
+        owner.store.split(for: source.id) == split && owner.store.state.activeTabID == sibling.id
+          && application.engine.pages[source.id] === source && source.nativeWindow?.isVisible == true
+          && application.engine.pages[sibling.id] === siblingPage && siblingPage.nativeWindow?.isVisible == true
+          && NSApp.keyWindow === siblingPage.nativeWindow && siblingPage.nativeWindow?.isKeyWindow == true
+      }
+      // The original helper selects the source, presents Peek, and runs the
+      // unchanged native tabs.update/get/query assertions. No expected state
+      // is imposed between those original API calls.
+      try await checkNativePeek(manager: manager, identifier: identifier, worker: worker, owner: owner, source: source, url: url)
+      try await cleanup()
+      try require(owner.store.split(for: source.id) == previousSplit,
+        "extensionPeekFocusedFixtureRestoresItsExactPriorSplit")
+    } catch {
+      let original = error
+      let cleanupTask = Task { @MainActor in
+        do { try await cleanup() }
+        catch { fputs("Native focused Peek split cleanup failed: \(error.localizedDescription)\n", stderr) }
+      }
+      await cleanupTask.value
+      throw original
+    }
+  }
+
   private func checkNativePeek(manager: ChromeExtensionManager, identifier: String,
                                worker: ChromeExtensionWorkerSession, owner: BrowserWindowCoordinator,
                                source: ChromiumPage, url: URL) async throws {
@@ -1523,7 +2032,33 @@ final class BrowserIntegrationAcceptance {
     guard let sourceID = source.reservedNativeTabID, let peekID = preview.reservedNativeTabID else {
       throw Failure("Extension Peek native identities")
     }
-    _ = try await worker.evaluate("zacroPeekFixture.activateSourceThenPeek(\(sourceID),\(peekID))")
+    func logActivation(_ phase: String, error: Error? = nil) {
+      let ids = Set([source.id, preview.id] + (owner.store.split(for: source.id)?.tabIDs ?? []))
+      let documents = ids.sorted().map { id -> [String: Any] in
+        let native = application.engine.pages[id], tab = owner.store.document(id: id)
+        return ["id": id, "modelExists": tab != nil, "nativeExists": native != nil,
+          "nativeID": native?.reservedNativeTabID ?? -1, "browserID": native?.browser?.id ?? -1,
+          "modelURL": String((tab?.url ?? "").prefix(500)),
+          "nativeURL": String((native?.url?.absoluteString ?? "").prefix(500)),
+          "profile": native?.profileID ?? "", "owner": native?.ownerWindowID ?? "",
+          "window": native?.nativeWindow?.windowNumber ?? -1,
+          "key": native?.nativeWindow?.isKeyWindow == true,
+          "visible": native?.nativeWindow?.isVisible == true,
+          "parent": native?.nativeWindow?.parent?.windowNumber ?? -1]
+      }
+      let value: [String: Any] = ["phase": phase, "owner": owner.windowContext.id,
+        "activeProfile": owner.store.activeProfileID, "sourceProfile": source.profileID,
+        "activeTab": owner.store.state.activeTabID ?? "", "selectedDocument": owner.selectedDocumentID ?? "",
+        "activePage": owner.activePage?.id ?? "", "sourceID": sourceID, "peekID": peekID,
+        "peekPresented": owner.store.tab(source.id)?.peek?.isPresented.map { $0 as Any } ?? NSNull(),
+        "keyWindow": NSApp.keyWindow?.windowNumber ?? -1,
+        "error": error.map { String($0.localizedDescription.prefix(4_000)) } ?? "", "documents": documents]
+      if let data = try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]),
+        let text = String(data: data, encoding: .utf8) { fputs("Native extension Peek activation \(text)\n", stderr) }
+    }
+    logActivation("before-original-source-then-peek")
+    do { _ = try await worker.evaluate("zacroPeekFixture.activateSourceThenPeek(\(sourceID),\(peekID))") }
+    catch { logActivation("original-source-then-peek-failed", error: error); throw error }
     try require(owner.activePage === preview && owner.store.tab(source.id)?.peek?.isPresented != false,
       "extensionSelectsRetainedPeekAndSource")
     let browser = try await preview.ready()

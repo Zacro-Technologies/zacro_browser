@@ -29,9 +29,13 @@ import ZacroCore
     }
     originalOwner.windowContext.show()
     application.repository.focusWindow(originalOwner.windowContext.id)
+    let previousWindows = Set(application.windows.keys)
     application.newWindow()
-    guard let owner = application.focusedCoordinator, owner !== originalOwner else {
-      throw ShortcutError("No retirement fixture owner")
+    let added = application.windows.values.filter {
+      !previousWindows.contains($0.windowContext.id) && $0.windowContext.isOpen && !$0.windowContext.isClosing
+    }
+    guard added.count == 1, let owner = added.first else {
+      throw ShortcutError("No exact new retirement fixture owner")
     }
     owner.actions.palette = false
     let address = url.appendingPathComponent("native-history-form")
@@ -97,22 +101,13 @@ import ZacroCore
         })()
         """)
       try await wait("actual retirement input target is focused and hit-testable") {
-        guard owner.activePage === target, target.browser === native else { return false }
+        guard owner.activePage === target, target.browser === native,
+          let view = native.nativeView, let nativeWindow = view.window,
+          nativeWindow.isVisible, nativeWindow.isKeyWindow, NSApp.keyWindow === nativeWindow else { return false }
         return try await native.devTools.evaluate("document.hasFocus() && document.elementFromPoint(60,36)?.id==='retirementActivate'") as? Bool == true
       }
-      for type in ["mousePressed", "mouseReleased"] {
-        _ = try await native.devTools.call("Input.dispatchMouseEvent", parameters: [
-          "type": type, "x": 60, "y": 36, "button": "left", "clickCount": 1,
-          "buttons": type == "mousePressed" ? 1 : 0,
-        ])
-      }
-      let activated = try await native.devTools.evaluate("""
-        ({trusted:globalThis.retirementClick?.trusted===true,
-          primary:globalThis.retirementClick?.button===0,
-          sticky:navigator.userActivation.hasBeenActive,
-          focused:document.hasFocus(), guarded:typeof window.onbeforeunload==='function',
-          target:document.elementFromPoint(60,36)?.id, viewport:[innerWidth,innerHeight]})
-        """) as? [String: Any] ?? [:]
+      let activated = try await NativeDocumentActivationAcceptance.click(application: application,
+        owner: owner, page: target, buttonID: "retirementActivate", label: "model-first-retirement")
       fputs("Native retirement activation id=\(target.id): \(activated)\n", stderr)
       return ["trusted", "primary", "sticky", "focused", "guarded"].allSatisfy { activated[$0] as? Bool == true }
     }

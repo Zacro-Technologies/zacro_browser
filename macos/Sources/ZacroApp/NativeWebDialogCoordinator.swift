@@ -11,7 +11,7 @@ final class NativeWebDialogCoordinator {
     weak var page: ChromiumPage?
     weak var browser: CefBrowser?
     weak var window: NSWindow?
-    let pageID: String
+    var pageID: String
     let profileID: String
     let ownerID: String
     let address: URL?
@@ -112,6 +112,20 @@ final class NativeWebDialogCoordinator {
     page.onJavaScriptDialogReset = nil
   }
 
+  /// Only the admitted popup's synchronous Core/native handoff may retarget a
+  /// live request. Every other document/browser/owner/URL guard stays exact.
+  func didAdoptPendingPopup(_ page: ChromiumPage, fromID: String) {
+    guard let application, application.engine.pages[page.id] === page,
+      let document = application.store.document(id: page.id), !document.isClosed,
+      document.windowID == page.ownerWindowID,
+      application.store.profileID(for: document) == page.profileID else { return }
+    for request in requests.values where request.page === page && request.pageID == fromID {
+      guard request.browser === page.browser, request.profileID == page.profileID,
+        request.ownerID == page.ownerWindowID, request.address == page.url else { continue }
+      request.pageID = page.id
+    }
+  }
+
   func close() async {
     stopped = true
     let old = Array(requests.values)
@@ -167,11 +181,15 @@ final class NativeWebDialogCoordinator {
       (request.beforeUnload || application.deletingProfileID != request.profileID),
       let owner = application.windows[request.ownerID], owner.windowContext.isOpen,
       owner.windowContext.window === request.window,
-      let document = application.store.document(id: request.pageID), !document.isClosed,
-      document.windowID == request.ownerID,
-      application.store.profileID(for: document) == request.profileID,
       let profile = application.store.state.profiles.first(where: { $0.id == request.profileID }),
       profile.isPrivate == page.isPrivate else { return false }
+    let document = application.store.document(id: request.pageID)
+    let hasCoreOwner = document.map {
+      !$0.isClosed && $0.windowID == request.ownerID
+        && application.store.profileID(for: $0) == request.profileID
+    } == true
+    guard hasCoreOwner || (document == nil && application.popupAdoptions.authorizesPendingDialog(page))
+      else { return false }
     // Real close/Quit must still negotiate beforeunload. Merely initiating
     // that close is never a reason to auto-veto its own prompt.
     return request.beforeUnload || (!owner.windowContext.isClosing && !application.engine.isTerminating)
