@@ -135,5 +135,6 @@ final class NativeSpacePageHost: NSHostingView<AnyView> {
   var contentRevision: UInt64 = 0
   var rootReplacementCount: UInt64 = 0
   override var isOpaque: Bool { false }
+  override func acceptsFirstMouse(for event: NSEvent?) -> Bool { isSelected }
   override func hitTest(_ point: NSPoint) -> NSView? { isSelected ? super.hitTest(point) : nil }
 }

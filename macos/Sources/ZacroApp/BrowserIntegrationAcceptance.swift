@@ -56,7 +56,7 @@ final class BrowserIntegrationAcceptance {
   /// Focused runs use the same production fixtures and disposable application
   /// owners. Their report names the suite and never claims full-app acceptance.
   private func checkFocusedSuite(url: URL) async throws {
-    guard ["extensions", "extension-actions", "extension-services", "extension-admission", "extension-search", "extension-management", "extension-uninstall", "extension-ui-owner", "extension-host", "history-mirror", "history-spa", "history-veto", "history-publication", "popup-close", "popup-adoption", "download-retirement", "windows", "hosted-selection", "resize", "peek", "navigation", "capture", "media", "sidebar", "space-input-construction", "space-swipe", "space-swipe-prelude", "recovery", "interface", "interface-prelude", "application-reopening"].contains(suite),
+    guard ["extensions", "extension-actions", "extension-services", "extension-admission", "extension-search", "extension-management", "extension-uninstall", "extension-ui-owner", "extension-host", "history-mirror", "history-spa", "history-veto", "history-publication", "popup-close", "popup-adoption", "download-retirement", "windows", "hosted-selection", "resize", "peek", "navigation", "capture", "media", "sidebar", "space-input-construction", "space-swipe", "space-swipe-prelude", "recovery", "interface", "interface-prelude", "application-reopening", "focus-family"].contains(suite),
       let owner = application.focusedCoordinator else { throw Failure("Unknown acceptance suite or missing owner") }
     let engine = application.engine
     nativeExtensions = try await engine.nativeCapabilities().extensionBrowser == true
@@ -91,7 +91,11 @@ final class BrowserIntegrationAcceptance {
     try await application.navigation.waitForRestore(page)
     try await loaded(page)
     try await page.ready().setDownloadDirectory(directory)
-    if suite == "application-reopening" {
+    if suite == "focus-family" {
+      for name in try await NativeBrowserFocusFamilyAcceptance.run(application: application, owner: owner, page: page) {
+        try require(true, name)
+      }
+    } else if suite == "application-reopening" {
       try await checkApplicationReopening(url: url, owner: owner, page: page)
     } else if suite == "recovery" {
       for name in try await NativeAuxiliaryTerminationRecoveryAcceptance.run() { try require(true, name) }
@@ -134,6 +138,7 @@ final class BrowserIntegrationAcceptance {
       for name in try await NativeInterfaceAlignmentAcceptance.run() { try require(true, name) }
       for name in try await NativeThemeAlignmentAcceptance.run() { try require(true, name) }
       for (name, passed) in NativePaneShadowAcceptance.check() { try require(passed, name) }
+      for (name, passed) in try NativeChromeMaterialAcceptance.check() { try require(passed, name) }
       try await NativeChromeControlRenderEvidence.capture(directory: engine.dataDirectory)
       for name in try await NativeWindowResizeAcceptance.run(application: application, url: url, originalOwner: owner) {
         try require(true, name)
@@ -240,6 +245,7 @@ final class BrowserIntegrationAcceptance {
     for (name, passed) in NativeThemeColorWellAcceptance.check() { try require(passed, name) }
     for (name, passed) in NativeThemeColorAcceptance.check() { try require(passed, name) }
     for (name, passed) in NativePaneShadowAcceptance.check() { try require(passed, name) }
+    for (name, passed) in try NativeChromeMaterialAcceptance.check() { try require(passed, name) }
   }
 
   private func retireInitialPaletteBeforeInterfaceFixtures(owner: BrowserWindowCoordinator, window: NSWindow) async throws {

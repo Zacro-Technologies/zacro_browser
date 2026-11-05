@@ -201,6 +201,7 @@ final class BrowserWindowCoordinator: NSObject, NSMenuItemValidation {
   private var siteControlsInitialized = false
   private var siteControlProfileID: String?
   private var commandFingerprint = ""
+  private var nativeMenus: (fingerprint: String, bar: NSMenu, services: NSMenu, windows: NSMenu, help: NSMenu)?
   private var recentTabCycle: [String]?
   private var recentTabIndex = 0
   private var recentModifiers: NSEvent.ModifierFlags = []
@@ -514,6 +515,17 @@ final class BrowserWindowCoordinator: NSObject, NSMenuItemValidation {
     }
     peekPanel.hide(immediately: immediately)
   }
+  private func performToolbarNavigation(_ action: () -> Void) {
+    let event = NSApp.currentEvent
+    let mouseOrigin = event?.window === window
+      // The delivered release event is authoritative. AppKit's global button
+      // snapshot can still report the button during this mouse-up action.
+      && event?.type == .leftMouseUp
+      && event.map { abs(ProcessInfo.processInfo.systemUptime - $0.timestamp) <= 0.5 } == true
+    let restorePage = mouseOrigin ? actions.capturePageFocusRestoration() : nil
+    action()
+    _ = restorePage?()
+  }
   func install(show: Bool = true) {
     guard let window = window else { return }
     store.enableDebouncedPersistence()
@@ -555,13 +567,21 @@ final class BrowserWindowCoordinator: NSObject, NSMenuItemValidation {
       self?.scheduleLayout()
       self?.focusSelectedDocument(force: true)
     }
-    actions.back = { [weak self] in self?.goBack() }
-    actions.forward = { [weak self] in self?.goForward() }
+    actions.back = { [weak self] in
+      guard let self else { return }
+      self.performToolbarNavigation { self.goBack() }
+    }
+    actions.forward = { [weak self] in
+      guard let self else { return }
+      self.performToolbarNavigation { self.goForward() }
+    }
     actions.reload = { [weak self] in
       guard let self else { return }
-      if let page = self.activePage {
-        if page.isLoading { page.stop() } else { page.reload() }
-      } else { self.retryActivePage() }
+      self.performToolbarNavigation {
+        if let page = self.activePage {
+          if page.isLoading { page.stop() } else { page.reload() }
+        } else { self.retryActivePage() }
+      }
     }
     actions.zoom = { [weak self] in self?.activePage?.zoom(by: $0) }
     actions.printPage = { [weak self] in self?.activePage?.printPage() }
@@ -571,6 +591,61 @@ final class BrowserWindowCoordinator: NSObject, NSMenuItemValidation {
         !self.engine.isTerminating, !self.actions.palette, !self.actions.themeEditor,
         self.actions.library == nil, self.window?.attachedSheet == nil, NSApp.modalWindow == nil else { return }
       self.activePage?.focus()
+    }
+    actions.capturePageFocusRestoration = { [weak self] in
+      guard let self, NSApp.isActive, self.windowContext.isOpen, !self.windowContext.isClosing,
+        !self.engine.isTerminating, self.deletingProfileID == nil,
+        let root = self.window, let page = self.activePage, let native = page.nativeWindow,
+        native.isVisible,
+        self.selectedDocumentID == page.id, page.ownerWindowID == self.windowContext.id,
+        page.profileID == self.store.activeProfileID, self.engine.pages[page.id] === page else { return nil }
+      let documentOrigin = NSApp.keyWindow === native && native.isKeyWindow
+      let event = NSApp.currentEvent
+      let rootMouseOrigin = NSApp.keyWindow === root && root.isKeyWindow
+        && event?.window === root && (event?.type == .leftMouseDown || event?.type == .leftMouseUp)
+        && event.map { abs(ProcessInfo.processInfo.systemUptime - $0.timestamp) <= 0.5 } == true
+        && !((root.firstResponder as? NSText)?.isEditable == true)
+      guard documentOrigin || rootMouseOrigin else { return nil }
+      let ownerID = self.windowContext.id, selectedID = page.id, profileID = page.profileID
+      let rootEditor = root.firstResponder as? NSTextView
+      let rootEditorDelegate = rootEditor?.delegate as AnyObject?
+      return { [weak self, weak page, weak native, weak root, weak rootEditor,
+        weak rootEditorDelegate] in
+        guard let self, let page, let native, let root else { return false }
+        @MainActor func admitted() -> Bool {
+          guard NSApp.isActive, self.application.focusedCoordinator === self,
+            self.windowContext.id == ownerID, self.window === root,
+            self.windowContext.isOpen, !self.windowContext.isClosing, !self.engine.isTerminating,
+            self.deletingProfileID == nil, root.isVisible, !root.isMiniaturized,
+            self.store.activeProfileID == profileID, self.selectedDocumentID == selectedID,
+            self.activePage === page, self.engine.pages[selectedID] === page,
+            page.ownerWindowID == ownerID, page.profileID == profileID, page.documentError == nil,
+            page.nativeWindow === native, native.isVisible,
+            !self.actions.palette, !self.actions.themeEditor, self.actions.library == nil,
+            !self.actions.findVisible, !self.actions.recordingShortcut,
+            root.attachedSheet == nil, NSApp.modalWindow == nil else { return false }
+          let key = NSApp.keyWindow
+          let retiringPalette = self.retiringPaletteWindow
+          let retiringOwnPanel = key === retiringPalette && retiringPalette?.isVisible == false
+            && retiringPalette?.parent == nil && ProcessInfo.processInfo.systemUptime < self.retiringPaletteDeadline
+          guard key == nil || key === native || key === root || retiringOwnPanel else { return false }
+          if key === root, let editor = root.firstResponder as? NSTextView {
+            guard editor === rootEditor, (editor.delegate as AnyObject?) === rootEditorDelegate else { return false }
+          }
+          return true
+        }
+        guard admitted() else { return false }
+        self.cancelSelectionFocus()
+        self.layoutPages()
+        guard admitted() else { return false }
+        // Clear an old rail keyboard target only for this admitted explicit
+        // document return. A generic native-key notification can also occur
+        // during an unrelated root-editor/sidebar handoff.
+        self.actions.prepareDocumentFocusRestoration()
+        guard admitted() else { return false }
+        page.focus()
+        return NSApp.keyWindow === native && native.isKeyWindow
+      }
     }
     actions.sidebarToggleOwnsFocus = { [weak self] candidate in
       self?.ownsSidebarToggleFocus(candidate) == true
@@ -2399,6 +2474,19 @@ final class BrowserWindowCoordinator: NSObject, NSMenuItemValidation {
   }
   func installMenus() {
     let catalog = BrowserShortcut.catalog(overrides: store.state.settings.shortcutOverrides)
+    let menuFingerprint = catalog.map { "\($0.id):\($0.accelerator):\(commandAvailable($0.id))" }.joined(separator: "|")
+      + ":\(window?.styleMask.contains(.fullScreen) == true):"
+      + ["unsplit", "reopen-window", "window-minimize", "window-zoom"].map { "\($0):\(commandAvailable($0))" }.joined(separator: "|")
+    if let cached = nativeMenus, cached.fingerprint == menuFingerprint {
+      // Chrome can replace the application's menu when its native document
+      // becomes key. Restore our exact owner's bar without rebuilding every
+      // menu for a page/editor focus change inside the same browser.
+      if NSApp.servicesMenu !== cached.services { NSApp.servicesMenu = cached.services }
+      if NSApp.windowsMenu !== cached.windows { NSApp.windowsMenu = cached.windows }
+      if NSApp.helpMenu !== cached.help { NSApp.helpMenu = cached.help }
+      if NSApp.mainMenu !== cached.bar { NSApp.mainMenu = cached.bar }
+      return
+    }
     func command(_ id: String, _ title: String) -> NSMenuItem {
       let item = NSMenuItem(title: title, action: #selector(menuCommand(_:)), keyEquivalent: "")
       item.target = self; item.representedObject = id; item.isEnabled = commandAvailable(id)
@@ -2451,8 +2539,10 @@ final class BrowserWindowCoordinator: NSObject, NSMenuItemValidation {
     window.addItem(command("window-zoom", "Zoom"))
     window.addItem(.separator()); window.addItem(withTitle: "Bring All to Front", action: #selector(NSApplication.arrangeInFront(_:)), keyEquivalent: "")
     NSApp.windowsMenu = window
-    NSApp.helpMenu = append("Help", [("onboarding","Welcome Tour"),("",""),("releases","Zacro Releases"),("issues","Report an Issue")])
+    let help = append("Help", [("onboarding","Welcome Tour"),("",""),("releases","Zacro Releases"),("issues","Report an Issue")])
+    NSApp.helpMenu = help
     NSApp.mainMenu = bar
+    nativeMenus = (menuFingerprint, bar, servicesMenu, window, help)
   }
   private func deleteScope(space: String?, profile: String?) {
     guard pendingDeletion == nil, deletingProfileID == nil else { return }
@@ -3705,6 +3795,9 @@ extension BrowserWindowCoordinator {
 
 final class PassthroughHostingView<Content: View>: NSHostingView<Content> {
   var shouldPassThrough: (NSPoint) -> Bool = { _ in false }
+  // The document can be key while this shell remains the browser's main
+  // window. A click on browser chrome must perform its action immediately.
+  override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
   override func hitTest(_ point: NSPoint) -> NSView? {
     let local = convert(point, from: superview)
     return shouldPassThrough(local) ? nil : super.hitTest(point)

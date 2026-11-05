@@ -377,12 +377,7 @@ public final class CefChromeBrowser {
                 window.styleMask.subtract(frameStyles)
             }
         }
-        guard let content = window.contentView else { return }
-        window.isOpaque = false
-        window.backgroundColor = .clear
-        window.hasShadow = false
-        content.wantsLayer = true
-        guard let layer = content.layer else { return }
+        guard let layer = Self.preparePageLayer(in: window) else { return }
         let bounds = layer.bounds
         guard clippedPageLayer !== layer || pageClipGeometry != bounds
             || appliedPageClipRadius != pageCornerRadius || layer.mask !== pageClipMask
@@ -643,6 +638,19 @@ public final class CefChromeBrowser {
     }
 
     // MARK: Helpers
+
+    /// AppKit window setters can invalidate native composition even when the
+    /// requested appearance is unchanged. Recheck actual values so ordinary
+    /// layout does no writes, while native view replacement or external changes
+    /// still repair the hosted surface before its clipping mask is applied.
+    static func preparePageLayer(in window: NSWindow) -> CALayer? {
+        guard let content = window.contentView else { return nil }
+        if window.isOpaque { window.isOpaque = false }
+        if window.backgroundColor != .clear { window.backgroundColor = .clear }
+        if window.hasShadow { window.hasShadow = false }
+        if !content.wantsLayer { content.wantsLayer = true }
+        return content.layer
+    }
 
     /// Converts AppKit screen coordinates (bottom-left origin) to CEF DIP
     /// screen coordinates (top-left origin of the primary display).

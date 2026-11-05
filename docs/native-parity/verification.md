@@ -2,7 +2,7 @@
 
 This is a working acceptance record, not a release certification. The Electron implementation remains the behavior reference. Native implementation and successful compilation do not establish runtime parity.
 
-Entries describe their exact checkpoints. The [UI 105 record](#current-completion-record) supersedes older current/pending statements; historical failures and partial runs remain recorded. Framework 49 and 66 hashes below identify historical packages; the current framework is 101.
+Entries describe their exact checkpoints. The [UI 110 record](#current-completion-record) supersedes older current/pending statements; historical failures and partial runs remain recorded. Framework 49 and 66 hashes below identify historical packages; the current framework is 101.
 
 ## 2026-11-01: integrated build 6
 
@@ -655,8 +655,6 @@ Current framework 101 SHA-256 is `8ea8e777b66023a1eff6abce8d339bc7d95d1eda9def83
 
 Evidence under `macos/.build/verification`: `completion-96/debug-interface-prelude/{application.json,application-launch.json}`; `completion-102/debug-space-swipe-prelude/application.log`; `completion-103/debug-space-swipe-prelude/{application.json,application-launch.json,application.log}`; `completion-103/full/{application.json,application-launch.json,turn-server.json}`; `completion-104/{package.log,release-build.json}`; and `completion-104/full/{application.json,application-launch.json,application.log,turn-server.json}`. Neither failed full report is a passing release result.
 
-<a id="current-completion-record"></a>
-
 ## 2026-11-04: native UI 105 full validation and delivery
 
 Release 105 completed warning-free packaging in **153.59 seconds**, with valid plists and development signatures. Its immutable executable SHA-256 is `b42f92ed866a230913f89f5586c5db7fa04e64ad447e30759e5ea3b322793c02`; the matching package-log SHA-256 is `368a47ed9cebf9e8542b848305d07b2602ac0134ba0b93dd6dc456fa693c7478`. The manifest is `completion-105/release-build.json`.
@@ -672,6 +670,43 @@ The same optimized candidate independently passed **51 engine + 9 window + 11 sc
 Framework 101 remains SHA-256 `8ea8e777b66023a1eff6abce8d339bc7d95d1eda9def83cd818dd34b4a47cff9` (**124 native inputs, 240 resource files, four symlinks**). Core/Services remains **321 passing tests**. The untraced Debug-103 383-check result and historical failures retain their stated scope. Earlier desktop review, including the actual build-99 window review, applies to the unchanged product UI; it is not relabeled release-105 capture or hardware evidence. The gallery remains the actual build-47 captures and original manifest. No measured GPU/FPS gain, physical trackpad/drag/haptic acceptance, universal vendor-extension compatibility, production-Keychain qualification or notarized distribution is claimed.
 
 Evidence under `macos/.build/verification`: `completion-105/{package.log,release-build.json,remaining-summary.json}`; `completion-105/debug-application-reopening{,-owned-presentation}/{application.json,application-launch.json}`; `completion-105/full/{application.json,application-launch.json,turn-server.json}`; `completion-105/engine/{engine.json,engine-launch.json}`; `completion-105/windows/{application.json,application-launch.json}`; `completion-105/accessibility/{accessibility.json,accessibility-launch.json}`; and `delivery-105.json`. The earlier failed reports remain failed historical evidence; the exact optimized-105 reports and normal exits establish the completed local gates above.
+
+<a id="current-completion-record"></a>
+
+## 2026-11-04: native UI 110 focus and rendering overhead
+
+The browser shell and hosted Chromium documents remain separate native windows. AppKit main-window ownership now stays with the exact live shell while the real page, palette or sheet retains its key window and responder. Reconciliation uses public `makeMain`, checks current ownership after native notification ordering, and preserves inactive applications, foreign windows, sheets and newer editing intent. It never fabricates key status or replaces the Chromium responder.
+
+Palette entry captures the originating document before taking key. Escape restores that exact document, profile, selection and native window through Chromium's focus API. Fresh pointer actions on Back, Forward and Reload also return focus to their selected document. Sidebar keyboard cleanup occurs only inside this admitted document return; explicit address/editor/sidebar handoffs keep their own focus. The 109 regression run caught an overly broad key-notification cleanup interfering with hidden-rail menu dismissal. Build 110 removes that global mutation, and the unchanged strict sidebar tests pass.
+
+Repeated key changes within one logical browser now skip repository persistence/publication. Native menus are reused until their shortcuts, availability or fullscreen label changes, and their exact owner is restored if Chromium replaces the application menu. Hover state lives within individual rows; drag cancellation polls only while dragging. Native document surfaces skip unchanged AppKit property writes. One retained visual-effect view masks blur beneath opaque pane interiors, preserving the continuous tint, rounded edges, shadows and split divider. Eight actual native-view checks cover its mask, cache, geometry and focus behavior.
+
+The warning-free optimized build completed in **135.45 seconds**. Its executable SHA-256 is `cf4b37d689c5a9c370f8e985530e4e923274dd2dfccaea6698ffe6a2d513fcd2`; the package-log SHA-256 is `7300636feff632eee3474c9172ddfd1adeab719a9ec98da80f26c6bef5210543`. The source manifest digest is `2527d3f0fa9ef55f8084cdedce5804f84ea37f9019f3bc668f00dc6b8d88e3fc`.
+
+The same optimized binary passed **660 targeted runtime checks** across ten fresh-profile runs:
+
+| Suite | Checks |
+| --- | ---: |
+| Sidebar | 25 |
+| Focus family and keyboard/pointer return | 16 |
+| Resize, alignment and material mask | 70 |
+| Space input | 12 |
+| Interface and native editing | 145 |
+| Extension management | 13 |
+| Windows | 9 |
+| Extensions and real MV3 fixture | 308 |
+| Engine | 51 |
+| Scoped accessibility | 11 |
+
+Every driver passed and every actual application/raw/open exit was **0/0/0**, without forced termination. The real extension fixture reports native protocol and fixture success. These are scoped runs; build 110 did not rerun the complete application/media/TURN catalog. Release 105's 1,032-check full run retains its historical identity. The current Core/Services run passed **323 tests** (229 Core, 94 Services), without skips, using the packaged Codex and PDF helpers. Two native surface setter tests and all 16 report-driver regressions also passed.
+
+Computer Use review of the exact build verified typing into a page, Cmd-L, Escape, and continued typing in the same retained draft. A real 80ms pointer click on Reload from a keyboard-focused sidebar returned to the content pane; its loopback page independently reported `document.hasFocus()` both on load and after settling. Pointer Back returned to the prior page with its draft intact; Forward returned to focused content. The final review exited normally. Earlier 107 review also confirmed the native Window menu changed from one window to two and back to one when returning to the cached owner menu. Temporary focus-probe HTML was removed after verified application exit.
+
+Performance evidence is deliberately scoped. The original empty-window main-thread sample mostly waited for events. An idle Metal trace attributed recorded direct GPU execution mainly to WindowServer, with no direct Metal execution attributed to the owned Zacro process family; WindowServer can still perform Zacro's composition work. The later 107 zero-tab, 1440×940, sidebar-hidden diagnostic measured about **1.69% of one CPU core** across the owned process tree in its saved-theme phase. Its foreground state differed from the earlier baseline, and GPU counters were whole-system, so these captures establish neither a causal GPU/FPS improvement nor Electron performance parity. The changes remove demonstrated redundant work; physical trackpad/frame-pacing qualification remains separate.
+
+Both local `dist/Zacro Native.app` and `macos/dist/Zacro Native.app` contain **0.11.0, bundle build 1, verification candidate 110**, with matching executable/provenance hashes and deep/strict development signatures. Prior delivered bundles were preserved before replacement. Framework 101 remains `8ea8e777b66023a1eff6abce8d339bc7d95d1eda9def83cd818dd34b4a47cff9`; runtime inputs and ABI are unchanged. Universal vendor-extension compatibility, production Keychain qualification and notarized distribution retain their existing separate gates.
+
+Evidence is under `macos/.build/verification/completion-106`: `release-build-110.json`, `release-110-build.log`, `targeted-110-summary.json`, each `*-110/{application,engine,accessibility}*.json`, `manual-preview-110/{application-launch.json,http.jsonl}`, `core-services-final-with-helpers.log`, `surface-tests.log`, `report-driver-tests.log`, `performance-comparison.json`, `manual-preview/idle-metal-analysis.json`, and `delivery-110.json`. Failed 106 and 109 reports and the intermediate 107–108 observations remain historical evidence.
 
 ## Required release evidence
 

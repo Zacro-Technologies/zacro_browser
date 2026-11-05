@@ -36,6 +36,13 @@ final class BrowserActions: ObservableObject {
   var toggleSidebar: (Bool) -> Void = { _ in }
   var sidebarToggleOwnsFocus: (NSWindow?) -> Bool = { _ in false }
   var focusPageAfterSidebarToggle: () -> Void = {}
+  var prepareDocumentFocusRestoration: @MainActor () -> Void = {}
+  var capturePageFocusRestoration: @MainActor () -> (@MainActor () -> Bool)? = { nil }
+  private var pendingPageFocusRestoration: (@MainActor () -> Bool)?
+  func consumePageFocusRestoration() -> (@MainActor () -> Bool)? {
+    defer { pendingPageFocusRestoration = nil }
+    return pendingPageFocusRestoration
+  }
   @Published var siteControls = SiteControlActions()
   @Published var canGoBack = false
   @Published var canGoForward = false
@@ -106,6 +113,7 @@ final class BrowserActions: ObservableObject {
     findVisible = true
   }
   func openPalette(address: String = "") {
+    if !palette { pendingPageFocusRestoration = capturePageFocusRestoration() }
     paletteRequest = nil
     paletteEditsAddress = !address.isEmpty
     query = address
@@ -149,10 +157,6 @@ struct BrowserShell<Content: View>: View {
   @State private var contextMenuRequest: String?
   @State private var editor: NativeInterfaceEditor?
   @State private var pendingEditorNavigation: NativeEditorNavigation?
-  @State private var hoveredTab: String?
-  @State private var hoveredFolder: String?
-  @State private var hoveredPin: String?
-  @State private var hoveredNewTab = false
   @State private var rowMotionSpaceID: String?
   @State private var editingGroupColor: String?
   @State private var operationError: String?
@@ -310,7 +314,9 @@ struct BrowserShell<Content: View>: View {
       // edge. A second inverse mask here exposes the desktop between two
       // partially covered edges, producing a bright seam.
       NativeSpaceWindowBackdrop(viewport: spaceViewport, spaces: spaces, fallback: theme,
-        prefersFallback: creatingSpace || themeDraft != nil)
+        prefersFallback: creatingSpace || themeDraft != nil,
+        materialOcclusion: NativeChromeMaterialOcclusion(contentFrame: actions.contentFrame,
+          radius: store.state.settings.pageRadius, splitRatio: actions.contentSplitRatio))
       VStack(spacing: 0) {
        HStack(spacing: 0) {
         if sidebarWidth > 0 {
@@ -376,6 +382,8 @@ struct BrowserShell<Content: View>: View {
         frame: actions.contentFrame.width > 0 ? actions.contentFrame : nil,
         presentationID: actions.paletteSession, restoresResponder: true,
         canRestoreFocus: { canRestorePaletteFocus },
+        captureDocumentFocus: { actions.consumePageFocusRestoration() },
+        onDidRestoreDocumentFocus: { paletteReturnFocus = nil },
         onRestoreFocus: restorePaletteFocus,
         onPresentationWindow: { [weak actions = actions] in actions?.paletteWindow = $0 },
         onDidHide: { sidebarToggleHandoff.retry() }
@@ -431,8 +439,17 @@ struct BrowserShell<Content: View>: View {
       value: store.state.settings.sidebarVisible
     )
     .animation(NativeMotion.animation(NativeMotion.chrome, scale: effectiveMotion), value: actions.library != nil)
-    .onReceive(Timer.publish(every: 0.15, on: .main, in: .common).autoconnect()) { _ in
-      if drag.id != nil && !drag.native.isDragging && NSEvent.pressedMouseButtons == 0 { drag.cancel() }
+    .task(id: drag.id) {
+      guard let id = drag.id else { return }
+      do {
+        while !Task.isCancelled {
+          try await Task.sleep(for: .milliseconds(150))
+          guard drag.id == id else { return }
+          if !drag.native.isDragging && NSEvent.pressedMouseButtons == 0 {
+            drag.cancel(); return
+          }
+        }
+      } catch { /* View removal or a newer drag cancels this poll. */ }
     }
     .onAppear {
       installPresentationHooks()
@@ -440,6 +457,7 @@ struct BrowserShell<Content: View>: View {
       rowMotionSpaceID = store.state.activeSpaceID
       actions.performInterfaceCommand = performInterfaceCommand
       actions.handleInterfaceEscape = dismissInterface
+      actions.prepareDocumentFocusRestoration = { if sidebarFocus != nil { sidebarFocus = nil } }
       if !offeredOnboarding && !store.state.settings.onboardingCompleted && !CommandLine.arguments.contains("--engine-acceptance") {
         offeredOnboarding = true; editor = .onboarding
       } else { maybeOpenBlankPalette() }
@@ -469,7 +487,10 @@ struct BrowserShell<Content: View>: View {
     }
     .onChange(of: spaces.map(\.id)) { _, _ in synchronizeSpaces() }
     .onChange(of: effectiveMotion) { _, _ in synchronizeSpaces() }
-    .onDisappear { sidebarToggleHandoff.cancel(); dialogs.cancel(); spaceViewport.stop() }
+    .onDisappear {
+      actions.prepareDocumentFocusRestoration = {}
+      sidebarToggleHandoff.cancel(); dialogs.cancel(); spaceViewport.stop()
+    }
     .onChange(of: isOwnedWindowOpen) { _, open in
       if !open { resetWindowPresentation() }
       else { maybeOpenBlankPalette() }
@@ -874,18 +895,19 @@ struct BrowserShell<Content: View>: View {
         }
       ForEach(store.state.folders.filter { $0.spaceID == store.state.activeSpaceID }) { folder in
         VStack(spacing: 2) {
+          NativeHoverRegion(isEnabled: isOwnedWindowOpen) { hovered in
           Button {
             store.updateFolder(id: folder.id, isExpanded: !folder.isExpanded)
           } label: {
             HStack(spacing: 8) {
               ZStack {
-                NativeGlyph("folder").opacity(hoveredFolder == folder.id || sidebarFocus == "folder:\(folder.id)" ? 0 : 1)
+                NativeGlyph("folder").opacity(hovered || sidebarFocus == "folder:\(folder.id)" ? 0 : 1)
                 NativeGlyph("chevron.down")
                   .rotationEffect(.degrees(folder.isExpanded ? 0 : -90))
                   .animation(NativeMotion.animation(0.12, scale: effectiveMotion), value: folder.isExpanded)
-                  .opacity(hoveredFolder == folder.id || sidebarFocus == "folder:\(folder.id)" ? 1 : 0)
+                  .opacity(hovered || sidebarFocus == "folder:\(folder.id)" ? 1 : 0)
               }.foregroundStyle(accent).frame(width: 16, height: 16)
-                .animation(NativeMotion.animation(NativeMotion.fast, scale: effectiveMotion), value: hoveredFolder == folder.id || sidebarFocus == "folder:\(folder.id)")
+                .animation(NativeMotion.animation(NativeMotion.fast, scale: effectiveMotion), value: hovered || sidebarFocus == "folder:\(folder.id)")
               Text(folder.name).font(.system(size: 13, weight: .semibold)).lineLimit(1)
                 .background { NativeInterfaceAlignmentMark(id: "active-folder-title:" + folder.id) }
               Spacer(minLength: 0)
@@ -894,7 +916,7 @@ struct BrowserShell<Content: View>: View {
           }.buttonStyle(NativeHoverPressButtonStyle(hover: colors.hover, radius: 6, scale: 1, motionScale: effectiveMotion))
             .accessibilityLabel("\(folder.isExpanded ? "Collapse" : "Expand") \(folder.name)")
             .focusable().focusEffectDisabled().focused($sidebarFocus, equals: "folder:\(folder.id)").id("folder:\(folder.id)")
-            .onHover { if $0 { hoveredFolder = folder.id } else if hoveredFolder == folder.id { hoveredFolder = nil } }
+          }
           if folder.isExpanded {
             VStack(spacing: 2) {
               rows(tabs.filter { $0.folderID == folder.id && !$0.isFavorite }, section: .folder(folder.id))
@@ -916,6 +938,7 @@ struct BrowserShell<Content: View>: View {
         .onDrop(of: [.plainText], delegate: dropDelegate(section: .pinned))
       Rectangle().fill(colors.ink.opacity(0.12)).frame(height: 1)
         .padding(.horizontal, 7).padding(.vertical, 10)
+      NativeHoverRegion(isEnabled: isOwnedWindowOpen) { hovered in
       Button {
         actions.openPalette()
       } label: {
@@ -925,16 +948,17 @@ struct BrowserShell<Content: View>: View {
           Spacer(minLength: 0)
           Text(NativeInterfaceEditors.keyLabel(BrowserShortcut.catalog(overrides: store.state.settings.shortcutOverrides)
             .first(where: { $0.id == "command-palette" })?.accelerator ?? ""))
-            .font(.system(size: 10)).opacity(hoveredNewTab || sidebarFocus == "new-tab" ? 1 : 0)
+            .font(.system(size: 10)).opacity(hovered || sidebarFocus == "new-tab" ? 1 : 0)
             .animation(effectiveMotion > 0 ? .timingCurve(0.25, 0.1, 0.25, 1, duration: 0.1 * effectiveMotion) : nil,
-              value: hoveredNewTab || sidebarFocus == "new-tab")
+              value: hovered || sidebarFocus == "new-tab")
         }.frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 8).frame(height: 34)
       }
       .buttonStyle(NativeHoverPressButtonStyle(hover: colors.hover, radius: 6, scale: 0.985,
         pressDuration: 0.1, motionScale: effectiveMotion)).foregroundStyle(colors.muted)
-        .focusable().focusEffectDisabled().focused($sidebarFocus, equals: "new-tab").onHover { hoveredNewTab = $0 }
+        .focusable().focusEffectDisabled().focused($sidebarFocus, equals: "new-tab")
         .background { NativeSidebarDropRegion(controller: drag.native, id: SidebarSection.regular.regionID(space: store.state.activeSpaceID)) }
         .onDrop(of: [.plainText], delegate: dropDelegate(section: .regular, before: todayTabs.first?.id))
+      }
       VStack(spacing: 2) {
         tabGroupRows
         splitRows
@@ -1142,20 +1166,22 @@ struct BrowserShell<Content: View>: View {
   private func tabRow(_ tab: BrowserTab, section: SidebarSection, grouped: Bool = false) -> some View {
     let favorite = section == .favorite
     let selected = highlightedTabIDs.contains(tab.id) && !tab.isClosed
-    let hovered = hoveredTab == tab.id || sidebarFocus == tab.id
     let away = tab.isPinned && !tab.isClosed && tab.savedURL != nil && tab.savedURL != tab.url
-    return HStack(spacing: 0) {
+    return NativeHoverRegion(isEnabled: isOwnedWindowOpen) { pointerHovered in
+    let hovered = pointerHovered || sidebarFocus == tab.id
+    HStack(spacing: 0) {
       if !favorite && !grouped && tab.isPinned {
+        NativeHoverRegion(isEnabled: isOwnedWindowOpen) { pinHovered in
         Button { store.resetPinnedDestination(id: tab.id); actions.activate(tab.id) } label: {
           Group {
-            if hoveredPin == tab.id { NativeGlyph("arrow.left", size: 15).frame(width: 16, height: 16) }
+            if pinHovered { NativeGlyph("arrow.left", size: 15).frame(width: 16, height: 16) }
             else { tabIcon(tab, size: 16)
               .background { NativeInterfaceAlignmentMark(id: "active-tab-icon:" + tab.id) }
             }
           }.frame(width: 28, height: 28)
         }.buttonStyle(NativeHoverPressButtonStyle(hover: colors.hover, radius: 5, scale: 1, motionScale: effectiveMotion))
           .padding(.leading, 2).help("Reset to saved page")
-          .onHover { if $0 { hoveredPin = tab.id } else if hoveredPin == tab.id { hoveredPin = nil } }
+        }
       }
       Button { selectSidebarTab(tab) } label: {
         HStack(spacing: 8) {
@@ -1213,7 +1239,6 @@ struct BrowserShell<Content: View>: View {
       .transition(allowsRowMotion ? .asymmetric(insertion: .modifier(
         active: NativeTabEntry(opacity: 0.3, offset: -3, scale: 0.985),
         identity: NativeTabEntry(opacity: 1, offset: 0, scale: 1)), removal: .identity) : .identity)
-      .onHover { if $0 { hoveredTab = tab.id } else if hoveredTab == tab.id { hoveredTab = nil } }
       .help("\(tab.displayTitle) — \(tab.isClosed ? "Closed" : actions.loadedTabIDs.contains(tab.id) ? "Loaded" : "Sleeping")\n\(tab.savedURL ?? tab.url)")
       .accessibilityElement(children: .contain).accessibilityAddTraits(selected ? [.isSelected] : [])
       .contextMenu { tabMenu(tab) }
@@ -1231,6 +1256,7 @@ struct BrowserShell<Content: View>: View {
       }
       .allowsHitTesting(!drag.isProjectedSplitPlaceholder(tab.id, in: store.state.activeSpaceID, section: section, store: store))
       .accessibilityHidden(drag.isProjectedSplitPlaceholder(tab.id, in: store.state.activeSpaceID, section: section, store: store))
+    }
   }
   private func tabMenu(_ tab: BrowserTab) -> some View { NativeMenuCommands(items: tabMenuItems(tab)) }
   private func tabMenuItems(_ tab: BrowserTab) -> [NativeMenuAction] {
@@ -1616,7 +1642,7 @@ struct BrowserShell<Content: View>: View {
     pendingEditorNavigation = nil; editor = nil; creation = nil; renameTarget = nil; editingGroupColor = nil
     themeDraft = nil; creatingSpace = false; themeError = nil; nameError = nil; operationError = nil
     libraryReturnFocus = nil; paletteReturnFocus = nil; sidebarFocus = nil; blankPaletteContext = nil
-    name = ""; hoveredTab = nil; hoveredFolder = nil; hoveredPin = nil; hoveredNewTab = false
+    name = ""
     actions.query = ""; actions.homeQuery = ""
   }
   private func saveRailWidth(_ proposed: Double, sidebar: Bool) {
@@ -2060,6 +2086,8 @@ private struct NativePalettePresenter: NSViewRepresentable {
   var dismissOnResign = true
   var restoresResponder = false
   var canRestoreFocus: () -> Bool = { true }
+  var captureDocumentFocus: @MainActor () -> (@MainActor () -> Bool)? = { nil }
+  var onDidRestoreDocumentFocus: () -> Void = {}
   var onRestoreFocus: () -> Void = {}
   var onPresentationWindow: (NSWindow?) -> Void = { _ in }
   var onDidHide: () -> Void = {}
@@ -2089,6 +2117,7 @@ private struct NativePalettePresenter: NSViewRepresentable {
     private var mouseMonitor: Any?
     private var lastPresentationID: UInt64?
     private let returnFocus = NativeFocusRestoration()
+    private var returnDocumentFocus: (@MainActor () -> Bool)?
     init(_ presenter: NativePalettePresenter) { self.presenter = presenter }
 
     func attach(to window: NSWindow?) {
@@ -2134,7 +2163,10 @@ private struct NativePalettePresenter: NSViewRepresentable {
       self.panel = panel
       presenter.onPresentationWindow(panel)
       lastPresentationID = presenter.presentationID
-      if presenter.restoresResponder { returnFocus.capture(in: parent) }
+      if presenter.restoresResponder {
+        returnFocus.capture(in: parent)
+        returnDocumentFocus = presenter.captureDocumentFocus()
+      }
       parent.addChildWindow(panel, ordered: .above)
       panel.alphaValue = presenter.animatesOpacity && presenter.motionScale > 0 ? 0 : 1
       if presenter.takesKey { panel.makeKeyAndOrderFront(nil) } else { panel.orderFront(nil) }
@@ -2215,9 +2247,11 @@ private struct NativePalettePresenter: NSViewRepresentable {
         NSEvent.removeMonitor(mouseMonitor)
         self.mouseMonitor = nil
       }
-      guard let panel else { returnFocus.clear(); return }
+      guard let panel else { returnFocus.clear(); returnDocumentFocus = nil; return }
       trace("hide panel \(panel.windowNumber)")
       let restoreKey = NSApp.keyWindow === panel
+      let restoreDocument = returnDocumentFocus
+      returnDocumentFocus = nil
       parent?.removeChildWindow(panel)
       panel.orderOut(nil)
       panel.contentView = nil
@@ -2226,9 +2260,16 @@ private struct NativePalettePresenter: NSViewRepresentable {
       presenter.onPresentationWindow(nil)
       lastPresentationID = nil
       if restoreFocus, restoreKey, presenter.canRestoreFocus(),
-        let parent, parent.isVisible, parent.attachedSheet == nil, NSApp.isActive {
-        parent.makeKey()
-        if presenter.restoresResponder, presenter.canRestoreFocus(), !returnFocus.restore(in: parent) { presenter.onRestoreFocus() }
+        let parent, parent.isVisible, parent.attachedSheet == nil, NSApp.modalWindow == nil, NSApp.isActive {
+        if let restoreDocument {
+          // A document-origin palette has its own exact owner/selection
+          // admission. Rejection belongs to a newer intent, so it must not
+          // fall through to the shell's old responder or address field.
+          if restoreDocument() { presenter.onDidRestoreDocumentFocus() }
+        } else {
+          parent.makeKey()
+          if presenter.restoresResponder, presenter.canRestoreFocus(), !returnFocus.restore(in: parent) { presenter.onRestoreFocus() }
+        }
       }
       returnFocus.clear()
       presenter.onDidHide()

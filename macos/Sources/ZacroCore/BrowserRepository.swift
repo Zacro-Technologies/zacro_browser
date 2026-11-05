@@ -241,6 +241,10 @@ import Foundation
 
   public func focusWindow(_ id: String) {
     guard windows.contains(where: { $0.id == id }) else { return }
+    // The shell and its native documents can exchange AppKit key ownership
+    // without changing the logical browser. Do not save or republish that
+    // unchanged selection to every window facade.
+    guard writer.state.focusedWindowID != id else { return }
     writer.state.focusedWindowID = id
     BrowserWindowState.applyFocusedSelection(&writer.state)
     writer.save(); publish()

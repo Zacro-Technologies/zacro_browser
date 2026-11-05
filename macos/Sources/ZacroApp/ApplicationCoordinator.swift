@@ -13,6 +13,12 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
   var store: BrowserStore { repository.canonicalStore }
   private(set) var windows: [String: BrowserWindowCoordinator] = [:]
   private var observations: Set<AnyCancellable> = []
+  private lazy var focusFamily = NativeBrowserFocusFamily { [weak self] window in
+    guard let self, !self.engine.isTerminating,
+      let context = self.focusContext(owning: window), context.isOpen, !context.isClosing,
+      self.windows[context.id]?.windowContext === context else { return nil }
+    return context.window
+  }
   var pendingDeletion: (Set<String>, () -> Void)?
   var profileDeletionPageIDs = Set<String>()
   var deletingProfileID: String? {
@@ -422,14 +428,20 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
     }
   }
 
-  private func focusChanged(_ window: NSWindow) {
+  private func focusContext(owning window: NSWindow) -> ChromiumWindowContext? {
     var parent = window
     var visited = Set<ObjectIdentifier>()
     while visited.insert(ObjectIdentifier(parent)).inserted,
       let next = parent.sheetParent ?? parent.parent { parent = next }
-    let context = engine.contexts.values.first { $0.window === parent }
+    return engine.contexts.values.first { $0.window === parent }
       ?? engine.pages.values.first { $0.nativeWindow === window }.flatMap { $0.ownerWindowID.flatMap(engine.context(id:)) }
+      ?? engine.extensionPopupOwner(window)
+  }
+
+  private func focusChanged(_ window: NSWindow) {
+    let context = focusContext(owning: window)
     guard let context, context.isOpen, let owner = windows[context.id] else { return }
+    focusFamily.scheduleReconciliation()
     repository.focusWindow(context.id)
     owner.installMenus()
     services.refreshContext()

@@ -1,3 +1,4 @@
+import Combine
 import XCTest
 @testable import ZacroCore
 
@@ -12,6 +13,66 @@ import XCTest
     let file = path.appendingPathComponent("native-state.json")
     if FileManager.default.fileExists(atPath: file.path) { try FileManager.default.removeItem(at: file) }
     try FileManager.default.createDirectory(at: file, withIntermediateDirectories: true)
+  }
+
+  func testRepeatedLogicalFocusDoesNotPublishOrAttemptPersistence() throws {
+    let repository = BrowserRepository(directory: try directory()), first = repository.focusedStore
+    _ = first.createTab(address: "https://first.example")
+    let second = try repository.makeWindow(addresses: ["https://second.example"], focus: false)
+    let canonical = repository.canonicalStore, firstID = try XCTUnwrap(first.owningWindowID)
+    let before = canonical.state
+    var repositoryPublications = 0, canonicalPublications = 0, firstPublications = 0, secondPublications = 0
+    let observations = [
+      repository.objectWillChange.sink { repositoryPublications += 1 },
+      canonical.$state.dropFirst().sink { _ in canonicalPublications += 1 },
+      first.$state.dropFirst().sink { _ in firstPublications += 1 },
+      second.$state.dropFirst().sink { _ in secondPublications += 1 },
+    ]
+    defer { observations.forEach { $0.cancel() } }
+    // A redundant native key hop must not attempt a session write. A real
+    // write here would fail and publish the writer's error to every facade.
+    try blockWrites(repository.directory)
+    repository.focusWindow(firstID)
+    repository.focusWindow(firstID)
+    repository.focusWindow("missing-native-owner")
+    XCTAssertEqual(repositoryPublications, 0)
+    XCTAssertEqual(canonicalPublications, 0)
+    XCTAssertEqual(firstPublications, 0)
+    XCTAssertEqual(secondPublications, 0)
+    XCTAssertEqual(canonical.state, before)
+    XCTAssertEqual(repository.focusedWindowID, firstID)
+    XCTAssertNil(canonical.lastError)
+    XCTAssertNil(first.lastError)
+    XCTAssertNil(second.lastError)
+  }
+
+  func testLogicalFocusChangeProjectsAndPersistsExactWindowSelectionOnce() throws {
+    let repository = BrowserRepository(directory: try directory()), first = repository.focusedStore
+    let firstTab = try XCTUnwrap(first.createTab(address: "https://first.example"))
+    let second = try repository.makeWindow(addresses: ["https://second.example"], focus: false)
+    let canonical = repository.canonicalStore, secondID = try XCTUnwrap(second.owningWindowID)
+    let secondTab = try XCTUnwrap(second.state.activeTabID)
+    var repositoryPublications = 0, canonicalPublications = 0, firstPublications = 0, secondPublications = 0
+    let observations = [
+      repository.objectWillChange.sink { repositoryPublications += 1 },
+      canonical.$state.dropFirst().sink { _ in canonicalPublications += 1 },
+      first.$state.dropFirst().sink { _ in firstPublications += 1 },
+      second.$state.dropFirst().sink { _ in secondPublications += 1 },
+    ]
+    defer { observations.forEach { $0.cancel() } }
+    repository.focusWindow(secondID)
+    XCTAssertEqual(repositoryPublications, 1)
+    XCTAssertEqual(canonicalPublications, 1)
+    XCTAssertEqual(firstPublications, 1)
+    XCTAssertEqual(secondPublications, 1)
+    XCTAssertEqual(canonical.state.focusedWindowID, secondID)
+    XCTAssertEqual(canonical.state.activeTabID, secondTab)
+    XCTAssertEqual(first.state.activeTabID, firstTab.id)
+    XCTAssertEqual(second.state.activeTabID, secondTab)
+    let restored = BrowserRepository(directory: repository.directory)
+    XCTAssertEqual(restored.focusedWindowID, secondID)
+    XCTAssertEqual(restored.canonicalStore.state.activeTabID, secondTab)
+    XCTAssertEqual(restored.store(for: first.owningWindowID!)?.state.activeTabID, firstTab.id)
   }
 
   func testColdLaunchChoosesMostRecentlyClosedWindowAndPreservesLiveFocus() throws {

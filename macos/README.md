@@ -19,9 +19,9 @@ Native state is stored separately in `~/Library/Application Support/Zacro Native
 
 ## Validation
 
-The latest completed Core/Services run passed 321 tests. Recent work aligns window controls and sidebar rows, preserves native text editing, and keeps Space transitions continuous with retained pages and scroll positions. Window transparency is applied once; an empty canvas keeps an opaque theme-colored surface.
+The latest completed Core/Services run passed 323 tests. Browser chrome retains main-window ownership while the page or editor holds keyboard focus. Palette dismissal and pointer navigation return to the intended page while preserving native editor and sidebar focus requests. Hover feedback stays within individual rows, and opaque page interiors are excluded from the window's blur material.
 
-Release 105 passed all 1,032 full application checks and 71 independent engine, window and scoped accessibility checks, with normal browser and TURN exits. Both `dist/Zacro Native.app` and `macos/dist/Zacro Native.app` now contain version **0.11.0** from that accepted release, with matching executable/provenance hashes and verified development signatures. See the [verification record](../docs/native-parity/verification.md#current-completion-record) for exact scope and historical failures.
+Build 110 passed 660 targeted runtime checks covering focus, sidebar, resizing, Space input, interface, extensions, windows, engine and scoped accessibility, with normal exits. Both `dist/Zacro Native.app` and `macos/dist/Zacro Native.app` contain this **0.11.0** build, with matching executable/provenance hashes and verified development signatures. Release 105 remains the most recent complete 1,032-check application run. See the [verification record](../docs/native-parity/verification.md#current-completion-record) for exact scope, desktop review and performance-measurement limits.
 
 Earlier desktop review confirmed the corrected pane contour, live tinted content beneath Peek, expansion retaining its draft, content-only mode, Unsplit, Favorite/pin/folder creation and saved themes. Physical drag/trackpad, VoiceOver, production Keychain and distribution checks remain separate gates. Universal Chrome extension compatibility is not established; some APIs have [external requirements](../docs/native-parity/compatibility-boundaries.md).
 

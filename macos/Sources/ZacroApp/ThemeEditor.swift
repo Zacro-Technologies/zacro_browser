@@ -225,13 +225,15 @@ struct NativeSpaceWindowBackdrop: View {
   var spaces: [BrowserSpace]
   var fallback: SpaceTheme
   var prefersFallback = false
+  var materialOcclusion: NativeChromeMaterialOcclusion?
   @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
   @Environment(\.colorSchemeContrast) private var contrast
 
   init(viewport: NativeSpaceViewport, spaces: [BrowserSpace], fallback: SpaceTheme,
-    prefersFallback: Bool = false) {
+    prefersFallback: Bool = false, materialOcclusion: NativeChromeMaterialOcclusion? = nil) {
     _viewport = ObservedObject(wrappedValue: viewport)
     self.spaces = spaces; self.fallback = fallback; self.prefersFallback = prefersFallback
+    self.materialOcclusion = materialOcclusion
   }
 
   var body: some View {
@@ -242,7 +244,9 @@ struct NativeSpaceWindowBackdrop: View {
     let style = NativeSpaceWindowBackdropStyle.resolve(presentation,
       reduceTransparency: reduceTransparency, increasedContrast: contrast == .increased)
     ZStack {
-      if style.materialAmount > 0 { ThemeMaterial(amount: style.materialAmount) }
+      if style.materialAmount > 0 {
+        NativeChromeMaterial(amount: style.materialAmount, occlusion: materialOcclusion)
+      }
       NativeSpaceBackdrop(viewport: viewport, spaces: spaces, fallback: fallback,
         prefersFallback: prefersFallback) { endpoint in
           NativeThemeTint(theme: endpoint)
