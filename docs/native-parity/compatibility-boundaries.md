@@ -1,4 +1,4 @@
-# Native messaging and Google identity audit
+# Native messaging, iCloud Passwords, and Google identity boundaries
 
 Reviewed 2026-11-02 against the Electron source and Chromium commit `d0c02bfad08ec92a6ffcf989e53cd995e6381a4c`. These are specific compatibility requirements and external dependencies, not a claim that all Chrome extensions work. No installed host executable was launched and no browser credentials were read or copied for this audit.
 
@@ -17,6 +17,16 @@ The separate disposable native-messaging fixture passes ten checks in Chrome 156
 The custom packaged Zacro build35 also passes all nine messaging API cases in `extensions-35/application.json`, including actual native-host responses, fragmented/ordered ports and permission/protocol failures. That broader extension run later fails an unrelated popup assertion, so it is not a full extension-suite pass. Its messaging results do not establish compatibility with installed vendor hosts or their browser-signature policies.
 
 Discovery alone does not prove compatibility with a password manager. A vendor host can independently restrict accepted browser signatures or bundle identifiers; those products need vendor-specific acceptance with their own supported browser policy.
+
+## iCloud Passwords: installed helper signing requirement
+
+Reviewed 2026-11-04. The installed iCloud Passwords extension's public assets loaded through the browser's Extensions UI in a fresh disposable profile and appeared enabled at version **3.4**. This verifies installation and its enabled UI state only. It does not verify the extension popup, native-host communication, pairing, password filling, or passkeys. No account pairing was performed and no credentials were read or copied.
+
+Read-only `codesign -dvvvvvv` inspection of Apple's installed `com.apple.PasswordManagerBrowserExtensionHelper` shows a **parent launch constraint**. It accepts either a parent with `com.apple.developer.web-browser.public-key-credential = true`, or one of its explicitly listed browser signing-identifier and team-identifier pairs. Zacro is not in that list. The current ad-hoc native build does not carry the approved entitlement or a listed signing identity, so it does not meet this installed helper's parent requirement. This is a signing-metadata finding, not an observed helper-launch rejection or a completed iCloud Passwords runtime test. The captured metadata is in `macos/.build/verification/completion-111/signing/apple-helper-signature.txt`.
+
+For Zacro's own signing identity, Apple's documented route requires the **Account Holder of an organization's Apple Developer account** to request the browser entitlement and receive Apple's managed-capability approval. The app then needs valid signing and a provisioning profile containing the approved entitlement; adding a key to an ad-hoc entitlement file does not provide that authorization. See Apple's [browser public-key credential entitlement](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.developer.web-browser.public-key-credential) and [provisioning with managed capabilities](https://developer.apple.com/help/account/reference/provisioning-with-managed-capabilities).
+
+Vendor assets and launch constraints remain unchanged. No browser identity impersonation, vendor-helper re-signing, or signature-policy workaround is implemented. Properly provisioned signing is a prerequisite for testing this integration through Zacro's own identity; it is not evidence that pairing or credential features will work. Those still require separate, authorized runtime acceptance.
 
 ## Google identity token acquisition
 

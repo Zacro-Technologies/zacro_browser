@@ -73,7 +73,7 @@ cp "$native_root/../LICENSE" "$native_licenses/Zacro.txt"
 cp "$native_root/Engine/CefSwift/LICENSE" "$native_licenses/CefSwift.txt"
 cp "$native_root/Engine/CefSwift/Sources/CCef/LICENSE.CEF.txt" "$native_licenses/CEF.txt"
 cp "$native_root/../assets/CODEX-LICENSE.txt" "$native_licenses/Codex.txt"
-python3 "$native_root/scripts/configure-app-plist.py" "$native_app/Contents/Info.plist" --version 0.11.0
+python3 "$native_root/scripts/configure-app-plist.py" "$native_app/Contents/Info.plist" --version 0.11.1
 plutil -lint "$native_app/Contents/Info.plist"
 if [[ "$native_stock" == 0 ]]; then
   python3 -B "$native_root/scripts/validate-runtime.py" "$native_runtime_record" \

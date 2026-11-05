@@ -6,6 +6,7 @@ import ZacroChromium
 
 @MainActor
 final class NativeExtensionsModel: ObservableObject {
+  typealias ActionQuery = @MainActor (ChromeExtensionManager, String, ChromiumPage?) async throws -> ChromeExtensionAction
   @Published private(set) var entries: [ChromeExtension] = []
   @Published private(set) var icons: [String:NSImage] = [:]
   @Published private(set) var loading = false
@@ -14,9 +15,12 @@ final class NativeExtensionsModel: ObservableObject {
   @Published private(set) var developerModeControlled = false
   @Published private(set) var incognitoAvailable = false
   @Published var error: String?
+  @Published private(set) var actionLoading = Set<String>()
+  @Published private(set) var actionErrors: [String: String] = [:]
   private let store: BrowserStore
   private let engine: ChromiumEngine
   private let actions: BrowserActions
+  private let actionQuery: ActionQuery
   private var scope: String?
   private var request: Task<Void,Never>?
   private var managementRequests: [UUID: Task<Void, Never>] = [:]
@@ -41,11 +45,12 @@ final class NativeExtensionsModel: ObservableObject {
   // Genuine manifest action capability is installation-scoped. Per-document
   // action state can expire without removing and reflowing every pinned tile.
   private var actionCapabilities: [String: Bool] = [:]
-  var invokeAction: ((String, String, NSRect?) async throws -> Void)?
-  var invokeOptions: ((String, String) async throws -> Void)?
-  var invokeSidePanel: ((String, String) async throws -> Void)?
-  init(store: BrowserStore, engine: ChromiumEngine, actions: BrowserActions) {
+  var invokeAction: (@MainActor (String, String, NSRect?) async throws -> Void)?
+  var invokeOptions: (@MainActor (String, String) async throws -> Void)?
+  var invokeSidePanel: (@MainActor (String, String) async throws -> Void)?
+  init(store: BrowserStore, engine: ChromiumEngine, actions: BrowserActions, actionQuery: ActionQuery? = nil) {
     self.store = store; self.engine = engine; self.actions = actions
+    self.actionQuery = actionQuery ?? { manager, identifier, page in try await manager.action(identifier, on: page) }
     recordingObservation = actions.$recordingShortcut.removeDuplicates().sink { [weak self] active in
       self?.setRecordingSuspended(active)
     }
@@ -60,6 +65,7 @@ final class NativeExtensionsModel: ObservableObject {
     request?.cancel(); generation += 1; scope = store.activeProfileID
     actionRequest?.cancel(); actionGeneration += 1
     activeDocument = nil; activeAddress = nil; actionStates = [:]; actionIcons = [:]; actionCapabilities = [:]
+    actionLoading = []; actionErrors = [:]
     shortcutRequest?.cancel(); shortcutGeneration += 1; shortcuts = []
     refreshPending = false
     entries = []; icons = [:]; error = nil; loading = false
@@ -91,6 +97,8 @@ final class NativeExtensionsModel: ObservableObject {
         self.icons = self.icons.filter { previousIcons[$0.key] == currentIcons[$0.key] && currentIcons[$0.key] != nil }
         self.actionCapabilities = self.actionCapabilities.filter { previousIcons[$0.key] == currentIcons[$0.key] && currentIcons[$0.key] != nil }
         self.entries = snapshot.extensions
+        self.actionStates = self.actionStates.filter { currentIcons[$0.key] != nil && previousIcons[$0.key] == currentIcons[$0.key] }
+        self.actionErrors = self.actionErrors.filter { currentIcons[$0.key] != nil }
         self.developerMode = snapshot.profile.inDeveloperMode
         self.canLoadUnpacked = snapshot.profile.canLoadUnpacked
         self.developerModeControlled = snapshot.profile.isDeveloperModeControlledByPolicy
@@ -98,12 +106,12 @@ final class NativeExtensionsModel: ObservableObject {
         // off-the-record child of this regular profile's extension registry.
         self.incognitoAvailable = false
         self.publish(profile, revision)
+        self.refreshActions()
         for item in snapshot.extensions where self.icons[item.id] == nil {
           if let data = try? await manager.iconData(item.id), let image = NSImage(data: data), self.valid(profile,revision) {
             self.icons[item.id] = image; self.publish(profile,revision)
           }
         }
-        self.refreshActions()
       } catch {
         guard self.valid(profile,revision) else { return }
         self.shortcutRequest?.cancel(); self.shortcutGeneration += 1; self.shortcuts = []
@@ -114,21 +122,25 @@ final class NativeExtensionsModel: ObservableObject {
     }
   }
   private func valid(_ profile: String, _ revision: Int) -> Bool {
-    generation == revision && store.activeProfileID == profile && !isPrivate && !Task.isCancelled
+    generation == revision && scope == profile && store.activeProfileID == profile && !isPrivate && !Task.isCancelled
   }
   private func publish(_ profile: String, _ revision: Int) {
     guard valid(profile,revision) else { return }
     actions.siteControls.extensions = entries.map { entry in
       let state = actionStates[entry.id]
+      let actionLoading = self.actionLoading.contains(entry.id)
+      let actionError = actionErrors[entry.id]
       let usableAction = entry.isEnabled && state?.hasAction == true && state?.enabled == true
-      let operation = usableAction ? "action" : entry.isEnabled && state?.hasSidePanel == true ? "side-panel"
+      let operation = actionLoading || actionError != nil ? "retry-action" : usableAction ? "action" : entry.isEnabled && state?.hasSidePanel == true ? "side-panel"
         : entry.isEnabled && entry.optionsPage != nil ? "options" : "manage"
       return SiteExtensionItem(id: entry.id, name: state?.title.isEmpty == false ? state!.title : entry.name,
         image: actionIcons[entry.id] ?? icons[entry.id], badgeText: state?.badgeText ?? "",
         badgeColor: state.flatMap { Self.color($0.badgeColor) },
         badgeForeground: state.flatMap { Self.color($0.badgeForeground) },
         enabled: entry.isEnabled, actionEnabled: usableAction,
-        pinned: entry.isPinned && actionCapabilities[entry.id] == true, canPin: entry.userMayModify && actionCapabilities[entry.id] == true,
+        actionLoading: actionLoading, actionError: actionError,
+        canRetryAction: entry.isEnabled && actionError != nil && !actionLoading,
+        pinned: entry.isPinned && actionCapabilities[entry.id] != false, canPin: entry.userMayModify && actionCapabilities[entry.id] == true,
         perform: { [weak self] in self?.perform(operation, id: entry.id, expectedProfile: profile) },
         togglePin: { [weak self] in self?.perform(entry.isPinned ? "unpin" : "pin", id: entry.id, expectedProfile: profile) })
     }
@@ -141,12 +153,18 @@ final class NativeExtensionsModel: ObservableObject {
   func nativeEvent(profileID: String, event: ChromeExtensionEvent) {
     guard scope == profileID, store.activeProfileID == profileID, !isPrivate else { return }
     switch event {
-    case .registryChanged, .installationChanged:
+    case .registryChanged:
       shortcutRequest?.cancel(); shortcutGeneration += 1; shortcuts = []
       actionRequest?.cancel(); actionGeneration += 1
-      actionStates = [:]; actionIcons = [:]; actionCapabilities = [:]
+      actionLoading = []; actionErrors = [:]
       refresh()
-    case .actionChanged: refreshActions()
+    case .installationChanged(let identifier, _):
+      actionCapabilities.removeValue(forKey: identifier)
+      actionStates.removeValue(forKey: identifier); actionIcons.removeValue(forKey: identifier)
+      shortcutRequest?.cancel(); shortcutGeneration += 1; shortcuts = []
+      actionRequest?.cancel(); actionGeneration += 1; actionLoading = []; actionErrors = [:]
+      refresh()
+    case .actionChanged(let identifier, _): refreshActions(identifiers: [identifier])
     case .commandsChanged: refreshShortcuts()
     case .storageChanged, .hostRequest, .postUninstallNavigation, .bookmarksChanged, .historyChanged, .downloadChanged, .downloadRemoved: break
     }
@@ -180,39 +198,74 @@ final class NativeExtensionsModel: ObservableObject {
     let address = page?.url?.absoluteString
     guard activeDocument !== page || activeAddress != address else { return }
     activeDocument = page; activeAddress = address
-    actionStates = [:]; actionIcons = [:]
+    actionStates = [:]; actionIcons = [:]; actionErrors = [:]
     if let scope { publish(scope, generation) }
     refreshActions()
   }
   func canPin(_ identifier: String) -> Bool {
     entries.first(where: { $0.id == identifier })?.userMayModify == true && actionCapabilities[identifier] == true
   }
-  private func refreshActions() {
+  func retryActionState(id: String) {
+    guard scope == store.activeProfileID, entries.contains(where: { $0.id == id && $0.isEnabled }),
+      !actionLoading.contains(id) else { return }
+    refreshActions(identifiers: [id])
+  }
+  private func refreshActions(identifiers: Set<String>? = nil) {
+    let requested = (identifiers ?? Set(entries.map(\.id))).union(actionLoading)
     actionRequest?.cancel(); actionGeneration += 1
     guard !isPrivate, let windowID = store.owningWindowID,
       let context = engine.context(id: windowID), context.isOpen, !context.isClosing else { return }
     let page = activeDocument
     if let page, page.profileID != store.activeProfileID || page.ownerWindowID != windowID { return }
     let profile = store.activeProfileID, revision = generation, actionRevision = actionGeneration
+    let address = activeAddress, targets = requested.intersection(Set(entries.map(\.id)))
+    actionLoading = targets
+    for identifier in targets { actionStates.removeValue(forKey: identifier); actionErrors.removeValue(forKey: identifier) }
+    publish(profile, revision)
     actionRequest = Task { [weak self, weak page] in
       guard let self else { return }
       let manager = ChromeExtensionManager(engine: self.engine, profileID: profile)
-      var states: [String: ChromeExtensionAction] = [:], images: [String: NSImage] = [:]
-      for entry in self.entries {
-        guard !Task.isCancelled, self.activeDocument === page, self.actionGeneration == actionRevision else { return }
-        if let state = try? await manager.action(entry.id, on: page) {
-          states[entry.id] = state
-          if let encoded = state.iconPNG, encoded.utf8.count <= 1_400_000,
-            let data = Data(base64Encoded: encoded), let image = NSImage(data: data) { images[entry.id] = image }
-        }
+      @MainActor func current() -> Bool {
+        self.valid(profile, revision) && self.activeDocument === page && self.activeAddress == address
+          && self.store.owningWindowID == windowID && context.isOpen && !context.isClosing
+          && self.actionGeneration == actionRevision
+          && (page == nil || (page?.ownerWindowID == windowID && page?.profileID == profile
+            && page.map { self.engine.pages[$0.id] === $0 } == true))
       }
-      guard self.valid(profile, revision), self.activeDocument === page,
-        page == nil || page?.ownerWindowID == windowID, context.isOpen, !context.isClosing,
-        self.actionGeneration == actionRevision else { return }
-      self.objectWillChange.send()
-      self.actionStates = states; self.actionIcons = images
-      for (id, state) in states { self.actionCapabilities[id] = state.hasAction }
-      self.publish(profile, revision)
+      var remaining = targets
+      // One initial query and two bounded retries. A new page/profile/native
+      // event starts a new generation; there is no permanent polling loop.
+      for attempt in 0..<3 {
+        guard current() else { return }
+        if attempt > 0 {
+          do { try await Task.sleep(for: .seconds(attempt == 1 ? 0.25 : 0.75)) }
+          catch { return }
+          guard current() else { return }
+        }
+        var failed = Set<String>()
+        for identifier in remaining.sorted() {
+          guard current(), self.entries.contains(where: { $0.id == identifier }) else { return }
+          do {
+            let state = try await self.actionQuery(manager, identifier, page)
+            guard current() else { return }
+            self.actionStates[identifier] = state
+            self.actionCapabilities[identifier] = state.hasAction
+            self.actionErrors.removeValue(forKey: identifier)
+            self.actionIcons.removeValue(forKey: identifier)
+            if let encoded = state.iconPNG, encoded.utf8.count <= 1_400_000,
+              let data = Data(base64Encoded: encoded), let image = NSImage(data: data) { self.actionIcons[identifier] = image }
+            self.actionLoading.remove(identifier)
+          } catch {
+            guard current() else { return }
+            self.actionErrors[identifier] = String(error.localizedDescription.prefix(320))
+            if attempt < 2 { failed.insert(identifier) }
+            else { self.actionLoading.remove(identifier) }
+          }
+          self.publish(profile, revision)
+        }
+        remaining = failed
+        if remaining.isEmpty { break }
+      }
     }
   }
   private static func color(_ rgba: [Int]) -> NSColor? {
@@ -222,6 +275,7 @@ final class NativeExtensionsModel: ObservableObject {
   }
   func perform(_ operation: String, id: String = "", value: String? = nil, expectedProfile: String? = nil) {
     guard !isPrivate, expectedProfile.map({ $0 == store.activeProfileID }) ?? true else { return }
+    if operation == "retry-action" { retryActionState(id: id); return }
     let profile = store.activeProfileID, revision = generation
     let ownerWindowID = store.owningWindowID
     let managementID = ["enable", "disable", "remove"].contains(operation) ? UUID() : nil
@@ -392,6 +446,7 @@ final class NativeExtensionsModel: ObservableObject {
     actionRequest?.cancel(); actionRequest = nil; actionGeneration += 1
     scope = nil; activeDocument = nil; activeAddress = nil; loading = false; refreshPending = false
     actionStates = [:]; actionIcons = [:]; actionCapabilities = [:]
+    actionLoading = []; actionErrors = [:]
     shortcutRequest?.cancel(); shortcutRequest = nil; shortcutGeneration += 1; shortcuts = []
     NativeShortcutSuspension.noteProfile(engine: engine, owner: suspensionToken, profile: nil)
   }
@@ -543,7 +598,8 @@ private struct NativeExtensionCard: View {
                     .lineLimit(1)
                   Spacer(minLength: 0)
                   NativeGlyph("external").frame(width: 11, height: 11)
-                }
+                }.frame(maxWidth: .infinity, minHeight: 24, alignment: .leading)
+                  .contentShape(Rectangle())
               }.buttonStyle(.plain).help(view.url).accessibilityLabel("Inspect " + view.url)
             }
           }.padding(.top, 6)

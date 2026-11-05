@@ -36,7 +36,7 @@ Optional **Ask Zacro** helps you ask questions, summarize pages and compare idea
 
 ## Try Zacro
 
-The **native macOS 0.11.0 implementation** is on the `swift-rewrite` branch. See the [Mac build guide](macos/README.md) and [verification record](docs/native-parity/verification.md). The local build is development-signed; public distribution signing and notarization remain separate release steps.
+The **native macOS 0.11.1 implementation** is on the `swift-rewrite` branch. See the [Mac build guide](macos/README.md) and [verification record](docs/native-parity/verification.md). The local build is development-signed; public distribution signing and notarization remain separate release steps.
 
 The earlier Electron desktop preview remains documented in the [0.10 release notes](docs/RELEASE-NOTES-0.10.md). [Website sign-in notes](docs/WEB-SIGN-IN.md) · [Security](docs/SECURITY.md).
 

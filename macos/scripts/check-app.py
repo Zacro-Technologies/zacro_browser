@@ -4,6 +4,7 @@
 import argparse
 import http.server
 from native_auth_fixture import handle_native_auth
+from native_extension_readiness_fixture import handle_native_extension_action
 from native_messaging_fixture import build_host
 import json
 import os
@@ -22,6 +23,8 @@ from urllib.parse import parse_qs, urlsplit
 
 class Fixture(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
+        if handle_native_extension_action(self):
+            return
         if urlsplit(self.path).path != "/native-extension-host/document":
             self.send_error(404)
             return
@@ -35,6 +38,8 @@ class Fixture(http.server.BaseHTTPRequestHandler):
             self.send_error(405)
 
     def do_GET(self):
+        if handle_native_extension_action(self):
+            return
         if handle_native_auth(self):
             return
         route = urlsplit(self.path).path

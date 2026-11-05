@@ -153,6 +153,9 @@ struct SiteExtensionItem: Identifiable {
   var badgeForeground: NSColor?
   var enabled = true
   var actionEnabled = true
+  var actionLoading = false
+  var actionError: String?
+  var canRetryAction = false
   var pinned = false
   var canPin = true
   var perform: () -> Void = {}
@@ -305,7 +308,7 @@ struct SiteControls: View {
     if !actions.isPrivate { result.append("extensions") }
     if !actions.isPrivate, actions.extensionsReady, actions.extensionError == nil {
       for item in actions.extensions {
-        result.append("extension:\(item.id)")
+        if item.enabled && !item.actionLoading { result.append("extension:\(item.id)") }
         if item.canPin { result.append("pin:\(item.id)") }
       }
     }
@@ -331,7 +334,9 @@ struct SiteControls: View {
   }
   private func empty(_ text: String) -> some View { Text(text).font(.system(size: 12)).foregroundStyle(colors.muted).padding(10) }
   private func extensionTile(_ item: SiteExtensionItem) -> some View {
-    Button { perform(item.perform) } label: {
+    Button {
+      if item.canRetryAction { item.perform() } else { perform(item.perform) }
+    } label: {
       ExtensionTileGlyph(item: item, size: 22, colors: colors)
         .frame(maxWidth: .infinity).aspectRatio(1, contentMode: .fit)
         .background(colors.ink.opacity(0.045), in: RoundedRectangle(cornerRadius: 9))
@@ -339,7 +344,9 @@ struct SiteControls: View {
         .overlay(alignment: .topTrailing) {
           if !item.badgeText.isEmpty { badge(item, small: false) }
         }
-    }.buttonStyle(.plain).help(item.name + (item.enabled ? "" : " · Disabled")).accessibilityLabel(item.name)
+        .overlay { ExtensionActionStatus(item: item, colors: colors) }
+    }.buttonStyle(.plain).disabled(!item.enabled || item.actionLoading)
+      .help(item.actionHelp).accessibilityLabel(item.actionLabel)
       .focusable().focusEffectDisabled().focused($focus, equals: "extension:\(item.id)")
       .id("extension:\(item.id)")
       .overlay(alignment: .bottomTrailing) {
@@ -410,7 +417,7 @@ struct NativePinnedExtensions: View {
           LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: columns), spacing: 6) {
             ForEach(items) { item in
               Button(action: item.perform) {
-                ExtensionTileGlyph(item: item, size: 18, colors: colors, dimmed: !item.enabled || !item.actionEnabled).frame(width: side, height: side)
+                ExtensionTileGlyph(item: item, size: 18, colors: colors, dimmed: !item.enabled || (!item.actionEnabled && !item.canRetryAction)).frame(width: side, height: side)
                   .background(colors.ink.opacity(0.045), in: RoundedRectangle(cornerRadius: 9))
                   .shadow(color: .black.opacity(0.05), radius: 2.5, y: 2)
                   .overlay(alignment: .bottomTrailing) {
@@ -421,7 +428,9 @@ struct NativePinnedExtensions: View {
                         .background(item.badgeColor.map(Color.init(nsColor:)) ?? .black, in: RoundedRectangle(cornerRadius: 3)).padding(1)
                     }
                   }
-              }.buttonStyle(.plain).disabled(!item.enabled || !item.actionEnabled).help(item.name).accessibilityLabel(item.name)
+                  .overlay { ExtensionActionStatus(item: item, colors: colors) }
+              }.buttonStyle(.plain).disabled(!item.enabled || (!item.actionEnabled && !item.canRetryAction))
+                .help(item.actionHelp).accessibilityLabel(item.actionLabel)
                 .contextMenu { if item.canPin { Button("Unpin extension", action: item.togglePin) } }
             }
           }
@@ -429,6 +438,33 @@ struct NativePinnedExtensions: View {
       }.frame(height: min(116, ceil(Double(items.count) / Double(columns)) * min(52, max(1, (width - Double(columns - 1) * 6) / Double(columns))) + Double(max(0, Int(ceil(Double(items.count) / Double(columns))) - 1)) * 6))
         .padding(.top, 6).padding(.bottom, 2).accessibilityElement(children: .contain).accessibilityLabel("Pinned extensions")
     }
+  }
+}
+private extension SiteExtensionItem {
+  var actionLabel: String {
+    if actionLoading { return name + " · Loading action" }
+    if canRetryAction { return "Retry " + name + " action" }
+    return name
+  }
+  var actionHelp: String {
+    if let actionError { return name + " · " + actionError + (canRetryAction ? " · Click to retry" : "") }
+    if actionLoading { return name + " · Loading action" }
+    return name + (enabled ? "" : " · Disabled")
+  }
+}
+private struct ExtensionActionStatus: View {
+  let item: SiteExtensionItem
+  let colors: NativeSpacePalette
+  var body: some View {
+    ZStack(alignment: .bottomTrailing) {
+      Color.clear
+      if item.actionLoading {
+        ProgressView().controlSize(.mini).padding(3)
+      } else if item.canRetryAction {
+        NativeGlyph("reload").frame(width: 11, height: 11).padding(3)
+          .foregroundStyle(colors.accent).background(colors.chrome, in: Circle()).padding(2)
+      }
+    }.allowsHitTesting(false).accessibilityHidden(true)
   }
 }
 private struct ExtensionTileGlyph: View {

@@ -671,8 +671,6 @@ Framework 101 remains SHA-256 `8ea8e777b66023a1eff6abce8d339bc7d95d1eda9def83cd8
 
 Evidence under `macos/.build/verification`: `completion-105/{package.log,release-build.json,remaining-summary.json}`; `completion-105/debug-application-reopening{,-owned-presentation}/{application.json,application-launch.json}`; `completion-105/full/{application.json,application-launch.json,turn-server.json}`; `completion-105/engine/{engine.json,engine-launch.json}`; `completion-105/windows/{application.json,application-launch.json}`; `completion-105/accessibility/{accessibility.json,accessibility-launch.json}`; and `delivery-105.json`. The earlier failed reports remain failed historical evidence; the exact optimized-105 reports and normal exits establish the completed local gates above.
 
-<a id="current-completion-record"></a>
-
 ## 2026-11-04: native UI 110 focus and rendering overhead
 
 The browser shell and hosted Chromium documents remain separate native windows. AppKit main-window ownership now stays with the exact live shell while the real page, palette or sheet retains its key window and responder. Reconciliation uses public `makeMain`, checks current ownership after native notification ordering, and preserves inactive applications, foreign windows, sheets and newer editing intent. It never fabricates key status or replaces the Chromium responder.
@@ -717,3 +715,39 @@ Evidence is under `macos/.build/verification/completion-106`: `release-build-110
 - Final packaged app validation, signing/distribution status, screenshots from the actual build, and an accurate version/readme.
 
 Do not infer universal Chrome-extension compatibility from Chromium embedding or from successful extension installation alone. APIs that require unimplemented native window ownership must report their limitation, not expose hidden implementation windows or fabricate success.
+
+
+<a id="current-completion-record"></a>
+
+## 2026-11-04: native UI 113 extension action reliability
+
+Extension actions now wait for the selected tab's real native Back/Forward history to be installed, without waiting for its HTTP navigation to succeed. Exact browser, profile, window and selection checks remain in place across suspension. Per-extension action queries expose loading and errors, retry at most three times, and offer a query-only retry after exhaustion. A genuine Chrome-disabled action remains disabled. Known installation capability and pinned preferences survive transient query failures.
+
+Worker inspection uses Chromium's inactive-worker wake path, preventing a stale process snapshot from silently doing nothing. The Inspect row also has a full-width pointer hit target: build 111/112 review established that its blank middle ignored physical clicks while AX activation worked. Build 112's actual 80ms center click opened the rendered worker DevTools console after this correction.
+
+The exact optimized **113** package passed all **685 targeted runtime checks**:
+
+| Suite | Checks |
+| --- | ---: |
+| Extensions | 333 |
+| Sidebar | 25 |
+| Focus family | 16 |
+| Interface | 145 |
+| Extension management | 13 |
+| Resize | 70 |
+| Space swipe | 12 |
+| Windows | 9 |
+| Engine | 51 |
+| Scoped accessibility | 11 |
+
+Every driver passed, every reported check is true, and every actual main/raw/LaunchServices exit is **0/0/0**, without forced termination. The 25 new extension assertions cover seven action-state recovery cases and eighteen failed/held-navigation, native-history, popup/panel, cancellation and ownership cases. The loading fixture holds a real loopback response before headers, verifies native installation before the actions, releases the request explicitly, and reads back both native history entries from the same controller after commit. The earlier 112 test stalled because its pre-navigation renderer protocol commands blocked its own restore setup; that failed report remains preserved. The revised fixture removes those commands while retaining the native identity/history assertions.
+
+Real Computer review of optimized **112**, using one disposable profile across two normally exited processes and no worker inspector during persistence checks, verified installation through the actual file chooser, pinning, the visible native popup, worker messaging, a page content script, and the saved worker counter advancing **1→2** after a cold restart without reinstalling. Only after those checks did a physical center click open the real worker inspector. The compiled-source delta from 112 to 113 is solely the gated readiness acceptance helper, recorded in the source manifest; product UI source is unchanged. An additional real desktop review of exact **113** verified page editing, Command-L, Escape returning to the original editor, continued typing retaining its draft, and a normal exit.
+
+The **323 Core/Services tests** passed without skips with packaged helpers (229 Core + 94 Services); their source hashes and byte-identical provider executables are bound to 113 in `core-services-evidence.json`. Additional focused checks cover twenty real-filesystem profile-lease cases, eleven persisted-workflow cases, six launch-lifecycle tests, sixteen report-driver cases, eight real loopback HTTP fixture tests, and four pinned native-messaging adapter tests (including twelve real resolver-body filesystem cases). The persisted test mode admits only an app-created, private, nonce/inode-bound disposable profile, holds a file lock, and permits exactly one cold restart. Ordinary profile storage and Keychain policy are unchanged.
+
+Both local `dist/Zacro Native.app` and `macos/dist/Zacro Native.app` contain **0.11.1, bundle build 1, candidate 113**, executable SHA-256 `c380d5bde7d2b6f053899d5b3d0e2d22c91703499b6da51d0a3b26767778347d`. Both deep/strict development signatures passed, and both runtime provenance files retain SHA-256 `153d7809d888d6c8b32431a5e9f2e633bfed7e094eb1c1f363fe25c9629399bd`. Delivery preserved both prior 110 bundles. Framework 101, its 124 native inputs, 240 resources and four symlinks remain unchanged.
+
+The installed iCloud Passwords public assets appeared enabled in a separate disposable UI test. Read-only inspection of Apple's helper signing constraints establishes that the current ad-hoc Zacro identity does not satisfy its parent-launch requirements. No pairing, password access or native hello was tested. Apple-approved browser entitlement/provisioning remains an external prerequisite; see the [compatibility boundaries](compatibility-boundaries.md#icloud-passwords-installed-helper-signing-requirement). This work does not establish universal Chrome-extension compatibility, production Keychain qualification, notarization, physical trackpad pacing or a measured GPU/FPS improvement. The complete media/TURN catalog was not repeated; exact 105 remains the most recent full 1,032-check application run. The README gallery remains its genuine historical native captures.
+
+Evidence is under `macos/.build/verification`: `completion-111/{core-services.log,signing/}`, `completion-112/{release-build-112.json,cold-ui/}`, and `completion-113/{build.log,release-build-113.json,targeted-113-summary.json,core-services-evidence.json,manual-ui-113/,delivery-113.json}`. Individual 113 suite folders retain their reports and actual process-exit receipts. Failed/intermediate invocations retain their original logs and are not counted as passes.

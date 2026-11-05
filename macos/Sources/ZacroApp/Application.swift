@@ -3130,13 +3130,17 @@ extension BrowserWindowCoordinator {
     }
     guard store.profileID(for: tab) == profileID else { throw CancellationError() }
     let page = try await ensurePageReady(tab)
-    try await navigation.waitForRestore(page)
-    guard page.profileID == profileID, page.ownerWindowID == windowContext.id,
+    let browser = try await page.ready()
+    // Toolbar actions operate on the real tab/controller, including a pending
+    // or failed network document. Preserve saved Back/Forward installation
+    // without requiring that document's HTTP navigation to succeed.
+    try await navigation.waitForNavigationInstallation(page)
+    guard page.browser === browser, page.profileID == profileID, page.ownerWindowID == windowContext.id,
       available(), selectedDocumentID == tab.id, activePage === page else { throw CancellationError() }
     try await extensionBrowser.prepareInitialNavigation(page)
     try Task.checkCancellation()
     guard available(), selectedDocumentID == tab.id, activePage === page,
-      engine.pages[tab.id] === page else { throw CancellationError() }
+      engine.pages[tab.id] === page, page.browser === browser else { throw CancellationError() }
     return page
   }
   private func installServices() {

@@ -824,9 +824,15 @@ public final class ChromeExtensionManager {
 
   public func inspectView(_ identifier: String, view: ChromeExtension.View) async throws {
     try validate(identifier)
+    let isServiceWorker = view.type == "EXTENSION_SERVICE_WORKER_BACKGROUND"
+    // An MV3 worker can stop after the views snapshot. Chromium's direct
+    // running-worker path silently does nothing when that target has gone.
+    // Its inactive-worker path also handles an already-running worker and
+    // waits for the real lazy context before opening its native inspector.
     try await invoke("developerPrivate.openDevTools", [["extensionId": identifier,
-      "renderViewId": view.renderViewId, "renderProcessId": view.renderProcessId,
-      "isServiceWorker": view.type == "EXTENSION_SERVICE_WORKER_BACKGROUND",
+      "renderViewId": isServiceWorker ? -1 : view.renderViewId,
+      "renderProcessId": isServiceWorker ? -1 : view.renderProcessId,
+      "isServiceWorker": isServiceWorker,
       "incognito": view.incognito, "url": view.url]], userGesture: true)
   }
 

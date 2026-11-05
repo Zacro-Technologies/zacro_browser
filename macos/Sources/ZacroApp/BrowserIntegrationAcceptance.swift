@@ -1560,6 +1560,13 @@ final class BrowserIntegrationAcceptance {
         await worker.close()
         return
       }
+      if includeProtocolFixtures || suite == "extension-actions" {
+        for name in try await NativeExtensionActionRecoveryAcceptance.run(application: application,
+          owner: owner, page: page, manager: manager, identifier: identifier, worker: worker) { checks[name] = true }
+        for name in try await NativeExtensionActionReadinessAcceptance.run(application: application,
+          url: url, owner: owner, page: page, manager: manager,
+          identifier: identifier, worker: worker) { checks[name] = true }
+      }
       if includeProtocolFixtures {
         let config: [String: Any] = ["baseURL": url.absoluteString,
           "sourceWindowID": owner.windowContext.nativeID, "groups": true]

@@ -27,6 +27,7 @@ public final class ChromiumEngine: NSObject {
   private var unsupportedNativeCapabilities = false
   private var capabilityProbe: Task<CefNativeCapabilities, Error>?
   private var capabilityProbeID: UUID?
+  private var acceptanceProfileLease: ChromiumAcceptanceProfileLease?
   public private(set) var contexts: [String: ChromiumWindowContext] = [:]
   public private(set) var primaryWindow: ChromiumWindowContext?
   public private(set) var focusedWindowID: String?
@@ -118,25 +119,30 @@ public final class ChromiumEngine: NSObject {
 
   /// Call before NSApplication.shared or SwiftUI's App.main().
   public func start() throws {
-    try FileManager.default.createDirectory(at: dataDirectory, withIntermediateDirectories: true)
-    try removeRetiredProfileData()
     var configuration = CefConfiguration()
     configuration.rootCachePath = dataDirectory.appendingPathComponent(
       "Chromium", isDirectory: true)
     configuration.noSandbox = false
     configuration.safeStorage = .keychain
-    if CommandLine.arguments.contains("--engine-acceptance") {
-      let directory = dataDirectory.standardizedFileURL.resolvingSymlinksInPath()
-      let temporary = FileManager.default.temporaryDirectory.standardizedFileURL
-        .resolvingSymlinksInPath()
+    let arguments = CommandLine.arguments
+    let persistedAcceptance = arguments.contains("--native-persisted-extension-acceptance")
+    let resumedAcceptance = arguments.contains("--native-persisted-extension-resume")
+    if persistedAcceptance || resumedAcceptance {
+      guard persistedAcceptance, arguments.contains("--engine-acceptance"),
+        arguments.contains("--native-ui-review"),
+        !arguments.contains("--native-integration-acceptance"),
+        !arguments.contains("--native-performance-acceptance"),
+        !arguments.contains("--native-accessibility-acceptance") else {
+        throw NSError(domain: "ZacroEngine", code: 1, userInfo: [NSLocalizedDescriptionKey:
+          "Persisted extension checks require their separate disposable UI acceptance mode."])
+      }
+    }
+    if arguments.contains("--engine-acceptance") {
       guard
         let fixtureURL = ProcessInfo.processInfo.environment["ZACRO_NATIVE_SMOKE_URL"].flatMap(
           URL.init(string:)),
         fixtureURL.scheme == "http", fixtureURL.host == "127.0.0.1",
-        fixtureURL.user == nil, fixtureURL.password == nil,
-        directory.deletingLastPathComponent() == temporary,
-        directory.lastPathComponent.hasPrefix("zacro-native-acceptance-"),
-        try FileManager.default.contentsOfDirectory(atPath: directory.path).isEmpty
+        fixtureURL.user == nil, fixtureURL.password == nil
       else {
         throw NSError(
           domain: "ZacroEngine", code: 1,
@@ -145,8 +151,16 @@ public final class ChromiumEngine: NSObject {
               "Engine acceptance requires a fresh empty zacro-native-acceptance-* directory inside the system temporary directory."
           ])
       }
+      acceptanceProfileLease = try ChromiumAcceptanceProfileLease.admit(directory: dataDirectory,
+        persisted: persistedAcceptance, resume: resumedAcceptance,
+        nonce: ProcessInfo.processInfo.environment["ZACRO_NATIVE_PERSISTED_EXTENSION_NONCE"])
       configuration.safeStorage = .mockKeychain
+    } else {
+      try FileManager.default.createDirectory(at: dataDirectory, withIntermediateDirectories: true)
     }
+    // Validate test ownership before reading or replaying any persisted native
+    // cleanup receipt. Ordinary profiles retain their unchanged storage policy.
+    try removeRetiredProfileData()
     configuration.persistSessionCookies = true
     // Match official CEF release behavior. Unbranded Chromium otherwise applies
     // its developer field-trial test matrix, including helper architectures
